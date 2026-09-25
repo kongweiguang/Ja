@@ -33,7 +33,8 @@ public final class TaskTerminalPersistence {
 
     /**
      * Conversation 唯一终态门获胜后，在同一 SqlSession 追加 Child Task 的 Activity、投影和父 Mailbox。
-     * final assistant 没有公开文本时不构造空 UserContent，也不发送伪结果。
+     * 输出额度续写的最后一个 Assistant 只保存尾段；父 Task 在摘要可证明包含更长答复时
+     * 使用其有界前缀，普通简短状态摘要不能覆盖真实终态正文。无公开文本不发送伪结果。
      */
     public static Optional<TaskRecords.TaskSummaryRow> settle(
             PersistenceMappers mapper, ObjectMapper objectMapper,
@@ -41,7 +42,12 @@ public final class TaskTerminalPersistence {
         Objects.requireNonNull(terminal, "terminal");
         TaskRecords.TerminalTaskRow task = mapper.tasks().selectTaskByTurn(terminal.turnId());
         if (task == null) return Optional.empty();
-        String visible = visibleText(terminal.finalMessage(), MAX_FINAL_ANSWER_CODE_POINTS);
+        String summaryText = bounded(terminal.summary(), MAX_FINAL_ANSWER_CODE_POINTS);
+        String finalText = visibleText(terminal.finalMessage(), MAX_FINAL_ANSWER_CODE_POINTS);
+        String visible = !finalText.isBlank()
+                && (summaryText.length() > finalText.length()
+                || summaryText.length() == MAX_FINAL_ANSWER_CODE_POINTS && !summaryText.equals(finalText))
+                ? summaryText : finalText;
         String safeSummary = visible.isBlank()
                 ? bounded(terminal.summary(), MAX_SAFE_SUMMARY_CODE_POINTS)
                 : bounded(visible, MAX_SAFE_SUMMARY_CODE_POINTS);

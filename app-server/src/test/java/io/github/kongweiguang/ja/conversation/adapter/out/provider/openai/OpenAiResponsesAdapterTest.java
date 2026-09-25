@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.conversation.adapter.out.provider.openai;
@@ -448,6 +449,47 @@ final class OpenAiResponsesAdapterTest {
         assertTrue(events.stream().noneMatch(event -> event.toString().contains("public summary")));
     }
 
+    /** 长公开 reasoning_text 必须按小 SSE 帧增量交付，不再因累计总长或重复全文复制而中断。 */
+    @Test
+    void retainsReasoningTextAcrossMoreThanFourMillionStreamedCharacters() throws Exception {
+        String chunk = "x".repeat(100_000);
+        String created = ModelAdapterTestSupport.openAiResponse("resp_long_reasoning", "in_progress");
+        String terminalItem = reasoningItem("reason_long", null, "opaque");
+        String completed = ModelAdapterTestSupport.openAiResponse(
+                "resp_long_reasoning", "completed", null, "[" + terminalItem + "]");
+        StringBuilder stream = new StringBuilder(event("response.created",
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":" + created + "}"));
+        for (int index = 1; index <= 41; index++) {
+            stream.append(event("response.reasoning_text.delta",
+                    "{\"type\":\"response.reasoning_text.delta\",\"item_id\":\"reason_long\","
+                            + "\"output_index\":0,\"content_index\":0,\"sequence_number\":" + index
+                            + ",\"delta\":\"" + chunk + "\"}"));
+        }
+        stream.append(event("response.completed",
+                "{\"type\":\"response.completed\",\"sequence_number\":42,\"response\":"
+                        + completed + "}"));
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream.toString(), 8_192))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(30));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(
+                                ModelAdapterTestSupport.request(configuration), event -> {
+                                    events.add(event);
+                                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                                }, CancellationToken.none())
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+        }
+        int characters = events.stream()
+                .filter(ModelPort.ReasoningSummaryDelta.class::isInstance)
+                .mapToInt(event -> ((ModelPort.ReasoningSummaryDelta) event).text().length())
+                .sum();
+        assertEquals(4_100_000, characters);
+    }
+
     /** 原生 block 已先完成时，terminal 才补出的公开 summary 仍须送达且不得重复 block。 */
     @Test
     void deliversTerminalOnlySummaryAfterReasoningBlockWasEmitted() throws Exception {
@@ -632,7 +674,7 @@ final class OpenAiResponsesAdapterTest {
                 assertEquals("OPENAI_EVENT",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -915,9 +957,9 @@ final class OpenAiResponsesAdapterTest {
         assertEquals(1, events.size());
     }
 
-    /** 在持久化或重试观察到数据前拒绝不可能成立的强类型 usage。 */
+    /** 非法 Usage 不影响完整的语义响应，实际用量保持未知。 */
     @Test
-    void rejectsInvalidUsage() throws Exception {
+    void completesWithInvalidUsageAsUnknown() throws Exception {
         String invalid = """
                 event: response.created
                 data: {"type":"response.created","sequence_number":0,"response":%s}
@@ -935,22 +977,19 @@ final class OpenAiResponsesAdapterTest {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                java.util.concurrent.ExecutionException failure = assertThrows(
-                        java.util.concurrent.ExecutionException.class, () ->
-                                adapter.start(ModelAdapterTestSupport.request(configuration),
-                                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                                CancellationToken.none())
-                                        .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("USAGE",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertNull(outcome.usage());
             }
             assertEquals(1, server.calls());
         }
     }
 
-    /** 在虚高总 Token 计数成为 usage 事件前拒绝它。 */
+    /** 虚高总 Token 不能进入计费事件，但完整的工具结果仍可交付。 */
     @Test
-    void rejectsInflatedUsageTotal() throws Exception {
+    void ignoresInflatedUsageTotal() throws Exception {
         String invalid = SUCCESS.replace("\"total_tokens\":14", "\"total_tokens\":99");
         List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
@@ -958,15 +997,12 @@ final class OpenAiResponsesAdapterTest {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                java.util.concurrent.ExecutionException failure = assertThrows(
-                        java.util.concurrent.ExecutionException.class, () ->
-                                adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
-                                            events.add(event);
-                                            return java.util.concurrent.CompletableFuture.completedFuture(null);
-                                        }, CancellationToken.none())
-                                        .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("USAGE",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> {
+                                    events.add(event);
+                                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                                }, CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertNull(outcome.usage());
             }
             assertTrue(events.stream().noneMatch(ModelPort.UsageEvent.class::isInstance));
             assertEquals(1, server.calls());
@@ -995,13 +1031,13 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(ModelPort.UsageEvent.class::isInstance));
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
-    /** 即使生成 record 接受各字段，也拒绝强类型 usage 中的有符号溢出。 */
+    /** Usage 数值溢出只降级计量，不能废弃已完成的响应。 */
     @Test
-    void rejectsOverflowingUsage() throws Exception {
+    void ignoresOverflowingUsage() throws Exception {
         String completed = ModelAdapterTestSupport.openAiResponse(
                         "resp_overflow", "completed", new ModelUsage(1, 1, 2))
                 .replace("\"input_tokens\":1", "\"input_tokens\":" + Long.MAX_VALUE)
@@ -1021,14 +1057,36 @@ final class OpenAiResponsesAdapterTest {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                java.util.concurrent.ExecutionException failure = assertThrows(
-                        java.util.concurrent.ExecutionException.class, () ->
-                                adapter.start(ModelAdapterTestSupport.request(configuration),
-                                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                                CancellationToken.none())
-                                        .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("USAGE",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertNull(outcome.usage());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 相同完成事件重复发送只结算一次，不重复正文或 Usage。 */
+    @Test
+    void acceptsRepeatedIdenticalCompletion() throws Exception {
+        String response = ModelAdapterTestSupport.openAiResponse("resp_duplicate", "completed");
+        String stream = "event: response.created\ndata: {\"type\":\"response.created\","
+                + "\"sequence_number\":0,\"response\":"
+                + ModelAdapterTestSupport.openAiResponse("resp_duplicate", "in_progress") + "}\n\n"
+                + "event: response.completed\ndata: {\"type\":\"response.completed\","
+                + "\"sequence_number\":1,\"response\":" + response + "}\n\n"
+                + "event: response.completed\ndata: {\"type\":\"response.completed\","
+                + "\"sequence_number\":2,\"response\":" + response + "}\n\n";
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 13))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
             }
             assertEquals(1, server.calls());
         }
@@ -1067,7 +1125,7 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(event -> event.toString().contains("late-terminal-sentinel")));
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -1092,11 +1150,11 @@ final class OpenAiResponsesAdapterTest {
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
             assertTrue(events.stream().noneMatch(ModelPort.TextDelta.class::isInstance));
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
-    /** 成功 HTTP 响应缺少 SSE media type 时，在解析正文或重试前拒绝它。 */
+    /** 成功 HTTP 响应缺少 SSE media type 时，在解析正文前拒绝它。 */
     @Test
     void rejectsSuccessfulNonSseContentType() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
@@ -1118,9 +1176,9 @@ final class OpenAiResponsesAdapterTest {
         }
     }
 
-    /** 通过 Content-Length 阻止超限 HTTP 错误正文，且不保留其中的哨兵文本。 */
+    /** 超限错误正文只丢弃诊断，不掩盖可恢复的 HTTP 500 分类或泄漏私有内容。 */
     @Test
-    void rejectsOversizedErrorBodyWithoutLeak() throws Exception {
+    void oversizedErrorBodyPreservesHttpStatusWithoutLeak() throws Exception {
         String sentinel = "private-error-body-sentinel";
         String body = "{\"error\":{\"code\":\"server_error\",\"message\":\""
                 + sentinel + "x".repeat(AbstractStreamingModelAdapter.MAX_ERROR_BODY_BYTES) + "\"}}";
@@ -1137,7 +1195,8 @@ final class OpenAiResponsesAdapterTest {
                                         .toCompletableFuture().get(5, TimeUnit.SECONDS));
                 ProviderProtocolException protocol =
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause());
-                assertEquals("RESPONSE_LIMIT", protocol.code());
+                assertEquals("HTTP_STATUS", protocol.code());
+                assertTrue(protocol.retryable());
                 assertFalse(protocol.toString().contains(sentinel));
                 assertNull(protocol.getCause());
             }

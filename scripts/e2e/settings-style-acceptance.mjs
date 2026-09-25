@@ -58,6 +58,7 @@ async function createNativeProbeDirectories(frontendPort) {
     localAppData: join(root, "localappdata"),
     userProfile: join(root, "userprofile"),
     workspace: join(root, "workspace"),
+    workspaceB: join(root, "workspace-b"),
   };
   await mkdir(runtime, { recursive: true });
   await Promise.all(
@@ -66,9 +67,9 @@ async function createNativeProbeDirectories(frontendPort) {
       .map((directory) => mkdir(directory, { recursive: true })),
   );
   const productionConfig = JSON.parse(
-    await readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8"),
+    await readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8"),
   );
-  const windowsConfigPath = join(repoRoot, "src-tauri", "tauri.windows.conf.json");
+  const windowsConfigPath = join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json");
   const windowsConfig = JSON.parse(await readFile(windowsConfigPath, "utf8"));
   const productionWindow = {
     ...productionConfig.app.windows.find((window) => window.label === "main"),
@@ -126,7 +127,7 @@ async function seedNativeConversationProvider(userProfile) {
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
@@ -140,10 +141,6 @@ async function seedNativeConversationProvider(userProfile) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 8",
-    "max_tool_calls = 8",
-    "wall_timeout_ms = 120000",
     "[[providers.models]]",
     'model_id = "model_e2e"',
     'name = "Isolated MCP header model"',
@@ -201,6 +198,40 @@ function launchNativeTauri(pnpm, configPath, environment) {
   return { child, stdout, stderr };
 }
 
+/** Job 受限的测试宿主先持有同一 Java TCP daemon，验收结束时由本 runner 终止它。 */
+async function startNativeDaemonForJob(javaExecutable, jar, directories, environment) {
+  const home = join(directories.userProfile, ".ja");
+  const encoded = (path) => Buffer.from(path, "utf8").toString("base64url");
+  const args = [
+    "-jar", jar,
+    `--home-dir-base64=${encoded(home)}`,
+    `--data-dir-base64=${encoded(join(home, "data"))}`,
+    `--run-dir-base64=${encoded(directories.runtime)}`,
+    `--log-dir-base64=${encoded(join(home, "logs", "java"))}`,
+    "--ja-runtime-generation=1",
+    "--ja-transport=tcp",
+  ];
+  const child = spawn(javaExecutable, args, {
+    cwd: directories.runtime,
+    env: environment,
+    windowsHide: true,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const diagnostics = [];
+  child.stderr?.on("data", (chunk) => diagnostics.push(String(chunk).slice(-300)));
+  const endpoint = join(directories.runtime, "app-server.endpoint.json");
+  const deadline = Date.now() + 25_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`isolated Java daemon exited=${child.exitCode} diagnostics=${diagnostics.join("").slice(-500)}`);
+    }
+    if (await stat(endpoint).then((value) => value.size > 0).catch(() => false)) return child;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  child.kill();
+  throw new Error(`isolated Java daemon endpoint not ready diagnostics=${diagnostics.join("").slice(-500)}`);
+}
+
 /** 只回收本函数启动的 launcher PID 树，不能枚举或影响其它 Ja、Edge 或开发进程。 */
 async function stopNativeTauri(child) {
   if (child.pid === undefined || child.exitCode !== null) return;
@@ -249,6 +280,7 @@ async function waitForNativeRuntimeReady(page, evidencePath) {
   const deadline = Date.now() + 60_000;
   const connected = page.getByRole("status", { name: "本地运行时：已连接" });
   let state = { status: "unavailable" };
+  let retried = false;
   while (Date.now() < deadline) {
     state = await page
       .evaluate(async () => {
@@ -267,6 +299,17 @@ async function waitForNativeRuntimeReady(page, evidencePath) {
       })
       .catch(() => ({ status: "unavailable" }));
     if (state.status === "ready" && (await connected.isVisible().catch(() => false))) return;
+    if (state.status === "stopped" && !retried) {
+      const details = page.getByRole("button", { name: "运行时异常详情" });
+      if (await details.isVisible().catch(() => false)) {
+        await details.click();
+        const restart = page.getByRole("button", { name: "重新启动" });
+        if (await restart.isVisible().catch(() => false)) {
+          retried = true;
+          await restart.click();
+        }
+      }
+    }
     if (["crashed", "faulted", "incompatible", "recovery_required"].includes(state.status)) break;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
@@ -274,6 +317,20 @@ async function waitForNativeRuntimeReady(page, evidencePath) {
     path: join(evidencePath, "native-runtime-not-ready.png"),
     animations: "disabled",
   });
+  const details = page.getByRole("button", { name: "运行时异常详情" });
+  if (await details.isVisible().catch(() => false)) {
+    await details.click();
+    state.issue = await page.locator(".ja-navigation-runtime-popover").innerText().catch(() => "unavailable");
+  }
+  state.startAttempt = await page.evaluate(async () => {
+    try {
+      const result = await globalThis.__TAURI_INTERNALS__?.invoke?.("ja_runtime_start");
+      return typeof result?.status === "string" ? result.status : "invalid";
+    } catch (failure) {
+      const record = failure && typeof failure === "object" ? failure : {};
+      return String(record.code ?? record.message ?? failure).slice(0, 160);
+    }
+  }).catch(() => "unavailable");
   throw new Error(`native runtime did not become ready: ${JSON.stringify(state)}`);
 }
 
@@ -301,7 +358,7 @@ async function openNativeSettings(page) {
  * 在真实 WebView2 中先运行隔离 MCP 与 Skill 设置验收，再用同一隔离 profile 创建会话并验证
  * 顶栏全局／项目 MCP 清单、跨会话状态隔离和 Settings 往返焦点。
  */
-async function inspectNativeSettings(cdpPort, evidencePath, userProfile, projectPath) {
+async function inspectNativeSettings(cdpPort, evidencePath, userProfile, projectPath, alternateProjectPath) {
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
   try {
     const page = browser.contexts().flatMap((context) => context.pages())[0];
@@ -332,6 +389,7 @@ async function inspectNativeSettings(cdpPort, evidencePath, userProfile, project
         page,
         evidenceDirectory: join(evidencePath, "mcp-header"),
         projectPath,
+        alternateProjectPath,
       });
       return {
         pages: browser.contexts().flatMap((context) => context.pages()).length,
@@ -345,34 +403,41 @@ async function inspectNativeSettings(cdpPort, evidencePath, userProfile, project
       page,
       evidenceDirectory: join(evidencePath, "mcp-settings"),
     });
+    const projectEmpty = page.getByRole("region", { name: "项目 MCP 服务" }).getByRole("status");
+    await expect(projectEmpty).toBeVisible();
+    expect(await projectEmpty.evaluate((element) => element.getBoundingClientRect().width))
+      .toBeGreaterThan(200);
+    await page.screenshot({ path: join(evidencePath, "native-mcp-unselected.png"), animations: "disabled" });
     await page.getByRole("tab", { name: "Skills", exact: true }).click();
-    await expect(page.locator(".ja-skill-scope")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("region", { name: "全局 Skills" })).toBeVisible({ timeout: 30_000 });
     await page.screenshot({
       path: join(evidencePath, "native-skills.png"),
       animations: "disabled",
     });
-    const nativeSkill = page.getByRole("switch", { name: "native-probe-skill：已停用" });
+    const nativeSkill = page.getByRole("switch", { name: "native-probe-skill：已启用" });
     await expect(nativeSkill).toBeVisible({ timeout: 30_000 });
     await nativeSkill.click();
-    await expect(page.getByRole("switch", { name: "native-probe-skill：已启用" })).toHaveAttribute(
+    await expect(page.getByRole("switch", { name: "native-probe-skill：已停用" })).toHaveAttribute(
       "aria-checked",
-      "true",
+      "false",
       { timeout: 30_000 },
     );
     const configPath = join(userProfile, ".ja", "config.toml");
     await expect
       .poll(async () => readFile(configPath, "utf8").catch(() => ""), { timeout: 30_000 })
-      .toMatch(/schema_version\s*=\s*2[\s\S]*skills\s*=\s*\[[\s\S]*"ja:native-probe-skill"/u);
+      .toMatch(/schema_version\s*=\s*2[\s\S]*disabled_skills\s*=\s*\[[\s\S]*"ja:native-probe-skill"/u);
     const persistedConfig = await readFile(configPath, "utf8");
     if (persistedConfig.includes("[[skills]]"))
       throw new Error("native skill persistence retained legacy [[skills]] entries");
     await page.screenshot({
-      path: join(evidencePath, "native-skills-enabled.png"),
+      path: join(evidencePath, "native-skills-disabled.png"),
       animations: "disabled",
     });
     const mcpHeader = await runMcpConversationHeaderAcceptance({
       page,
       evidenceDirectory: join(evidencePath, "mcp-header"),
+      projectPath,
+      alternateProjectPath,
     });
     return {
       pages: browser.contexts().flatMap((context) => context.pages()).length,
@@ -452,7 +517,17 @@ async function runNativeProbe() {
     );
   }
   await prewarmNativeProfile(pnpm, directories.configPath, environment, directories.profile);
-  const { child, stdout, stderr } = launchNativeTauri(pnpm, directories.configPath, environment);
+  const managedDaemon = process.env.JA_SETTINGS_PRESTART_DAEMON === "1"
+    ? await startNativeDaemonForJob(javaExecutable, jar, directories, environment)
+    : undefined;
+  let launch;
+  try {
+    launch = launchNativeTauri(pnpm, directories.configPath, environment);
+  } catch (failure) {
+    managedDaemon?.kill();
+    throw failure;
+  }
+  const { child, stdout, stderr } = launch;
   try {
     await waitForNativeCdp(cdpPort, child, stdout, stderr);
     const observation = await inspectNativeSettings(
@@ -460,6 +535,7 @@ async function runNativeProbe() {
       directories.root,
       directories.userProfile,
       directories.workspace,
+      directories.workspaceB,
     );
     await writeFile(
       join(directories.root, "native-report.json"),
@@ -469,8 +545,11 @@ async function runNativeProbe() {
     process.stdout.write(
       `JA_SETTINGS_NATIVE_PROBE_OK root=${directories.root} cdpPort=${cdpPort} pid=${child.pid}\n`,
     );
+  } catch (failure) {
+    throw new Error(`native settings probe failed: ${String(failure)}; host=${stderr.join("").slice(-1500)}`);
   } finally {
     await stopNativeTauri(child);
+    managedDaemon?.kill();
   }
 }
 
@@ -611,19 +690,39 @@ async function inspectSections(page, metadata, prefix) {
     await assertLayout(page, `${prefix}/${label}`);
     await capture(page, `${prefix}-${label}`, metadata);
     if (label === "Skills") {
-      const scope = page.locator(".ja-skill-scope");
-      const global = scope.getByRole("tab", { name: "全局", exact: true });
-      const project = scope.getByRole("tab", { name: "当前项目", exact: true });
+      const global = page.getByRole("region", { name: "全局 Skills" });
+      const project = page.getByRole("region", { name: "项目 Skills" });
       await expect(global).toBeVisible();
       await expect(project).toBeVisible();
-      await global.click();
-      await expect(scope.getByRole("switch")).toHaveCount(2);
+      await expect(global.getByRole("switch")).toHaveCount(2);
       await assertLayout(page, `${prefix}/Skills-global`);
       await capture(page, `${prefix}-Skills-global`, metadata);
-      await project.click();
-      await expect(scope.getByText("project-rules", { exact: true })).toBeVisible();
+      await expect(project.getByText("project-rules", { exact: true })).toBeVisible();
+      await project.getByRole("button", { name: /选择设置项目/u }).click();
+      if (prefix === "light-compact") {
+        await assertLayout(page, `${prefix}/project-picker`);
+        await capture(page, `${prefix}-project-picker`, metadata);
+      }
+      await page.getByRole("textbox", { name: "搜索已有项目" }).fill("beta");
+      await page.getByRole("option", { name: /Beta/u }).click();
+      await expect(project.getByText("beta-rules", { exact: true })).toBeVisible();
+      await project.getByRole("button", { name: /选择设置项目/u }).click();
+      await page.getByRole("option", { name: /Alpha/u }).click();
       await assertLayout(page, `${prefix}/Skills-project`);
       await capture(page, `${prefix}-Skills-project`, metadata);
+    }
+    if (label === "MCP" && prefix === "light-wide") {
+      const project = page.getByRole("region", { name: "项目 MCP 服务" });
+      await expect(project.getByText("项目 A 文件工具", { exact: true })).toBeVisible();
+      await project.getByRole("button", { name: /选择设置项目/u }).click();
+      await page.getByRole("option", { name: /Beta/u }).click();
+      await expect(project.getByText("项目 B 文件工具", { exact: true })).toBeVisible();
+      await page.getByRole("tab", { name: "Skills", exact: true }).click();
+      await expect(page.getByRole("region", { name: "项目 Skills" })
+        .getByText("beta-rules", { exact: true })).toBeVisible();
+      await page.getByRole("tab", { name: "MCP", exact: true }).click();
+      await project.getByRole("button", { name: /选择设置项目/u }).click();
+      await page.getByRole("option", { name: /Alpha/u }).click();
     }
   }
 }
@@ -663,8 +762,9 @@ async function exerciseWorkflows(page, metadata) {
   await page.getByRole("tab", { name: "MCP", exact: true }).click();
   const failingServer = page.getByRole("button", { name: "测试" }).last();
   await failingServer.click();
-  await expect(page.getByRole("status")).toContainText("连接失败");
-  const addServer = page.getByRole("button", { name: "新增服务", exact: true });
+  await expect(page.getByText(/连接失败/u).first()).toBeVisible();
+  const addServer = page.getByRole("region", { name: "全局 MCP 服务" })
+    .getByRole("button", { name: "新增服务", exact: true });
   await addServer.click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.locator("#mcp-name")).toBeFocused();
@@ -679,13 +779,18 @@ async function exerciseEmptyStates(page, metadata, origin) {
   await expect(page.getByRole("tab", { name: "通用", exact: true })).toBeVisible();
 
   await page.getByRole("tab", { name: "Skills", exact: true }).click();
-  await expect(page.getByText("暂无 Skills", { exact: true })).toHaveCount(4);
+  await expect(page.getByText("未发现全局 Skills", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "项目 Skills" })
+    .getByText("选择项目后管理项目能力", { exact: true })).toBeVisible();
   await assertLayout(page, "empty/Skills");
   await capture(page, "empty-skills", metadata);
 
   await page.getByRole("tab", { name: "MCP", exact: true }).click();
   await expect(page.getByText("还没有 MCP 服务", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "新增服务", exact: true })).toHaveCount(1);
+  const projectEmpty = page.getByRole("region", { name: "项目 MCP 服务" }).getByRole("status");
+  expect(await projectEmpty.evaluate((element) => element.getBoundingClientRect().width))
+    .toBeGreaterThan(200);
   await assertLayout(page, "empty/MCP");
   await capture(page, "empty-mcp", metadata);
 
@@ -763,6 +868,12 @@ async function main() {
         viewport: { width: 720, height: 640 },
         reducedMotion: true,
       },
+      {
+        name: "light-compact",
+        theme: "light",
+        viewport: { width: 420, height: 780 },
+        reducedMotion: true,
+      },
     ];
     for (const mode of modes) {
       metadata.modes.push(mode);
@@ -810,7 +921,7 @@ async function main() {
       { theme: "light", reducedMotion: true, forcedColors: false },
       { width: 1280, height: 820 },
     );
-    await exerciseWorkflows(page, metadata);
+    if (process.env.JA_SETTINGS_CAPABILITIES_ONLY !== "1") await exerciseWorkflows(page, metadata);
     await exerciseEmptyStates(page, metadata, preview.origin);
     metadata.pageErrors = [...new Set(metadata.pageErrors)];
     metadata.requestFailures = [...new Set(metadata.requestFailures)];

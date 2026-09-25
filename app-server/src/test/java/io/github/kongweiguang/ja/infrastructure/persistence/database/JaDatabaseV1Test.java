@@ -41,7 +41,7 @@ final class JaDatabaseV1Test {
             "context_projection_stages", "execution_runs", "goal_acceptance_criteria",
             "goal_continuation_leases", "goal_definition_revisions", "goal_evaluations", "goal_events",
             "goal_plan_links", "goal_tool_attempts", "goals", "message_attachments",
-            "messages", "pending_input_attachments", "pending_inputs", "plan_approvals", "plan_drafts",
+            "messages", "assistant_public_text", "pending_input_attachments", "pending_inputs", "plan_approvals", "plan_drafts",
             "plan_events", "plan_revisions", "plan_step_executions", "plan_steps", "plans",
             "task_activities", "task_context_seeds", "task_mailbox", "task_process_generation",
             "task_projections", "thread_instruction_scopes", "thread_lineage", "thread_title_generations",
@@ -49,23 +49,272 @@ final class JaDatabaseV1Test {
             "thread_subagent_policies", "turn_execution", "turn_internal_context", "turns", "usage",
             "workspace_write_claims", "interaction_requests", "interaction_drafts", "interaction_events",
             "plan_turn_claims", "plan_evaluation_requests", "tool_recoveries", "tool_recovery_attempts",
-            "workspaces");
+            "workspaces", "client_operations", "input_operation_receipts", "goal_no_progress_counts", "goal_repeated_failure_counts");
 
     @TempDir Path temp;
 
-    /** 空库一次创建完整领域结构；再次启动只能验证同一 V7，不会产生第二条 history。 */
+    /** 空库一次创建完整领域结构；再次启动只能验证同一 V15，不会产生第二条 history。 */
     @Test
-    void initializesCompleteV7AndReopensWithoutMigration() throws Exception {
+    void initializesCompleteV15AndReopensWithoutMigration() throws Exception {
         Path databasePath = temp.resolve("fresh").resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
             // 首次 close 同样走生产 WAL checkpoint，确保 lease 在完整生命周期后释放。
         }
 
-        assertCurrentV7(databasePath);
+        assertCurrentV15(databasePath);
         try (JaDatabase ignored = openForTest(databasePath)) {
-            // 当前 V7 只做 checksum、数据迁移幂等性和完整性验证。
+            // 当前 V15 只做 checksum、数据迁移幂等性和完整性验证。
         }
-        assertCurrentV7(databasePath);
+        assertCurrentV15(databasePath);
+    }
+
+    /** V13 的有序 Assistant 文本块迁移为同一条可分页正文，升级前备份且不触碰模型块。 */
+    @Test
+    void migratesV13AssistantTextIntoPagedPublicContent() throws Exception {
+        Path databasePath = temp.resolve("assistant-pages-v13").resolve("ja.db");
+        Files.createDirectories(databasePath.getParent());
+        org.sqlite.SQLiteDataSource source = new org.sqlite.SQLiteDataSource();
+        source.setUrl("jdbc:sqlite:" + databasePath);
+        Flyway.configure().dataSource(source).locations(new String[0])
+                .resourceProvider(JaFlywayResources.provider())
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("13")).load().migrate();
+        try (java.sql.Connection connection = source.getConnection()) {
+            seedGoalOwners(connection);
+            try (java.sql.Statement statement = connection.createStatement()) {
+                statement.executeUpdate("""
+                        INSERT INTO messages(message_id,thread_id,turn_id,ordinal,role,blocks_json,created_at)
+                        VALUES('item_migrated','thread_1','turn_1',1,'ASSISTANT',
+                            '[{"kind":"text","text":"甲😀"},{"kind":"reasoning","nativeJson":"private"},'
+                            ||'{"kind":"text","text":"乙"}]','2026-09-07T00:00:01Z')
+                        """);
+                statement.executeUpdate("""
+                        INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,
+                            model_round,created_at)
+                        VALUES('item_migrated','thread_1','turn_1','ASSISTANT_PROGRESS','甲😀乙',1,
+                            '2026-09-07T00:00:01Z')
+                        """);
+            }
+        }
+        try (JaDatabase ignored = openForTest(databasePath)) {
+            // V14 migration reads the saved model blocks within the same protected database lease.
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement()) {
+            assertEquals("甲😀乙", text(statement,
+                    "SELECT content FROM assistant_public_text WHERE message_id='item_migrated'"));
+            assertEquals("😀", text(statement,
+                    "SELECT substr(content,2,1) FROM assistant_public_text WHERE message_id='item_migrated'"));
+            assertEquals(3, number(statement,
+                    "SELECT length(content) FROM assistant_public_text WHERE message_id='item_migrated'"));
+            assertEquals("ok", text(statement, "PRAGMA integrity_check"));
+        }
+        try (java.util.stream.Stream<Path> files = Files.list(databasePath.getParent())) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().startsWith("ja.db.pre-v14-")
+                    && path.getFileName().toString().endsWith(".bak")).count());
+        }
+    }
+
+    /** V9 含消息和 UNKNOWN Usage 的旧库升级后保留原行，并在表重建前生成一致备份。 */
+    @Test
+    void upgradesPopulatedV9WithoutLosingConversationFacts() throws Exception {
+        Path databasePath = temp.resolve("populated-v9").resolve("ja.db");
+        java.nio.file.Files.createDirectories(databasePath.getParent());
+        org.sqlite.SQLiteDataSource source = new org.sqlite.SQLiteDataSource();
+        source.setUrl("jdbc:sqlite:" + databasePath);
+        org.flywaydb.core.Flyway.configure().dataSource(source).locations(new String[0])
+                .resourceProvider(JaFlywayResources.provider())
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("9")).load().migrate();
+        try (java.sql.Connection connection = source.getConnection()) {
+            seedGoalOwners(connection);
+            try (java.sql.Statement statement = connection.createStatement()) {
+                statement.executeUpdate("""
+                        INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,
+                            model_round,created_at)
+                        VALUES('item_old','thread_1','turn_1','ASSISTANT_PROGRESS','kept',128,
+                            '2026-09-07T00:00:01Z')
+                        """);
+                statement.executeUpdate("""
+                        INSERT INTO usage(usage_id,request_id,thread_id,turn_id,model_round,
+                            request_ordinal,purpose,certainty,profile_json,created_at)
+                        VALUES('usage_old','request_old','thread_1','turn_1',128,1024,
+                            'ASSISTANT','UNKNOWN','{}','2026-09-07T00:00:01Z')
+                        """);
+            }
+        }
+        try (JaDatabase ignored = openForTest(databasePath)) {
+            // Flyway 与 SQLite 完整性检查完成后再验证复制和备份。
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement()) {
+            statement.executeUpdate("""
+                    INSERT INTO timeline_messages(item_id,thread_id,turn_id,message_kind,public_text,
+                        model_round,created_at)
+                    VALUES('item_new','thread_1','turn_1','ASSISTANT_PROGRESS','continued',129,
+                        '2026-09-07T00:00:02Z')
+                    """);
+            statement.executeUpdate("""
+                    INSERT INTO usage(usage_id,request_id,thread_id,turn_id,model_round,
+                        request_ordinal,purpose,certainty,profile_json,created_at)
+                    VALUES('usage_new','request_new','thread_1','turn_1',129,1025,
+                        'ASSISTANT','UNKNOWN','{}','2026-09-07T00:00:02Z')
+                    """);
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM timeline_messages "
+                    + "WHERE item_id='item_old' AND model_round=128 AND public_text='kept'"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM timeline_messages "
+                    + "WHERE item_id='item_new' AND model_round=129 AND public_text='continued'"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM usage "
+                    + "WHERE usage_id='usage_old' AND model_round=128 AND request_ordinal=1024"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM usage "
+                    + "WHERE usage_id='usage_new' AND model_round=129 AND request_ordinal=1025"));
+            assertEquals("ok", text(statement, "PRAGMA integrity_check"));
+            assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
+        }
+        try (java.util.stream.Stream<Path> files = java.nio.file.Files.list(databasePath.getParent())) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().startsWith("ja.db.pre-v10-")
+                    && path.getFileName().toString().endsWith(".bak")).count());
+        }
+    }
+
+    /** V10 的挂起游标只去掉失效预算，恢复身份和计数原样保留，并先保留数据库快照。 */
+    @Test
+    void migratesV10ExecutionCursorWithoutLosingResumeFacts() throws Exception {
+        Path databasePath = temp.resolve("cursor-v10").resolve("ja.db");
+        Files.createDirectories(databasePath.getParent());
+        org.sqlite.SQLiteDataSource source = new org.sqlite.SQLiteDataSource();
+        source.setUrl("jdbc:sqlite:" + databasePath);
+        org.flywaydb.core.Flyway.configure().dataSource(source).locations(new String[0])
+                .resourceProvider(JaFlywayResources.provider())
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("10")).load().migrate();
+        try (java.sql.Connection connection = source.getConnection()) {
+            seedGoalOwners(connection);
+            try (java.sql.Statement statement = connection.createStatement()) {
+                statement.executeUpdate("""
+                        INSERT INTO turn_execution(turn_id,schema_version,state_json)
+                        VALUES('turn_1',1,'{"schemaVersion":1,"kind":"READY","common":{
+                            "modelRound":129,"usedToolCalls":3,"nextProviderOrdinal":1025,
+                            "promptCheckpointId":null,"activeSkills":[],
+                            "deadlineAt":"2026-09-07T00:10:00Z","activeBudgetMillis":17000,
+                            "origin":"USER"},"next":"ASSISTANT","summary":null}')
+                        """);
+            }
+        }
+        try (JaDatabase ignored = openForTest(databasePath)) {
+            // 恢复游标迁移和备份均须在正式生命周期内完成。
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement()) {
+            String cursor = text(statement, "SELECT state_json FROM turn_execution WHERE turn_id='turn_1'");
+            assertFalse(cursor.contains("deadlineAt"));
+            assertFalse(cursor.contains("activeBudgetMillis"));
+            io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState state =
+                    new io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnExecutionStateCodec(
+                            new com.fasterxml.jackson.databind.ObjectMapper()).read(cursor);
+            assertEquals(129, state.common().modelRound());
+            assertEquals(1025, state.common().nextProviderOrdinal());
+            assertEquals(3, state.common().usedToolCalls());
+        }
+        try (java.util.stream.Stream<Path> files = Files.list(databasePath.getParent())) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().startsWith("ja.db.pre-v11-")
+                    && path.getFileName().toString().endsWith(".bak")).count());
+        }
+    }
+
+    /** V11 的 Run 身份和累计诊断升级后保留，旧预算列原位移除且升级前有完整备份。 */
+    @Test
+    void migratesPopulatedV11RunWithoutBudgetColumns() throws Exception {
+        Path databasePath = temp.resolve("run-v11").resolve("ja.db");
+        Files.createDirectories(databasePath.getParent());
+        org.sqlite.SQLiteDataSource source = new org.sqlite.SQLiteDataSource();
+        source.setUrl("jdbc:sqlite:" + databasePath);
+        org.flywaydb.core.Flyway.configure().dataSource(source).locations(new String[0])
+                .resourceProvider(JaFlywayResources.provider())
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("11")).load().migrate();
+        try (java.sql.Connection connection = source.getConnection()) {
+            seedGoalOwners(connection);
+            try (java.sql.Statement statement = connection.createStatement()) {
+                statement.executeUpdate("UPDATE execution_runs SET used_model_rounds=129,"
+                        + "used_tool_calls=257,used_active_millis=86400001 WHERE run_id='run_1'");
+            }
+        }
+        try (JaDatabase ignored = openForTest(databasePath)) {
+            // 正式升级负责一致备份和完成全部外键校验。
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement()) {
+            assertEquals(129, number(statement,
+                    "SELECT used_model_rounds FROM execution_runs WHERE run_id='run_1'"));
+            assertEquals(257, number(statement,
+                    "SELECT used_tool_calls FROM execution_runs WHERE run_id='run_1'"));
+            assertEquals(86400001, number(statement,
+                    "SELECT used_active_millis FROM execution_runs WHERE run_id='run_1'"));
+            java.util.Set<String> columns = new java.util.HashSet<>();
+            try (java.sql.ResultSet rows = statement.executeQuery("PRAGMA table_info(execution_runs)")) {
+                while (rows.next()) columns.add(rows.getString("name"));
+            }
+            for (String removed : java.util.List.of("turn_budget", "turns_used", "max_model_rounds",
+                    "max_tool_calls", "wall_budget_millis")) assertFalse(columns.contains(removed));
+            assertEquals("ok", text(statement, "PRAGMA integrity_check"));
+            assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
+        }
+        try (java.util.stream.Stream<Path> files = Files.list(databasePath.getParent())) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().startsWith("ja.db.pre-v12-")
+                    && path.getFileName().toString().endsWith(".bak")).count());
+        }
+    }
+
+    /** V12 中单请求审计升级为按尝试序号存储，旧 UNKNOWN 身份仍保留且同输入可接纳新尝试。 */
+    @Test
+    void migratesPopulatedV12PlanEvaluationAudit() throws Exception {
+        Path databasePath = temp.resolve("plan-audit-v12").resolve("ja.db");
+        Files.createDirectories(databasePath.getParent());
+        org.sqlite.SQLiteDataSource source = new org.sqlite.SQLiteDataSource();
+        source.setUrl("jdbc:sqlite:" + databasePath);
+        org.flywaydb.core.Flyway.configure().dataSource(source).locations(new String[0])
+                .resourceProvider(JaFlywayResources.provider())
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("12")).load().migrate();
+        try (java.sql.Connection connection = source.getConnection()) {
+            seedGoalOwners(connection);
+            try (java.sql.Statement statement = connection.createStatement()) {
+                statement.executeUpdate("INSERT INTO plans(plan_id,owner_thread_id,objective,"
+                        + "create_idempotency_key,status,revision,created_at,updated_at) VALUES("
+                        + "'plan_eval','thread_1','Verify','plan_eval_key','DRAFT',0,"
+                        + "'2026-09-07T00:00:00Z','2026-09-07T00:00:00Z')");
+                statement.executeUpdate("INSERT INTO plan_revisions(plan_revision_id,plan_id,revision_number,"
+                        + "definition_json,plan_hash,created_by,created_at) VALUES("
+                        + "'planrev_eval','plan_eval',1,'{}','" + "a".repeat(64)
+                        + "','AGENT','2026-09-07T00:00:00Z')");
+                statement.executeUpdate("INSERT INTO execution_runs(run_id,plan_id,plan_revision_id,plan_hash,"
+                        + "status,process_generation,created_at,updated_at) VALUES("
+                        + "'run_eval','plan_eval','planrev_eval','" + "a".repeat(64)
+                        + "','VERIFYING',1,'2026-09-07T00:00:00Z','2026-09-07T00:00:00Z')");
+                statement.executeUpdate("INSERT INTO plan_evaluation_requests(request_id,plan_id,"
+                        + "plan_revision_id,run_id,owner_thread_id,input_digest,profile_json,outcome,certainty,"
+                        + "started_at,completed_at) VALUES('request_plan_eval_old','plan_eval','planrev_eval',"
+                        + "'run_eval','thread_1','" + "b".repeat(64)
+                        + "','{}','UNKNOWN','UNKNOWN','2026-09-07T00:00:00Z','2026-09-07T00:00:01Z')");
+            }
+        }
+        try (JaDatabase ignored = openForTest(databasePath)) {
+            // Flyway 在独占 lease 内先备份再迁移，测试随后从新表回读原行。
+        }
+        try (java.sql.Connection connection = source.getConnection();
+             java.sql.Statement statement = connection.createStatement()) {
+            assertEquals(1, number(statement, "SELECT attempt_ordinal FROM plan_evaluation_requests "
+                    + "WHERE request_id='request_plan_eval_old' AND outcome='UNKNOWN'"));
+            statement.executeUpdate("INSERT INTO plan_evaluation_requests(request_id,plan_id,"
+                    + "plan_revision_id,run_id,owner_thread_id,input_digest,attempt_ordinal,profile_json,"
+                    + "outcome,certainty,started_at) VALUES('request_plan_eval_next','plan_eval',"
+                    + "'planrev_eval','run_eval','thread_1','" + "b".repeat(64)
+                    + "',2,'{}','RUNNING','UNKNOWN','2026-09-07T00:00:02Z')");
+            assertEquals(2, number(statement, "SELECT COUNT(*) FROM plan_evaluation_requests "
+                    + "WHERE plan_id='plan_eval' AND input_digest='" + "b".repeat(64) + "'"));
+            assertEquals("ok", text(statement, "PRAGMA integrity_check"));
+            assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
+        }
+        try (java.util.stream.Stream<Path> files = Files.list(databasePath.getParent())) {
+            assertEquals(1, files.filter(path -> path.getFileName().toString().startsWith("ja.db.pre-v13-")
+                    && path.getFileName().toString().endsWith(".bak")).count());
+        }
     }
 
     /** 未带 Flyway history 的非空 schema 明确拒绝，原表保留且失败后 lease 可重新获取。 */
@@ -114,8 +363,8 @@ final class JaDatabaseV1Test {
         Path databasePath = initialized("future");
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            statement.executeUpdate("UPDATE flyway_schema_history SET version='8',description='future' "
-                    + "WHERE version='7'");
+            statement.executeUpdate("UPDATE flyway_schema_history SET version='16',description='future' "
+                    + "WHERE version='15'");
         }
 
         StorageException failure = assertThrows(StorageException.class,
@@ -124,8 +373,8 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals("8", text(statement,
-                    "SELECT version FROM flyway_schema_history WHERE version='8' AND success=1"));
+            assertEquals("16", text(statement,
+                    "SELECT version FROM flyway_schema_history WHERE version='16' AND success=1"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -178,7 +427,7 @@ final class JaDatabaseV1Test {
         assertEquals(StorageException.Code.STORAGE_CONFLICT, failure.code());
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
-            assertEquals(7, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(15, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
         }
         assertLeaseReleased(databasePath);
     }
@@ -308,10 +557,10 @@ final class JaDatabaseV1Test {
         try (JaDatabase ignored = openForTest(databasePath)) {
             // 失败 migration 没有发布领域表或占住 lease，正式迁移链可以原位重试。
         }
-        assertCurrentV7(databasePath);
+        assertCurrentV15(databasePath);
     }
 
-    /** 创建并完整关闭一个真实 V7，所有后续漂移测试都从同一生产路径出发。 */
+    /** 创建并完整关闭一个真实 V15，所有后续漂移测试都从同一生产路径出发。 */
     private Path initialized(String name) {
         Path databasePath = temp.resolve(name).resolve("ja.db");
         try (JaDatabase ignored = openForTest(databasePath)) {
@@ -331,7 +580,7 @@ final class JaDatabaseV1Test {
     }
 
     /** 当前 schema 由成功 history、完整领域表集和格式约束共同定义；V5 是并发迁移保留的版本空档。 */
-    private static void assertCurrentV7(Path databasePath) throws Exception {
+    private static void assertCurrentV15(Path databasePath) throws Exception {
         try (java.sql.Connection connection = DriverManager.getConnection("jdbc:sqlite:" + databasePath);
              java.sql.Statement statement = connection.createStatement()) {
             assertEquals(DOMAIN_TABLES, tableNames(statement));
@@ -347,7 +596,23 @@ final class JaDatabaseV1Test {
                     + "WHERE version='6' AND success=1"));
             assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
                     + "WHERE version='7' AND success=1"));
-            assertEquals(6, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='8' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='9' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='10' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='11' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='12' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='13' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='14' AND success=1"));
+            assertEquals(1, number(statement, "SELECT COUNT(*) FROM flyway_schema_history "
+                    + "WHERE version='15' AND success=1"));
+            assertEquals(14, number(statement, "SELECT COUNT(*) FROM flyway_schema_history"));
             assertEquals("ok", text(statement, "PRAGMA integrity_check"));
             assertFalse(statement.executeQuery("PRAGMA foreign_key_check").next());
             assertEquals(0, number(statement, "SELECT last_generation FROM task_process_generation "

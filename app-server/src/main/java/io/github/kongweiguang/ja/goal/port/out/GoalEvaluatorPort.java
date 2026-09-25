@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.goal.port.out;
 
 import io.github.kongweiguang.ja.goal.domain.GoalModels.CriterionEvaluation;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.EvaluationVerdict;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.util.List;
 import java.util.concurrent.CompletionStage;
@@ -18,11 +19,13 @@ public interface GoalEvaluatorPort {
     record Request(String goalId, String ownerThreadId, long goalDefinitionRevision,
                    String planRevisionId, String runId,
                    String providerId, String modelId, String objective, String canonicalPlanJson,
-                   List<Criterion> criteria, List<EvidenceDigest> evidence) {
+                   List<Criterion> criteria, List<EvidenceDigest> evidence,
+                   CancellationToken cancellation) {
         /** 防御性复制 evidence，异步调用期间输入不可变化。 */
         public Request {
             criteria = List.copyOf(criteria);
             evidence = List.copyOf(evidence);
+            cancellation = java.util.Objects.requireNonNull(cancellation, "cancellation");
         }
     }
 

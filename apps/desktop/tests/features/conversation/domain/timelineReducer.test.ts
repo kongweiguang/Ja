@@ -175,6 +175,147 @@ function applySnapshot(
 }
 
 describe("timeline reducer", () => {
+  /** 最后一轮只带尾段时，已确认的同 Turn 草稿仍组成一份完整最终答复。 */
+  it("joins live output-limit segments without a full terminal copy", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_answer_first",
+        sequence: 2,
+        streamSeq: 1,
+        text: "first part ",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_answer_second",
+        sequence: 3,
+        streamSeq: 2,
+        text: "second part",
+      }),
+    );
+    const liveBeforeTerminal = state;
+    state = apply(
+      state,
+      event("turn/terminal", 2, {
+        eventId: "evt_answer_terminal",
+        sequence: 4,
+        state: "completed",
+        summary: "second part",
+        finalMessage: { messageId: "item_answer_final", text: "second part" },
+      }),
+    );
+    expect(state.items["item_answer_final"]?.text).toBe("first part second part");
+    expect(state.draftByTurn[turnId]).toBeUndefined();
+    const capped = apply(
+      liveBeforeTerminal,
+      event("turn/terminal", 2, {
+        eventId: "evt_answer_capped",
+        sequence: 4,
+        state: "completed",
+        summary: "first part ",
+        finalMessage: { messageId: "item_answer_capped", text: "first part " },
+      }),
+    );
+    expect(capped.items["item_answer_capped"]?.text).toBe("first part second part");
+  });
+
+  /** 历史只拼接最后一个 Tool 之后的续写段，旧版已合并终态也不能重复前缀。 */
+  it("rebuilds durable output-limit segments without crossing tools", () => {
+    const snapshot = (finalText: string) => ({
+      threadId,
+      revision: 4,
+      turns: [
+        {
+          turnId,
+          status: "completed",
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:04Z",
+          completedAt: "2026-08-18T00:00:04Z",
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [
+        {
+          itemId: "item_before_tool",
+          turnId,
+          kind: "assistant_progress",
+          text: "tool preface ",
+          modelRound: 1,
+          createdAt: "2026-08-18T00:00:01Z",
+        },
+        {
+          itemId: "item_tool",
+          turnId,
+          kind: "tool_call",
+          callId: "call_read",
+          toolName: "read",
+          ordinal: 0,
+          presentation: presentation("read", "success"),
+          createdAt: "2026-08-18T00:00:02Z",
+        },
+        {
+          itemId: "item_answer_part",
+          turnId,
+          kind: "assistant_progress",
+          text: "first part ",
+          modelRound: 2,
+          createdAt: "2026-08-18T00:00:03Z",
+        },
+        {
+          itemId: "item_answer_final",
+          turnId,
+          kind: "final_answer",
+          text: finalText,
+          createdAt: "2026-08-18T00:00:04Z",
+        },
+      ],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      taskActivities: [],
+      goalActivities: [],
+      nextCursor: null,
+    });
+    const current = applySnapshot(readyState(), snapshot("second part"), "ws_one");
+    const older = applySnapshot(readyState(), snapshot("first part second part"), "ws_one");
+    expect(current.items["item_answer_final"]?.text).toBe("first part second part");
+    expect(older.items["item_answer_final"]?.text).toBe("first part second part");
+  });
+
+  it("后台重启时按实例身份接受较小 generation，并拒绝同实例的倒退", () => {
+    const first = applyRuntimeStatus(createTimelineState(), {
+      status: "ready",
+      generation: 7,
+      serverInstanceId: "srv_first",
+    });
+    expect(
+      applyRuntimeStatus(first, {
+        status: "ready",
+        generation: 2,
+        serverInstanceId: "srv_first",
+      }).lastOutcome,
+    ).toBe("rejected");
+
+    const disconnected = applyRuntimeStatus(first, {
+      status: "crashed",
+      generation: 7,
+      serverInstanceId: "srv_first",
+    });
+    const restarted = applyRuntimeStatus(disconnected, {
+      status: "ready",
+      generation: 2,
+      serverInstanceId: "srv_second",
+    });
+    expect(restarted.lastOutcome).toBe("applied");
+    expect(restarted.handshake.generation).toBe(2);
+    expect(restarted.serverInstanceId).toBe("srv_second");
+  });
+
   it("按 root 原子替换 taskActivities，并在 runtime generation 变化时清除旧投影", () => {
     const first = applySnapshot(
       readyState(),
@@ -3559,13 +3700,12 @@ describe("timeline reducer", () => {
         eventId: "evt_retry_attempt_two",
         sequence: 3,
         attempt: 2,
-        maxAttempts: 6,
       }),
     );
     expect(state.lastOutcome).toBe("applied");
     expect(state.draftByTurn[turnId]).toBeUndefined();
     expect(state.streamSeqByTurn[turnId]).toBe(1);
-    expect(state.retryingByTurn[turnId]).toMatchObject({ attempt: 2, maxAttempts: 6 });
+    expect(state.retryingByTurn[turnId]).toMatchObject({ attempt: 2 });
 
     state = applySnapshot(
       state,
@@ -3592,7 +3732,7 @@ describe("timeline reducer", () => {
       },
       "ws_one",
     );
-    expect(state.retryAttemptByTurn[turnId]).toEqual({ attempt: 2, maxAttempts: 6 });
+    expect(state.retryAttemptByTurn[turnId]).toEqual({ attempt: 2 });
     expect(state.retryingByTurn[turnId]?.attempt).toBe(2);
     expect(state.streamSeqByTurn[turnId]).toBe(1);
 
@@ -3602,7 +3742,6 @@ describe("timeline reducer", () => {
         eventId: "evt_retry_attempt_three",
         sequence: 4,
         attempt: 3,
-        maxAttempts: 6,
       }),
     );
     state = apply(
@@ -3620,7 +3759,7 @@ describe("timeline reducer", () => {
     expect(state.retryingByTurn[turnId]).toBeUndefined();
   });
 
-  it("恢复快照清除瞬时 retry 基线，并允许下一条合法的有界 attempt", () => {
+  it("恢复快照清除瞬时 retry 基线，并允许下一条合法尝试", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
     state = apply(
@@ -3629,7 +3768,6 @@ describe("timeline reducer", () => {
         eventId: "evt_retry_before_recovery",
         sequence: 2,
         attempt: 2,
-        maxAttempts: 6,
       }),
     );
     const restored = applySnapshot(
@@ -3667,11 +3805,10 @@ describe("timeline reducer", () => {
         eventId: "evt_retry_after_recovery",
         sequence: 3,
         attempt: 4,
-        maxAttempts: 6,
       }),
     );
     expect(nextAttempt.lastOutcome).toBe("applied");
-    expect(nextAttempt.retryingByTurn[turnId]).toMatchObject({ attempt: 4, maxAttempts: 6 });
+    expect(nextAttempt.retryingByTurn[turnId]).toMatchObject({ attempt: 4 });
   });
 
   it("后台重读请求不会把真实 gap 降级成普通 health 标记", () => {

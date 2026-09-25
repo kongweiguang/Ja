@@ -167,7 +167,7 @@ final class LegacySessionWorkspaceMigrationTest {
                 assertEquals(0, childCount(home.resolve("workspaces/thr_main_b")));
                 assertEquals(1L, scalarLong(database,
                         "SELECT revision FROM workspaces WHERE workspace_id='" + legacyWorkspaceId + "'"));
-                assertEquals("7", scalar(database,
+                assertEquals("15", scalar(database,
                         "SELECT version FROM flyway_schema_history WHERE success=1 ORDER BY installed_rank DESC LIMIT 1"));
             }
 
@@ -501,10 +501,10 @@ final class LegacySessionWorkspaceMigrationTest {
         return new StorageExceptionCarrier(failure);
     }
 
-    /** 回读证明数据事务因所有权歧义整体回滚，Flyway schema 版本可独立保持在 V7。 */
+    /** 回读证明数据事务因所有权歧义整体回滚，Flyway schema 版本仍可独立完成迁移。 */
     private static void assertFailedDataTransactionWasRolledBack(SQLiteDataSource source, String legacyWorkspaceId)
             throws Exception {
-        assertEquals("7", scalar(source,
+        assertEquals("15", scalar(source,
                 "SELECT version FROM flyway_schema_history WHERE success=1 ORDER BY installed_rank DESC LIMIT 1"));
         assertEquals("PROJECT", scalar(source,
                 "SELECT kind FROM workspaces WHERE workspace_id='" + legacyWorkspaceId + "'"));

@@ -16,7 +16,7 @@ export default tseslint.config(
       ".codex-target/**",
       "dist",
       "node_modules",
-      "src-tauri",
+      "apps/desktop/src-tauri/**",
       "**/target/**",
       "**/target-*/**",
     ],
@@ -43,10 +43,7 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs["recommended-latest"].rules,
-      "react-refresh/only-export-components": [
-        "warn",
-        { allowConstantExport: true },
-      ],
+      "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
     },
   },
 );

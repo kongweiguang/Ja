@@ -38,6 +38,16 @@ public final class ProviderSseReader {
      * 但不能补造缺失的事件名或 data 字段。
      */
     Event next() throws IOException {
+        while (true) {
+            Event event = readFrame();
+            if (event == null || allowedEvents.contains(event.name())) return event;
+        }
+    }
+
+    /**
+     * 未知 SSE 字段与事件只消耗单帧字节预算，不改变语义状态；已知 event/data 仍保持唯一性校验。
+     */
+    private Event readFrame() throws IOException {
         String eventName = null;
         StringBuilder data = new StringBuilder();
         boolean frameHasField = false;
@@ -46,18 +56,23 @@ public final class ProviderSseReader {
             String line = lines.nextLine();
             if (line == null) {
                 if (!frameHasField) return null;
-                return finish(eventName, data, dataSeen);
+                if (eventName == null && !dataSeen) return null;
+                return finish(eventName, data, dataSeen, true);
             }
             if (line.isEmpty()) {
                 if (!frameHasField) continue;
-                return finish(eventName, data, dataSeen);
+                if (eventName == null && !dataSeen) {
+                    frameHasField = false;
+                    continue;
+                }
+                return finish(eventName, data, dataSeen, false);
             }
             if (line.charAt(0) == ':') continue;
             frameHasField = true;
             int separator = line.indexOf(':');
-            if (separator <= 0) throw protocol("provider SSE field is invalid");
-            String field = line.substring(0, separator);
-            String value = line.substring(separator + 1);
+            if (separator == 0) throw protocol("provider SSE field is invalid");
+            String field = separator < 0 ? line : line.substring(0, separator);
+            String value = separator < 0 ? "" : line.substring(separator + 1);
             if (value.startsWith(" ")) value = value.substring(1);
             if ("event".equals(field)) {
                 if (eventName != null || value.isEmpty()) {
@@ -69,7 +84,7 @@ public final class ProviderSseReader {
                 data.append(value);
                 dataSeen = true;
             } else {
-                throw protocol("provider SSE field is unsupported");
+                // SSE 扩展字段不参与模型语义；仍由外层字节流限制单帧资源。
             }
         }
     }
@@ -77,9 +92,13 @@ public final class ProviderSseReader {
     /**
      * 仅在精确事件名和根 type 一致后解析帧。
      */
-    private Event finish(String eventName, StringBuilder data, boolean dataSeen) {
-        if (eventName == null || !dataSeen || !allowedEvents.contains(eventName)) {
+    private Event finish(String eventName, StringBuilder data, boolean dataSeen, boolean eofTerminated) {
+        if (eventName == null || !dataSeen) {
+            if (eofTerminated) throw truncated();
             throw protocol("provider SSE event is unsupported");
+        }
+        if (!allowedEvents.contains(eventName)) {
+            return new Event(eventName, AbstractStreamingModelAdapter.JSON.createObjectNode());
         }
         try (JsonParser parser = AbstractStreamingModelAdapter.JSON.createParser(data.toString())) {
             JsonNode root = AbstractStreamingModelAdapter.JSON.readTree(parser);
@@ -90,9 +109,18 @@ public final class ProviderSseReader {
             return new Event(eventName, root);
         } catch (ProviderProtocolException failure) {
             throw failure;
+        } catch (com.fasterxml.jackson.core.io.JsonEOFException failure) {
+            if (eofTerminated) throw truncated();
+            throw protocol("provider SSE event payload is invalid");
         } catch (IOException | RuntimeException failure) {
             throw protocol("provider SSE event payload is invalid");
         }
+    }
+
+    /** 仅把传输 EOF 截断的半帧归入可恢复故障；显式结束的畸形帧仍保持确定性协议错误。 */
+    private static ProviderProtocolException truncated() {
+        return new ProviderProtocolException("STREAM_TRUNCATED",
+                "provider SSE event ended before completion", true, "MODEL_STREAM_INVALID");
     }
 
     /**

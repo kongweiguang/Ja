@@ -181,6 +181,17 @@ public final class WorkspaceService implements WorkspaceUseCase {
         return verifyRegisteredDirectory(persisted);
     }
 
+    /** 设置只访问持久登记的 PROJECT，并每次重验物理目录及稳定 ID，不进入活动绑定表。 */
+    @Override
+    public Workspace requireSettingsWorkspace(String workspaceId) {
+        Workspace persisted = repository.findById(Objects.requireNonNull(workspaceId, "workspaceId"))
+                .orElseThrow(() -> unavailable("workspace is unavailable"));
+        if (persisted.kind() != Workspace.Kind.PROJECT) throw identityConflict();
+        WorkspaceDirectory directory = directories.verifyProjectDirectory(persisted.root());
+        verifyIdentity(persisted, directory);
+        return persisted;
+    }
+
     /**
      * 持久化事实先提交，再同步配置 owner；同步失败允许按相同目标状态安全重试。
      */

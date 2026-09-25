@@ -43,6 +43,7 @@ public final class OverflowRecovery {
     /**
      * 在每次 Provider 尝试前完成压缩并同步发布新提交回执。同步回调保证外部模型 IO 开始时，
      * Checkpoint、Thread revision 和回执身份已经持久化；重试复用首次回执，不会重复发布上下文事件。
+     * 若真实溢出后没有更小的可发送提示，直接收口而不原样重投一次付费请求。
      */
     public <T> Execution<T> execute(ContextCompactionService.CompactionRequest request,
                                     CheckpointReceiptSink receiptSink, PromptSender<T> sender) {
@@ -87,6 +88,11 @@ public final class OverflowRecovery {
                         ? compaction.reprojectCommittedForOverflow(request, attempt.context())
                         : compactAttempt(request.shrinkForOverflow(), lifecycle,
                                 ContextCompactionEvent.Trigger.OVERFLOW_RECOVERY);
+                if (retry.plan().summaryInput().isEmpty() && retry.plan().fullPromptFits()
+                    && retry.plan().compactedPromptTokens() >= retry.plan().fullPromptTokens()) {
+                    throw new ContextException(ContextException.Code.CONTEXT_LIMIT,
+                            "overflow recovery had no smaller sendable envelope");
+                }
                 publishReceipt(retry, receiptSink);
                 completeLifecycle(retry, lifecycle);
                 Optional<CheckpointStore.CommittedCheckpoint> receipt = attempt.committedReceipt()

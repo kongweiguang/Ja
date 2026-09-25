@@ -206,7 +206,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 parent.latestTurnSeen(), parent.activeGoalId(), parent.revision(), parent.createdAt(),
                 parent.updatedAt());
         return startNew(command.parentThreadId(), command.parentTurnId(), command.taskName(), command.brief(),
-                command.deadline(), parent, TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED,
+                parent, TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED,
                 TaskModels.InheritanceMode.BRIEF_ONLY, null, references(command.brief()),
                 command.capabilityCeiling());
     }
@@ -224,7 +224,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
 
     /** Child 创建严格遵循 reserve → 单事务 admission → submit，完成回调只读取已提交终态。 */
     private StartResult startNew(String parentThreadId, String parentTurnId, String taskName, UserContent content,
-                                 Duration deadline, ThreadSummary parent, TaskModels.Kind kind,
+                                 ThreadSummary parent, TaskModels.Kind kind,
                                  TaskModels.Lifecycle lifecycle, TaskModels.InheritanceMode inheritance,
                                  JsonObject effectiveContext, JsonArray references, JsonObject permissionCeiling) {
         if (tasks.listTree(rootThread(parentThreadId)).size() >= MAX_TREE_TASKS) {
@@ -246,14 +246,14 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 summary("已派发 " + taskName));
         TurnStartRequest request = new TurnStartRequest(childThreadId, turnId, parent.workspaceId(), workspace.root(),
                 content, preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),
-                preferences.accessMode(), preferences.collaborationMode(), deadline, 0, 0, now);
+                preferences.accessMode(), preferences.collaborationMode(), 0, 0, now);
         TurnEventBinding events = prepareTurn(request);
         TurnUseCase.Accepted accepted;
         boolean admitted = false;
         try {
             accepted = scheduler.startChild(request, events.turnEvents(),
                     admission -> childAdmissionReceipt(tasks.admitChild(child,
-                            repositoryAdmission(admission))));
+                            repositoryAdmission(admission))), parentThreadId, parentTurnId);
             admitted = true;
         } finally {
             if (!admitted) events.abandon();
@@ -460,7 +460,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         Workspace workspace = workspaces.requireOpenWorkspace(child.thread().workspaceId());
         String turnId = id("turn_task_");
         TurnStartRequest request = request(child.thread(), workspace, turnId, command.message().content(),
-                command.deadline(), now);
+                now);
         TurnEventBinding events = prepareTurn(request);
         AtomicReference<TaskModels.FollowUpAdmissionReceipt> persisted = new AtomicReference<>();
         TurnUseCase.Accepted accepted;
@@ -472,7 +472,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                                 command.expectedTaskRevision(), id("activity_"), summary("已追加后续任务")));
                 persisted.set(receipt);
                 return childAdmissionReceipt(receipt.admission());
-            });
+            }, command.message().senderThreadId(), command.message().causalTurnId());
             admitted = true;
         } finally {
             if (!admitted) events.abandon();
@@ -1123,11 +1123,11 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
 
     /** Follow-up 继承目标 Child 当前偏好，每个 Turn 开始重新冻结配置。 */
     private static TurnStartRequest request(ThreadSummary child, Workspace workspace, String turnId,
-                                            UserContent content, Duration deadline, Instant now) {
+                                            UserContent content, Instant now) {
         ThreadPreferences preferences = Objects.requireNonNull(child.preferences(), "child preferences");
         return new TurnStartRequest(child.threadId(), turnId, child.workspaceId(), workspace.root(), content,
                 preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),
-                preferences.accessMode(), preferences.collaborationMode(), deadline, child.revision(), 0, now);
+                preferences.accessMode(), preferences.collaborationMode(), child.revision(), 0, now);
     }
 
     /** 明确引用单独进入 seed；不复制父 Timeline 或把附件内容内联进 JSON。 */

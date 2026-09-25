@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -28,7 +29,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * 直接运行一次 fd/rg，并持续排空两个继承管道；调用方通过逐行消费者控制结果上限，
  * 避免把 native 搜索快照无界物化到 Java 内存。
  */
-final class NativeSearchProcess {
+public final class NativeSearchProcess {
     private static final int BUFFER_SIZE = 8_192;
     private static final long POLL_MILLIS = 25;
     private static final long CLEANUP_GRACE_MILLIS = 3_000;
@@ -37,7 +38,7 @@ final class NativeSearchProcess {
      * 消费一个 UTF-8 native 输出记录；返回 false 表示调用方已达到结果或输出上限。
      */
     @FunctionalInterface
-    interface LineConsumer {
+    public interface LineConsumer {
         /**
          * 消费当前行；异常会终止 native 进程并在调用边界转换为脱敏 IO 失败。
          */
@@ -47,8 +48,8 @@ final class NativeSearchProcess {
     /**
      * 只保留 find/grep 需要的生命周期事实，stderr 受限保存供进程内诊断而不回显给模型。
      */
-    record Result(int exitCode, boolean outputTruncated, boolean stoppedByConsumer,
-                  boolean cancelled, boolean deadlineExceeded, String stderr) {
+    public record Result(int exitCode, boolean outputTruncated, boolean stoppedByConsumer,
+                         boolean cancelled, boolean deadlineExceeded, String stderr) {
     }
 
     /**
@@ -58,15 +59,29 @@ final class NativeSearchProcess {
      * 因此只在本方法局部抑制 CloseResource。
      */
     @SuppressWarnings("PMD.CloseResource")
-    static Result run(Path executable, List<String> arguments, Path workingDirectory,
-                      CancellationToken token, Instant deadline, int maxStdoutBytes,
-                      int maxStderrBytes, LineConsumer consumer) throws IOException {
+    public static Result run(Path executable, List<String> arguments, Path workingDirectory,
+                             CancellationToken token, Instant deadline, int maxStdoutBytes,
+                             int maxStderrBytes, LineConsumer consumer) throws IOException {
+        return run(executable, arguments, workingDirectory, token, deadline,
+                maxStdoutBytes, maxStderrBytes, System.getenv(), consumer);
+    }
+
+    /**
+     * 每次启动都用 Turn 冻结的完整环境替换后台默认值；fd/rg 的配置、代理与临时目录
+     * 必须与同一 Turn 的 Shell 一致，不能在连接断开后退回后台启动者的环境。
+     */
+    @SuppressWarnings("PMD.CloseResource")
+    public static Result run(Path executable, List<String> arguments, Path workingDirectory,
+                             CancellationToken token, Instant deadline, int maxStdoutBytes,
+                             int maxStderrBytes, Map<String, String> environment,
+                             LineConsumer consumer) throws IOException {
         Objects.requireNonNull(executable, "executable");
         Objects.requireNonNull(arguments, "arguments");
         Objects.requireNonNull(workingDirectory, "workingDirectory");
         Objects.requireNonNull(token, "token");
         Objects.requireNonNull(deadline, "deadline");
         Objects.requireNonNull(consumer, "consumer");
+        Objects.requireNonNull(environment, "environment");
         if (maxStdoutBytes < 1 || maxStderrBytes < 1) {
             throw new IllegalArgumentException("native search output limits are invalid");
         }
@@ -78,10 +93,12 @@ final class NativeSearchProcess {
         List<String> command = new ArrayList<>(arguments.size() + 1);
         command.add(executable.toString());
         command.addAll(arguments);
-        Process process = new ProcessBuilder(command)
+        ProcessBuilder builder = new ProcessBuilder(command)
                 .directory(workingDirectory.toFile())
-                .redirectErrorStream(false)
-                .start();
+                .redirectErrorStream(false);
+        builder.environment().clear();
+        builder.environment().putAll(environment);
+        Process process = builder.start();
         AtomicBoolean stopRequested = new AtomicBoolean();
         AtomicBoolean outputTruncated = new AtomicBoolean();
         AtomicBoolean stoppedByConsumer = new AtomicBoolean();

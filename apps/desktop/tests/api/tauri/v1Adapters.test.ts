@@ -143,14 +143,13 @@ describe("Ja v1 desktop adapters", () => {
     await adapter.turnStart({
       threadId: "thr_server",
       content: [{ type: "text", text: "hello" }],
-      deadlineMs: 30_000,
     });
 
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnStart, {
       input: {
         threadId: "thr_server",
+        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/u),
         content: [{ type: "text", text: "hello" }],
-        deadlineMs: 30_000,
       },
     });
     expect(JSON.stringify(invoke.mock.calls)).not.toMatch(/cwd|profileId|configRevision/u);
@@ -184,7 +183,7 @@ describe("Ja v1 desktop adapters", () => {
         subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
         providers: [],
         mcp_servers: [],
-        skills: [],
+        disabled_skills: [],
       },
       expectedVersion: "cfg_A",
     });
@@ -211,7 +210,7 @@ describe("Ja v1 desktop adapters", () => {
           subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
           providers: [],
           mcp_servers: [],
-          skills: [],
+          disabled_skills: [],
         },
         expectedVersion: "cfg_A",
       },

@@ -65,7 +65,6 @@ export interface RuntimeWorkspaceActivation {
 export interface TurnStartInput {
   threadId: string;
   content: UserContentBlock[];
-  deadlineMs?: number;
 }
 
 /** turn/start 的 Renderer 投影摘要不进入 JA-RPC，只跨越 ACK 竞态补齐当前用户消息。 */
@@ -339,6 +338,14 @@ export interface RuntimeHostPort {
   activateWorkspace(workspaceId: string): Promise<RuntimeWorkspaceActivation>;
   recoveryState(): Promise<RuntimeRecoveryState>;
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
+  pendingOperations(): Promise<readonly RuntimePendingClientOperation[]>;
+  recheckPendingOperations(): Promise<readonly RuntimePendingClientOperation[]>;
+  acknowledgePendingOperation(
+    clientOperationId: string,
+  ): Promise<RuntimePendingAcknowledgementResult>;
+  subscribePendingOperations(
+    listener: (records: readonly RuntimePendingClientOperation[]) => void,
+  ): () => void;
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
   turnResume(input: TurnResumeInput): Promise<TurnAccepted>;
@@ -354,6 +361,18 @@ export interface RuntimeHostPort {
   subscribe(listener: (event: RuntimeHostEvent) => void): Promise<RuntimeHostUnsubscribe>;
 }
 
+/** 恢复 UI 只接收不透明关联元数据；业务结果始终由 Java 回执和 thread/read 拥有。 */
+export interface RuntimePendingClientOperation {
+  clientOperationId: string;
+  method: "turn/start" | "turn/continue" | "turn/reask" | "approval/respond";
+  threadId: string | null;
+  createdAt: string;
+}
+export interface RuntimePendingAcknowledgementResult {
+  status: "unknown_acknowledged" | "committed";
+  pending: readonly RuntimePendingClientOperation[];
+}
+
 export type RuntimeApplicationErrorCode =
   | "INVALID_INPUT"
   | "RUNTIME_UNAVAILABLE"
@@ -365,6 +384,7 @@ export type RuntimeApplicationErrorCode =
   | "TURN_INPUT_QUEUE_FULL"
   | "QUEUED_INPUT_NOT_FOUND"
   | "CONFLICT"
+  | "OPERATION_UNCONFIRMED"
   | "SENSITIVE_EVENT_BLOCKED";
 
 const RUNTIME_ERROR_CATALOG: Record<
@@ -381,6 +401,7 @@ const RUNTIME_ERROR_CATALOG: Record<
   TURN_INPUT_QUEUE_FULL: { message: "排队消息已满，请等待处理后再发送", retryable: true },
   QUEUED_INPUT_NOT_FOUND: { message: "这条排队消息已被处理", retryable: true },
   CONFLICT: { message: "排队消息已更新，请重试", retryable: true },
+  OPERATION_UNCONFIRMED: { message: "上一次操作结果待核实，请先查看当前会话。", retryable: false },
   SENSITIVE_EVENT_BLOCKED: { message: "运行时事件包含受保护数据", retryable: false },
 };
 

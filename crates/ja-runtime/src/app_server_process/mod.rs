@@ -11,10 +11,13 @@ pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod process;
 pub(crate) mod protocol;
+mod shared;
 
 pub use client::{EventPump, Session, SessionEvent};
 pub use error::AppServerProcessError;
-pub use lifecycle::{LifecycleState, SidecarSupervisor, TurnChangeSetReadLease};
+pub use lifecycle::{
+    LifecycleState, SidecarSupervisor, ThreadCompactionLease, TurnChangeSetReadLease,
+};
 pub use process::SidecarConfig;
 pub use protocol::{
     ATTACHMENT_PREVIEW_READ_MAX_BYTES, ATTACHMENT_PREVIEW_READ_MIN_BYTES,
@@ -24,3 +27,4 @@ pub use protocol::{
     TurnChangeSetContractError, TurnChangeSetReadParams, TurnChangeSetReadResult,
     valid_protocol_timestamp, valid_ready_token,
 };
+pub use shared::SharedAppServerClient;

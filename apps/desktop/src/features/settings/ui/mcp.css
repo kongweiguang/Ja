@@ -13,36 +13,6 @@
   gap: 20px;
 }
 
-.ja-mcp-scope-tabs {
-  display: inline-flex;
-  width: fit-content;
-  padding: 3px;
-  border: 1px solid var(--ja-border);
-  border-radius: 7px;
-  background: var(--ja-control);
-}
-.ja-mcp-scope-tabs [role="tab"] {
-  min-width: 76px;
-  min-height: 28px;
-  padding: 3px 10px;
-  border: 0;
-  border-radius: 4px;
-  color: var(--ja-foreground-muted);
-  background: transparent;
-  font: inherit;
-  font-size: var(--ja-text-caption-size);
-  cursor: pointer;
-}
-.ja-mcp-scope-tabs [role="tab"][data-state="active"] {
-  color: var(--ja-foreground);
-  background: var(--ja-surface-raised);
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--ja-foreground) 14%, transparent);
-}
-.ja-mcp-scope-tabs [role="tab"]:focus-visible {
-  outline: 2px solid var(--ja-focus);
-  outline-offset: 2px;
-}
-
 .ja-mcp-list {
   display: grid;
   min-width: 0;
@@ -198,7 +168,31 @@
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 8px 6px 0 0;
+}
+
+.ja-mcp-tool-disclosure {
+  min-width: 0;
   padding-left: 44px;
+}
+
+.ja-mcp-tool-disclosure > summary {
+  width: fit-content;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  cursor: pointer;
+}
+
+.ja-mcp-tool-disclosure > summary:hover,
+.ja-mcp-tool-disclosure > summary:focus-visible {
+  color: var(--ja-foreground);
+}
+
+.ja-mcp-tool-disclosure > summary:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
 }
 
 .ja-mcp-chip {
@@ -236,6 +230,13 @@
 
 .ja-mcp-empty p {
   margin: 3px 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+
+.ja-mcp-project-empty {
+  padding: 12px 0;
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
@@ -434,6 +435,33 @@
 @media (max-width: 640px) {
   .ja-mcp-empty {
     grid-template-columns: 32px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 560px) {
+  .ja-mcp-row {
+    padding: 14px 12px;
+  }
+  .ja-mcp-row-main {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+  .ja-mcp-row-title {
+    flex-wrap: wrap;
+    gap: 2px 8px;
+  }
+  .ja-mcp-row-details {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2px 6px;
+  }
+  .ja-mcp-row-details > span:first-child {
+    grid-column: 1 / -1;
+    white-space: nowrap;
+  }
+  .ja-mcp-row-details code::before,
+  .ja-mcp-row-details > span + code::before {
+    content: none;
   }
 }
 

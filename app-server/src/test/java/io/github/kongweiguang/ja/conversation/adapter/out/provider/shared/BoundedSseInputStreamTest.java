@@ -13,6 +13,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -26,7 +27,7 @@ final class BoundedSseInputStreamTest {
                 + "event: message_stop\rdata: {}\r\r"
                 + "event: ping\ndata: {}").getBytes(StandardCharsets.UTF_8);
         try (BoundedSseInputStream stream = new BoundedSseInputStream(
-                new ByteArrayInputStream(source), 1_024, 4_096, 8)) {
+                new ByteArrayInputStream(source), 1_024)) {
             assertArrayEquals(source, stream.readAllBytes());
         }
     }
@@ -35,7 +36,7 @@ final class BoundedSseInputStreamTest {
     @Test
     void handlesCrLfAcrossReadBoundaries() throws Exception {
         byte[] source = "event: ping\r\ndata: {}\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-        try (BoundedSseInputStream stream = bounded(source, 128, 256, 1)) {
+        try (BoundedSseInputStream stream = bounded(source, 128)) {
             for (byte expected : source) assertEquals(Byte.toUnsignedInt(expected), stream.read());
             assertEquals(-1, stream.read());
         }
@@ -46,27 +47,41 @@ final class BoundedSseInputStreamTest {
     void rejectsOversizedEvent() {
         byte[] source = "data: 123456789\n\n".getBytes(StandardCharsets.US_ASCII);
         ProviderProtocolException failure = assertThrows(ProviderProtocolException.class,
-                () -> bounded(source, 8, 128, 2).readAllBytes());
+                () -> bounded(source, 8).readAllBytes());
         assertEquals("EVENT_LIMIT", failure.code());
     }
 
-    /** 响应达到精确总字节上限后仍有数据时拒绝。 */
+    /** 大量小分片与心跳跨越旧累计阈值仍可完成，单帧边界保持有效。 */
     @Test
-    void rejectsOversizedResponse() {
-        byte[] source = "data: {}\n\n".getBytes(StandardCharsets.US_ASCII);
-        long responseLimit = source.length - 1L;
-        ProviderProtocolException failure = assertThrows(ProviderProtocolException.class,
-                () -> bounded(source, responseLimit, responseLimit, 2).readAllBytes());
-        assertEquals("RESPONSE_LIMIT", failure.code());
-    }
+    void acceptsManyFramesBeyondFormerAggregateLimit() throws Exception {
+        byte[] frame = ": ping\n\n".getBytes(StandardCharsets.US_ASCII);
+        long expectedBytes = 65L * 1024 * 1024;
+        InputStream source = new InputStream() {
+            private long emitted;
 
-    /** 注释也计为非空帧，使心跳洪泛仍受帧数限制。 */
-    @Test
-    void rejectsExcessiveFrameCount() {
-        byte[] source = ": one\n\n: two\n\n".getBytes(StandardCharsets.US_ASCII);
-        ProviderProtocolException failure = assertThrows(ProviderProtocolException.class,
-                () -> bounded(source, 64, 128, 1).readAllBytes());
-        assertEquals("RESPONSE_LIMIT", failure.code());
+            /** 测试流按需生成心跳帧，避免把旧阈值大小的正文一次放进测试堆。 */
+            @Override public int read() {
+                if (emitted == expectedBytes) return -1;
+                return Byte.toUnsignedInt(frame[(int) (emitted++ % frame.length)]);
+            }
+
+            /** 批量生成与单字节读取相同的帧序列，使测试覆盖生产批量读取路径。 */
+            @Override public int read(byte[] bytes, int offset, int length) {
+                Objects.checkFromIndexSize(offset, length, bytes.length);
+                if (length == 0) return 0;
+                if (emitted == expectedBytes) return -1;
+                int count = (int) Math.min(length, expectedBytes - emitted);
+                for (int index = 0; index < count; index++) bytes[offset + index] = frame[(int) (emitted++ % frame.length)];
+                return count;
+            }
+        };
+        try (BoundedSseInputStream stream = new BoundedSseInputStream(source, 64)) {
+            byte[] buffer = new byte[8_192];
+            long received = 0;
+            int read;
+            while ((read = stream.read(buffer)) >= 0) received += read;
+            assertEquals(expectedBytes, received);
+        }
     }
 
     /** skip 仍通过受限读取，不能绕过原始事件容量校验。 */
@@ -74,7 +89,7 @@ final class BoundedSseInputStreamTest {
     void skipStillAppliesValidation() {
         byte[] source = "data: 123456789\n\n".getBytes(StandardCharsets.US_ASCII);
         BoundedSseInputStream stream = new BoundedSseInputStream(
-                new ByteArrayInputStream(source), 8, 256, 2);
+                new ByteArrayInputStream(source), 8);
         ProviderProtocolException failure = assertThrows(ProviderProtocolException.class,
                 () -> stream.skip(source.length));
         assertEquals("EVENT_LIMIT", failure.code());
@@ -92,7 +107,7 @@ final class BoundedSseInputStreamTest {
                 super.close();
             }
         };
-        BoundedSseInputStream stream = new BoundedSseInputStream(delegate, 8, 8, 1);
+        BoundedSseInputStream stream = new BoundedSseInputStream(delegate, 8);
         assertFalse(stream.markSupported());
         assertThrows(IOException.class, stream::reset);
         stream.close();
@@ -102,9 +117,8 @@ final class BoundedSseInputStreamTest {
     }
 
     /** 为不验证 Provider 事件白名单的用例创建仅做容量限制的流。 */
-    private static BoundedSseInputStream bounded(byte[] source, long eventBytes,
-                                                  long responseBytes, long events) {
+    private static BoundedSseInputStream bounded(byte[] source, long eventBytes) {
         return new BoundedSseInputStream(
-                new ByteArrayInputStream(source), eventBytes, responseBytes, events);
+                new ByteArrayInputStream(source), eventBytes);
     }
 }

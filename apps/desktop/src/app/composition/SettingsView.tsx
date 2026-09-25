@@ -1,13 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { lazy, Suspense, type ReactElement } from "react";
+import { lazy, Suspense, useMemo, type ReactElement } from "react";
 import type {
   DesktopNotificationPreference,
   SettingsController,
   SettingsDesktopPort,
   SettingsSection,
 } from "@/features/settings";
+import { capabilitySettingsPorts } from "../application/capabilitySettingsPorts";
+import type { WorkspaceProjection } from "@/features/workspace";
 import { useRuntimeState } from "../RuntimeProvider";
 import { RecoveryPanel } from "./RecoveryPanel";
 import type { SettingsInterfacePreferences, ExecutionScope } from "@/features/settings";
@@ -20,6 +22,10 @@ const LazySettings = lazy(async () => {
 
 export interface SettingsViewProps {
   readonly settings: SettingsController;
+  readonly projectSettings: SettingsController;
+  readonly projects: readonly WorkspaceProjection[];
+  readonly selectedProjectId: string | undefined;
+  readonly onSelectProject: (workspaceId: string) => void;
   readonly interfacePreferences: SettingsInterfacePreferences;
   readonly executionScope: ExecutionScope;
   readonly required: boolean;
@@ -37,6 +43,10 @@ export interface SettingsViewProps {
  */
 export function SettingsView({
   settings,
+  projectSettings,
+  projects,
+  selectedProjectId,
+  onSelectProject,
   interfacePreferences,
   executionScope,
   required,
@@ -47,6 +57,11 @@ export function SettingsView({
   desktop,
 }: SettingsViewProps): ReactElement {
   const { boot } = useRuntimeState();
+  /** 作用域路由只随两端权威动作变化，避免设置视图自己构造配置快照。 */
+  const ports = useMemo(
+    () => capabilitySettingsPorts(settings.ports, projectSettings.ports),
+    [settings.ports, projectSettings.ports],
+  );
   return (
     <section className="ja-settings-view" aria-label="设置页面">
       {boot.status === "recovery_required" ? <RecoveryPanel /> : null}
@@ -59,14 +74,35 @@ export function SettingsView({
       >
         <LazySettings
           snapshot={settings.globalSnapshot}
-          skillSettings={settings.skillSettings}
-          mcpSettings={settings.mcpSettings}
-          issues={settings.loaded?.issues ?? []}
-          onIssuesRetry={settings.reload}
+          skillSettings={{
+            ...settings.skillSettings,
+            project: projectSettings.skillSettings.project,
+            projectAvailable: projectSettings.skillSettings.projectAvailable,
+          }}
+          mcpSettings={{
+            ...settings.mcpSettings,
+            project: projectSettings.mcpSettings.project,
+            projectAvailable: projectSettings.mcpSettings.projectAvailable,
+            projectWorkspaceId: projectSettings.mcpSettings.projectWorkspaceId,
+          }}
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onSelectProject={onSelectProject}
+          projectLoading={projectSettings.loading || projectSettings.synchronizing}
+          issues={[
+            ...(settings.loaded?.issues ?? []).filter((issue) => issue.scope !== "project"),
+            ...(projectSettings.scopeReady ? (projectSettings.loaded?.issues ?? []) : []).filter(
+              (issue) => issue.scope === "project",
+            ),
+          ]}
+          onIssuesRetry={async () => {
+            await settings.reload();
+            if (selectedProjectId !== undefined) await projectSettings.reload();
+          }}
           onIssuesRestore={settings.restoreLastKnownGood}
           interfacePreferences={interfacePreferences}
           executionScope={executionScope}
-          ports={settings.ports}
+          ports={ports}
           section={section}
           onSectionChange={onSectionChange}
           desktopNotifications={desktopNotifications}

@@ -54,7 +54,7 @@ async function writeIsolatedHome(homeRoot) {
     "default_reasoning_level = { __ja_null = true }",
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "[interaction]",
     "clarification_enabled = true",
     "",
@@ -70,10 +70,6 @@ async function writeIsolatedHome(homeRoot) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 8",
-    "max_tool_calls = 16",
-    "wall_timeout_ms = 30000",
     "[[providers.models]]",
     'model_id = "model_side_task"',
     'name = "Side Task Bootstrap Model"',
@@ -87,7 +83,11 @@ async function writeIsolatedHome(homeRoot) {
   ].join("\n");
   await writeFile(join(jaHome, "config.toml"), config, "utf8");
   const authPath = join(jaHome, "auth.json");
-  await writeFile(join(jaHome, "auth.json"), '{"cred_side_task":"isolated-bootstrap-token"}\n', "utf8");
+  await writeFile(
+    join(jaHome, "auth.json"),
+    '{"cred_side_task":"isolated-bootstrap-token"}\n',
+    "utf8",
+  );
   const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
   if (account.endsWith("\\")) throw new Error("无法确定 Windows 隔离 profile ACL 用户");
   await execFileAsync("icacls.exe", [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`], {
@@ -100,8 +100,13 @@ async function writeIsolatedHome(homeRoot) {
 /** 为 Tauri 继承生产窗口事实，只替换 devUrl、唯一 identifier 与隔离 CSP。 */
 async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const [base, windows] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(
+      JSON.parse,
+    ),
+    readFile(
+      join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"),
+      "utf8",
+    ).then(JSON.parse),
   ]);
   const window = {
     ...base.app.windows.find((candidate) => candidate.label === "main"),
@@ -111,7 +116,7 @@ async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const config = {
     ...base,
     identifier: `io.github.kongweiguang.ja.side_task_e2e_${frontendPort}`,
-    build: { ...base.build, devUrl: origin, beforeDevCommand: "pnpm dev" },
+    build: { ...base.build, devUrl: origin, beforeDevCommand: base.build.beforeDevCommand },
     app: {
       ...base.app,
       windows: [window],
@@ -130,7 +135,9 @@ async function writeTauriOverlay(runtimeRoot, frontendPort) {
 async function waitForCdp(port, deadline) {
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1000) });
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.timeout(1000),
+      });
       if (response.ok) return;
     } catch {
       // Tauri/WebView2 的 browser listener 与 renderer 页面分阶段启动。
@@ -152,7 +159,9 @@ async function primeWebViewProfile(directories, frontendPort, cdpPort, configPat
     let ready = false;
     while (Date.now() < deadline) {
       if (launch.child.exitCode !== null || launch.child.signalCode !== null) {
-        throw new Error(`WebView2 profile 预热时 Tauri 退出：${launch.output.slice(-4).join("\\n")}`);
+        throw new Error(
+          `WebView2 profile 预热时 Tauri 退出：${launch.output.slice(-4).join("\\n")}`,
+        );
       }
       try {
         await access(preferences);
@@ -170,12 +179,12 @@ async function primeWebViewProfile(directories, frontendPort, cdpPort, configPat
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
 }
 
-/** 启动唯一 launcher root；子进程环境只包含本轮 profile、Java 25 与专属 Cargo target。 */
+/** 启动唯一 launcher root，并以 ja-desktop.exe 的准确路径回收本轮 Tauri 进程。 */
 function startTauri(directories, frontendPort, cdpPort, configPath, java, jar) {
   const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
   const hostUserProfile = process.env.USERPROFILE ?? process.env.HOME ?? "";
-  const targetDirectory = join(repoRoot, "src-tauri", "target", "side-task-preferences");
-  const target = join(targetDirectory, "debug", "ja.exe");
+  const targetDirectory = join(repoRoot, "target", "side-task-preferences");
+  const target = join(targetDirectory, "debug", "ja-desktop.exe");
   const env = {
     ...process.env,
     APPDATA: directories.appdata,
@@ -258,11 +267,20 @@ async function stopOwnedWebView2(profile) {
 
 /** 检查 JDK 25 与已有 app-server jar，避免 runner 误用默认 JDK 或进入 Maven 构建竞争。 */
 async function resolveJavaAndJar() {
-  const javaHome = process.env.JA_E2E_JAVA_HOME?.trim() || "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
+  const javaHome =
+    process.env.JA_E2E_JAVA_HOME?.trim() || "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
   const java = join(javaHome, "bin", "java.exe");
-  const jar = resolve(process.env.JA_E2E_APP_SERVER_JAR?.trim() || join(repoRoot, "app-server", "target", "ja-app-server.jar"));
-  const version = await execFileAsync(java, ["-version"], { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
-  if (!`${version.stderr ?? ""}${version.stdout ?? ""}`.includes('version "25')) throw new Error("侧边任务 runner 必须使用 JDK 25");
+  const jar = resolve(
+    process.env.JA_E2E_APP_SERVER_JAR?.trim() ||
+      join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+  );
+  const version = await execFileAsync(java, ["-version"], {
+    windowsHide: true,
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+  });
+  if (!`${version.stderr ?? ""}${version.stdout ?? ""}`.includes('version "25'))
+    throw new Error("侧边任务 runner 必须使用 JDK 25");
   return { java, jar };
 }
 
@@ -303,14 +321,20 @@ async function main() {
       stdio: "inherit",
       windowsHide: true,
     });
-    exitCode = await new Promise((resolvePromise) => driver.once("exit", (code) => resolvePromise(code ?? 1)));
+    exitCode = await new Promise((resolvePromise) =>
+      driver.once("exit", (code) => resolvePromise(code ?? 1)),
+    );
   } catch (error) {
-    process.stderr.write(`JA_SIDE_TASK_RUNNER_FAILED ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(
+      `JA_SIDE_TASK_RUNNER_FAILED ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     if (launch?.output?.length) process.stderr.write(`${launch.output.slice(-4).join("\n")}\n`);
   } finally {
     await stopTauri(launch);
   }
-  process.stdout.write(`JA_SIDE_TASK_RUNNER_EXIT code=${exitCode} artifacts=${directories.artifacts} cdp=${cdpPort}\n`);
+  process.stdout.write(
+    `JA_SIDE_TASK_RUNNER_EXIT code=${exitCode} artifacts=${directories.artifacts} cdp=${cdpPort}\n`,
+  );
   if (exitCode !== 0) process.exitCode = exitCode;
 }
 

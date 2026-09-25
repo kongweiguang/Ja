@@ -49,6 +49,11 @@ public interface WorkspaceUseCase {
      */
     Workspace requireOpenWorkspace(String workspaceId);
 
+    /** 设置编辑可验证已登记项目而不打开会话工作区或分配长寿命原生资源。 */
+    default Workspace requireSettingsWorkspace(String workspaceId) {
+        return requireOpenWorkspace(workspaceId);
+    }
+
     /**
      * 更新权威信任状态，并同步项目配置边界与预热状态。
      */

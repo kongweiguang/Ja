@@ -21,19 +21,25 @@ import java.util.Optional;
  * {@code tools/} 中；JVM 开发和测试则使用继承的 PATH。Java 启动器目录不是应用资源目录，
  * 因此这两条路径必须明确区分。</p>
  */
-final class NativeSearchToolResolver {
+public final class NativeSearchToolResolver {
     private static final List<String> FD_NAMES = List.of("fd", "fdfind");
     private static final String RG_NAME = "rg";
     private final Map<String, Path> fixedExecutables;
+    private final Map<String, String> environment;
 
     /** 延迟解析生产搜索工具，使缺失工具只在实际调用时报告，不影响其它内置能力注册。 */
-    static NativeSearchToolResolver system() {
-        return new NativeSearchToolResolver(Map.of());
+    public static NativeSearchToolResolver system() {
+        return system(System.getenv());
+    }
+
+    /** 绑定本 Turn 的完整客户端环境，搜索可执行文件解析与真正启动保持一致。 */
+    public static NativeSearchToolResolver system(Map<String, String> environment) {
+        return new NativeSearchToolResolver(Map.of(), environment);
     }
 
     /** 注入明确的 fd/rg 路径；调用方可用空值表示该工具交由系统解析。 */
-    NativeSearchToolResolver(Path fd, Path rg) {
-        this(fixedExecutables(fd, rg));
+    public NativeSearchToolResolver(Path fd, Path rg) {
+        this(fixedExecutables(fd, rg), System.getenv());
     }
 
     /** 把可选注入路径收敛为不可变表，避免解析过程观察到调用方后续修改。 */
@@ -45,7 +51,7 @@ final class NativeSearchToolResolver {
     }
 
     /** 按注入路径、Native 旁路资源、宿主 PATH 的优先级解析工具；缺失时不回退 Java 递归扫描。 */
-    Path resolve(String toolName) throws IOException {
+    public Path resolve(String toolName) throws IOException {
         Objects.requireNonNull(toolName, "toolName");
         Path fixed = fixedExecutables.get(toolName);
         if (fixed != null) return validate(toolName, fixed);
@@ -62,11 +68,17 @@ final class NativeSearchToolResolver {
     }
 
     /** 只保存归一化的绝对测试路径，生产解析仍独立于该注入表。 */
-    private NativeSearchToolResolver(Map<String, Path> fixedExecutables) {
+    private NativeSearchToolResolver(Map<String, Path> fixedExecutables, Map<String, String> environment) {
         Map<String, Path> normalized = new LinkedHashMap<>();
         fixedExecutables.forEach((name, path) -> normalized.put(name,
                 Objects.requireNonNull(path, name).toAbsolutePath().normalize()));
         this.fixedExecutables = Map.copyOf(normalized);
+        this.environment = Map.copyOf(Objects.requireNonNull(environment, "environment"));
+    }
+
+    /** 搜索进程取得冻结副本，不能读取当前长驻后台的启动环境。 */
+    public Map<String, String> environment() {
+        return environment;
     }
 
     /**
@@ -97,8 +109,10 @@ final class NativeSearchToolResolver {
     }
 
     /** 查找继承环境中的 PATH，保留宿主 CLI 配置，不拼接 shell 命令，也不改写环境。 */
-    private static Optional<Path> fromPath(String name) {
-        String rawPath = System.getenv("PATH");
+    private Optional<Path> fromPath(String name) {
+        String rawPath = environment.entrySet().stream()
+                .filter(entry -> "PATH".equalsIgnoreCase(entry.getKey()))
+                .map(Map.Entry::getValue).findFirst().orElse(null);
         if (rawPath == null || rawPath.isBlank()) return Optional.empty();
         String[] entries = rawPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator));
         for (String entry : entries) {

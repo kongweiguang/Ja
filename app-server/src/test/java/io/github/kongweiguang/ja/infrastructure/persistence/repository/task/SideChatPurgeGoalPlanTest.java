@@ -242,8 +242,8 @@ final class SideChatPurgeGoalPlanTest extends PersistenceTestSupport {
                 + "('evidence_side','plan_side','run_plan','pr_side','criterion_plan','step_side','TEST_REPORT','test-side','ok','" + "c".repeat(64) + "','" + AT + "','" + AT + "')");
         sql.executeUpdate("INSERT INTO goal_evaluations(evaluation_id,goal_id,goal_definition_revision,run_id,status,process_generation,model_id,provider_id,requested_at) VALUES "
                 + "('evaluation_side','goal_side',1,'run_goal','REQUESTED',1,'model','provider','" + AT + "')");
-        sql.executeUpdate("INSERT INTO plan_evaluation_requests(request_id,plan_id,plan_revision_id,run_id,owner_thread_id,input_digest,profile_json,outcome,certainty,started_at) VALUES "
-                + "('plan-eval-side','plan_side','pr_side','run_plan','thr_side','" + "d".repeat(64) + "','{}','RUNNING','UNKNOWN','" + AT + "')");
+        sql.executeUpdate("INSERT INTO plan_evaluation_requests(request_id,plan_id,plan_revision_id,run_id,owner_thread_id,input_digest,attempt_ordinal,profile_json,outcome,certainty,started_at) VALUES "
+                + "('plan-eval-side','plan_side','pr_side','run_plan','thr_side','" + "d".repeat(64) + "',1,'{}','RUNNING','UNKNOWN','" + AT + "')");
     }
 
     /** 构造引用 Plan Run 的 Interaction request/draft/event，覆盖完整 request owner 子查询。 */

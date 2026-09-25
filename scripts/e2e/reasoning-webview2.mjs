@@ -145,7 +145,7 @@ async function writeIsolatedSettings(home, protocol, baseUrl) {
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
@@ -159,10 +159,6 @@ async function writeIsolatedSettings(home, protocol, baseUrl) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 8",
-    "max_tool_calls = 8",
-    "wall_timeout_ms = 120000",
     "[[providers.models]]",
     'model_id = "model_e2e"',
     `name = ${tomlString(`Reasoning ${protocol} model`)}`,
@@ -180,8 +176,8 @@ async function writeIsolatedSettings(home, protocol, baseUrl) {
 /** 读取生产窗口并生成唯一 identifier/CSP overlay，不修改 src-tauri 配置文件。 */
 async function writeTauriOverlay(directories, frontendPort) {
   const [base, windows] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
   ]);
   const baseWindow = base?.app?.windows?.find((window) => window?.label === "main");
   const windowsWindow = windows?.app?.windows?.find((window) => window?.label === "main");
@@ -437,7 +433,7 @@ async function findTauriPage(browser, frontendPort, deadline) {
   throw new Error("Ja Tauri main WebView was not found");
 }
 
-/** 只杀本 runner 的 cmd/Tauri 进程树；不按 ja.exe/java.exe 名称结束已有用户进程。 */
+/** 只杀本 runner 的 cmd/Tauri 进程树；不按 Ja CLI、桌面或 Java 名称结束已有用户进程。 */
 async function terminateOwnedLauncher(launch) {
   const pid = launch?.child?.pid;
   if (!Number.isSafeInteger(pid) || launch.child.exitCode !== null) return;

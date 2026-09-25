@@ -165,7 +165,7 @@ public final class ConfigGeneration implements AutoCloseable {
     }
 
     /**
-     * skills 集中维护 secret 与 credential 的脱敏边界，并确保敏感缓冲区按所有权生命周期清理。
+     * skills 保存冻结的停用引用投影；代际租约结束时仍按所有权顺序释放相关资源。
      */
     public List<JsonNode> skills() {
         return copyNodes(skills);
@@ -215,7 +215,7 @@ public final class ConfigGeneration implements AutoCloseable {
     }
 
     /**
-     * skillDefinitions 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
+     * skillDefinitions 固定本代际的停用引用，Turn 发现时再取有效目录。
      */
     public List<Skill> skillDefinitions() {
         return List.copyOf(skillDefinitions.values());
@@ -404,12 +404,11 @@ public final class ConfigGeneration implements AutoCloseable {
         }
     }
 
-    /** Provider 级 Agent 默认值只固定上下文和 Turn 上限，目录启停由根级事实决定。 */
-    public record AgentDefaultsConfig(ContextConfig context, TurnLimitConfig turnLimits) {
+    /** Provider 级 Agent 默认值只保留上下文压缩开关。 */
+    public record AgentDefaultsConfig(ContextConfig context) {
         /** 固定代际内两个默认对象；后续 Provider 请求可改读更新后的配置代际。 */
         public AgentDefaultsConfig {
             java.util.Objects.requireNonNull(context, "context");
-            java.util.Objects.requireNonNull(turnLimits, "turnLimits");
         }
     }
 
@@ -529,24 +528,6 @@ public final class ConfigGeneration implements AutoCloseable {
     public record ContextConfig(boolean autoCompact) {
         /** 布尔值由严格文档解析器提供，无额外兼容语义。 */
         public ContextConfig {
-        }
-    }
-
-    /**
-     * TurnLimitConfig 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
-     */
-    public record TurnLimitConfig(int maxModelRounds, int maxToolCalls, Duration wallTimeout) {
-        /**
-         * 该声明 固定 Turn 使用的配置代际，并确保租约结束后按顺序释放关联资源。
-         */
-        public TurnLimitConfig {
-            java.util.Objects.requireNonNull(wallTimeout, "wallTimeout");
-            long wallMs = wallTimeout.toMillis();
-            if (maxModelRounds < 1 || maxModelRounds > 128 || maxToolCalls < 0 || maxToolCalls > 1_024
-                || wallMs < 1_000 || wallMs > 86_400_000
-                || wallMs != wallTimeout.toNanos() / 1_000_000) {
-                throw new IllegalArgumentException("provider turn limits are outside supported bounds");
-            }
         }
     }
 
@@ -863,16 +844,13 @@ public final class ConfigGeneration implements AutoCloseable {
                 case OPENAI_CHAT_COMPLETIONS -> ConfigurationGenerationSnapshot.Api.OPENAI_CHAT_COMPLETIONS;
             };
             ConfigGeneration.AgentDefaultsConfig defaults = provider.agentDefaults();
-            ConfigGeneration.TurnLimitConfig turnLimits = defaults.turnLimits();
             ConfigGeneration.NetworkTimeoutConfig timeouts = provider.networkTimeouts();
             return new ConfigurationGenerationSnapshot.Provider(provider.providerId(), provider.name(),
                     api, provider.baseUrl(), provider.credentialId(),
                     new ConfigurationGenerationSnapshot.NetworkTimeouts(
                             timeouts.connectTimeout(), timeouts.requestTimeout()),
                     new ConfigurationGenerationSnapshot.AgentDefaults(
-                            new ConfigurationGenerationSnapshot.Context(defaults.context().autoCompact()),
-                            new ConfigurationGenerationSnapshot.TurnLimits(turnLimits.maxModelRounds(),
-                                    turnLimits.maxToolCalls(), turnLimits.wallTimeout())),
+                            new ConfigurationGenerationSnapshot.Context(defaults.context().autoCompact())),
                     provider.models().stream().map(GenerationView::projectModel).toList());
         }
 

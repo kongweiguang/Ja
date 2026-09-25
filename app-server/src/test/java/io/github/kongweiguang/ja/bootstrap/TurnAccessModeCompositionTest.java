@@ -24,7 +24,6 @@ import org.noear.solon.Solon;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -104,14 +103,14 @@ final class TurnAccessModeCompositionTest {
                 TurnRuntimeResolver resolver = Solon.context().getBean(TurnRuntimeResolver.class);
                 try (var lease = resolver.resolve(new TurnRuntimeRequest(thread.threadId(), turnId, workspace.root(),
                         workspace.workspaceId(), "provider_mode", "model_mode", null, requested,
-                        CollaborationMode.DEFAULT, TurnOrigin.USER, Duration.ofSeconds(20), Instant.now()))) {
+                        CollaborationMode.DEFAULT, TurnOrigin.USER, Instant.now()))) {
                     assertEquals(requested, lease.accessMode());
                 }
                 var accepted = Solon.context().getBean(TurnUseCase.class).start(new TurnStartRequest(
                         thread.threadId(), turnId, workspace.workspaceId(), workspace.root(),
                         new UserContent(List.of(new TextContent("mode admission regression"))),
                         "provider_mode", "model_mode", null, requested, CollaborationMode.DEFAULT,
-                        Duration.ofSeconds(20), thread.revision(), 0, Instant.now()),
+                        thread.revision(), 0, Instant.now()),
                         event -> CompletableFuture.completedFuture(null));
                 assertTrue(accepted.threadRevision() > thread.revision());
                 accepted.completion().toCompletableFuture().get(20, TimeUnit.SECONDS);
@@ -138,7 +137,7 @@ final class TurnAccessModeCompositionTest {
                 default_model_id = "model_mode"
                 default_reasoning_level = { __ja_null = true }
                 mcp_servers = []
-                skills = []
+                disabled_skills = []
                 [subagents]
                 enabled = true
                 provider_id = { __ja_null = true }
@@ -155,10 +154,6 @@ final class TurnAccessModeCompositionTest {
                 request_timeout_ms = 10000
                 [providers.agent_defaults.context]
                 auto_compact = true
-                [providers.agent_defaults.turn_limits]
-                max_model_rounds = 4
-                max_tool_calls = 4
-                wall_timeout_ms = 20000
                 [[providers.models]]
                 model_id = "model_mode"
                 name = "Mode fixture"

@@ -376,7 +376,8 @@ final class WorkspaceFileTools {
             AtomicBoolean outputLimit = new AtomicBoolean();
             AtomicBoolean nonTextRecord = new AtomicBoolean();
             NativeSearchProcess.Result result = NativeSearchProcess.run(executable, arguments, start,
-                    token, context.deadline(), MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, line -> {
+                    token, context.deadline(), MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES,
+                    resolver.environment(), line -> {
                         JsonNode record = parseSearchRecord(line);
                         String type = record.path("type").asText();
                         boolean matchRecord = "match".equals(type);
@@ -496,7 +497,7 @@ final class WorkspaceFileTools {
             AtomicBoolean outputLimit = new AtomicBoolean();
             NativeSearchProcess.Result result = NativeSearchProcess.run(executable,
                     findArguments(pattern, start, maxResults), start, token, context.deadline(),
-                    MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, rawLine -> {
+                    MAX_NATIVE_STDOUT_BYTES, MAX_NATIVE_STDERR_BYTES, resolver.environment(), rawLine -> {
                         String nativeLine = lineText(rawLine);
                         Path candidate = nativePath(start, nativeLine);
                         if (candidate == null) {

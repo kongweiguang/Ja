@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 export { useConversationController } from "./application/useConversationController";
+export { readFullMessageContent } from "./application/readFullMessageContent";
+export { readFullAnswerContent } from "./application/readFullMessageContent";
 export type { ConversationController } from "./application/useConversationController";
 export { useConversationInteractionController } from "./application/useConversationInteractionController";
 export { useInteractionController } from "./application/useInteractionController";

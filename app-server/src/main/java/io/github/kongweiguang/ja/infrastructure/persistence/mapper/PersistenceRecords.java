@@ -44,7 +44,12 @@ public final class PersistenceRecords {
     /** Plan evaluator intent 只保存非敏感 Profile 和冻结 identity，Provider 凭据永不落库。 */
     public record PlanEvaluationIntentInsert(String requestId, String planId, String planRevisionId,
                                              String runId, String ownerThreadId, String inputDigest,
-                                             String profileJson, String startedAt) { }
+                                             int attemptOrdinal, String profileJson, String startedAt) { }
+    /** 冻结 Plan 输入的审计查询键，避免字符串拼接绕过模型身份边界。 */
+    public record PlanEvaluationLatestLookup(String planId, String planRevisionId,
+                                              String runId, String inputDigest) { }
+    /** 崩溃恢复只改变旧请求终态，不猜测其用量或重写输入身份。 */
+    public record PlanEvaluationInterruptedUpdate(String requestId, String completedAt) { }
       /** Plan evaluator usage 终态使用 identity/CAS 更新，UNKNOWN 不伪造 token 数值。 */
       public record PlanEvaluationUsageUpdate(String requestId, String planId, String planRevisionId,
                                               String runId, String outcome, String certainty,
@@ -52,7 +57,7 @@ public final class PersistenceRecords {
                                               String verdict, String criteriaJson, String summary,
                                               String completedAt) { }
       /** 重试门只需读取 request identity 与当前终态。 */
-      public record PlanEvaluationPriorRow(String requestId, String outcome, String verdict,
+      public record PlanEvaluationPriorRow(String requestId, Integer attemptOrdinal, String outcome, String verdict,
                                            String criteriaJson, String summary) { }
     /** Thread 创建时冻结的子智能体策略；空 provider/model 表示跟随父 Turn。 */
     public record SubagentPolicyRow(String threadId, boolean enabled, String providerId, String modelId,
@@ -200,6 +205,8 @@ public final class PersistenceRecords {
     /** Message 插入的完整持久化参数。 */
     public record MessageInsert(String messageId, String threadId, String turnId, long ordinal,
                          String role, String blocksJson, String occurredAt) { }
+    /** 只读分页查询直接返回一页文本与完整字符数，不把整条消息交给 JVM。 */
+    public record PublicContentPageRow(String content, int totalCharacters) { }
     /** Tool 的 Turn 内复合身份。 */
     public record ToolKey(String turnId, String callId) { }
     /** PREPARED Tool 插入参数。 */
@@ -328,6 +335,11 @@ public final class PersistenceRecords {
     /** 全局发现使用统一更新时间/身份 keyset，可选 Workspace 与标题 contains 过滤。 */
     public record ThreadDiscoveryPage(String workspaceId, String normalizedQuery,
                                       String cursorTime, String cursorId, int limit) { }
+    /** 输入历史从公开 USER timeline 作 keyset 分页，查询不物化整个 Thread。 */
+    public record InputHistoryPage(String normalizedQuery, String cursorTime, String cursorId, int limit) { }
+    /** 查询仅物化用户可见文本和导航身份，不读取 Provider 原始消息。 */
+    public record InputHistoryRow(String itemId, String threadId, String publicText, String createdAt,
+                                  boolean truncated) { }
     /**
      * 用户重命名与自动标题共享 SQL 形状；placeholderOnly 为自动路径启用来源所有权 CAS，
      * expectedRevision 在该路径作为首次成功 Turn 的 revision 下界，而不是精确相等条件。
@@ -354,6 +366,16 @@ public final class PersistenceRecords {
     public record ThreadRestore(String threadId, long expectedRevision, String occurredAt) { }
     /** 混合 Thread 快照的 keyset 分页参数。 */
     public record SnapshotPage(String threadId, String cursorTime, String cursorId, int limit) { }
+
+    /** 客户端提交只保存安全回执与请求指纹，业务正文仍在原领域表中。 */
+    public record ClientOperationRow(String clientOperationId, String method, String requestFingerprint,
+                                     String threadId, String turnId, long threadRevision, boolean queued,
+                                     String approvalId, String decision, String createdAt) { }
+
+    /** 入队回执只保留请求指纹和条目身份，不能把用户正文复制进账本。 */
+    public record InputOperationRow(String clientOperationId, String requestFingerprint,
+                                    String threadId, String turnId, String inputId,
+                                    String inputKind, String createdAt) { }
 
     /** Checkpoint source revision 复合身份。 */
     public record CheckpointKey(String threadId, long sourceRevision) { }

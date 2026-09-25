@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.port.out;
 
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
+import io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
@@ -44,9 +45,20 @@ public interface ConversationRepository extends AutoCloseable {
      */
     AdmissionReceipt admit(TurnAdmission admission);
 
+    /** 外部启动的幂等身份须与 Turn admission 同事务写入；内部来源仍调用无身份入口。 */
+    default AdmissionReceipt admit(TurnAdmission admission, String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
+    }
+
     /** 隐藏 Goal continuation 只创建 Turn/execution，不写 USER message 或用户时间线。 */
     default AdmissionReceipt admitContinuation(ContinuationAdmission admission) {
         throw new UnsupportedOperationException("Goal continuation admission is unavailable");
+    }
+
+    /** 仅显式用户继续写入客户端身份，Plan/Goal 内部 continuation 不建立外部 operation。 */
+    default AdmissionReceipt admitContinuation(ContinuationAdmission admission,
+                                               String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
     }
 
     /** 找到当前有效路径最后一个未答问题；准入事务仍须重新验证该问题和 Thread revision。 */
@@ -54,6 +66,17 @@ public interface ConversationRepository extends AutoCloseable {
 
     /** 以 CAS 原子切走问题所在 Turn 及其后缀，再把编辑后的 USER Turn 接入当前路径。 */
     AdmissionReceipt admitReask(ReaskAdmission admission);
+
+    /** 重答路径切换与客户端幂等回执同事务提交，重复请求不得再次剪切历史。 */
+    default AdmissionReceipt admitReask(ReaskAdmission admission,
+                                        String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
+    }
+
+    /** 查询已确认提交的客户端 operation，空值只代表没有持久成功事实。 */
+    default Optional<ClientOperationReceipt> readClientOperation(String clientOperationId) {
+        throw new UnsupportedOperationException("client operation read is unavailable");
+    }
 
     /**
      * 用 Thread revision CAS 原子提交非终态及其全部事实。
@@ -182,10 +205,24 @@ public interface ConversationRepository extends AutoCloseable {
         return false;
     }
 
+    /** 外部审批在原 decision 事务内记录客户端身份；超时和取消继续走无身份入口。 */
+    default boolean resolveApproval(String approvalId, ApprovalDecision decision, Instant resolvedAt,
+                                    String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation approval is unavailable");
+    }
+
     /** 为活动 Turn 追加一条持久 FIFO 输入，并返回提交后的完整权威队列。 */
     default QueueMutation enqueueInput(PendingInput input) {
         throw new UnsupportedOperationException("pending input is unavailable");
     }
+
+    /** 外部入队把客户端操作身份与队列事实写在同一事务，失败后可只读查询。 */
+    default QueueMutation enqueueInput(PendingInput input, String operationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("idempotent pending input is unavailable");
+    }
+
+    /** 查询同事务回执；未知不证明请求未执行。 */
+    default Optional<InputOperationReceipt> readInputOperation(String operationId) { return Optional.empty(); }
 
     /** 读取下一条真实 FIFO head 供外部引用和 Skill 正文在消费事务前完成无副作用校验。 */
     default Optional<InputQueue.QueuedInput> peekInput(String turnId, InputKind kind) {
@@ -455,6 +492,13 @@ public interface ConversationRepository extends AutoCloseable {
         public QueueMutation(String inputId, InputQueue inputQueue, long threadRevision, boolean changed) {
             this(inputId, inputQueue, threadRevision, 0, changed);
         }
+    }
+
+    /** 入队回执不复制用户正文，只保留用于判别相同请求的安全身份。 */
+    record InputOperationReceipt(String operationId, String fingerprint, String threadId,
+                                 String turnId, String inputId, InputKind kind) {
+        /** 只比较规范化请求指纹，避免回执在诊断时暴露用户输入正文。 */
+        public boolean matches(String expectedFingerprint) { return fingerprint.equals(expectedFingerprint); }
     }
 
     /** 消费事务返回原条目、公开 USER item、消费后队列与两套权威 revision。 */
@@ -974,12 +1018,12 @@ public interface ConversationRepository extends AutoCloseable {
         public ReasoningSummaryFact {
             messageId = identifier(messageId, "item_", "messageId");
             text = validateReasoningSummary(text);
-            if (modelRound < 1 || modelRound > 128) throw new IllegalArgumentException("invalid modelRound");
+            if (modelRound < 1) throw new IllegalArgumentException("invalid modelRound");
         }
 
-        /** 摘要必须保持有界且可写入 timeline；空白摘要不应制造一个看似有内容的条目。 */
+        /** 空白或 NUL 摘要不能形成有效公开事实；长度由分页交付，不是任务停止条件。 */
         private static String validateReasoningSummary(String value) {
-            if (value == null || value.length() > 1_048_576 || value.indexOf('\0') >= 0 || value.isBlank()) {
+            if (value == null || value.indexOf('\0') >= 0 || value.isBlank()) {
                 throw new IllegalArgumentException("invalid reasoningSummary");
             }
             return value;
@@ -1000,9 +1044,9 @@ public interface ConversationRepository extends AutoCloseable {
             if (message.role() != ModelRole.ASSISTANT) throw new IllegalArgumentException("assistant role required");
             publicText = text(publicText, "publicText", 1_048_576, true);
             if (reasoningSummary != null) {
-                reasoningSummary = text(reasoningSummary, "reasoningSummary", 1_048_576, false);
+                reasoningSummary = ReasoningSummaryFact.validateReasoningSummary(reasoningSummary);
             }
-            if (modelRound < 1 || modelRound > 128) throw new IllegalArgumentException("invalid modelRound");
+            if (modelRound < 1) throw new IllegalArgumentException("invalid modelRound");
         }
     }
 
@@ -1161,7 +1205,7 @@ public interface ConversationRepository extends AutoCloseable {
             Objects.requireNonNull(purpose, "purpose");
             Objects.requireNonNull(certainty, "certainty");
             Objects.requireNonNull(profile, "profile");
-            if (modelRound < 1 || modelRound > 128 || requestOrdinal < 1) {
+            if (modelRound < 1 || requestOrdinal < 1) {
                 throw new IllegalArgumentException("invalid Provider request ordinal");
             }
             if ((certainty == UsageCertainty.KNOWN) != (usage != null)) {

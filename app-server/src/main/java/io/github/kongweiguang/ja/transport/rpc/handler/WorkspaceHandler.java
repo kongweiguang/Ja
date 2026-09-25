@@ -77,6 +77,10 @@ public final class WorkspaceHandler implements RpcHandler {
         }
         if (!params.has("cwd")) throw JaRpcException.invalidParams();
         Path root = path(RpcParams.text(params, "cwd", 4_096, false));
+        // Schema 的可选字段只允许省略；显式 null 不能伪装为省略并改变 Workspace 名称来源。
+        if (params.has("displayName") && params.get("displayName").isNull()) {
+            throw JaRpcException.invalidParams();
+        }
         String displayName = RpcParams.optionalText(params, "displayName", 1_024);
         Workspace value = session.workspaces().openWorkspace(
                 new WorkspaceUseCase.OpenWorkspace(root, displayName));

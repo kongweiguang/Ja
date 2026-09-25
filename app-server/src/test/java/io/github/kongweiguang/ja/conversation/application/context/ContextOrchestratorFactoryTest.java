@@ -76,7 +76,7 @@ final class ContextOrchestratorFactoryTest {
                         Optional.empty(), new ToolProjectionLimits(64, 64), TEST_METER),
                 receipt -> { }, prompt -> "ok");
 
-        assertSame(binding, observedBinding.get());
+        org.junit.jupiter.api.Assertions.assertNotSame(binding, observedBinding.get());
         assertSame(configuration, observedBinding.get().configuration());
         assertSame(token, observedBinding.get().cancellationToken());
         assertEquals(NOW.plusSeconds(30), observedBinding.get().deadline());

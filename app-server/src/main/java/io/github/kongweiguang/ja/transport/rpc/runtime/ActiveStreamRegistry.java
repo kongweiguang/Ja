@@ -335,7 +335,7 @@ public final class ActiveStreamRegistry {
 
     /** 已完成模型轮次来自持久 execution common；未发起首轮使用零，不能出现负数或越过 128 上限。 */
     private static void requireModelRound(int modelRound) {
-        if (modelRound < 0 || modelRound > 128) throw new IllegalArgumentException("invalid model round");
+        if (modelRound < 0) throw new IllegalArgumentException("invalid model round");
     }
 
     /** 只接受已有 JA-RPC opaque identity 词汇，避免 registry 成为第二套 ID 规则。 */

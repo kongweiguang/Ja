@@ -51,7 +51,7 @@ const SOURCE_IDENTITY_FILES = Object.freeze({
     "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/RpcResults.java",
   threadReadContract:
     "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/ThreadReadContract.java",
-  rustHistoryModel: "src-tauri/src/app_runtime/interface/history_model.rs",
+  rustHistoryModel: "apps/desktop/src-tauri/src/app_runtime/interface/history_model.rs",
   mybatisHistoryService:
     "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
   agentLoopPersistence:
@@ -128,11 +128,11 @@ async function readSourceFileIdentities() {
   return entries;
 }
 
-/** 只在隔离 runner 的预期 Cargo 目标存在时记录 Ja 可执行文件哈希，否则明确标记未取得。 */
+/** 按新的桌面目标名读取隔离 Cargo 产物；文件缺失时明确标记未取得。 */
 async function readRunnerJaExecutableIdentity(cargoTargetDirectory) {
   if (typeof cargoTargetDirectory !== "string" || cargoTargetDirectory.length === 0)
     return { status: "unavailable", reason: "cargo_target_directory_missing" };
-  const path = join(cargoTargetDirectory, "debug", "ja.exe");
+  const path = join(cargoTargetDirectory, "debug", "ja-desktop.exe");
   try {
     const metadata = await stat(path);
     if (!metadata.isFile()) throw new Error("runner executable path is not a file");

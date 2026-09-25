@@ -208,6 +208,8 @@ function createPorts(): {
   return {
     port,
     transcript: {
+      observe: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
+      unobserve: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
       read: vi.fn(async () => ({
         threadId: task.taskThreadId,
         revision: task.revision,
@@ -353,6 +355,7 @@ describe("useTaskController", () => {
     expect(ports.port.list).not.toHaveBeenCalled();
     expect(ports.port.read).not.toHaveBeenCalled();
     expect(ports.transcript.read).not.toHaveBeenCalled();
+    expect(ports.transcript.observe).not.toHaveBeenCalled();
     expect(ports.port.observe).not.toHaveBeenCalled();
   });
 
@@ -374,12 +377,14 @@ describe("useTaskController", () => {
       { initialProps: { visible: true } },
     );
     await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(1));
+    expect(ports.transcript.observe).toHaveBeenCalledWith({ threadId: "thr_child" });
     await waitFor(() => expect(ports.transcript.read).toHaveBeenCalledTimes(2));
 
     rerender({ visible: false });
     await waitFor(() =>
       expect(ports.port.unobserve).toHaveBeenCalledWith({ observationId: "observation_child" }),
     );
+    expect(ports.transcript.unobserve).toHaveBeenCalledWith({ threadId: "thr_child" });
     expect(ports.port.cancel).not.toHaveBeenCalled();
   });
 

@@ -6,6 +6,7 @@
     <resultMap id="prior" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationPriorRow">
         <constructor>
             <idArg column="request_id" javaType="String"/>
+            <arg column="attempt_ordinal" javaType="int"/>
             <arg column="outcome" javaType="String"/>
             <arg column="verdict" javaType="String"/>
             <arg column="criteria_json" javaType="String"/>
@@ -13,23 +14,32 @@
         </constructor>
     </resultMap>
     <select id="selectPrior" resultMap="prior">
-        SELECT request_id,outcome,verdict,criteria_json,summary
+        SELECT request_id,attempt_ordinal,outcome,verdict,criteria_json,summary
         FROM plan_evaluation_requests WHERE request_id=#{requestId}
     </select>
+    <select id="selectLatest" resultMap="prior">
+        SELECT request_id,attempt_ordinal,outcome,verdict,criteria_json,summary
+        FROM plan_evaluation_requests
+        WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+          AND run_id=#{runId} AND input_digest=#{inputDigest}
+        ORDER BY attempt_ordinal DESC LIMIT 1
+    </select>
+    <update id="markInterrupted">
+        UPDATE plan_evaluation_requests SET outcome='UNKNOWN',completed_at=#{completedAt}
+        WHERE request_id=#{requestId} AND outcome='RUNNING'
+    </update>
     <insert id="insertIntent">
         INSERT INTO plan_evaluation_requests(request_id,plan_id,plan_revision_id,run_id,owner_thread_id,
-            input_digest,profile_json,outcome,certainty,started_at)
-        VALUES(#{requestId},#{planId},#{planRevisionId},#{runId},#{ownerThreadId},#{inputDigest},#{profileJson},
+            input_digest,attempt_ordinal,profile_json,outcome,certainty,started_at)
+        VALUES(#{requestId},#{planId},#{planRevisionId},#{runId},#{ownerThreadId},#{inputDigest},#{attemptOrdinal},#{profileJson},
             'RUNNING','UNKNOWN',#{startedAt})
     </insert>
-    <update id="reserveModelRound">
+    <update id="recordModelRequest">
         UPDATE execution_runs
         SET used_model_rounds=used_model_rounds+1,updated_at=#{startedAt}
         WHERE run_id=#{runId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
           AND status IN ('RUNNING','VERIFYING')
           AND pause_requested=0
-          AND max_model_rounds IS NOT NULL AND used_model_rounds &lt; max_model_rounds
-          AND wall_budget_millis IS NOT NULL AND used_active_millis &lt; wall_budget_millis
           AND EXISTS (
                 SELECT 1 FROM plans p
                 WHERE p.plan_id=execution_runs.plan_id

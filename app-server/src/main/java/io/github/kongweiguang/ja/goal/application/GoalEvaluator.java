@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.goal.application;
 
 import io.github.kongweiguang.ja.goal.port.out.GoalEvaluatorPort;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
+import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,14 +46,15 @@ public final class GoalEvaluator {
         this.processGeneration = processGeneration;
     }
 
-    /** 请求先落 REQUESTED，再异步调用；失败不切模型、不重试付费调用。 */
+    /** 请求先落 REQUESTED，再由会话层恢复瞬时 Provider 故障，结果仍只结算一次。 */
     public CompletionStage<GoalRepository.CompleteEvaluation> evaluate(Evaluate command) {
         String evaluationId = id("evaluation_");
         goals.requestEvaluation(new GoalRepository.RequestEvaluation(command.request().goalId(),
                 command.expectedGoalRevision(), evaluationId, command.request().runId(),
                 command.request().planRevisionId(), processGeneration,
                 java.util.List.of(), id("evt_"), command.requestIdempotencyKey(), clock.instant()));
-        return evaluator.evaluate(command.request()).handle((result, failure) -> {
+        return evaluateWithRetry(command.request()).handle((result, failure) -> {
+            command.request().cancellation().throwIfCancellationRequested();
             long completionRevision = command.expectedGoalRevision() + 1;
             if (failure != null || result == null || !valid(command.request(), result)) {
                 return new GoalRepository.CompleteEvaluation(command.request().goalId(), completionRevision,
@@ -72,14 +74,11 @@ public final class GoalEvaluator {
     public CompletionStage<GoalRepository.CompleteEvaluation> evaluateRequested(
             String evaluationId, long expectedGoalRevision, GoalEvaluatorPort.Request request,
             String completionIdempotencyKey) {
-        CompletionStage<GoalEvaluatorPort.Result> stage;
-        try {
-            stage = evaluator.evaluate(request);
-        } catch (RuntimeException failure) {
-            stage = java.util.concurrent.CompletableFuture.failedFuture(failure);
-        }
-        return stage.handle((result, failure) -> completion(
-                        evaluationId, expectedGoalRevision, request, result, failure, completionIdempotencyKey))
+        return evaluateWithRetry(request).handle((result, failure) -> {
+                    request.cancellation().throwIfCancellationRequested();
+                    return completion(evaluationId, expectedGoalRevision, request, result, failure,
+                            completionIdempotencyKey);
+                })
                 .thenApply(completion -> {
                     var settled = goals.completeEvaluation(completion);
                     committed.accept(request.goalId());
@@ -89,6 +88,60 @@ public final class GoalEvaluator {
                     return completion;
                 });
     }
+
+    /** 同一个验收 intent 下每次只打开一次 Provider；瞬时失败换新租约且不按次数结束 Goal。 */
+    private CompletionStage<GoalEvaluatorPort.Result> evaluateWithRetry(GoalEvaluatorPort.Request request) {
+        java.util.concurrent.CompletableFuture<GoalEvaluatorPort.Result> result =
+                new java.util.concurrent.CompletableFuture<>();
+        attemptEvaluation(request, 1, result);
+        return result;
+    }
+
+    /** 回调只处理本次响应，下一次重试在独立虚拟线程等待以避免同步完成导致栈增长。 */
+    private void attemptEvaluation(GoalEvaluatorPort.Request request, int attempt,
+                                   java.util.concurrent.CompletableFuture<GoalEvaluatorPort.Result> result) {
+        if (result.isDone()) return;
+        try {
+            request.cancellation().throwIfCancellationRequested();
+            CompletionStage<GoalEvaluatorPort.Result> stage = evaluator.evaluate(request);
+            if (stage == null) throw new IllegalStateException("Goal evaluator returned no stage");
+            stage.whenComplete((value, failure) -> {
+                if (result.isDone()) return;
+                try {
+                    request.cancellation().throwIfCancellationRequested();
+                    ModelPort.ModelUnavailableException provider = EvaluationRetry.retryableProvider(failure);
+                    if (provider != null) {
+                        Thread.startVirtualThread(() -> {
+                            try {
+                                EvaluationRetry.await(EvaluationRetry.delay(provider, attempt), request.cancellation());
+                                attemptEvaluation(request, Math.addExact(attempt, 1), result);
+                            } catch (RuntimeException stopped) {
+                                result.completeExceptionally(stopped);
+                            }
+                        });
+                    } else if (failure != null) {
+                        result.completeExceptionally(failure);
+                    } else {
+                        result.complete(value);
+                    }
+                } catch (RuntimeException stopped) {
+                    result.completeExceptionally(stopped);
+                }
+            });
+        } catch (RuntimeException failure) {
+            ModelPort.ModelUnavailableException provider = EvaluationRetry.retryableProvider(failure);
+            if (provider == null) result.completeExceptionally(failure);
+            else Thread.startVirtualThread(() -> {
+                try {
+                    EvaluationRetry.await(EvaluationRetry.delay(provider, attempt), request.cancellation());
+                    attemptEvaluation(request, Math.addExact(attempt, 1), result);
+                } catch (RuntimeException stopped) {
+                    result.completeExceptionally(stopped);
+                }
+            });
+        }
+    }
+
 
     /** 已领取但无法安全组装请求的 intent 仍要结算，不能永久占用 run 的唯一活跃索引。 */
     public void rejectRequested(String evaluationId, long expectedGoalRevision, String goalId,

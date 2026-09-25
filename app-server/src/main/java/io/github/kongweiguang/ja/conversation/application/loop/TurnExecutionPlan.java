@@ -35,8 +35,7 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
                                 RequestRuntimeFactory runtimeFactory, TurnChangeTracker changeTracker) {
 
     /**
-     * 新 Turn 默认创建 complete tracker；稳定 Operation 与请求视图在构造边界即分离，
-     * 后续热更新只能替换 RequestView，不能重置累计预算或绝对 Deadline。
+     * 新 Turn 默认创建 complete tracker；身份与 CAS 游标跨请求稳定，短租约在安全点刷新。
      */
     public TurnExecutionPlan(String threadId, String turnId, Path workspaceRoot, UserContent content,
                              ModelPort.ModelConfiguration model, AccessMode accessMode, TurnLimits limits,
@@ -98,7 +97,7 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
     }
 
     /**
-     * 只替换数据库准入回执，保持 Operation 身份、累计预算与绝对 Deadline 不变。
+     * 只替换数据库准入回执，保持 Operation 身份与当前请求租约不变。
      */
     public TurnExecutionPlan withAdmissionReceipt(long revision, long turnMutationVersion) {
         return new TurnExecutionPlan(operation.withAdmissionReceipt(revision, turnMutationVersion),
@@ -106,13 +105,14 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
     }
 
     /**
-     * Provider 或 Tool 安全点打开最新环境；返回视图只替换请求环境，稳定 Operation 始终沿用当前实例。
+     * Provider 或 Tool 安全点打开最新环境；保留稳定身份和游标，换入本次请求的短租约。
      * 工厂返回值的 release 所有权转移给新 RequestRuntime，由调用方 try-with-resources 关闭。
      */
     @SuppressWarnings("PMD.CloseResource")
     public RequestRuntime openRequestRuntime(TurnExecutionState.Common common, String promptSummary) {
         RequestRuntime opened = Objects.requireNonNull(runtimeFactory.open(common, promptSummary), "requestRuntime");
-        TurnExecutionPlan rebound = new TurnExecutionPlan(operation, opened.plan().requestView(),
+        TurnExecutionPlan rebound = new TurnExecutionPlan(
+                operation.withRequestResources(opened.plan().operation()), opened.plan().requestView(),
                 runtimeFactory, changeTracker);
         return new RequestRuntime(rebound, opened.profile(), opened.release());
     }
@@ -135,7 +135,7 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
     public UserContent content() { return operation.content(); }
     /** Turn 来源决定 content 是否存在，内部来源不能产生 USER message。 */
     public TurnOrigin origin() { return operation.origin(); }
-    /** 累计轮次和 Tool 数使用准入时硬上限，环境刷新不得重置预算。 */
+    /** 当前模型窗口及单次请求时限来自最新租约，不构成整项任务预算。 */
     public TurnLimits limits() { return operation.limits(); }
     /** 原始请求时间用于审计和恢复，不随请求安全点变化。 */
     public Instant requestedAt() { return operation.requestedAt(); }
@@ -149,7 +149,7 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
     public String initialSummary() { return operation.initialSummary(); }
     /** 输入队列属于 Operation owner，不能被请求环境刷新替换。 */
     public QueuedInputBoundary queuedInputBoundary() { return operation.queuedInputBoundary(); }
-    /** 绝对 Deadline 属于 Operation，任何请求租约都只能收紧。 */
+    /** 当前短租约的 IO 截止时间，每个安全点重新建立。 */
     public Instant deadlineAt() { return operation.deadlineAt(); }
     /** Provider 配置只从当前请求视图读取。 */
     public ModelPort.ModelConfiguration model() { return requestView.model(); }
@@ -263,7 +263,7 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
     }
 
     /**
-     * TurnOperation 只保存跨请求必须稳定的身份、累计预算、权威游标和绝对 Deadline。
+     * TurnOperation 保存稳定身份与权威游标，同时承载可在安全点替换的请求短租约。
      */
     public record TurnOperation(String threadId, String turnId, Path workspaceRoot, UserContent content,
                                 TurnOrigin origin,
@@ -296,6 +296,22 @@ public record TurnExecutionPlan(TurnOperation operation, RequestView requestView
         private TurnOperation withAdmissionReceipt(long revision, long turnMutationVersion) {
             return new TurnOperation(threadId, turnId, workspaceRoot, content, origin, limits, requestedAt, workspaceId,
                     revision, turnMutationVersion, initialSummary, queuedInputBoundary, deadlineAt);
+        }
+
+        /**
+         * 只从新解析环境取得模型窗口、排队输入边界和 IO 截止时间；身份及 CAS 游标仍属于原 Turn。
+         */
+        private TurnOperation withRequestResources(TurnOperation fresh) {
+            Objects.requireNonNull(fresh, "fresh");
+            if (!threadId.equals(fresh.threadId) || !turnId.equals(fresh.turnId)
+                    || !workspaceRoot.equals(fresh.workspaceRoot) || !workspaceId.equals(fresh.workspaceId)
+                    || !Objects.equals(content, fresh.content) || origin != fresh.origin
+                    || !requestedAt.equals(fresh.requestedAt)) {
+                throw new IllegalArgumentException("request runtime changed Turn identity");
+            }
+            return new TurnOperation(threadId, turnId, workspaceRoot, content, origin, fresh.limits,
+                    requestedAt, workspaceId, initialThreadRevision, initialTurnMutationVersion,
+                    initialSummary, fresh.queuedInputBoundary, fresh.deadlineAt);
         }
     }
 

@@ -49,7 +49,8 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
 
             repository.recordIntent(first);
             assertEquals(Optional.of(new PlanEvaluationAuditPort.Prior(
-                    first.requestId(), PlanEvaluationAuditPort.Outcome.RUNNING)), repository.find(first.requestId()));
+                    first.requestId(), 1, PlanEvaluationAuditPort.Outcome.RUNNING, null)),
+                    repository.find(first.requestId()));
 
             ProviderRequestUsage known = new ProviderRequestUsage(first.requestId(), 1, 1,
                     ProviderRequestUsage.Purpose.ASSISTANT, ProviderRequestUsage.Certainty.KNOWN,
@@ -76,7 +77,7 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
                             new PlanEvaluationAuditPort.EvaluationResult(GoalModels.EvaluationVerdict.MET,
                                     java.util.List.of(new GoalModels.CriterionEvaluation("criterion_test",
                                             GoalModels.EvaluationVerdict.MET, "通过")), "通过"))));
-            assertEquals("1/1000", fixture.runUsage(), "duplicate settlement must not double count budget");
+            assertEquals("1/1000", fixture.runUsage(), "duplicate settlement must not double count activity");
 
             // requestId/inputDigest 同时改变，表示新增 evidence 或其它冻结事实后的新 intent。
             PlanEvaluationAuditPort.Intent changed = intent("request_plan_eval_b", "b".repeat(64), profile);
@@ -103,38 +104,99 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
                     START.plusSeconds(1)));
 
             assertEquals(Optional.of(new PlanEvaluationAuditPort.Prior(
-                    intent.requestId(), PlanEvaluationAuditPort.Outcome.UNKNOWN)), repository.find(intent.requestId()));
+                    intent.requestId(), 1, PlanEvaluationAuditPort.Outcome.UNKNOWN, null)),
+                    repository.find(intent.requestId()));
             assertEquals("1/1000", fixture.runUsage(), "UNKNOWN still consumes the reserved round and active time");
         }
     }
 
-    /** Run 的模型轮次在 Provider 前预留；预算耗尽时第二个 evaluator 不得发起调用。 */
+    /** 相同冻结输入的第二次模型请求使用新身份，旧 UNKNOWN 和新成功均可独立回读。 */
     @Test
-    void rejectsIntentWhenModelRoundBudgetIsExhausted() throws Exception {
-        try (Fixture fixture = fixture("round-budget", 1, 10_000)) {
-            MybatisPlanEvaluationAuditRepository repository = fixture.repository();
-            ProviderRequestProfile profile = profile();
-            repository.recordIntent(intent("request_plan_eval_budget_a", "a".repeat(64), profile));
-            assertThrows(IllegalStateException.class,
-                    () -> repository.recordIntent(intent("request_plan_eval_budget_b", "b".repeat(64), profile)));
-            assertEquals("1/0", fixture.runUsage(), "failed reservation must roll back without partial accounting");
+    void recordsIndependentAttemptsForTheSamePlanInput() throws Exception {
+        try (Fixture fixture = fixture("same-input-retry")) {
+            var repository = fixture.repository();
+            var profile = profile();
+            String digest = "a".repeat(64);
+            var first = intent("request_plan_eval_retry", digest, profile);
+            repository.recordIntent(first);
+            var unknown = new ProviderRequestUsage(first.requestId(), 1, 1,
+                    ProviderRequestUsage.Purpose.ASSISTANT, ProviderRequestUsage.Certainty.UNKNOWN,
+                    profile, null);
+            repository.recordUsage(new PlanEvaluationAuditPort.Usage(first.requestId(), first.planId(),
+                    first.planRevisionId(), first.runId(), unknown, PlanEvaluationAuditPort.Outcome.UNKNOWN,
+                    START.plusSeconds(1)));
+
+            var second = new PlanEvaluationAuditPort.Intent("request_plan_eval_retry_a2", "plan_eval",
+                    "planrev_eval", "run_eval", "thr_eval", profile, digest, 2, START.plusSeconds(2));
+            repository.recordIntent(second);
+            assertEquals(new PlanEvaluationAuditPort.Prior(second.requestId(), 2,
+                    PlanEvaluationAuditPort.Outcome.RUNNING, null), repository.findLatest(
+                    "plan_eval", "planrev_eval", "run_eval", digest).orElseThrow());
+            var known = new ProviderRequestUsage(second.requestId(), 1, 2,
+                    ProviderRequestUsage.Purpose.ASSISTANT, ProviderRequestUsage.Certainty.KNOWN,
+                    profile, new ModelUsage(11, 7, 18));
+            repository.recordUsage(new PlanEvaluationAuditPort.Usage(second.requestId(), second.planId(),
+                    second.planRevisionId(), second.runId(), known, PlanEvaluationAuditPort.Outcome.SUCCEEDED,
+                    START.plusSeconds(3), new PlanEvaluationAuditPort.EvaluationResult(
+                            GoalModels.EvaluationVerdict.MET, java.util.List.of(
+                            new GoalModels.CriterionEvaluation("criterion_test",
+                                    GoalModels.EvaluationVerdict.MET, "通过")), "通过")));
+
+            assertEquals(PlanEvaluationAuditPort.Outcome.UNKNOWN,
+                    repository.find(first.requestId()).orElseThrow().outcome());
+            assertEquals(PlanEvaluationAuditPort.Outcome.SUCCEEDED,
+                    repository.findLatest("plan_eval", "planrev_eval", "run_eval", digest)
+                            .orElseThrow().outcome());
+            assertEquals("2/2000", fixture.runUsage());
         }
     }
 
-    /** 未冻结预算不能被解释为无限预算，必须在 Provider 前拒绝 evaluator intent。 */
+    /** 重启丢失的 RUNNING 请求只能变 UNKNOWN 一次，新请求不得覆盖旧用量身份。 */
     @Test
-    void rejectsIntentWhenBudgetIsMissing() throws Exception {
-        try (Fixture fixture = fixture("missing-budget", (Integer) null, (Long) null, "VERIFYING", 0)) {
-            assertThrows(IllegalStateException.class,
-                    () -> fixture.repository().recordIntent(intent("request_plan_eval_missing", "d".repeat(64), profile())));
-            assertEquals("0/0", fixture.runUsage());
+    void marksInterruptedRequestUnknownBeforeNewAttempt() throws Exception {
+        try (Fixture fixture = fixture("interrupted-request")) {
+            var repository = fixture.repository();
+            var first = intent("request_plan_eval_interrupted", "e".repeat(64), profile());
+            repository.recordIntent(first);
+
+            assertEquals(true, repository.markInterrupted(first.requestId(), START.plusSeconds(1)));
+            assertEquals(false, repository.markInterrupted(first.requestId(), START.plusSeconds(2)));
+            assertEquals(PlanEvaluationAuditPort.Outcome.UNKNOWN,
+                    repository.find(first.requestId()).orElseThrow().outcome());
+            var next = new PlanEvaluationAuditPort.Intent("request_plan_eval_interrupted_a2", "plan_eval",
+                    "planrev_eval", "run_eval", "thr_eval", profile(), "e".repeat(64), 2,
+                    START.plusSeconds(3));
+            repository.recordIntent(next);
+            assertEquals(2, repository.findLatest("plan_eval", "planrev_eval", "run_eval",
+                    "e".repeat(64)).orElseThrow().attemptOrdinal());
+        }
+    }
+
+    /** 旧 Run 模型轮次阈值不能阻断新的合法验收请求。 */
+    @Test
+    void admitsIntentBeyondOldModelRoundBudget() throws Exception {
+        try (Fixture fixture = fixture("round-budget")) {
+            MybatisPlanEvaluationAuditRepository repository = fixture.repository();
+            ProviderRequestProfile profile = profile();
+            repository.recordIntent(intent("request_plan_eval_budget_a", "a".repeat(64), profile));
+            repository.recordIntent(intent("request_plan_eval_budget_b", "b".repeat(64), profile));
+            assertEquals("2/0", fixture.runUsage());
+        }
+    }
+
+    /** 旧预算列为空时仍依据 Plan 状态与 pause fence 接纳验收。 */
+    @Test
+    void admitsIntentWithoutOldBudgetColumns() throws Exception {
+        try (Fixture fixture = fixture("missing-budget")) {
+            fixture.repository().recordIntent(intent("request_plan_eval_missing", "d".repeat(64), profile()));
+            assertEquals("1/0", fixture.runUsage());
         }
     }
 
     /** pause fence 一旦落库，迟到 evaluator 不得重新取得 Provider 调用资格。 */
     @Test
     void rejectsIntentAfterPauseFence() throws Exception {
-        try (Fixture fixture = fixture("pause-fence", 4, 10_000, "VERIFYING", 1)) {
+        try (Fixture fixture = fixture("pause-fence", "VERIFYING", 1)) {
             assertThrows(IllegalStateException.class,
                     () -> fixture.repository().recordIntent(intent("request_plan_eval_paused", "e".repeat(64), profile())));
             assertEquals("0/0", fixture.runUsage());
@@ -144,10 +206,10 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
     /** intent 的 revision 必须仍是 Plan 当前 active revision，迟到旧 revision 不得占用预算。 */
     @Test
     void rejectsIntentForStaleRevision() throws Exception {
-        try (Fixture fixture = fixture("stale-revision", 4, 10_000, "VERIFYING", 0)) {
+        try (Fixture fixture = fixture("stale-revision")) {
             PlanEvaluationAuditPort.Intent stale = new PlanEvaluationAuditPort.Intent(
                     "request_plan_eval_stale", "plan_eval", "planrev_stale", "run_eval", "thr_eval",
-                    profile(), "f".repeat(64), START);
+                    profile(), "f".repeat(64), 1, START);
             assertThrows(IllegalStateException.class, () -> fixture.repository().recordIntent(stale));
             assertEquals("0/0", fixture.runUsage());
         }
@@ -164,29 +226,16 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
     private static PlanEvaluationAuditPort.Intent intent(String requestId, String inputDigest,
                                                           ProviderRequestProfile profile) {
         return new PlanEvaluationAuditPort.Intent(requestId, "plan_eval", "planrev_eval", "run_eval",
-                "thr_eval", profile, inputDigest, START);
+                "thr_eval", profile, inputDigest, 1, START);
     }
 
     /** 打开真实 SQLite、建最小 owner 事实并注册 Plan evaluation Mapper。 */
     private Fixture fixture(String name) throws Exception {
-        return fixture(name, 4, 10_000, "VERIFYING", 0);
+        return fixture(name, "VERIFYING", 0);
     }
 
-    /** 允许预算边界测试显式冻结 Run 上限，仍通过真实 schema 与 SQLite 事务执行。 */
-    private Fixture fixture(String name, int maxModelRounds, long wallBudgetMillis) throws Exception {
-        return fixture(name, Integer.valueOf(maxModelRounds), Long.valueOf(wallBudgetMillis), "VERIFYING", 0);
-    }
-
-    /** 用可空预算和 pause fence 复现执行前边界，确保 SQL 不提供无限预算兜底。 */
-    private Fixture fixture(String name, Integer maxModelRounds, Integer wallBudgetMillis,
-                            String runStatus, int pauseRequested) throws Exception {
-        return fixture(name, maxModelRounds, wallBudgetMillis == null ? null : Long.valueOf(wallBudgetMillis),
-                runStatus, pauseRequested);
-    }
-
-    /** 允许 SQLite fixture 显式写入缺失预算，验证严格执行策略而非测试默认值。 */
-    private Fixture fixture(String name, Integer maxModelRounds, Long wallBudgetMillis,
-                            String runStatus, int pauseRequested) throws Exception {
+    /** Fixture 只设置 Plan 状态与暂停 fence，累计模型和时长均只作诊断。 */
+    private Fixture fixture(String name, String runStatus, int pauseRequested) throws Exception {
         JaDatabase database = JaDatabase.open(DatabaseConfig.of(temp.resolve(name + ".sqlite3"), temp));
         Configuration configuration = new Configuration(new Environment("plan-evaluation-test",
                 new JdbcTransactionFactory(), database.dataSource()));
@@ -206,9 +255,8 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
             sql.executeUpdate("INSERT INTO plan_revisions(plan_revision_id,plan_id,revision_number,definition_json,plan_hash,created_by,created_at) "
                     + "VALUES('planrev_eval','plan_eval',1,'{}','" + "a".repeat(64) + "','AGENT',CURRENT_TIMESTAMP)");
             sql.executeUpdate("INSERT INTO execution_runs(run_id,plan_id,plan_revision_id,plan_hash,status,process_generation,"
-                    + "pause_requested,max_model_rounds,wall_budget_millis,created_at,updated_at) VALUES('run_eval','plan_eval',"
-                    + "'planrev_eval','" + "a".repeat(64) + "','" + runStatus + "',1," + pauseRequested + ","
-                    + sqlLiteral(maxModelRounds) + "," + sqlLiteral(wallBudgetMillis)
+                    + "pause_requested,created_at,updated_at) VALUES('run_eval','plan_eval',"
+                    + "'planrev_eval','" + "a".repeat(64) + "','" + runStatus + "',1," + pauseRequested
                     + ",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)");
             sql.executeUpdate("UPDATE plans SET status='VERIFYING',revision=1,active_plan_revision_id='planrev_eval',active_run_id='run_eval' WHERE plan_id='plan_eval'");
             session.commit();
@@ -232,11 +280,6 @@ final class MybatisPlanEvaluationAuditRepositoryTest {
         };
         return new Fixture(database, sessions, new MybatisPlanEvaluationAuditRepository(
                 sessions, new ObjectMapper(), owner));
-    }
-
-    /** 将可选测试预算编码为 SQL NULL，避免字符串拼接把缺失值伪装成零预算。 */
-    private static String sqlLiteral(Number value) {
-        return value == null ? "NULL" : value.toString();
     }
 
     /** Fixture 关闭数据库 lease，避免测试文件和 WAL 句柄泄漏到后续用例。 */

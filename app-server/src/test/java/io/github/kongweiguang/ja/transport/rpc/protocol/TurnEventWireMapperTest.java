@@ -48,11 +48,11 @@ final class TurnEventWireMapperTest {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
         TurnEvent.Context context = new TurnEvent.Context("evt_retry", "thr_test", "turn_test", 8,
                 0, Instant.parse("2026-09-23T00:00:00Z"));
-        TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.RetryStarted(context, 3, 6));
+        TurnEventWireMapper.WireEvent wire = mapper.map(new TurnEvent.RetryStarted(context, 3));
 
         assertEquals("turn/retry-started", wire.method());
         assertEquals(3, wire.params().path("attempt").intValue());
-        assertEquals(6, wire.params().path("maxAttempts").intValue());
+        assertEquals(false, wire.params().has("maxAttempts"));
         assertEquals("evt_retry", wire.params().path("eventId").textValue());
     }
 

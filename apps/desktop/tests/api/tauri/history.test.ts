@@ -116,6 +116,68 @@ function snapshot() {
 }
 
 describe("TauriHistoryAdapter v1", () => {
+  /** 长答复只通过稳定消息身份读取一页；错配或多余字段不能进入 Renderer。 */
+  it("按消息身份分页读取完整公开正文", async () => {
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      expect(command).toBe(JA_HISTORY_COMMANDS.messageContentRead);
+      return {
+        messageId: "item_answer",
+        offsetCharacters: 0,
+        nextOffsetCharacters: null,
+        totalCharacters: 2,
+        truncated: false,
+        content: "甲😀",
+      };
+    }) as unknown as HistoryNativeBridge["invoke"];
+    const adapter = new TauriHistoryAdapter({ invoke });
+    await expect(
+      adapter.messageContentRead({
+        threadId: "thr_fixture",
+        messageId: "item_answer",
+        offsetCharacters: 0,
+        limitCharacters: 32_768,
+      }),
+    ).resolves.toMatchObject({ content: "甲😀", totalCharacters: 2 });
+    expect(invoke).toHaveBeenCalledWith(JA_HISTORY_COMMANDS.messageContentRead, {
+      input: {
+        threadId: "thr_fixture",
+        messageId: "item_answer",
+        offsetCharacters: 0,
+        limitCharacters: 32_768,
+      },
+    });
+  });
+
+  it("通过独立强类型命令建立与释放 Thread 观察，并拒绝错配 ACK", async () => {
+    const invoke = vi.fn(async (_command: string, args: unknown): Promise<unknown> => {
+      const input = (args as { input: { threadId: string } }).input;
+      return { accepted: true, threadId: input.threadId };
+    });
+    const adapter = new TauriHistoryAdapter({ invoke: invoke as HistoryNativeBridge["invoke"] });
+    await expect(adapter.threadObserve({ threadId: "thr_fixture" })).resolves.toEqual({
+      accepted: true,
+      threadId: "thr_fixture",
+    });
+    await expect(adapter.threadUnobserve({ threadId: "thr_fixture" })).resolves.toEqual({
+      accepted: true,
+      threadId: "thr_fixture",
+    });
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_HISTORY_COMMANDS.threadObserve,
+      JA_HISTORY_COMMANDS.threadUnobserve,
+    ]);
+
+    const wrong = new TauriHistoryAdapter({
+      invoke: vi.fn(async () => ({
+        accepted: true,
+        threadId: "thr_other",
+      })) as HistoryNativeBridge["invoke"],
+    });
+    await expect(wrong.threadObserve({ threadId: "thr_fixture" })).rejects.toMatchObject({
+      code: "RUNTIME_UNAVAILABLE",
+    });
+  });
+
   it("uses the dedicated runtime workspace command instead of the file open-with command", () => {
     expect(JA_HISTORY_COMMANDS.workspaceOpen).toBe("ja_runtime_workspace_open");
   });
@@ -171,6 +233,8 @@ describe("TauriHistoryAdapter v1", () => {
             inputTokensBefore: 12_000,
             inputTokensAfter: 5_000,
           };
+        case JA_HISTORY_COMMANDS.threadCompactCancel:
+          return { accepted: false };
         default:
           throw new Error(`unexpected command: ${command}`);
       }
@@ -229,6 +293,9 @@ describe("TauriHistoryAdapter v1", () => {
     await adapter.threadRestore({ threadId: "thr_fixture", expectedThreadRevision: 4 });
     await adapter.threadDelete({ threadId: "thr_fixture", expectedThreadRevision: 4 });
     await adapter.threadCompact({ threadId: "thr_fixture", expectedThreadRevision: 4 });
+    expect(await adapter.threadCompactCancel({ threadId: "thr_fixture" })).toEqual({
+      accepted: false,
+    });
 
     expect(invokeMock.mock.calls).toEqual([
       [
@@ -305,6 +372,7 @@ describe("TauriHistoryAdapter v1", () => {
         JA_HISTORY_COMMANDS.threadCompact,
         { input: { threadId: "thr_fixture", expectedThreadRevision: 4 } },
       ],
+      [JA_HISTORY_COMMANDS.threadCompactCancel, { input: { threadId: "thr_fixture" } }],
     ]);
   });
 

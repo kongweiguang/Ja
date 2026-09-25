@@ -51,11 +51,13 @@ describe("official desktop plugin adapters", () => {
     expect(native.openUrl).toHaveBeenCalledOnce();
   });
 
-  it("writes bounded text without exposing a clipboard read path", async () => {
+  it("writes complete long text only after an explicit copy action", async () => {
     await writeClipboardText("复制内容");
     expect(native.writeText).toHaveBeenCalledWith("复制内容");
-    await expect(writeClipboardText("x".repeat(4_194_305))).rejects.toThrow("supported size");
-    expect(native.writeText).toHaveBeenCalledOnce();
+    const longText = "x".repeat(4_194_305);
+    await writeClipboardText(longText);
+    expect(native.writeText).toHaveBeenCalledWith(longText);
+    expect(native.writeText).toHaveBeenCalledTimes(2);
   });
 
   it("requests notification permission only from the explicit enable action", async () => {
@@ -96,7 +98,10 @@ describe("desktop capability manifest", () => {
     permissions: Array<string | { identifier: string; allow?: Array<Record<string, string>> }>;
   } {
     return JSON.parse(
-      readFileSync(resolve(process.cwd(), "src-tauri/capabilities/default.json"), "utf8"),
+      readFileSync(
+        resolve(process.cwd(), "apps/desktop/src-tauri/capabilities/default.json"),
+        "utf8",
+      ),
     ) as ReturnType<typeof capability>;
   }
 
@@ -166,7 +171,10 @@ describe("desktop capability manifest", () => {
   });
 
   it("registers single-instance before every other plugin", () => {
-    const source = readFileSync(resolve(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
+    const source = readFileSync(
+      resolve(process.cwd(), "apps/desktop/src-tauri/src/lib.rs"),
+      "utf8",
+    );
     const singleInstance = source.indexOf("builder.plugin(tauri_plugin_single_instance::init");
     expect(singleInstance).toBeGreaterThan(0);
     for (const registration of [
@@ -184,7 +192,7 @@ describe("desktop capability manifest", () => {
   /** Updater 信任根、静态端点和 v2 产物开关属于同一个发布契约，任一漂移都应在 CI 静态失败。 */
   it("pins the signed GitHub updater contract", () => {
     const configuration = JSON.parse(
-      readFileSync(resolve(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"),
+      readFileSync(resolve(process.cwd(), "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
     ) as {
       bundle: { createUpdaterArtifacts?: boolean | string };
       plugins?: {

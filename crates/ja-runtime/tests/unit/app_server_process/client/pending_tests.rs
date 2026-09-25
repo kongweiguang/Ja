@@ -79,6 +79,24 @@ fn timeout_cancel_and_close_are_bounded_terminal_paths() {
     }
 }
 
+/// 压缩等待不受旧请求 deadline 影响，仍受 active 容量、明确结果和 Session 关闭收口。
+#[test]
+fn compaction_pending_waits_for_result_or_close_without_expiring() {
+    let mut pending = PendingRegistry::new(1, 2).unwrap();
+    let result = pending.register_until_closed("c:compact").unwrap();
+    assert_eq!(pending.expire(Instant::now() + Duration::from_secs(3_600)), 0);
+    assert!(matches!(
+        pending.register_until_closed("c:second"),
+        Err(PendingRegisterError::LimitReached)
+    ));
+    assert_eq!(pending.resolve(response("c:compact")), ResolveDisposition::Delivered);
+    assert_eq!(result.recv().unwrap().unwrap().id(), "c:compact");
+
+    let closing = pending.register_until_closed("c:closing").unwrap();
+    assert_eq!(pending.close(), 1);
+    assert_eq!(closing.recv().unwrap(), Err(AppServerProcessError::SessionClosed));
+}
+
 /// 64 个 active request 到期后只保留有限 tombstone，迟到与重复响应仍必须稳定分类。
 #[test]
 fn pending64_deadline_late_duplicate_and_bounded_tombstones() {

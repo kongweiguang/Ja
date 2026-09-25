@@ -121,7 +121,7 @@ try {
     }
 
     Write-Host '正在启动 pnpm tauri dev…' -ForegroundColor Cyan
-    Invoke-CheckedCommand -Command 'pnpm.cmd' -Arguments @('exec', 'tauri', 'dev')
+    Invoke-CheckedCommand -Command 'pnpm.cmd' -Arguments @('tauri', 'dev')
 }
 finally {
     Pop-Location

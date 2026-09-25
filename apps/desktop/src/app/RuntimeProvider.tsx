@@ -41,6 +41,7 @@ export function RuntimeProvider({
       lastConfigurationEvent: controllers.state.lastConfigurationEvent,
       lastThreadMetadataEvent: controllers.state.lastThreadMetadataEvent,
       recovery: controllers.state.recovery,
+      pendingClientOperations: controllers.state.pendingClientOperations,
       runtimeState: controllers.state.runtimeState,
       turnAdmissionReady: controllers.state.turnAdmissionReady,
     }),
@@ -49,6 +50,7 @@ export function RuntimeProvider({
       controllers.state.lastConfigurationEvent,
       controllers.state.lastThreadMetadataEvent,
       controllers.state.recovery,
+      controllers.state.pendingClientOperations,
       controllers.state.runtimeState,
       controllers.state.turnAdmissionReady,
     ],
@@ -56,6 +58,8 @@ export function RuntimeProvider({
   const lifecycle = useMemo<RuntimeLifecycleController>(
     () => ({
       acknowledgeRecovery: controllers.lifecycle.acknowledgeRecovery,
+      recheckPendingOperations: controllers.lifecycle.recheckPendingOperations,
+      acknowledgePendingOperation: controllers.lifecycle.acknowledgePendingOperation,
       activateWorkspace: controllers.lifecycle.activateWorkspace,
       queryRuntime: controllers.lifecycle.queryRuntime,
       readRuntimeStorage: controllers.lifecycle.readRuntimeStorage,
@@ -64,6 +68,8 @@ export function RuntimeProvider({
     }),
     [
       controllers.lifecycle.acknowledgeRecovery,
+      controllers.lifecycle.recheckPendingOperations,
+      controllers.lifecycle.acknowledgePendingOperation,
       controllers.lifecycle.activateWorkspace,
       controllers.lifecycle.queryRuntime,
       controllers.lifecycle.readRuntimeStorage,

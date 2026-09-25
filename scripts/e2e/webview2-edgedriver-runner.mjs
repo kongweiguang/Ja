@@ -221,7 +221,7 @@ async function supervise(driver, driverPort, session) {
   });
 }
 
-/** 串起编译、官方 driver、session ACK 与退出监督，任一阶段失败都保持非零退出。 */
+/** 编译并启动 ja-desktop.exe，再监督 driver session；任一阶段失败都保持非零退出。 */
 async function main() {
   const cargo = requiredPath("JA_E2E_CARGO_COMMAND");
   const edgeDriver = requiredPath("JA_E2E_EDGEDRIVER_PATH");
@@ -230,7 +230,7 @@ async function main() {
   const driverPort = requiredPort("JA_E2E_EDGEDRIVER_PORT");
   await buildApplication(cargo, process.argv.slice(2));
   const targetDirectory = resolve(process.env.CARGO_TARGET_DIR ?? join(process.cwd(), "target"));
-  const binary = join(targetDirectory, "debug", "ja.exe");
+  const binary = join(targetDirectory, "debug", "ja-desktop.exe");
   const driverArguments =
     process.env.JA_E2E_EDGEDRIVER_VERBOSE === "1"
       ? [`--port=${driverPort}`, "--verbose"]

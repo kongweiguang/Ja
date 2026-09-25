@@ -64,15 +64,6 @@ const providerContextSchema = z
   })
   .strict();
 
-/** Turn 上限在保存前完成纯校验，避免 UI 依赖 Provider SDK 的可变默认行为。 */
-const providerTurnLimitsSchema = z
-  .object({
-    maxModelRounds: z.number().int().min(1).max(128),
-    maxToolCalls: z.number().int().min(0).max(1_024),
-    wallTimeoutMs: z.number().int().min(1_000).max(86_400_000),
-  })
-  .strict();
-
 /** 网络超时保持在 JA-RPC v1 可接受范围内，避免无界等待或立即超时。 */
 const providerNetworkTimeoutsSchema = z
   .object({
@@ -132,7 +123,6 @@ export const providerSchema = z
     agentDefaults: z
       .object({
         context: providerContextSchema,
-        turnLimits: providerTurnLimitsSchema,
       })
       .strict(),
   })

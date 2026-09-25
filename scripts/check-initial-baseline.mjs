@@ -8,7 +8,8 @@ const sourceRoots = [
   "app-server/src/main",
   "apps/desktop/src",
   "crates/ja-runtime/src",
-  "src-tauri/src",
+  "apps/cli/src",
+  "apps/desktop/src-tauri/src",
 ];
 const textExtensions = new Set([".java", ".rs", ".ts", ".tsx", ".json", ".xml", ".sql"]);
 const retiredTokens =
@@ -30,7 +31,7 @@ async function sourceFiles(directory) {
   return files;
 }
 
-/** 只允许逐项审定的初始化、对话恢复和 Workspace 身份迁移，禁止把额外历史转换混入首版。 */
+/** 只允许逐项审定的初始化、恢复、Workspace 身份与执行回执迁移，禁止加入未审定转换。 */
 export async function checkInitialBaseline(root) {
   const violations = [];
   const migrationRoot = path.join(root, "app-server/src/main/resources/db/migration");
@@ -42,12 +43,20 @@ export async function checkInitialBaseline(root) {
     "V4__conversation_recovery_usage_projection.sql",
     "V6__conversation_current_path_reask.sql",
     "V7__session_workspace_identity.sql",
+    "V8__client_operation_receipts.sql",
+    "V9__goal_progress_counter.sql",
+    "V10__unbounded_round_counters.sql",
+    "V11__execution_cursor_without_budget.sql",
+    "V12__drop_execution_budgets.sql",
+    "V13__plan_evaluation_attempts.sql",
+    "V14__assistant_public_text_pages.sql",
+    "V15__input_operation_receipts.sql",
   ];
   if (
     migrations.length !== expectedMigrations.length ||
     expectedMigrations.some((name) => !migrations.includes(name))
   ) {
-    violations.push("数据库只允许 V1 建库、V2/V3 会话策略、V4 对话恢复资源、V6 当前路径重答与 V7 Workspace 身份迁移");
+    violations.push("数据库迁移必须只包含已登记的 V1-V15 脚本");
   }
   const protocolEntries = await readdir(path.join(root, "contracts/ja-rpc"), {
     withFileTypes: true,

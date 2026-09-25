@@ -95,8 +95,7 @@ final class AgentToolRunner implements AutoCloseable {
      * 只有内建 Tool 显式声明的可信内核操作免去外部动作审批，实际 MCP 与其它工具仍遵守原权限策略。
      */
     List<AgentTool.ToolResult> execute(Execution execution, List<AgentTool.Invocation> calls) {
-        Objects.requireNonNull(execution, "execution");
-        calls = List.copyOf(Objects.requireNonNull(calls, "calls"));
+        calls = stableCalls(execution, calls);
         List<AgentTool.ToolResult> results = new ArrayList<>(calls.size());
         for (int index = 0; index < calls.size(); index++) {
             AgentTool.Invocation call = calls.get(index);
@@ -220,6 +219,29 @@ final class AgentToolRunner implements AutoCloseable {
         return List.copyOf(results);
     }
 
+    /** 输出额度截断后所有 Tool 参数都视为不完整；只提交失败结果，不进入授权或副作用路径。 */
+    List<AgentTool.ToolResult> failTruncatedCalls(Execution execution, List<AgentTool.Invocation> calls) {
+        calls = stableCalls(execution, calls);
+        List<AgentTool.ToolResult> results = new ArrayList<>(calls.size());
+        for (int index = 0; index < calls.size(); index++) {
+            AgentTool.Invocation call = calls.get(index);
+            AgentTool.ToolResult result = execution.cancellation().isCancellationRequested()
+                    ? cancelledResult()
+                    : failed("TOOL_CALL_TRUNCATED",
+                            "The model output limit cut off this Tool call. Generate a complete call again.");
+            results.add(result);
+            publishResult(execution, call, result, 0, index == calls.size() - 1);
+            observers.observe(toolCompleted(execution, call, result, 0, false));
+        }
+        return List.copyOf(results);
+    }
+
+    /** 两条结算路径都在进入循环前冻结调用清单，防止回调改变 ordinal 与身份。 */
+    private static List<AgentTool.Invocation> stableCalls(Execution execution, List<AgentTool.Invocation> calls) {
+        Objects.requireNonNull(execution, "execution");
+        return List.copyOf(Objects.requireNonNull(calls, "calls"));
+    }
+
     /**
      * 审批豁免必须同时满足内建路由和显式内核标记；路由检查防止 MCP 适配器伪造内部审批语义。
      */
@@ -307,7 +329,7 @@ final class AgentToolRunner implements AutoCloseable {
      * authority，避免把并发取消误判为普通内部错误，拒绝仍作为普通 ToolResult 返回。
      */
     private boolean awaitApproval(Execution execution, AgentTool.Invocation call) {
-        Instant expiresAt = minimum(clock.instant().plus(Duration.ofMinutes(5)), deadline(execution.command()));
+        Instant expiresAt = clock.instant().plus(Duration.ofMinutes(5));
         PermissionRequest permission = permission(execution, call);
         ConversationRepository.PendingApproval persisted = execution.approvalLookup().find(call.callId()).orElse(null);
         if (persisted != null && persisted.decision() != null) {
@@ -522,14 +544,9 @@ final class AgentToolRunner implements AutoCloseable {
                 identity.map(GoalToolExecutionPort.ExecutionIdentity::goalId).orElse(null), command.origin());
     }
 
-    /** 从 Turn 请求时刻计算所有 Tool 与审批共享的固定 Deadline。 */
+    /** 纯读取本次短租约冻结的执行窗口；静态上下文构造不得依赖 Runner 实例状态。 */
     private static Instant deadline(TurnExecutionPlan command) {
         return command.deadlineAt();
-    }
-
-    /** 选择两个时间中的较早者，审批绝不能扩大 Turn 生命周期。 */
-    private static Instant minimum(Instant first, Instant second) {
-        return first.isBefore(second) ? first : second;
     }
 
     /** 构造未执行调用的确定性失败结果。 */
@@ -551,8 +568,7 @@ final class AgentToolRunner implements AutoCloseable {
             TurnExecutionState.Common current, AgentPromptSession promptSession) {
         return new TurnExecutionState.Common(current.modelRound(), current.usedToolCalls(),
                 current.nextProviderOrdinal(), current.promptCheckpointId(),
-                promptSession.activeSkillReferences(), current.deadlineAt(), current.origin(),
-                current.activeBudget());
+                promptSession.activeSkillReferences(), current.origin());
     }
 
     /** 同步取得异步端口结果并保留运行时异常类型。 */

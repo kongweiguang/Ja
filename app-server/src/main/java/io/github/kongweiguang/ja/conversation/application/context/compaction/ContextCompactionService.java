@@ -64,8 +64,8 @@ public final class ContextCompactionService {
     }
 
     /**
-     * 在策略确认确需压缩并取得完整 envelope 官方计量后同步通知 started；观察器先于摘要调用，
-     * 从而让自动和手动入口共享真实副作用边界，而不是由 RPC Handler 推测生命周期。
+     * 在策略确认确需压缩并取得完整 envelope 官方计量后同步通知 started；观察器先于摘要调用。
+     * 没有可淘汰事实且压缩投影不更小时直接保留原提示，避免短对话误报窗口不足或产生空检查点。
      */
     public CompactionResult compact(CompactionRequest request, CompactionStartObserver observer) {
         Objects.requireNonNull(request, "request");
@@ -97,7 +97,9 @@ public final class ContextCompactionService {
                 request.forceCompaction(), request.continuation(), request.outputLimits(), projection.selections());
         ContextPolicy.Plan plan = policy.plan(input, request.meter());
         checkpoints.persistProjection(projection, plan.projectionChoices());
-        if (!plan.requiresCompaction()) {
+        boolean noSmallerEnvelope = plan.summaryInput().isEmpty() && plan.fullPromptFits()
+                && plan.compactedPromptTokens() >= plan.fullPromptTokens();
+        if (!plan.requiresCompaction() || noSmallerEnvelope) {
             if (!plan.fullPromptFits()) {
                 throw new ContextException(ContextException.Code.CONTEXT_LIMIT,
                         "context exceeds the provider send ceiling while automatic compaction is disabled");

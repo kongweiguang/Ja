@@ -5,8 +5,8 @@ package io.github.kongweiguang.ja.conversation.application.loop;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointStore;
 import io.github.kongweiguang.ja.conversation.application.observation.ExecutionObservers;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
-import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.model.PublicTextPreview;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.ProviderRequestUsage;
@@ -23,7 +23,6 @@ import io.github.kongweiguang.ja.conversation.port.out.ExecutionObserver;
 import io.github.kongweiguang.ja.conversation.port.out.TaskMailboxPort;
 
 import java.time.Clock;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -340,8 +339,7 @@ final class AgentLoopPersistence {
         TurnExecutionState.Common current = ready.common();
         TurnExecutionState.Common updated = new TurnExecutionState.Common(
                 current.modelRound(), current.usedToolCalls(), current.nextProviderOrdinal(),
-                current.promptCheckpointId(), boundary.activeSkills(), current.deadlineAt(), current.origin(),
-                current.activeBudget());
+                current.promptCheckpointId(), boundary.activeSkills(), current.origin());
         return new TurnExecutionState.Ready(updated, ready.next(), ready.summary());
     }
 
@@ -390,8 +388,10 @@ final class AgentLoopPersistence {
                 .filter(ConversationRepository.AssistantFact.class::isInstance)
                 .map(ConversationRepository.AssistantFact.class::cast).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("STOP continuation requires assistant fact"));
-        return new TurnEvent.AssistantSettlement(assistant.messageId(), assistant.publicText(),
-                assistant.modelRound(), Objects.requireNonNull(usage, "usage"), assistant.reasoningSummary());
+        return new TurnEvent.AssistantSettlement(assistant.messageId(),
+                PublicTextPreview.wire(assistant.publicText()),
+                assistant.modelRound(), Objects.requireNonNull(usage, "usage"),
+                PublicTextPreview.wire(assistant.reasoningSummary()));
     }
 
     /**
@@ -524,11 +524,8 @@ final class AgentLoopPersistence {
         }
         TurnEvent.StateChanged draft = new TurnEvent.StateChanged(
                 draftContext(request, state), state.state, TurnState.SUSPENDED);
-        /* 将挂起瞬间的剩余活动预算写入同一事务；绝对 deadline 只服务当前运行，不能让用户等待消耗额度。 */
         Instant suspendedAt = clock.instant();
-        Duration remaining = Duration.between(suspendedAt, state.execution.common().deadlineAt());
-        TurnExecutionState pausedExecution = state.execution.withActiveBudget(
-                remaining.isNegative() ? Duration.ZERO : remaining);
+        TurnExecutionState pausedExecution = state.execution;
         ConversationRepository.InteractionSuspensionReceipt receipt = store.suspendForInteraction(
                 new ConversationRepository.InteractionSuspensionRequest(
                         interaction, pausedExecution, state.turnMutationVersion, suspendedAt));
@@ -550,12 +547,8 @@ final class AgentLoopPersistence {
         ConversationRepository.TurnSnapshot current = store.findTurn(request.threadId(), request.turnId())
                 .orElse(null);
         if (current == null || current.state().terminal()) return false;
-        /* 取消 claim 只表示停止新调用；这里再把暂停瞬间的剩余活动预算写入 cursor，
-         * 使用户等待和应用重启都不会消耗 Plan 的执行时长。 */
         Instant suspendedAt = clock.instant();
-        Duration remaining = Duration.between(suspendedAt, state.execution.common().deadlineAt());
-        TurnExecutionState pausedExecution = state.execution.withActiveBudget(
-                remaining.isNegative() ? Duration.ZERO : remaining);
+        TurnExecutionState pausedExecution = state.execution;
         if (!store.suspendCancelled(request.threadId(), request.turnId(), current.threadRevision(),
                 current.turnMutationVersion(), pausedExecution, suspendedAt)) return false;
         state.execution = pausedExecution;
@@ -665,12 +658,13 @@ final class AgentLoopPersistence {
                                         committedContext(request, receipt.threadRevision(),
                                                 receipt.turnMutationVersion()),
                                         target,
-                                        text,
+                                        PublicTextPreview.wire(text),
                                         errorCode,
                                         errorMessage,
                                         finalMessage == null
                                                 ? null
-                                                : new TurnEvent.FinalMessage(messageId, visibleText(finalMessage)),
+                                                : new TurnEvent.FinalMessage(messageId,
+                                                        PublicTextPreview.wireFrom(finalMessage)),
                                         providerPending == null ? committedUsage
                                                 : requestUsage(providerPending, usage, modelRound, requestOrdinal),
                                         Objects.requireNonNull(frozenChange.get(), "frozen change set").changeSet()),
@@ -778,16 +772,6 @@ final class AgentLoopPersistence {
         }
     }
 
-    /**
-     * 只拼接最终消息中的文本块，避免把 Tool 调用结构泄露为用户可见摘要。
-     */
-    private static String visibleText(ModelMessage message) {
-        StringBuilder result = new StringBuilder();
-        for (ModelContent content : message.content()) {
-            if (content instanceof TextContent text) result.append(text.text());
-        }
-        return result.toString();
-    }
 
     /**
      * 在同步 Loop 边界等待异步 Sink，并解包运行时异常以保留原始失败分类。

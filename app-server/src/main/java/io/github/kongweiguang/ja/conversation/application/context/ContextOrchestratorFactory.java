@@ -43,7 +43,7 @@ public final class ContextOrchestratorFactory {
     }
 
     /**
-     * 在绑定仍有效时创建专属编排器；过期或取消的 Turn 不得启动摘要模型。
+     * 在绑定仍有效时创建专属编排器；每次摘要请求重新取得同长度短租约。
      */
     public ContextOrchestrator create(SummaryModel.TurnBinding binding) {
         return create(binding, ModelSummaryGenerator.SummaryOperation.none());
@@ -60,7 +60,10 @@ public final class ContextOrchestratorFactory {
             throw new ContextException(ContextException.Code.SUMMARY_FAILURE,
                     "summary model deadline expired before Turn binding");
         }
-        return create(binding.threadId(), () -> ModelSummaryGenerator.RequestRuntime.unprofiled(binding), operation);
+        java.time.Duration requestWindow = java.time.Duration.between(clock.instant(), binding.deadline());
+        return create(binding.threadId(), () -> ModelSummaryGenerator.RequestRuntime.unprofiled(
+                new SummaryModel.TurnBinding(binding.threadId(), binding.configuration(),
+                        clock.instant().plus(requestWindow), binding.cancellationToken())), operation);
     }
 
     /**

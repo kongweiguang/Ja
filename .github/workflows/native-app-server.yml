@@ -18,8 +18,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
-      - "src-tauri/**"
-      - "apps/desktop/**"
+      - "apps/**"
+      - "packages/**"
       - "package.json"
       - "knip.jsonc"
       - "pnpm-lock.yaml"
@@ -43,8 +43,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
-      - "src-tauri/**"
-      - "apps/desktop/**"
+      - "apps/**"
+      - "packages/**"
       - "package.json"
       - "knip.jsonc"
       - "pnpm-lock.yaml"
@@ -302,7 +302,7 @@ jobs:
       - name: Cache Rust verification dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          workspaces: ". -> src-tauri/target"
+          workspaces: ". -> target"
           shared-key: ja-windows-verification
 
       # 功能测试依赖系统 Windows PowerShell；在真正执行 JVM/Git/Shell 测试的 runner 上确认它可启动，
@@ -458,7 +458,7 @@ jobs:
       - name: Cache target-specific Rust build dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          workspaces: ". -> src-tauri/target"
+          workspaces: ". -> target"
           shared-key: ja-native-${{ matrix.platform }}-${{ matrix.arch }}
           cache-on-failure: true
 
@@ -521,7 +521,7 @@ jobs:
           if ((node --version).Trim() -ne 'v24.10.0') { throw 'Node.js version drifted from the locked project toolchain' }
           pnpm --version
           if ((pnpm --version).Trim() -ne '10.33.0') { throw 'pnpm version drifted from the locked project toolchain' }
-          pnpm exec tauri --version
+          pnpm tauri --version
 
       - name: Verify frontend and Tauri toolchain (macOS)
         if: matrix.platform == 'macos'
@@ -531,7 +531,7 @@ jobs:
           node --version
           test "$(node --version)" = "v24.10.0"
           test "$(pnpm --version)" = "10.33.0"
-          pnpm exec tauri --version
+          pnpm tauri --version
 
       - name: Install pinned Liberica NIK (Windows)
         if: matrix.platform == 'windows'
@@ -864,7 +864,7 @@ jobs:
           $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
           $toolsSource = Join-Path $stage 'sidecars/tools'
           $toolsManifest = Join-Path $toolsSource 'tools-manifest.json'
-          $sidecars = Join-Path $PWD 'src-tauri/sidecars'
+          $sidecars = Join-Path $PWD 'apps/desktop/src-tauri/sidecars'
           $target = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
           $toolsTarget = Join-Path $sidecars 'tools'
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
@@ -876,16 +876,16 @@ jobs:
             if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
             if (-not (Test-Path -LiteralPath $toolsSource -PathType Container)) { throw 'staged search-tool directory is missing' }
             if (-not (Test-Path -LiteralPath $toolsManifest -PathType Leaf)) { throw 'staged search-tool manifest is missing' }
-            if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
-            if (Test-Path -LiteralPath $toolsTarget) { throw 'src-tauri/sidecars/tools already exists' }
+            if (Test-Path -LiteralPath $target) { throw 'apps/desktop/src-tauri/sidecars already contains the target sidecar' }
+            if (Test-Path -LiteralPath $toolsTarget) { throw 'apps/desktop/src-tauri/sidecars/tools already exists' }
             $targetCreated = $true
             Copy-Item -LiteralPath $source -Destination $target
             $toolsCreated = $true
             Copy-Item -LiteralPath $toolsSource -Destination $toolsTarget -Recurse
-            '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
-            pnpm exec tauri build --ci --no-sign --bundles nsis
+            '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
+            pnpm tauri build --ci --no-sign --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
-            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --no-sign
+            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --no-sign
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
             if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
@@ -908,7 +908,7 @@ jobs:
           $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
           $toolsSource = Join-Path $stage 'sidecars/tools'
           $toolsManifest = Join-Path $toolsSource 'tools-manifest.json'
-          $sidecars = Join-Path $PWD 'src-tauri/sidecars'
+          $sidecars = Join-Path $PWD 'apps/desktop/src-tauri/sidecars'
           $target = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
           $toolsTarget = Join-Path $sidecars 'tools'
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
@@ -920,16 +920,16 @@ jobs:
             if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
             if (-not (Test-Path -LiteralPath $toolsSource -PathType Container)) { throw 'staged search-tool directory is missing' }
             if (-not (Test-Path -LiteralPath $toolsManifest -PathType Leaf)) { throw 'staged search-tool manifest is missing' }
-            if (Test-Path -LiteralPath $target) { throw 'src-tauri/sidecars already contains the target sidecar' }
-            if (Test-Path -LiteralPath $toolsTarget) { throw 'src-tauri/sidecars/tools already exists' }
+            if (Test-Path -LiteralPath $target) { throw 'apps/desktop/src-tauri/sidecars already contains the target sidecar' }
+            if (Test-Path -LiteralPath $toolsTarget) { throw 'apps/desktop/src-tauri/sidecars/tools already exists' }
             $targetCreated = $true
             Copy-Item -LiteralPath $source -Destination $target
             $toolsCreated = $true
             Copy-Item -LiteralPath $toolsSource -Destination $toolsTarget -Recurse
-            '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
-            pnpm exec tauri build --ci --bundles nsis
+            '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
+            pnpm tauri build --ci --bundles nsis
             if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle with updater signature failed with exit code $LASTEXITCODE" }
-            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --updater-signed
+            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --updater-signed
             if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
           } finally {
             if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
@@ -945,7 +945,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # Release and non-release bundles share the installer lifecycle check; the
           # operating-system signature is intentionally absent while updater signing stays separate.
-          $installers = @(Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
+          $installers = @(Get-ChildItem -LiteralPath 'target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
           if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'installer-smoke.json'
           & pwsh -NoProfile -File 'scripts/native/run-windows-installer-smoke.ps1' `
@@ -966,7 +966,7 @@ jobs:
           source_manifest="$stage/sidecar-manifest.json"
           tools_source="$stage/sidecars/tools"
           tools_manifest="$tools_source/tools-manifest.json"
-          sidecars="src-tauri/sidecars"
+          sidecars="apps/desktop/src-tauri/sidecars"
           target="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
           tools_target="$sidecars/tools"
           evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
@@ -988,9 +988,9 @@ jobs:
           cp -- "$source" "$target"
           tools_created=true
           cp -R -- "$tools_source" "$tools_target"
-          printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
-          pnpm exec tauri build --ci --no-sign --bundles dmg
-          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --no-sign
+          printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
+          pnpm tauri build --ci --no-sign --bundles dmg
+          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --no-sign
           cleanup
           trap - EXIT
           test ! -e "$target"
@@ -1010,7 +1010,7 @@ jobs:
           source_manifest="$stage/sidecar-manifest.json"
           tools_source="$stage/sidecars/tools"
           tools_manifest="$tools_source/tools-manifest.json"
-          sidecars="src-tauri/sidecars"
+          sidecars="apps/desktop/src-tauri/sidecars"
           target="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
           tools_target="$sidecars/tools"
           evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
@@ -1032,9 +1032,9 @@ jobs:
           cp -- "$source" "$target"
           tools_created=true
           cp -R -- "$tools_source" "$tools_target"
-          printf '%s\n' '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm exec tauri build --ci --bundles app,dmg"}' > "$evidence/bundle-contract.json"
-          pnpm exec tauri build --ci --bundles app,dmg
-          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'src-tauri/target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --updater-signed
+          printf '%s\n' '{"noSign":false,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --bundles app,dmg"}' > "$evidence/bundle-contract.json"
+          pnpm tauri build --ci --bundles app,dmg
+          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --updater-signed
           cleanup
           trap - EXIT
           test ! -e "$target"
@@ -1046,7 +1046,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'release-sbom'
-          $bundle = (Resolve-Path 'src-tauri/target/release/bundle/nsis').Path
+          $bundle = (Resolve-Path 'target/release/bundle/nsis').Path
           # 无 target 的离线 metadata 覆盖全部平台依赖，先按 lock 补齐 registry 缓存。
           cargo fetch --locked
           if ($LASTEXITCODE -ne 0) { throw 'Cargo SBOM dependency preparation failed' }
@@ -1070,7 +1070,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'release-sbom'
-          $bundle = (Resolve-Path 'src-tauri/target/release/bundle/dmg').Path
+          $bundle = (Resolve-Path 'target/release/bundle/dmg').Path
           cargo fetch --locked
           if ($LASTEXITCODE -ne 0) { throw 'Cargo SBOM dependency preparation failed' }
           pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
@@ -1197,8 +1197,8 @@ jobs:
             app-server/target/ja-app-server.exe
             ${{ runner.temp }}/ja-native-evidence
             ${{ runner.temp }}/ja-native-stage
-            src-tauri/target/release/bundle/${{ matrix.tauriBundle }}
-            src-tauri/target/release/bundle/macos
+            target/release/bundle/${{ matrix.tauriBundle }}
+            target/release/bundle/macos
             ${{ runner.temp }}/ja-tauri-bundle-evidence
           if-no-files-found: warn
           compression-level: 0

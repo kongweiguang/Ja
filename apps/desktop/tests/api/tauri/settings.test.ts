@@ -31,7 +31,6 @@ const CONFIG = {
       network_timeouts: { connect_timeout_ms: 10_000, request_timeout_ms: 120_000 },
       agent_defaults: {
         context: { auto_compact: true },
-        turn_limits: { max_model_rounds: 32, max_tool_calls: 128, wall_timeout_ms: 3_600_000 },
       },
       models: [
         {
@@ -49,7 +48,7 @@ const CONFIG = {
     },
   ],
   mcp_servers: [],
-  skills: [],
+  disabled_skills: [],
 } as const;
 
 /** 构造 configuration/read 的完整脱敏 envelope，避免测试跳过 CAS 和 layer 契约。 */
@@ -92,7 +91,6 @@ function uiDocument(): SettingsDocument {
         networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
         agentDefaults: {
           context: { autoCompact: true },
-          turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3_600_000 },
         },
         models: [
           {
@@ -110,7 +108,7 @@ function uiDocument(): SettingsDocument {
       },
     ],
     mcpServers: [],
-    skills: [],
+    disabledSkills: [],
     window: { width: 1280, height: 800, maximized: false },
   };
 }
@@ -183,8 +181,7 @@ describe("TauriSettingsAdapter v1", () => {
         document: {
           schema_version: 2,
           config_revision: 3,
-          skills: ["project:one"],
-          disabled_skills: ["user:one"],
+          disabled_skills: ["project:one"],
         },
       },
     };
@@ -195,13 +192,12 @@ describe("TauriSettingsAdapter v1", () => {
     expect(loaded.projectOverrides).toEqual({
       defaultSelection: false,
       accessMode: false,
-      disabledSkillReferences: ["user:one"],
+      disabledSkillReferences: ["project:one"],
     });
     expect(loaded.projectSkillDocument).toEqual({
       schemaVersion: 2,
       revision: 3,
-      skills: ["project:one"],
-      disabledSkills: ["user:one"],
+      disabledSkills: ["project:one"],
     });
   });
 

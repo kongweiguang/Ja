@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
-import * as Tabs from "@radix-ui/react-tabs";
 import {
   ChevronDown,
   CircleAlert,
@@ -17,7 +16,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { toast } from "sonner";
 import {
@@ -97,7 +96,12 @@ export function McpSection({
   servers,
   projectServers,
   projectAvailable = false,
+  projectUnavailableMessage = "选择可信项目后管理其 MCP 服务",
   projectWorkspaceId,
+  projectName,
+  projectPicker,
+  onDraftStateChange,
+  onBusyChange,
   snapshotRevision = 0,
   onSaveMcp,
   onDeleteMcp,
@@ -108,7 +112,12 @@ export function McpSection({
   servers: McpServerProjection[];
   projectServers?: McpServerProjection[];
   projectAvailable?: boolean;
+  projectUnavailableMessage?: string;
   projectWorkspaceId?: string;
+  projectName?: string;
+  projectPicker?: ReactNode;
+  onDraftStateChange?: (dirty: boolean) => void;
+  onBusyChange?: (busy: boolean) => void;
   snapshotRevision?: number;
   onSaveMcp: SettingsPorts["onSaveMcp"];
   onDeleteMcp: SettingsPorts["onDeleteMcp"];
@@ -116,10 +125,12 @@ export function McpSection({
   onReplaceCredential: SettingsPorts["onReplaceCredential"];
   onClearCredential: SettingsPorts["onClearCredential"];
 }): ReactElement {
-  const [scope, setScope] = useState<"user" | "project">(projectAvailable ? "project" : "user");
-  const visibleServers = scope === "project" ? (projectServers ?? []) : servers;
+  const [scope, setScope] = useState<"user" | "project">("user");
   const [feedback, setFeedback] = useState<string>();
   const [pending, setPending] = useState<string>();
+  const targetIdentityRef = useRef(projectWorkspaceId);
+  targetIdentityRef.current = projectWorkspaceId;
+  const previousProjectIdRef = useRef(projectWorkspaceId);
   // 默认先展示列表；创建服务必须由用户显式发起，避免进入页面就产生草稿状态。
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<McpServerProjection>();
@@ -143,13 +154,28 @@ export function McpSection({
   const credentialRef = watch("credentialRef");
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  /** 工作区切换时撤销旧项目表单，避免保存到新的项目身份。 */
+  /** 连接测试和写入中锁定项目目标，避免保存回读落到另一项目画面。 */
   useEffect(() => {
-    setScope(projectAvailable ? "project" : "user");
-    setEditorOpen(false);
-    setDeleteTarget(undefined);
+    onBusyChange?.(pending !== undefined || formState.isSubmitting);
+    return () => onBusyChange?.(false);
+  }, [formState.isSubmitting, onBusyChange, pending]);
+
+  /** 只把未保存状态上报给共同的项目选择器，草稿内容仍留在本表单内。 */
+  useEffect(() => {
+    onDraftStateChange?.(editorOpen && formState.isDirty);
+    return () => onDraftStateChange?.(false);
+  }, [editorOpen, formState.isDirty, onDraftStateChange]);
+
+  /** 目标 ID 变化只撤销项目草稿；全局草稿与项目筛选无关，异步就绪也不能关闭它。 */
+  useEffect(() => {
+    if (previousProjectIdRef.current === projectWorkspaceId) return;
+    previousProjectIdRef.current = projectWorkspaceId;
+    if (scope === "project") {
+      setEditorOpen(false);
+      setDeleteTarget(undefined);
+    }
     setFeedback(undefined);
-  }, [projectAvailable, projectWorkspaceId]);
+  }, [projectWorkspaceId, scope]);
   const firstErrorField = Object.keys(formState.errors)[0] as
     | keyof McpServerDraft
     | "root"
@@ -181,7 +207,11 @@ export function McpSection({
   }, [advancedOpen, firstErrorField, firstErrorIsAdvanced, setFocus]);
 
   /** 新建和编辑共用一个受控草稿；投影健康字段绝不进入持久化表单。 */
-  const openEditor = (server?: McpServerProjection): void => {
+  const openEditor = (
+    server?: McpServerProjection,
+    targetScope: "user" | "project" = "user",
+  ): void => {
+    setScope(targetScope);
     setEditingServer(server);
     setAdvancedOpen(
       server !== undefined &&
@@ -252,7 +282,11 @@ export function McpSection({
   };
 
   /** 启停只更新同一 MCP 定义，停用项因此可原位重新启用且不丢失连接信息。 */
-  const toggleServer = async (server: McpServerProjection, enabled: boolean): Promise<void> => {
+  const toggleServer = async (
+    server: McpServerProjection,
+    enabled: boolean,
+    targetScope: "user" | "project",
+  ): Promise<void> => {
     // 启停改变连接语义，必须同时清除上一次测试反馈，避免停用后仍宣称已连接。
     setFeedback(undefined);
     setPending(server.id);
@@ -269,7 +303,7 @@ export function McpSection({
           auth: { ...server.auth },
           enabled,
         },
-        scope,
+        targetScope,
       );
     } catch (error) {
       toast.error(
@@ -296,11 +330,16 @@ export function McpSection({
   };
 
   /** 只能通过 Host 回调执行测试；Host 错误由 controller 投影，UI 不保留旧健康反馈。 */
-  const testServer = async (server: McpServerProjection): Promise<void> => {
+  const testServer = async (
+    server: McpServerProjection,
+    targetScope: "user" | "project",
+  ): Promise<void> => {
+    const targetIdentity = targetIdentityRef.current;
     setPending(server.id);
     setFeedback(undefined);
     try {
-      const status = await onTestMcp(server.id, scope);
+      const status = await onTestMcp(server.id, targetScope);
+      if (targetIdentityRef.current !== targetIdentity) return;
       setFeedback(
         status === "connected"
           ? `${server.name} 服务已连接，工具目录已读取。`
@@ -309,6 +348,7 @@ export function McpSection({
       if (status === "connected") toast.success(`${server.name} 服务已连接`);
       else toast.error(`${server.name}：${mcpStatusLabel(status)}`);
     } catch {
+      if (targetIdentityRef.current !== targetIdentity) return;
       setFeedback(`${server.name} 检查请求未完成，请检查 sidecar 状态。`);
       toast.error(`${server.name} 检查请求未完成`);
     } finally {
@@ -320,147 +360,179 @@ export function McpSection({
     <div className="ja-settings-section ja-mcp-section">
       <SectionHeader
         title="MCP 工具"
-        description="连接外部工具，并按需启用。此处检查服务目录，不代表当前会话已加载这些工具。"
-        action={
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            onClick={(event) => {
-              editorReturnFocusRef.current = event.currentTarget;
-              openEditor();
-            }}
-            disabled={pending !== undefined}
-          >
-            <Plus size={14} aria-hidden="true" />
-            新增服务
-          </Button>
-        }
+        description="新增服务默认启用；此处检查不代表当前会话已加载工具。"
       />
-      <Tabs.Root value={scope} onValueChange={(value) => setScope(value as "user" | "project")}>
-        <Tabs.List className="ja-mcp-scope-tabs" aria-label="MCP 作用域">
-          <Tabs.Trigger value="user" disabled={pending !== undefined || editorOpen}>
-            全局
-          </Tabs.Trigger>
-          {projectAvailable ? (
-            <Tabs.Trigger value="project" disabled={pending !== undefined || editorOpen}>
-              当前项目
-            </Tabs.Trigger>
-          ) : null}
-        </Tabs.List>
-      </Tabs.Root>
-      <div
-        className="ja-mcp-list"
-        aria-label={scope === "project" ? "当前项目 MCP 服务" : "全局 MCP 服务"}
-      >
-        {visibleServers.length === 0 ? (
-          <div className="ja-mcp-empty">
-            <span className="ja-mcp-empty-icon" aria-hidden="true">
-              <Server size={19} />
-            </span>
-            <div>
-              <strong>还没有 MCP 服务</strong>
-              <p>添加一个本地进程或 HTTP 服务，让 Ja 可以按需使用它的工具。</p>
-            </div>
-          </div>
-        ) : (
-          visibleServers.map((server) => (
-            <article
-              className={`ja-mcp-row ${server.enabled ? "is-enabled" : "is-disabled"}`}
-              data-setting-id={`mcp-${server.id}`}
-              data-setting-search={`${server.name} ${server.endpoint} mcp server ${server.transport}`}
-              key={server.id}
-            >
-              <div className="ja-mcp-row-main">
-                <span className="ja-mcp-row-icon" aria-hidden="true">
-                  {server.transport === "stdio" ? <Terminal size={17} /> : <Globe2 size={17} />}
-                </span>
-                <div className="ja-mcp-row-copy">
-                  <div className="ja-mcp-row-title">
-                    <h3>{server.name}</h3>
-                    <span className={`ja-mcp-status is-${server.status}`}>
-                      <span className="ja-mcp-status-dot" aria-hidden="true" />
-                      {mcpStatusLabel(server.status)}
-                    </span>
-                  </div>
-                  <div className="ja-mcp-row-details">
-                    <span>{server.transport === "stdio" ? "本地进程" : "Streamable HTTP"}</span>
-                    <code title={server.endpoint}>{server.endpoint}</code>
-                    <span>{mcpToolCountLabel(server)}</span>
-                  </div>
-                </div>
-                <div className="ja-mcp-row-toggle">
-                  <SwitchField
-                    id={`mcp-enabled-${server.id}`}
-                    label={server.name + "：" + (server.enabled ? "已启用" : "已停用")}
-                    hideLabel
-                    checked={server.enabled}
-                    disabled={pending !== undefined}
-                    onCheckedChange={(enabled) => void toggleServer(server, enabled)}
-                  />
-                </div>
+      {(["user", "project"] as const).map((targetScope) => {
+        const visibleServers = targetScope === "project" ? (projectServers ?? []) : servers;
+        return (
+          <section
+            className="ja-capability-group"
+            aria-label={targetScope === "user" ? "全局 MCP 服务" : "项目 MCP 服务"}
+            key={targetScope}
+          >
+            <div className="ja-capability-group-header">
+              <div className="ja-capability-group-title">
+                <h3>{targetScope === "user" ? "全局" : "项目"}</h3>
+                {targetScope === "project" ? projectPicker : null}
               </div>
-              {server.lastError === undefined ? null : (
-                <p className="ja-settings-error ja-mcp-error" role="alert">
-                  <CircleAlert size={14} aria-hidden="true" />
-                  {server.lastError}
-                </p>
-              )}
-              {server.tools.length === 0 ? null : (
-                <div className="ja-mcp-tools">
-                  {server.tools.map((tool) => (
-                    <span className="ja-mcp-chip" key={tool.name}>
-                      {tool.name} · {tool.policy}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="ja-mcp-row-actions">
+              {targetScope === "user" || projectAvailable ? (
                 <Button
                   type="button"
-                  variant="ghost"
+                  variant="secondary"
                   size="sm"
-                  onClick={() => void testServer(server)}
-                  disabled={pending !== undefined || !server.enabled}
+                  onClick={(event) => {
+                    editorReturnFocusRef.current = event.currentTarget;
+                    openEditor(undefined, targetScope);
+                  }}
+                  disabled={pending !== undefined}
                 >
-                  <Play size={14} aria-hidden="true" />
-                  测试
+                  <Plus size={14} aria-hidden="true" />
+                  新增服务
                 </Button>
-                <Menu>
-                  <MenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      aria-label={`${server.name} 更多操作`}
-                      disabled={pending !== undefined}
-                      onPointerDown={(event) => {
-                        editorReturnFocusRef.current = event.currentTarget;
-                      }}
-                    >
-                      <MoreHorizontal size={16} aria-hidden="true" />
-                    </Button>
-                  </MenuTrigger>
-                  <MenuContent align="end">
-                    <MenuItem onSelect={() => openEditor(server)} disabled={pending !== undefined}>
-                      <Pencil size={14} aria-hidden="true" />
-                      编辑
-                    </MenuItem>
-                    <MenuItem
-                      className="is-danger"
-                      onSelect={() => setDeleteTarget(server)}
-                      disabled={pending !== undefined}
-                    >
-                      <Trash2 size={14} aria-hidden="true" />
-                      删除
-                    </MenuItem>
-                  </MenuContent>
-                </Menu>
+              ) : null}
+            </div>
+            {targetScope === "project" && !projectAvailable ? (
+              <div className="ja-mcp-project-empty" role="status">
+                {projectUnavailableMessage}
               </div>
-            </article>
-          ))
-        )}
-      </div>
+            ) : (
+              <div
+                className="ja-mcp-list"
+                aria-label={targetScope === "project" ? "项目 MCP 服务" : "全局 MCP 服务"}
+              >
+                {visibleServers.length === 0 ? (
+                  <div className="ja-mcp-empty">
+                    <span className="ja-mcp-empty-icon" aria-hidden="true">
+                      <Server size={19} />
+                    </span>
+                    <div>
+                      <strong>还没有 MCP 服务</strong>
+                      <p>添加一个本地进程或 HTTP 服务，让 Ja 可以按需使用它的工具。</p>
+                    </div>
+                  </div>
+                ) : (
+                  visibleServers.map((server) => (
+                    <article
+                      className={`ja-mcp-row ${server.enabled ? "is-enabled" : "is-disabled"}`}
+                      data-setting-id={`mcp-${targetScope}-${server.id}`}
+                      data-setting-search={`${server.name} ${server.endpoint} mcp server ${server.transport}`}
+                      key={server.id}
+                    >
+                      <div className="ja-mcp-row-main">
+                        <span className="ja-mcp-row-icon" aria-hidden="true">
+                          {server.transport === "stdio" ? (
+                            <Terminal size={17} />
+                          ) : (
+                            <Globe2 size={17} />
+                          )}
+                        </span>
+                        <div className="ja-mcp-row-copy">
+                          <div className="ja-mcp-row-title">
+                            <h3>{server.name}</h3>
+                            <span className={`ja-mcp-status is-${server.status}`}>
+                              <span className="ja-mcp-status-dot" aria-hidden="true" />
+                              {mcpStatusLabel(server.status)}
+                            </span>
+                          </div>
+                          <div className="ja-mcp-row-details">
+                            <span>
+                              {server.transport === "stdio" ? "本地进程" : "Streamable HTTP"}
+                            </span>
+                            <code title={server.endpoint}>{server.endpoint}</code>
+                            <span>{mcpToolCountLabel(server)}</span>
+                          </div>
+                        </div>
+                        <div className="ja-mcp-row-toggle">
+                          <SwitchField
+                            id={`mcp-enabled-${targetScope}-${server.id}`}
+                            label={server.name + "：" + (server.enabled ? "已启用" : "已停用")}
+                            hideLabel
+                            checked={server.enabled}
+                            disabled={pending !== undefined}
+                            onCheckedChange={(enabled) =>
+                              void toggleServer(server, enabled, targetScope)
+                            }
+                          />
+                        </div>
+                      </div>
+                      {server.lastError === undefined ? null : (
+                        <p className="ja-settings-error ja-mcp-error" role="alert">
+                          <CircleAlert size={14} aria-hidden="true" />
+                          {server.lastError}
+                        </p>
+                      )}
+                      {server.tools.length === 0 ? null : (
+                        <details className="ja-mcp-tool-disclosure">
+                          <summary
+                            aria-label={`${server.name} 的工具目录，共 ${server.tools.length} 个`}
+                          >
+                            查看工具目录
+                          </summary>
+                          <div className="ja-mcp-tools">
+                            {server.tools.map((tool) => (
+                              <span className="ja-mcp-chip" key={tool.name}>
+                                {tool.name} · {tool.policy}
+                              </span>
+                            ))}
+                          </div>
+                        </details>
+                      )}
+                      <div className="ja-mcp-row-actions">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => void testServer(server, targetScope)}
+                          disabled={pending !== undefined || !server.enabled}
+                        >
+                          <Play size={14} aria-hidden="true" />
+                          测试
+                        </Button>
+                        <Menu>
+                          <MenuTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`${server.name} 更多操作`}
+                              disabled={pending !== undefined}
+                              onPointerDown={(event) => {
+                                editorReturnFocusRef.current = event.currentTarget;
+                              }}
+                            >
+                              <MoreHorizontal size={16} aria-hidden="true" />
+                            </Button>
+                          </MenuTrigger>
+                          <MenuContent align="end">
+                            <MenuItem
+                              onSelect={() => openEditor(server, targetScope)}
+                              disabled={pending !== undefined}
+                            >
+                              <Pencil size={14} aria-hidden="true" />
+                              编辑
+                            </MenuItem>
+                            <MenuItem
+                              className="is-danger"
+                              onSelect={() => {
+                                setScope(targetScope);
+                                setDeleteTarget(server);
+                              }}
+                              disabled={pending !== undefined}
+                            >
+                              <Trash2 size={14} aria-hidden="true" />
+                              删除
+                            </MenuItem>
+                          </MenuContent>
+                        </Menu>
+                      </div>
+                    </article>
+                  ))
+                )}
+              </div>
+            )}
+          </section>
+        );
+      })}
       {feedback === undefined ? null : (
         <p className="ja-settings-feedback" role="status">
           {feedback}
@@ -491,7 +563,8 @@ export function McpSection({
                 id="ja-mcp-dialog-description"
                 className="ja-settings-dialog-description ja-mcp-dialog-description"
               >
-                连接后，Ja 可在任务中使用此服务提供的工具。
+                保存到{scope === "project" ? `项目「${projectName ?? "所选项目"}」` : "全局"}
+                。连接后，Ja 可在任务中使用此服务提供的工具。
               </DialogDescription>
             </div>
             <DialogClose asChild>
@@ -779,7 +852,8 @@ export function McpSection({
           <AlertDialog.Content className="ja-settings-confirm-dialog">
             <AlertDialog.Title>删除 MCP 服务？</AlertDialog.Title>
             <AlertDialog.Description>
-              将删除 {deleteTarget?.name} 的配置，但不会清除其凭据。
+              将从{scope === "project" ? `项目「${projectName ?? "所选项目"}」` : "全局"}删除{" "}
+              {deleteTarget?.name} 的配置，但不会清除其凭据。
             </AlertDialog.Description>
             <div className="ja-settings-form-actions">
               <AlertDialog.Cancel asChild>

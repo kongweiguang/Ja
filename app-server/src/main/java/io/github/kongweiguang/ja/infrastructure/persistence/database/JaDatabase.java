@@ -60,7 +60,7 @@ public final class JaDatabase implements AutoCloseable {
                     .resourceProvider(JaFlywayResources.provider()).baselineOnMigrate(false)
                     .ignoreMigrationPatterns(new String[0])
                     .validateMigrationNaming(true).load();
-            backupBeforeV7UpgradeIfNeeded(flyway, source, config.databasePath());
+            backupBeforeSchemaRebuildIfNeeded(flyway, source, config.databasePath());
             migrateAndVerify(flyway, source, config);
             return new JaDatabase(config.databasePath(), source, lease);
         } catch (StorageException failure) {
@@ -85,10 +85,10 @@ public final class JaDatabase implements AutoCloseable {
             flyway.migrate();
             MigrationInfo current = flyway.info().current();
             if (current == null || current.getVersion() == null
-                || !"7".equals(current.getVersion().getVersion())
+                || !"15".equals(current.getVersion().getVersion())
                 || flyway.info().pending().length != 0) {
                 throw new StorageException(StorageException.Code.STORAGE_CONFLICT,
-                        "database schema is not the current Ja V7");
+                        "database schema is not the current Ja V15");
             }
             LegacySessionWorkspaceMigration.migrate(source, config);
             verifySqliteIntegrity(source);
@@ -101,12 +101,11 @@ public final class JaDatabase implements AutoCloseable {
     }
 
     /**
-     * V7 会重属旧会话历史，因此迁移前必须在独占 lease 内保留 SQLite 一致快照。
-     *
-     * V7 reassigns existing session history, so retain a SQLite-consistent snapshot under the exclusive lease
-     * before Flyway starts; VACUUM INTO includes committed WAL pages, unlike copying the main database file.
+     * V7 重属旧历史、V10 重建消息与 Usage、V11/V12 清理旧预算、V13 扩展验收审计、
+     * V14 建立公开正文分页索引、V15 建立输入操作回执；升级前备份。
+     * VACUUM INTO 包含已提交 WAL 页，直接复制主数据库文件不能保证这个边界。
      */
-    private static void backupBeforeV7UpgradeIfNeeded(Flyway flyway, SQLiteDataSource source, Path databasePath)
+    private static void backupBeforeSchemaRebuildIfNeeded(Flyway flyway, SQLiteDataSource source, Path databasePath)
             throws SQLException, java.io.IOException {
         MigrationInfo current = flyway.info().current();
         boolean upgradingExistingSchemaToV7 = current != null && current.getVersion() != null
@@ -115,13 +114,52 @@ public final class JaDatabase implements AutoCloseable {
                 && java.util.Arrays.stream(flyway.info().pending())
                 .anyMatch(migration -> migration.getVersion() != null
                         && "7".equals(migration.getVersion().getVersion()));
-        if (!upgradingExistingSchemaToV7) return;
+        boolean upgradingExistingSchemaToV10 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("10")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "10".equals(migration.getVersion().getVersion()));
+        boolean upgradingExistingSchemaToV11 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("11")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "11".equals(migration.getVersion().getVersion()));
+        boolean upgradingExistingSchemaToV12 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("12")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "12".equals(migration.getVersion().getVersion()));
+        boolean upgradingExistingSchemaToV13 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("13")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "13".equals(migration.getVersion().getVersion()));
+        boolean upgradingExistingSchemaToV14 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("14")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "14".equals(migration.getVersion().getVersion()));
+        boolean upgradingExistingSchemaToV15 = current != null && current.getVersion() != null
+                && current.getVersion().compareTo(MigrationVersion.fromVersion("15")) < 0
+                && java.util.Arrays.stream(flyway.info().pending())
+                .anyMatch(migration -> migration.getVersion() != null
+                        && "15".equals(migration.getVersion().getVersion()));
+        if (!upgradingExistingSchemaToV7 && !upgradingExistingSchemaToV10
+                && !upgradingExistingSchemaToV11 && !upgradingExistingSchemaToV12
+                && !upgradingExistingSchemaToV13 && !upgradingExistingSchemaToV14
+                && !upgradingExistingSchemaToV15) return;
         Path parent = databasePath.getParent();
         Path databaseName = databasePath.getFileName();
         if (parent == null || databaseName == null) {
             throw new SQLException("database backup location is unavailable");
         }
-        String backupName = databaseName + ".pre-v7-" + java.util.UUID.randomUUID() + ".bak";
+        String backupName = databaseName + (upgradingExistingSchemaToV7 ? ".pre-v7-"
+                : upgradingExistingSchemaToV10 ? ".pre-v10-"
+                : upgradingExistingSchemaToV11 ? ".pre-v11-"
+                : upgradingExistingSchemaToV12 ? ".pre-v12-"
+                : upgradingExistingSchemaToV13 ? ".pre-v13-"
+                : upgradingExistingSchemaToV14 ? ".pre-v14-" : ".pre-v15-")
+                + java.util.UUID.randomUUID() + ".bak";
         Path backup = parent.resolve(backupName);
         try (Connection connection = source.getConnection();
              PreparedStatement statement = connection.prepareStatement("VACUUM INTO ?")) {

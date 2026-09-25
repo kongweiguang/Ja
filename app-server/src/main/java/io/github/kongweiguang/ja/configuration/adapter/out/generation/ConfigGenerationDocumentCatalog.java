@@ -76,7 +76,6 @@ final class ConfigGenerationDocumentCatalog {
         ObjectNode network = requireObject(object, "network_timeouts");
         ObjectNode defaults = requireObject(object, "agent_defaults");
         ObjectNode context = requireObject(defaults, "context");
-        ObjectNode limits = requireObject(defaults, "turn_limits");
         return new ConfigGeneration.ProviderDefinition(
                 requiredText(object, "provider_id"), requiredText(object, "name"), api,
                 URI.create(requiredText(object, "base_url")), requiredText(object, "credential_id"),
@@ -84,10 +83,7 @@ final class ConfigGenerationDocumentCatalog {
                         Duration.ofMillis(number(network, "connect_timeout_ms")),
                         Duration.ofMillis(number(network, "request_timeout_ms"))),
                 new ConfigGeneration.AgentDefaultsConfig(
-                        new ConfigGeneration.ContextConfig(bool(context, "auto_compact")),
-                        new ConfigGeneration.TurnLimitConfig(integer(limits, "max_model_rounds"),
-                                integer(limits, "max_tool_calls"),
-                                Duration.ofMillis(number(limits, "wall_timeout_ms")))),
+                        new ConfigGeneration.ContextConfig(bool(context, "auto_compact"))),
                 parseModels(object));
     }
 
@@ -174,7 +170,7 @@ final class ConfigGenerationDocumentCatalog {
     /** 解析来源限定的 Skill 引用，展示元数据不进入代际快照。 */
     private static Map<String, ConfigGeneration.Skill> parseSkills(ObjectNode root) {
         Map<String, ConfigGeneration.Skill> values = new LinkedHashMap<>();
-        ArrayNode array = requireArray(root, "skills");
+        ArrayNode array = requireArray(root, "disabled_skills");
         for (JsonNode value : array) {
             ConfigGeneration.Skill skill = new ConfigGeneration.Skill(SkillReference.parse(value.textValue()));
             values.put(skill.reference().identifier(), skill);
@@ -210,7 +206,7 @@ final class ConfigGenerationDocumentCatalog {
                                     ? requiredText(authObject, "name") : null,
                             kind == ConfigGeneration.AuthKind.NONE
                                     ? null : requiredText(authObject, "credential_id")),
-                    requiredBoolean(object, "enabled"));
+                    !object.has("enabled") || requiredBoolean(object, "enabled"));
             values.put(server.mcpId(), server);
         }
         return Map.copyOf(values);
@@ -247,15 +243,6 @@ final class ConfigGenerationDocumentCatalog {
         JsonNode value = object.get(key);
         if (value == null || !value.isIntegralNumber()) throw new IllegalArgumentException("number expected");
         return value.longValue();
-    }
-
-    /** 把已校验整数收敛到 Java int 范围。 */
-    private static int integer(JsonNode object, String key) {
-        long value = number(object, key);
-        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("integer expected");
-        }
-        return (int) value;
     }
 
     /** 只接受显式布尔值，新 schema 不为策略选择提供隐式默认。 */

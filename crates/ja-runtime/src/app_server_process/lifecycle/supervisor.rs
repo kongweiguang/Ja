@@ -41,9 +41,9 @@ pub struct SidecarSupervisor {
 
 /// 当前 sidecar generation 的窄只读句柄；它只允许读取冻结 ChangeSet，不能驱动生命周期或 Turn。
 pub struct TurnChangeSetReadLease {
-    session: Session,
-    stopping: Arc<Mutex<bool>>,
-    generation: u64,
+    pub(crate) session: Session,
+    pub(crate) stopping: Arc<Mutex<bool>>,
+    pub(crate) generation: u64,
 }
 
 impl TurnChangeSetReadLease {
@@ -61,6 +61,40 @@ impl TurnChangeSetReadLease {
     }
 
     /// generation 供宿主在完整读取结束后拒绝旧 sidecar 的迟到结果。
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// 当前连接的手动压缩窄句柄；只允许固定方法，等待不占用 Bridge actor。
+pub struct ThreadCompactionLease {
+    pub(crate) session: Session,
+    pub(crate) stopping: Arc<Mutex<bool>>,
+    pub(crate) generation: u64,
+}
+
+impl ThreadCompactionLease {
+    /// 一次 CAS 压缩只由结果或 Session 关闭收口，不把 Provider 退避算成 RPC 超时。
+    pub fn compact(
+        &self,
+        thread_id: &str,
+        expected_thread_revision: u64,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        if !valid_schema_id(thread_id, "thr_", 100)
+            || expected_thread_revision > 9_007_199_254_740_991
+        {
+            return Err(AppServerProcessError::ProtocolFault);
+        }
+        self.session.request_compaction_with_gate(
+            serde_json::json!({
+                "threadId": thread_id,
+                "expectedThreadRevision": expected_thread_revision,
+            }),
+            &self.stopping,
+        )
+    }
+
+    /// 调用方在结果交付前复核代际，避免旧连接的迟到压缩结果覆盖新 Runtime。
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -681,24 +715,35 @@ pub(crate) fn validate_turn_identity(
             .and_then(Value::as_str)
             .is_some_and(|value| valid_schema_id(value, prefix, max))
     };
+    let valid_operation_id = || {
+        object
+            .get("clientOperationId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 35
+                    && value.starts_with("op_")
+                    && value.as_bytes()[3..]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            })
+    };
     let valid = match method {
+        // 只有规范操作身份可查询持久回执；不能由客户端选择 Thread 或数据库行。
+        "operation/read" => exact_keys(&["clientOperationId"]) && valid_operation_id(),
         "attachment/preview/open" | "attachment/preview/read" | "attachment/preview/close" => {
             validate_attachment_preview_request(method, params)
         }
         "turn/change-set/read" => validate_turn_change_set_request(method, params),
         "turn/start" => {
-            exact_keys(&["threadId", "content", "deadlineMs"])
+            exact_keys(&["threadId", "content", "clientOperationId"])
                 && valid_id("threadId", "thr_", 100)
+                && valid_operation_id()
                 && valid_turn_content(object.get("content"))
-                && object.get("deadlineMs").is_none_or(|value| {
-                    value
-                        .as_u64()
-                        .is_some_and(|millis| (1_000..=86_400_000).contains(&millis))
-                })
         }
         "turn/continue" => {
-            exact_keys(&["threadId", "expectedThreadRevision"])
+            exact_keys(&["threadId", "expectedThreadRevision", "clientOperationId"])
                 && valid_id("threadId", "thr_", 100)
+                && valid_operation_id()
                 && valid_revision("expectedThreadRevision")
         }
         "turn/reask" => {
@@ -707,15 +752,22 @@ pub(crate) fn validate_turn_identity(
                 "expectedThreadRevision",
                 "sourceMessageId",
                 "content",
+                "clientOperationId",
             ]) && valid_id("threadId", "thr_", 100)
                 && valid_revision("expectedThreadRevision")
+                && valid_operation_id()
                 && valid_id("sourceMessageId", "item_", 101)
                 && valid_turn_content(object.get("content"))
         }
         "turn/cancel" => exact_keys(&["turnId"]) && valid_id("turnId", "turn_", 101),
         "turn/input/enqueue" => {
-            exact_keys(&["turnId", "content"])
+            exact_keys(&["turnId", "content", "kind", "clientOperationId"])
                 && valid_id("turnId", "turn_", 101)
+                && valid_operation_id()
+                && matches!(
+                    object.get("kind").and_then(Value::as_str),
+                    Some("steering" | "follow_up")
+                )
                 && valid_turn_content(object.get("content"))
                 && queued_content_within_budget(object.get("content"))
         }
@@ -753,9 +805,15 @@ pub(crate) fn validate_turn_identity(
         }
         "task/close" => exact_keys(&["taskThreadId"]) && valid_id("taskThreadId", "thr_", 100),
         "approval/respond" => {
-            exact_keys(&["approvalId", "turnId", "decision", "expectedThreadRevision"])
-                && valid_id("approvalId", "appr_", 101)
+            exact_keys(&[
+                "approvalId",
+                "turnId",
+                "decision",
+                "expectedThreadRevision",
+                "clientOperationId",
+            ]) && valid_id("approvalId", "appr_", 101)
                 && valid_id("turnId", "turn_", 101)
+                && valid_operation_id()
                 && matches!(
                     object.get("decision").and_then(Value::as_str),
                     Some("approve" | "deny")
@@ -772,18 +830,17 @@ pub(crate) fn validate_turn_identity(
                         .and_then(Value::as_str)
                         .is_some_and(|cwd| {
                             !cwd.is_empty()
-                                && cwd.len() <= 4_096
-                                && !cwd.chars().any(char::is_control)
+                                && cwd.encode_utf16().count() <= 4_096
+                                && !cwd.contains('\0')
                                 && std::path::Path::new(cwd).is_absolute()
                         })
-                    && object
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| {
+                    && object.get("displayName").is_none_or(|value| {
+                        value.as_str().is_some_and(|name| {
                             !name.trim().is_empty()
-                                && name.len() <= 512
-                                && !name.chars().any(char::is_control)
-                        }))
+                                && name.encode_utf16().count() <= 1_024
+                                && !name.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r'))
+                        })
+                    }))
         }
         "workspace/path/search" => {
             exact_keys(&["threadId", "workspaceId", "query", "limit"])
@@ -890,9 +947,7 @@ fn valid_turn_content(value: Option<&Value>) -> bool {
                     && item
                         .get("skillId")
                         .and_then(Value::as_str)
-                        .is_some_and(|id| {
-                            valid_schema_id(id, "skill_", 101) && skill_ids.insert(id)
-                        })
+                        .is_some_and(|id| valid_skill_reference(id) && skill_ids.insert(id))
             }
             _ => false,
         };
@@ -901,6 +956,17 @@ fn valid_turn_content(value: Option<&Value>) -> bool {
         }
     }
     sendable
+}
+
+/// Skill 身份带来源域，必须与 Java 和 JA-RPC 的 `user|ja|project:name` 合同一致。
+fn valid_skill_reference(value: &str) -> bool {
+    let Some((scope, name)) = value.split_once(':') else {
+        return false;
+    };
+    matches!(scope, "user" | "ja" | "project")
+        && (1..=512).contains(&name.chars().count())
+        && value.chars().count() <= 520
+        && !name.chars().any(|ch| ch == ':' || ch <= '\u{001f}')
 }
 
 /// 队列预算按实际紧凑 JSON bytes 校验，避免多字节路径或结构开销绕过 512 KiB 上限。

@@ -21,6 +21,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -451,6 +452,8 @@ public final class ConfigurationDocumentRuntime {
                 return new LayerLoad(scope, true, trusted, version,
                         ConfigurationData.LayerStatus.VALID, document, document, List.of());
             } catch (ConfigurationError strictFailure) {
+                LayerLoad migrated = migrateRemovedTurnLimits(path, scope, trusted, bytes, document);
+                if (migrated != null) return migrated;
                 TolerantConfigurationDocumentReader.Result tolerant =
                         TolerantConfigurationDocumentReader.normalize(document, scope);
                 return new LayerLoad(scope, true, trusted, version,
@@ -459,6 +462,45 @@ public final class ConfigurationDocumentRuntime {
         } catch (RuntimeException failure) {
             return new LayerLoad(scope, true, trusted, version,
                     ConfigurationData.LayerStatus.CORRUPT, null, null, List.of());
+        }
+    }
+
+    /** 仅当删除旧预算字段后整份用户配置严格有效时，先备份并以同一文件 CAS 原子升级。 */
+    private LayerLoad migrateRemovedTurnLimits(Path path, ConfigurationScope scope, boolean trusted,
+                                               byte[] original, ObjectNode document) {
+        if (scope != ConfigurationScope.USER) return null;
+        ObjectNode current = document.deepCopy();
+        boolean changed = false;
+        JsonNode providers = current.get("providers");
+        if (providers instanceof ArrayNode entries) {
+            for (JsonNode entry : entries) {
+                if (entry instanceof ObjectNode provider
+                        && provider.get("agent_defaults") instanceof ObjectNode defaults) {
+                    changed |= defaults.remove("turn_limits") != null;
+                }
+            }
+        }
+        if (!changed) return null;
+        try {
+            validateDocument(current, scope);
+            byte[] replacement = toml.write(current).getBytes(StandardCharsets.UTF_8);
+            boolean migrated = ConfigurationMutationCoordinator.execute(path, () -> {
+                try {
+                    byte[] latest = readWithRetry(path);
+                    if (!Arrays.equals(original, latest)) return false;
+                    backupUserConfiguration(original);
+                    ConfigurationStore.writeAtomic(path, replacement, false);
+                    return true;
+                } catch (IOException failure) {
+                    throw new UncheckedIOException(failure);
+                }
+            });
+            if (!migrated) return null;
+            persistLastKnownGood(current);
+            return new LayerLoad(scope, true, trusted, ConfigurationStore.versionOf(replacement),
+                    ConfigurationData.LayerStatus.VALID, current, current, List.of());
+        } catch (ConfigurationError | UncheckedIOException failure) {
+            return null;
         }
     }
 

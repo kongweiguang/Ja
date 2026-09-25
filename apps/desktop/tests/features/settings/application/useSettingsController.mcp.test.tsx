@@ -60,7 +60,7 @@ function documentWithMcp(server: SettingsMcpServer): SettingsDocument {
     subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
     providers: [],
     mcpServers: [structuredClone(server)],
-    skills: [],
+    disabledSkills: [],
     window: { width: 1280, height: 800, maximized: false },
   };
 }

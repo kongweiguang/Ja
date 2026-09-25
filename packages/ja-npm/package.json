@@ -1,0 +1,39 @@
+{
+  "name": "@kongweiguang/ja",
+  "version": "0.1.20",
+  "private": true,
+  "description": "Ja native command-line interface for Windows x64",
+  "license": "GPL-3.0-or-later",
+  "type": "commonjs",
+  "bin": {
+    "ja": "bin/ja.cjs"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "files": [
+    "bin/ja.cjs",
+    "bin/verify.cjs",
+    "runtime",
+    "LICENSE",
+    "NOTICE.md",
+    "third_party/codex-LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "verify:package": "node bin/verify.cjs",
+    "prepublishOnly": "node bin/verify.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kongweiguang/Ja.git",
+    "directory": "packages/ja-npm"
+  }
+}

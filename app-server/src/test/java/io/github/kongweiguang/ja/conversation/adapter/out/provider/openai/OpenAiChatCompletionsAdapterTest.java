@@ -36,6 +36,107 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 以真实 loopback HTTP 覆盖 Chat Completions 请求、Tool delta、usage 与终态。 */
 final class OpenAiChatCompletionsAdapterTest {
+    /** 兼容端可使用稀疏上游索引；完整调用仍按出现顺序映射为连续本地 ordinal。 */
+    @Test
+    void acceptsSparseToolIndexWithoutLosingCallIdentity() throws Exception {
+        String stream = TOOL_STREAM.replace("\\\"tool_calls\\\":[{\\\"index\\\":0",
+                "\\\"tool_calls\\\":[{\\\"index\\\":7");
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 17))) {
+            ModelPort.ModelConfiguration configuration = configuration(server);
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                    events.add(event);
+                    return CompletableFuture.completedFuture(null);
+                }, CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertEquals(0, events.stream().filter(ModelPort.ToolCallReady.class::isInstance)
+                .map(ModelPort.ToolCallReady.class::cast).findFirst().orElseThrow().ordinal());
+    }
+
+    /** 重复相同结束标记与无效 usage 不得抹掉已完整输出的回答。 */
+    @Test
+    void acceptsDuplicateStopAndKeepsUnknownUsage() throws Exception {
+        String stop = chunk("[{\"index\":0,\"delta\":{\"content\":\"ok\"},"
+                + "\"finish_reason\":\"stop\"}]", null);
+        String duplicate = chunk("[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]",
+                "{\"prompt_tokens\":\"bad\"}");
+        ModelPort.ModelOutcome outcome = execute(stop + duplicate + "data: [DONE]\n\n");
+        assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+        assertNull(outcome.usage());
+    }
+
+    /** 长思考的分片数量由上游决定，超过旧 8192 帧阈值仍应交付完整正文而不是要求手动继续。 */
+    @Test
+    void completesLongReasoningStreamBeyondOldFrameLimit() throws Exception {
+        int fragments = 10_000;
+        String stream = chunk("[{\"index\":0,\"delta\":{\"reasoning_content\":\"think \"},"
+                + "\"finish_reason\":null}]", null).repeat(fragments)
+                + chunk("[{\"index\":0,\"delta\":{\"content\":\"complete\"},"
+                + "\"finish_reason\":\"stop\"}]", null) + "data: [DONE]\n\n";
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 16_384))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_CHAT_COMPLETIONS, Duration.ofSeconds(30));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(new ModelPort.ModelRequest(configuration,
+                        base.prompt(), base.messages(), base.tools(), null, 1,
+                        ModelPort.RequestDeadlinePolicy.TURN_MANAGED), event -> {
+                            events.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none()).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertEquals("think ".repeat(fragments), events.stream()
+                        .filter(ModelPort.ReasoningSummaryDelta.class::isInstance)
+                        .map(ModelPort.ReasoningSummaryDelta.class::cast).map(ModelPort.ReasoningSummaryDelta::text)
+                        .collect(java.util.stream.Collectors.joining()));
+                assertEquals("complete", events.stream().filter(ModelPort.TextDelta.class::isInstance)
+                        .map(ModelPort.TextDelta.class::cast).map(ModelPort.TextDelta::text)
+                        .collect(java.util.stream.Collectors.joining()));
+                assertEquals(1, server.calls());
+            }
+        }
+    }
+
+    /** DeepSeek 风格的 reasoning_content 分片越过旧累计阈值时仍须完成并保留原生历史。 */
+    @Test
+    void completesReasoningContentBeyondFormerAggregateLimit() throws Exception {
+        String thought = "x".repeat(100_000);
+        String stream = chunk("[{\"index\":0,\"delta\":{\"reasoning_content\":\"" + thought
+                + "\"},\"finish_reason\":null}]", null).repeat(41)
+                + chunk("[{\"index\":0,\"delta\":{\"content\":\"complete\"},"
+                + "\"finish_reason\":\"stop\"}]", null) + "data: [DONE]\n\n";
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 16_384))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_CHAT_COMPLETIONS, Duration.ofSeconds(30));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(new ModelPort.ModelRequest(configuration,
+                        base.prompt(), base.messages(), base.tools(), null, 1,
+                        ModelPort.RequestDeadlinePolicy.TURN_MANAGED), event -> {
+                            events.add(event);
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none()).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+        }
+        assertEquals(4_100_000, events.stream()
+                .filter(ModelPort.ReasoningSummaryDelta.class::isInstance)
+                .mapToInt(event -> ((ModelPort.ReasoningSummaryDelta) event).text().length()).sum());
+        ReasoningContent content = events.stream()
+                .filter(ModelPort.ReasoningBlockReady.class::isInstance)
+                .map(event -> ((ModelPort.ReasoningBlockReady) event).content())
+                .findFirst().orElseThrow();
+        assertEquals(4_100_000, AbstractStreamingModelAdapter.JSON.readTree(content.nativeJson())
+                .path("reasoning_content").textValue().length());
+    }
+
     private static final String TOOL_STREAM =
             chunk("[{\"index\":0,\"delta\":{\"role\":\"assistant\","
                     + "\"content\":\"I will read it.\"},\"finish_reason\":null}]", null)
@@ -267,7 +368,7 @@ final class OpenAiChatCompletionsAdapterTest {
     /** usage 与 finish_reason 同 chunk 时先接纳计量，再完成语义终态。 */
     @Test
     void acceptsUsageAndFinishInSameChunk() throws Exception {
-        String stream = chunk(
+        String stream = "id: metadata-only\n\n" + chunk(
                 "[{\"index\":0,\"delta\":{\"content\":\"ok\"},"
                         + "\"finish_reason\":\"stop\"}]",
                 "{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}")
@@ -334,13 +435,24 @@ final class OpenAiChatCompletionsAdapterTest {
         assertEquals("STREAM_TRUNCATED", providerFailure(failure).code());
     }
 
+    /** 真 HTTP 在 JSON 帧中途断开应进入会话层恢复，不显示不可继续的格式错误。 */
+    @Test
+    void classifiesMidJsonEofAsRecoverableStreamDamage() throws Exception {
+        Exception failure = assertThrows(Exception.class,
+                () -> execute("data: {\"id\":\"chatcmpl_partial\",\"choices\":["));
+        ProviderProtocolException provider = providerFailure(failure);
+        assertEquals("STREAM_TRUNCATED", provider.code());
+        assertEquals("MODEL_STREAM_INVALID", provider.terminalErrorCode());
+        assertTrue(provider.retryable());
+    }
+
     /** 普通对话只要显式完成即可成功；缺失 usage 必须保持 UNKNOWN，而不是伪造零。 */
     @Test
     void completesWithoutUsageAsUnknown() throws Exception {
         String stream = chunk(
                 "[{\"index\":0,\"delta\":{\"content\":\"ok\"},"
                         + "\"finish_reason\":\"stop\"}]", null)
-                + "data: [DONE]\n\n";
+                + "data: [DONE]\n\ndata: [DONE]\n\n";
         ModelPort.ModelOutcome outcome = execute(stream);
         assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
         assertNull(outcome.usage());

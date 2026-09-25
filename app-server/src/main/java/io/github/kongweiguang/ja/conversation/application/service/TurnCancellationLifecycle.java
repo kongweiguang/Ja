@@ -151,7 +151,6 @@ final class TurnCancellationLifecycle {
             turn.cancellationDebt.compareAndSet(null, failure);
             queued = false;
         }
-        if (turn.deadline != null) turn.deadline.cancel(false);
         CompletionStage<CancellationCoordinator.CancelOutcome> cancellation;
         try {
             cancellation = Objects.requireNonNull(

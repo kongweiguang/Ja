@@ -295,7 +295,7 @@ final class AgentLoopTest {
         TurnExecutionState.Common common = new TurnExecutionState.Common(
                 1, initial.common().usedToolCalls(), initial.common().nextProviderOrdinal(),
                 initial.common().promptCheckpointId(), initial.common().activeSkills(),
-                initial.common().deadlineAt(), initial.common().origin());
+                initial.common().origin());
 
         try (AgentLoop loop = loop(model, store, mcp)) {
             TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
@@ -389,9 +389,9 @@ final class AgentLoopTest {
         }
     }
 
-    /** Provider 失败必须形成可重试的模型不可用终态，不能再伪装成 Ja 内部错误。 */
+    /** 瞬时故障超过旧的六次上限仍自动完成，逐次 Usage 保留独立请求身份。 */
     @Test
-    void providerFailureMapsToModelUnavailableTerminal() {
+    void providerFailureRecoversBeyondOldAttemptLimit() {
         RecordingStore store = new RecordingStore();
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         AtomicInteger attempts = new AtomicInteger();
@@ -399,26 +399,229 @@ final class AgentLoopTest {
             int attempt = attempts.incrementAndGet();
             sink.onEvent(new ModelPort.UsageEvent(new ModelUsage(attempt, 1, attempt + 1)))
                     .toCompletableFuture().join();
+            if (attempt == 7) {
+                sink.onEvent(new ModelPort.TextDelta("recovered after seven attempts"))
+                        .toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.STOP, null, new ModelUsage(7, 1, 8)));
+            }
             return CompletableFuture.failedFuture(
-                    new ModelPort.ModelUnavailableException("provider request failed", null));
+                    new ProviderProtocolException("HTTP_STATUS", "temporary failure", true,
+                            java.time.Duration.ZERO, "MODEL_UNAVAILABLE"));
         };
 
         try (AgentLoop loop = loop(model, store, mcp)) {
             TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
                     event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
 
-            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
-            assertEquals("MODEL_UNAVAILABLE", result.terminal().errorCode());
-            assertEquals("model provider is unavailable", result.terminal().errorMessage());
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("recovered after seven attempts", text(store.terminal.finalMessage()));
             assertEquals(1, store.terminalCommits);
-            assertEquals(6, attempts.get());
+            assertEquals(7, attempts.get());
             List<ConversationRepository.UsageFact> usageFacts = store.facts.stream()
                     .filter(ConversationRepository.UsageFact.class::isInstance)
                     .map(ConversationRepository.UsageFact.class::cast).toList();
-            assertEquals(6, usageFacts.stream().map(ConversationRepository.UsageFact::requestId).distinct().count());
-            assertEquals(List.of(1, 2, 3, 4, 5, 6), usageFacts.stream()
+            assertEquals(7, usageFacts.stream().map(ConversationRepository.UsageFact::requestId).distinct().count());
+            assertEquals(List.of(1, 2, 3, 4, 5, 6, 7), usageFacts.stream()
                     .filter(fact -> fact.certainty() == ConversationRepository.UsageCertainty.KNOWN)
                     .map(ConversationRepository.UsageFact::requestOrdinal).distinct().sorted().toList());
+        }
+    }
+
+    /** 跨过旧 128 轮仍保留工具、持久游标和最后一次答复。 */
+    @Test
+    void continuesBeyondOldModelRoundLimit() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        EchoTool tool = new EchoTool();
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() <= 128) {
+                sink.onEvent(new ModelPort.ToolCallReady("call_cycle_" + request.round(),
+                        "echo", textArguments("x"), 0)).toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertEquals(129, request.round());
+            sink.onEvent(new ModelPort.TextDelta("finished after old limit")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals("finished after old limit", text(store.terminal.finalMessage()));
+            assertEquals(128, store.facts.stream()
+                    .filter(ConversationRepository.ToolResultFact.class::isInstance).count());
+        }
+    }
+
+    /** 输出额度耗尽时分别提交续写段，不在终态复制前段形成新的大消息。 */
+    @Test
+    void outputLengthContinuesWithoutManualTurn() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger requests = new AtomicInteger();
+        ModelPort model = (request, sink, cancellation) -> {
+            int call = requests.incrementAndGet();
+            if (call == 1) {
+                sink.onEvent(new ModelPort.TextDelta("first part ")).toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.MAX_OUTPUT_TOKENS, null, new ModelUsage(1, 3, 4)));
+            }
+            assertTrue(request.messages().stream().anyMatch(message -> message.role() == ModelRole.ASSISTANT
+                    && message.content().stream().anyMatch(content -> content instanceof TextContent text
+                            && text.text().equals("first part "))));
+            sink.onEvent(new ModelPort.TextDelta("second part")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(4, 2, 6)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(2, requests.get());
+            assertEquals("second part", text(store.terminal.finalMessage()));
+            assertTrue(store.messages.stream().anyMatch(message -> message.message().content().stream()
+                    .anyMatch(content -> content instanceof TextContent text
+                            && text.text().equals("first part "))));
+        }
+    }
+
+    /** 两个已提交续写段越过旧终态 1 MiB 上限，仍由第三轮直接完成且不复制前段。 */
+    @Test
+    void outputLengthSegmentsCrossOldTerminalTextLimit() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        AtomicInteger requests = new AtomicInteger();
+        String segment = "x".repeat(600_000);
+        ModelPort model = (request, sink, cancellation) -> {
+            int round = requests.incrementAndGet();
+            sink.onEvent(new ModelPort.TextDelta(round < 3 ? segment : "done"))
+                    .toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    round < 3 ? ModelPort.FinishReason.MAX_OUTPUT_TOKENS : ModelPort.FinishReason.STOP,
+                    null, new ModelUsage(1, 1, 2)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(),
+                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(3, requests.get());
+            assertEquals("done", text(store.terminal.finalMessage()));
+            assertEquals(2, store.facts.stream().filter(ConversationRepository.AssistantFact.class::isInstance)
+                    .map(ConversationRepository.AssistantFact.class::cast)
+                    .filter(fact -> fact.publicText().length() == 65_536
+                            && fact.message().content().stream().map(TextContent.class::cast)
+                            .mapToInt(block -> block.text().length()).sum() == segment.length()).count());
+        }
+    }
+
+    /** 单轮完整模型正文超过公开事件容量时仍成功，终态仅发安全前缀而保留完整模型块。 */
+    @Test
+    void largeSingleRoundKeepsFullStoredTextWithoutOversizedTerminalEvent() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        String part = "x".repeat(600_000);
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta(part)).toCompletableFuture().join();
+            sink.onEvent(new ModelPort.TextDelta(part)).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(), mcp), CancellationToken.none(), event -> {
+                events.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(1_200_000, store.terminal.finalMessage().content().stream()
+                    .map(TextContent.class::cast).mapToInt(block -> block.text().length()).sum());
+            TurnEvent.Terminal terminal = events.stream().filter(TurnEvent.Terminal.class::isInstance)
+                    .map(TurnEvent.Terminal.class::cast).findFirst().orElseThrow();
+            assertEquals(4_096, terminal.finalMessage().text().length());
+        }
+    }
+
+    /** Tool 模型步的巨型公开摘要完整落库，实时事件只带安全前缀，不在提交后撞帧。 */
+    @Test
+    void largeReasoningSummaryKeepsFullFactAndSmallModelStepEvent() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        String chunk = "思".repeat(600_000);
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() == 1) {
+                sink.onEvent(new ModelPort.ReasoningSummaryDelta(chunk)).toCompletableFuture().join();
+                sink.onEvent(new ModelPort.ReasoningSummaryDelta(chunk)).toCompletableFuture().join();
+                sink.onEvent(new ModelPort.ToolCallReady("call_long_reasoning", "echo",
+                        textArguments("ok"), 0)).toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
+            }
+            sink.onEvent(new ModelPort.TextDelta("done")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(new EchoTool()), mcp), CancellationToken.none(),
+                    event -> {
+                        events.add(event);
+                        return CompletableFuture.completedFuture(null);
+                    }).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            var step = events.stream().filter(TurnEvent.ModelStepCommitted.class::isInstance)
+                    .map(TurnEvent.ModelStepCommitted.class::cast).findFirst().orElseThrow();
+            assertEquals(4_096, step.reasoningSummary().length());
+            assertTrue(store.facts.stream().filter(ConversationRepository.AssistantFact.class::isInstance)
+                    .map(ConversationRepository.AssistantFact.class::cast)
+                    .anyMatch(fact -> fact.reasoningSummary() != null
+                            && fact.reasoningSummary().length() == 1_200_000));
+        }
+    }
+
+    /** pi 的 length+tool 调用只生成失败结果；Ja 同样不得执行，且崩溃恢复没有可重放 binding。 */
+    @Test
+    void outputTruncatedToolCallReturnsFailureWithoutExecuting() {
+        RecordingStore store = new RecordingStore();
+        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
+        List<TurnEvent> events = new CopyOnWriteArrayList<>();
+        AtomicInteger executions = new AtomicInteger();
+        EchoTool tool = new EchoTool() {
+            /** 一旦被调用就记录副作用窗口，测试要求截断调用始终停在该窗口之前。 */
+            @Override public CompletionStage<ToolResult> execute(Invocation invocation,
+                    ExecutionContext context, CancellationToken cancellationToken) {
+                executions.incrementAndGet();
+                return CompletableFuture.completedFuture(ToolResult.success("unexpected"));
+            }
+        };
+        ModelPort model = (request, sink, cancellation) -> {
+            if (request.round() == 1) {
+                sink.onEvent(new ModelPort.ToolCallReady("call_cut_off", "echo",
+                        textArguments("partial"), 0)).toCompletableFuture().join();
+                return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                        ModelPort.FinishReason.MAX_OUTPUT_TOKENS, null, new ModelUsage(1, 1, 2)));
+            }
+            assertTrue(latestToolResult(request).error());
+            sink.onEvent(new ModelPort.TextDelta("regenerated complete answer")).toCompletableFuture().join();
+            return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
+                    ModelPort.FinishReason.STOP, null, new ModelUsage(1, 1, 2)));
+        };
+        try (AgentLoop loop = loop(model, store, mcp)) {
+            TurnResult result = run(loop, request(List.of(tool), mcp), CancellationToken.none(), event -> {
+                events.add(event);
+                return CompletableFuture.completedFuture(null);
+            }).toCompletableFuture().join();
+            assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+            assertEquals(0, executions.get());
+            assertTrue(store.facts.stream().filter(ConversationRepository.ToolPreparedFact.class::isInstance)
+                    .map(ConversationRepository.ToolPreparedFact.class::cast)
+                    .anyMatch(fact -> fact.callId().equals("call_cut_off") && fact.binding() == null));
+            assertTrue(events.stream().filter(TurnEvent.ToolBatchCommitted.class::isInstance)
+                    .map(TurnEvent.ToolBatchCommitted.class::cast)
+                    .flatMap(event -> event.results().stream())
+                    .anyMatch(value -> "TOOL_CALL_TRUNCATED".equals(value.errorCode())));
         }
     }
 
@@ -433,7 +636,7 @@ final class AgentLoopTest {
         ModelPort model = (request, sink, cancellation) -> {
             requests.add(request);
             int attempt = attempts.incrementAndGet();
-            assertEquals(ModelPort.RetryPolicy.SINGLE_ATTEMPT, request.retryPolicy());
+            assertEquals(ModelPort.RequestDeadlinePolicy.TURN_MANAGED, request.deadlinePolicy());
             assertEquals(ModelPort.RequestDeadlinePolicy.TURN_MANAGED, request.deadlinePolicy());
             assertTrue(request.messages().stream().noneMatch(message -> message.content().stream()
                     .anyMatch(content -> content instanceof TextContent text
@@ -447,7 +650,8 @@ final class AgentLoopTest {
                 sink.onEvent(new ModelPort.UsageEvent(new ModelUsage(attempt, 1, attempt + 1)))
                         .toCompletableFuture().join();
                 return CompletableFuture.failedFuture(new ProviderProtocolException(
-                        "TRUNCATED_STREAM", "response ended early", true, "MODEL_STREAM_INVALID"));
+                        "TRUNCATED_STREAM", "response ended early", true,
+                        java.time.Duration.ZERO, "MODEL_STREAM_INVALID"));
             }
             sink.onEvent(new ModelPort.TextDelta("answer after retry")).toCompletableFuture().join();
             return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
@@ -467,7 +671,7 @@ final class AgentLoopTest {
                     .filter(TurnEvent.RetryStarted.class::isInstance)
                     .map(TurnEvent.RetryStarted.class::cast).toList();
             assertEquals(List.of(2, 3, 4, 5, 6), retries.stream().map(TurnEvent.RetryStarted::attempt).toList());
-            assertTrue(retries.stream().allMatch(event -> event.maxAttempts() == 6));
+            assertTrue(retries.stream().allMatch(event -> event.attempt() >= 2));
             assertEquals("answer after retry", text(store.terminal.finalMessage()));
             List<ConversationRepository.StoredMessage> partialAudits = store.messages.stream()
                     .filter(message -> message.messageId().startsWith("item_partial_")).toList();
@@ -935,9 +1139,9 @@ final class AgentLoopTest {
         }
     }
 
-    /** 最后一个模型轮次不再暴露 Tool，使持续失败也能在硬预算内生成基于事实的最终答复。 */
+    /** 多轮 Tool 失败后目录仍可用，直到模型自己给出最终答复。 */
     @Test
-    void finalModelRoundClosesWithoutToolsAtConfiguredLimit() {
+    void toolCatalogRemainsAvailableAcrossModelRounds() {
         RecordingStore store = new RecordingStore();
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         FailingReadTool tool = new FailingReadTool();
@@ -952,7 +1156,7 @@ final class AgentLoopTest {
                 return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
                         ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
             }
-            assertTrue(request.tools().isEmpty(), "最终轮不得继续开放会产生副作用的 Tool");
+            assertEquals(List.of(tool.spec()), request.tools());
             assertTrue(latestToolResult(request).error());
             sink.onEvent(new ModelPort.TextDelta("best effort result"));
             return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
@@ -960,7 +1164,7 @@ final class AgentLoopTest {
         };
 
         try (AgentLoop loop = loop(model, store, mcp)) {
-            TurnResult result = run(loop, requestWithModelRoundLimit(List.of(tool), mcp, 4),
+            TurnResult result = run(loop, request(List.of(tool), mcp),
                     CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
                     .toCompletableFuture().join();
 
@@ -971,9 +1175,9 @@ final class AgentLoopTest {
         }
     }
 
-    /** Tool 配额刚好耗尽后立即进入无 Tool 收口轮，既不越过硬上限也不丢失最终答复。 */
+    /** 已执行一个 Tool 后仍开放真实目录，由模型决定何时结束。 */
     @Test
-    void exhaustedToolBudgetClosesWithoutAnotherToolCall() {
+    void toolDirectoryRemainsAvailableAfterToolResult() {
         RecordingStore store = new RecordingStore();
         EmptyMcpFactory mcp = new EmptyMcpFactory(store);
         RecoveringTool tool = new RecoveringTool("echo", ToolSideEffect.READ_ONLY, 0);
@@ -987,7 +1191,7 @@ final class AgentLoopTest {
                 return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
                         ModelPort.FinishReason.TOOL_CALLS, null, new ModelUsage(1, 1, 2)));
             }
-            assertTrue(request.tools().isEmpty(), "Tool 配额耗尽后不得再次暴露 Tool");
+            assertEquals(List.of(tool.spec()), request.tools());
             assertFalse(latestToolResult(request).error());
             sink.onEvent(new ModelPort.TextDelta("tool budget summary"));
             return CompletableFuture.completedFuture(new ModelPort.ModelOutcome(
@@ -995,7 +1199,7 @@ final class AgentLoopTest {
         };
 
         try (AgentLoop loop = loop(model, store, mcp)) {
-            TurnResult result = run(loop, requestWithToolLimit(List.of(tool), mcp, 1),
+            TurnResult result = run(loop, request(List.of(tool), mcp),
                     CancellationToken.none(), event -> CompletableFuture.completedFuture(null))
                     .toCompletableFuture().join();
 
@@ -1162,9 +1366,7 @@ final class AgentLoopTest {
         }
     }
 
-    /**
-     * 合法的 1024 调用上限必须保持可执行，但窗口外调用不能预先扩张为等待虚拟线程。
-     */
+    /** 大批量 Tool 调用逐一结算，不以旧配置预算停止任务。 */
     @Test
     void maximumToolBatchCompletesThroughBoundedWindow() {
         RecordingStore store = new RecordingStore();
@@ -1172,7 +1374,7 @@ final class AgentLoopTest {
         SlidingWindowTool tool = new SlidingWindowTool(0);
         List<TurnEvent> events = new ArrayList<>();
         try (AgentLoop loop = loop(new BatchToolModel(1_024), store, mcp)) {
-            TurnResult result = run(loop, requestWithToolLimit(List.of(tool), mcp, 1_024),
+            TurnResult result = run(loop, request(List.of(tool), mcp),
                     CancellationToken.none(), event -> {
                         events.add(event);
                         return CompletableFuture.completedFuture(null);
@@ -1186,29 +1388,6 @@ final class AgentLoopTest {
             assertEquals(1_024, batches.size());
             assertTrue(batches.stream().allMatch(batch -> batch.results().size() == 1));
             assertEquals(1_023, batches.getLast().results().getFirst().ordinal());
-        }
-    }
-
-    /**
-     * 请求级配置刷新只能改变单次 Provider 窗口，不能扩大 Turn admission 已固定的累计 Tool 预算。
-     */
-    @Test
-    void requestRuntimeRefreshCannotExpandOperationToolBudget() {
-        RecordingStore store = new RecordingStore();
-        EmptyMcpFactory mcp = new EmptyMcpFactory(store);
-        SlidingWindowTool tool = new SlidingWindowTool(0);
-        TurnExecutionPlan operation = requestWithToolLimit(List.of(tool), mcp, 1);
-        TurnExecutionPlan refreshed = requestWithToolLimit(List.of(tool), mcp, 2);
-        TurnExecutionPlan dynamic = withRequestRuntime(operation,
-                (common, summary) -> new TurnExecutionPlan.RequestRuntime(
-                        refreshed, profile("provider_test", "model_test", "cfg_test"), () -> { }));
-
-        try (AgentLoop loop = loop(new BatchToolModel(2), store, mcp)) {
-            TurnResult result = run(loop, dynamic, CancellationToken.none(),
-                    event -> CompletableFuture.completedFuture(null)).toCompletableFuture().join();
-            assertEquals(TurnState.FAILED, result.state(), () -> terminalFailure(result, store));
-            assertEquals("BUDGET_EXCEEDED", result.terminal().errorCode());
-            assertEquals(0, tool.executions.get());
         }
     }
 
@@ -1254,7 +1433,7 @@ final class AgentLoopTest {
                 contextFactory(store), argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK)) {
             TurnResult result = run(loop, dynamic, CancellationToken.none(),
                     event -> CompletableFuture.completedFuture(null), new TurnExecutionState.Ready(
-                            new TurnExecutionState.Common(0, 0, 1, null, List.of(), operation.deadlineAt(),
+                            new TurnExecutionState.Common(0, 0, 1, null, List.of(),
                                     io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER),
                             TurnExecutionState.Next.ASSISTANT, null)).toCompletableFuture().join();
             assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
@@ -1264,7 +1443,8 @@ final class AgentLoopTest {
                     && common.usedToolCalls() == 0 && common.nextProviderOrdinal() == 1));
             assertTrue(safePoints.stream().anyMatch(common -> common.modelRound() == 1
                     && common.usedToolCalls() == 1 && common.nextProviderOrdinal() == 2));
-            assertTrue(safePoints.stream().allMatch(common -> common.deadlineAt().equals(operation.deadlineAt())));
+            assertTrue(safePoints.stream().allMatch(common -> common.origin()
+                    == io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER));
         }
     }
 
@@ -1293,6 +1473,40 @@ final class AgentLoopTest {
                     .toCompletableFuture().join();
 
             assertEquals(TurnState.COMPLETED, result.state(), () -> terminalFailure(result, store));
+        }
+    }
+
+    /**
+     * 新请求短租约必须替换旧截止时间和排队输入边界，同时保留 admission 的权威游标。
+     */
+    @Test
+    void requestRuntimeRefreshesDeadlineWithoutResettingTurnIdentity() {
+        TurnExecutionPlan base = request(List.of(), new EmptyMcpFactory(new RecordingStore()))
+                .withAdmissionReceipt(7, 3);
+        TurnLimits nextLimits = new TurnLimits(base.limits().maxInputTokens(),
+                base.limits().maxOutputTokens(), Duration.ofMinutes(10));
+        Instant nextDeadline = base.deadlineAt().plus(Duration.ofMinutes(10));
+        QueuedInputBoundary nextBoundary = content -> QueuedInputBoundary.Prepared.noChange();
+        TurnExecutionPlan dynamic = withRequestRuntime(base, (common, summary) -> {
+            TurnExecutionPlan fresh = new TurnExecutionPlan(base.threadId(), base.turnId(),
+                    base.workspaceRoot(), base.content(), base.model(), base.accessMode(),
+                    nextLimits, base.requestedAt(), base.workspaceId(), 0, 0,
+                    summary, base.promptSession(), nextBoundary, base.attachments(), base.tools(),
+                    base.configRevision(), base.toolSessions(), base.outputLimits(),
+                    base.presentationSecrets(), nextDeadline, (ignored, ignoredSummary) -> {
+                        throw new AssertionError("nested request runtime must not open");
+                    });
+            return new TurnExecutionPlan.RequestRuntime(fresh,
+                    profile("provider_test", "model_test", "cfg_test"), () -> { });
+        });
+
+        try (TurnExecutionPlan.RequestRuntime opened = dynamic.openRequestRuntime(
+                execution("cfg_test").common(), "")) {
+            assertEquals(nextDeadline, opened.plan().deadlineAt());
+            assertEquals(nextLimits, opened.plan().limits());
+            assertSame(nextBoundary, opened.plan().queuedInputBoundary());
+            assertEquals(7, opened.plan().initialThreadRevision());
+            assertEquals(3, opened.plan().initialTurnMutationVersion());
         }
     }
 
@@ -2013,36 +2227,6 @@ final class AgentLoopTest {
         return assertInstanceOf(TextContent.class, message.content().getFirst()).text();
     }
 
-    /**
-     * 只替换 Tool 预算以覆盖合法硬上限，其余身份、Provider 和输出边界保持基础请求不变。
-     */
-    private static TurnExecutionPlan requestWithToolLimit(
-            List<AgentTool> tools, TurnToolSessionFactory toolSessions, int maxToolCalls) {
-        TurnExecutionPlan base = request(tools, toolSessions);
-        TurnLimits limits = new TurnLimits(base.limits().maxModelRounds(), maxToolCalls,
-                base.limits().maxInputTokens(), base.limits().maxOutputTokens(), base.limits().wallTimeout());
-        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
-                base.model(), base.accessMode(), limits, base.requestedAt(), base.workspaceId(),
-                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.initialSummary(),
-                base.promptSession(), base.queuedInputBoundary(), base.attachments(),
-                base.tools(),
-                base.configRevision(), base.toolSessions(), base.outputLimits(), base.presentationSecrets());
-    }
-
-    /** 只收紧模型轮次，验证持续 Tool 调用最终只能由公开预算终止。 */
-    private static TurnExecutionPlan requestWithModelRoundLimit(
-            List<AgentTool> tools, TurnToolSessionFactory toolSessions, int maxModelRounds) {
-        TurnExecutionPlan base = request(tools, toolSessions);
-        TurnLimits limits = new TurnLimits(maxModelRounds, base.limits().maxToolCalls(),
-                base.limits().maxInputTokens(), base.limits().maxOutputTokens(), base.limits().wallTimeout());
-        return fixedPlan(base.threadId(), base.turnId(), base.workspaceRoot(), base.content(),
-                base.model(), base.accessMode(), limits, base.requestedAt(), base.workspaceId(),
-                base.initialThreadRevision(), base.initialTurnMutationVersion(), base.initialSummary(),
-                base.promptSession(), base.queuedInputBoundary(), base.attachments(), base.tools(),
-                base.configRevision(), base.toolSessions(),
-                base.outputLimits(), base.presentationSecrets());
-    }
-
     /** 构造必经压缩的执行请求，用于隔离检查点事件发布边界。 */
     private static TurnExecutionPlan compactingRequest(TurnToolSessionFactory toolSessions) {
         TurnExecutionPlan base = request(List.of(new EchoTool()), toolSessions);
@@ -2099,7 +2283,7 @@ final class AgentLoopTest {
                 model, accessMode, limits, requestedAt, workspaceId, initialThreadRevision,
                 initialTurnMutationVersion, initialSummary, promptSession, queuedInputBoundary,
                 attachments, tools, configRevision, toolSessions, outputLimits, presentationSecrets,
-                requestedAt.plus(limits.wallTimeout()), factory);
+                requestedAt.plus(limits.requestWindow()), factory);
         holder.set(plan);
         return plan;
     }

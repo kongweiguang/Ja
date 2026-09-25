@@ -94,6 +94,12 @@ public final class ProviderProtocolException extends ModelPort.ModelUnavailableE
         return Optional.ofNullable(retryAfter);
     }
 
+    /** 只将已校验的等待时长交给 Session，避免恢复层引用 Provider 私有异常类型。 */
+    @Override
+    public Optional<Duration> retryAfterHint() {
+        return retryAfter();
+    }
+
     /**
      * 拒绝攻击者可控 code，使日志可安全索引该值。
      */

@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
@@ -83,6 +84,38 @@ import org.junit.jupiter.api.Test;
 
 /** 真实临时 SQLite 覆盖 V1 schema、事务原子性、恢复、CAS 与完整 blocks。 */
 final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
+    /** 准入与客户端回执同事务，丢失 ACK 后跨进程重试只能取原 Turn，冲突指纹必须拒绝。 */
+    @Test
+    void persistsClientStartOperationAcrossRestartWithoutSecondTurn() throws Exception {
+        String operationId = "op_" + "a".repeat(32);
+        String fingerprint = "b".repeat(64);
+        try (TestDatabase database = database("client-start-operation")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.TurnAdmission first = new ConversationRepository.TurnAdmission(
+                    "thr_1", "turn_1", "item_user_1", new ModelMessage(ModelRole.USER,
+                    List.of(new TextContent("hello"))), List.of(), 0, START, execution("cfg_1"));
+            ConversationRepository.AdmissionReceipt accepted = store.admit(first, operationId, fingerprint);
+            assertEquals("turn_1", accepted.turnId());
+            assertEquals(1, accepted.threadRevision());
+            assertEquals("turn/start", store.readClientOperation(operationId).orElseThrow().method());
+            store.close();
+
+            MybatisConversationRepository reopened = database.agentStore();
+            ConversationRepository.TurnAdmission retry = new ConversationRepository.TurnAdmission(
+                    "thr_1", "turn_retry", "item_user_retry", first.userMessage(), List.of(), 0,
+                    START.plusSeconds(1), execution("cfg_1"));
+            ConversationRepository.AdmissionReceipt repeated = reopened.admit(retry, operationId, fingerprint);
+            assertEquals("turn_1", repeated.turnId());
+            assertEquals(accepted.threadRevision(), repeated.threadRevision());
+            assertEquals(1, reopened.readThread("thr_1").orElseThrow().turns().size());
+            assertEquals(1, reopened.readThread("thr_1").orElseThrow().messages().size());
+            StorageException conflict = assertThrows(StorageException.class,
+                    () -> reopened.admit(retry, operationId, "c".repeat(64)));
+            assertEquals(StorageException.Code.CAS_CONFLICT, conflict.code());
+            reopened.close();
+        }
+    }
+
     /** Thread 创建只读取当时的全局策略；设置源变化与仓储重开都不能改写旧会话快照。 */
     @Test
     void freezesSubagentPolicyPerThreadAndAcrossRepositoryRestart() throws Exception {
@@ -177,6 +210,31 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         }
     }
 
+    /** 响应丢失后的同 ID 查询或重试只能得到原入队身份，冲突指纹必须拒绝且队列不推进。 */
+    @Test
+    void inputOperationReceiptAndQueueCommitAtomically() throws Exception {
+        try (TestDatabase database = database("input-operation-receipt")) {
+            MybatisConversationRepository store = initialized(database);
+            admit(store);
+            String operationId = "op_11111111111111111111111111111111";
+            String fingerprint = "a".repeat(64);
+            var first = store.enqueueInput(pending("input_receipt_first", ConversationRepository.InputKind.STEERING,
+                    "steer", START.plusSeconds(1)), operationId, fingerprint);
+            var receipt = store.readInputOperation(operationId).orElseThrow();
+            assertEquals("input_receipt_first", receipt.inputId());
+            assertEquals(ConversationRepository.InputKind.STEERING, receipt.kind());
+            var repeated = store.enqueueInput(pending("input_receipt_second", ConversationRepository.InputKind.STEERING,
+                    "steer", START.plusSeconds(2)), operationId, fingerprint);
+            assertFalse(repeated.changed());
+            assertEquals(first.inputId(), repeated.inputId());
+            assertEquals(1, repeated.inputQueue().revision());
+            assertThrows(StorageException.class, () -> store.enqueueInput(pending("input_conflict",
+                    ConversationRepository.InputKind.FOLLOW_UP, "different", START.plusSeconds(3)),
+                    operationId, "b".repeat(64)));
+            assertEquals(1, store.readInputOperation(operationId).stream().count());
+        }
+    }
+
     /**
      * 队列数量与 UTF-8 总量是两个独立上限；多字节正文必须按真实字节拒绝，失败事务不能推进 revision。
      */
@@ -247,9 +305,36 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** 同批随机 ID 不得打乱“摘要、进展、工具序号”；逐条分页必须与整页一致且不漏不重。 */
+    /** 输入历史必须来自已提交 USER_INPUT，并由 Java 维持搜索和分页边界。 */
     @Test
-    void ordersSameCommitProgressBeforeToolsAcrossPages() throws Exception {
+    void searchesPersistedUserInputHistory() throws Exception {
+        try (TestDatabase database = database("input-history-search")) {
+            MybatisConversationRepository store = initialized(database);
+            admit(store);
+            var history = database.history(store);
+            var matched = history.searchUserInputs("hello", null, 10);
+            assertEquals(1, matched.items().size());
+            assertEquals("thr_1", matched.items().getFirst().threadId());
+            assertEquals("hello", matched.items().getFirst().text());
+            assertFalse(matched.items().getFirst().truncated());
+            assertNull(matched.nextCursor());
+            assertTrue(history.searchUserInputs("absent", null, 10).items().isEmpty());
+            long revision = store.readThread("thr_1").orElseThrow().revision();
+            store.admit(new ConversationRepository.TurnAdmission("thr_1", "turn_history_2",
+                    "item_history_2", new ModelMessage(ModelRole.USER, List.of(new TextContent("later input"))),
+                    List.of(), revision, START.plusSeconds(2), execution("cfg_1")));
+            var newest = history.searchUserInputs("", null, 1);
+            assertEquals("later input", newest.items().getFirst().text());
+            assertNotNull(newest.nextCursor());
+            var older = history.searchUserInputs("", newest.nextCursor(), 1);
+            assertEquals("hello", older.items().getFirst().text());
+            assertNull(older.nextCursor());
+        }
+    }
+
+    /** 同批随机 ID 不得打乱“摘要、进展、工具序号”；两个方向的逐页结果必须与完整权威顺序一致。 */
+    @Test
+    void ordersSameCommitProgressBeforeToolsAcrossBothDirections() throws Exception {
         try (TestDatabase database = database("snapshot-semantic-order")) {
             MybatisConversationRepository store = initialized(database);
             ConversationRepository.AdmissionReceipt admission = admit(store);
@@ -284,6 +369,55 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
             assertNull(cursor);
             assertEquals(items.stream().map(ThreadSnapshot.Item::itemId).toList(), paged);
             assertEquals(paged.size(), new java.util.HashSet<>(paged).size());
+
+            java.util.ArrayList<String> reversePaged = new java.util.ArrayList<>();
+            cursor = null;
+            for (int page = 0; page < 10; page++) {
+                ThreadSnapshot snapshot = history.readThreadLatest("thr_1", cursor, 2).orElseThrow();
+                List<String> pageIds = snapshot.items().stream().map(ThreadSnapshot.Item::itemId).toList();
+                assertEquals(pageIds, items.stream().map(ThreadSnapshot.Item::itemId).toList()
+                        .subList(items.size() - reversePaged.size() - pageIds.size(),
+                                items.size() - reversePaged.size()));
+                reversePaged.addAll(0, pageIds);
+                cursor = snapshot.nextCursor();
+                if (cursor == null) break;
+            }
+            assertNull(cursor);
+            assertEquals(paged, reversePaged);
+            assertEquals(paged.size(), new java.util.HashSet<>(reversePaged).size());
+        }
+    }
+
+    /** 旧页仍附带真实最新 Turn，活动流和会话头不会被当前页的较早 owner 冒充。 */
+    @Test
+    void latestHistoryPagesKeepItemOwnersAndActualThreadHead() throws Exception {
+        try (TestDatabase database = database("snapshot-latest-turn-owners")) {
+            MybatisConversationRepository store = initialized(database);
+            for (int index = 1; index <= 3; index++) {
+                String turnId = "turn_" + index;
+                ConversationRepository.AdmissionReceipt admission = store.admit(
+                        new ConversationRepository.TurnAdmission("thr_1", turnId, "item_user_" + index,
+                                new ModelMessage(ModelRole.USER, List.of(new TextContent("question " + index))),
+                                List.of(), store.readThread("thr_1").orElseThrow().revision(),
+                                START.plusSeconds(index * 2L), execution("cfg_1")));
+                store.commitTerminal(new ConversationRepository.TerminalCommit(
+                        "thr_1", turnId, TurnState.COMPLETED, "done", null, null, null, null,
+                        List.of(), admission.turnMutationVersion(), START.plusSeconds(index * 2L + 1)));
+            }
+
+            var history = database.history(store);
+            ThreadSnapshot newest = history.readThreadLatest("thr_1", null, 1).orElseThrow();
+            assertEquals(List.of("turn_3"), newest.items().stream().map(ThreadSnapshot.Item::turnId).toList());
+            assertEquals(List.of("turn_3"), newest.turns().stream().map(ThreadSnapshot.Turn::turnId).toList());
+            ThreadSnapshot middle = history.readThreadLatest("thr_1", newest.nextCursor(), 1).orElseThrow();
+            assertEquals(List.of("turn_2"), middle.items().stream().map(ThreadSnapshot.Item::turnId).toList());
+            assertEquals(List.of("turn_2", "turn_3"), middle.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            ThreadSnapshot oldest = history.readThreadLatest("thr_1", middle.nextCursor(), 1).orElseThrow();
+            assertEquals(List.of("turn_1"), oldest.items().stream().map(ThreadSnapshot.Item::turnId).toList());
+            assertEquals(List.of("turn_1", "turn_3"), oldest.turns().stream()
+                    .map(ThreadSnapshot.Turn::turnId).toList());
+            assertNull(oldest.nextCursor());
         }
     }
 
@@ -320,14 +454,94 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** 原生 reasoning 不是只存在于 Codec：真实 SQLite 提交、关闭、重开后仍须保留完整 opaque block。 */
+    /** 公开摘要超过预览后仍可按 Unicode 页完整读取，历史页与模型事件不会携带巨型字段。 */
+    @Test
+    void largeReasoningSummaryUsesPreviewAndPublicPages() throws Exception {
+        try (TestDatabase database = database("long-reasoning-summary")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING, List.of(),
+                    admission.turnMutationVersion(), START.plusSeconds(1)));
+            String full = "思".repeat(65_536) + "😀终";
+            store.commitTerminal(new ConversationRepository.TerminalCommit(
+                    "thr_1", "turn_1", TurnState.COMPLETED, "done", null, null,
+                    "item_summary_anchor", new ModelMessage(ModelRole.ASSISTANT,
+                    List.of(new TextContent("done"))),
+                    List.of(new ConversationRepository.ReasoningSummaryFact(
+                            "item_summary_anchor", full, 1)),
+                    running.turnMutationVersion(), START.plusSeconds(2)));
+            ThreadSnapshot.TextItem summary = database.history(store).readThread("thr_1", null, 20)
+                    .orElseThrow().items().stream().filter(ThreadSnapshot.TextItem.class::isInstance)
+                    .map(ThreadSnapshot.TextItem.class::cast)
+                    .filter(item -> item.kind() == ThreadSnapshot.TextKind.REASONING_SUMMARY)
+                    .findFirst().orElseThrow();
+            assertEquals(65_536, summary.text().length());
+            var tail = database.history(store).readMessageContent("thr_1",
+                    "item_summary_anchor_reasoning", 65_536, 8).orElseThrow();
+            assertEquals("😀终", tail.content());
+            assertEquals(65_538, tail.totalCharacters());
+            assertNull(tail.nextOffsetCharacters());
+            String publicId = SnapshotItemIdentity.of("message", "item_summary_anchor_reasoning");
+            assertEquals("😀终", database.history(store).readMessageContent("thr_1", publicId,
+                    65_536, 8).orElseThrow().content());
+        }
+    }
+
+    /** 单轮长答复的公开历史保留安全前缀，模型消息本身仍完整落库供后续分页读取。 */
+    @Test
+    void largeTerminalStoresFullMessageWithBoundedHistoryPreview() throws Exception {
+        try (TestDatabase database = database("terminal-long-preview")) {
+            MybatisConversationRepository store = initialized(database);
+            ConversationRepository.AdmissionReceipt admission = admit(store);
+            ConversationRepository.CommitReceipt running = store.commit(commitRequest(
+                    "thr_1", "turn_1", TurnState.RUNNING, List.of(),
+                    admission.turnMutationVersion(), START.plusSeconds(1)));
+            String full = "x".repeat(1_200_000);
+            store.commitTerminal(new ConversationRepository.TerminalCommit(
+                    "thr_1", "turn_1", TurnState.COMPLETED, "done", null, null,
+                    "item_long_final", new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent(full))),
+                    List.of(), running.turnMutationVersion(), START.plusSeconds(2)));
+            String stored = store.readThread("thr_1").orElseThrow().messages().stream()
+                    .filter(message -> message.messageId().equals("item_long_final"))
+                    .map(message -> ((TextContent) message.message().content().getFirst()).text())
+                    .findFirst().orElseThrow();
+            ThreadSnapshot.TextItem publicItem = database.history(store).readThread("thr_1", null, 20)
+                    .orElseThrow().items().stream().filter(ThreadSnapshot.TextItem.class::isInstance)
+                    .map(ThreadSnapshot.TextItem.class::cast)
+                    .filter(item -> item.kind() == ThreadSnapshot.TextKind.FINAL_ANSWER)
+                    .findFirst().orElseThrow();
+            assertEquals(full, stored);
+            assertEquals(65_536, publicItem.text().length());
+            var firstPage = database.history(store).readMessageContent("thr_1", "item_long_final", 0, 65_536)
+                    .orElseThrow();
+            var secondPage = database.history(store).readMessageContent("thr_1", "item_long_final",
+                    firstPage.nextOffsetCharacters(), 65_536).orElseThrow();
+            assertEquals(1_200_000, firstPage.totalCharacters());
+            assertEquals(65_536, firstPage.content().length());
+            assertEquals(65_536, secondPage.offsetCharacters());
+            assertEquals(full.substring(0, 131_072), firstPage.content() + secondPage.content());
+            String publicId = SnapshotItemIdentity.of("message", "item_long_final");
+            var publicPage = database.history(store).readMessageContent("thr_1", publicId, 65_536, 8)
+                    .orElseThrow();
+            assertEquals(publicId, publicPage.messageId());
+            assertEquals("x".repeat(8), publicPage.content());
+            assertTrue(database.history(store).readMessageContent("thr_1", "item_user", 0, 65_536).isEmpty());
+            assertTrue(database.history(store).readMessageContent("thr_1",
+                    SnapshotItemIdentity.of("message", "item_user"), 0, 65_536).isEmpty());
+        }
+    }
+
+    /** 原生 reasoning 越过旧累计阈值后，真实 SQLite 提交、关闭和重开仍须保留完整块。 */
     @Test
     void persistsNativeReasoningAcrossRepositoryRestart() throws Exception {
         String databaseName = "native-reasoning-restart";
+        String nativeJson = "{\"type\":\"reasoning\",\"thinking\":\""
+                + "x".repeat(4_000_001) + "\",\"encrypted_content\":\"opaque\"}";
         ReasoningContent reasoning = new ReasoningContent(
                 "provider_1", "model_1", "openai_responses", "test-model",
                 ReasoningContent.endpointFingerprint(java.net.URI.create("https://api.example/v1")),
-                "reasoning", "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}");
+                "reasoning", nativeJson);
         ModelMessage assistant = new ModelMessage(ModelRole.ASSISTANT,
                 List.of(new TextContent("visible"), reasoning, new TextContent("answer")));
 
@@ -347,10 +561,13 @@ final class MybatisConversationRepositoryTest extends PersistenceTestSupport {
             ModelMessage restored = reopened.agentStore().readThread("thr_1").orElseThrow().messages().stream()
                     .filter(message -> message.messageId().equals("item_native_reasoning"))
                     .findFirst().orElseThrow().message();
-            assertEquals(assistantBlocks(assistant), assistantBlocks(restored));
+            assertEquals(3, restored.content().size());
+            assertEquals("visible", assertInstanceOf(TextContent.class, restored.content().get(0)).text());
+            assertEquals("answer", assertInstanceOf(TextContent.class, restored.content().get(2)).text());
             ReasoningContent restoredReasoning = assertInstanceOf(ReasoningContent.class,
                     restored.content().get(1));
-            assertEquals(reasoning, restoredReasoning);
+            assertEquals(nativeJson, restoredReasoning.nativeJson());
+            assertEquals(reasoning.providerId(), restoredReasoning.providerId());
         }
     }
 
@@ -1430,9 +1647,9 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             database.checkpoints().commit(new CheckpointStore.CommitRequest("thr_1", 1, checkpoint));
             TurnExecutionState.Common source = execution("cfg_1").common();
             List<TurnExecutionState.ActiveSkill> activeSkills = List.of(
-                    new TurnExecutionState.ActiveSkill("skill_review"));
+                    new TurnExecutionState.ActiveSkill("ja:review"));
             TurnExecutionState.Common common = new TurnExecutionState.Common(
-                    1, 2, 2, checkpoint.checkpointId(), activeSkills, source.deadlineAt(), source.origin());
+                    1, 2, 2, checkpoint.checkpointId(), activeSkills, source.origin());
             ModelMessage assistant = new ModelMessage(ModelRole.ASSISTANT, List.of(
                     new ToolCallContent("call_1", "read_file", textArguments("path", "a")),
                     new ToolCallContent("call_2", "read_file", textArguments("path", "b"))));
@@ -2115,8 +2332,19 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
                         .selectTurnExecution("turn_1").stateJson();
             }
 
-            assertTrue(store.resolveApproval(
-                    "appr_existing", ApprovalDecision.APPROVE, START.plusSeconds(3)));
+            String approvalOperation = "op_" + "f".repeat(32);
+            String approvalFingerprint = "1".repeat(64);
+            assertTrue(store.resolveApproval("appr_existing", ApprovalDecision.APPROVE,
+                    START.plusSeconds(3), approvalOperation, approvalFingerprint));
+            var approvalReceipt = store.readClientOperation(approvalOperation).orElseThrow();
+            assertEquals("approval/respond", approvalReceipt.method());
+            assertEquals("approve", approvalReceipt.decision());
+            assertEquals(waiting.threadRevision() + 1, approvalReceipt.threadRevision());
+            assertTrue(store.resolveApproval("appr_existing", ApprovalDecision.APPROVE,
+                    START.plusSeconds(4), approvalOperation, approvalFingerprint));
+            assertEquals(StorageException.Code.CAS_CONFLICT, assertThrows(StorageException.class,
+                    () -> store.resolveApproval("appr_existing", ApprovalDecision.DENY,
+                            START.plusSeconds(4), approvalOperation, "2".repeat(64))).code());
             assertEquals(waiting.turnMutationVersion() + 1,
                     store.findTurn("thr_1", "turn_1").orElseThrow().turnMutationVersion());
             try (org.apache.ibatis.session.SqlSession session = database.sessions().openSession()) {
@@ -2462,14 +2690,25 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             assertEquals("item_question", store.findLastUnansweredQuestionMessageId(
                     "thr_1", questionFailure.threadRevision()).orElseThrow());
 
-            ConversationRepository.AdmissionReceipt first = store.admitContinuation(
+            ConversationRepository.ContinuationAdmission firstRequest =
                     new ConversationRepository.ContinuationAdmission("thr_1", "turn_continue_one",
                             questionFailure.threadRevision(), START.plusSeconds(3), continuationExecution(),
-                            "继续回答原问题", "item_question"));
+                            "继续回答原问题", "item_question");
+            String continueOperation = "op_" + "b".repeat(32);
+            String continueFingerprint = "c".repeat(64);
+            ConversationRepository.AdmissionReceipt first = store.admitContinuation(firstRequest,
+                    continueOperation, continueFingerprint);
             ConversationRepository.CommitReceipt firstFailure = failContinuation(store, first, 2,
                     START.plusSeconds(3), List.of(new ConversationRepository.AssistantFact(
                             "item_partial_retry_one", new ModelMessage(ModelRole.ASSISTANT,
                             List.of(new TextContent("半截草稿"))), "半截草稿", "公开 reasoning 摘要", 1)));
+            ConversationRepository.AdmissionReceipt repeated = store.admitContinuation(
+                    new ConversationRepository.ContinuationAdmission("thr_1", "turn_continue_duplicate",
+                            questionFailure.threadRevision(), START.plusSeconds(4), continuationExecution(),
+                            "继续回答原问题", "item_question"), continueOperation, continueFingerprint);
+            assertEquals(first.turnId(), repeated.turnId());
+            assertEquals(first.threadRevision(), repeated.threadRevision());
+            assertEquals("turn/continue", store.readClientOperation(continueOperation).orElseThrow().method());
 
             ConversationRepository.AdmissionReceipt second = store.admitContinuation(
                     new ConversationRepository.ContinuationAdmission("thr_1", "turn_continue_two",
@@ -2533,11 +2772,23 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
             assertEquals("item_question_two", store.findLastUnansweredQuestionMessageId(
                     "thr_1", secondFailure.threadRevision()).orElseThrow());
 
-            ConversationRepository.AdmissionReceipt reask = store.admitReask(
+            ConversationRepository.ReaskAdmission reaskRequest =
                     new ConversationRepository.ReaskAdmission(new ConversationRepository.TurnAdmission(
                             "thr_1", "turn_reask", "item_reask",
                             new ModelMessage(ModelRole.USER, List.of(new TextContent("修订后的问题"))), List.of(),
-                            secondFailure.threadRevision(), START.plusSeconds(20), execution("cfg_1")), sourceHash));
+                            secondFailure.threadRevision(), START.plusSeconds(20), execution("cfg_1")), sourceHash);
+            String reaskOperation = "op_" + "d".repeat(32);
+            String reaskFingerprint = "e".repeat(64);
+            ConversationRepository.AdmissionReceipt reask = store.admitReask(
+                    reaskRequest, reaskOperation, reaskFingerprint);
+            ConversationRepository.AdmissionReceipt repeatedReask = store.admitReask(
+                    new ConversationRepository.ReaskAdmission(new ConversationRepository.TurnAdmission(
+                            "thr_1", "turn_reask_duplicate", "item_reask_duplicate",
+                            reaskRequest.turn().userMessage(), List.of(), secondFailure.threadRevision(),
+                            START.plusSeconds(21), execution("cfg_1")), sourceHash),
+                    reaskOperation, reaskFingerprint);
+            assertEquals(reask.turnId(), repeatedReask.turnId());
+            assertEquals("turn/reask", store.readClientOperation(reaskOperation).orElseThrow().method());
 
             ConversationRepository.ThreadSnapshot raw = store.readThread("thr_1").orElseThrow();
             assertTrue(raw.turns().stream().filter(turn -> turn.turnId().equals("turn_question_two"))
@@ -2875,7 +3126,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
     /** 用户 continuation 的固定游标让恢复测试验证 source/history 约束，不依赖进程时钟默认值。 */
     private static TurnExecutionState.Ready continuationExecution() {
         TurnExecutionState.Common common = new TurnExecutionState.Common(0, 0, 1, null, List.of(),
-                Instant.parse("2099-01-01T00:00:00Z"), TurnOrigin.USER_CONTINUATION, Duration.ofMinutes(5));
+                TurnOrigin.USER_CONTINUATION);
         return new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null);
     }
 
@@ -2993,7 +3244,7 @@ assertThrows(StorageException.class, () -> store.commit(commitRequest(
         TurnExecutionState.Common source = execution(generation).common();
         return new TurnExecutionState.Common(source.modelRound(), source.usedToolCalls(),
                 source.nextProviderOrdinal(), checkpointId,
-                source.activeSkills(), source.deadlineAt(), source.origin());
+                source.activeSkills(), source.origin());
     }
 
 }

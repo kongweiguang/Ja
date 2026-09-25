@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::app_server_process;
+use crate::app_server_process::client::pending::ResolveDisposition;
 use crate::app_server_process::protocol::{self as codec, CodecError, Limits};
 use crate::unit_support_tests::*;
 use serde_json::json;
@@ -183,6 +184,127 @@ fn event_pump_is_take_once_and_shutdown_gate_is_linearized() {
     close_session(&session);
     assert_eq!(
         waiter.join().unwrap(),
+        Err(app_server_process::AppServerProcessError::SessionClosed)
+    );
+}
+
+/// 手动压缩越过普通请求上限仍保留 pending；连接关闭必须立刻解除等待，不能卡住应用退出。
+#[test]
+fn compaction_request_waits_for_session_close_without_deadline() {
+    let (server_to_host_reader, _server_to_host_writer) = pipe_pair();
+    let (ack_sender, ack_receiver) = mpsc::channel();
+    let session = session_from_io(
+        server_to_host_reader,
+        AckWriter { writes: ack_sender },
+        EmptyReader,
+        19,
+        Limits::default(),
+    )
+    .unwrap();
+    let gate = Arc::new(Mutex::new(false));
+    let caller = session.clone();
+    let caller_gate = Arc::clone(&gate);
+    let waiter = thread::spawn(move || {
+        caller.request_compaction_with_gate(
+            json!({"threadId":"thr_test","expectedThreadRevision":1}),
+            &caller_gate,
+        )
+    });
+    ack_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("compaction request crossed writer gate");
+    let Ok(mut pending) = session.inner.pending.lock() else {
+        panic!("pending fixture must remain healthy");
+    };
+    assert_eq!(
+        pending.expire(std::time::Instant::now() + Duration::from_secs(3_600)),
+        0
+    );
+    drop(pending);
+    close_session(&session);
+    assert_eq!(
+        waiter.join().unwrap(),
+        Err(app_server_process::AppServerProcessError::SessionClosed)
+    );
+}
+
+/// 压缩 pending 等待期间同一 Session 的普通读取仍可先完成，防止窄 lease 占住整个 RPC 通道。
+#[test]
+fn ordinary_request_completes_while_compaction_is_pending() {
+    let (server_to_host_reader, _server_to_host_writer) = pipe_pair();
+    let (ack_sender, ack_receiver) = mpsc::channel();
+    let session = session_from_io(
+        server_to_host_reader,
+        AckWriter { writes: ack_sender },
+        EmptyReader,
+        20,
+        Limits::default(),
+    )
+    .unwrap();
+    let gate = Arc::new(Mutex::new(false));
+    let compact_session = session.clone();
+    let compact_gate = Arc::clone(&gate);
+    let compact = thread::spawn(move || {
+        compact_session.request_compaction_with_gate(
+            json!({"threadId":"thr_test","expectedThreadRevision":1}),
+            &compact_gate,
+        )
+    });
+    ack_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("compaction request reached writer");
+    let compact_id = {
+        let pending = session
+            .inner
+            .pending
+            .lock()
+            .expect("healthy pending registry");
+        pending
+            .active
+            .keys()
+            .next()
+            .cloned()
+            .expect("compaction pending")
+    };
+    let read_session = session.clone();
+    let read_gate = Arc::clone(&gate);
+    let read = thread::spawn(move || {
+        read_session.request_with_gate(
+            "thread/read",
+            json!({"threadId":"thr_test"}),
+            Duration::from_secs(1),
+            &read_gate,
+        )
+    });
+    ack_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ordinary read reached writer");
+    let read_id = {
+        let pending = session
+            .inner
+            .pending
+            .lock()
+            .expect("healthy pending registry");
+        pending
+            .active
+            .keys()
+            .find(|id| id.as_str() != compact_id.as_str())
+            .cloned()
+            .expect("ordinary read pending")
+    };
+    let mut wire = format!(r#"{{"jsonrpc":"2.0","id":"{read_id}","result":{{}}}}"#).into_bytes();
+    wire.push(b'\n');
+    let response = codec::decode_frame(&wire, Limits::default().max_frame_bytes)
+        .expect("valid response fixture");
+    let Ok(mut pending) = session.inner.pending.lock() else {
+        panic!("healthy pending registry");
+    };
+    assert_eq!(pending.resolve(response), ResolveDisposition::Delivered);
+    drop(pending);
+    assert_eq!(read.join().unwrap().unwrap().id(), read_id);
+    close_session(&session);
+    assert_eq!(
+        compact.join().unwrap(),
         Err(app_server_process::AppServerProcessError::SessionClosed)
     );
 }

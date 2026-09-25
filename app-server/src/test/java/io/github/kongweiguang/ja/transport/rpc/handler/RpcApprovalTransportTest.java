@@ -95,7 +95,8 @@ final class RpcApprovalTransportTest {
 
             ObjectNode params = mapper.createObjectNode().put("approvalId", "appr_test")
                     .put("turnId", "turn_test").put("decision", "approve")
-                    .put("expectedThreadRevision", 3);
+                    .put("expectedThreadRevision", 3)
+                    .put("clientOperationId", "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
             params.put("decision", "invalid_decision");
             assertThrows(RuntimeException.class,
                     () -> new TurnApprovalHandler(current).handle(
@@ -168,7 +169,7 @@ final class RpcApprovalTransportTest {
 
             ObjectNode params = mapper.createObjectNode()
                     .put("threadId", "thr_start")
-                    .put("deadlineMs", 2_500);
+                    .put("clientOperationId", "op_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
             params.putArray("content").addObject().put("type", "text").put("text", "第一段\n第二段");
 
             ObjectNode response = new TurnApprovalHandler(current)
@@ -187,7 +188,6 @@ final class RpcApprovalTransportTest {
             assertEquals("medium", request.reasoningLevel());
             assertEquals(io.github.kongweiguang.ja.conversation.domain.permission.AccessMode.APPROVAL_REQUIRED,
                     request.accessMode());
-            assertEquals(Duration.ofMillis(2_500), request.deadline());
             assertEquals(7, request.expectedThreadRevision());
             assertEquals(0, request.initialTurnMutationVersion());
             assertEquals(NOW, request.requestedAt());
@@ -221,7 +221,8 @@ final class RpcApprovalTransportTest {
             current.initialize();
             markReady(current, "0123456789abcdef0123456789abcdef");
 
-            ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start");
+            ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start")
+                    .put("clientOperationId", "op_cccccccccccccccccccccccccccccccc");
             var content = params.putArray("content");
             content.addObject().put("type", "skill_reference").put("skillId", "user:composer-context");
             content.addObject().put("type", "workspace_reference").put("workspaceId", "ws_start")
@@ -241,7 +242,7 @@ final class RpcApprovalTransportTest {
                     parsedContent, "provider_start", "model_start", "medium",
                     io.github.kongweiguang.ja.conversation.domain.permission.AccessMode.APPROVAL_REQUIRED,
                     io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
-                    Duration.ofHours(24), 7, 0, NOW), "domain turn request");
+                    7, 0, NOW), "domain turn request");
 
             new TurnApprovalHandler(current)
                     .handle(new RpcCommand(RpcMethod.TURN_START, params))
@@ -285,7 +286,8 @@ final class RpcApprovalTransportTest {
             session = current;
             current.initialize();
             markReady(current, "0123456789abcdef0123456789abcdef");
-            ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start");
+            ObjectNode params = mapper.createObjectNode().put("threadId", "thr_start")
+                    .put("clientOperationId", "op_dddddddddddddddddddddddddddddddd");
             params.putArray("content").addObject().put("type", "text").put("text", "继续下一轮");
 
             ObjectNode response = new TurnApprovalHandler(current)
@@ -527,11 +529,18 @@ final class RpcApprovalTransportTest {
                 return true;
             }
 
+            /** 该投影测试仅验证 Writer 顺序；新幂等载荷已由独立持久层测试覆盖。 */
+            @Override
+            public boolean resolve(String approvalId, ApprovalDecision response, Instant resolvedAt,
+                                   String clientOperationId, String requestFingerprint) {
+                return resolve(approvalId, response, resolvedAt);
+            }
+
         };
 
         /** 只组合审批与 Turn 查找端口，其余能力由测试拒绝实现保护。 */
         private RpcServiceBindings bindings() {
-            return RpcTestBindings.create(null, history, null, approvals, null, null);
+            return RpcTestBindings.create(null, history, new CapturingTurns(), approvals, null, null);
         }
 
         /** 最小权威查询为 respond 提供准确的 Thread revision CAS 投影。 */
@@ -710,6 +719,20 @@ final class RpcApprovalTransportTest {
                     request.expectedThreadRevision() + 1, true, new CompletableFuture<>());
         }
 
+        /** 传输映射夹具只观察一次新准入，持久幂等由 Repository 独立验证。 */
+        @Override
+        public Accepted start(TurnStartRequest request, TurnEventSink sink,
+                              String clientOperationId, String requestFingerprint) {
+            return start(request, sink);
+        }
+
+        /** 无已提交回执，允许 Handler 进入本次新准入路径。 */
+        @Override
+        public Optional<io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt>
+        readClientOperation(String clientOperationId) {
+            return Optional.empty();
+        }
+
         /** 当前 transport 启动夹具不模拟失败问题恢复。 */
         @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
             throw unsupported();
@@ -868,6 +891,14 @@ final class RpcApprovalTransportTest {
             return new Accepted(candidate.threadId(), candidate.turnId(),
                     candidate.expectedThreadRevision() + 1, true, new CompletableFuture<>());
         }
+        /** 首次无副作用 CAS 冲突后仍复用同一客户端操作身份重试。 */
+        @Override public Accepted start(TurnStartRequest candidate, TurnEventSink sink,
+                                        String clientOperationId, String requestFingerprint) {
+            return start(candidate, sink);
+        }
+        /** 存储成功前没有可重放回执。 */
+        @Override public Optional<io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt>
+        readClientOperation(String clientOperationId) { return Optional.empty(); }
         /** 竞态夹具不模拟无用户消息的继续请求。 */
         @Override public Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink) {
             throw unsupported();

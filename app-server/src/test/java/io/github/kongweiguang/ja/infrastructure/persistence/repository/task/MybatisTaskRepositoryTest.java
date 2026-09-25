@@ -1122,6 +1122,27 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         }
     }
 
+    /** 子任务续写的父 Mailbox 应收到前后段摘要；普通短状态词不能替代最终正文。 */
+    @Test
+    void childTerminalUsesContinuedAnswerPreviewForParent() throws Exception {
+        try (TestDatabase database = database("task-continued-answer")) {
+            setupRoot(database.sessions());
+            MybatisTaskRepository tasks = repository(database);
+            ChildFixture fixture = child("thr_task_continued", "turn_task_continued",
+                    "item_task_continued", "seed_continued", "activity_continued",
+                    TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED,
+                    TaskModels.InheritanceMode.BRIEF_ONLY, null, new JsonArray(List.of()), permission());
+            tasks.admitChild(fixture.child(), fixture.turn());
+            database.agentStore().commitTerminal(new ConversationRepository.TerminalCommit(
+                    "thr_task_continued", "turn_task_continued", TurnState.COMPLETED,
+                    "first part second part", null, null, "item_task_continued_final",
+                    new ModelMessage(ModelRole.ASSISTANT, List.of(new TextContent("second part"))),
+                    List.of(), 0, START.plusSeconds(20)));
+            TaskModels.Detail completed = tasks.readTask("thr_task_continued", 0, 0, 20).orElseThrow();
+            assertEquals("first part second part", completed.mailbox().getFirst().content().text());
+        }
+    }
+
     /** Goal/Plan hidden Turn admission 只进入队列，并在终态提交时回传新的父 Mailbox。 */
     @Test
     void reopensCompletedSideTaskForGoalAndPlanContinuations() throws Exception {
@@ -1394,7 +1415,7 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
     /** 构造与生产 hidden Turn 相同来源的 READY 游标，确保 continuation context 与 execution origin 一致。 */
     private static TurnExecutionState.Ready internalExecution(TurnOrigin origin) {
         return new TurnExecutionState.Ready(new TurnExecutionState.Common(0, 0, 1, null, List.of(),
-                Instant.parse("2099-01-01T00:00:00Z"), origin), TurnExecutionState.Next.ASSISTANT, null);
+                origin), TurnExecutionState.Next.ASSISTANT, null);
     }
 
     /** 测试消息始终是一条规范 text block。 */

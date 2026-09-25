@@ -1,0 +1,12 @@
+{"jsonrpc":"2.0","id":"c:context-register","method":"runtime/context/register","params":{"environment":{"JA_TEST":"isolated"},"shell":null}}
+{"jsonrpc":"2.0","id":"c:context-register","result":{"contextId":"ctx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+{"jsonrpc":"2.0","id":"c:operation-read","method":"operation/read","params":{"clientOperationId":"op_dddddddddddddddddddddddddddddddd"}}
+{"jsonrpc":"2.0","id":"c:operation-read","result":{"status":"unknown"}}
+{"jsonrpc":"2.0","id":"c:operation-committed","method":"operation/read","params":{"clientOperationId":"op_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}
+{"jsonrpc":"2.0","id":"c:operation-committed","result":{"status":"committed","method":"turn/start","threadId":"thr_demo","result":{"accepted":true,"queued":true,"turnId":"turn_demo","threadRevision":1}}}
+{"jsonrpc":"2.0","id":"c:thread-observe","method":"thread/observe","params":{"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:thread-observe","result":{"accepted":true,"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:thread-unobserve","method":"thread/unobserve","params":{"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:thread-unobserve","result":{"accepted":true,"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:shutdown-force","method":"runtime/shutdown","params":{"force":true}}
+{"jsonrpc":"2.0","id":"c:shutdown-force","result":{"accepted":true,"status":"shutting_down"}}

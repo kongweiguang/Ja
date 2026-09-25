@@ -50,7 +50,7 @@ function providerDocument() {
         base_url: "http://172.16.40.21:8082/custom/v1",
         credential_id: "cred_test",
         network_timeouts: { connect_timeout_ms: 5000, request_timeout_ms: 120000 },
-        agent_defaults: { turn_limits: { max_model_rounds: 8 } },
+        agent_defaults: { context: { auto_compact: true } },
         models: [
           {
             model_id: "model_test",
@@ -62,7 +62,7 @@ function providerDocument() {
       },
     ],
     mcp_servers: [{ endpoint: "http://must-not-connect.invalid" }],
-    skills: [{ path: "must-not-be-loaded" }],
+    disabled_skills: ["fixture-skill"],
   };
 }
 
@@ -142,7 +142,7 @@ test("profile selection and isolated settings retain one configured Responses mo
   assert.equal(isolated.providers[0].base_url, "http://127.0.0.1:45321/v1");
   assert.equal(isolated.providers[0].models[0].model, "upstream-model");
   assert.deepEqual(isolated.mcp_servers, []);
-  assert.deepEqual(isolated.skills, []);
+  assert.deepEqual(isolated.disabled_skills, []);
   assert.equal(isolated.default_access_mode, "approval_required");
   assert.throws(
     () =>

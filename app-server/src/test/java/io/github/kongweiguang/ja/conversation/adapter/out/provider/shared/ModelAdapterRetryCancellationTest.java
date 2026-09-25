@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.conversation.adapter.out.provider.shared;
@@ -19,7 +20,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
-import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.URI;
@@ -29,11 +29,8 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import mockwebserver3.MockResponse;
 import mockwebserver3.MockWebServer;
 import mockwebserver3.RecordedRequest;
@@ -56,43 +53,62 @@ final class ModelAdapterRetryCancellationTest {
                     ModelAdapterTestSupport.openAiResponse(
                             "resp_ok", "completed", new ModelUsage(1, 1, 2)));
 
-    /** 在首个语义事件被接纳前重试 429 和可恢复 5xx，随后只成功一次。 */
+    /** Provider Adapter 每次只发送一个 HTTP 请求，瞬时错误交给持久会话重试。 */
     @Test
-    void retriesTransientStatusesOnlyBeforeCommit() throws Exception {
-        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
-            if (call == 1) ModelAdapterTestSupport.status(exchange, 429, "0");
-            else if (call == 2) ModelAdapterTestSupport.status(exchange, 503, "0");
-            else ModelAdapterTestSupport.sse(exchange, COMPLETE, 9);
-        })) {
+    void transientStatusStopsSingleAdapterAttempt() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.status(exchange, 429, "0"))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
-                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                CancellationToken.none())
-                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
-                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                assertTrue(failure.getCause() instanceof ProviderProtocolException);
             }
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
-    /** 三次请求各耗尽三次重试后，第四次显式请求仍必须真正到达 HTTP，避免共享状态隐形封锁。 */
+    /** 代理返回巨大的 429 错误正文时仍按状态进入会话重试，诊断容量不能夺走错误分类。 */
     @Test
-    void explicitRequestsReachHttpAfterThreeFailedRequests() throws Exception {
+    void oversizedRateLimitBodyStillClassifiesAsRetryable() throws Exception {
+        String errorBody = "x".repeat(AbstractStreamingModelAdapter.MAX_ERROR_BODY_BYTES + 1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.json(exchange, 429, errorBody))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                ProviderProtocolException status = assertInstanceOf(ProviderProtocolException.class,
+                        failure.getCause());
+                assertEquals("HTTP_STATUS", status.code());
+                assertTrue(status.retryable());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** Adapter 不记录跨请求熔断状态；显式创建的第十次请求仍真实到达 HTTP。 */
+    @Test
+    void explicitRequestsReachHttpAfterRepeatedFailures() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
             if (call <= 9) ModelAdapterTestSupport.status(exchange, 503, "0");
             else ModelAdapterTestSupport.sse(exchange, COMPLETE, 9);
         }); ModelAdapterFactory factory = new ModelAdapterFactory()) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            for (int index = 0; index < 3; index++) {
+            for (int index = 0; index < 9; index++) {
                 try (ModelAdapter adapter = factory.create(configuration)) {
                     assertThrows(ExecutionException.class, () -> adapter.start(
                             ModelAdapterTestSupport.request(configuration), event -> CompletableFuture.completedFuture(null),
                             CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS));
                 }
-                assertEquals((index + 1) * 3, server.calls());
+                assertEquals(index + 1, server.calls());
             }
             try (ModelAdapter adapter = factory.create(configuration)) {
                 assertEquals(ModelPort.FinishReason.STOP, adapter.start(ModelAdapterTestSupport.request(configuration),
@@ -103,55 +119,6 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 第一次 loopback 连接被拒绝后等待代理恢复，证明应用退避而非 OkHttp 隐式重放完成恢复。 */
-    @Test
-    void retriesAfterTransientConnectionRefusalWhenLoopbackRecovers() throws Exception {
-        MockWebServer unavailable = new MockWebServer();
-        unavailable.start(InetAddress.getByName("127.0.0.1"), 0);
-        int port = unavailable.getPort();
-        unavailable.close();
-
-        MockWebServer recovered = new MockWebServer();
-        recovered.setDispatcher(new mockwebserver3.Dispatcher() {
-            /** 恢复后的本地端点只返回一次完整 SSE，隔离旧重试窗口与新退避窗口的真实请求次数。 */
-            @Override
-            public MockResponse dispatch(RecordedRequest request) {
-                return new MockResponse.Builder().code(200)
-                        .setHeader("Content-Type", "text/event-stream; charset=utf-8")
-                        .body(COMPLETE)
-                        .build();
-            }
-        });
-        ScheduledExecutorService starter = Executors.newSingleThreadScheduledExecutor();
-        AtomicReference<Throwable> startupFailure = new AtomicReference<>();
-        try {
-            URI baseUri = URI.create("http://127.0.0.1:" + port);
-            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
-                    baseUri, ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                long requestStartedAt = System.nanoTime();
-                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
-                                ModelAdapterTestSupport.request(configuration),
-                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
-                        .toCompletableFuture();
-                starter.schedule(() -> {
-                    try {
-                        recovered.start(InetAddress.getByName("127.0.0.1"), port);
-                    } catch (IOException failure) {
-                        startupFailure.set(failure);
-                    }
-                }, 750, TimeUnit.MILLISECONDS);
-                ModelPort.ModelOutcome outcome = future.get(8, TimeUnit.SECONDS);
-                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
-                assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requestStartedAt) >= 700);
-            }
-            assertNull(startupFailure.get());
-            assertEquals(1, recovered.getRequestCount());
-        } finally {
-            starter.shutdownNow();
-            recovered.close();
-        }
-    }
 
     /** 连接预算较短时，首个 SSE 正文仍可等待到请求总预算，避免慢首 token 被误判为断连。 */
     @Test
@@ -197,134 +164,37 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 自动标题等自带本地回退的请求必须在首个瞬时失败后结束，不能触发共享三次重试。 */
+
+    /** 截断流保留已经送达的单次文本，Adapter 不自行回放第二次响应。 */
     @Test
-    void singleAttemptPolicyDisablesTransientRetry() throws Exception {
+    void truncatedStreamStopsAfterOneAttempt() throws Exception {
+        String truncated = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                """.formatted(ModelAdapterTestSupport.openAiResponse("resp_partial", "in_progress"));
+        StringBuilder text = new StringBuilder();
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
-                (call, exchange) -> ModelAdapterTestSupport.status(exchange, 503, "0"))) {
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, truncated, 5))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
-            ModelPort.ModelRequest singleAttempt = new ModelPort.ModelRequest(
-                    base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
-                    base.round(), ModelPort.RetryPolicy.SINGLE_ATTEMPT);
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(singleAttempt,
-                                        event -> CompletableFuture.completedFuture(null),
-                                        CancellationToken.none())
-                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertTrue(failure.getCause() instanceof ProviderProtocolException);
+                        adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                            if (event instanceof ModelPort.TextDelta delta) text.append(delta.text());
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS));
+                assertEquals("MODEL_STREAM_INVALID",
+                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).terminalErrorCode());
             }
+            assertEquals("persisted", text.toString());
             assertEquals(1, server.calls());
         }
     }
 
-    /** 文本被接纳后流被截断时自动恢复，并且重试返回的已接纳前缀只发布一次。 */
-    @Test
-    void retriesTruncatedStreamAfterSemanticEventWithoutDuplicatingText() throws Exception {
-        String committedThenTruncated = """
-                event: response.created
-                data: {"type":"response.created","sequence_number":0,"response":%s}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
-
-                """.formatted(ModelAdapterTestSupport.openAiResponse(
-                "resp_partial", "in_progress"));
-        String completedAfterRetry = """
-                event: response.created
-                data: {"type":"response.created","sequence_number":0,"response":%s}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","content_index":0,"delta":" repaired","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":2}
-
-                event: response.output_text.done
-                data: {"type":"response.output_text.done","content_index":0,"item_id":"message_1","output_index":0,"sequence_number":3,"text":"persisted repaired"}
-
-                event: response.completed
-                data: {"type":"response.completed","sequence_number":4,"response":%s}
-
-                """.formatted(
-                ModelAdapterTestSupport.openAiResponse("resp_retry", "in_progress"),
-                ModelAdapterTestSupport.openAiResponse("resp_retry", "completed", new ModelUsage(1, 1, 2),
-                        "[{\"id\":\"message_1\",\"type\":\"message\",\"role\":\"assistant\","
-                                + "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\","
-                                + "\"text\":\"persisted repaired\",\"annotations\":[],\"logprobs\":[]}]}]"));
-        AtomicInteger textEvents = new AtomicInteger();
-        StringBuilder text = new StringBuilder();
-        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
-                (call, exchange) -> ModelAdapterTestSupport.sse(
-                        exchange, call == 1 ? committedThenTruncated : completedAfterRetry, 5))) {
-            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
-                            if (event instanceof ModelPort.TextDelta delta) {
-                                textEvents.incrementAndGet();
-                                text.append(delta.text());
-                            }
-                            return java.util.concurrent.CompletableFuture.completedFuture(null);
-                        }, CancellationToken.none())
-                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
-                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
-            }
-            assertEquals(2, textEvents.get());
-            assertEquals("persisted repaired", text.toString());
-            assertEquals(2, server.calls());
-        }
-    }
-
-    /** 重试流只返回已接纳正文的短前缀时，即使上游正常 STOP 也必须拒绝旧尾巴残留。 */
-    @Test
-    void rejectsShortReplayPrefixAtNormalStop() throws Exception {
-        String committedThenTruncated = """
-                event: response.created
-                data: {"type":"response.created","sequence_number":0,"response":%s}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
-
-                """.formatted(ModelAdapterTestSupport.openAiResponse(
-                "resp_short_partial", "in_progress"));
-        String shortCompleted = """
-                event: response.created
-                data: {"type":"response.created","sequence_number":0,"response":%s}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","content_index":0,"delta":"persis","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
-
-                event: response.output_text.done
-                data: {"type":"response.output_text.done","content_index":0,"item_id":"message_1","output_index":0,"sequence_number":2,"text":"persis"}
-
-                event: response.completed
-                data: {"type":"response.completed","sequence_number":3,"response":%s}
-
-                """.formatted(
-                ModelAdapterTestSupport.openAiResponse("resp_short_retry", "in_progress"),
-                ModelAdapterTestSupport.openAiResponse("resp_short_retry", "completed", new ModelUsage(1, 1, 2),
-                        "[{\"id\":\"message_1\",\"type\":\"message\",\"role\":\"assistant\","
-                                + "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\","
-                                + "\"text\":\"persis\",\"annotations\":[],\"logprobs\":[]}]}]"));
-        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
-                (call, exchange) -> ModelAdapterTestSupport.sse(
-                        exchange, call == 1 ? committedThenTruncated : shortCompleted, 5))) {
-            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
-                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration),
-                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
-                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("STREAM_REPLAY_MISMATCH",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
-            }
-            assertEquals(2, server.calls());
-        }
-    }
 
     /** 在解析 Provider JSON 或发布到 sink 前拒绝解码后超限的 SSE 事件。 */
     @Test
@@ -348,23 +218,27 @@ final class ModelAdapterRetryCancellationTest {
         }
     }
 
-    /** 将未知原生事件视为终止协议错误，不静默丢失状态。 */
+    /** 未知扩展事件被跳过，后续已知完成事件仍只结算一次。 */
     @Test
-    void rejectsUnknownProviderEvent() throws Exception {
-        String unknown = "event: response.future_event\ndata: {\"type\":\"response.future_event\"}\n\n";
+    void ignoresUnknownProviderEventBeforeCompletion() throws Exception {
+        String unknown = "event: response.future_event\ndata: {\"type\":\"response.future_event\"}\n\n"
+                + "event: response.created\ndata: {\"type\":\"response.created\","
+                + "\"sequence_number\":0,\"response\":"
+                + ModelAdapterTestSupport.openAiResponse("resp_future", "in_progress") + "}\n\n"
+                + "event: response.completed\ndata: {\"type\":\"response.completed\","
+                + "\"sequence_number\":1,\"response\":"
+                + ModelAdapterTestSupport.openAiResponse("resp_future", "completed") + "}\n\n";
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, unknown, 3))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
-                ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration),
-                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
-                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("OPENAI_EVENT",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
             }
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -626,7 +500,7 @@ final class ModelAdapterRetryCancellationTest {
             ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
             ModelPort.ModelRequest singleAttempt = new ModelPort.ModelRequest(
                     base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
-                    base.round(), ModelPort.RetryPolicy.SINGLE_ATTEMPT,
+                    base.round(),
                     ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 ExecutionException failure = assertThrows(ExecutionException.class, () ->
@@ -683,7 +557,7 @@ final class ModelAdapterRetryCancellationTest {
             ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
             ModelPort.ModelRequest bounded = new ModelPort.ModelRequest(
                     base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
-                    base.round(), ModelPort.RetryPolicy.SINGLE_ATTEMPT,
+                    base.round(),
                     ModelPort.RequestDeadlinePolicy.CALL_BOUNDED);
             try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
                 CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(bounded,
@@ -707,6 +581,6 @@ final class ModelAdapterRetryCancellationTest {
     private static ModelPort.ModelRequest withDeadlinePolicy(
             ModelPort.ModelRequest request, ModelPort.RequestDeadlinePolicy deadlinePolicy) {
         return new ModelPort.ModelRequest(request.configuration(), request.prompt(), request.messages(),
-                request.tools(), request.continuation(), request.round(), request.retryPolicy(), deadlinePolicy);
+                request.tools(), request.continuation(), request.round(), deadlinePolicy);
     }
 }

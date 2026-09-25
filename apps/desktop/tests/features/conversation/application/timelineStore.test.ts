@@ -77,6 +77,23 @@ function projectionThread(threadId: string) {
 }
 
 describe("timeline Zustand seam", () => {
+  it("同代际切换后台实例时清除旧快照与恢复状态", () => {
+    prepareStore();
+    const token = useTimelineStore.getState().beginRecovery("thr_store", 1, "recovery");
+    expect(token).toBeDefined();
+    expect(
+      useTimelineStore.getState().applyRuntimeStatus({
+        status: "ready",
+        generation: 1,
+        serverInstanceId: "srv_restarted",
+      }),
+    ).toBe("applied");
+    const next = useTimelineStore.getState();
+    expect(next.threads).toEqual({});
+    expect(next.serverInstanceId).toBe("srv_restarted");
+    expect(next.handshake.serverInstanceId).toBe("srv_restarted");
+  });
+
   it("requires the ready runtime projection before a snapshot or event can enter", () => {
     useTimelineStore.getState().reset();
     expect(
@@ -148,14 +165,13 @@ describe("timeline Zustand seam", () => {
         threadRevision: 2,
         occurredAt: "2026-08-18T00:00:02Z",
         attempt: 2,
-        maxAttempts: 6,
       },
     };
     expect(store.applyHostEvent({ kind: "timeline", event: retryStarted })).toBe("applied");
     const duringRetry = selectItemsForThread("thr_store")(useTimelineStore.getState());
     const retryStatuses = duringRetry.filter((item) => item.metadata?.phase === "assistant_retry");
     expect(retryStatuses).toHaveLength(1);
-    expect(retryStatuses[0]?.text).toBe("重试 2/6");
+    expect(retryStatuses[0]?.text).toBe("连接中断，正在恢复");
     expect(duringRetry.some((item) => item.text === "失败请求半截正文")).toBe(false);
 
     const newDelta: TimelineEvent = {

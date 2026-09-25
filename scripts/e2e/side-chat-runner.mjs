@@ -24,7 +24,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const sideChatScript = join(repoRoot, "scripts", "e2e", "side-chat-webview2.mjs");
-const defaultTargetDirectory = join(repoRoot, "src-tauri", "target", "side-chat");
+const defaultTargetDirectory = join(repoRoot, "target", "side-chat");
 const edgeDebugArguments =
   "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-address=127.0.0.1 --remote-debugging-port=";
 
@@ -60,7 +60,7 @@ async function writeIsolatedHome(homeRoot) {
     "default_reasoning_level = { __ja_null = true }",
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "[interaction]",
     "clarification_enabled = true",
     "",
@@ -76,10 +76,6 @@ async function writeIsolatedHome(homeRoot) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 8",
-    "max_tool_calls = 16",
-    "wall_timeout_ms = 30000",
     "[[providers.models]]",
     'model_id = "model_side_chat"',
     'name = "Side Chat Bootstrap Model"',
@@ -113,8 +109,13 @@ async function writeIsolatedHome(homeRoot) {
  */
 async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const [base, windows] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(
+      JSON.parse,
+    ),
+    readFile(
+      join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"),
+      "utf8",
+    ).then(JSON.parse),
   ]);
   const window = {
     ...base.app.windows.find((candidate) => candidate.label === "main"),
@@ -127,7 +128,7 @@ async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const config = {
     ...base,
     identifier: `io.github.kongweiguang.ja.side_chat_e2e_${frontendPort}`,
-    build: { ...base.build, devUrl: origin, beforeDevCommand: "pnpm dev" },
+    build: { ...base.build, devUrl: origin, beforeDevCommand: base.build.beforeDevCommand },
     app: {
       ...base.app,
       windows: [window],

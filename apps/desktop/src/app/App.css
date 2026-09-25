@@ -542,6 +542,10 @@ button {
   color: var(--ja-danger);
   font-size: var(--ja-text-control-size);
 }
+.ja-inline-attention {
+  color: var(--ja-warning);
+  font-size: var(--ja-text-control-size);
+}
 .ja-recovery-card {
   margin: 0.75rem clamp(0.75rem, 3vw, 1.5rem) 0;
   padding: 0.75rem 0.85rem;
@@ -550,7 +554,8 @@ button {
   background: var(--ja-warning-soft);
 }
 .ja-conversation > .ja-recovery-card,
-.ja-conversation > .ja-inline-error {
+.ja-conversation > .ja-inline-error,
+.ja-conversation > .ja-inline-attention {
   position: relative;
   z-index: 4;
   flex: 0 0 auto;

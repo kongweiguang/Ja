@@ -14,7 +14,7 @@ const desktopTestRoot = path.join(repositoryRoot, "apps", "desktop", "tests");
 const architectureFixtureRoot = path.join(repositoryRoot, "scripts", "fixtures", "architecture");
 const cratesRoot = path.join(repositoryRoot, "crates");
 const runtimeCrateRoot = path.join(repositoryRoot, "crates", "ja-runtime");
-const tauriSourceRoot = path.join(repositoryRoot, "src-tauri", "src");
+const tauriSourceRoot = path.join(repositoryRoot, "apps", "desktop", "src-tauri", "src");
 const sourceExtensions = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
 const rustDddOwners = new Set(["workspace", "review", "app_runtime"]);
 const rustDddLayers = new Set(["domain", "application", "infrastructure", "interface"]);
@@ -605,11 +605,13 @@ function runtimeTestFeatureAttributes(source) {
   );
 }
 
-/** 生产实现不得恢复测试专用函数或字段，确定性控制统一由 tests/support Harness 暴露。 */
+/** 仅识别测试语义的构造器与字段；new_for_terminal 等生产场景不能被命名形状误拒绝。 */
 function containsRustTestOnlyProductionSymbol(source) {
   const code = stripCommentsAndStrings(source);
   return (
-    /\bfn\s+(?:new_for_[A-Za-z0-9_]+|[A-Za-z0-9_]+_for_test)\b/.test(code) ||
+    /\bfn\s+(?:new_for_(?:[A-Za-z0-9_]+_)?(?:test|tests|smoke)(?:_[A-Za-z0-9_]+)?|[A-Za-z0-9_]+_for_test)\b/.test(
+      code,
+    ) ||
     /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:[A-Za-z_][A-Za-z0-9_]*_for_test|(?:test|smoke)_[A-Za-z0-9_]+)\s*:/m.test(
       code,
     )
@@ -1409,7 +1411,7 @@ async function checkRustDddResponsibilities() {
   for (const owner of rustDddOwners) {
     const ownerRoot = path.join(tauriSourceRoot, owner);
     for (const problem of await rustDddResponsibilityProblems(ownerRoot))
-      violations.push(`src-tauri/src/${owner}: Rust DDD 责任结构违规（${problem}）`);
+      violations.push(`apps/desktop/src-tauri/src/${owner}: Rust DDD 责任结构违规（${problem}）`);
   }
   return violations;
 }
@@ -1554,10 +1556,15 @@ async function checkTauriPlacement() {
   return violations;
 }
 
-/** 收集每个 workspace crate 的 src，避免新增 crate 后自动掉出测试组织门禁。 */
+/** 共享 crate 与 CLI 应用共同接受 Rust 门禁，避免应用迁出 crates 后漏检。 */
 async function collectCrateRustSourceRoots() {
   const entries = await readdir(cratesRoot, { withFileTypes: true });
-  const roots = [];
+  const roots = [
+    {
+      crateRoot: path.join(repositoryRoot, "apps", "cli"),
+      sourceRoot: path.join(repositoryRoot, "apps", "cli", "src"),
+    },
+  ];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const sourceRoot = path.join(cratesRoot, entry.name, "src");
@@ -1579,7 +1586,10 @@ async function collectCrateRustSourceRoots() {
 async function checkRustTestOrganization() {
   const violations = [];
   const roots = [
-    { crateRoot: path.join(repositoryRoot, "src-tauri"), sourceRoot: tauriSourceRoot },
+    {
+      crateRoot: path.join(repositoryRoot, "apps", "desktop", "src-tauri"),
+      sourceRoot: tauriSourceRoot,
+    },
     ...(await collectCrateRustSourceRoots()),
   ];
   for (const { crateRoot, sourceRoot } of roots) {
@@ -1730,7 +1740,10 @@ async function checkRustTestOrganization() {
 async function checkRuntimeTestConstructors() {
   const violations = [];
   const roots = [
-    { crateRoot: path.join(repositoryRoot, "src-tauri"), sourceRoot: tauriSourceRoot },
+    {
+      crateRoot: path.join(repositoryRoot, "apps", "desktop", "src-tauri"),
+      sourceRoot: tauriSourceRoot,
+    },
     ...(await collectCrateRustSourceRoots()),
   ];
   for (const { sourceRoot } of roots) {
@@ -2013,7 +2026,7 @@ async function checkAuthorMarkers() {
     desktopSourceRoot,
     desktopTestRoot,
     tauriSourceRoot,
-    path.join(repositoryRoot, "src-tauri", "tests"),
+    path.join(repositoryRoot, "apps", "desktop", "src-tauri", "tests"),
     path.join(runtimeCrateRoot, "src"),
     path.join(runtimeCrateRoot, "tests"),
     architectureFixtureRoot,
@@ -2032,7 +2045,7 @@ async function checkAuthorMarkers() {
   }
   for (const file of [
     path.join(repositoryRoot, "Cargo.toml"),
-    path.join(repositoryRoot, "src-tauri", "Cargo.toml"),
+    path.join(repositoryRoot, "apps", "desktop", "src-tauri", "Cargo.toml"),
     path.join(runtimeCrateRoot, "Cargo.toml"),
   ]) {
     const header = (await readFile(file, "utf8")).split(/\r?\n/).slice(0, 16).join("\n");
@@ -2486,7 +2499,13 @@ function checkRuleFixtures() {
     fixtureFailures.push("Rust unit 文件 IO reject fixture 未命中");
   if (rustUnitExternalIoOperations('let child = std::process::Command::new("git");').length !== 1)
     fixtureFailures.push("Rust unit 进程 IO reject fixture 未命中");
-  const rustFixtureCrateRoot = path.join(repositoryRoot, "__architecture_fixture__", "src-tauri");
+  const rustFixtureCrateRoot = path.join(
+    repositoryRoot,
+    "__architecture_fixture__",
+    "apps",
+    "desktop",
+    "src-tauri",
+  );
   if (
     rustTestLayer(
       path.join(rustFixtureCrateRoot, "tests", "unit", "query.rs"),
@@ -2561,6 +2580,8 @@ function checkRuleFixtures() {
     fixtureFailures.push("Rust 生产类型 allow fixture 被误拒绝");
   if (containsRustTestOnlyProductionSymbol("fn controlled_exit_host() {}"))
     fixtureFailures.push("Runtime controlled harness port allow fixture 被误拒绝");
+  if (containsRustTestOnlyProductionSymbol("fn new_for_terminal() {}"))
+    fixtureFailures.push("CLI 真实终端构造器 allow fixture 被误拒绝");
   if (!containsRustTestOnlyProductionSymbol("fn new_for_exit_test() {}"))
     fixtureFailures.push("Runtime 测试构造器 reject fixture 未命中");
   if (!containsRustTestOnlyProductionSymbol("test_exit_gate: Option<Gate>,"))
@@ -3041,27 +3062,30 @@ async function main() {
   for (const requiredPath of [
     "apps/desktop/src",
     "apps/desktop/tests",
-    "src-tauri/src",
+    "apps/desktop/src-tauri/src",
+    "apps/cli/src",
     "crates/ja-runtime/src",
     "app-server/pom.xml",
   ]) {
     await requirePath(requiredPath);
   }
   const legacyPaths = [
+    "src-tauri",
+    "crates/ja-cli",
     "src",
     "index.html",
     "vite.config.ts",
     "playwright.config.ts",
     "agent",
     "app-server/agent",
-    "src-tauri/Cargo.lock",
-    "src-tauri/src/agent_process",
-    "src-tauri/src/workspace_read",
-    "src-tauri/src/git_read",
-    "src-tauri/src/settings",
-    "src-tauri/src/app_runtime/application/bridge",
-    "src-tauri/tests/unit/settings",
-    "src-tauri/tests/unit/app_runtime/bridge",
+    "apps/desktop/src-tauri/Cargo.lock",
+    "apps/desktop/src-tauri/src/agent_process",
+    "apps/desktop/src-tauri/src/workspace_read",
+    "apps/desktop/src-tauri/src/git_read",
+    "apps/desktop/src-tauri/src/settings",
+    "apps/desktop/src-tauri/src/app_runtime/application/bridge",
+    "apps/desktop/src-tauri/tests/unit/settings",
+    "apps/desktop/src-tauri/tests/unit/app_runtime/bridge",
     "apps/desktop/src/features/workbench/git",
     "apps/desktop/tests/features/workbench/git",
     "apps/desktop/src/features/workbench/SummaryPanel.tsx",
@@ -3108,7 +3132,7 @@ async function main() {
     throw new Error(`架构边界检查失败:\n${violations.map((item) => `- ${item}`).join("\n")}`);
   }
   console.log(
-    "ARCHITECTURE_CHECK_OK chain=apps/desktop->src-tauri->crates/ja-runtime->app-server desktop=app,api,features,shared tests=apps/desktop/tests",
+    "ARCHITECTURE_CHECK_OK chain=apps/desktop/src-tauri+apps/cli->crates/ja-runtime->app-server desktop=app,api,features,shared tests=apps/desktop/tests",
   );
 }
 

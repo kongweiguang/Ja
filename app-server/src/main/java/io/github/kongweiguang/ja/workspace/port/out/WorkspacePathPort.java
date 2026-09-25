@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.workspace.port.out;
 
 import io.github.kongweiguang.ja.workspace.domain.WorkspaceEntryKind;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -13,8 +14,8 @@ import java.util.Objects;
  * 隔离 Workspace application 与 NIO 枚举、链接检测和 deadline 实现。
  */
 public interface WorkspacePathPort {
-    /** 只扫描条目名称与相对路径，不打开普通文件或读取正文。 */
-    SearchOutcome search(Path workspaceRoot, String query, int limit);
+    /** 只枚举条目路径；同一 Thread 的新查询可取消已过时的目录进程。 */
+    SearchOutcome search(Path workspaceRoot, String query, int limit, CancellationToken cancellationToken);
 
     /** 在消息真正接纳或消费前重验引用目标及声明类型。 */
     ValidatedPath validate(Path workspaceRoot, String relativePath, WorkspaceEntryKind kind);

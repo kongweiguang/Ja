@@ -343,8 +343,7 @@ final class ShellToolTest {
     @Test
     void normalRootExitClosesBackgroundDescendantAndReaders() throws Exception {
         Path childPid = temp.resolve("background-child.txt");
-        String command = "$child=Start-Process -FilePath $env:ComSpec "
-                + "-ArgumentList @('/d','/c','ping.exe','127.0.0.1','-n','120') -PassThru; "
+        String command = startHiddenLongLivedChild()
                 + "Set-Content -LiteralPath " + quote(childPid) + " -Value ([string]$child.Id); "
                 + "Write-Output 'root-complete'; exit 0";
 
@@ -417,10 +416,17 @@ final class ShellToolTest {
         return new AgentTool.Invocation("call_shell", "shell", arguments.build(), 0);
     }
 
-    /** 创建持有继承管道的长寿命子进程，并原子写入根/子 PID 供返回后的外部存活断言。 */
+    /** 用无窗口 CreateProcess 创建测试后代，避免 Windows Terminal 为短命 cmd 留下失败标签页。 */
+    private static String startHiddenLongLivedChild() {
+        return "$start=[System.Diagnostics.ProcessStartInfo]::new($env:ComSpec); "
+                + "$start.Arguments='/d /c ping.exe 127.0.0.1 -n 120'; "
+                + "$start.UseShellExecute=$false; $start.CreateNoWindow=$true; "
+                + "$child=[System.Diagnostics.Process]::Start($start); ";
+    }
+
+    /** 创建长寿命后代并写入根/子 PID，供返回后的进程树存活断言。 */
     private static String spawnLongLivedChildAndWritePids(Path pids) {
-        return "$child=Start-Process -FilePath $env:ComSpec "
-                + "-ArgumentList @('/d','/c','ping.exe','127.0.0.1','-n','120') -PassThru; "
+        return startHiddenLongLivedChild()
                 + "Set-Content -LiteralPath " + quote(pids)
                 + " -Value @([string]$PID,[string]$child.Id); Start-Sleep -Seconds 120";
     }

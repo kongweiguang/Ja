@@ -47,7 +47,7 @@ final class ConfigGenerationV1Test {
                     model.reasoningLevelMap());
             assertEquals(ConfigurationGenerationSnapshot.ReasoningLevel.MEDIUM,
                     snapshot.requireModel("provider_fixture", "model_second").defaultReasoningLevel());
-            assertEquals(32, provider.agentDefaults().turnLimits().maxModelRounds());
+            assertEquals(true, provider.agentDefaults().context().autoCompact());
         } finally {
             generation.close();
         }
@@ -168,7 +168,7 @@ final class ConfigGenerationV1Test {
         root.putObject("subagents").put("enabled", true).putNull("provider_id").putNull("model_id")
                 .putNull("reasoning_level");
         root.putArray("mcp_servers");
-        root.putArray("skills");
+        root.putArray("disabled_skills");
         ObjectNode provider = root.putArray("providers").addObject();
         provider.put("provider_id", "provider_fixture");
         provider.put("name", "Fixture");
@@ -179,8 +179,6 @@ final class ConfigGenerationV1Test {
                 .put("connect_timeout_ms", 10_000).put("request_timeout_ms", 120_000);
         ObjectNode defaults = provider.putObject("agent_defaults");
         defaults.putObject("context").put("auto_compact", true);
-        defaults.putObject("turn_limits").put("max_model_rounds", 32)
-                .put("max_tool_calls", 128).put("wall_timeout_ms", 600_000);
         addModel(provider, "model_fixture", "Fixture", true);
         addModel(provider, "model_second", "Second", false);
         return root;

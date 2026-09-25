@@ -117,7 +117,9 @@ public final class GoalContinuationTurnAdapter implements GoalContinuationCoordi
             TurnUseCase.Accepted accepted = turns.startContinuation(
                     command, hiddenContext(goal, request.fencingToken()),
                     tasks.projectContinuationEvents(thread.threadId(),
-                            phaseAwareSink(request.goalId(), route.sink())));
+                            phaseAwareSink(request.goalId(), route.sink())),
+                    io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext.shared()
+                            .findRun("goal", request.goalId(), request.runId()).orElse(null));
             gate.activate(request.goalId(), turnId, request.fencingToken(),
                     () -> cancelCurrent(turnId));
             route.retain();

@@ -20,6 +20,8 @@ GOLDEN = Path(os.environ.get("JA_GOLDEN_PATH", ROOT / "contracts" / "golden"))
 SCHEMA_PATH = ROOT / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
 VALID = GOLDEN / "v1" / "valid" / "agent-process.jsonl"
 INVALID = GOLDEN / "v1" / "invalid" / "agent-presentation.jsonl"
+MESSAGE_CONTENT_VALID = GOLDEN / "v1" / "valid" / "thread-message-content.jsonl"
+MESSAGE_CONTENT_INVALID = GOLDEN / "v1" / "invalid" / "thread-message-content.jsonl"
 CHANGE_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "change-set-results.jsonl"
 WORKSPACE_IDENTITY_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-identities.jsonl"
 QUEUE_VALID = GOLDEN / "v1" / "valid" / "input-queue.jsonl"
@@ -49,6 +51,7 @@ RESULT_DEFS = {
     "thread/archive": "threadResult",
     "thread/restore": "threadResult",
     "thread/read": "threadReadResult",
+    "thread/message-content/read": "messageContentReadResult",
     "thread/usage/read": "threadUsageSummary",
     "thread/mcp/read": "threadMcpStatusResult",
     "tool/artifact/read": "toolArtifactReadResult",
@@ -137,7 +140,7 @@ def require_invalid(validator: Draft202012Validator, value: Any, label: str) -> 
 
 def validate_artifact_result(method: str, result: dict[str, Any]) -> None:
     """分别锁定 Tool 字符分页与冻结文件完整 Base64 的语义。"""
-    if method == "tool/artifact/read":
+    if method in {"tool/artifact/read", "thread/message-content/read"}:
         offset = result["offsetCharacters"]
         end = result["totalCharacters"] if result["nextOffsetCharacters"] is None \
             else result["nextOffsetCharacters"]
@@ -611,7 +614,7 @@ def main() -> int:
     root = Draft202012Validator(schema, format_checker=FormatChecker())
     pending: dict[str, str] = {}
     observed: set[str] = set()
-    positive = documents(VALID)
+    positive = documents(VALID) + documents(MESSAGE_CONTENT_VALID)
     for frame in positive:
         require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
         if "method" in frame and "id" in frame:
@@ -622,14 +625,14 @@ def main() -> int:
         elif "result" in frame:
             method = pending.pop(frame["id"])
             require_valid(definition_validator(schema, RESULT_DEFS[method]), frame["result"], method)
-            if method in {"tool/artifact/read", "turn/change-set/read"}:
+            if method in {"tool/artifact/read", "thread/message-content/read", "turn/change-set/read"}:
                 validate_artifact_result(method, frame["result"])
     expected = {"assistant/model-step-committed", "tool/started", "tool/batch-committed", "thread/read",
-                "tool/artifact/read", "turn/change-set/read"}
+                "tool/artifact/read", "thread/message-content/read", "turn/change-set/read"}
     if not expected <= observed:
         raise RuntimeError("positive corpus lacks Agent process methods")
 
-    negative = documents(INVALID)
+    negative = documents(INVALID) + documents(MESSAGE_CONTENT_INVALID)
     for frame in negative:
         if "method" in frame:
             require_invalid(root, frame, str(frame["method"]))

@@ -290,12 +290,11 @@ describe("ConversationTimelineSurface", () => {
           threadRevision: 3,
           occurredAt: "2026-09-20T00:00:04Z",
           attempt: 2,
-          maxAttempts: 6,
         },
       });
     });
 
-    expect(await screen.findByText("正在工作 · 重试 2/6")).toBeDefined();
+    expect(await screen.findByText("正在工作 · 连接中断，正在恢复")).toBeDefined();
     expect(document.querySelector('[data-retry-status="true"]')).not.toBeNull();
     expect(screen.queryByText("旧请求半截正文")).toBeNull();
     expect(screen.getByRole("article", { name: "回复状态" }).textContent).toContain("正在工作");

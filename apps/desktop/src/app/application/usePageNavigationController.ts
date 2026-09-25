@@ -28,41 +28,43 @@ export function usePageNavigationController(settingsRequired: boolean): PageNavi
   const [forwardStack, setForwardStack] = useState<AppView[]>([]);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("models");
 
-  /** 导航只提交新的可见页面，并把历史限制为二十项以避免无界 renderer 状态。 */
+  /** 必填设置期间不记录不可见导航，避免历史栈出现可点击却不能离开的伪入口。 */
   const navigate = useCallback(
     (nextView: AppView): void => {
-      if (nextView === view) return;
+      if (settingsRequired || nextView === view) return;
       setBackStack((current) => [...current.slice(-19), view]);
       setForwardStack([]);
       setView(nextView);
     },
-    [view],
+    [settingsRequired, view],
   );
 
-  /** 回退时把当前页面压入 forward stack，页面切换不触碰领域 controller。 */
+  /** 必填设置保留原历史；可导航时才把当前页面压入 forward stack。 */
   const goBack = useCallback((): void => {
+    if (settingsRequired) return;
     const target = backStack.at(-1);
     if (target === undefined) return;
     setBackStack(backStack.slice(0, -1));
     setForwardStack((current) => [view, ...current].slice(0, 20));
     setView(target);
-  }, [backStack, view]);
+  }, [backStack, settingsRequired, view]);
 
-  /** 前进只重放先前回退的页面，保持与浏览器历史相同的栈语义。 */
+  /** 前进与回退遵守同一必填设置边界，不让快捷键改写暂不可见的页面历史。 */
   const goForward = useCallback((): void => {
+    if (settingsRequired) return;
     const [target, ...remaining] = forwardStack;
     if (target === undefined) return;
     setForwardStack(remaining);
     setBackStack((current) => [...current.slice(-19), view]);
     setView(target);
-  }, [forwardStack, view]);
+  }, [forwardStack, settingsRequired, view]);
 
   return {
     view,
     settingsVisible: view === "settings" || settingsRequired,
     settingsSection,
-    canGoBack: backStack.length > 0,
-    canGoForward: forwardStack.length > 0,
+    canGoBack: !settingsRequired && backStack.length > 0,
+    canGoForward: !settingsRequired && forwardStack.length > 0,
     setSettingsSection,
     navigate,
     goBack,

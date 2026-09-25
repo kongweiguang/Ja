@@ -19,14 +19,15 @@ PRODUCT_VERSION_PATTERN = re.compile(
     r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
-LOCAL_CARGO_PACKAGES = ("ja", "ja-runtime")
+LOCAL_CARGO_PACKAGES = ("ja-desktop", "ja-runtime")
 FILES = {
     "package_json": "package.json",
+    "npm_package_json": "packages/ja-npm/package.json",
     "cargo_workspace": "Cargo.toml",
-    "desktop_cargo": "src-tauri/Cargo.toml",
+    "desktop_cargo": "apps/desktop/src-tauri/Cargo.toml",
     "runtime_cargo": "crates/ja-runtime/Cargo.toml",
     "cargo_lock": "Cargo.lock",
-    "tauri_config": "src-tauri/tauri.conf.json",
+    "tauri_config": "apps/desktop/src-tauri/tauri.conf.json",
     "maven_pom": "app-server/pom.xml",
     "golden_core": "contracts/golden/v1/valid/core.jsonl",
     "java_version_resource": "app-server/src/main/version/ja-build.properties",
@@ -268,8 +269,27 @@ def inspect_product_version_sources(
         if actual != expected:
             drift.append(f"{label}: expected {expected}, found {actual}")
 
-    tauri = _parse_json(sources["tauri_config"], "src-tauri/tauri.conf.json")
-    expect("src-tauri/tauri.conf.json version", tauri.get("version"), version)
+    npm_package = _parse_json(
+        sources["npm_package_json"], "packages/ja-npm/package.json"
+    )
+    expect(
+        "packages/ja-npm/package.json name",
+        npm_package.get("name"),
+        "@kongweiguang/ja",
+    )
+    expect(
+        "packages/ja-npm/package.json version",
+        npm_package.get("version"),
+        version,
+    )
+    expect(
+        "packages/ja-npm/package.json private",
+        npm_package.get("private"),
+        True,
+    )
+
+    tauri = _parse_json(sources["tauri_config"], "apps/desktop/src-tauri/tauri.conf.json")
+    expect("apps/desktop/src-tauri/tauri.conf.json version", tauri.get("version"), version)
 
     cargo_workspace = _parse_toml(sources["cargo_workspace"], "Cargo.toml")
     expect(
@@ -278,7 +298,7 @@ def inspect_product_version_sources(
         version,
     )
     for label, key in (
-        ("src-tauri/Cargo.toml", "desktop_cargo"),
+        ("apps/desktop/src-tauri/Cargo.toml", "desktop_cargo"),
         ("crates/ja-runtime/Cargo.toml", "runtime_cargo"),
     ):
         manifest = _parse_toml(sources[key], label)
@@ -355,11 +375,14 @@ def inspect_product_version_sources(
 
 
 def synchronize_product_version_sources(sources: dict[str, str]) -> dict[str, str]:
-    """Build a fully validated projection set before writing, including the JSONL response identity."""
+    """Sync product projections and the private npm template before validating the release identity."""
     version = _authoritative_version(sources)
     updated = dict(sources)
+    updated["npm_package_json"] = _update_json_version(
+        sources["npm_package_json"], version, "packages/ja-npm/package.json"
+    )
     updated["tauri_config"] = _update_json_version(
-        sources["tauri_config"], version, "src-tauri/tauri.conf.json"
+        sources["tauri_config"], version, "apps/desktop/src-tauri/tauri.conf.json"
     )
     updated["cargo_workspace"] = _replace_toml_assignment(
         sources["cargo_workspace"], "workspace.package", "version", version

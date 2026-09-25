@@ -7,7 +7,6 @@ import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
 
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 
@@ -33,10 +32,10 @@ final class TurnStartRequestValidation {
     }
 
     /**
-     * 集中验证运行时选择、期限和 CAS 游标，使内部续跑与用户 Turn 保持完全相同的资源边界。
+     * 集中验证运行时选择和 CAS 游标，避免内部续跑重新引入整轮期限。
      */
     static void validateRuntime(String reasoningLevel, AccessMode accessMode,
-                                CollaborationMode collaborationMode, Duration deadline,
+                                CollaborationMode collaborationMode,
                                 long expectedThreadRevision, long initialTurnMutationVersion,
                                 Instant requestedAt) {
         if (reasoningLevel != null && !reasoningLevel.matches("off|minimal|low|medium|high|xhigh|max")) {
@@ -44,12 +43,6 @@ final class TurnStartRequestValidation {
         }
         Objects.requireNonNull(accessMode, "accessMode");
         Objects.requireNonNull(collaborationMode, "collaborationMode");
-        Objects.requireNonNull(deadline, "deadline");
-        long deadlineMillis = deadline.toMillis();
-        if (deadlineMillis < 1_000 || deadlineMillis > 86_400_000
-                || deadlineMillis != deadline.toNanos() / 1_000_000) {
-            throw new IllegalArgumentException("deadline is outside supported bounds");
-        }
         if (expectedThreadRevision < 0 || initialTurnMutationVersion < 0) {
             throw new IllegalArgumentException("turn revisions must be non-negative");
         }

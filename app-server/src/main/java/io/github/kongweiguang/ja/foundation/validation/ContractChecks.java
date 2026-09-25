@@ -28,6 +28,23 @@ public final class ContractChecks {
         return value;
     }
 
+    /** 运行期 Skill 包含内置来源；配置写入仍由各自领域决定是否允许该来源。 */
+    public static String runtimeSkillIdentifier(String value) {
+        if (value == null || value.length() > 520) throw new IllegalArgumentException("invalid skillId");
+        int delimiter = value.indexOf(':');
+        if (delimiter <= 0 || delimiter != value.lastIndexOf(':') || delimiter == value.length() - 1
+                || !java.util.Set.of("user", "ja", "project", "bundled")
+                        .contains(value.substring(0, delimiter))) {
+            throw new IllegalArgumentException("invalid skillId");
+        }
+        String name = value.substring(delimiter + 1);
+        if (name.isBlank() || name.length() > 512
+                || name.chars().anyMatch(Character::isISOControl)) {
+            throw new IllegalArgumentException("invalid skillId");
+        }
+        return value;
+    }
+
     /**
      * 配置代际只接受配置 Owner 产生的 `cfg_` 身份；独立入口共享该约束，避免旧 Profile revision
      * 或任意安全字符串在 Tool、权限和模型调用链中重新取得代际语义。

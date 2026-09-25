@@ -93,16 +93,21 @@ fn attachment_preview_identity_validation_fails_closed() {
     );
 }
 
-/// generic session admission 对四个队列方法执行各自精确字段与预算校验，旧 steer/follow-up 不再准入。
+/// 入队新合同必须在共享 Rust 准入层接受 kind 与操作标识；缺失时不能被误报为响应丢失。
 #[test]
 fn turn_input_identity_validation_is_method_specific() {
-    assert!(
-        validate_turn_identity(
-            "turn/input/enqueue",
-            &json!({"turnId":"turn_demo","content":[{"type":"text","text":"follow up"}]}),
-        )
-        .is_ok()
-    );
+    let input = json!({"turnId":"turn_demo","content":[{"type":"text","text":"follow up"}],
+        "kind":"follow_up","clientOperationId":"op_0123456789abcdef0123456789abcdef"});
+    assert!(validate_turn_identity("turn/input/enqueue", &input).is_ok());
+    let mut steering = input.clone();
+    steering["kind"] = json!("steering");
+    assert!(validate_turn_identity("turn/input/enqueue", &steering).is_ok());
+    let mut old_shape = input.clone();
+    old_shape.as_object_mut().unwrap().remove("kind");
+    assert!(validate_turn_identity("turn/input/enqueue", &old_shape).is_err());
+    let mut invalid_operation = input.clone();
+    invalid_operation["clientOperationId"] = json!("op_wrong");
+    assert!(validate_turn_identity("turn/input/enqueue", &invalid_operation).is_err());
     assert!(
         validate_turn_identity(
             "turn/input/prioritize",
@@ -126,20 +131,38 @@ fn turn_input_identity_validation_is_method_specific() {
     );
 }
 
+/// 文件与来源限定 Skill 在同一正文中必须通过 Rust 准入，旧 `skill_` 伪身份仍被拒绝。
+#[test]
+fn turn_start_accepts_structured_file_and_skill_references() {
+    let content = json!([
+        {"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"Cargo.toml","kind":"file"},
+        {"type":"skill_reference","skillId":"ja:qa-tui-reference"},
+        {"type":"text","text":"请检查引用"}
+    ]);
+    let request = json!({"threadId":"thr_demo","content":content,
+        "clientOperationId":"op_0123456789abcdef0123456789abcdef"});
+    assert!(validate_turn_identity("turn/start", &request).is_ok());
+    let mut old_identity = request.clone();
+    old_identity["content"][1]["skillId"] = json!("skill_legacy");
+    assert!(validate_turn_identity("turn/start", &old_identity).is_err());
+}
+
 /// client admission 独立锁定新增 wire envelope，避免 Rust 调用绕过 Tauri DTO 将受管请求通道变成任意 payload tunnel。
 #[test]
 fn continue_and_reask_identity_validation_is_method_specific() {
     assert!(
         validate_turn_identity(
             "turn/continue",
-            &json!({"threadId":"thr_demo","expectedThreadRevision":7}),
+            &json!({"threadId":"thr_demo","expectedThreadRevision":7,
+                "clientOperationId":"op_0123456789abcdef0123456789abcdef"}),
         )
         .is_ok()
     );
     assert!(
         validate_turn_identity(
             "turn/continue",
-            &json!({"threadId":"thr_demo","expectedThreadRevision":7,"content":[]}),
+            &json!({"threadId":"thr_demo","expectedThreadRevision":7,"content":[],
+                "clientOperationId":"op_0123456789abcdef0123456789abcdef"}),
         )
         .is_err()
     );
@@ -150,7 +173,8 @@ fn continue_and_reask_identity_validation_is_method_specific() {
                 "threadId":"thr_demo",
                 "expectedThreadRevision":7,
                 "sourceMessageId":"item_user_demo",
-                "content":[{"type":"text","text":"replacement"}]
+                "content":[{"type":"text","text":"replacement"}],
+                "clientOperationId":"op_0123456789abcdef0123456789abcdef"
             }),
         )
         .is_ok()
@@ -162,8 +186,92 @@ fn continue_and_reask_identity_validation_is_method_specific() {
                 "threadId":"thr_demo",
                 "expectedThreadRevision":7,
                 "sourceMessageId":"turn_wrong_domain",
-                "content":[{"type":"text","text":"replacement"}]
+                "content":[{"type":"text","text":"replacement"}],
+                "clientOperationId":"op_0123456789abcdef0123456789abcdef"
             }),
+        )
+        .is_err()
+    );
+}
+
+/// 持久操作查询和四个有副作用入口只能接受精确 op_ 十六进制键，响应丢失后
+/// 客户端可查询同一操作而无需重新提交，空值或旧参数不能穿过本地准入。
+#[test]
+fn client_operation_identity_is_required_before_wire() {
+    let operation = "op_0123456789abcdef0123456789abcdef";
+    assert!(
+        validate_turn_identity("operation/read", &json!({"clientOperationId":operation})).is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "operation/read",
+            &json!({"clientOperationId":"op_UPPERCASE"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/start",
+            &json!({"threadId":"thr_demo",
+            "content":[{"type":"text","text":"start"}],"clientOperationId":operation})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "turn/start",
+            &json!({"threadId":"thr_demo",
+            "content":[{"type":"text","text":"start"}]})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "approval/respond",
+            &json!({"approvalId":"appr_demo","turnId":"turn_demo",
+            "decision":"approve","expectedThreadRevision":1,"clientOperationId":operation})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "approval/respond",
+            &json!({"approvalId":"appr_demo","turnId":"turn_demo",
+            "decision":"approve","expectedThreadRevision":1})
+        )
+        .is_err()
+    );
+}
+
+/// Java 对项目 cwd 允许缺省 displayName 并自行生成名称；本地准入不能把
+/// 合法的 CLI 首次打开误报为协议故障，显式名称仍按服务端上限校验。
+#[test]
+fn workspace_open_accepts_optional_display_name() {
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    assert!(validate_turn_identity("workspace/open", &json!({"cwd":cwd})).is_ok());
+    assert!(
+        validate_turn_identity("workspace/open", &json!({"cwd":cwd,"displayName":null})).is_err()
+    );
+    assert!(
+        validate_turn_identity("workspace/open", &json!({"cwd":cwd,"displayName":"项目"})).is_ok()
+    );
+    assert!(
+        validate_turn_identity(
+            "workspace/open",
+            &json!({"cwd":cwd,"displayName":"x".repeat(700)})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_turn_identity("workspace/open", &json!({"cwd":cwd,"displayName":"  "})).is_err()
+    );
+    assert!(
+        validate_turn_identity("workspace/open", &json!({"cwd":cwd,"displayName":42})).is_err()
+    );
+    assert!(
+        validate_turn_identity(
+            "workspace/open",
+            &json!({"cwd":cwd,"displayName":"x".repeat(1_025)})
         )
         .is_err()
     );
@@ -828,7 +936,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         json!({
             "threadId": "thr_blocked_stdin",
             "content": [{"type": "text", "text": "x".repeat(900_000)}],
-            "deadlineMs": 30_000
+            "clientOperationId": "op_0123456789abcdef0123456789abcdef"
         }),
         Duration::from_secs(30),
     );

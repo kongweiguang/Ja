@@ -110,8 +110,8 @@ public final class GoalModels {
             Objects.requireNonNull(phase, "phase");
             Objects.requireNonNull(createdAt, "createdAt");
             Objects.requireNonNull(updatedAt, "updatedAt");
-            if (goalDefinitionRevision < 1 || revision < 0 || turnsWithoutProgress < 0 || turnsWithoutProgress > 3
-                    || repeatedFailureCount < 0 || repeatedFailureCount > 3) {
+            if (goalDefinitionRevision < 1 || revision < 0 || turnsWithoutProgress < 0
+                    || repeatedFailureCount < 0) {
                 throw new IllegalArgumentException("invalid Goal counters");
             }
         }

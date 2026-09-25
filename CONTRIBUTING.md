@@ -36,7 +36,9 @@ mvn.cmd -version
 ## 目录边界
 
 - `apps/desktop/`：React/Vite 桌面前端；测试只放在 `apps/desktop/tests/`。
-- `src-tauri/`：Tauri 壳与 Windows/macOS 原生能力；Rust 测试放在其 `tests/` 边界。
+- `apps/desktop/src-tauri/`：Tauri 壳与 Windows/macOS 原生能力；Rust 测试放在其 `tests/` 边界。
+- `apps/cli/`：Rust CLI/TUI；复用 `crates/ja-runtime`，测试放在所属应用的 `tests/`。
+- `packages/ja-npm/`：CLI 的 npm 分发包装及其打包验证。
 - `crates/ja-runtime/`：不依赖 Tauri 的 Ja App Server host runtime。
 - `app-server/`：唯一 Java App Server 和 Agent Kernel，构建入口是 `app-server/pom.xml`。
 - `contracts/ja-rpc/v1/` 与 `contracts/golden/v1/`：JA-RPC v1 schema 与三端语料。

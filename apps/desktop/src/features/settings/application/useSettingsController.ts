@@ -52,6 +52,9 @@ interface SettingsControllerOptions {
   boot: BootProjection;
   configurationChange: SettingsConfigurationChange | undefined;
   runtimePort: SettingsRuntimePort;
+  /** 编辑面可延迟加载，避免隐藏设置页扫描另一个项目的目录。 */
+  active?: boolean;
+  catalogSection?: "skills" | "mcp" | "all" | "none";
 }
 
 /** Settings controller 只暴露 v1 Provider 聚合，模型选择始终归属已保存 Provider。 */
@@ -85,7 +88,7 @@ export interface SettingsController {
   reload(): Promise<void>;
 }
 
-/** 将健康与启用事实分开收敛，避免把已发现但未授权的 Skill 显示成已加载。 */
+/** 将健康与停用事实分开收敛，避免把已发现但损坏的 Skill 显示成可用。 */
 function skillStatus(
   status: "healthy" | "invalid" | "unavailable",
   enabled: boolean,
@@ -106,22 +109,21 @@ function projectSkills(result: SkillListResult): SkillProjection[] {
 }
 
 /**
- * 把发现元数据与来源限定授权重新组合；缺失记录只供设置页移除，绝不伪造成可读 Skill。
+ * 把发现元数据与来源限定停用记录重新组合；缺失记录只供设置页移除。
  */
 function skillSettingsProjection(
   discovered: SkillProjection[],
-  activeReferences: readonly string[],
-  retainedReferences: readonly string[],
+  disabledReferences: readonly string[],
   include: (skill: SkillProjection) => boolean,
 ): SkillProjection[] {
-  const active = new Set(activeReferences);
+  const disabled = new Set(disabledReferences);
   const visible = discovered.filter(include).map((skill) => ({
     ...skill,
-    enabled: active.has(skill.id),
-    status: active.has(skill.id) ? skill.status : ("disabled" as const),
+    enabled: !disabled.has(skill.id),
+    status: disabled.has(skill.id) ? ("disabled" as const) : skill.status,
   }));
   const known = new Set(discovered.map((skill) => skill.id));
-  for (const reference of retainedReferences) {
+  for (const reference of disabledReferences) {
     if (known.has(reference)) continue;
     const delimiter = reference.indexOf(":");
     const source = reference.slice(0, delimiter);
@@ -133,7 +135,7 @@ function skillSettingsProjection(
       name,
       source,
       description: "",
-      enabled: active.has(reference),
+      enabled: false,
       missing: true,
       status: "error",
       error: "文件已移除",
@@ -233,7 +235,6 @@ function toSettingsSnapshot(
       networkTimeouts: { ...provider.networkTimeouts },
       agentDefaults: {
         context: { ...provider.agentDefaults.context },
-        turnLimits: { ...provider.agentDefaults.turnLimits },
       },
       models: provider.models.map((model) => ({
         ...model,
@@ -242,7 +243,7 @@ function toSettingsSnapshot(
       })),
     })),
     mcpServers: mcpSettingsProjection(document.mcpServers, runtimeMcpServers),
-    skills: skillSettingsProjection(runtimeSkills, document.skills, document.skills, () => true),
+    skills: skillSettingsProjection(runtimeSkills, document.disabledSkills, () => true),
     defaultAccessMode: document.defaultAccessMode,
     clarificationEnabled: document.clarificationEnabled,
     appearance: {
@@ -364,11 +365,17 @@ function rebaseSettingsDocument(
     latest.mcpServers,
     (server) => server.mcpRevision,
   );
-  const skills = rebaseEntries(baseline.skills, intended.skills, latest.skills, (skill) => skill);
-  if (providers === undefined || mcpServers === undefined || skills === undefined) return undefined;
+  const disabledSkills = rebaseEntries(
+    baseline.disabledSkills,
+    intended.disabledSkills,
+    latest.disabledSkills,
+    (skill) => skill,
+  );
+  if (providers === undefined || mcpServers === undefined || disabledSkills === undefined)
+    return undefined;
   rebased.providers = providers;
   rebased.mcpServers = mcpServers;
-  rebased.skills = skills;
+  rebased.disabledSkills = disabledSkills;
   return rebased;
 }
 
@@ -427,6 +434,8 @@ export function useSettingsController({
   boot,
   configurationChange,
   runtimePort,
+  active = true,
+  catalogSection = "all",
 }: SettingsControllerOptions): SettingsController {
   const queryClient = useQueryClient();
   // Workspace owner 位于 composition；每次 render 直接派生 query key，避免 ref 更新不触发 render
@@ -447,7 +456,7 @@ export function useSettingsController({
     setReducedTransparency,
   } = appearancePort;
   const runtimeReady =
-    runtimeState !== undefined && ["ready", "busy"].includes(runtimeState.status);
+    active && runtimeState !== undefined && ["ready", "busy"].includes(runtimeState.status);
   // Query 与失效 effect 只依赖投影中的分代标量；调用方重建等值对象时不能形成 fetch 循环。
   const runtimeServerInstanceId = runtimeState?.serverInstanceId;
   const runtimeGeneration = runtimeState?.generation;
@@ -542,13 +551,16 @@ export function useSettingsController({
           skillWorkspaceId === undefined ? undefined : { workspaceId: skillWorkspaceId },
         ),
       ),
-    enabled: runtimeReady,
+    enabled: runtimeReady && (catalogSection === "all" || catalogSection === "skills"),
+    // 仅可见 Skills 管理页低频重发现，安装新文件后无需切换工作区或修改配置。
+    refetchInterval: runtimeReady && catalogSection === "skills" ? 15_000 : false,
   });
   /** 全局列表永远不携带 workspace，保证项目同名覆盖不会污染全局授权编辑面。 */
   const globalSkillsQuery = useQuery({
     queryKey: globalSkillsKey,
     queryFn: async () => projectSkills(await runtimePort.listSkills()),
-    enabled: runtimeReady,
+    enabled: runtimeReady && (catalogSection === "all" || catalogSection === "skills"),
+    refetchInterval: runtimeReady && catalogSection === "skills" ? 15_000 : false,
   });
 
   /** MCP catalog 与流式 timeline 分离；仅保存有界、脱敏的一次性查询投影。 */
@@ -560,12 +572,12 @@ export function useSettingsController({
           queryWorkspaceId === undefined ? undefined : { workspaceId: queryWorkspaceId },
         ),
       ),
-    enabled: runtimeReady,
+    enabled: runtimeReady && (catalogSection === "all" || catalogSection === "mcp"),
   });
   const globalMcpQuery = useQuery({
     queryKey: globalMcpKey,
     queryFn: async () => projectMcpServers(await runtimePort.listMcpServers()),
-    enabled: runtimeReady,
+    enabled: runtimeReady && (catalogSection === "all" || catalogSection === "mcp"),
   });
   const loaded = settingsQuery.data;
   const runtimeSkills = useMemo(() => skillsQuery.data ?? [], [skillsQuery.data]);
@@ -1293,7 +1305,7 @@ export function useSettingsController({
   );
 
   /**
-   * Skill 开关只提交来源限定引用：全局维护用户授权，项目只登记项目授权或收紧已启用的全局引用。
+   * Skill 开关只提交来源限定停用引用；全局与项目各自写入所属来源名单。
    * 保存失败或 CAS 冲突会保留当前画面并权威重读，禁止乐观状态漂移到其它 workspace。
    */
   const toggleSkill = useCallback(
@@ -1304,13 +1316,13 @@ export function useSettingsController({
         if (!skillReference.startsWith("user:") && !skillReference.startsWith("ja:")) {
           throw new Error("global skill unavailable");
         }
-        const skills = enabled
-          ? Array.from(new Set([...current.userDocument.skills, skillReference]))
-          : current.userDocument.skills.filter((skill) => skill !== skillReference);
+        const disabledSkills = enabled
+          ? current.userDocument.disabledSkills.filter((skill) => skill !== skillReference)
+          : Array.from(new Set([...current.userDocument.disabledSkills, skillReference]));
         await saveDocument({
           ...current.userDocument,
           revision: current.userDocument.revision + 1,
-          skills,
+          disabledSkills,
         });
       } else {
         const workspaceId = queryWorkspaceId;
@@ -1318,25 +1330,14 @@ export function useSettingsController({
         if (workspaceId === undefined || project === undefined) {
           throw new Error("project settings unavailable");
         }
-        const projectSkill = skillReference.startsWith("project:");
-        if (!projectSkill && !current.userDocument.skills.includes(skillReference)) {
-          throw new Error("project may only disable globally enabled skills");
-        }
-        const next = projectSkill
-          ? {
-              ...project,
-              revision: project.revision + 1,
-              skills: enabled
-                ? Array.from(new Set([...project.skills, skillReference]))
-                : project.skills.filter((skill) => skill !== skillReference),
-            }
-          : {
-              ...project,
-              revision: project.revision + 1,
-              disabledSkills: enabled
-                ? project.disabledSkills.filter((skill) => skill !== skillReference)
-                : Array.from(new Set([...project.disabledSkills, skillReference])),
-            };
+        if (!skillReference.startsWith("project:")) throw new Error("project skill unavailable");
+        const next = {
+          ...project,
+          revision: project.revision + 1,
+          disabledSkills: enabled
+            ? project.disabledSkills.filter((skill) => skill !== skillReference)
+            : Array.from(new Set([...project.disabledSkills, skillReference])),
+        };
         try {
           await adapter.saveProjectSkills(next, workspaceId, current.cas.projectVersion);
         } catch (error) {
@@ -1483,43 +1484,45 @@ export function useSettingsController({
   );
 
   /**
-   * Skills 的全局/项目投影各自以所属文档为真相；项目页只暴露可操作的项目项和已全局启用项。
+   * Skills 的全局/项目投影各自以所属停用名单为真相；项目组只展示项目来源。
    */
   const skillSettings = useMemo<SettingsController["skillSettings"]>(() => {
     if (loaded === undefined) return { global: [], projectAvailable: false };
-    const globalReferences = loaded.userDocument.skills;
+    const globalDisabled = loaded.userDocument.disabledSkills;
     const global = skillSettingsProjection(
       globalRuntimeSkills,
-      globalReferences,
-      globalReferences,
+      globalDisabled,
       (skill) => skill.source === "user" || skill.source === "ja",
     );
     const projectDocument = loaded.projectSkillDocument;
-    const projectAvailable = queryWorkspaceId !== undefined && projectDocument !== undefined;
+    const projectAvailable =
+      queryWorkspaceId !== undefined &&
+      projectDocument !== undefined &&
+      !settingsQuery.isPlaceholderData;
     if (!projectAvailable || projectDocument === undefined)
       return { global, projectAvailable: false };
-    const disabled = new Set(projectDocument.disabledSkills);
-    const active = [
-      ...projectDocument.skills,
-      ...globalReferences.filter((reference) => !disabled.has(reference)),
-    ];
     const project = skillSettingsProjection(
       runtimeSkills,
-      active,
-      [...projectDocument.skills, ...projectDocument.disabledSkills],
-      (skill) =>
-        skill.source === "project" ||
-        ((skill.source === "user" || skill.source === "ja") && globalReferences.includes(skill.id)),
+      projectDocument.disabledSkills,
+      (skill) => skill.source === "project",
     );
     return { global, project, projectAvailable: true };
-  }, [globalRuntimeSkills, loaded, queryWorkspaceId, runtimeSkills]);
+  }, [
+    globalRuntimeSkills,
+    loaded,
+    queryWorkspaceId,
+    runtimeSkills,
+    settingsQuery.isPlaceholderData,
+  ]);
 
   /** 全局与项目 MCP 分别以各自配置文档为编辑事实，健康度只叠加同作用域测试结果。 */
   const mcpSettings = useMemo<SettingsController["mcpSettings"]>(() => {
     if (loaded === undefined) return { global: [], projectAvailable: false };
     const global = mcpSettingsProjection(loaded.userDocument.mcpServers, globalRuntimeMcpServers);
     const projectAvailable =
-      queryWorkspaceId !== undefined && loaded.projectMcpServers !== undefined;
+      queryWorkspaceId !== undefined &&
+      loaded.projectMcpServers !== undefined &&
+      !settingsQuery.isPlaceholderData;
     if (!projectAvailable || loaded.projectMcpServers === undefined) {
       return { global, projectAvailable: false };
     }
@@ -1529,7 +1532,13 @@ export function useSettingsController({
       projectAvailable: true,
       projectWorkspaceId: queryWorkspaceId,
     };
-  }, [globalRuntimeMcpServers, loaded, queryWorkspaceId, runtimeMcpServers]);
+  }, [
+    globalRuntimeMcpServers,
+    loaded,
+    queryWorkspaceId,
+    runtimeMcpServers,
+    settingsQuery.isPlaceholderData,
+  ]);
 
   /** 以稳定 action 集合作为 UI 边界，避免视图接触 adapter 或 CAS 文档。 */
   const ports = useMemo<SettingsPorts>(

@@ -183,6 +183,29 @@ final class AgentContextMapperTest {
                 .map(content -> assertInstanceOf(TextContent.class, content).text()).toList());
     }
 
+    /** 跨模型公开摘要必须完整分段，旧的一 MiB 静默截断会造成用户历史语义丢失。 */
+    @Test
+    void preservesLongPublicReasoningAcrossProviderIdentityChanges() {
+        String visible = "a".repeat(1_048_575) + "😀end";
+        ReasoningContent reasoning = new ReasoningContent("provider_test", "model_test", "openai_responses",
+                "test-model", ReasoningContent.endpointFingerprint(URI.create("http://127.0.0.1:60842")),
+                "reasoning", "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\""
+                        + visible + "\"}]}");
+        ModelMessage assistant = new ModelMessage(ModelRole.ASSISTANT, List.of(reasoning));
+        List<ContextMessage> context = new AgentContextMapper(new TestJsonValueCodec())
+                .fromSnapshot(snapshot(new ConversationRepository.StoredMessage(
+                        "item_long_reasoning", "turn_test", 1, assistant,
+                        Instant.parse("2026-08-25T12:00:00Z"))), "turn_test");
+
+        ModelPort.ModelRequest request = requestFor(context, configuration(Set.of(ModelPort.InputModality.TEXT),
+                "provider_other", "model_other", "test-model", URI.create("http://127.0.0.1:60843")));
+        List<ModelContent> parts = request.messages().getFirst().content();
+        assertTrue(parts.size() > 1);
+        assertEquals(visible, parts.stream()
+                .map(part -> assertInstanceOf(TextContent.class, part).text())
+                .collect(java.util.stream.Collectors.joining()));
+    }
+
     /**
      * Reask/off-path facts never enter the next prompt; committed Tool call/results stay paired, while only
      * partial and terminal-identified failure items are removed even when a real answer has identical text.

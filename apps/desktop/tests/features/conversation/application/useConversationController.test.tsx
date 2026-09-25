@@ -71,8 +71,12 @@ function historyExtensions(): Pick<
   | "threadSeen"
   | "threadArchive"
   | "threadRestore"
+  | "threadObserve"
+  | "threadUnobserve"
 > {
   return {
+    threadObserve: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
+    threadUnobserve: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
     threadSearch: vi.fn(async () => ({ items: [], nextCursor: null })),
     threadRename: vi.fn(async () => thread("thr_unused")),
     threadPreferencesUpdate: vi.fn(async () => thread("thr_unused")),
@@ -235,6 +239,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -258,6 +263,10 @@ describe("useConversationController", () => {
     );
 
     await waitFor(() => expect(result.current.currentThreadId).toBe("thr_created"));
+    expect(history.threadObserve).toHaveBeenCalledWith({ threadId: "thr_created" });
+    expect(vi.mocked(history.threadObserve).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(history.threadRead).mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
+    );
     expect(history.threadCreate).toHaveBeenCalledWith({
       cwd: "C:\\demo",
       title: "新对话",
@@ -270,8 +279,8 @@ describe("useConversationController", () => {
     expect(useTimelineStore.getState().threads["thr_created"]?.workspaceId).toBe("ws_project");
   });
 
-  /** 长历史的 thread/read 需要消费完整 keyset 页面，不能把首个 nextCursor 当成恢复失败。 */
-  it("自动恢复会合并分页 Thread 快照并清除 resync 错误", async () => {
+  /** 首屏只读最新页；点击后才读取旧页并保留所有 item 的 Turn owner。 */
+  it("首屏 tail 与按需旧页在同 revision 下合并", async () => {
     const existing = thread("thr_paginated_recovery");
     const first = contentSnapshot(existing.threadId, "running", 4);
     const firstItem = first.items[0];
@@ -283,7 +292,6 @@ describe("useConversationController", () => {
     };
     const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>();
     threadRead
-      .mockResolvedValueOnce(first)
       .mockResolvedValueOnce({ ...first, items: [firstItem], nextCursor: "cursor_page_2" })
       .mockResolvedValueOnce({ ...first, items: [secondItem], nextCursor: null });
     const history: ConversationHistoryPort = {
@@ -291,6 +299,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -313,35 +322,47 @@ describe("useConversationController", () => {
     );
 
     await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
-    act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
-    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(3));
-    await waitFor(() => expect(result.current.error).toBeUndefined());
-
-    expect(threadRead).toHaveBeenNthCalledWith(3, {
+    expect(threadRead).toHaveBeenCalledTimes(1);
+    expect(threadRead).toHaveBeenNthCalledWith(1, {
       threadId: existing.threadId,
+      tail: true,
+      limit: 200,
+    });
+    expect(result.current.hasOlderHistory).toBe(true);
+    await act(async () => result.current.loadOlderHistory());
+    expect(threadRead).toHaveBeenNthCalledWith(2, {
+      threadId: existing.threadId,
+      tail: true,
       cursor: "cursor_page_2",
+      limit: 200,
     });
     expect(useTimelineStore.getState().items[secondItem.itemId]?.text).toBe("分页后的历史正文");
-    expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeUndefined();
+    expect(result.current.hasOlderHistory).toBe(false);
   });
 
-  /** 分页提交边界连续变化时只从第一页重取三次，不能把混合 revision 发布成历史正文。 */
-  it("分页 revision 变化最多重取三次并保留 resync 意图", async () => {
-    const existing = thread("thr_paginated_revision_race");
-    const threadRead = vi
-      .fn<ConversationHistoryPort["threadRead"]>()
-      .mockResolvedValueOnce(emptySnapshot(existing.threadId, 0))
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 1), nextCursor: "cursor_1" })
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 2), nextCursor: null })
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 3), nextCursor: "cursor_2" })
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 4), nextCursor: null })
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 5), nextCursor: "cursor_3" })
-      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 6), nextCursor: null });
+  /** 用户明确翻页可跨过旧 3200 条硬停点，首屏仍只物化最近一页。 */
+  it("continues explicit history pagination beyond the former item cap", async () => {
+    const existing = thread("thr_history_many_pages");
+    const seed = contentSnapshot(existing.threadId, "running", 4);
+    const original = seed.items[0];
+    if (original === undefined) throw new Error("test snapshot item missing");
+    const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>(async (input) => {
+      const index = input.cursor === undefined ? 0 : Number(input.cursor.slice("cursor_".length));
+      return {
+        ...seed,
+        items: Array.from({ length: 200 }, (_, ordinal) => ({
+          ...original,
+          itemId: `item_history_${index}_${ordinal}`,
+        })),
+        nextCursor: index < 16 ? `cursor_${index + 1}` : null,
+      };
+    });
     const history: ConversationHistoryPort = {
       ...historyExtensions(),
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -351,7 +372,54 @@ describe("useConversationController", () => {
         inputTokensAfter: 0,
       })),
     };
-    const { result, unmount } = renderHook(() =>
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
+    expect(threadRead).toHaveBeenCalledTimes(1);
+    for (let page = 1; page <= 16; page += 1) {
+      await act(async () => result.current.loadOlderHistory());
+      expect(
+        result.current.olderHistoryError,
+        `page ${page}, outcome ${useTimelineStore.getState().lastOutcome}`,
+      ).toBeUndefined();
+    }
+    expect(result.current.hasOlderHistory).toBe(false);
+    expect(threadRead).toHaveBeenCalledTimes(17);
+    expect(Object.keys(useTimelineStore.getState().items)).toHaveLength(3_400);
+  }, 20_000);
+
+  /** 旧页更新时保留首屏，不能把不同 revision 的 Turn 拼成一份可见历史。 */
+  it("旧页 revision 漂移时不混合可见历史", async () => {
+    const existing = thread("thr_paginated_revision_race");
+    const threadRead = vi
+      .fn<ConversationHistoryPort["threadRead"]>()
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 1), nextCursor: "cursor_1" })
+      .mockResolvedValueOnce({ ...emptySnapshot(existing.threadId, 2), nextCursor: null });
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
+      threadCompact: vi.fn(async (input) => ({
+        outcome: "unchanged" as const,
+        compactionId: null,
+        checkpointId: null,
+        threadRevision: input.expectedThreadRevision,
+        inputTokensBefore: 0,
+        inputTokensAfter: 0,
+      })),
+    };
+    const { result } = renderHook(() =>
       useConversationController({
         history,
         workspace: WORKSPACE,
@@ -364,23 +432,10 @@ describe("useConversationController", () => {
     );
 
     await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
-    vi.useFakeTimers();
-    try {
-      act(() => useTimelineStore.getState().requestThreadResync(existing.threadId));
-      await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-      expect(threadRead).toHaveBeenCalledTimes(7);
-      expect(threadRead).toHaveBeenNthCalledWith(2, { threadId: existing.threadId });
-      expect(threadRead).toHaveBeenNthCalledWith(4, { threadId: existing.threadId });
-      expect(threadRead).toHaveBeenNthCalledWith(6, { threadId: existing.threadId });
-      expect(useTimelineStore.getState().resyncRequired[existing.threadId]).toBeDefined();
-    } finally {
-      unmount();
-      vi.useRealTimers();
-    }
+    await act(async () => result.current.loadOlderHistory());
+    expect(threadRead).toHaveBeenCalledTimes(2);
+    expect(result.current.olderHistoryError).toBeDefined();
+    expect(useTimelineStore.getState().threadRevisionByThread[existing.threadId]).toBe(1);
   });
 
   /**
@@ -401,6 +456,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -470,6 +526,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -579,6 +636,7 @@ describe("useConversationController", () => {
       .fn<ConversationHistoryPort["threadRead"]>()
       .mockResolvedValueOnce(emptySnapshot(first.threadId, 1))
       .mockImplementationOnce(async () => healthRead)
+      .mockResolvedValueOnce(emptySnapshot(second.threadId, 2))
       .mockResolvedValueOnce(emptySnapshot(first.threadId, 3))
       .mockImplementationOnce(async () => nextHealthRead);
     const history: ConversationHistoryPort = {
@@ -586,6 +644,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
       threadCreate: vi.fn(async () => first),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -620,11 +679,11 @@ describe("useConversationController", () => {
 
     await act(async () => result.current.select(second.threadId));
     await act(async () => result.current.select(first.threadId));
-    expect(threadRead).toHaveBeenCalledTimes(3);
+    expect(threadRead).toHaveBeenCalledTimes(4);
     act(() => useTimelineStore.getState().requestThreadResync(first.threadId));
-    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(threadRead).toHaveBeenCalledTimes(5));
 
-    // 旧 health read 此时晚到；它不能清理 call 4 的 in-flight 标记或再开 call 5。
+    // 旧 health read 此时晚到；它不能清理 call 5 的 in-flight 标记或再开新请求。
     releaseHealth(contentSnapshot(first.threadId, "running", 2));
     await act(async () => {
       await healthRead;
@@ -635,7 +694,7 @@ describe("useConversationController", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(threadRead).toHaveBeenCalledTimes(4);
+    expect(threadRead).toHaveBeenCalledTimes(5);
     expect(useTimelineStore.getState().turns[`${first.threadId}:turn`]).toBeUndefined();
 
     releaseNextHealth(emptySnapshot(first.threadId, 4));
@@ -664,6 +723,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -716,12 +776,14 @@ describe("useConversationController", () => {
       .fn<ConversationHistoryPort["threadRead"]>()
       .mockResolvedValueOnce(emptySnapshot(first.threadId, 1))
       .mockImplementationOnce(async () => healthRead)
+      .mockResolvedValueOnce(emptySnapshot(second.threadId, 2))
       .mockResolvedValueOnce(emptySnapshot(first.threadId, 2));
     const history: ConversationHistoryPort = {
       ...historyExtensions(),
       threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
       threadCreate: vi.fn(async () => first),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -769,7 +831,7 @@ describe("useConversationController", () => {
     expect(result.current.backgroundError).toBeUndefined();
 
     await act(async () => result.current.select(first.threadId));
-    expect(threadRead).toHaveBeenCalledTimes(3);
+    expect(threadRead).toHaveBeenCalledTimes(4);
     expect(result.current.currentThreadId).toBe(first.threadId);
     expect(result.current.backgroundError).toBeUndefined();
   });
@@ -785,12 +847,14 @@ describe("useConversationController", () => {
     const threadRead = vi
       .fn<ConversationHistoryPort["threadRead"]>()
       .mockResolvedValueOnce(emptySnapshot(first.threadId))
-      .mockImplementationOnce(async () => lateRead);
+      .mockImplementationOnce(async () => lateRead)
+      .mockResolvedValueOnce(emptySnapshot(second.threadId));
     const history: ConversationHistoryPort = {
       ...historyExtensions(),
       threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
       threadCreate: vi.fn(async () => first),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -851,6 +915,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -920,6 +985,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => projectThread),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1002,6 +1068,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => projectThread),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1049,7 +1116,7 @@ describe("useConversationController", () => {
     expect(useTimelineStore.getState().turns[projectTurnId]?.status).toBe("completed");
     rerender({ workspace: WORKSPACE, revision: 3 });
     await waitFor(() => expect(result.current.currentThreadId).toBe(projectThread.threadId));
-    expect(threadRead).toHaveBeenCalledTimes(2);
+    expect(threadRead).toHaveBeenCalledTimes(3);
     expect(useTimelineStore.getState().items[`${projectThread.threadId}:item`]?.text).toBe(
       "缓存中的历史正文",
     );
@@ -1058,7 +1125,7 @@ describe("useConversationController", () => {
     rerender({ workspace: otherWorkspace, revision: 4 });
     expect(result.current.currentThreadId).toBe(otherThread.threadId);
     expect(result.current.threads).toEqual([otherThread]);
-    expect(threadRead).toHaveBeenCalledTimes(2);
+    expect(threadRead).toHaveBeenCalledTimes(3);
 
     releaseOtherRefresh();
     await waitFor(() => expect(result.current.busy).toBe(false));
@@ -1096,6 +1163,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => newThread),
       threadRead: vi.fn(async ({ threadId }) => emptySnapshot(threadId)),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1145,6 +1213,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => initial),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1194,6 +1263,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => created),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1238,6 +1308,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1298,6 +1369,7 @@ describe("useConversationController", () => {
       threadList,
       threadCreate: vi.fn(async () => threads[0]!),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1388,6 +1460,7 @@ describe("useConversationController", () => {
       threadCreate: vi.fn(async () => existing),
       threadRead,
       threadSeen,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1431,7 +1504,7 @@ describe("useConversationController", () => {
    * CAS 重读即使只为取得 revision 也必须消费完整分页；否则应用首个半快照会擦掉第二页正文，
    * 并让 ChatTimeline 的 turn + exchangeOrdinal 行身份在一次正常重试中发生漂移。
    */
-  it("CAS 冲突重读使用完整同 revision 快照而不擦除分页正文", async () => {
+  it("CAS 冲突重读最近页并保留可见正文", async () => {
     const existing = {
       ...thread("thr_unseen_paginated_reread"),
       latestTurnStatus: "failed" as const,
@@ -1482,8 +1555,7 @@ describe("useConversationController", () => {
     const threadRead = vi
       .fn<ConversationHistoryPort["threadRead"]>()
       .mockResolvedValueOnce(snapshot(3, [firstItem, secondItem], null))
-      .mockResolvedValueOnce(snapshot(4, [firstItem], "cas_page_2"))
-      .mockResolvedValueOnce(snapshot(4, [secondItem], null));
+      .mockResolvedValueOnce(snapshot(4, [firstItem, secondItem], null));
     const threadSeen = vi
       .fn<ConversationHistoryPort["threadSeen"]>()
       .mockRejectedValueOnce({ code: "CONFLICT" })
@@ -1494,6 +1566,7 @@ describe("useConversationController", () => {
       threadCreate: vi.fn(async () => existing),
       threadRead,
       threadSeen,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1518,10 +1591,10 @@ describe("useConversationController", () => {
     await waitFor(() => expect(result.current.currentThreadId).toBe(existing.threadId));
     await waitFor(() => expect(threadSeen).toHaveBeenCalledTimes(2));
 
-    expect(threadRead).toHaveBeenNthCalledWith(2, { threadId: existing.threadId });
-    expect(threadRead).toHaveBeenNthCalledWith(3, {
+    expect(threadRead).toHaveBeenNthCalledWith(2, {
       threadId: existing.threadId,
-      cursor: "cas_page_2",
+      tail: true,
+      limit: 200,
     });
     expect(useTimelineStore.getState().items[firstItem.itemId]?.text).toBe("完整正文前半段");
     expect(useTimelineStore.getState().items[secondItem.itemId]?.text).toBe("完整正文后半段");
@@ -1546,6 +1619,7 @@ describe("useConversationController", () => {
       threadCreate: vi.fn(async () => existing),
       threadRead: vi.fn(async () => contentSnapshot(existing.threadId, "completed", 2)),
       threadSeen,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1654,6 +1728,7 @@ describe("useConversationController", () => {
         nextCursor: null,
       })),
       threadSeen,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1719,6 +1794,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1787,6 +1863,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1846,6 +1923,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -1927,6 +2005,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2010,6 +2089,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2104,6 +2184,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2181,6 +2262,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2271,6 +2353,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [initial], nextCursor: null })),
       threadCreate: vi.fn(async () => initial),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2342,6 +2425,7 @@ describe("useConversationController", () => {
         nextCursor: null,
       })),
       threadCompact,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
     };
     const runtimeState = { status: "ready" as const, generation: 1, serverInstanceId: "srv_1" };
     const { result } = renderHook(() =>
@@ -2382,6 +2466,69 @@ describe("useConversationController", () => {
     expect(threadCompact).toHaveBeenCalledTimes(1);
   });
 
+  /** 停止按钮只发取消意图，原请求报 CANCELLED 后才结束工作状态。 */
+  it("keeps manual compaction running until cancellation has a final result", async () => {
+    const existing = thread("thr_cancel_compaction");
+    let rejectCompact: (reason: unknown) => void = () => undefined;
+    const pending = new Promise<Awaited<ReturnType<ConversationHistoryPort["threadCompact"]>>>(
+      (_resolve, reject) => {
+        rejectCompact = reject;
+      },
+    );
+    const cancel = vi.fn(async () => ({ accepted: true }));
+    const history: ConversationHistoryPort = {
+      ...historyExtensions(),
+      threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
+      threadCreate: vi.fn(async () => existing),
+      threadRead: vi.fn(async ({ threadId }) => ({
+        threadId,
+        revision: 2,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        goalActivities: [],
+        nextCursor: null,
+      })),
+      threadCompact: vi.fn(() => pending),
+      threadCompactCancel: cancel,
+    };
+    const { result } = renderHook(() =>
+      useConversationController({
+        history,
+        workspace: WORKSPACE,
+        workspaceRevision: 1,
+        modelSelection: MODEL_SELECTION,
+        accessMode: "approval_required",
+        runtimeState: { status: "ready", generation: 1, serverInstanceId: "srv_1" },
+        activateWorkspace: async () => undefined,
+      }),
+    );
+    await waitFor(() => expect(result.current.canCompact).toBe(true));
+    act(() => {
+      void result.current.compact();
+    });
+    await waitFor(() => expect(result.current.compaction.cancellable).toBe(true));
+    await act(async () => result.current.cancelCompaction());
+    expect(cancel).toHaveBeenCalledWith({ threadId: existing.threadId });
+    expect(result.current.compaction).toMatchObject({
+      phase: "running",
+      message: "正在停止上下文压缩…",
+    });
+    await act(async () => {
+      rejectCompact({ code: "CANCELLED" });
+      await pending.catch(() => undefined);
+    });
+    await waitFor(() =>
+      expect(result.current.compaction).toMatchObject({
+        phase: "error",
+        message: "上下文压缩已取消。",
+      }),
+    );
+  });
+
   /** 流式正文只应唤醒 Timeline owner；壳层 controller 不能因每个 delta 重投影导航。 */
   it("does not rerender the shell controller for an assistant text delta", async () => {
     const existing = thread("thr_stream_shell");
@@ -2391,6 +2538,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [existing], nextCursor: null })),
       threadCreate: vi.fn(async () => existing),
       threadRead: vi.fn(async () => contentSnapshot(existing.threadId, "running", 1)),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2472,6 +2620,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2510,7 +2659,7 @@ describe("useConversationController", () => {
     expect(threadList).toHaveBeenCalledTimes(1);
   });
 
-  it("重复点击与已加载会话切换直接复用 timeline，不进入读取态", async () => {
+  it("重复点击复用当前页，切换到旧会话先重建观察并读取基线", async () => {
     const first = thread("thr_first");
     const second = thread("thr_second");
     const threadRead = vi.fn<ConversationHistoryPort["threadRead"]>(async ({ threadId }) => ({
@@ -2530,6 +2679,7 @@ describe("useConversationController", () => {
       threadList: vi.fn(async () => ({ items: [first, second], nextCursor: null })),
       threadCreate: vi.fn(async () => first),
       threadRead,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2580,7 +2730,7 @@ describe("useConversationController", () => {
     await act(async () => result.current.select(second.threadId));
     expect(result.current.currentThreadId).toBe(second.threadId);
     expect(result.current.busy).toBe(false);
-    expect(threadRead).toHaveBeenCalledOnce();
+    expect(threadRead).toHaveBeenCalledTimes(2);
   });
 
   /** terminal 自带完整终态事实；保留可见答复，但不得触发第二次历史读取。 */
@@ -2612,6 +2762,7 @@ describe("useConversationController", () => {
       threadCreate: vi.fn(async () => existing),
       threadRead,
       threadSeen,
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2736,6 +2887,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async () => {
         throw { code: "SUMMARY_FAILURE", detail: "private provider payload" };
       }),
@@ -2780,6 +2932,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2857,6 +3010,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -2946,6 +3100,7 @@ describe("useConversationController", () => {
         pinned,
         revision: 6,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,
@@ -3115,6 +3270,7 @@ describe("useConversationController", () => {
         goalActivities: [],
         nextCursor: null,
       })),
+      threadCompactCancel: vi.fn(async () => ({ accepted: true })),
       threadCompact: vi.fn(async (input) => ({
         outcome: "unchanged" as const,
         compactionId: null,

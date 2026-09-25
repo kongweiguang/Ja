@@ -22,6 +22,23 @@ public interface AgentMapper {
      */
     List<PersistenceRecords.TurnRow> selectTurns(@Param("threadId") String threadId);
 
+    /** 最新页只投影页面所属、最新和队列头 Turn，避免长会话恢复时返回超出协议上限的全量元数据。 */
+    List<PersistenceRecords.TurnRow> selectSnapshotTurns(@Param("threadId") String threadId,
+                                                         @Param("turnIds") List<String> turnIds,
+                                                         @Param("hasTurnIds") boolean hasTurnIds);
+
+    /** PK 读取提交回执，重复请求不能依赖进程内生命周期判断是否已执行。 */
+    PersistenceRecords.ClientOperationRow selectClientOperation(@Param("clientOperationId") String clientOperationId);
+
+    /** 只在业务事务成功后插入同一事务回执，唯一键串行化并发重复提交。 */
+    int insertClientOperation(PersistenceRecords.ClientOperationRow row);
+
+    /** 读取与一次入队同事务写入的身份，响应丢失时只查询不重发。 */
+    PersistenceRecords.InputOperationRow selectInputOperation(@Param("clientOperationId") String clientOperationId);
+
+    /** 唯一键串行化同操作 ID 的竞争提交，正文仍只留在队列表。 */
+    int insertInputOperation(PersistenceRecords.InputOperationRow row);
+
     /**
      * 按 V1 基线保证的全局 Turn 身份读取取消目标。
      */
@@ -89,6 +106,9 @@ public interface AgentMapper {
      * 插入已经分配序号的消息，唯一约束阻止消息身份或序号重复。
      */
     int insertMessage(PersistenceRecords.MessageInsert values);
+    /** 与 Assistant 模型消息同事务保存可分页公开正文，不能晚于消息提交。 */
+    int insertAssistantPublicText(@Param("messageId") String messageId,
+                                  @Param("content") String content);
 
     /** 追加一条面向客户端的阶段化安全文本，不复用模型上下文 blocks。 */
     int insertTimelineMessage(PersistenceRecords.TimelineMessageInsert values);

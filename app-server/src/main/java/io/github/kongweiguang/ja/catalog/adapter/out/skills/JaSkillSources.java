@@ -49,17 +49,18 @@ public final class JaSkillSources implements SkillCatalog {
      */
     @Override
     public Catalog discover(DiscoveryRequest request) {
+        return discover(request, Set.of());
+    }
+
+    /** 停用来源在同名覆盖之前移除，使仍启用的低优先级来源可以自然接管。 */
+    public Catalog discover(DiscoveryRequest request, Set<String> disabledReferences) {
         Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(disabledReferences, "disabledReferences");
         try {
             LinkedHashMap<String, SkillPackageFactory.LocatedSkill> resolved = new LinkedHashMap<>();
-            merge(resolved, SkillPackageFactory.discoverBuiltins());
-            merge(resolved, SkillPackageFactory.discoverFilesystemSource(
-                    request.agentsSkillRoot(), Source.AGENTS_USER));
-            merge(resolved, SkillPackageFactory.discoverFilesystemSource(
-                    request.jaSkillRoot(), Source.JA_USER));
-            if (request.workspaceTrusted()) {
-                for (Path root : workspaceSkillRoots(request.workspaceDirectory())) {
-                    merge(resolved, SkillPackageFactory.discoverFilesystemSource(root, Source.WORKSPACE));
+            for (SkillPackageFactory.LocatedSkill skill : discoverSources(request)) {
+                if (!disabledReferences.contains(reference(skill.descriptor()))) {
+                    resolved.put(skill.name(), skill);
                 }
             }
             List<SkillPackageFactory.LocatedSkill> ordered = ordered(resolved.values());
@@ -70,6 +71,47 @@ public final class JaSkillSources implements SkillCatalog {
         } catch (IOException exception) {
             throw new UncheckedIOException("skill_discovery_io_failed", exception);
         }
+    }
+
+    /** 设置页枚举每个来源，避免同名覆盖让低优先级来源的开关消失。 */
+    @Override
+    public List<SkillDescriptor> discoverAll(DiscoveryRequest request) {
+        Objects.requireNonNull(request, "request");
+        try {
+            Map<String, SkillPackageFactory.LocatedSkill> byReference = new LinkedHashMap<>();
+            for (SkillPackageFactory.LocatedSkill skill : discoverSources(request)) {
+                byReference.put(reference(skill.descriptor()), skill);
+            }
+            return ordered(byReference.values()).stream()
+                    .map(SkillPackageFactory.LocatedSkill::descriptor).toList();
+        } catch (IOException exception) {
+            throw new UncheckedIOException("skill_discovery_io_failed", exception);
+        }
+    }
+
+    /** 统一发现入口保留来源身份，运行时和管理目录只在最后一步选择不同投影。 */
+    private static List<SkillPackageFactory.LocatedSkill> discoverSources(DiscoveryRequest request) throws IOException {
+        List<SkillPackageFactory.LocatedSkill> found = new ArrayList<>();
+        found.addAll(SkillPackageFactory.discoverBuiltins());
+        found.addAll(SkillPackageFactory.discoverFilesystemSource(request.agentsSkillRoot(), Source.AGENTS_USER));
+        found.addAll(SkillPackageFactory.discoverFilesystemSource(request.jaSkillRoot(), Source.JA_USER));
+        if (request.workspaceTrusted()) {
+            for (Path root : workspaceSkillRoots(request.workspaceDirectory())) {
+                found.addAll(SkillPackageFactory.discoverFilesystemSource(root, Source.WORKSPACE));
+            }
+        }
+        return found;
+    }
+
+    /** 稳定停用身份直接由来源和声明名构造，不从显示名猜测来源。 */
+    private static String reference(SkillDescriptor skill) {
+        String scope = switch (skill.source()) {
+            case AGENTS_USER -> "user";
+            case JA_USER -> "ja";
+            case WORKSPACE -> "project";
+            case BUNDLED -> "bundled";
+        };
+        return scope + ":" + skill.name();
     }
 
     /**
@@ -155,17 +197,6 @@ public final class JaSkillSources implements SkillCatalog {
             throw new IllegalArgumentException("skill_resource_path_invalid", invalid);
         }
         return normalized;
-    }
-
-    /**
-     * 高优先级包整体替换低优先级 locator，禁止同名来源间混用元数据与资源目录。
-     */
-    private static void merge(
-            Map<String, SkillPackageFactory.LocatedSkill> target,
-            List<SkillPackageFactory.LocatedSkill> source) {
-        for (SkillPackageFactory.LocatedSkill skill : source) {
-            target.put(skill.name(), skill);
-        }
     }
 
     /**

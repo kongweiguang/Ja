@@ -16,7 +16,6 @@ import io.github.kongweiguang.ja.conversation.port.out.ModelPort;
 import io.github.kongweiguang.ja.conversation.port.out.RuntimeLease;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest;
 import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
-import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.goal.port.out.GoalEvaluatorPort;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
@@ -26,7 +25,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -66,13 +64,13 @@ public final class RuntimeGoalEvaluatorAdapter implements GoalEvaluatorPort {
             throw new IllegalStateException("Goal evaluator model selection changed");
         }
         Workspace workspace = workspaces.requireOpenWorkspace(thread.workspaceId());
+        String input = encodeInput(request);
         RuntimeLease lease = runtimes.resolve(new TurnRuntimeRequest(thread.threadId(), null,
                 workspace.root(), workspace.workspaceId(), request.providerId(), request.modelId(),
                 thread.preferences().reasoningLevel(), thread.preferences().accessMode(),
                 thread.preferences().collaborationMode(),
                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER,
-                Duration.ofMinutes(30), clock.instant()));
-        String input = encodeInput(request);
+                clock.instant()));
         String system = "You are an independent acceptance evaluator. Use only the supplied frozen plan and evidence. "
                 + "Return one JSON object with verdict, summary, and criteria; never request or call tools.";
         String revision = "prompt_" + digest(system + '\n' + input);
@@ -80,15 +78,22 @@ public final class RuntimeGoalEvaluatorAdapter implements GoalEvaluatorPort {
         ModelPort.ModelRequest modelRequest = new ModelPort.ModelRequest(lease.model(),
                 new ModelPort.PromptPayload(system, revision),
                 List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent(input)))),
-                List.of(), null, 1, ModelPort.RetryPolicy.SINGLE_ATTEMPT);
-        CompletionStage<ModelPort.ModelOutcome> stage = models.start(modelRequest, event -> {
-            if (event instanceof ModelPort.TextDelta text) output.append(text.text());
-            if (event instanceof ModelPort.ToolCallReady) {
-                return java.util.concurrent.CompletableFuture.failedFuture(
-                        new IllegalStateException("Goal evaluator attempted a Tool call"));
-            }
-            return java.util.concurrent.CompletableFuture.completedFuture(null);
-        }, CancellationToken.none());
+                List.of(), null, 1, ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+        CompletionStage<ModelPort.ModelOutcome> stage;
+        try {
+            request.cancellation().throwIfCancellationRequested();
+            stage = Objects.requireNonNull(models.start(modelRequest, event -> {
+                if (event instanceof ModelPort.TextDelta text) output.append(text.text());
+                if (event instanceof ModelPort.ToolCallReady) {
+                    return java.util.concurrent.CompletableFuture.failedFuture(
+                            new IllegalStateException("Goal evaluator attempted a Tool call"));
+                }
+                return java.util.concurrent.CompletableFuture.completedFuture(null);
+            }, request.cancellation()), "Goal evaluator model stage");
+        } catch (RuntimeException failure) {
+            lease.close();
+            throw failure;
+        }
         return stage.thenApply(outcome -> {
             if (outcome.finishReason() != ModelPort.FinishReason.STOP) {
                 throw new IllegalStateException("Goal evaluator response is incomplete");

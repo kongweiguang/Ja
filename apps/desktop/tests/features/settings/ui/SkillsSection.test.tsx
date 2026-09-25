@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SkillsSection } from "@/features/settings/ui/skills";
@@ -13,47 +13,54 @@ const skill = (overrides: Partial<SkillProjection> = {}): SkillProjection => ({
   name: "review",
   source: "user",
   description: "检查变更、风险与测试覆盖。",
-  enabled: false,
-  status: "disabled",
+  enabled: true,
+  status: "ready",
   ...overrides,
 });
 
 describe("SkillsSection", () => {
-  afterEach(() => {
-    cleanup();
-  });
+  afterEach(cleanup);
 
-  it("keeps the global view compact and hides the project tab without a trusted project", () => {
+  it("keeps global and project groups visible together", () => {
     render(
       <SkillsSection
         globalSkills={[skill()]}
-        projectAvailable={false}
-        onToggleSkill={vi.fn(async () => undefined)}
-      />,
-    );
-
-    expect(screen.getByRole("tab", { name: "全局" })).toBeDefined();
-    expect(screen.queryByRole("tab", { name: "当前项目" })).toBeNull();
-    expect(screen.getByText("检查变更、风险与测试覆盖。")).toBeDefined();
-  });
-
-  it("switches to the trusted project view and keeps source labels visible", async () => {
-    const user = userEvent.setup();
-    render(
-      <SkillsSection
-        globalSkills={[skill()]}
-        projectSkills={[skill({ id: "project:review", source: "project", enabled: true })]}
+        projectSkills={[skill({ id: "project:review", source: "project" })]}
         projectAvailable
         onToggleSkill={vi.fn(async () => undefined)}
       />,
     );
-
-    await user.click(screen.getByRole("tab", { name: "当前项目" }));
-    expect(screen.getByLabelText("当前项目 Skills")).toBeDefined();
-    expect(screen.getByText("项目")).toBeDefined();
+    expect(
+      within(screen.getByRole("region", { name: "全局 Skills" })).getByRole("switch"),
+    ).toBeChecked();
+    expect(
+      within(screen.getByRole("region", { name: "项目 Skills" })).getByRole("switch"),
+    ).toBeChecked();
+    expect(screen.getByText(/项目.*同名 Skill 覆盖/u)).toBeInTheDocument();
   });
 
-  it("targets the named Skill switch and keeps mutation failures recoverable", async () => {
+  it("routes each switch to its own persisted scope", async () => {
+    const user = userEvent.setup();
+    const onToggleSkill = vi.fn(async () => undefined);
+    render(
+      <SkillsSection
+        globalSkills={[skill()]}
+        projectSkills={[skill({ id: "project:review", source: "project" })]}
+        projectAvailable
+        onToggleSkill={onToggleSkill}
+      />,
+    );
+    await user.click(
+      within(screen.getByRole("region", { name: "全局 Skills" })).getByRole("switch"),
+    );
+    await user.click(
+      within(screen.getByRole("region", { name: "项目 Skills" })).getByRole("switch"),
+    );
+    expect(onToggleSkill).toHaveBeenNthCalledWith(1, "user:review", false, "user");
+    expect(onToggleSkill).toHaveBeenNthCalledWith(2, "project:review", false, "project");
+  });
+
+  it("preserves the switch after a failed save", async () => {
     const user = userEvent.setup();
     const onToggleSkill = vi.fn(async () => {
       throw new Error("network unavailable");
@@ -65,16 +72,14 @@ describe("SkillsSection", () => {
         onToggleSkill={onToggleSkill}
       />,
     );
-
-    const toggle = screen.getByRole("switch", { name: /review/u });
+    const toggle = within(screen.getByRole("region", { name: "全局 Skills" })).getByRole("switch");
     await user.click(toggle);
-    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("user:review", true, "user"));
-    expect(screen.getByRole("status").textContent).toContain("Skill 状态修改失败");
-    expect(toggle.hasAttribute("disabled")).toBe(false);
+    expect(toggle).toBeChecked();
+    expect(toggle).not.toBeDisabled();
+    expect(screen.getByText("Skill 状态修改失败。")).toBeInTheDocument();
   });
 
-  /** 保存直到权威回读完成前锁住整个子面，不能从全局页误切换到项目页。 */
-  it("locks scope switching and other Skill actions while a write is pending", async () => {
+  it("locks both groups and reports busy while a save is pending", async () => {
     const user = userEvent.setup();
     let release: (() => void) | undefined;
     const onToggleSkill = vi.fn(
@@ -83,46 +88,38 @@ describe("SkillsSection", () => {
           release = resolve;
         }),
     );
+    const onBusyChange = vi.fn();
     render(
       <SkillsSection
         globalSkills={[skill()]}
         projectSkills={[skill({ id: "project:review", source: "project" })]}
         projectAvailable
         onToggleSkill={onToggleSkill}
+        onBusyChange={onBusyChange}
       />,
     );
-
-    const globalTab = screen.getByRole("tab", { name: "全局" });
-    const projectTab = screen.getByRole("tab", { name: "当前项目" });
-    const toggle = screen.getByRole("switch", { name: /review/u });
-    await user.click(toggle);
-
-    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("user:review", true, "user"));
-    expect(globalTab).toBeDisabled();
-    expect(projectTab).toBeDisabled();
-    expect(toggle).toBeDisabled();
-
+    await user.click(
+      within(screen.getByRole("region", { name: "全局 Skills" })).getByRole("switch"),
+    );
+    await waitFor(() => expect(onBusyChange).toHaveBeenCalledWith(true));
+    expect(
+      within(screen.getByRole("region", { name: "项目 Skills" })).getByRole("switch"),
+    ).toBeDisabled();
     release?.();
-    await waitFor(() => expect(globalTab).not.toBeDisabled());
-    expect(projectTab).not.toBeDisabled();
-    expect(toggle).not.toBeDisabled();
+    await waitFor(() => expect(onBusyChange).toHaveBeenCalledWith(false));
   });
 
-  /** 缺失记录在窄屏会显示为图标；ARIA 名称仍保留对象和动作，避免键盘操作失义。 */
-  it("keeps the missing-record action identifiable when its compact label is hidden", async () => {
+  it("removes a missing disabled record through its original scope", async () => {
     const user = userEvent.setup();
     const onToggleSkill = vi.fn(async () => undefined);
     render(
       <SkillsSection
-        globalSkills={[skill({ missing: true, status: "error", error: "文件已移除" })]}
+        globalSkills={[skill({ enabled: false, missing: true, status: "error" })]}
         projectAvailable={false}
         onToggleSkill={onToggleSkill}
       />,
     );
-
-    const remove = screen.getByRole("button", { name: "移除 review 的记录" });
-    expect(remove).toHaveAttribute("title", "移除记录");
-    await user.click(remove);
-    await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("user:review", false, "user"));
+    await user.click(screen.getByRole("button", { name: "移除 review 的停用记录" }));
+    expect(onToggleSkill).toHaveBeenCalledWith("user:review", true, "user");
   });
 });

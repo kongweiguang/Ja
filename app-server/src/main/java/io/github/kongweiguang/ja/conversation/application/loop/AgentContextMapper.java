@@ -42,7 +42,6 @@ import java.util.Set;
  * 在持久化消息、上下文预算模型与 Provider 请求之间转换，避免 Wire 或存储表示进入 Agent Loop。
  */
 final class AgentContextMapper {
-    private static final int MAX_CROSS_PROVIDER_REASONING = 1_048_576;
     private final JsonValueCodec argumentsCodec;
     private final TerminalFailureReplyPolicy failureReplies = new TerminalFailureReplyPolicy();
 
@@ -265,7 +264,7 @@ final class AgentContextMapper {
                      * 块没有公开文本时安全丢弃，绝不把 opaque JSON 当普通提示词发送。
                      */
                     String publicReasoning = crossProviderReasoningText(reasoning.content());
-                    if (publicReasoning != null) blocks.add(new TextContent(publicReasoning));
+                    if (publicReasoning != null) addPublicReasoningBlocks(blocks, publicReasoning);
                 }
             }
         }
@@ -283,9 +282,9 @@ final class AgentContextMapper {
             JsonValue decoded = argumentsCodec.decode(reasoning.nativeJson());
             if (!(decoded instanceof JsonObject object)) return null;
             String direct = directReasoningText(object, reasoning.wireField());
-            if (!direct.isBlank()) return boundCrossProviderReasoning(direct);
+            if (!direct.isBlank()) return direct;
             String summary = responsesSummaryText(object.get("summary"));
-            return summary.isBlank() ? null : boundCrossProviderReasoning(summary);
+            return summary.isBlank() ? null : summary;
         } catch (RuntimeException ignored) {
             return null;
         }
@@ -321,14 +320,16 @@ final class AgentContextMapper {
         return result.toString();
     }
 
-    /**
-     * 跨身份文本复用与 Timeline 摘要相同的 1 MiB 上限，并避免在 UTF-16 surrogate 中间截断。
-     */
-    private static String boundCrossProviderReasoning(String value) {
-        if (value.length() <= MAX_CROSS_PROVIDER_REASONING) return value;
-        int end = MAX_CROSS_PROVIDER_REASONING;
-        if (Character.isHighSurrogate(value.charAt(end - 1))) end--;
-        return value.substring(0, end);
+    /** 跨模型公开摘要按已有文本块大小分段，保留完整原文且不制造单个巨型块。 */
+    private static void addPublicReasoningBlocks(List<ModelContent> blocks, String value) {
+        final int blockCharacters = 262_144;
+        for (int start = 0; start < value.length();) {
+            int end = Math.min(value.length(), start + blockCharacters);
+            if (end < value.length() && Character.isHighSurrogate(value.charAt(end - 1))
+                    && Character.isLowSurrogate(value.charAt(end))) end--;
+            blocks.add(new TextContent(value.substring(start, end)));
+            start = end;
+        }
     }
 
     /**

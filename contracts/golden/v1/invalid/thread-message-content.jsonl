@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":"c:message-content-no-id","method":"thread/message-content/read","params":{"threadId":"thr_demo","offsetCharacters":0,"limitCharacters":2}}
+{"jsonrpc":"2.0","id":"c:message-content-zero-limit","method":"thread/message-content/read","params":{"threadId":"thr_demo","messageId":"item_answer","offsetCharacters":0,"limitCharacters":0}}
+{"jsonrpc":"2.0","id":"c:message-content-extra","method":"thread/message-content/read","params":{"threadId":"thr_demo","messageId":"item_answer","offsetCharacters":0,"limitCharacters":2,"path":"secret"}}

@@ -12,4 +12,8 @@
 {"jsonrpc":"2.0","id":"c:compact-summary","error":{"code":-32049,"message":"context compaction failed","data":{"errorCode":"SUMMARY_FAILURE","category":"unavailable","retryable":true,"errorId":"err_00000000000000000000000000000049"}}}
 {"jsonrpc":"2.0","id":"c:compact-cancelled","method":"thread/compact","params":{"threadId":"thr_demo","expectedThreadRevision":11}}
 {"jsonrpc":"2.0","id":"c:compact-cancelled","error":{"code":-32035,"message":"context compaction failed","data":{"errorCode":"CANCELLED","category":"cancelled","retryable":false,"errorId":"err_00000000000000000000000000000035"}}}
+{"jsonrpc":"2.0","id":"c:compact-cancel","method":"thread/compact/cancel","params":{"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:compact-cancel","result":{"accepted":true}}
+{"jsonrpc":"2.0","id":"c:compact-cancel-idle","method":"thread/compact/cancel","params":{"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:compact-cancel-idle","result":{"accepted":false}}
 {"jsonrpc":"2.0","method":"context/compaction-failed","params":{"serverInstanceId":"srv_demo","eventId":"evt_compaction_cancelled","sequence":6,"occurredAt":"2026-08-29T05:03:00Z","generation":1,"workspaceId":"ws_demo","threadId":"thr_demo","turnId":null,"threadRevision":11,"compactionId":"cmp_manual_cancelled","trigger":"manual","sourceRevision":11,"inputTokensBefore":180000,"inputTokensAfter":null,"strategyVersion":"ja-context-v1","errorCode":"CANCELLED"}}

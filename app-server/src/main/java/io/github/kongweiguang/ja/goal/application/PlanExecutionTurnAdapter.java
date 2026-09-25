@@ -11,9 +11,10 @@ import io.github.kongweiguang.ja.conversation.application.interaction.Interactio
 import io.github.kongweiguang.ja.conversation.application.loop.AgentLoop;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.port.in.InternalTurnStartRequest;
+import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
-import io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeResolver;
-import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.PlanSnapshot;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.PlanStatus;
 import io.github.kongweiguang.ja.goal.port.in.PlanExecutionEventSink;
@@ -34,9 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /** 将一次 standalone Plan execution 接入唯一 TurnService，执行上下文不写 USER message 历史。 */
-public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.PlanExecutionTurnPort,
-        PlanExecutionCoordinator.PlanExecutionBudgetPort {
-    private static final int DEFAULT_TURN_BUDGET = 32;
+public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.PlanExecutionTurnPort {
     private final TurnService turns;
     private final ConversationRepository conversations;
     private final WorkspaceUseCase workspaces;
@@ -44,7 +43,6 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
     private final ObjectMapper json;
     private final Clock clock;
     private final TaskCoordinator tasks;
-    private final TurnRuntimeResolver runtimeResolver;
     private final ConcurrentMap<String, CompletionStage<Void>> activeTurns = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, CompletionStage<?>> activeTurnSources = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ResumeRegistration> resumeRegistrations = new ConcurrentHashMap<>();
@@ -55,17 +53,6 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
     public PlanExecutionTurnAdapter(TurnService turns, ConversationRepository conversations,
                                      WorkspaceUseCase workspaces, GoalRepository plans,
                                      ObjectMapper json, Clock clock, TaskCoordinator tasks) {
-        this(turns, conversations, workspaces, plans, json, clock, tasks, null);
-    }
-
-    /**
-     * 生产构造额外注入 RuntimeResolver，使 Plan 冻结的预算来自真实配置代际，而不是 UI 或常量。
-     * 旧构造保留给不涉及执行的单元测试；缺少 resolver 的实例在真正解析预算时显式失败。
-     */
-    public PlanExecutionTurnAdapter(TurnService turns, ConversationRepository conversations,
-                                     WorkspaceUseCase workspaces, GoalRepository plans,
-                                     ObjectMapper json, Clock clock, TaskCoordinator tasks,
-                                     TurnRuntimeResolver runtimeResolver) {
         this.turns = Objects.requireNonNull(turns, "turns");
         this.conversations = Objects.requireNonNull(conversations, "conversations");
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
@@ -73,35 +60,9 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
         this.json = Objects.requireNonNull(json, "json");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.tasks = Objects.requireNonNull(tasks, "tasks");
-        this.runtimeResolver = runtimeResolver;
     }
 
-    /**
-     * execute 前只解析配置预算；此时 Run/Turn 尚未准入，完整 RuntimeLease 会错误要求已经存在
-     * 的 Plan binding。工具和 Prompt 仍由真正 Turn admission 后的完整解析建立。
-     */
-    @Override public PlanExecutionCoordinator.EffectiveBudget resolve(
-            PlanExecutionCoordinator.ExecutionRequest request) {
-        if (runtimeResolver == null) {
-            throw new IllegalStateException("Plan execution runtime resolver is unavailable");
-        }
-        ConversationRepository.ThreadSnapshot thread = conversations.readThread(request.ownerThreadId())
-                .orElseThrow(() -> new IllegalStateException("Plan owner Thread is unavailable"));
-        Workspace workspace = workspaces.requireOpenWorkspace(thread.workspaceId());
-        InternalTurnStartRequest command = InternalTurnRequests.create(
-                thread, workspace, request.turnId(), clock.instant(), TurnOrigin.PLAN_EXECUTION);
-        var limits = runtimeResolver.resolveLimits(new io.github.kongweiguang.ja.conversation.port.out.TurnRuntimeRequest(
-                command.threadId(), command.turnId(), command.workspaceRoot(), command.workspaceId(),
-                command.providerId(), command.modelId(), command.reasoningLevel(), command.accessMode(),
-                command.collaborationMode(), command.origin(), command.deadline(), command.requestedAt()));
-        return new PlanExecutionCoordinator.EffectiveBudget(limits.maxModelRounds(), limits.maxToolCalls(),
-                limits.wallTimeout().toMillis(), DEFAULT_TURN_BUDGET);
-    }
-
-    /**
-     * 无 claim 的内部入口也必须先经过持久 Run 预算 admission；保留该入口只是为了
-     * 让端口在恢复/测试场景保持可调用，不能让它成为绕过 plan_turn_claims 的后门。
-     */
+    /** 无 claim 的内部入口同样先领取持久 Run identity，防止恢复时重复派发同一 Turn。 */
     @Override public CompletionStage<Void> start(PlanExecutionCoordinator.ExecutionRequest request,
                                                  PlanExecutionEventSink events) {
         return claimAndStart(request, events);
@@ -171,10 +132,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
                 });
     }
 
-    /**
-     * admission 使用 SQLite 返回的 Run 剩余预算收紧当前 Turn；ceiling 只限制模型轮次、Tool 次数和墙钟，
-     * Provider 能力、token 上限及权限仍由 RuntimeLease owner 决定，避免跨 Turn 预算绕过。
-     */
+    /** 只使用已提交的 Run claim 锁定身份；当前模型与工具目录由 TurnService 的短租约解析。 */
     @Override public CompletionStage<Void> start(PlanExecutionCoordinator.ExecutionRequest request,
                                                  GoalRepository.PlanTurnClaim claim,
                                                  PlanExecutionEventSink events) {
@@ -194,9 +152,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
                 thread.threadId(), thread.revision());
         try {
             var accepted = turns.startContinuation(command, hiddenContext(plan),
-                    tasks.projectContinuationEvents(thread.threadId(), registered
-                            ? events::publish : io.github.kongweiguang.ja.conversation.port.in.TurnEventSink.noop()),
-                    ceiling(claim));
+                    projectedEvents(thread, registered, events), runContext(request));
             CompletionStage<Void> completion = trackCompletion(request, accepted.completion(), clock.instant(),
                     "start");
             completion.whenComplete((ignored, failure) -> {
@@ -237,8 +193,7 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
                 thread.threadId(), thread.revision());
         try {
             var accepted = turns.resume(request.turnId(), thread.revision(),
-                    tasks.projectContinuationEvents(thread.threadId(), registered
-                            ? events::publish : io.github.kongweiguang.ja.conversation.port.in.TurnEventSink.noop()));
+                    projectedEvents(thread, registered, events), runContext(request));
             // TurnService.resume 会在 admission 内把原始 completion 交给已注册 continuation；
             // adapter 不再创建第二个 tracked wrapper，避免手动 Resume 与自动回答重复结算。
             CompletionStage<Void> completion = accepted.completion().thenApply(ignored -> null);
@@ -253,6 +208,18 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
             if (registered) events.abandonTurn(request.turnId());
             return CompletableFuture.failedFuture(failure);
         }
+    }
+
+    /** Plan 新建与恢复共用同一 Task 投影出口；未注册观察时只保留内部事实，不伪造公开事件。 */
+    private TurnEventSink projectedEvents(ConversationRepository.ThreadSnapshot thread,
+                                          boolean registered, PlanExecutionEventSink events) {
+        return tasks.projectContinuationEvents(thread.threadId(),
+                registered ? events::publish : TurnEventSink.noop());
+    }
+
+    /** 只取本次 Run 已登记的宿主环境，不能在恢复时退回后台进程的偶然环境。 */
+    private static NativeExecutionSnapshot runContext(PlanExecutionCoordinator.ExecutionRequest request) {
+        return NativeExecutionContext.shared().findRun("plan", request.planId(), request.runId()).orElse(null);
     }
 
     /** pause 保留 SUSPENDED 游标，stop 则将其取消；运行态取消后共享 Turn completion barrier。 */
@@ -402,16 +369,6 @@ public final class PlanExecutionTurnAdapter implements PlanExecutionCoordinator.
                 throw failure;
             }
         }
-    }
-
-    /** 把 Run remainder 映射为 TurnService 可验证的单 Turn ceiling，处理旧无冻结测试数据的无穷哨兵。 */
-    private static TurnLimits ceiling(GoalRepository.PlanTurnClaim claim) {
-        if (claim == null) return null;
-        int rounds = Math.min(128, Math.max(1, claim.remainingModelRounds()));
-        int tools = Math.min(1_024, Math.max(0, claim.remainingToolCalls()));
-        long wall = Math.min(24L * 60 * 60 * 1_000, Math.max(1L, claim.remainingWallBudgetMillis()));
-        return new TurnLimits(rounds, tools, 4_000_000, 1_000_000,
-                java.time.Duration.ofMillis(wall));
     }
 
     /** 隐藏上下文仅携带冻结 Plan 与 Run identity，不复制对话历史，避免旧消息改变已批准执行语义。 */

@@ -153,13 +153,6 @@ const UiProviderSchema = z
     agentDefaults: z
       .object({
         context: z.object({ autoCompact: z.boolean() }).strict(),
-        turnLimits: z
-          .object({
-            maxModelRounds: z.number().int(),
-            maxToolCalls: z.number().int(),
-            wallTimeoutMs: z.number().int(),
-          })
-          .strict(),
       })
       .strict(),
     models: z.array(UiProviderModelSchema).min(1).max(MAX_ENTRIES),
@@ -223,10 +216,10 @@ const SettingsDocumentSchema = z
       .strict(),
     providers: z.array(UiProviderSchema).max(MAX_ENTRIES),
     mcpServers: z.array(UiMcpSchema).max(MAX_ENTRIES),
-    skills: z
+    disabledSkills: z
       .array(ConfigSkillReferenceSchema)
-      .refine((skills) =>
-        skills.every((skill) => skill.startsWith("user:") || skill.startsWith("ja:")),
+      .refine((disabledSkills) =>
+        disabledSkills.every((skill) => skill.startsWith("user:") || skill.startsWith("ja:")),
       ),
     window: WindowSettingsSchema,
   })
@@ -255,7 +248,6 @@ type SettingsMcpServer = z.infer<typeof UiMcpSchema>;
 export interface ProjectSkillSettingsDocument {
   schemaVersion: 2;
   revision: number;
-  skills: string[];
   disabledSkills: string[];
 }
 export type ConfigReadInput = z.infer<typeof ConfigReadInputSchema>;
@@ -307,7 +299,7 @@ function projectSkillDocumentFrom(
   layer: ConfigReadResult["project"],
 ): ProjectSkillSettingsDocument | undefined {
   if (!layer.present && layer.trusted) {
-    return { schemaVersion: 2, revision: 0, skills: [], disabledSkills: [] };
+    return { schemaVersion: 2, revision: 0, disabledSkills: [] };
   }
   if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
   const parsed = ConfigProjectDocumentSchema.safeParse(layer.document);
@@ -315,7 +307,6 @@ function projectSkillDocumentFrom(
   return {
     schemaVersion: 2,
     revision: parsed.data.config_revision,
-    skills: [...parsed.data.skills],
     disabledSkills: [...parsed.data.disabled_skills],
   };
 }
@@ -513,11 +504,6 @@ function toUiProvider(
     },
     agentDefaults: {
       context: { autoCompact: provider.agent_defaults.context.auto_compact },
-      turnLimits: {
-        maxModelRounds: provider.agent_defaults.turn_limits.max_model_rounds,
-        maxToolCalls: provider.agent_defaults.turn_limits.max_tool_calls,
-        wallTimeoutMs: provider.agent_defaults.turn_limits.wall_timeout_ms,
-      },
     },
     models: provider.models.map((model) => ({
       modelId: model.model_id,
@@ -561,7 +547,7 @@ function toUiDocument(
     },
     providers: config.providers.map((provider) => toUiProvider(provider, credentials)),
     mcpServers: config.mcp_servers.map(toUiMcp),
-    skills: [...config.skills],
+    disabledSkills: [...config.disabled_skills],
     window: { width: 1280, height: 800, maximized: false },
   };
 }
@@ -577,7 +563,7 @@ function emptySettingsDocument(): SettingsDocument {
     subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
     providers: [],
     mcpServers: [],
-    skills: [],
+    disabledSkills: [],
     window: { width: 1280, height: 800, maximized: false },
   };
 }
@@ -602,11 +588,6 @@ function toNativeProvider(provider: SettingsProvider): z.infer<typeof ConfigProv
     },
     agent_defaults: {
       context: { auto_compact: provider.agentDefaults.context.autoCompact },
-      turn_limits: {
-        max_model_rounds: provider.agentDefaults.turnLimits.maxModelRounds,
-        max_tool_calls: provider.agentDefaults.turnLimits.maxToolCalls,
-        wall_timeout_ms: provider.agentDefaults.turnLimits.wallTimeoutMs,
-      },
     },
     models: provider.models.map((model) =>
       ConfigModelSchema.parse({
@@ -664,7 +645,7 @@ function settingsDocumentValue(document: SettingsDocument): z.infer<typeof Confi
     },
     providers: document.providers.map(toNativeProvider),
     mcp_servers: document.mcpServers.map(toNativeMcp),
-    skills: [...document.skills],
+    disabled_skills: [...document.disabledSkills],
   });
 }
 
@@ -677,7 +658,7 @@ const USER_PATCH_FIELDS = [
   "subagents",
   "providers",
   "mcp_servers",
-  "skills",
+  "disabled_skills",
 ] as const;
 
 /**
@@ -838,9 +819,7 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
         workspaceId,
         expectedVersion,
         patch: {
-          skills: [...document.skills],
-          disabled_skills:
-            document.disabledSkills.length === 0 ? null : [...document.disabledSkills],
+          disabled_skills: [...document.disabledSkills],
         },
       })
     ).version;
@@ -856,7 +835,7 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
     const validated = ConfigProjectDocumentSchema.parse({
       schema_version: 2,
       config_revision: 0,
-      skills: [],
+      disabled_skills: [],
       mcp_servers: values,
     }).mcp_servers;
     return (

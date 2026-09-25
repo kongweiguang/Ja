@@ -485,6 +485,9 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
     "terminal must calibrate the existing response node",
   );
   assert.equal(await page.getByText(finalText, { exact: true }).count(), 1);
+  await page.getByRole("button", { name: "发送", exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "停止生成", exact: true }).count(), 0);
+  await page.getByText("已连接", { exact: true }).waitFor();
   const trigger = process.locator(".ja-work-process__trigger");
   await trigger.getByText("查看工作过程", { exact: true }).waitFor();
   assert.equal(await trigger.getAttribute("aria-expanded"), "false");
@@ -577,6 +580,8 @@ async function captureVisualMatrix(page, fixtureUrl, evidenceDirectory) {
       };
     });
     assert.equal(facts.reducedMotion, frame.reduced);
+    await page.getByRole("button", { name: "发送", exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "停止生成", exact: true }).count(), 0);
     assert.equal(
       facts.horizontalOverflow,
       false,

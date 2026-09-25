@@ -415,7 +415,7 @@ function Write-CandidateManifest {
             Get-FileEvidence -Role 'node-manifest' -Path 'package.json' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'node-lock' -Path 'pnpm-lock.yaml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'cargo-workspace-manifest' -Path 'Cargo.toml' -RepositoryRoot $RepositoryRoot
-            Get-FileEvidence -Role 'cargo-package-manifest' -Path 'src-tauri/Cargo.toml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'cargo-package-manifest' -Path 'apps/desktop/src-tauri/Cargo.toml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'cargo-lock' -Path 'Cargo.lock' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'maven-manifest' -Path 'app-server/pom.xml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'maven-bom' -Path $MavenBomPath -RepositoryRoot $RepositoryRoot
@@ -483,7 +483,7 @@ foreach ($group in $npm.PSObject.Properties) {
     }
 }
 
-$cargoManifest = Resolve-RepositoryPath -Path 'src-tauri/Cargo.toml' -BasePath $root -RequireExisting
+$cargoManifest = Resolve-RepositoryPath -Path 'apps/desktop/src-tauri/Cargo.toml' -BasePath $root -RequireExisting
 $cargo = Invoke-JsonCommand -FilePath 'cargo' -Arguments @("+$CargoToolchain", 'metadata', '--manifest-path', $cargoManifest, '--locked', '--offline', '--format-version', '1')
 foreach ($package in @($cargo.packages)) {
     $manifestPath = [string]$package.manifest_path

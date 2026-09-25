@@ -8,7 +8,8 @@
 .DESCRIPTION
   This is an engineering smoke only. It proves that a real Windows NSIS package can install,
   expose the expected app/sidecar files, enforce the single-instance boundary, and uninstall
-  without requiring signing credentials. The emitted record explicitly remains outside the release gate.
+  without requiring signing credentials. Run it only under a clean Windows user profile: NSIS
+  uses product-wide uninstall and shortcut identities. The emitted record remains outside the release gate.
 #>
 
 [CmdletBinding()]
@@ -225,6 +226,14 @@ if (-not $installerFile.PSIsContainer -and $installerFile.Extension -ieq '.exe')
 } else {
     throw "Installer must be an .exe file: $Installer"
 }
+# 同名 NSIS 会覆盖已有 Ja 的卸载键和快捷方式；普通开发机必须在任何安装副作用前失败。
+$existingJaBinary = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Programs\Ja\ja.exe'
+if ((Test-Path -LiteralPath $existingJaBinary) -or
+    (Test-Path -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Ja') -or
+    (Test-Path -LiteralPath 'HKCU:\Software\github\Ja') -or
+    (Test-Path -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Ja')) {
+    throw 'Windows installer smoke requires a clean user profile without an existing Ja installation'
+}
 $outputParent = Split-Path -Parent $Output
 if ([string]::IsNullOrWhiteSpace($outputParent)) { $outputParent = (Get-Location).Path }
 New-Item -ItemType Directory -Force -Path $outputParent | Out-Null
@@ -279,7 +288,7 @@ try {
         $entry
     }
     $result.installation.files = @($evidenceFiles)
-    $app = Get-Item -LiteralPath (Join-Path $installPath 'ja.exe') -ErrorAction Stop
+    $app = Get-Item -LiteralPath (Join-Path $installPath 'ja-desktop.exe') -ErrorAction Stop
     $uninstaller = Get-Item -LiteralPath (Join-Path $installPath 'uninstall.exe') -ErrorAction Stop
     $sidecarFiles = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'sidecars') -Filter 'ja-app-server-*.exe' -File)
     if ($sidecarFiles.Count -ne 1) { throw "Unexpected sidecar count in install directory: $($sidecarFiles.Count)" }
@@ -342,7 +351,21 @@ catch {
 }
 finally {
     if (Test-Path -LiteralPath $rootPath) {
-        Remove-Item -LiteralPath $rootPath -Recurse -Force -ErrorAction SilentlyContinue
+        # 递归清理前再次证明随机私有根仍在真实 Temp 目录内，且未被替换为重解析点。
+        $resolvedBase = (Resolve-Path -LiteralPath $tempBase).Path.TrimEnd('\') + '\'
+        $resolvedRoot = (Resolve-Path -LiteralPath $rootPath).Path.TrimEnd('\')
+        $rootInfo = Get-Item -LiteralPath $resolvedRoot -Force
+        $baseInfo = Get-Item -LiteralPath $tempBase -Force
+        $privateLeaf = [System.IO.Path]::GetFileName($resolvedRoot)
+        $safeCleanup = $resolvedRoot.StartsWith($resolvedBase, [StringComparison]::OrdinalIgnoreCase) -and `
+            $privateLeaf -match '^ja-installer-smoke-[0-9a-f]{32}$' -and `
+            -not ($rootInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and `
+            -not ($baseInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        if ($safeCleanup) {
+            Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            $result.error = 'Unsafe installer smoke cleanup target'
+        }
     }
     $result.cleanup.temporaryRootRemoved = -not (Test-Path -LiteralPath $rootPath)
     $result.cleanup.status = if ($result.cleanup.temporaryRootRemoved) { 'passed' } else { 'failed' }

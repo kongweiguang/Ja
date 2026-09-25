@@ -11,4 +11,4 @@ pub(crate) mod supervisor;
 
 pub use machine::LifecycleState;
 pub(crate) use machine::{LifecycleMachine, RestartPolicy};
-pub use supervisor::{SidecarSupervisor, TurnChangeSetReadLease};
+pub use supervisor::{SidecarSupervisor, ThreadCompactionLease, TurnChangeSetReadLease};

@@ -350,6 +350,26 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
+    /** Plan 在旧的 32 Turn 边界后仍可领取新执行 Turn，序号来自权威 claim 账本。 */
+    @Test
+    void claimsPlanTurnBeyondOldBudget() throws Exception {
+        try (Fixture fixture = fixture("plan-unbounded-turns")) {
+            MybatisGoalRepository goals = fixture.repository();
+            Plan plan = executeStandalonePlan(goals, "plan_long", "planrev_long", "run_long");
+            for (int number = 1; number <= 33; number++) {
+                String turnId = "turn_long_" + number;
+                GoalRepository.PlanTurnClaim claim = goals.claimPlanTurn(new GoalRepository.ClaimPlanTurn(
+                        plan.planId(), plan.revision(), plan.activeRunId(), plan.activePlanRevisionId(),
+                        turnId, "evt_long_" + number, "claim:long:" + number,
+                        NOW.plusSeconds(number))).orElseThrow();
+                assertEquals(number, claim.ordinal());
+                fixture.settlePlanClaim(plan.activeRunId(), turnId);
+            }
+            assertEquals(GoalModels.PlanStatus.EXECUTING,
+                    goals.readPlanSnapshot(plan.planId()).plan().status());
+        }
+    }
+
     /** 活动 Goal 与 standalone Plan 共享 owner 时，执行事务必须在创建 Run 前拒绝并发执行。 */
     @Test
     void activeGoalBlocksStandalonePlanExecution() throws Exception {
@@ -362,8 +382,7 @@ final class MybatisGoalRepositoryTest {
             GoalRepositoryException blocked = assertThrows(GoalRepositoryException.class, () ->
                     goals.executePlan(new GoalRepository.ExecutePlan(awaiting.planId(), awaiting.revision(),
                             revision.planRevisionId(), revision.planHash(), "approval:exclusive", "run_plan_exclusive", 1,
-                            "evt_execute_exclusive", "execute:exclusive", NOW,
-                            10, 10, 60_000L, 4)));
+                            "evt_execute_exclusive", "execute:exclusive", NOW)));
             assertEquals(GoalRepositoryException.Code.GOAL_INVALID_STATE, blocked.code());
             assertTrue(goals.readPlanSnapshot(awaiting.planId()).plan().activeRunId() == null);
         }
@@ -623,21 +642,21 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
-    /** 连续三个完全无 revision 进展的 continuation 必须由数据库计数并在第三次暂停。 */
+    /** 旧计数达到三以后仍允许 Goal 工作，不能由次数预算自动暂停。 */
     @Test
-    void pausesAfterThreeContinuationTurnsWithoutProgress() throws Exception {
+    void keepsWorkingAfterRepeatedContinuationWithoutProgress() throws Exception {
         try (Fixture fixture = fixture("goal-continuation-stall")) {
             MybatisGoalRepository goals = fixture.repository();
             Goal current = approved(goals);
-            for (int turn = 1; turn <= 3; turn++) {
+            for (int turn = 1; turn <= 4; turn++) {
                 current = goals.recordContinuationNoProgress("goal_one", current.revision(),
                         "evt_no_progress_" + turn, "continuation:no-progress:" + turn,
                         NOW.plusSeconds(turn));
             }
 
-            assertEquals(GoalModels.GoalStatus.PAUSED, current.status());
-            assertEquals(GoalModels.GoalPhase.NEEDS_ATTENTION, current.phase());
-            assertEquals(3, current.turnsWithoutProgress());
+            assertEquals(GoalModels.GoalStatus.ACTIVE, current.status());
+            assertEquals(GoalModels.GoalPhase.WORKING, current.phase());
+            assertEquals(4, current.turnsWithoutProgress());
         }
     }
 
@@ -696,14 +715,14 @@ final class MybatisGoalRepositoryTest {
         }
     }
 
-    /** 同一失败签名第三次出现且没有真实新证据时，步骤结算与 Goal 熔断必须原子提交。 */
+    /** 同一失败签名跨过旧三次阈值后仍可继续；次数只用于观察。 */
     @Test
-    void pausesAfterThreeRepeatedFailuresWithoutEvidence() throws Exception {
+    void keepsWorkingAfterRepeatedFailuresWithoutEvidence() throws Exception {
         try (Fixture fixture = fixture("goal-repeated-failure")) {
             MybatisGoalRepository goals = fixture.repository();
             Goal current = approved(goals);
             String signature = "f".repeat(64);
-            for (int attempt = 1; attempt <= 3; attempt++) {
+            for (int attempt = 1; attempt <= 4; attempt++) {
                 current = goals.updateStep(new GoalRepository.UpdateStep("goal_one", current.revision(), "run_one",
                         "step_work", GoalModels.StepStatus.READY, GoalModels.StepStatus.RUNNING,
                         null, List.of(), "evt_running_" + attempt, "step:running:" + attempt, NOW.plusSeconds(attempt)));
@@ -711,7 +730,7 @@ final class MybatisGoalRepositoryTest {
                         "step_work", GoalModels.StepStatus.RUNNING, GoalModels.StepStatus.FAILED,
                         signature, List.of(), "evt_failed_" + attempt, "step:failed:" + attempt,
                         NOW.plusSeconds(attempt + 10L)));
-                if (attempt < 3) {
+                if (attempt < 4) {
                     current = goals.updateStep(new GoalRepository.UpdateStep("goal_one", current.revision(),
                             "run_one", "step_work", GoalModels.StepStatus.FAILED, GoalModels.StepStatus.READY,
                             null, List.of(), "evt_retry_" + attempt, "step:retry:" + attempt,
@@ -719,9 +738,9 @@ final class MybatisGoalRepositoryTest {
                 }
             }
 
-            assertEquals(GoalModels.GoalStatus.PAUSED, current.status());
-            assertEquals(GoalModels.GoalPhase.NEEDS_ATTENTION, current.phase());
-            assertEquals(3, current.repeatedFailureCount());
+            assertEquals(GoalModels.GoalStatus.ACTIVE, current.status());
+            assertEquals(GoalModels.GoalPhase.WORKING, current.phase());
+            assertEquals(4, current.repeatedFailureCount());
             assertEquals(signature, current.lastFailureSignature());
         }
     }
@@ -1183,7 +1202,7 @@ final class MybatisGoalRepositoryTest {
         PlanRevision revision = goals.readPlanSnapshot(planId).currentRevision();
         return goals.executePlan(new GoalRepository.ExecutePlan(planId, awaiting.revision(),
                 revision.planRevisionId(), revision.planHash(), "approval:" + planId, runId, 1,
-                "evt_execute:" + planId, "execute:" + planId, NOW, 10, 10, 60_000L, 4));
+                "evt_execute:" + planId, "execute:" + planId, NOW));
     }
 
     /** 测试 evaluator 固定返回结构化 MET，完成资格仍完全由 repository 的真实事实决定。 */
@@ -1200,7 +1219,8 @@ final class MybatisGoalRepositoryTest {
     private static GoalEvaluatorPort.Request evaluatorRequest(String goalId, String runId) {
         return new GoalEvaluatorPort.Request(goalId, "thr_one", 1, null, runId,
                 "provider", "model", "交付目标", null,
-                List.of(new GoalEvaluatorPort.Criterion("criterion_goal", "目标验收通过", true)), List.of());
+                List.of(new GoalEvaluatorPort.Criterion("criterion_goal", "目标验收通过", true)), List.of(),
+                io.github.kongweiguang.ja.foundation.concurrent.CancellationToken.none());
     }
 
     /** 外部测试报告 evidence 精确绑定当前 Goal definition/run，不依赖 evaluation Tool 自身。 */
@@ -1251,6 +1271,17 @@ final class MybatisGoalRepositoryTest {
     /** 关闭 fresh 数据库并执行 WAL checkpoint。 */
     private record Fixture(JaDatabase database, SqlSessionFactory sessions,
                            MybatisGoalRepository repository) implements AutoCloseable {
+        /** 测试只结算 claim 状态，隔离验证跨 Turn 准入的持久序号与预算门。 */
+        private void settlePlanClaim(String runId, String turnId) throws Exception {
+            try (SqlSession session = sessions.openSession();
+                 java.sql.PreparedStatement update = session.getConnection().prepareStatement(
+                         "UPDATE plan_turn_claims SET state='SETTLED' WHERE run_id=? AND turn_id=?")) {
+                update.setString(1, runId);
+                update.setString(2, turnId);
+                assertEquals(1, update.executeUpdate());
+                session.commit();
+            }
+        }
         /** 建立既有 Turn Tool call，证明 Goal attempt 只能绑定真实持久 identity。 */
         private void insertToolCall() throws Exception {
             try (SqlSession session = sessions.openSession(); Statement sql = session.getConnection().createStatement()) {

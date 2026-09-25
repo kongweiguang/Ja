@@ -36,8 +36,7 @@ impl Default for Limits {
             max_tombstones: 128,
             max_stderr_line_bytes: 64 * 1024,
             max_log_bytes: 1_048_576,
-            // 手动上下文压缩的 Java 绝对预算为五分钟；Session 上限略大于业务预算，
-            // 仅让专用 thread/compact 调用有机会接收终态响应，其他方法仍由各自短 timeout 约束。
+            // 普通 RPC 的本地可配置 deadline 上限；手动压缩走取消与连接关闭驱动的专用等待路径。
             request_deadline_ms: 305_000,
         }
     }

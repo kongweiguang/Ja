@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -109,6 +110,24 @@ final class JaSkillSourcesTest {
                 discovered.skills().stream().map(SkillCatalog.SkillDescriptor::name).toList());
         assertEquals(SkillCatalog.Source.JA_USER, descriptor(discovered, "shared").source());
         assertEquals("ja", read(catalog, discovered, "shared", "SKILL.md", 100).content());
+    }
+
+    /** 停用项目同名包后用户包接管，管理目录仍同时显示两个来源。 */
+    @Test
+    void disabledProjectSourceFallsBackToEnabledUserSource() throws Exception {
+        Path agents = Files.createDirectories(temporary.resolve("fallback-user"));
+        Path workspace = Files.createDirectories(temporary.resolve("fallback-project"));
+        writeSkill(agents, "review", "User review.", "user body", null, null);
+        writeSkill(workspace.resolve(".agents/skills"), "review", "Project review.", "project body", null, null);
+        JaSkillSources sources = new JaSkillSources();
+        SkillCatalog.DiscoveryRequest request = request(workspace, agents,
+                temporary.resolve("fallback-ja-absent"), true);
+
+        assertEquals(2, sources.discoverAll(request).stream()
+                .filter(skill -> skill.name().equals("review")).count());
+        SkillCatalog.Catalog effective = sources.discover(request, Set.of("project:review"));
+        assertEquals(SkillCatalog.Source.AGENTS_USER, descriptor(effective, "review").source());
+        assertEquals("user body", read(sources, effective, "review", "SKILL.md", 100).content());
     }
 
     /** 工作区信任为 false 时完全跳过项目来源，损坏项目包也不能影响用户 Skill。 */

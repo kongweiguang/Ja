@@ -15,12 +15,11 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 聚合已接纳 Turn 的队列槽位、取消 Scope、绝对 Deadline 和唯一终态完成权。
+ * 聚合已接纳 Turn 的队列槽位、取消 Scope、请求窗口与唯一终态完成权。
  */
 final class TurnOwnership {
     final TurnExecutionPlan request;
@@ -39,7 +38,6 @@ final class TurnOwnership {
     final Instant deadlineAt;
     final TurnExecutionState execution;
     final TurnChangeTracker changeTracker;
-    volatile ScheduledFuture<?> deadline;
 
     /**
      * 在准入成功点固定 Operation 所有权；请求级 RuntimeLease 不得进入这个长生命周期对象。

@@ -28,6 +28,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationError;
 import io.github.kongweiguang.ja.configuration.port.in.ConfigurationUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
 import io.github.kongweiguang.ja.foundation.concurrent.BoundedVirtualExecutor;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseCoordinator;
 import io.github.kongweiguang.ja.foundation.concurrent.ShutdownDeadline;
@@ -264,7 +265,13 @@ public final class RpcServer implements AutoCloseable {
         CompletableFuture<Void> completion = new CompletableFuture<>();
         handlerCompletions.add(completion);
         try {
-            CompletionStage<ObjectNode> stage = router.dispatch(request.method(), request.params());
+            CompletionStage<ObjectNode> stage;
+            NativeExecutionContext.Scope context = NativeExecutionContext.shared().enterRequest(request.id());
+            try {
+                stage = router.dispatch(request.method(), request.params());
+            } finally {
+                context.close();
+            }
             stage.whenComplete((result, failure) -> {
                 CompletionStage<Void> response = failure == null
                         ? completeResult(request.id(), result)
@@ -315,6 +322,7 @@ public final class RpcServer implements AutoCloseable {
                                 CompletableFuture<Void> completion) {
         response.whenComplete((ignored, failure) -> {
             if (id != null) inFlightIds.remove(id);
+            if (id != null) NativeExecutionContext.shared().unbindRequest(id);
             if (failure == null) completion.complete(null);
             else {
                 session.failProjection(failure);

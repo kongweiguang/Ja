@@ -114,7 +114,7 @@ final class GoldenCorpusTest {
             Map.entry("turn/resume", "turnResumeResult"),
             Map.entry("turn/recovery/respond", "turnRecoveryRespondResult"),
             Map.entry("turn/cancel", "turnCancelResult"),
-            Map.entry("turn/input/enqueue", "turnInputMutationResult"),
+            Map.entry("turn/input/enqueue", "turnInputEnqueueResult"),
             Map.entry("turn/input/prioritize", "turnInputMutationResult"),
             Map.entry("turn/input/update", "turnInputMutationResult"),
             Map.entry("turn/input/delete", "turnInputMutationResult"),

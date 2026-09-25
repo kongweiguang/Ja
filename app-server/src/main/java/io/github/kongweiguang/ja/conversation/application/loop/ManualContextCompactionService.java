@@ -28,7 +28,6 @@ import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.in.WorkspaceUseCase;
 
 import java.time.Clock;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -37,7 +36,6 @@ import java.util.UUID;
 
 /** 在空闲 Thread 上复用生产 ContextOrchestrator，且永不执行普通模型发送。 */
 public final class ManualContextCompactionService implements ContextCompactionUseCase {
-    private static final Duration MANUAL_DEADLINE = Duration.ofSeconds(290);
 
     private final ConversationRepository conversations;
     private final CheckpointStore checkpoints;
@@ -71,6 +69,7 @@ public final class ManualContextCompactionService implements ContextCompactionUs
     /**
      * 冻结 Thread、Provider/Model、Prompt、Tool schema 与配置代际后执行强制压缩；sender 为空操作，
      * 因此唯一付费副作用是 Summary；预算估算为纯本地计算，不会生成普通 assistant 回复。
+     * 无可缩小的提示及幂等复用返回 unchanged，不能伪称新 Checkpoint 已提交。
      */
     @Override
     @SuppressWarnings("PMD.CloseResource")
@@ -110,7 +109,7 @@ public final class ManualContextCompactionService implements ContextCompactionUs
                 preferences.providerId(), preferences.modelId(), preferences.reasoningLevel(),
                 preferences.accessMode(), preferences.collaborationMode(),
                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER,
-                MANUAL_DEADLINE, requestedAt);
+                requestedAt);
         try (RuntimeLease runtime = runtimes.resolve(runtimeRequest);
              TurnToolSessionFactory.Session mcp = runtime.toolSessions().open(cancellation)) {
             List<AgentTool> tools = new ArrayList<>(runtime.tools());
@@ -120,20 +119,23 @@ public final class ManualContextCompactionService implements ContextCompactionUs
             AgentPromptSession.PreparedPrompt initial = runtime.promptSession().prepare("", specs);
             ContextTokenMeter meter = meter(runtime, catalog, cancellation, snapshot.threadId());
             ContextOrchestrator orchestrator = contexts.create(new SummaryModel.TurnBinding(
-                    snapshot.threadId(), runtime.model(), requestedAt.plus(runtime.limits().wallTimeout()),
+                    snapshot.threadId(), runtime.model(), requestedAt.plus(runtime.limits().requestWindow()),
                     cancellation));
             ContextOrchestrator.Execution<Void> execution = orchestrator.execute(
                     new ContextOrchestrator.Request(snapshot.threadId(), snapshot.revision(), history,
                             initial.budget(), true, Optional.empty(), runtime.outputLimits(), meter,
                             cancellation),
                     receipt -> { }, prompt -> null, lifecycle, ContextCompactionEvent.Trigger.MANUAL);
+            Optional<CheckpointStore.CommittedCheckpoint> receipt = execution.committedReceipt();
+            if (receipt.isEmpty() || !receipt.orElseThrow().newlyCommitted()) {
+                long tokens = execution.prompt().estimatedTokens();
+                long revision = receipt.map(CheckpointStore.CommittedCheckpoint::threadRevision)
+                        .orElse(snapshot.revision());
+                return new Result(Outcome.UNCHANGED, null, null, revision, tokens, tokens);
+            }
             CheckpointStore.ContextCheckpoint checkpoint = execution.checkpoint()
                     .orElseThrow(() -> failure(Code.INVALID_STATE));
-            long committedRevision = execution.committedReceipt()
-                    .map(CheckpointStore.CommittedCheckpoint::threadRevision)
-                    .orElseGet(() -> conversations.readThread(snapshot.threadId())
-                            .map(ConversationRepository.ThreadSnapshot::revision)
-                            .orElseThrow(() -> failure(Code.INVALID_STATE)));
+            long committedRevision = receipt.orElseThrow().threadRevision();
             return new Result(Outcome.COMPACTED, compactionId, checkpoint.checkpointId(),
                     committedRevision, lifecycle.inputTokensBefore(), execution.prompt().estimatedTokens());
         } catch (java.util.concurrent.CancellationException failure) {

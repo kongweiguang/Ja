@@ -6,6 +6,9 @@ import {
   CursorSchema,
   ThreadIdSchema,
   ThreadReadResultSchema,
+  MessageContentReadResultSchema,
+  ThreadObservationParamsSchema,
+  ThreadObservationResultSchema,
   ThreadUsageSummarySchema,
   ThreadMcpStatusResultSchema,
   ParamsSchemaByMethod,
@@ -42,6 +45,9 @@ export const JA_HISTORY_COMMANDS = {
   threadList: "ja_thread_list",
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
+  messageContentRead: "ja_thread_message_content_read",
+  threadObserve: "ja_thread_observe",
+  threadUnobserve: "ja_thread_unobserve",
   threadUsageRead: "ja_thread_usage_read",
   threadMcpRead: "ja_thread_mcp_read",
   threadRename: "ja_thread_rename",
@@ -52,6 +58,7 @@ export const JA_HISTORY_COMMANDS = {
   threadRestore: "ja_thread_restore",
   threadDelete: "ja_thread_delete",
   threadCompact: "ja_thread_compact",
+  threadCompactCancel: "ja_thread_compact_cancel",
 } as const;
 
 const PageInputSchema = z
@@ -70,7 +77,7 @@ const WorkspaceOpenInputSchema = z
       .min(1)
       .max(4_096)
       .refine((value) => !value.includes("\u0000"), "cwd contains NUL"),
-    displayName: z.string().min(1).max(512).optional(),
+    displayName: z.string().min(1).max(1_024).optional(),
   })
   .strict();
 const ThreadCreateInputSchema = z
@@ -102,6 +109,7 @@ const ThreadReadInputSchema = z
     threadId: ThreadIdSchema,
     cursor: CursorSchema.optional(),
     limit: z.number().int().min(1).max(200).optional(),
+    tail: z.literal(true).optional(),
   })
   .strict();
 /** 累计账本只按 Thread 身份读取；React 不提交范围、过滤器或计价参数。 */
@@ -133,6 +141,7 @@ const ThreadPreferencesUpdateInputSchema = z
   })
   .strict();
 const AcceptedResultSchema = z.object({ accepted: z.literal(true) }).strict();
+const ThreadCompactCancelResultSchema = z.object({ accepted: z.boolean() }).strict();
 const ThreadCompactResultSchema = z
   .object({
     outcome: z.enum(["compacted", "unchanged"]),
@@ -184,6 +193,12 @@ export type HistoryThreadListInput = z.infer<typeof ThreadListInputSchema>;
 export type HistoryThreadDiscoverInput = z.infer<typeof ThreadDiscoverInputSchema>;
 export type HistoryThreadSearchInput = z.infer<typeof ThreadSearchInputSchema>;
 export type HistoryThreadReadInput = z.infer<typeof ThreadReadInputSchema>;
+export type HistoryMessageContentReadInput = z.infer<
+  (typeof ParamsSchemaByMethod)["thread/message-content/read"]
+>;
+export type HistoryMessageContentReadResult = z.infer<typeof MessageContentReadResultSchema>;
+export type HistoryThreadObservationInput = z.infer<typeof ThreadObservationParamsSchema>;
+export type HistoryThreadObservationResult = z.infer<typeof ThreadObservationResultSchema>;
 export type HistoryThreadUsageReadInput = z.infer<typeof ThreadUsageReadInputSchema>;
 export type HistoryThreadMcpReadInput = z.infer<typeof ThreadMcpReadInputSchema>;
 export type HistoryThreadRenameInput = z.infer<typeof ThreadRenameInputSchema>;
@@ -224,6 +239,12 @@ export interface HistoryAdapter {
   threadList(input: HistoryThreadListInput): Promise<HistoryThreadListResult>;
   threadSearch(input: HistoryThreadSearchInput): Promise<HistoryThreadListResult>;
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
+  /** 只读能力；注入式测试 adapter 可省略，生产始终由 Java 权威消息分页提供。 */
+  messageContentRead?: (
+    input: HistoryMessageContentReadInput,
+  ) => Promise<HistoryMessageContentReadResult>;
+  threadObserve(input: HistoryThreadObservationInput): Promise<HistoryThreadObservationResult>;
+  threadUnobserve(input: HistoryThreadObservationInput): Promise<HistoryThreadObservationResult>;
   /** 用量在旧注入式测试 adapter 中可缺席；生产 adapter 固定提供此只读能力。 */
   threadUsageRead?: (input: HistoryThreadUsageReadInput) => Promise<HistoryThreadUsageSummary>;
   /** MCP status is queried only while the header popover is open. */
@@ -236,6 +257,7 @@ export interface HistoryAdapter {
   threadRestore(input: HistoryThreadMutationInput): Promise<HistoryThread>;
   threadDelete?: (input: HistoryThreadMutationInput) => Promise<void>;
   threadCompact(input: HistoryThreadMutationInput): Promise<HistoryThreadCompactResult>;
+  threadCompactCancel(input: { threadId: string }): Promise<{ accepted: boolean }>;
 }
 
 /** 拒绝畸形输入，且不得通过 Zod 诊断回显标识或路径片段。 */
@@ -351,6 +373,51 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
+  /** Unicode 字符分页只接受已提交消息身份；完整正文不进入 thread/read 大帧。 */
+  messageContentRead(
+    input: HistoryMessageContentReadInput,
+  ): Promise<HistoryMessageContentReadResult> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.messageContentRead,
+      input,
+      ParamsSchemaByMethod["thread/message-content/read"],
+      MessageContentReadResultSchema,
+    );
+  }
+
+  /** 先订阅后读取基线，ACK 身份必须与请求一致才能把 Thread 标为实时可见。 */
+  async threadObserve(
+    input: HistoryThreadObservationInput,
+  ): Promise<HistoryThreadObservationResult> {
+    const result = await invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadObserve,
+      input,
+      ThreadObservationParamsSchema,
+      ThreadObservationResultSchema,
+    );
+    if (result.threadId !== input.threadId)
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    return result;
+  }
+
+  /** 隐藏会话只释放这条连接的订阅；后台回合与持久会话由 Java 继续持有。 */
+  async threadUnobserve(
+    input: HistoryThreadObservationInput,
+  ): Promise<HistoryThreadObservationResult> {
+    const result = await invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadUnobserve,
+      input,
+      ThreadObservationParamsSchema,
+      ThreadObservationResultSchema,
+    );
+    if (result.threadId !== input.threadId)
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    return result;
+  }
+
   /** 读取完整账本时不加载 Timeline 页；原生边界会拒绝畸形或错配响应。 */
   threadUsageRead(input: HistoryThreadUsageReadInput): Promise<HistoryThreadUsageSummary> {
     return invokeHistory(
@@ -458,6 +525,17 @@ export class TauriHistoryAdapter implements HistoryAdapter {
       input,
       ThreadMutationInputSchema,
       ThreadCompactResultSchema,
+    );
+  }
+
+  /** 停止意图只向当前连接发出，压缩本身的最终结果仍由原 Promise 和事件确认。 */
+  threadCompactCancel(input: { threadId: string }): Promise<{ accepted: boolean }> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.threadCompactCancel,
+      input,
+      z.object({ threadId: ThreadIdSchema }).strict(),
+      ThreadCompactCancelResultSchema,
     );
   }
 }

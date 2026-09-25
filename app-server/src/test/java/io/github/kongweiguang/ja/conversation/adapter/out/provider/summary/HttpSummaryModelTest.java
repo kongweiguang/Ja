@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.conversation.adapter.out.provider.summary;
 
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.ModelAdapterFactory;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.shared.AbstractStreamingModelAdapter;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.adapter.out.provider.support.ModelAdapterTestSupport;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.ReasoningContent;
@@ -87,7 +88,7 @@ final class HttpSummaryModelTest {
         }
     }
 
-    /** 摘要连续失败只耗尽各自请求预算，不能阻止后续摘要恢复或累积跨请求熔断状态。 */
+    /** 每次摘要调用只产生一次 HTTP 请求，后续显式调用不受先前失败次数限制。 */
     @Test
     void summaryRequestsReachHttpAfterRepeatedFailures() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
@@ -95,10 +96,10 @@ final class HttpSummaryModelTest {
             else ModelAdapterTestSupport.sse(exchange, openAiSummary(DOCUMENT, new ModelUsage(12, 5, 17)), 7);
         }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
             ModelPort.ModelConfiguration configuration = configuration(server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
-            for (int index = 0; index < 3; index++) {
+            for (int index = 0; index < 9; index++) {
                 assertThrows(ContextException.class, () -> countedSummary(
                         factory.bind(binding(configuration, CancellationToken.none())), prompt()));
-                assertEquals((index + 1) * 3, server.calls());
+                assertEquals(index + 1, server.calls());
             }
             assertDocument(countedSummary(factory.bind(binding(configuration, CancellationToken.none())), prompt()).document());
             assertEquals(10, server.calls());
@@ -265,7 +266,7 @@ final class HttpSummaryModelTest {
 
             assertTrue(responseStarted.await(1, TimeUnit.SECONDS));
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
-            assertNull(failure.getCause());
+            assertTrue(failure.getCause() instanceof ProviderProtocolException);
             assertEquals(1, server.calls());
         }
     }
@@ -290,9 +291,9 @@ final class HttpSummaryModelTest {
         }
     }
 
-    /** 瞬时 HTTP 失败仅可在摘要收集器接纳语义输出前重试。 */
+    /** 摘要 Adapter 将瞬时错误交还会话层；下一次显式请求可重新打开模型。 */
     @Test
-    void retriesTransientStatusBeforeStructuredOutput() throws Exception {
+    void transientStatusRequiresNewSummaryRequest() throws Exception {
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
             if (call == 1) {
                 ModelAdapterTestSupport.status(exchange, 503);
@@ -304,6 +305,9 @@ final class HttpSummaryModelTest {
             ModelPort.ModelConfiguration configuration = configuration(
                     server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
 
+            assertThrows(ContextException.class, () -> countedSummary(factory.bind(
+                    binding(configuration, CancellationToken.none())), prompt()));
+            assertEquals(1, server.calls());
             SummaryGenerator.SummaryResult result = countedSummary(factory.bind(
                     binding(configuration, CancellationToken.none())), prompt());
 
@@ -335,7 +339,7 @@ final class HttpSummaryModelTest {
                     countedSummary(factory.bind(binding(configuration, CancellationToken.none())), prompt()));
 
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
-            assertNull(failure.getCause());
+            assertTrue(failure.getCause() instanceof ProviderProtocolException);
             assertEquals(1, server.calls());
         }
     }

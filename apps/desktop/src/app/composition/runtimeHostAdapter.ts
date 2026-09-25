@@ -82,6 +82,11 @@ export function createRuntimeHostPort(
     activateWorkspace: (workspaceId) => adapter.activateWorkspace(workspaceId),
     recoveryState: () => adapter.recoveryState(),
     acknowledgeRecovery: (confirmation) => adapter.acknowledgeRecovery(confirmation),
+    pendingOperations: () => adapter.pendingOperations(),
+    recheckPendingOperations: () => adapter.recheckPendingOperations(),
+    acknowledgePendingOperation: (clientOperationId) =>
+      adapter.acknowledgePendingOperation(clientOperationId),
+    subscribePendingOperations: (listener) => adapter.subscribePendingOperations(listener),
     approvalRespond: (input) => adapter.approvalRespond(input),
     turnStart: (input) => adapter.turnStart(input),
     turnResume: (input) => adapter.turnResume(input),

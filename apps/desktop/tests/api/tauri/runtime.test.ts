@@ -130,7 +130,127 @@ function createBridge(overrides: Partial<RuntimeNativeBridge> = {}): RuntimeNati
 }
 
 describe("RuntimeHost v1 typed adapter", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("丢失提交响应后持久保留同一操作 ID，重载只查回执不自动重发", async () => {
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.turnStart) throw new Error("connection lost");
+      if (command === JA_RUNTIME_COMMANDS.operationRead) return { status: "unknown" };
+      return readyStatus;
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    const input = { threadId: "thr_fixture", content: [{ type: "text" as const, text: "hello" }] };
+    await expect(adapter.turnStart(input)).rejects.toMatchObject({ code: "OPERATION_UNCONFIRMED" });
+    const pending = await adapter.pendingOperations();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ method: "turn/start", threadId: "thr_fixture" });
+    expect(JSON.stringify(pending)).not.toContain("hello");
+
+    const reloaded = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    await expect(reloaded.turnStart(input)).rejects.toMatchObject({
+      code: "OPERATION_UNCONFIRMED",
+    });
+    expect(
+      invoke.mock.calls.filter(([command]) => command === JA_RUNTIME_COMMANDS.turnStart),
+    ).toHaveLength(1);
+  });
+
+  it("已提交回执经权威 Thread revision 对账后清除重载残留", async () => {
+    const operationId = "op_0123456789abcdef0123456789abcdef";
+    localStorage.setItem(
+      "ja.pending-operations.v1",
+      JSON.stringify([
+        {
+          clientOperationId: operationId,
+          method: "turn/start",
+          threadId: "thr_fixture",
+          createdAt: "2026-09-24T00:00:00.000Z",
+        },
+      ]),
+    );
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.operationRead)
+        return {
+          status: "committed",
+          method: "turn/start",
+          threadId: "thr_fixture",
+          result: {
+            accepted: true,
+            queued: false,
+            turnId: "turn_fixture",
+            threadRevision: 1,
+          },
+        };
+      if (command === JA_RUNTIME_COMMANDS.threadReadForOperation)
+        return {
+          threadId: "thr_fixture",
+          revision: 1,
+          turns: [],
+          items: [],
+          taskActivities: [],
+          goalActivities: [],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          nextCursor: null,
+        };
+      return readyStatus;
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    await expect(adapter.recheckPendingOperations()).resolves.toEqual([]);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_RUNTIME_COMMANDS.operationRead,
+      JA_RUNTIME_COMMANDS.threadReadForOperation,
+    ]);
+    expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
+  });
+
+  it("人工二次确认仅解除 unknown 的本机阻挡并保留不确定审计", async () => {
+    const operationId = "op_0123456789abcdef0123456789abcdef";
+    localStorage.setItem(
+      "ja.pending-operations.v1",
+      JSON.stringify([
+        {
+          clientOperationId: operationId,
+          method: "turn/start",
+          threadId: "thr_fixture",
+          createdAt: "2026-09-24T00:00:00.000Z",
+        },
+      ]),
+    );
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.operationRead) return { status: "unknown" };
+      throw new Error("new request must not be sent");
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    await expect(adapter.acknowledgePendingOperation(operationId)).resolves.toMatchObject({
+      status: "unknown_acknowledged",
+      pending: [],
+    });
+    expect(
+      JSON.parse(localStorage.getItem("ja.acknowledged-unknown-operations.v1") ?? "[]"),
+    ).toMatchObject([
+      {
+        clientOperationId: operationId,
+        method: "turn/start",
+        threadId: "thr_fixture",
+      },
+    ]);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_RUNTIME_COMMANDS.operationRead,
+    ]);
+  });
 
   it("keeps raw invoke private and routes lifecycle/turn calls without config snapshot fields", async () => {
     const invoke = vi.fn(async (command: string): Promise<unknown> => {
@@ -232,10 +352,18 @@ describe("RuntimeHost v1 typed adapter", () => {
 
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.start, {});
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnStart, {
-      input: { threadId: "thr_fixture", content: [{ type: "text", text: "hello" }] },
+      input: {
+        threadId: "thr_fixture",
+        content: [{ type: "text", text: "hello" }],
+        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
+      },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnContinue, {
-      input: { threadId: "thr_fixture", expectedThreadRevision: 2 },
+      input: {
+        threadId: "thr_fixture",
+        expectedThreadRevision: 2,
+        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
+      },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnReask, {
       input: {
@@ -243,6 +371,7 @@ describe("RuntimeHost v1 typed adapter", () => {
         expectedThreadRevision: 2,
         sourceMessageId: "item_question",
         content: [{ type: "text", text: "edited" }],
+        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
       },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnInputEnqueue, {

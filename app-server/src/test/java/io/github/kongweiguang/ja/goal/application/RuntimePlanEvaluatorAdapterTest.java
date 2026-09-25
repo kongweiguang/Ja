@@ -9,7 +9,6 @@ import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.goal.port.out.PlanEvaluatorPort;
 import org.junit.jupiter.api.Test;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CancellationException;
@@ -103,8 +102,7 @@ final class RuntimePlanEvaluatorAdapterTest {
     void deterministicEvaluatorHonorsCancellationContext() {
         CancellationSource cancellation = new CancellationSource();
         cancellation.cancel("plan_pause");
-        PlanEvaluatorPort.EvaluationContext context = new PlanEvaluatorPort.EvaluationContext(
-                cancellation, Duration.ofSeconds(5));
+        PlanEvaluatorPort.EvaluationContext context = new PlanEvaluatorPort.EvaluationContext(cancellation);
 
         assertThrows(CancellationException.class, () -> new DeterministicPlanEvaluator()
                 .evaluate(null, List.of(), context).toCompletableFuture().join());

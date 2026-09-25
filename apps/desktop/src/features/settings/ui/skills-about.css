@@ -2,7 +2,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 /* Skills 与关于页共享一套偏好页表面，直接消费设置页已有 token，避免颜色漂移。 */
-.ja-skill-scope,
+.ja-skill-list,
 .ja-about-list,
 .ja-about-identity {
   --surface-settings-group: var(--ja-surface-raised);
@@ -17,47 +17,11 @@
   --ja-preference-control-radius: 10px;
 }
 
-.ja-skill-scope {
-  display: grid;
-  gap: 10px;
-}
-
-.ja-skill-scope-tabs {
-  display: inline-flex;
-  width: fit-content;
-  min-height: var(--ja-control-height-compact);
-  padding: 3px;
-  border: 1px solid var(--ja-border);
-  border-radius: 7px;
-  background: var(--ja-control);
-}
-
-.ja-skill-scope-tab {
-  min-width: 76px;
-  min-height: 28px;
-  padding: 3px 10px;
-  border: 0;
-  border-radius: 4px;
-  color: var(--ja-foreground-muted);
-  background: transparent;
-  font: inherit;
-  font-size: var(--ja-text-caption-size);
-  cursor: pointer;
-}
-
-.ja-skill-scope-tab[data-state="active"] {
-  color: var(--ja-foreground);
-  background: var(--ja-surface-raised);
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--ja-foreground) 14%, transparent);
-}
-
-.ja-skill-scope-tab:focus-visible,
 .ja-skill-remove:focus-visible {
   outline: 2px solid var(--ja-focus);
   outline-offset: 2px;
 }
 
-.ja-skill-scope-content,
 .ja-skill-list {
   min-width: 0;
 }
@@ -275,11 +239,5 @@
 
   .ja-about-list .ja-settings-about-row {
     padding: 12px 14px;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ja-skill-scope-tab {
-    transition: none;
   }
 }

@@ -46,7 +46,6 @@ const completeConfigDocument = {
       network_timeouts: { connect_timeout_ms: 10_000, request_timeout_ms: 120_000 },
       agent_defaults: {
         context: { auto_compact: true },
-        turn_limits: { max_model_rounds: 32, max_tool_calls: 128, wall_timeout_ms: 600_000 },
       },
       models: [
         {
@@ -64,13 +63,12 @@ const completeConfigDocument = {
     },
   ],
   mcp_servers: [],
-  skills: [],
+  disabled_skills: [],
 } as const;
 
 const completeProjectSkillDocument = {
   schema_version: 2,
   config_revision: 0,
-  skills: ["project:demo-skill"],
   disabled_skills: [],
 } as const;
 

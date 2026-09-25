@@ -29,6 +29,8 @@ import {
 } from "@/features/command";
 import {
   useConversationController,
+  readFullMessageContent,
+  readFullAnswerContent,
   type ConversationArtifactPort,
   type ConversationAttachmentPort,
   type ConversationMcpReader,
@@ -305,9 +307,43 @@ export function JaApplication({
   }, []);
   const taskTranscriptPort = useMemo<TaskTranscriptPort>(
     () => ({
+      /** Child 的正文观察独立于 Task Activity handle，隐藏 Tab 时可单独释放。 */
+      observe: (input) => resolvedHistoryAdapter.threadObserve(input),
+      unobserve: (input) => resolvedHistoryAdapter.threadUnobserve(input),
       /** Child Transcript 原样复用完整 thread/read 快照，确保 Timeline reducer 不丢队列与 Usage。 */
       read: (input) => resolvedHistoryAdapter.threadRead(input),
     }),
+    [resolvedHistoryAdapter],
+  );
+  /** 子任务正文沿用同一分页合同，UI 只在用户查看或复制时物化选中消息。 */
+  const readTaskMessageContent = useCallback(
+    (threadId: string, messageId: string): Promise<string> => {
+      const readPage = resolvedHistoryAdapter.messageContentRead;
+      if (readPage === undefined) return Promise.reject(new Error("完整内容暂时不可用。"));
+      return readFullMessageContent(
+        (input) => readPage.call(resolvedHistoryAdapter, input),
+        threadId,
+        messageId,
+      );
+    },
+    [resolvedHistoryAdapter],
+  );
+  /** 子任务最终答复可能跨历史页；按受管 Thread 身份按需读齐，保持侧聊与主会话一致。 */
+  const readTaskAnswerContent = useCallback(
+    (
+      threadId: string,
+      finalMessageId: string,
+      minimumRevision?: number,
+      turnId?: string,
+    ): Promise<string> =>
+      readFullAnswerContent(
+        resolvedHistoryAdapter,
+        threadId,
+        finalMessageId,
+        () => true,
+        minimumRevision,
+        turnId,
+      ),
     [resolvedHistoryAdapter],
   );
   const taskPreferencesPort = useMemo<TaskPreferencesPort>(
@@ -708,6 +744,37 @@ export function JaApplication({
   const pageNavigation = usePageNavigationController(required);
   const { settingsVisible, settingsSection, setSettingsSection, navigate, goBack, goForward } =
     pageNavigation;
+  const [settingsSelection, setSettingsSelection] = useState<{
+    visible: boolean;
+    projectId?: string;
+  }>({ visible: settingsVisible });
+  // 只在设置可见性切换时调整本地筛选状态；下一次进入总是从当时的当前项目开始。
+  if (settingsSelection.visible !== settingsVisible) {
+    setSettingsSelection({ visible: settingsVisible });
+  }
+  /** 用户选择只改变这次设置访问的目标，不触碰当前会话的 workspace。 */
+  const setSettingsProjectId = useCallback((projectId: string): void => {
+    setSettingsSelection({ visible: true, projectId });
+  }, []);
+  const settingsTargetProjectId =
+    (settingsSelection.visible === settingsVisible ? settingsSelection.projectId : undefined) ??
+    (settingsVisible ? settingsWorkspaceScope?.workspaceId : undefined);
+  /** 设置编辑面独立读取所选项目；对话继续使用当前工作区的 settings 快照。 */
+  const settingsEditor = useSettingsController({
+    adapter: settingsAdapter ?? DEFAULT_SETTINGS_ADAPTER,
+    appearancePort,
+    workspaceScope:
+      settingsTargetProjectId === undefined
+        ? undefined
+        : { workspaceId: settingsTargetProjectId, kind: "project" },
+    runtimeState,
+    boot,
+    configurationChange: projectSettingsConfigurationChange(lastConfigurationEvent),
+    runtimePort: settingsRuntimePort,
+    active: settingsVisible,
+    catalogSection:
+      settingsSection === "skills" || settingsSection === "mcp" ? settingsSection : "none",
+  });
   const isProjectScope = workspace.workspace?.kind === "project";
   // native general scope 与已选项目都是有效 conversation scope。Navigation action 与
   // Composer 等待相同 lifecycle/history gate，启动期不能在 Thread/runtime admission
@@ -1761,6 +1828,10 @@ export function JaApplication({
   ) : (
     <SettingsView
       settings={settings}
+      projectSettings={settingsEditor}
+      projects={workspace.projects}
+      selectedProjectId={settingsTargetProjectId}
+      onSelectProject={setSettingsProjectId}
       interfacePreferences={interfacePreferences}
       executionScope={{
         scopedDefault: settings.snapshot.defaultAccessMode,
@@ -1829,6 +1900,8 @@ export function JaApplication({
         onRegisterSideChatLauncher={registerSideChatLauncher}
         taskPort={taskAdapter}
         taskTranscriptPort={taskTranscriptPort}
+        taskMessageContentRead={readTaskMessageContent}
+        taskAnswerContentRead={readTaskAnswerContent}
         taskThreadRenamePort={taskThreadRenamePort}
         taskNativeDropPort={nativeDropPort}
         taskPreferencesPort={taskPreferencesPort}

@@ -23,7 +23,7 @@ public interface ContextCompactionUseCase {
         }
     }
 
-    /** 返回压缩或无变化结果；Token 均来自 Provider 官方计量。 */
+    /** 返回压缩或无变化结果；Token 来自同一模型请求计量端口，不冒充实际 Usage。 */
     record Result(Outcome outcome, String compactionId, String checkpointId,
                   long threadRevision, long inputTokensBefore, long inputTokensAfter) {
         /** changed 必须带完整身份，unchanged 不伪造 Checkpoint。 */
@@ -41,7 +41,7 @@ public interface ContextCompactionUseCase {
     enum Outcome {
         /** 新 Checkpoint 已通过 Thread revision CAS 提交。 */
         COMPACTED,
-        /** 最新 Checkpoint 已覆盖全部永久消息，没有新事实需要摘要。 */
+        /** 没有可缩小的提示，或现有 Checkpoint 已覆盖全部待摘要事实。 */
         UNCHANGED
     }
 

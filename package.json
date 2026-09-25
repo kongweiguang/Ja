@@ -1,7 +1,7 @@
 {
   "name": "ja",
   "private": true,
-  "version": "0.1.19",
+  "version": "0.1.20",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -17,10 +17,10 @@
     "dev": "vite --config apps/desktop/vite.config.ts",
     "build": "pnpm typecheck && vite build --config apps/desktop/vite.config.ts",
     "preview": "vite preview --config apps/desktop/vite.config.ts",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri": "node scripts/dev/tauri.mjs",
+    "tauri:dev": "node scripts/dev/tauri.mjs dev",
     "tauri:dev:jar": ".\\dev.cmd",
-    "tauri:build": "tauri build",
+    "tauri:build": "node scripts/dev/tauri.mjs build",
     "version:check": "python -B scripts/version/product_version.py check",
     "version:sync": "python -B scripts/version/product_version.py sync",
     "typecheck": "tsc --noEmit --pretty false && tsc --noEmit -p tsconfig.node.json --pretty false",

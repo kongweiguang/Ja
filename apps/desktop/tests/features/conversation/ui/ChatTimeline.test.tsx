@@ -29,6 +29,31 @@ const baseItem = (item: Partial<TimelineItemAdapter>): TimelineItemAdapter => ({
 describe("ChatTimeline", () => {
   afterEach(() => cleanup());
 
+  it("只在旧页可用时提供单次按需加载入口", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const loadOlder = vi.fn(() => pending);
+    const { rerender } = render(
+      <ChatTimeline items={[]} hasOlderHistory onLoadOlderHistory={loadOlder} />,
+    );
+    const button = screen.getByRole("button", { name: "加载更早的记录" });
+    fireEvent.click(button);
+    rerender(
+      <ChatTimeline
+        items={[]}
+        hasOlderHistory
+        loadingOlderHistory
+        onLoadOlderHistory={loadOlder}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "正在加载…" })).toBeDisabled();
+    expect(loadOlder).toHaveBeenCalledTimes(1);
+    release();
+    await waitFor(() => expect(loadOlder).toHaveBeenCalledTimes(1));
+  });
+
   it("renders one user question and one final answer without identity avatars", () => {
     render(
       <ChatTimeline
@@ -50,6 +75,60 @@ describe("ChatTimeline", () => {
     ).toBeGreaterThan(0);
     // rehype-sanitize 会移除可执行 Markup；其惰性文本允许继续可见，避免静默改写 Assistant Response。
     expect(document.querySelector("script")).toBeNull();
+  });
+
+  /** 预览到顶后只能从持久消息读取全文，复制不能静默退化为截断预览。 */
+  it("按需展开并复制超过事件帧的完整回复", async () => {
+    const preview = "答".repeat(65_536);
+    const complete = `${preview}末尾保留`;
+    const read = vi.fn(async (messageId: string) => {
+      expect(messageId).toBe("item_long_final");
+      return complete;
+    });
+    const copy = vi.fn(async () => {});
+    render(
+      <ChatTimeline
+        items={[baseItem({ itemId: "item_long_final", final: true, text: preview })]}
+        onReadMessageContent={read}
+        onCopyText={copy}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "查看完整回复" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "查看完整回复" }));
+    await waitFor(() => expect(screen.getByText(/末尾保留/)).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "复制回复" }));
+    expect(read).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(complete));
+  });
+
+  /** 思考摘要沿用同一分页身份，展开与复制不能仅拿到历史页的安全前缀。 */
+  it("按需读取完整公开思考摘要", async () => {
+    const preview = "思".repeat(65_536);
+    const complete = `${preview}摘要末尾`;
+    const read = vi.fn(async (messageId: string) => {
+      expect(messageId).toBe("item_reasoning");
+      return complete;
+    });
+    const copy = vi.fn(async () => {});
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_reasoning",
+            kind: "reasoning",
+            status: "completed",
+            text: preview,
+          }),
+        ]}
+        onReadMessageContent={read}
+        onCopyText={copy}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "查看完整思考摘要" }));
+    await waitFor(() => expect(screen.getByText(/摘要末尾/)).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "复制全文" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(complete));
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   /** 同一 Turn 的多个 assistant fragment 必须合并为一个答复块，但不能丢失任一段正文。 */
@@ -1628,7 +1707,7 @@ describe("ChatTimeline", () => {
     expect(reason.textContent).toBe(expectedReason);
   });
 
-  /** 重试次数只修饰正在工作状态；不增加过程行，旧半截正文也不会回到时间线。 */
+  /** 恢复提示只修饰正在工作状态；不增加过程行，旧半截正文也不会回到时间线。 */
   it("重试期间只展示一处轻状态并保持正在工作", () => {
     render(
       <ChatTimeline
@@ -1639,7 +1718,7 @@ describe("ChatTimeline", () => {
             itemId: "item_retry_status",
             kind: "commentary",
             status: "in_progress",
-            text: "重试 2/6",
+            text: "连接中断，正在恢复",
             metadata: { phase: "assistant_retry" },
           }),
         ]}
@@ -1650,7 +1729,7 @@ describe("ChatTimeline", () => {
       "data-response-state",
       "working",
     );
-    expect(screen.getByText("正在工作 · 重试 2/6")).toBeVisible();
+    expect(screen.getByText("正在工作 · 连接中断，正在恢复")).toBeVisible();
     expect(document.querySelectorAll('[data-retry-status="true"]')).toHaveLength(1);
     expect(screen.queryByRole("listitem", { name: "助手进展" })).not.toBeInTheDocument();
     expect(screen.queryByText(/失败请求的半截正文/u)).not.toBeInTheDocument();

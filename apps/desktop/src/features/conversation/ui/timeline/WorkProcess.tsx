@@ -26,6 +26,8 @@ import {
 import { MarkdownMessage, type MarkdownFileTarget } from "./MarkdownMessage";
 import { ToolStepDetails } from "./ToolStepDetails";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
+import { useFullPublicText } from "./useFullPublicText";
+import { exportPublicText } from "./exportPublicText";
 import "./timeline.css";
 
 export interface WorkProcessProps {
@@ -57,6 +59,7 @@ export interface WorkProcessProps {
     mode?: "explorer",
   ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  onReadMessageContent?: (messageId: string) => Promise<string>;
   onReadToolArtifact?: (input: {
     threadId: string;
     turnId: string;
@@ -231,22 +234,151 @@ function presentedStepStatusLabel(step: WorkStepAdapter): string {
 /**
  * Detail 只渲染公开 Commentary/Reasoning Text 与显式 Item Summary。Item Kind 已在 Protocol
  * 边界列入 Allowlist，因此 Hidden Reasoning Record 不能借由兜底展示通道进入组件；公开
- * reasoning 已由 App Server 做有界投影，不能在这里再次截断，否则用户展开后仍会静默丢正文。
+ * 持久正文可能只给安全预览；视图不再额外截断 Commentary，完整内容由用户按需读取。
  */
 function stepDetail(step: WorkStepAdapter): string | undefined {
   const summary = step.summary?.trim();
   // Tool/Command/File 文本可能含 Path、Argument 或 Provider Output；
   // 只有公开 Commentary/Reasoning Text 与显式 Adapter Summary 可以安全渲染。
   const text =
-    summary ||
-    (step.kind === "commentary" || isReasoningItem(step) ? step.text?.trim() : undefined);
+    summary || (step.kind === "commentary" || isReasoningItem(step) ? step.text : undefined);
   if (!text) {
     return undefined;
   }
-  if (isReasoningItem(step)) {
-    return text;
-  }
-  return text.length > 2_048 ? `${text.slice(0, 2_048)}…` : text;
+  return text;
+}
+
+/** 长公开过程和持续增长的草稿只渲染一个文本节点，避免每个 delta 重解析整段 Markdown；
+ * 已提交内容的查看和复制仍通过同一 item 分页读取全文。 */
+function PublicTextStep({
+  step,
+  detail,
+  onReadMessageContent,
+  onCopyText,
+  onOpenLink,
+  onOpenFile,
+}: {
+  step: WorkStepAdapter;
+  detail: string;
+  onReadMessageContent?: (messageId: string) => Promise<string>;
+  onCopyText?: (text: string) => Promise<void>;
+  onOpenLink?: WorkProcessProps["onOpenLink"];
+  onOpenFile?: WorkProcessProps["onOpenFile"];
+}): ReactElement {
+  const long = detail.length >= 4_095;
+  const plainDuringLongStream = step.status === "in_progress" && detail.length >= 2_048;
+  const persistedPublicText =
+    isReasoningItem(step) ||
+    (step.kind === "commentary" && step.metadata?.phase === "assistant_progress");
+  const canRead =
+    long &&
+    persistedPublicText &&
+    detail === step.text &&
+    step.status === "completed" &&
+    onReadMessageContent !== undefined;
+  const { text, loading, error, load } = useFullPublicText(
+    step.itemId,
+    canRead ? () => onReadMessageContent(step.itemId) : undefined,
+  );
+  const [exportFeedback, setExportFeedback] = useState<{
+    itemId: string;
+    phase: "saving" | "saved" | "unsupported" | "error";
+  }>();
+  const exportPhase = exportFeedback?.itemId === step.itemId ? exportFeedback.phase : undefined;
+  /** 长过程只由用户点击后读取并写入系统保存句柄，取消不制造错误状态。 */
+  const exportFullText = async (): Promise<void> => {
+    setExportFeedback({ itemId: step.itemId, phase: "saving" });
+    try {
+      const outcome = await exportPublicText(
+        await load(),
+        isReasoningItem(step) ? "Ja-思考摘要.txt" : "Ja-过程正文.txt",
+      );
+      setExportFeedback(
+        outcome === "cancelled"
+          ? undefined
+          : { itemId: step.itemId, phase: outcome === "saved" ? "saved" : "unsupported" },
+      );
+    } catch {
+      setExportFeedback({ itemId: step.itemId, phase: "error" });
+    }
+  };
+  const visibleText = text ?? detail;
+  const plainLongText = plainDuringLongStream || visibleText.length >= 65_535;
+  return (
+    <>
+      {plainLongText ? (
+        <pre className="ja-chat-response__long-text">{visibleText}</pre>
+      ) : (
+        <MarkdownMessage
+          content={visibleText}
+          onOpenLink={onOpenLink}
+          onOpenFile={onOpenFile}
+          onCopyText={onCopyText}
+        />
+      )}
+      {canRead ? (
+        <div className="ja-public-text-actions">
+          {text === undefined ? (
+            <button
+              type="button"
+              className="ja-chat-response__full-action"
+              disabled={loading}
+              onClick={() => void load().catch(() => {})}
+            >
+              {loading
+                ? "正在读取全文…"
+                : error
+                  ? "重试读取全文"
+                  : isReasoningItem(step)
+                    ? "查看完整思考摘要"
+                    : "查看完整过程正文"}
+            </button>
+          ) : null}
+          {onCopyText === undefined ? null : (
+            <button
+              type="button"
+              className="ja-chat-response__full-action"
+              onClick={() =>
+                void load()
+                  .then(onCopyText)
+                  .catch(() => {})
+              }
+            >
+              复制全文
+            </button>
+          )}
+          <button
+            type="button"
+            className="ja-chat-response__full-action"
+            disabled={exportPhase === "saving"}
+            onClick={() => void exportFullText()}
+          >
+            {exportPhase === "saving" ? "正在导出…" : "导出全文"}
+          </button>
+        </div>
+      ) : null}
+      {exportPhase === "saved" ? (
+        <p className="ja-chat-response__full-note" role="status">
+          已导出全文。
+        </p>
+      ) : null}
+      {exportPhase === "unsupported" ? (
+        <p className="ja-chat-response__full-error" role="alert">
+          当前窗口不支持直接导出，可复制全文。
+        </p>
+      ) : null}
+      {exportPhase === "error" ? (
+        <p className="ja-chat-response__full-error" role="alert">
+          导出未完成，请重试。
+        </p>
+      ) : null}
+      {error ? (
+        <p className="ja-chat-response__full-error" role="alert">
+          完整内容暂时无法读取。
+        </p>
+      ) : null}
+    </>
+  );
 }
 
 /** 只有至少一个 Source Item 提供 Metric 时才合计可选值。 */
@@ -296,6 +428,7 @@ export function WorkProcess({
   onOpenLink,
   onOpenFile,
   onCopyText,
+  onReadMessageContent,
   onReadToolArtifact,
   onResolveToolRecovery,
   className,
@@ -506,8 +639,10 @@ export function WorkProcess({
                   data-role="reasoning"
                   aria-label="模型思考"
                 >
-                  <MarkdownMessage
-                    content={detail}
+                  <PublicTextStep
+                    step={step}
+                    detail={detail}
+                    onReadMessageContent={onReadMessageContent}
                     onOpenLink={onOpenLink}
                     onOpenFile={onOpenFile}
                     onCopyText={onCopyText}
@@ -526,8 +661,10 @@ export function WorkProcess({
                   }
                   aria-label="助手进展"
                 >
-                  <MarkdownMessage
-                    content={detail}
+                  <PublicTextStep
+                    step={step}
+                    detail={detail}
+                    onReadMessageContent={onReadMessageContent}
                     onOpenLink={onOpenLink}
                     onOpenFile={onOpenFile}
                     onCopyText={onCopyText}

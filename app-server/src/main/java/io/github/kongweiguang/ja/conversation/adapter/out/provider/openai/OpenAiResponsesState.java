@@ -47,6 +47,8 @@ final class OpenAiResponsesState {
     private int nextOrdinal;
     private int nextOutputIndex;
     private boolean terminal;
+    private String terminalEventName;
+    private JsonNode terminalResponse;
 
     /**
      * 绑定本次 Responses 请求身份，令 reasoning 原生块只能回传给同一 provider/model/endpoint。
@@ -60,7 +62,11 @@ final class OpenAiResponsesState {
      */
     List<ModelPort.ModelEvent> reduce(
             ProviderSseReader.Event event, Function<String, ToolSpec> toolLookup) {
-        if (terminal) throw protocol("OpenAI emitted data after a terminal event");
+        if (terminal) {
+            if (event.name().equals(terminalEventName)
+                    && event.data().path("response").equals(terminalResponse)) return List.of();
+            throw protocol("OpenAI emitted data after a terminal event");
+        }
         JsonNode data = event.data();
         List<ModelPort.ModelEvent> effects = new ArrayList<>();
         if (!"error".equals(event.name())) checkSequence(data);
@@ -261,13 +267,15 @@ final class OpenAiResponsesState {
                     "RESPONSE_STATUS", "OpenAI response status is not completed", false);
         }
         validateFinalOutput(response, true, effects);
-        usage = response.hasNonNull("usage") ? usage(requiredObject(response, "usage")) : null;
+        usage = usageOrUnknown(response.get("usage"));
         finishReason = emittedCalls.isEmpty() ? FinishReason.STOP : FinishReason.TOOL_CALLS;
         effects.addAll(flushOrderedEffects());
         if (!itemSlots.isEmpty() || !pendingEffects.isEmpty()) {
             throw protocol("OpenAI final output item order is incomplete");
         }
         terminal = true;
+        terminalEventName = "response.completed";
+        terminalResponse = response.deepCopy();
     }
 
     /**
@@ -286,13 +294,15 @@ final class OpenAiResponsesState {
                     "RESPONSE_STATUS", "OpenAI response status is not incomplete", false);
         }
         validateFinalOutput(response, false, effects);
-        usage = response.hasNonNull("usage") ? usage(requiredObject(response, "usage")) : null;
+        usage = usageOrUnknown(response.get("usage"));
         finishReason = FinishReason.MAX_OUTPUT_TOKENS;
         effects.addAll(flushOrderedEffects());
         if (!itemSlots.isEmpty() || !pendingEffects.isEmpty()) {
             throw protocol("OpenAI final output item order is incomplete");
         }
         terminal = true;
+        terminalEventName = "response.incomplete";
+        terminalResponse = response.deepCopy();
     }
 
     /**
@@ -314,6 +324,16 @@ final class OpenAiResponsesState {
      */
     private void requireFirstTerminal() {
         if (terminal) throw protocol("OpenAI repeated a terminal event");
+    }
+
+    /** 计量异常只使本次 Usage 未知；完整正文和结构化调用仍以各自的语义校验为准。 */
+    private static ModelUsage usageOrUnknown(JsonNode value) {
+        if (value == null || value.isNull() || !value.isObject()) return null;
+        try {
+            return usage(value);
+        } catch (ProviderProtocolException invalidUsage) {
+            return null;
+        }
     }
 
     /**
@@ -697,6 +717,7 @@ final class OpenAiResponsesState {
         private final Map<Integer, StringBuilder> summaryParts = new TreeMap<>();
         private final StringBuilder reasoningText = new StringBuilder();
         private String publicDisplayed = "";
+        private int reasoningDisplayedCharacters;
         private DisplaySource displaySource = DisplaySource.UNSELECTED;
         private JsonNode nativeItem;
         private boolean emitted;
@@ -758,12 +779,8 @@ final class OpenAiResponsesState {
             }
         }
 
-        /** 收集兼容网关的公开 reasoning_text，后续与 summary 共用展示去重账本。 */
+        /** 收集兼容网关的公开 reasoning_text；只由真实输出与请求窗口约束总长。 */
         private void appendReasoningText(String value) {
-            if ((long) reasoningText.length() + value.length() > 4_000_000L) {
-                throw new ProviderProtocolException(
-                        "REASONING_LIMIT", "OpenAI reasoning exceeds the limit", false);
-            }
             reasoningText.append(value);
         }
 
@@ -793,16 +810,22 @@ final class OpenAiResponsesState {
             }
         }
 
-        /** 首个非空公开通道即成为该 item 的稳定展示来源，避免另一通道迟到时重复拼接。 */
+        /** 首个非空公开通道即成为稳定展示来源；reasoning 只取新后缀，避免碎片流反复复制全文。 */
         private String nextPublicSuffix() {
-            String summary = summaryText();
             if (displaySource == DisplaySource.UNSELECTED) {
+                String summary = summaryText();
                 if (!summary.isEmpty()) displaySource = DisplaySource.SUMMARY;
                 else if (!reasoningText.isEmpty()) displaySource = DisplaySource.REASONING_TEXT;
                 else return "";
             }
-            String candidate = displaySource == DisplaySource.SUMMARY
-                    ? summary : reasoningText.toString();
+            if (displaySource == DisplaySource.REASONING_TEXT) {
+                int end = reasoningText.length();
+                if (end < reasoningDisplayedCharacters) throw protocol("OpenAI reasoning display source regressed");
+                String suffix = reasoningText.substring(reasoningDisplayedCharacters, end);
+                reasoningDisplayedCharacters = end;
+                return suffix;
+            }
+            String candidate = summaryText();
             if (candidate.isEmpty()) return "";
             if (candidate.startsWith(publicDisplayed)) {
                 String suffix = candidate.substring(publicDisplayed.length());

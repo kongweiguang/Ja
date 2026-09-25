@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.conversation.adapter.out.tools.BuiltInTools;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.PlanReadOnlyToolCatalog;
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.ShellCapability;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.conversation.application.capability.AgentCapabilityCatalog;
 import io.github.kongweiguang.ja.conversation.application.policy.PlanToolPolicy;
 import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
@@ -50,7 +51,6 @@ import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.foundation.json.JsonValue;
 
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -76,6 +76,8 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     private final Path jaSkillRoot;
     private final Path jaHome;
     private final ShellCapability shellCapability;
+    private final Map<NativeExecutionSnapshot, ShellCapability> clientShells =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
     private final GenerationCatalog generationCatalog;
     private final GenerationTurnMcpSessionFactory mcpSessions;
     private final JsonValueCodec argumentsCodec;
@@ -128,17 +130,21 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     @SuppressWarnings("PMD.CloseResource")
     public RuntimeLease resolve(TurnRuntimeRequest request) {
         Objects.requireNonNull(request, "request");
+        ShellCapability requestShell = shellFor(request.executionContext());
+        Map<String, String> hostEnvironment = request.executionContext() == null ? System.getenv()
+                : request.executionContext().environment();
         Optional<JsonObject> inheritedCeiling = taskCeilings.read(request.threadId());
         Optional<RuntimeIdentity> taskIdentity = taskCeilings.readIdentity(request.threadId());
         ConfigurationGenerationPort.Lease lease = configurations.acquire(request.workspaceRoot());
         boolean transferred = false;
+        GenerationTurnMcpSessionFactory.CatalogSnapshot ownedMcpCatalog = null;
         try {
             ConfigurationGenerationSnapshot.Provider provider =
                     lease.snapshot().requireProvider(request.providerId());
             ConfigurationGenerationSnapshot.Model selectedModel =
                     lease.snapshot().requireModel(request.providerId(), request.modelId());
             validateReasoning(request.reasoningLevel(), selectedModel);
-            TurnLimits limits = limits(request, provider, selectedModel);
+            TurnLimits limits = limits(provider, selectedModel);
             ModelPort.ModelConfiguration model = model(
                     provider, selectedModel, request.reasoningLevel(), lease, limits.maxOutputTokens());
             SkillResolution availableSkills = skillCatalog(request.workspaceRoot(), lease);
@@ -149,7 +155,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             ThreadPreferences requestPreferences = new ThreadPreferences(provider.providerId(), selectedModel.modelId(),
                     request.reasoningLevel(), resolvedAccessMode, request.collaborationMode(),
                     ThreadPreferences.TitleSource.MANUAL);
-            Instant requestDeadline = request.requestedAt().plus(limits.wallTimeout());
+            Instant requestDeadline = request.requestedAt().plus(limits.requestWindow());
             AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities = capabilities.prepare(
                     new AgentCapability.Request(request.threadId(), request.turnId(), request.workspaceRoot(),
                             request.workspaceId(), requestPreferences, lease.generationId(),
@@ -157,19 +163,20 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                             request.origin(), taskIdentity.map(RuntimeIdentity::kind)));
             AgentPromptSession promptSession = promptSessions.open(new AgentPromptSessionFactory.SessionRequest(
                     request.threadId(), request.workspaceRoot(), jaHome, lease.snapshot().trusted(),
-                    promptEnvironment(request, preparedCapabilities, taskIdentity), contextBudget, skills,
+                    promptEnvironment(request, requestShell, preparedCapabilities, taskIdentity), contextBudget, skills,
                     skillResolution.catalog(), skillResolution.skillNamesById()));
             List<AgentTool> builtInTools = BuiltInTools.create(
-                    request.workspaceRoot(), skills, skillResolution.catalog(), shellCapability, promptSession,
-                    attachments).snapshot();
+                    request.workspaceRoot(), skills, skillResolution.catalog(), requestShell, promptSession,
+                    attachments, hostEnvironment).snapshot();
             boolean planning = PlanToolPolicy.isReadOnlyPlanning(request.origin(), request.collaborationMode());
             if (planning) builtInTools = PlanReadOnlyToolCatalog.filter(builtInTools);
             TurnMcpSessionFactory.Context toolContext = new TurnMcpSessionFactory.Context(
                     provider.providerId(), selectedModel.modelId(), request.workspaceRoot(),
-                    requestDeadline);
+                    requestDeadline, request.executionContext());
             GenerationTurnMcpSessionFactory.CatalogSnapshot mcpCatalog = planning
                     ? GenerationTurnMcpSessionFactory.CatalogSnapshot.planningEmpty()
                     : mcpSessions.catalog(toolContext, lease);
+            ownedMcpCatalog = mcpCatalog;
             List<AgentCapability.ToolContribution> catalogCapabilities = planning
                     ? preparedCapabilities.catalogToolContributions().stream()
                         .filter(contribution -> contribution.planAccess() != AgentTool.PlanAccess.DISALLOWED
@@ -213,19 +220,40 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                         request.collaborationMode(), request.turnId(),
                         dispatchCatalogRevision, Instant.now(), observedStatuses, dispatchScopes));
             };
+            GenerationTurnMcpSessionFactory.CatalogSnapshot releasedCatalog = mcpCatalog;
+            AutoCloseable release = () -> {
+                try {
+                    releasedCatalog.close();
+                } finally {
+                    lease.close();
+                }
+            };
             RuntimeLease runtimeLease = new RuntimeLease(lease.generationId(), model,
                     resolvedAccessMode, request.collaborationMode(), limits,
                     List.copyOf(requestTools), toolSessions, outputLimits, promptSession, attachments,
-                    presentationSecrets(lease.snapshot(), lease, model.apiKey()),
+                    presentationSecrets(lease.snapshot(), lease, model.apiKey(), hostEnvironment),
                     catalogDigest, promptSession.currentRevision(),
-                    request.reasoningLevel(), lease, observeDispatch);
+                    request.reasoningLevel(), release, observeDispatch);
             transferred = true;
             return runtimeLease;
         } finally {
             if (!transferred) {
-                lease.close();
+                try {
+                    if (ownedMcpCatalog != null) ownedMcpCatalog.close();
+                } finally {
+                    lease.close();
+                }
             }
         }
+    }
+
+    /**
+     * 同一客户端快照可被一个 Turn 的多个 Provider 安全点复用；弱键缓存只避免重复
+     * 启动 Shell 预检进程，不延长已经结束的 Turn 或断开客户端的环境生命周期。
+     */
+    private ShellCapability shellFor(NativeExecutionSnapshot context) {
+        if (context == null) return shellCapability;
+        return clientShells.computeIfAbsent(context, ShellCapability::forClient);
     }
 
     /**
@@ -254,9 +282,10 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
      * 或 summary，且每个请求都重新读取持久投影，保证后续 continuation 不依赖首轮缓存。
      */
     private String promptEnvironment(
-            TurnRuntimeRequest request, AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities,
+            TurnRuntimeRequest request, ShellCapability requestShell,
+            AgentCapabilityCatalog.PreparedCapabilities preparedCapabilities,
             Optional<RuntimeIdentity> taskIdentity) {
-        String environment = shellCapability.executionEnvironment(request.workspaceRoot());
+        String environment = requestShell.executionEnvironment(request.workspaceRoot());
         String fragment = preparedCapabilities.promptFragment();
         String taskFragment = taskIdentity.filter(identity -> identity.kind() == Kind.SIDE_TASK)
                 .map(ConfigurationTurnRuntimeResolver::sideTaskIdentityPrompt).orElse("");
@@ -552,7 +581,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     private static List<String> presentationSecrets(
             ConfigurationGenerationSnapshot snapshot,
             ConfigurationGenerationPort.Lease lease,
-            String providerSecret) {
+            String providerSecret, Map<String, String> hostEnvironment) {
         LinkedHashSet<String> values = new LinkedHashSet<>();
         addSecret(values, providerSecret);
         for (ConfigurationGenerationSnapshot.McpServer server : snapshot.mcpDefinitions()) {
@@ -563,7 +592,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
                 addSecret(values, lease.secretFor(server.auth().credentialId()));
             }
         }
-        System.getenv().forEach((key, value) -> addSensitiveSetting(values, key, value));
+        hostEnvironment.forEach((key, value) -> addSensitiveSetting(values, key, value));
         return values.stream().sorted(Comparator.comparingInt(String::length).reversed()).toList();
     }
 
@@ -592,7 +621,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             var provider = lease.snapshot().requireProvider(request.providerId());
             var selectedModel = lease.snapshot().requireModel(request.providerId(), request.modelId());
             validateReasoning(request.reasoningLevel(), selectedModel);
-            return limits(request, provider, selectedModel);
+            return limits(provider, selectedModel);
         }
     }
 
@@ -623,20 +652,16 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 把 Provider 默认上限映射为领域预算，并以入站 Deadline 继续收紧。
+     * 把 Provider 模型能力与网络请求窗口映射到一次请求，不引入 Turn 总时长预算。
      */
-    private static TurnLimits limits(TurnRuntimeRequest request,
-                                     ConfigurationGenerationSnapshot.Provider provider,
+    private static TurnLimits limits(ConfigurationGenerationSnapshot.Provider provider,
                                      ConfigurationGenerationSnapshot.Model model) {
         ConfigurationGenerationSnapshot.Capabilities capabilities = model.capabilities();
         int maxInputTokens = boundedTokenCount(
                 capabilities.contextWindowTokens() - capabilities.maxOutputTokens(), 4_000_000);
         int maxOutputTokens = boundedTokenCount(capabilities.maxOutputTokens(), 1_000_000);
-        ConfigurationGenerationSnapshot.TurnLimits configured = provider.agentDefaults().turnLimits();
-        Duration wallTimeout = minimum(request.deadline(), configured.wallTimeout());
-        return new TurnLimits(
-                configured.maxModelRounds(), configured.maxToolCalls(),
-                maxInputTokens, maxOutputTokens, wallTimeout);
+        return new TurnLimits(maxInputTokens, maxOutputTokens,
+                provider.networkTimeouts().requestTimeout());
     }
 
     /**
@@ -674,7 +699,7 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
     }
 
     /**
-     * 依据配置中的稳定名称选择本 Turn 可发现目录；正文直到 read 激活时才访问对应资源。
+     * 依据配置中的停用引用选择本 Turn 可发现目录；正文直到 read 激活时才访问对应资源。
      *
      * <p>项目 Skill 的配置身份来自全局文档，但资源身份属于当前工作区；工作区切换后，
      * 之前启用的项目 Skill 可能自然消失，必须把它当作能力收窄而不是阻断所有模型请求。
@@ -684,15 +709,11 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             Path workspaceRoot, ConfigurationGenerationPort.Lease lease) {
         SkillCatalog.DiscoveryRequest request = new SkillCatalog.DiscoveryRequest(
                 workspaceRoot, agentsSkillRoot, jaSkillRoot, lease.snapshot().trusted());
-        List<ConfigurationGenerationSnapshot.Skill> enabled = lease.snapshot().skillDefinitions();
-        if (enabled.isEmpty()) {
-            // 未授权任何 Skill 时不扫描无关目录；严格格式错误只能阻断真正选择了 Skill 的 Turn。
-            return new SkillResolution(skills.emptyCatalog(), Map.of());
-        }
-        SkillCatalog.Catalog discovered = skills.discover(request);
-        List<String> availableNames = availableSkillNames(enabled, discovered);
-        return new SkillResolution(skills.select(discovered, availableNames),
-                skillNamesById(enabled, discovered));
+        List<ConfigurationGenerationSnapshot.Skill> disabled = lease.snapshot().skillDefinitions();
+        Set<String> disabledReferences = disabled.stream()
+                .map(skill -> skill.reference().identifier()).collect(java.util.stream.Collectors.toSet());
+        SkillCatalog.Catalog discovered = skills.discover(request, disabledReferences);
+        return new SkillResolution(discovered, skillNamesById(disabled, discovered));
     }
 
     /**
@@ -700,13 +721,13 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
      * 缺失记录是设置页可移除的历史事实，不能阻断未依赖它的 Turn。
      */
     static List<String> availableSkillNames(
-            List<ConfigurationGenerationSnapshot.Skill> enabled,
+            List<ConfigurationGenerationSnapshot.Skill> disabled,
             SkillCatalog.Catalog discovered) {
-        Objects.requireNonNull(enabled, "enabled");
+        Objects.requireNonNull(disabled, "disabled");
         Objects.requireNonNull(discovered, "discovered");
         return discovered.skills().stream()
-                .filter(discoveredSkill -> enabled.stream()
-                        .anyMatch(configured -> matches(configured.reference(), discoveredSkill)))
+                .filter(discoveredSkill -> disabled.stream()
+                        .noneMatch(configured -> matches(configured.reference(), discoveredSkill)))
                 .map(SkillCatalog.SkillDescriptor::name)
                 .toList();
     }
@@ -716,16 +737,24 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
      * 避免用展示名称反推配置身份，也不会把未启用或未发现条目暴露给消息引用。
      */
     static Map<String, String> skillNamesById(
-            List<ConfigurationGenerationSnapshot.Skill> definitions,
+            List<ConfigurationGenerationSnapshot.Skill> disabled,
             SkillCatalog.Catalog discovered) {
         Map<String, String> identities = new java.util.LinkedHashMap<>();
-        definitions.stream()
-                .forEach(skill -> discovered.skills().stream()
-                        .filter(discoveredSkill -> matches(skill.reference(), discoveredSkill))
-                        .findFirst()
-                        .ifPresent(discoveredSkill -> identities.put(
-                                skill.reference().identifier(), discoveredSkill.name())));
+        discovered.skills().stream()
+                .filter(skill -> disabled.stream().noneMatch(item -> matches(item.reference(), skill)))
+                .forEach(skill -> identities.put(skillId(skill), skill.name()));
         return java.util.Collections.unmodifiableMap(identities);
+    }
+
+    /** 发现来源是唯一 ID 来源，防止同名低优先级包借用被覆盖包的身份。 */
+    private static String skillId(SkillCatalog.SkillDescriptor skill) {
+        String scope = switch (skill.source()) {
+            case AGENTS_USER -> "user";
+            case JA_USER -> "ja";
+            case WORKSPACE -> "project";
+            case BUNDLED -> "bundled";
+        };
+        return scope + ":" + skill.name();
     }
 
     /**
@@ -818,13 +847,6 @@ public final class ConfigurationTurnRuntimeResolver implements TurnRuntimeResolv
             throw new IllegalArgumentException("configured token budget is exhausted");
         }
         return (int) Math.min(value, maximum);
-    }
-
-    /**
-     * 选择两个正 Deadline 中更严格者，Resolver 永远不能扩大客户端意图。
-     */
-    private static Duration minimum(Duration requested, Duration configured) {
-        return requested.compareTo(configured) <= 0 ? requested : configured;
     }
 
     /** reasoning 必须属于所选模型显式能力集合；null 继续使用模型默认。 */

@@ -70,7 +70,8 @@ final class OpenAiProviderSupport {
             && CONTEXT_LENGTH_EXCEEDED.equals(error.path("error").path("code").textValue())) {
             return new ModelPort.ContextOverflowException(null);
         }
-        boolean retryable = status == 429 || status >= 500 && status <= 599;
+        boolean retryable = status == 408 || status == 409 || status == 429
+                || status >= 500 && status <= 599;
         return new ProviderProtocolException(
                 "HTTP_STATUS", serviceFailureDetail(status, error), retryable,
                 RetryAfter.parse(headers.get("Retry-After")),
@@ -90,9 +91,9 @@ final class OpenAiProviderSupport {
         return detail.toString();
     }
 
-    /** 只添加预先确认安全且可用于定位协议字段的 OpenAI 分类值。 */
+    /** 缺失或非文本的上游字段按未知值忽略；只输出固定闭集内的分类，不回显自由文本。 */
     private static void appendAllowlisted(StringBuilder detail, String label, String value, Set<String> allowed) {
-        if (allowed.contains(value)) detail.append(' ').append(label).append(' ').append(value);
+        if (value != null && allowed.contains(value)) detail.append(' ').append(label).append(' ').append(value);
     }
 
     /** 将数组索引折叠为通配符后再做闭集匹配，不把任意上游字符串拼进异常或日志。 */

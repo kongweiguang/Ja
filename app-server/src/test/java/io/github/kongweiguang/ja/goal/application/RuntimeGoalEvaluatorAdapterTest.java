@@ -32,7 +32,8 @@ final class RuntimeGoalEvaluatorAdapterTest {
                 null, "run_test", "provider_test", "model_test", "持续完成验收", null,
                 List.of(new GoalEvaluatorPort.Criterion("criterion_main", "测试通过", true)),
                 List.of(new GoalEvaluatorPort.EvidenceDigest("criterion_main", "tool_result", "call_test",
-                        "测试成功", "a".repeat(64))));
+                        "测试成功", "a".repeat(64))),
+                io.github.kongweiguang.ja.foundation.concurrent.CancellationToken.none());
 
         var root = json.readTree(adapter.encodeInput(request));
 

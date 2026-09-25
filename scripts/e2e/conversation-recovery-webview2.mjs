@@ -106,7 +106,6 @@ async function restore(page, threadId) {
           "threadRevision",
           "occurredAt",
           "attempt",
-          "maxAttempts",
           "to",
           "status",
           "errorCode",
@@ -132,7 +131,6 @@ async function restore(page, threadId) {
             threadRevision: params.threadRevision,
             sequence: params.sequence,
             attempt: params.attempt,
-            maxAttempts: params.maxAttempts,
           });
           globalThis.__recoveryRetryEventWaiter = null;
         }
@@ -245,6 +243,7 @@ async function readComposerHitTestDiagnostic(page) {
 
 /** 将主会话和侧聊都通过真实 Composer 提交，避免测试绕过各自的应用控制器。 */
 async function sendText(page, text, scope = page) {
+  await scope.getByRole("textbox", { name: "消息", exact: true }).fill(text);
   const sendButton = scope.getByRole("button", { name: "发送", exact: true });
   try {
     await sendButton.waitFor();
@@ -253,7 +252,6 @@ async function sendText(page, text, scope = page) {
       page.__recoveryComposerHitTest = await readComposerHitTestDiagnostic(page).catch(() => null);
     throw error;
   }
-  await scope.getByRole("textbox", { name: "消息", exact: true }).fill(text);
   await sendButton.click();
 }
 
@@ -567,7 +565,7 @@ async function captureLayout(page, evidenceDirectory, { name, width, colorScheme
   return layout;
 }
 
-/** 实际手动压缩失败提示使用局部主题按钮，不能出现浏览器默认白底，并由真实点击关闭。 */
+/** 压缩完成提示使用局部主题按钮，不能出现浏览器默认白底，并由真实点击关闭。 */
 async function closeToast(page) {
   const button = page.locator(
     '.ja-thread-compaction-feedback button[aria-label="关闭上下文压缩提示"]',
@@ -609,7 +607,7 @@ async function closeToast(page) {
   return {
     ...geometry,
     hoverBackground,
-    trigger: "manual_compaction_failure",
+    trigger: "automatic_compaction_recovery",
     closedByClick: true,
   };
 }
@@ -658,13 +656,14 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
   await sendText(page, continuePrompt);
   const continueRetry = page.locator('[data-retry-status="true"]');
   await continueRetry.first().waitFor({ state: "visible" });
-  assert.match(await continueRetry.first().innerText(), /正在工作 · 重试 [2-6]\/6/u);
+  assert.equal(await continueRetry.first().innerText(), "正在工作 · 连接中断，正在恢复");
   await page.screenshot({ path: join(evidenceDirectory, "main-retrying-light.png") });
-  await until("six failed continuation attempts", async () => {
+  await until("deterministic rejection after transient continuation attempts", async () => {
     const attempts = fixture.attempts.filter((attempt) => attempt.step === "JA_RECOVERY_CONTINUE");
     return (
-      attempts.length === 6 &&
-      attempts.every((attempt) => attempt.status === 503) &&
+      attempts.length === 7 &&
+      attempts.slice(0, 6).every((attempt) => attempt.status === 503) &&
+      attempts[6]?.status === 400 &&
       (await page.locator('[data-response-state="failed"]').count()) === 1
     );
   });
@@ -679,11 +678,11 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
   await continueReply(page, "keyboard");
   await until("manual continuation reaches gated loopback response", () =>
     fixture.attempts.some(
-      (attempt) => attempt.step === "JA_RECOVERY_CONTINUE" && attempt.requestNumber === 7,
+      (attempt) => attempt.step === "JA_RECOVERY_CONTINUE" && attempt.requestNumber === 8,
     ),
   );
   const gatedContinuation = fixture.attempts.find(
-    (attempt) => attempt.step === "JA_RECOVERY_CONTINUE" && attempt.requestNumber === 7,
+    (attempt) => attempt.step === "JA_RECOVERY_CONTINUE" && attempt.requestNumber === 8,
   );
   assert.equal(gatedContinuation?.status, 200);
   assert.equal(gatedContinuation?.continuationContext?.continueMessageCount, 0);
@@ -762,13 +761,14 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
 
   const reaskOriginal = "JA_RECOVERY_REASK_ORIGINAL 旧问题正文。";
   await sendText(page, reaskOriginal);
-  await until("reask source fails after six attempts", async () => {
+  await until("reask source reaches deterministic rejection", async () => {
     const attempts = fixture.attempts.filter(
       (attempt) => attempt.step === "JA_RECOVERY_REASK_ORIGINAL",
     );
     return (
-      attempts.length === 6 &&
-      attempts.every((attempt) => attempt.status === 503) &&
+      attempts.length === 7 &&
+      attempts.slice(0, 6).every((attempt) => attempt.status === 503) &&
+      attempts[6]?.status === 400 &&
       (await page.locator('[data-response-state="failed"]').count()) === 1
     );
   });
@@ -868,7 +868,7 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
     .waitFor();
   await page.getByRole("progressbar", { name: "上下文使用量", exact: true }).waitFor();
 
-  const compaction = await verifyCompaction(page, fixture, evidenceDirectory);
+  const compaction = await verifyCompaction(page, fixture, evidenceDirectory, created.threadId);
   const side = await openSideChat(page);
   const sideLayouts = [
     await captureLayout(page, evidenceDirectory, {
@@ -887,7 +887,7 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
   );
   const sideRetryStatus = side.region.locator('[data-retry-status="true"]').last();
   await sideRetryStatus.waitFor({ state: "visible" });
-  assert.match(await sideRetryStatus.innerText(), /正在工作 · 重试 [2-6]\/6/u);
+  assert.equal(await sideRetryStatus.innerText(), "正在工作 · 连接中断，正在恢复");
   await page.screenshot({ path: join(evidenceDirectory, "side-chat-retrying-light.png") });
   await side.region.getByText("JA_RECOVERY_RETRY_SUCCESS_AFTER_FIVE", { exact: true }).waitFor();
   const sideRetryAttempts = fixture.attempts.filter(
@@ -1020,6 +1020,100 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
       colorScheme: "light",
     }),
   );
+  // 长答复走真实 Java 分页与 WebView2 UI；保存句柄在页面内替换为只读记录器，避免验收写入用户 Downloads。
+  await sendText(page, "JA_RECOVERY_LONG_OUTPUT 请返回超过安全预览的正文。", side.composer);
+  const longAnswer = side.region.locator('article[data-role="final"]').last();
+  await longAnswer.getByRole("button", { name: "查看完整回复", exact: true })
+    .waitFor({ timeout: 90_000 });
+  const finalMessageId = await longAnswer.getAttribute("data-item-id");
+  const terminal = await page.evaluate((threadId) =>
+    (globalThis.__recoveryRuntimeEvents ?? []).filter((event) =>
+      event.method === "turn/terminal" && event.params.threadId === threadId)
+      .at(-1)?.params ?? null, side.threadId);
+  const expectedRevision = terminal?.threadRevision ?? null;
+  const directRead = await page.evaluate(async ({ threadId, messageId, expectedRevision, turnId }) => {
+    const { TauriHistoryAdapter } = await import("/src/api/tauri/history.ts");
+    // 该路径属于隔离 WebView 的 Vite 模块 URL，保持运行时拼接以免仓库静态依赖分析误作磁盘导入。
+    const moduleUrl = ["/src", "features", "conversation", "application", "readFullMessageContent.ts"].join("/");
+    const { readFullAnswerContent } = await import(moduleUrl);
+    const adapter = new TauriHistoryAdapter();
+    const calls = [];
+    for (const method of ["threadRead", "messageContentRead"]) {
+      const original = adapter[method].bind(adapter);
+      adapter[method] = async (input) => {
+        try {
+          const result = await original(input);
+          calls.push({ method, itemId: input.messageId ?? null, count: result.items?.length ??
+            result.content?.length ?? null, cursor: input.cursor ?? null,
+            revision: result.revision ?? null, nextCursor: result.nextCursor ?? null,
+            containsFinal: result.items?.some((item) => item.itemId === messageId) ?? null });
+          return result;
+        } catch (error) {
+          calls.push({ method, itemId: input.messageId ?? null, cursor: input.cursor ?? null,
+            code: error?.code ?? null, error: String(error?.message ?? error) });
+          throw error;
+        }
+      };
+    }
+    try {
+      const content = await readFullAnswerContent(adapter, threadId, messageId,
+        () => true, expectedRevision ?? undefined, turnId ?? undefined);
+      return { characters: [...content].length, complete: content.endsWith("\nJA_RECOVERY_LONG_END"), calls };
+    } catch (error) {
+      return { error: String(error?.message ?? error), code: error?.code ?? null, calls };
+    }
+  }, { threadId: side.threadId, messageId: finalMessageId, expectedRevision, turnId: terminal?.turnId });
+  assert.equal(directRead?.error, undefined,
+    JSON.stringify({ finalMessageId, expectedRevision, directRead }));
+  assert.equal(directRead.characters, 70_044);
+  assert.equal(directRead.complete, true);
+  const pickerAvailable = await page.evaluate(() => typeof globalThis.showSaveFilePicker === "function");
+  assert.equal(pickerAvailable, true, "WebView2 must expose a native user-selected save handle");
+  await longAnswer.getByRole("button", { name: "查看完整回复", exact: true }).click();
+  await until("long answer is complete after pagination", async () =>
+    (await longAnswer.locator(".ja-chat-response__long-text").textContent())
+      ?.endsWith("\nJA_RECOVERY_LONG_END") === true,
+  );
+  await page.evaluate(() => {
+    globalThis.__recoverySavePickerDescriptor =
+      Object.getOwnPropertyDescriptor(globalThis, "showSaveFilePicker");
+    Object.defineProperty(globalThis, "showSaveFilePicker", {
+      configurable: true,
+      value: async (options) => ({
+        createWritable: async () => {
+          const chunks = [];
+          return {
+            write: async (chunk) => { chunks.push(chunk); },
+            close: async () => {
+              const decoder = new TextDecoder();
+              let content = "";
+              for (const chunk of chunks) content += decoder.decode(chunk, { stream: true });
+              content += decoder.decode();
+              globalThis.__recoveryExport = {
+                suggestedName: options.suggestedName,
+                characters: [...content].length,
+                complete: content.startsWith("JA_RECOVERY_LONG_START\n") &&
+                  content.endsWith("\nJA_RECOVERY_LONG_END"),
+              };
+            },
+          };
+        },
+      }),
+    });
+  });
+  await longAnswer.getByRole("button", { name: "导出全文", exact: true }).click();
+  await longAnswer.getByText("已导出全文。", { exact: true }).waitFor();
+  const longExport = await page.evaluate(() => {
+    const result = globalThis.__recoveryExport;
+    const original = globalThis.__recoverySavePickerDescriptor;
+    if (original) Object.defineProperty(globalThis, "showSaveFilePicker", original);
+    else Reflect.deleteProperty(globalThis, "showSaveFilePicker");
+    return result;
+  });
+  assert.equal(longExport?.suggestedName, "Ja-回复.txt");
+  assert.equal(longExport?.characters, 70_044);
+  assert.equal(longExport?.complete, true);
+  await page.screenshot({ path: join(evidenceDirectory, "side-chat-long-answer-expanded.png") });
   return {
     schemaVersion: 2,
     status: "passed",
@@ -1031,7 +1125,7 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
     },
     provider: { kind: "deterministic_loopback", externalCalls: 0, attempts: fixture.attempts },
     recovery: {
-      maxAttempts: 6,
+      fixtureAttemptCount: 6,
       continueAttemptStatuses: fixture.attempts
         .filter((attempt) => attempt.step === "JA_RECOVERY_CONTINUE")
         .map((attempt) => attempt.status),
@@ -1046,6 +1140,7 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
       toolExecutedOnceWithOnePersistedResult: true,
       deterministic400DoesNotRetry: true,
       cancelledBackoffSentNoNextRequest: true,
+      longAnswerPagedAndExported: true,
     },
     evidence: {
       screenshots: [
@@ -1062,34 +1157,53 @@ export async function runRecovery({ page, workspaceRoot, evidenceDirectory, fixt
         "side-chat-dark-1280.png",
         "side-chat-dark-720.png",
         "side-chat-light-720.png",
+        "side-chat-long-answer-expanded.png",
+        ...compaction.screenshots,
       ],
       mainLayouts,
       sideLayouts,
     },
     compaction,
+    longContent: { pickerAvailable, ...longExport },
   };
 }
 
-/** 通过长历史跨过保留尾部预算；网络失败不能被结构化修复 fallback 当成成功。 */
-async function verifyCompaction(page, fixture, evidenceDirectory) {
+/** 长历史压缩在上游持续失败时保持工作态，端点恢复后自行完成且不要求用户重试。 */
+async function verifyCompaction(page, fixture, evidenceDirectory, threadId) {
   for (const step of [6, 7, 8]) {
     await send(page, step, " bounded historical evidence ".repeat(800));
     await page.getByText(`JA_RECOVERY_SUCCESS_${step}`, { exact: true }).waitFor();
   }
   const original = await page.locator('.ja-chat-message-user[data-role="user"]').allTextContents();
+  const attemptsBefore = fixture.attempts.filter((attempt) => attempt.step === "summary").length;
   await page.getByRole("button", { name: "打开对话操作", exact: true }).click();
   await page.getByRole("menuitem", { name: "压缩上下文", exact: true }).click();
-  await page.locator(".ja-thread-compaction-feedback.is-error").waitFor({ timeout: 30_000 });
-  assert.ok(
-    fixture.attempts.some((attempt) => attempt.step === "summary" && attempt.status === 503),
+  await page.locator(".ja-thread-compaction-feedback.is-running").waitFor({ timeout: 30_000 });
+  await until("summary continues beyond old retry ceiling", () =>
+    fixture.attempts.filter((attempt) => attempt.step === "summary" && attempt.status === 503)
+      .length >= attemptsBefore + 7,
   );
+  assert.equal(await page.locator(".ja-thread-compaction-feedback.is-error").count(), 0);
+  // 压缩等待不占据 Bridge actor；同一窗口仍能读取当前会话和累计用量。
+  let readDeadline;
+  try {
+    const duringCompaction = await Promise.race([
+      readThreadState(page, threadId),
+      new Promise((_, reject) => {
+        readDeadline = setTimeout(() => reject(new Error("history read blocked by compaction")), 5_000);
+      }),
+    ]);
+    assert.equal(duringCompaction.snapshot.threadId, threadId);
+  } finally {
+    clearTimeout(readDeadline);
+  }
   assert.deepEqual(
     await page.locator('.ja-chat-message-user[data-role="user"]').allTextContents(),
     original,
   );
   // 与续答完成态一致，确认压缩前的真实 Provider 计量仍可访问。
   await page.getByRole("progressbar", { name: "上下文使用量", exact: true }).waitFor();
-  await page.screenshot({ path: join(evidenceDirectory, "compaction-failed.png") });
+  await page.screenshot({ path: join(evidenceDirectory, "compaction-retrying.png") });
   await page.emulateMedia({ colorScheme: "dark" });
   await until("system dark theme", () =>
     page.evaluate(
@@ -1098,21 +1212,13 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
         document.documentElement.dataset.theme === "dark",
     ),
   );
-  await page.screenshot({ path: join(evidenceDirectory, "compaction-failed-dark.png") });
-  const toast = await closeToast(page);
-  await page.getByRole("button", { name: "打开对话操作", exact: true }).click();
-  await page.getByRole("menuitem", { name: "压缩上下文", exact: true }).click();
-  await page.locator(".ja-thread-compaction-feedback.is-error").waitFor({ timeout: 30_000 });
+  await page.screenshot({ path: join(evidenceDirectory, "compaction-retrying-dark.png") });
   fixture.recoverSummary();
-  await page
-    .locator(".ja-thread-compaction-feedback")
-    .getByRole("button", { name: "重试", exact: true })
-    .click();
   const usageIndicator = page.getByRole("img", {
     name: "上下文使用量待确认",
     exact: true,
   });
-  await usageIndicator.waitFor({ timeout: 30_000 });
+  await usageIndicator.waitFor({ timeout: 90_000 });
   // 压缩刚结算时不复用旧请求的比例；圆环以 unknown tone 表达待下一次 Provider 计量确认。
   await until(
     "context usage pending confirmation",
@@ -1126,6 +1232,7 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
     original,
   );
   await page.screenshot({ path: join(evidenceDirectory, "compaction-recovered-unknown.png") });
+  const toast = await closeToast(page);
   await send(page, 9);
   await until("last response after compaction", async () => {
     const latest = page.getByRole("button", { name: "回到最新", exact: true });
@@ -1138,10 +1245,12 @@ async function verifyCompaction(page, fixture, evidenceDirectory) {
   return {
     verified: true,
     toast,
-    failedRetainedHistory: true,
-    retrySucceeded: true,
+    retainedHistoryAcrossRetries: true,
+    recoveredWithoutManualRetry: true,
     unknownAfterCompaction: true,
     knownAfterNextResponse: true,
+    screenshots: ["compaction-retrying.png", "compaction-retrying-dark.png",
+      "compaction-recovered-unknown.png", "compaction-next-response-known.png"],
   };
 }
 
@@ -1154,7 +1263,7 @@ async function main() {
     await runProduction({
       ...options,
       providerBaseUrl: fixture.baseUrl,
-      prewarmWebview: options.edgeDriver === undefined,
+      prewarmWebview: false,
       hiddenWindow: true,
       preserveFailedProfile: true,
       scope: "git",

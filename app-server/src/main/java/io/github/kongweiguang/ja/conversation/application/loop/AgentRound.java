@@ -32,8 +32,8 @@ import java.util.function.BooleanSupplier;
  * 持有单个 Provider 流式轮次可丢弃的回调状态。
  */
 final class AgentRound implements ModelEventSink {
-    private static final int MAX_PUBLIC_TEXT = 1_000_000;
-    private static final int MAX_ASSISTANT_TEXT_BLOCK = 4_000_000;
+    private static final int PUBLIC_PREVIEW_CHARACTERS = 65_536;
+    private static final int TEXT_BLOCK_CHARACTERS = 262_144;
     static final Duration DRAIN_TIMEOUT = Duration.ofSeconds(2);
 
     private final String turnId;
@@ -199,12 +199,10 @@ final class AgentRound implements ModelEventSink {
     }
 
     /**
-     * 当流事件未携带 Usage 时接纳 Provider 终局 Usage；已有值时保持首次事实。
+     * 终局 Usage 是本次物理请求的最终快照；覆盖流中早期快照，避免把增量计量当成结算值。
      */
     synchronized void recordOutcomeUsage(ModelUsage usage) {
-        if (usage != null && this.usage == null) {
-            recordUsage(usage);
-        }
+        if (usage != null) this.usage = usage;
     }
 
     /**
@@ -337,26 +335,34 @@ final class AgentRound implements ModelEventSink {
     }
 
     /**
-     * 只接受一个 Usage 事实，重复事件视为 Provider 协议错误而不是覆盖。
+     * Usage 只是诊断快照；同一响应多次上报时保留最新可信值，不能因此废弃正文或 Tool 结果。
      */
     private void recordUsage(ModelUsage usage) {
-        if (this.usage != null) {
-            throw new AgentLoop.LoopFailure("MODEL_PROTOCOL_ERROR", "duplicate usage event");
-        }
         this.usage = Objects.requireNonNull(usage, "usage");
     }
 
     /**
-     * 分别维护完整上下文文本与有界公开文本，并避免在 UTF-16 代理对中间截断。
+     * 完整正文按固定块冻结，避免单个 StringBuilder 越长越大；公开前缀只是帧内预览，完整块
+     * 随模型消息提交到持久层。分块时避开代理对，使后续逐页读取与原始文本一致。
      */
     private void appendText(String value) {
         Objects.requireNonNull(value, "value");
-        if (value.length() > MAX_ASSISTANT_TEXT_BLOCK - activeTextBlock.length()) {
-            throw new AgentLoop.LoopFailure(
-                    "MODEL_PROTOCOL_ERROR", "assistant text block exceeds its context bound");
+        int start = 0;
+        while (start < value.length()) {
+            int room = TEXT_BLOCK_CHARACTERS - activeTextBlock.length();
+            int end = Math.min(value.length(), start + room);
+            if (end < value.length() && end > start
+                    && Character.isHighSurrogate(value.charAt(end - 1))
+                    && Character.isLowSurrogate(value.charAt(end))) end--;
+            if (end == start) {
+                freezeActiveTextBlock();
+                continue;
+            }
+            activeTextBlock.append(value, start, end);
+            start = end;
+            if (activeTextBlock.length() >= TEXT_BLOCK_CHARACTERS) freezeActiveTextBlock();
         }
-        activeTextBlock.append(value);
-        int remaining = MAX_PUBLIC_TEXT - text.length();
+        int remaining = PUBLIC_PREVIEW_CHARACTERS - text.length();
         if (remaining > 0) {
             int end = Math.min(remaining, value.length());
             if (end < value.length()
@@ -369,13 +375,9 @@ final class AgentRound implements ModelEventSink {
         }
     }
 
-    /** 公开摘要沿用可见文本硬上限，避免摘要流成为无界持久化通道。 */
+    /** 公开思考摘要不因输出长度变成协议故障；真正的分块交付由 Timeline 持久化处理。 */
     private void appendReasoningSummary(String value) {
         Objects.requireNonNull(value, "value");
-        if (value.length() > MAX_PUBLIC_TEXT - reasoningSummary.length()) {
-            throw new AgentLoop.LoopFailure(
-                    "MODEL_PROTOCOL_ERROR", "reasoning summary exceeds its public bound");
-        }
         reasoningSummary.append(value);
     }
 

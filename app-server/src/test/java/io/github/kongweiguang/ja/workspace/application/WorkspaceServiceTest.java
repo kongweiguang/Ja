@@ -86,6 +86,20 @@ final class WorkspaceServiceTest {
         assertEquals(2, prepared.size());
     }
 
+    /** 设置访问验证持久项目 ID，但不把重启后的项目加入活动工作区或触发预热。 */
+    @Test
+    void readsRegisteredProjectSettingsWithoutOpeningIt() {
+        Workspace registered = service.openWorkspace(new WorkspaceUseCase.OpenWorkspace(
+                directories.project, "项目"));
+        WorkspaceService restarted = new WorkspaceService(repository, directories, prepared::add,
+                (root, trust) -> synchronizedTrust.add(root + ":" + trust), new WorkspacePolicy(), CLOCK);
+
+        assertThrows(WorkspaceFailure.class, () -> restarted.requireOpenWorkspace(registered.workspaceId()));
+        assertEquals(registered, restarted.requireSettingsWorkspace(registered.workspaceId()));
+        assertEquals(List.of(directories.project), prepared);
+        assertTrue(synchronizedTrust.isEmpty());
+    }
+
     /** 信任变更先更新权威 revision，再同步配置边界并重新预热项目。 */
     @Test
     void synchronizesTrustAndPreparesProject() {

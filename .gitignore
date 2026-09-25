@@ -40,7 +40,6 @@ target/
 target-*/
 /.codex-target/
 .cargo/target-*/
-src-tauri/target/
 *.rlib
 *.rmeta
 *.pdb
@@ -86,21 +85,11 @@ release/
 *.userosscache
 *.sln.docstates
 
-# Updeng/Codex machine-local state. These paths are intentionally not
-# source documentation and must not leak local plans, prompts, or credentials.
-/.agents/
-/.codex/
-/.updeng/
-/AGENTS.md
-
 # A previously interpolated Windows environment token may create this literal machine-cache mirror.
 # Keep it out of Git and Turn baselines without deleting the user's recoverable files.
 /%SystemDrive%/
 
 # Local configuration and credentials. Keep the template visible to users.
-.env
-.env.*
-!.env.example
 .secrets/
 secrets/
 *.secret

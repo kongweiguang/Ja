@@ -4,6 +4,7 @@ package io.github.kongweiguang.ja.infrastructure.persistence.mapper;
 
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.cursor.Cursor;
 
 import java.util.List;
 
@@ -46,6 +47,19 @@ public interface HistoryMapper {
      * 按稳定 Thread 身份读取元数据与当前 revision。
      */
     PersistenceRecords.ThreadRow selectThread(@Param("threadId") String threadId);
+
+    /** 排除被删除和临时侧聊，公开用户输入按时间与身份稳定倒序分页。 */
+    List<PersistenceRecords.InputHistoryRow> selectInputHistoryPage(PersistenceRecords.InputHistoryPage query);
+
+    /** 只允许当前路径的 Assistant 正文或公开思考摘要进入按页读取，拒绝其它角色与旧尝试。 */
+    PersistenceRecords.PublicContentPageRow selectPublicContentPage(
+            @Param("threadId") String threadId,
+            @Param("messageId") String messageId,
+            @Param("offsetCharacters") int offsetCharacters,
+            @Param("limitCharacters") int limitCharacters);
+
+    /** 仅流式遍历当前路径公开文本身份，供哈希 ItemId 解析，不读取任意正文。 */
+    Cursor<String> streamPublicContentIds(@Param("threadId") String threadId);
 
     /**
      * 插入初始 Thread，外键保证其 Workspace 已存在。
@@ -143,6 +157,12 @@ public interface HistoryMapper {
      * 按提交时间与条目身份混合读取消息、Tool 和审批快照。
      */
     List<PersistenceRecords.SnapshotItemRow> selectSnapshotItems(PersistenceRecords.SnapshotPage values);
+
+    /** 以同一复合排序键反向读取最近的有界页面，供长会话直接从末端恢复。 */
+    List<PersistenceRecords.SnapshotItemRow> selectSnapshotItemsLatest(PersistenceRecords.SnapshotPage values);
+
+    /** 只读取被隐藏续答取代的 Turn 身份，避免快照页物化整个 Thread 的消息正文。 */
+    List<String> selectSupersededErrorTurnIds(@Param("threadId") String threadId);
 
     /** 读取 Thread 最近一次已提交 Provider Usage，供重启后恢复上下文指示器。 */
     PersistenceRecords.ContextUsageRow selectLatestContextUsage(@Param("threadId") String threadId);

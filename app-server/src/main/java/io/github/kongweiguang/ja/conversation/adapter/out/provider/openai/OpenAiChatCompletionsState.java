@@ -36,6 +36,7 @@ final class OpenAiChatCompletionsState {
     private String completionId;
     private String model;
     private ModelPort.FinishReason finishReason;
+    private String rawFinishReason;
     private ModelUsage usage;
     private boolean done;
 
@@ -49,7 +50,7 @@ final class OpenAiChatCompletionsState {
     /** 在单个 chunk 内先校验身份和 choice 形状，再产生待提交的 Provider 中立效果。 */
     List<ModelPort.ModelEvent> reduce(
             OpenAiChatSseReader.Event event, Function<String, ToolSpec> toolLookup) {
-        if (done) throw protocol("OpenAI Chat emitted an event after [DONE]");
+        if (done && !event.done()) throw protocol("OpenAI Chat emitted an event after [DONE]");
         if (event.done()) {
             done = true;
             return List.of();
@@ -61,7 +62,15 @@ final class OpenAiChatCompletionsState {
         if (choices == null || !choices.isArray()) throw field("OpenAI Chat choices are invalid");
         if (chunk.hasNonNull("usage")) acceptUsage(chunk.get("usage"));
         if (choices.isEmpty()) return effects;
-        if (finishReason != null) throw protocol("OpenAI Chat emitted a choice after finish_reason");
+        if (finishReason != null) {
+            JsonNode duplicate = choices.get(0);
+            if (choices.size() == 1 && duplicate.isObject()
+                    && rawFinishReason.equals(duplicate.path("finish_reason").textValue())
+                    && duplicate.path("delta").isObject() && duplicate.path("delta").isEmpty()) {
+                return effects;
+            }
+            throw protocol("OpenAI Chat emitted a choice after finish_reason");
+        }
         if (choices.size() != 1) throw field("OpenAI Chat returned multiple choices");
         JsonNode choice = choices.get(0);
         if (!choice.isObject() || requiredIndex(choice, "index") != 0) {
@@ -134,10 +143,6 @@ final class OpenAiChatCompletionsState {
             if (text.isEmpty()) continue;
             if (reasoningField == null) reasoningField = wireField;
             if (!reasoningField.equals(wireField)) continue;
-            if ((long) reasoning.length() + text.length() > MAX_ARGUMENT_CHARACTERS) {
-                throw new ProviderProtocolException(
-                        "REASONING_LIMIT", "OpenAI Chat reasoning exceeds the limit", false);
-            }
             reasoning.append(text);
             effects.add(new ModelPort.ReasoningSummaryDelta(text));
             break;
@@ -196,6 +201,7 @@ final class OpenAiChatCompletionsState {
     private void finish(String reason, Function<String, ToolSpec> toolLookup,
                         List<ModelPort.ModelEvent> effects) {
         if (finishReason != null) throw protocol("OpenAI Chat repeated finish_reason");
+        rawFinishReason = reason;
         appendReasoningBlock(effects);
         switch (reason) {
             case "stop" -> {
@@ -219,13 +225,10 @@ final class OpenAiChatCompletionsState {
     private void finishTools(Function<String, ToolSpec> toolLookup,
                              List<ModelPort.ModelEvent> effects) {
         if (tools.isEmpty()) throw protocol("OpenAI Chat reported Tool calls without deltas");
-        int expectedIndex = 0;
         Set<String> callIds = new HashSet<>();
+        int ordinal = 0;
         for (ToolAccumulator tool : tools.values()) {
-            if (tool.index() != expectedIndex++) {
-                throw protocol("OpenAI Chat Tool indices are not contiguous");
-            }
-            ModelPort.ToolCallReady ready = tool.finish(toolLookup);
+            ModelPort.ToolCallReady ready = tool.finish(toolLookup, ordinal++);
             if (!callIds.add(ready.callId())) {
                 throw protocol("OpenAI Chat repeated a Tool call id");
             }
@@ -240,7 +243,10 @@ final class OpenAiChatCompletionsState {
      * 部分兼容端会在多个 chunk 重复累计 usage，因此不能按帧求和，也不能拒绝合法后续快照。
      */
     private void acceptUsage(JsonNode value) {
-        if (!value.isObject()) throw field("OpenAI Chat usage is invalid");
+        if (!value.isObject()) {
+            usage = null;
+            return;
+        }
         try {
             long input = requiredLong(value, "prompt_tokens");
             long output = requiredLong(value, "completion_tokens");
@@ -258,7 +264,7 @@ final class OpenAiChatCompletionsState {
             }
             usage = snapshot;
         } catch (IllegalArgumentException failure) {
-            throw new ProviderProtocolException("USAGE", "OpenAI Chat usage is invalid", false);
+            usage = null;
         }
     }
 
@@ -327,7 +333,7 @@ final class OpenAiChatCompletionsState {
         private String id;
         private String name;
 
-        /** 绑定官方 tool_calls index，作为 Ja 的确定性 ordinal。 */
+        /** 绑定上游 index 仅用于排序；Ja ordinal 在完整批次后独立连续分配。 */
         ToolAccumulator(int index) {
             this.index = index;
         }
@@ -356,7 +362,7 @@ final class OpenAiChatCompletionsState {
         }
 
         /** 只恢复已知 strict null 占位；未知 Tool 与参数错误由 Runner 回传可恢复结果。 */
-        ModelPort.ToolCallReady finish(Function<String, ToolSpec> toolLookup) {
+        ModelPort.ToolCallReady finish(Function<String, ToolSpec> toolLookup, int ordinal) {
             if (id == null || id.isEmpty() || name == null || name.isEmpty()) {
                 throw protocol("OpenAI Chat Tool metadata is incomplete");
             }
@@ -372,7 +378,7 @@ final class OpenAiChatCompletionsState {
                 }
             }
             return new ModelPort.ToolCallReady(
-                    id, name, ProviderJsonValues.toObject(restored), index);
+                    id, name, ProviderJsonValues.toObject(restored), ordinal);
         }
 
         /** 返回冻结的 Provider Tool 顺序。 */

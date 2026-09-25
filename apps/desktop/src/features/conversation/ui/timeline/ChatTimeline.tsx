@@ -47,7 +47,12 @@ import {
   type TimelineScrollKey,
 } from "./timelineScroll";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
+import { useFullPublicText } from "./useFullPublicText";
+import { exportPublicText } from "./exportPublicText";
 import "./timeline.css";
+
+/** 实时终态最多 4,096 UTF-16 单元；代理对边界可少一位，之后按身份读取全文。 */
+const LONG_ANSWER_PREVIEW_THRESHOLD = 4_095;
 
 export interface ChatTimelineExternalRow {
   /** 持久 identity 用于去重和虚拟行 key，禁止使用 Renderer 数组下标。 */
@@ -62,6 +67,11 @@ export interface ChatTimelineExternalRow {
 export interface ChatTimelineProps {
   /** 当前 Thread 的瞬态 viewport identity；缺失时保留 fixture/嵌入调用方的默认尾部语义。 */
   threadId?: string;
+  /** 旧页只在当前可见 Thread 中按需读取，按钮不触发隐藏会话的扫描。 */
+  hasOlderHistory?: boolean;
+  loadingOlderHistory?: boolean;
+  olderHistoryError?: string;
+  onLoadOlderHistory?: () => Promise<void>;
   /** 由稳定的 ConversationWorkspace owner 提供，使 Timeline 短暂卸载时仍能恢复滚动锚点。 */
   scrollCache?: TimelineScrollCache;
   /** Thread 作用域的用户折叠选择；虚拟卸载与历史回读不得重置用户主动展开的内容。 */
@@ -98,6 +108,14 @@ export interface ChatTimelineProps {
     mode?: "explorer",
   ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  /** 仅在用户查看或复制长答复时读取已提交消息的完整正文。 */
+  onReadMessageContent?: (messageId: string) => Promise<string>;
+  /** 终态答复可跨未加载的旧页；生产 Controller 应以最终消息身份查齐整段。 */
+  onReadAnswerContent?: (
+    finalMessageId: string,
+    minimumRevision?: number,
+    turnId?: string,
+  ) => Promise<string>;
   onReadToolArtifact?: (input: {
     threadId: string;
     turnId: string;
@@ -203,7 +221,12 @@ function messageMenuActions(
     item.metadata?.failureReply === true &&
     (row?.turn?.status === "failed" || item.status === "failed");
   const copyText =
-    onCopyText !== undefined && !failedReplyIsHidden && item.text?.trim() ? item.text : undefined;
+    onCopyText !== undefined &&
+    !failedReplyIsHidden &&
+    item.text?.trim() &&
+    !(item.kind === "agent_message" && item.text.length >= LONG_ANSWER_PREVIEW_THRESHOLD)
+      ? item.text
+      : undefined;
   const canEdit =
     role === "user" &&
     row !== undefined &&
@@ -315,6 +338,31 @@ function isPersistedFinalProgressDuplicate(
 /** 重试是当前工作状态的修饰信息，不作为单独过程步骤占一行。 */
 function isAssistantRetryStatus(item: TimelineItemAdapter): boolean {
   return item.kind === "commentary" && item.metadata?.phase === "assistant_retry";
+}
+
+/** 只拼接最近一次 Tool 之后已提交的纯文本段；完整消息按需读取，避免长回复常驻 Timeline。 */
+async function readCompleteAnswer(
+  final: TimelineItemAdapter,
+  work: readonly TimelineItemAdapter[],
+  readMessage: (messageId: string) => Promise<string>,
+): Promise<string> {
+  let lastToolIndex = -1;
+  for (let index = work.length - 1; index >= 0; index -= 1) {
+    if (work[index]?.kind === "tool_call") {
+      lastToolIndex = index;
+      break;
+    }
+  }
+  const progress = work
+    .slice(lastToolIndex + 1)
+    .filter((item) => item.kind === "commentary" && item.metadata?.phase === "assistant_progress");
+  const parts: string[] = [];
+  for (const item of progress) parts.push(await readMessage(item.itemId));
+  const fullFinal = await readMessage(final.itemId);
+  const preceding = parts.join("");
+  if (preceding === "" || fullFinal.startsWith(preceding)) return fullFinal;
+  if (preceding.endsWith(fullFinal)) return preceding;
+  return preceding + fullFinal;
 }
 
 /**
@@ -1001,6 +1049,7 @@ function AssistantResponse({
   onOpenLink,
   onOpenFile,
   onCopyText,
+  onReadFullText,
   onContextMenu,
   onContextMenuKeyDown,
 }: {
@@ -1010,6 +1059,7 @@ function AssistantResponse({
   onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
   onOpenFile?: (target: MarkdownFileTarget, source: HTMLElement) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  onReadFullText?: () => Promise<string>;
   onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
   onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
@@ -1032,6 +1082,40 @@ function AssistantResponse({
               : undefined;
   const isFailureReply = isFailed && item?.metadata?.failureReply === true;
   const text = isFailureReply || !item?.text?.trim() ? undefined : item.text;
+  const {
+    text: fullText,
+    loading: fullTextLoading,
+    error: fullTextError,
+    load: loadFullText,
+  } = useFullPublicText(item?.itemId, onReadFullText);
+  const [exportFeedback, setExportFeedback] = useState<{
+    itemId: string;
+    phase: "saving" | "saved" | "unsupported" | "error";
+  }>();
+  const exportPhase =
+    exportFeedback !== undefined && exportFeedback.itemId === item?.itemId
+      ? exportFeedback.phase
+      : undefined;
+  /** 导出和复制共用同一按需全文读取，浏览器保存面板取消时不显示失败。 */
+  const exportFullText = useCallback(async (): Promise<void> => {
+    const itemId = item?.itemId;
+    if (itemId === undefined) return;
+    setExportFeedback({ itemId, phase: "saving" });
+    try {
+      const outcome = await exportPublicText(await loadFullText(), "Ja-回复.txt");
+      setExportFeedback(
+        outcome === "cancelled"
+          ? undefined
+          : { itemId, phase: outcome === "saved" ? "saved" : "unsupported" },
+      );
+    } catch {
+      setExportFeedback({ itemId, phase: "error" });
+    }
+  }, [item?.itemId, loadFullText]);
+  const longAnswer =
+    state === "completed" && text !== undefined && text.length >= LONG_ANSWER_PREVIEW_THRESHOLD;
+  const visibleText = fullText ?? text;
+  const plainLongText = visibleText !== undefined && visibleText.length >= 65_535;
   const failure = isFailed ? turnFailurePresentation(turn?.error) : undefined;
   const isFinalAnswer = state === "completed" && text !== undefined;
   const articleLabel = isFinalAnswer
@@ -1056,24 +1140,76 @@ function AssistantResponse({
       data-item-id={item?.itemId ?? `response:${turn?.turnId ?? "unknown"}`}
       data-response-state={state}
       data-role={isFinalAnswer ? "final" : isFailed ? "failure" : "response"}
-      tabIndex={text !== undefined && onCopyText !== undefined ? -1 : undefined}
+      tabIndex={visibleText !== undefined && onCopyText !== undefined ? -1 : undefined}
       aria-keyshortcuts={
-        text !== undefined && onCopyText !== undefined ? "ContextMenu Shift+F10" : undefined
+        visibleText !== undefined && onCopyText !== undefined && !longAnswer
+          ? "ContextMenu Shift+F10"
+          : undefined
       }
-      onContextMenu={text !== undefined ? onContextMenu : undefined}
-      onKeyDown={text !== undefined ? onContextMenuKeyDown : undefined}
+      onContextMenu={visibleText !== undefined && !longAnswer ? onContextMenu : undefined}
+      onKeyDown={visibleText !== undefined && !longAnswer ? onContextMenuKeyDown : undefined}
     >
       <div className="ja-chat-message__body">
-        {text === undefined ? null : (
+        {visibleText === undefined ? null : (
           <div className="ja-chat-response__content" aria-live="off">
-            <MarkdownMessage
-              content={text}
-              onOpenLink={onOpenLink}
-              onOpenFile={onOpenFile}
-              onCopyText={onCopyText}
-            />
+            {plainLongText ? (
+              <pre className="ja-chat-response__long-text">{visibleText}</pre>
+            ) : (
+              <MarkdownMessage
+                content={visibleText}
+                onOpenLink={onOpenLink}
+                onOpenFile={onOpenFile}
+                onCopyText={onCopyText}
+              />
+            )}
           </div>
         )}
+        {longAnswer && onReadFullText !== undefined ? (
+          <div className="ja-public-text-actions">
+            {fullText === undefined ? (
+              <button
+                type="button"
+                className="ja-chat-response__full-action"
+                disabled={fullTextLoading}
+                onClick={() => void loadFullText().catch(() => {})}
+              >
+                {fullTextLoading
+                  ? "正在读取全文…"
+                  : fullTextError
+                    ? "重试读取全文"
+                    : "查看完整回复"}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="ja-chat-response__full-action"
+              disabled={exportPhase === "saving"}
+              onClick={() => void exportFullText()}
+            >
+              {exportPhase === "saving" ? "正在导出…" : "导出全文"}
+            </button>
+          </div>
+        ) : null}
+        {exportPhase === "saved" ? (
+          <p className="ja-chat-response__full-note" role="status">
+            已导出全文。
+          </p>
+        ) : null}
+        {exportPhase === "unsupported" ? (
+          <p className="ja-chat-response__full-error" role="alert">
+            当前窗口不支持直接导出，可复制全文。
+          </p>
+        ) : null}
+        {exportPhase === "error" ? (
+          <p className="ja-chat-response__full-error" role="alert">
+            导出未完成，请重试。
+          </p>
+        ) : null}
+        {fullTextError ? (
+          <p className="ja-chat-response__full-error" role="alert">
+            完整回复暂时无法读取。
+          </p>
+        ) : null}
         {failure === undefined ? null : (
           <p className="ja-chat-failure" role="alert">
             {failure}
@@ -1091,16 +1227,20 @@ function AssistantResponse({
           </div>
         )}
       </div>
-      {text !== undefined && onCopyText !== undefined ? (
+      {visibleText !== undefined && onCopyText !== undefined ? (
         <div
           className="ja-chat-message__actions"
           role="group"
           aria-label={isFailed ? "未完成回复操作" : "回复操作"}
         >
           <CopyTextButton
-            text={text}
+            text={visibleText}
             label={isFailed ? "复制未完成内容" : "复制回复"}
-            onCopyText={onCopyText}
+            onCopyText={
+              longAnswer && onReadFullText !== undefined
+                ? async () => onCopyText(await loadFullText())
+                : onCopyText
+            }
           />
         </div>
       ) : null}
@@ -1114,6 +1254,10 @@ function AssistantResponse({
  */
 export function ChatTimeline({
   threadId,
+  hasOlderHistory = false,
+  loadingOlderHistory = false,
+  olderHistoryError,
+  onLoadOlderHistory,
   scrollCache,
   disclosureCache,
   items,
@@ -1127,6 +1271,8 @@ export function ChatTimeline({
   onOpenLink,
   onOpenFile,
   onCopyText,
+  onReadMessageContent,
+  onReadAnswerContent,
   onReadToolArtifact,
   onResolveToolRecovery,
   onReviewTurn,
@@ -1221,6 +1367,18 @@ export function ChatTimeline({
     [openMessageContextMenu],
   );
   const scrollRef = useRef<HTMLDivElement>(null);
+  /** 设计原因：旧页插入到视口上方时补偿高度差，保持用户正在阅读的行和输入焦点。 */
+  const loadOlderHistory = useCallback(async (): Promise<void> => {
+    if (onLoadOlderHistory === undefined || loadingOlderHistory) return;
+    const scroller = scrollRef.current;
+    const beforeHeight = scroller?.scrollHeight ?? 0;
+    const beforeTop = scroller?.scrollTop ?? 0;
+    await onLoadOlderHistory();
+    requestAnimationFrame(() => {
+      const current = scrollRef.current;
+      if (current !== null) current.scrollTop = beforeTop + current.scrollHeight - beforeHeight;
+    });
+  }, [loadingOlderHistory, onLoadOlderHistory]);
   const revision = useMemo(
     () =>
       orderedRows
@@ -1361,6 +1519,24 @@ export function ChatTimeline({
       aria-label="对话时间线"
       data-thread-id={threadId}
     >
+      {(hasOlderHistory || olderHistoryError !== undefined) && (
+        <div
+          className="ja-conversation-content-rail"
+          style={{ textAlign: "center", padding: "0.35rem 0" }}
+        >
+          {hasOlderHistory && onLoadOlderHistory !== undefined && (
+            <button
+              className="ja-button ja-button-sm ja-button-ghost"
+              type="button"
+              disabled={loadingOlderHistory}
+              onClick={() => void loadOlderHistory()}
+            >
+              {loadingOlderHistory ? "正在加载…" : "加载更早的记录"}
+            </button>
+          )}
+          {olderHistoryError !== undefined && <span role="status">{olderHistoryError}</span>}
+        </div>
+      )}
       {orderedRows.length === 0 ? <p className="ja-chat-timeline__empty">{emptyText}</p> : null}
       <div className="ja-chat-timeline__scroll" ref={scrollRef}>
         <div
@@ -1476,6 +1652,7 @@ export function ChatTimeline({
                           onOpenLink={onOpenLink}
                           onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
+                          onReadMessageContent={onReadMessageContent}
                           onReadToolArtifact={onReadToolArtifact}
                           onResolveToolRecovery={onResolveToolRecovery}
                         />
@@ -1490,6 +1667,21 @@ export function ChatTimeline({
                           onOpenLink={onOpenLink}
                           onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
+                          onReadFullText={
+                            row.final === undefined
+                              ? undefined
+                              : onReadAnswerContent !== undefined
+                                ? () =>
+                                    onReadAnswerContent(
+                                      row.final!.itemId,
+                                      row.turn?.threadRevision,
+                                      row.final!.turnId,
+                                    )
+                                : onReadMessageContent === undefined
+                                  ? undefined
+                                  : () =>
+                                      readCompleteAnswer(row.final!, row.work, onReadMessageContent)
+                          }
                           onContextMenu={handleMessageContextMenu}
                           onContextMenuKeyDown={handleMessageContextMenuKeyDown}
                         />

@@ -215,7 +215,7 @@ function Get-InputEvidence {
         'package.json',
         'pnpm-lock.yaml',
         'Cargo.toml',
-        'src-tauri/Cargo.toml',
+        'apps/desktop/src-tauri/Cargo.toml',
         'Cargo.lock',
         'app-server/pom.xml',
         'LICENSE'
@@ -324,7 +324,7 @@ function Get-CargoLicenseInventory {
         [Parameter(Mandatory = $true)][string]$Toolchain
     )
 
-    $manifest = Resolve-RepositoryPath -Path 'src-tauri/Cargo.toml' -BasePath $RepositoryRoot -RequireExisting
+    $manifest = Resolve-RepositoryPath -Path 'apps/desktop/src-tauri/Cargo.toml' -BasePath $RepositoryRoot -RequireExisting
     $result = Invoke-ExternalCommand -FilePath 'cargo' -Arguments @("+$Toolchain", 'metadata', '--manifest-path', $manifest, '--locked', '--offline', '--format-version', '1')
     if ($result.ExitCode -ne 0) {
         throw "cargo metadata failed with exit code $($result.ExitCode)"
@@ -517,7 +517,7 @@ function Get-LicenseArchiveInputAudit {
         'node-manifest' = 'package.json'
         'node-lock' = 'pnpm-lock.yaml'
         'cargo-workspace-manifest' = 'Cargo.toml'
-        'cargo-package-manifest' = 'src-tauri/Cargo.toml'
+        'cargo-package-manifest' = 'apps/desktop/src-tauri/Cargo.toml'
         'cargo-lock' = 'Cargo.lock'
         'maven-manifest' = 'app-server/pom.xml'
         'maven-bom' = $MavenBomPath

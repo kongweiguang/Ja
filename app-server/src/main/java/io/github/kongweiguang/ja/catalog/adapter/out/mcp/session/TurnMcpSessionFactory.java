@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.catalog.adapter.out.mcp.session;
 
 import io.github.kongweiguang.ja.catalog.port.out.ConfigurationGenerationPort;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.validation.ContractChecks;
@@ -29,9 +30,11 @@ public interface TurnMcpSessionFactory {
     /**
      * MCP 打开阶段所需的 Provider/Model 身份、工作区与绝对 Deadline，不暴露应用执行计划。
      */
-    record Context(String providerId, String modelId, Path workspaceRoot, Instant deadlineAt) {
+    record Context(String providerId, String modelId, Path workspaceRoot, Instant deadlineAt,
+                   NativeExecutionSnapshot executionContext) {
         /**
-         * 固定代际解析键与路径，防止会话工厂重新解释入站 DTO。
+         * 固定代际解析键、路径和客户端环境；null 仅代表 stdio 合同入口使用
+         * Java 进程环境，TCP Turn 必须在更早的准入边界冻结非空快照。
          */
         public Context {
             providerId = ContractChecks.identifier(providerId, "providerId");

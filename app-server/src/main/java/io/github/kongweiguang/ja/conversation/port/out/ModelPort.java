@@ -139,6 +139,11 @@ public interface ModelPort {
         public final String terminalErrorCode() {
             return terminalErrorCode;
         }
+
+        /** Provider 可传递受限的退避提示，Session 无需依赖任一具体协议适配器。 */
+        public java.util.Optional<java.time.Duration> retryAfterHint() {
+            return java.util.Optional.empty();
+        }
     }
 
     /**
@@ -372,18 +377,8 @@ public interface ModelPort {
     }
 
     /**
-     * 一次模型请求允许的传输重试策略；内部低优先级任务可显式关闭共享 Adapter 的瞬时重试。
-     */
-    enum RetryPolicy {
-        /** 普通 Agent 请求只允许在首个语义事件前重试已分类的瞬时故障。 */
-        TRANSIENT_BEFORE_OUTPUT,
-        /** 单次请求不进行任何应用层重试，适用于自动标题等有独立失败回退的任务。 */
-        SINGLE_ATTEMPT
-    }
-
-    /**
-     * Provider 传输的 Deadline 所有权；长时 Agent Turn 使用持久化绝对截止时间，
-     * 有界目录和评估调用继续使用逐请求硬超时。
+     * Provider 单次请求的超时所有权；长时 Agent Turn 在会话层持有取消和恢复，
+     * 有界内部调用仍使用逐请求硬超时。
      */
     enum RequestDeadlinePolicy {
         /** Adapter 将 requestTimeout 用作调用绝对上限。 */
@@ -393,7 +388,7 @@ public interface ModelPort {
     }
 
     /**
-     * 一次模型轮次的冻结配置、提示信封、持久上下文、Tool 目录、续传状态与重试策略。
+     * 一次模型轮次的冻结配置、提示信封、持久上下文、Tool 目录与续传状态。
      */
     record ModelRequest(
             ModelConfiguration configuration,
@@ -402,25 +397,15 @@ public interface ModelPort {
             List<ToolSpec> tools,
             Continuation continuation,
             int round,
-            RetryPolicy retryPolicy,
             RequestDeadlinePolicy deadlinePolicy) {
         /**
-         * 普通 Agent、摘要和模型测试沿用首个语义事件前的瞬时重试；需要单次尝试的内部任务
-         * 必须使用完整构造器显式声明，避免靠 Prompt revision 等隐式约定分流。
+         * 默认内部调用只发送一次并使用请求硬上限；持续恢复由会话层建立新请求。
          */
         public ModelRequest(ModelConfiguration configuration, PromptPayload prompt,
                             List<ModelMessage> messages, List<ToolSpec> tools,
                             Continuation continuation, int round) {
             this(configuration, prompt, messages, tools, continuation, round,
-                    RetryPolicy.TRANSIENT_BEFORE_OUTPUT, RequestDeadlinePolicy.CALL_BOUNDED);
-        }
-
-        /** 非 Turn 内部调用仍采用请求硬上限，避免重试脱离时间预算。 */
-        public ModelRequest(ModelConfiguration configuration, PromptPayload prompt,
-                            List<ModelMessage> messages, List<ToolSpec> tools,
-                            Continuation continuation, int round, RetryPolicy retryPolicy) {
-            this(configuration, prompt, messages, tools, continuation, round,
-                    retryPolicy, RequestDeadlinePolicy.CALL_BOUNDED);
+                    RequestDeadlinePolicy.CALL_BOUNDED);
         }
 
         /**
@@ -431,10 +416,9 @@ public interface ModelPort {
             Objects.requireNonNull(prompt, "prompt");
             messages = ContractChecks.immutableList(messages, "messages");
             tools = ContractChecks.immutableList(tools, "tools");
-            if (round < 1 || round > 128) {
-                throw new IllegalArgumentException("round must be in [1,128]");
+            if (round < 1) {
+                throw new IllegalArgumentException("round must be positive");
             }
-            Objects.requireNonNull(retryPolicy, "retryPolicy");
             Objects.requireNonNull(deadlinePolicy, "deadlinePolicy");
         }
     }

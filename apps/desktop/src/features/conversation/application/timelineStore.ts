@@ -50,7 +50,11 @@ export interface TimelineStore extends TimelineState {
   recoveredActiveTurnByThread: Record<string, string>;
   /** 每次重读意图的单调序号；相同 reason 的失败重试也必须重新触发 consumer。 */
   resyncRequestSequenceByThread: Record<string, number>;
-  applySnapshot: (snapshot: TimelineSnapshot, workspaceId: string) => TimelineState["lastOutcome"];
+  applySnapshot: (
+    snapshot: TimelineSnapshot,
+    workspaceId: string,
+    options?: { accumulatedHistory?: true },
+  ) => TimelineState["lastOutcome"];
   applyHostEvent: (event: ConversationHostEvent) => TimelineState["lastOutcome"];
   applyTurnAccepted: (accepted: AcceptedTurnProjection) => TimelineState["lastOutcome"];
   applyInputQueue: (inputQueue: InputQueue) => TimelineState["lastOutcome"];
@@ -248,12 +252,12 @@ function retryStatusItemForTurn(
   const cached = retryStatusItemByProjection.get(retry);
   if (cached !== undefined) return cached;
   const item: TimelineItemAdapter = {
-    itemId: `retry:${turnId}:${retry.attempt}`,
+    itemId: `retry:${turnId}`,
     threadId,
     turnId,
     kind: "commentary",
     status: "in_progress",
-    text: `重试 ${retry.attempt}/${retry.maxAttempts}`,
+    text: "连接中断，正在恢复",
     title: "重试",
     metadata: { phase: "assistant_retry" },
     createdAt: retry.occurredAt,
@@ -273,10 +277,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     ...createTimelineState(),
     recoveredActiveTurnByThread: {},
     resyncRequestSequenceByThread: {},
-    applySnapshot: (snapshot, workspaceId) => {
+    applySnapshot: (snapshot, workspaceId, options) => {
       let nextOutcome: TimelineState["lastOutcome"] = "invalid";
       set((state) => {
-        const next = applySnapshot(state, snapshot, workspaceId);
+        const next = applySnapshot(state, snapshot, workspaceId, options);
         nextOutcome = next.lastOutcome;
         if (next.lastOutcome !== "applied")
           return {
@@ -373,7 +377,11 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             delete recoveredActiveTurnByThread[threadId];
           return { ...next, recoveredActiveTurnByThread };
         }
-        if (event.kind === "status" && next.handshake.generation !== state.handshake.generation) {
+        if (
+          event.kind === "status" &&
+          (next.handshake.generation !== state.handshake.generation ||
+            next.handshake.serverInstanceId !== state.handshake.serverInstanceId)
+        ) {
           recoveryBuffers.clear();
           lastAcceptedLiveByThread.clear();
           return {
@@ -414,7 +422,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       set((state) => {
         const next = applyRuntimeStatus(state, status);
         nextOutcome = next.lastOutcome;
-        if (next.handshake.generation !== state.handshake.generation) {
+        if (
+          next.handshake.generation !== state.handshake.generation ||
+          next.handshake.serverInstanceId !== state.handshake.serverInstanceId
+        ) {
           recoveryBuffers.clear();
           lastAcceptedLiveByThread.clear();
           return {

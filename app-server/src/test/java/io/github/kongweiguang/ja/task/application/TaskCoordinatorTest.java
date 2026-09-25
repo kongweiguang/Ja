@@ -96,7 +96,7 @@ final class TaskCoordinatorTest {
             coordinator.spawnAgent(new TaskUseCase.SpawnCommand(
                     "thr_parent", "turn_parent", "review",
                     new UserContent(List.of(new TextContent("review changes"))),
-                        Duration.ofMinutes(5), PREFERENCES, ceiling));
+                        PREFERENCES, ceiling));
         } finally {
             detachLogs(logs);
         }
@@ -126,7 +126,7 @@ final class TaskCoordinatorTest {
                     () -> coordinator.spawnAgent(new TaskUseCase.SpawnCommand(
                             "thr_parent", "turn_parent", "blocked",
                             new UserContent(List.of(new TextContent("must not run"))),
-                            Duration.ofMinutes(5), PREFERENCES,
+                            PREFERENCES,
                             capabilityCeiling(PREFERENCES, Set.of()))));
             assertEquals(TaskRepositoryException.Code.PERMISSION_DENIED, failure.code());
         }
@@ -283,7 +283,7 @@ final class TaskCoordinatorTest {
         TaskUseCase.FollowUpCommand command = new TaskUseCase.FollowUpCommand(
                 new TaskUseCase.MessageCommand("thr_parent", "thr_target",
                         new UserContent(List.of(new TextContent("继续完成"))),
-                        "follow-public-retry", "turn_parent"), 3, Duration.ofMinutes(5));
+                        "follow-public-retry", "turn_parent"), 3);
 
         try (TaskCoordinator coordinator = new TaskCoordinator(repository, childThreads,
                 (TurnUseCase) owner, (ChildTurnScheduler) owner, workspaces(),
@@ -295,7 +295,7 @@ final class TaskCoordinatorTest {
                             new TaskUseCase.MessageCommand("thr_parent", "thr_target",
                                     new UserContent(List.of(new TextContent("不同内容"))),
                                     "follow-public-retry", "turn_parent"),
-                            3, Duration.ofMinutes(5))));
+                            3)));
 
             assertEquals(first.messageId(), replay.messageId());
             assertEquals(first.turnId(), replay.turnId());
@@ -598,7 +598,7 @@ final class TaskCoordinatorTest {
                 Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies())) {
             TaskUseCase.StartResult result = coordinator.spawnAgent(new TaskUseCase.SpawnCommand(
                     "thr_parent", "turn_parent", "review", new UserContent(List.of(new TextContent("review"))),
-                    Duration.ofMinutes(5), PREFERENCES, capabilityCeiling(PREFERENCES, Set.of())));
+                    PREFERENCES, capabilityCeiling(PREFERENCES, Set.of())));
 
             assertEquals("thr_parent", result.task().lineage().rootThreadId());
             assertEquals(8, attempts.get());
@@ -785,7 +785,7 @@ final class TaskCoordinatorTest {
                         TurnStartRequest request = (TurnStartRequest) args[0];
                         ChildTurnScheduler.Admission admission = (ChildTurnScheduler.Admission) args[2];
                         TurnExecutionState.Common common = new TurnExecutionState.Common(
-                                0, 0, 1, null, List.of(), NOW.plus(request.deadline()),
+                                0, 0, 1, null, List.of(),
                                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.CHILD_TASK);
                         ChildTurnScheduler.AdmissionRequest child = new ChildTurnScheduler.AdmissionRequest(
                                 request.threadId(), request.turnId(), "item_fixture",
@@ -922,7 +922,7 @@ final class TaskCoordinatorTest {
                             (io.github.kongweiguang.ja.conversation.port.in.TurnEventSink) args[1];
                     ChildTurnScheduler.Admission admission = (ChildTurnScheduler.Admission) args[2];
                     TurnExecutionState.Common common = new TurnExecutionState.Common(
-                            0, 0, 1, null, List.of(), NOW.plus(request.deadline()),
+                            0, 0, 1, null, List.of(),
                             io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.CHILD_TASK);
                     ChildTurnScheduler.AdmissionReceipt receipt = admission.admit(
                             new ChildTurnScheduler.AdmissionRequest(request.threadId(), request.turnId(),

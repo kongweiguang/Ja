@@ -47,7 +47,7 @@ public final class TurnEventWireMapper {
         switch (event) {
             case TurnEvent.RetryStarted value -> {
                 method = "turn/retry-started";
-                params.put("attempt", value.attempt()).put("maxAttempts", value.maxAttempts());
+                params.put("attempt", value.attempt());
             }
             case TurnEvent.StateChanged value -> {
                 method = "turn/state-changed";

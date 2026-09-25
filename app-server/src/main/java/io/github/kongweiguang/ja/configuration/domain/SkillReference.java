@@ -67,4 +67,5 @@ public record SkillReference(Source source, String name) {
         }
         return new SkillReference(Source.fromPrefix(value.substring(0, delimiter)), value.substring(delimiter + 1));
     }
+
 }

@@ -64,7 +64,19 @@ public final class BuiltInTools {
                                        SkillCatalog.Catalog skillCatalogView, ShellCapability shellCapability,
                                        AgentPromptSession promptSession, ManagedAttachmentReader attachments) {
         return create(workspaceRoot, skillCatalog, skillCatalogView, shellCapability, promptSession,
-                attachments, BuiltInTools::atomicWrite);
+                attachments, System.getenv());
+    }
+
+    /**
+     * 搜索工具与 Shell Tool 使用同一 Turn 冻结的宿主环境；长驻后台不得把自身的
+     * PATH、代理或临时目录无意传播给另一个客户端的原生进程。
+     */
+    public static ToolRegistry create(Path workspaceRoot, SkillCatalog skillCatalog,
+                                      SkillCatalog.Catalog skillCatalogView, ShellCapability shellCapability,
+                                      AgentPromptSession promptSession, ManagedAttachmentReader attachments,
+                                      Map<String, String> environment) {
+        return create(workspaceRoot, skillCatalog, skillCatalogView, shellCapability, promptSession,
+                attachments, BuiltInTools::atomicWrite, NativeSearchToolResolver.system(environment));
     }
 
     /** 测试可替换唯一 mutation IO 边界以稳定构造写后路径竞态，生产始终传入受检原子写实现。 */

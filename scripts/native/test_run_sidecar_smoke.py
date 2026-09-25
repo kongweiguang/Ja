@@ -35,6 +35,53 @@ SPEC.loader.exec_module(SMOKE)
 class NativeSmokeV1Test(unittest.TestCase):
     """Verifies exact v1 frames and the complete mock-sidecar lifecycle."""
 
+    def test_capability_names_follow_golden_order_and_schema_set(self) -> None:
+        """沿用 Java 共用的 golden 顺序，同时由 schema 封闭校验成员集合。"""
+
+        document = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        definitions = document["$defs"]
+        methods, events = SMOKE.load_capability_names(SCHEMA)
+        golden_params = json.loads(GOLDEN.read_text(encoding="utf-8").splitlines()[0])["params"]
+
+        self.assertEqual(golden_params["capabilities"]["methods"], methods)
+        self.assertEqual(golden_params["capabilities"]["events"], events)
+        self.assertEqual(set(definitions["methodName"]["enum"]), set(methods))
+        self.assertEqual(
+            set(name for name in definitions["eventName"]["enum"] if name != "runtime/initialized"),
+            set(events),
+        )
+        self.assertIn("runtime/context/register", methods)
+        self.assertIn("operation/read", methods)
+        self.assertIn("thread/observe", methods)
+        self.assertIn("thread/unobserve", methods)
+
+    def test_capability_loader_tracks_schema_additions(self) -> None:
+        """golden 新成员决定 offer 顺序，schema 同时必须声明完全相同的闭集。"""
+
+        document = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        definitions = document["$defs"]
+        methods = definitions["methodName"]["enum"]
+        events = definitions["eventName"]["enum"]
+        methods.append("smoke/test-operation")
+        events.append("smoke/test-event")
+        golden_frame = json.loads(GOLDEN.read_text(encoding="utf-8").splitlines()[0])
+        golden_capabilities = golden_frame["params"]["capabilities"]
+        golden_capabilities["methods"].insert(0, "smoke/test-operation")
+        golden_capabilities["events"].append("smoke/test-event")
+        with tempfile.TemporaryDirectory(prefix="ja-native-capability-schema-") as directory:
+            schema_path = Path(directory) / "schema.json"
+            golden_path = Path(directory) / "core.jsonl"
+            schema_path.write_text(json.dumps(document), encoding="utf-8")
+            golden_path.write_text(json.dumps(golden_frame) + "\n", encoding="utf-8")
+            loaded_methods, loaded_events = SMOKE.load_capability_names(schema_path, golden_path)
+            self.assertEqual("smoke/test-operation", loaded_methods[0])
+            self.assertEqual("smoke/test-event", loaded_events[-1])
+
+            definitions["methodName"]["enum"].append("smoke/unlisted-operation")
+            schema_path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "capability sets differ"):
+                SMOKE.load_capability_names(schema_path, golden_path)
+
     def test_rpc_rejection_preserves_only_bounded_diagnostics(self) -> None:
         """错误操作与机器码可定位失败，任意消息和路径不得进入脱敏异常。"""
         with self.assertRaises(SMOKE.NativeRpcRejection) as raised:
@@ -55,11 +102,19 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn(SMOKE.SMOKE_SECRET, f"payload={SMOKE.SMOKE_SECRET}")
 
     def test_initialize_is_exact_v1_and_configuration_free(self) -> None:
-        """将 Native offer 绑定到 golden v1 闭集，防止发布脚本滞后于三端合同。"""
+        """方法与事件顺序来自合同 schema，golden 继续锚定其它能力、模式和限制。"""
 
         params = SMOKE.initialize_frame()["params"]
         golden_params = json.loads(GOLDEN.read_text(encoding="utf-8").splitlines()[0])["params"]
+        schema_definitions = json.loads(SCHEMA.read_text(encoding="utf-8"))["$defs"]
         methods = params["capabilities"]["methods"]
+        events = params["capabilities"]["events"]
+        schema_methods = set(schema_definitions["methodName"]["enum"])
+        schema_events = set(
+            name
+            for name in schema_definitions["eventName"]["enum"]
+            if name != "runtime/initialized"
+        )
         self.assertEqual(1, params["protocolMajor"])
         self.assertEqual(0, params["protocolMinor"])
         self.assertEqual(
@@ -69,6 +124,14 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertNotIn("configSnapshot", params)
         self.assertNotIn("apiKey", str(params))
         self.assertNotIn("runtime/configure", methods)
+        self.assertEqual(golden_params["capabilities"]["methods"], methods)
+        self.assertEqual(golden_params["capabilities"]["events"], events)
+        self.assertEqual(schema_methods, set(methods))
+        self.assertEqual(schema_events, set(events))
+        self.assertIn("runtime/context/register", methods)
+        self.assertIn("operation/read", methods)
+        self.assertIn("thread/observe", methods)
+        self.assertIn("thread/unobserve", methods)
         self.assertIn("thread/compact", methods)
         self.assertIn("thread/pin", methods)
         self.assertIn("thread/seen", methods)
@@ -95,25 +158,26 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("turn/change-set/read", methods)
         self.assertNotIn("turn/change-preview/open", methods)
         self.assertNotIn("turn/change-set/commit", methods)
-        self.assertEqual(len(golden_params["capabilities"]["methods"]), len(methods))
         self.assertEqual(len(methods), len(set(methods)))
-        self.assertIn("context/compaction-started", params["capabilities"]["events"])
-        self.assertIn("context/compaction-failed", params["capabilities"]["events"])
-        self.assertIn("thread/metadata-changed", params["capabilities"]["events"])
-        self.assertIn("task/activity", params["capabilities"]["events"])
-        self.assertIn("goal/changed", params["capabilities"]["events"])
-        self.assertIn("goal/activity", params["capabilities"]["events"])
-        self.assertNotIn("goal/input-requested", params["capabilities"]["events"])
-        self.assertIn("interaction/changed", params["capabilities"]["events"])
-        self.assertIn("plan/changed", params["capabilities"]["events"])
-        self.assertNotIn("turn/change-preview-updated", params["capabilities"]["events"])
+        self.assertNotIn("runtime/initialized", events)
+        self.assertIn("context/compaction-started", events)
+        self.assertIn("context/compaction-failed", events)
+        self.assertIn("thread/metadata-changed", events)
+        self.assertIn("task/activity", events)
+        self.assertIn("goal/changed", events)
+        self.assertIn("goal/activity", events)
+        self.assertNotIn("goal/input-requested", events)
+        self.assertIn("interaction/changed", events)
+        self.assertIn("plan/changed", events)
+        self.assertNotIn("turn/change-preview-updated", events)
         self.assertEqual(["default", "plan"], params["capabilities"]["collaborationModes"])
         self.assertEqual(
             ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
             params["capabilities"]["features"],
         )
         self.assertEqual(["approval_required", "full_access"], params["capabilities"]["accessModes"])
-        self.assertEqual(golden_params["capabilities"], params["capabilities"])
+        for capability in ("accessModes", "collaborationModes", "features"):
+            self.assertEqual(golden_params["capabilities"][capability], params["capabilities"][capability])
         self.assertEqual(golden_params["limits"], params["limits"])
 
     def test_initialize_identity_requires_current_product_version(self) -> None:
@@ -195,6 +259,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             SMOKE.thread_create_frame(Path(tempfile.gettempdir()) / "ja-合同-workspace"),
             SMOKE.thread_rename_frame("thr_demo", 1),
             SMOKE.configuration_replace_frame("cfg_missing"),
+            SMOKE.approval_response_frame("appr_demo", "turn_demo", 1),
             SMOKE.turn_start_frame("thr_demo", "current content contract"),
             SMOKE.turn_cancel_frame("turn_demo"),
             SMOKE.skill_list_frame("ws_demo"),
@@ -210,8 +275,34 @@ class NativeSmokeV1Test(unittest.TestCase):
         frame = SMOKE.turn_cancel_frame("turn_demo")
         self.assertEqual({"turnId": "turn_demo"}, frame["params"])
 
+    def test_turn_start_frame_has_a_fresh_client_operation_id(self) -> None:
+        """每次 smoke admission 使用独立回执键，满足当前 JA-RPC 幂等边界。"""
+
+        first = SMOKE.turn_start_frame("thr_demo", "first")["params"]
+        second = SMOKE.turn_start_frame("thr_demo", "second")["params"]
+        self.assertRegex(first["clientOperationId"], r"^op_[0-9a-f]{32}$")
+        self.assertRegex(second["clientOperationId"], r"^op_[0-9a-f]{32}$")
+        self.assertNotEqual(first["clientOperationId"], second["clientOperationId"])
+
+    def test_turn_start_frame_uses_only_schema_owned_request_fields(self) -> None:
+        """Deadline 由 smoke harness 限制，不能扩展服务端 admission 的严格 v1 字段集。"""
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        frame = SMOKE.turn_start_frame("thr_demo", "schema-owned request")
+        self.assertEqual({"threadId", "content", "clientOperationId"}, set(frame["params"]))
+        jsonschema.Draft202012Validator(schema).validate(frame)
+
+    def test_approval_response_frame_has_a_fresh_client_operation_id(self) -> None:
+        """每次审批裁决都用独立回执键，避免重复提交串扰另一条 smoke 任务。"""
+
+        first = SMOKE.approval_response_frame("appr_demo", "turn_demo", 1)["params"]
+        second = SMOKE.approval_response_frame("appr_demo", "turn_demo", 2)["params"]
+        self.assertRegex(first["clientOperationId"], r"^op_[0-9a-f]{32}$")
+        self.assertRegex(second["clientOperationId"], r"^op_[0-9a-f]{32}$")
+        self.assertNotEqual(first["clientOperationId"], second["clientOperationId"])
+
     def test_loopback_configuration_document_is_exact_v2(self) -> None:
-        """Locks the smoke fixture to v2 so user configuration cannot carry project Skill objects."""
+        """锁定当前 v2 用户配置字段，禁用列表与 workspace 中发现的 Skill 分开表达。"""
 
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         frame = SMOKE.configuration_replace_frame(
@@ -226,8 +317,9 @@ class NativeSmokeV1Test(unittest.TestCase):
         model = provider["models"][0]
         self.assertEqual(2, document["schema_version"])
         self.assertEqual({"clarification_enabled": True}, document["interaction"])
-        self.assertEqual([], document["skills"])
-        self.assertEqual({"context", "turn_limits"}, set(provider["agent_defaults"]))
+        self.assertEqual([], document["disabled_skills"])
+        self.assertNotIn("skills", document)
+        self.assertEqual({"context"}, set(provider["agent_defaults"]))
         self.assertEqual(
             {"context_window_tokens", "max_output_tokens"},
             set(model["capabilities"]),

@@ -179,7 +179,7 @@ public interface TaskUseCase extends AutoCloseable {
 
     /** Subagent 必须绑定创建它的父 Turn，并显式传入 brief，默认不继承父 Transcript。 */
     record SpawnCommand(String parentThreadId, String parentTurnId, String taskName,
-                        UserContent brief, Duration deadline, ThreadPreferences frozenPreferences,
+                        UserContent brief, ThreadPreferences frozenPreferences,
                         JsonObject capabilityCeiling) {
         /** 父 Turn 是 ATTACHED 生命周期的取消传播根，不能缺省。 */
         public SpawnCommand {
@@ -189,10 +189,6 @@ public interface TaskUseCase extends AutoCloseable {
                 throw new IllegalArgumentException("invalid subagent command");
             }
             Objects.requireNonNull(brief, "brief");
-            Objects.requireNonNull(deadline, "deadline");
-            if (deadline.toMillis() < 1_000 || deadline.toMillis() > 86_400_000) {
-                throw new IllegalArgumentException("invalid task deadline");
-            }
             Objects.requireNonNull(frozenPreferences, "frozenPreferences");
             Objects.requireNonNull(capabilityCeiling, "capabilityCeiling");
         }
@@ -213,15 +209,11 @@ public interface TaskUseCase extends AutoCloseable {
     }
 
     /** Follow-up 额外携带 Task projection CAS，禁止在已变化状态上静默启动新 Turn。 */
-    record FollowUpCommand(MessageCommand message, long expectedTaskRevision, Duration deadline) {
-        /** revision 与 Deadline 在进入队列前固定。 */
+    record FollowUpCommand(MessageCommand message, long expectedTaskRevision) {
+        /** revision 在进入队列前固定，后续 Turn 不继承父工具请求超时。 */
         public FollowUpCommand {
             Objects.requireNonNull(message, "message");
             if (expectedTaskRevision < 0) throw new IllegalArgumentException("invalid task revision");
-            Objects.requireNonNull(deadline, "deadline");
-            if (deadline.toMillis() < 1_000 || deadline.toMillis() > 86_400_000) {
-                throw new IllegalArgumentException("invalid task deadline");
-            }
         }
     }
 

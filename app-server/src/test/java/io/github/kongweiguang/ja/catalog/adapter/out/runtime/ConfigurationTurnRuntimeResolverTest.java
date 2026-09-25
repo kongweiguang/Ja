@@ -69,7 +69,7 @@ final class ConfigurationTurnRuntimeResolverTest {
         return ConfigurationTurnRuntimeResolver.isClarificationEnabled(new TurnRuntimeRequest(
                 "thr_clarification", "turn_clarification", Path.of(".").toAbsolutePath(), "ws_clarification",
                 "provider_clarification", "model_clarification", "medium", AccessMode.FULL_ACCESS, mode,
-                origin, Duration.ofMinutes(1), Instant.parse("2026-09-10T12:00:00Z")), configured);
+                origin, Instant.parse("2026-09-10T12:00:00Z")), configured);
     }
 
     /** Side Task 身份必须留在 system environment，且真实通信 Tool 的目标参数不能被自然语言改名。 */
@@ -115,7 +115,7 @@ final class ConfigurationTurnRuntimeResolverTest {
                 new SkillCatalog.SkillDescriptor(
                         "unconfigured", "Unconfigured skill", SkillCatalog.Source.WORKSPACE)));
 
-        assertEquals(Map.of("ja:review", "review", "ja:disabled", "disabled"),
+        assertEquals(Map.of("project:unconfigured", "unconfigured"),
                 ConfigurationTurnRuntimeResolver.skillNamesById(configured, discovered));
     }
 
@@ -130,7 +130,6 @@ final class ConfigurationTurnRuntimeResolverTest {
                 projectOnly, new SkillCatalog.Catalog(List.of())));
 
         List<ConfigurationGenerationSnapshot.Skill> mixed = List.of(
-                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("ja:review")),
                 new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:project-only")));
         SkillCatalog.Catalog discovered = new SkillCatalog.Catalog(List.of(
                 new SkillCatalog.SkillDescriptor("review", "Review changes", SkillCatalog.Source.JA_USER)));
@@ -142,8 +141,7 @@ final class ConfigurationTurnRuntimeResolverTest {
                 missingUser, new SkillCatalog.Catalog(List.of())));
 
         List<ConfigurationGenerationSnapshot.Skill> duplicateName = List.of(
-                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("user:same-name")),
-                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("project:same-name")));
+                new ConfigurationGenerationSnapshot.Skill(SkillReference.parse("user:same-name")));
         assertEquals(List.of("same-name"), ConfigurationTurnRuntimeResolver.availableSkillNames(
                 duplicateName, new SkillCatalog.Catalog(List.of(
                         new SkillCatalog.SkillDescriptor(
@@ -545,8 +543,7 @@ final class ConfigurationTurnRuntimeResolverTest {
                 new ConfigurationGenerationSnapshot.NetworkTimeouts(
                         Duration.ofSeconds(5), Duration.ofMinutes(2)),
                 new ConfigurationGenerationSnapshot.AgentDefaults(
-                        new ConfigurationGenerationSnapshot.Context(true),
-                        new ConfigurationGenerationSnapshot.TurnLimits(8, 32, Duration.ofMinutes(5))),
+                        new ConfigurationGenerationSnapshot.Context(true)),
                 List.of(model));
     }
 

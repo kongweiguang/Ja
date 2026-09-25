@@ -22,8 +22,20 @@ const REQUEST_PROFILE = {
 };
 
 describe("JA RPC v1 configuration ownership", () => {
+  it("matches explicit shared daemon shutdown without widening renderer commands", () => {
+    expect(parseMethodParams("runtime/shutdown", {})).toEqual({});
+    expect(parseMethodParams("runtime/shutdown", { force: true })).toEqual({ force: true });
+    expect(() => parseMethodParams("runtime/shutdown", { force: "true" })).toThrow();
+  });
+
   it("accepts cwd/thread/turn intent without client-owned identity or generation", () => {
     expect(parseMethodParams("workspace/open", { cwd: "C:\\demo" })).toEqual({ cwd: "C:\\demo" });
+    expect(
+      parseMethodParams("workspace/open", { cwd: "C:\\demo", displayName: "项".repeat(1024) }),
+    ).toMatchObject({ displayName: "项".repeat(1024) });
+    expect(() =>
+      parseMethodParams("workspace/open", { cwd: "C:\\demo", displayName: "项".repeat(1025) }),
+    ).toThrow();
     expect(parseMethodParams("workspace/open", { workspaceId: "ws_session" })).toEqual({
       workspaceId: "ws_session",
     });
@@ -67,12 +79,21 @@ describe("JA RPC v1 configuration ownership", () => {
       parseMethodParams("turn/start", {
         threadId: "thr_demo",
         content: [{ type: "text", text: "hello" }],
+        clientOperationId: "op_0123456789abcdef0123456789abcdef",
       }),
-    ).toEqual({ threadId: "thr_demo", content: [{ type: "text", text: "hello" }] });
+    ).toEqual({
+      threadId: "thr_demo",
+      content: [{ type: "text", text: "hello" }],
+      clientOperationId: "op_0123456789abcdef0123456789abcdef",
+    });
   });
 
   it("validates hidden continuation/reask requests and the bounded retry notification", () => {
-    const continueParams = { threadId: "thr_demo", expectedThreadRevision: 4 };
+    const continueParams = {
+      threadId: "thr_demo",
+      expectedThreadRevision: 4,
+      clientOperationId: "op_0123456789abcdef0123456789abcdef",
+    };
     expect(parseMethodParams("turn/continue", continueParams)).toEqual(continueParams);
     const reaskParams = {
       ...continueParams,
@@ -83,6 +104,20 @@ describe("JA RPC v1 configuration ownership", () => {
       ],
     };
     expect(parseMethodParams("turn/reask", reaskParams)).toEqual(reaskParams);
+    expect(
+      parseMethodParams("operation/read", { clientOperationId: continueParams.clientOperationId }),
+    ).toEqual({ clientOperationId: continueParams.clientOperationId });
+    expect(parseMethodResult("operation/read", { status: "unknown" })).toEqual({
+      status: "unknown",
+    });
+    expect(
+      parseMethodResult("operation/read", {
+        status: "committed",
+        method: "turn/continue",
+        threadId: "thr_demo",
+        result: { accepted: true, queued: true, turnId: "turn_continue", threadRevision: 5 },
+      }),
+    ).toMatchObject({ status: "committed", threadId: "thr_demo" });
     expect(() => parseMethodParams("turn/continue", { ...continueParams, content: [] })).toThrow();
     expect(
       parseMethodResult("turn/continue", {
@@ -108,14 +143,14 @@ describe("JA RPC v1 configuration ownership", () => {
       parseNotification({
         jsonrpc: "2.0",
         method: "turn/retry-started",
-        params: { ...retryBase, attempt: 2, maxAttempts: 6 },
+        params: { ...retryBase, attempt: 2 },
       }),
-    ).toMatchObject({ method: "turn/retry-started", params: { attempt: 2, maxAttempts: 6 } });
+    ).toMatchObject({ method: "turn/retry-started", params: { attempt: 2 } });
     expect(() =>
       parseNotification({
         jsonrpc: "2.0",
         method: "turn/retry-started",
-        params: { ...retryBase, attempt: 7, maxAttempts: 6 },
+        params: { ...retryBase, attempt: 1 },
       }),
     ).toThrow();
   });

@@ -12,6 +12,8 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+base64 = "=0.22.1"
+fs2 = "=0.4.3"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tracing = "=0.1.44"
@@ -25,6 +27,10 @@ path = "tests/integration/app_server_process.rs"
 [[test]]
 name = "int_golden_corpus"
 path = "tests/integration/golden_corpus.rs"
+
+[[test]]
+name = "int_shared_connection"
+path = "tests/integration/shared_connection.rs"
 
 # 私有进程树、可执行文件身份与 supervisor 故障测试保留 crate 内可见性，但物理归入
 # integration；这样真实文件和子进程不会与纯协议/状态机测试混为一组。

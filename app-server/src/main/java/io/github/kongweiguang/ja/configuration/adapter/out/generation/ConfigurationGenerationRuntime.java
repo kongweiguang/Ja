@@ -85,7 +85,7 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
                     diagnostics.add(new ConfigGeneration.Diagnostic("MISSING_CREDENTIAL", false));
                 }
             }
-            List<JsonNode> skills = catalogEntries(read.effective(), "skills");
+            List<JsonNode> skills = catalogEntries(read.effective(), "disabled_skills");
             List<JsonNode> mcpServers = catalogEntries(read.effective(), "mcp_servers");
             String catalogDigest = catalogDigest(skills, mcpServers);
             String generationId = generationId(canonical, read.effective(), read.user().version(),
@@ -184,7 +184,7 @@ public final class ConfigurationGenerationRuntime implements AutoCloseable {
     private String catalogDigest(List<JsonNode> skills, List<JsonNode> mcpServers) {
         try {
             ObjectNode catalog = mapper.createObjectNode();
-            ArrayNode skillArray = catalog.putArray("skills");
+            ArrayNode skillArray = catalog.putArray("disabledSkills");
             skills.forEach(skillArray::add);
             ArrayNode mcpArray = catalog.putArray("mcpServers");
             mcpServers.forEach(mcpArray::add);

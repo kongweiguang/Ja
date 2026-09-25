@@ -57,6 +57,7 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
             CatalogSnapshot catalogSnapshot, CancellationToken cancellation) {
         Objects.requireNonNull(catalogSnapshot, "catalogSnapshot");
         Objects.requireNonNull(cancellation, "cancellation");
+        catalogSnapshot.requireOpen();
         SharedMcpGateway gateway = new SharedMcpGateway(
                 catalogSnapshot.snapshot(), catalogSnapshot.services(),
                 catalogSnapshot.serverStatuses(), objectMapper,
@@ -87,13 +88,38 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
                 lease.snapshot().requireProvider(context.providerId());
         lease.snapshot().requireModel(context.providerId(), context.modelId());
         GenerationCatalog.TurnCatalog captured = catalog.capture(
-                lease, provider.agentDefaults(), context.workspaceRoot());
-        return new CatalogSnapshot(captured.snapshot(), captured.routeIdentities(), captured.services(),
-                captured.serverStatuses(), context.workspaceRoot(),
-                lease.snapshot().mcpDefinitions().stream()
-                        .filter(server -> server.scope() == ConfigurationGenerationSnapshot.Scope.PROJECT)
-                        .map(ConfigurationGenerationSnapshot.McpServer::mcpId)
-                        .collect(java.util.stream.Collectors.toUnmodifiableSet()));
+                lease, provider.agentDefaults(), context.workspaceRoot(), context.executionContext());
+        try {
+            return new CatalogSnapshot(captured.snapshot(), captured.routeIdentities(), captured.services(),
+                    captured.serverStatuses(), context.workspaceRoot(),
+                    lease.snapshot().mcpDefinitions().stream()
+                            .filter(server -> server.scope() == ConfigurationGenerationSnapshot.Scope.PROJECT)
+                            .map(ConfigurationGenerationSnapshot.McpServer::mcpId)
+                            .collect(java.util.stream.Collectors.toUnmodifiableSet()),
+                    captured.privateServices());
+        } catch (RuntimeException failure) {
+            try {
+                retirePrivateServices(captured.privateServices());
+            } catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    /** 多个私有 MCP 同时存在时逐个退休，单一传输清理故障不得留下其它客户端进程。 */
+    @SuppressWarnings("PMD.CloseResource") // retire(true) 是该目录的完整关闭边界，必须逐项执行。
+    private static void retirePrivateServices(java.util.List<McpServiceDirectory> directories) {
+        RuntimeException first = null;
+        for (McpServiceDirectory directory : directories) {
+            try {
+                directory.retire(true);
+            } catch (RuntimeException failure) {
+                if (first == null) first = new IllegalStateException("mcp_private_cleanup_failed");
+                first.addSuppressed(failure);
+            }
+        }
+        if (first != null) throw first;
     }
 
     /** 每次项目远端调用前读取最新代际；信任读取失败时拒绝调用，避免旧 Turn pin 绕过撤信。 */
@@ -109,13 +135,15 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
     /**
      * Provider 安全点返回目录与同源路由证明，禁止调用方重新散列或从名称猜测 definitionRevision。
      */
-    public static final class CatalogSnapshot {
+    public static final class CatalogSnapshot implements AutoCloseable {
         private final McpGateway.McpSnapshot snapshot;
         private final Map<String, McpGateway.RouteIdentity> routeIdentities;
         private final Map<String, McpServiceDirectory> services;
         private final java.util.List<McpGateway.McpServerStatus> serverStatuses;
         private final java.nio.file.Path workspaceRoot;
         private final Set<String> projectServerIds;
+        private final java.util.List<McpServiceDirectory> privateServices;
+        private final AtomicBoolean closed = new AtomicBoolean();
 
         /**
          * 防御性复制同源投影与不对外暴露的目录 owner，避免请求组装后被并发刷新替换。
@@ -125,13 +153,15 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
                 Map<String, McpGateway.RouteIdentity> routeIdentities,
                 Map<String, McpServiceDirectory> services,
                 java.util.List<McpGateway.McpServerStatus> serverStatuses,
-                java.nio.file.Path workspaceRoot, Set<String> projectServerIds) {
+                java.nio.file.Path workspaceRoot, Set<String> projectServerIds,
+                java.util.List<McpServiceDirectory> privateServices) {
             this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
             this.routeIdentities = Map.copyOf(routeIdentities);
             this.services = Map.copyOf(services);
             this.serverStatuses = java.util.List.copyOf(serverStatuses);
             this.workspaceRoot = workspaceRoot;
             this.projectServerIds = Set.copyOf(projectServerIds);
+            this.privateServices = java.util.List.copyOf(privateServices);
         }
 
         /**
@@ -141,7 +171,8 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         public static CatalogSnapshot planningEmpty() {
             return new CatalogSnapshot(
                     new McpGateway.McpSnapshot("mcp_plan_disabled", java.util.List.of(),
-                            java.time.Instant.EPOCH), Map.of(), Map.of(), java.util.List.of(), null, Set.of());
+                            java.time.Instant.EPOCH), Map.of(), Map.of(), java.util.List.of(), null, Set.of(),
+                    java.util.List.of());
         }
 
         /** 返回当前 Provider 请求看到的不可变 Tool 目录。 */
@@ -162,6 +193,19 @@ public final class GenerationTurnMcpSessionFactory implements TurnMcpSessionFact
         /** 仅允许本 Factory pin 包内 owner，防止上层绕过 Gateway 生命周期。 */
         private Map<String, McpServiceDirectory> services() {
             return services;
+        }
+
+        /** RuntimeLease 完成或失败时退休客户端私有目录；已被 Gateway pin 的调用结算后再关。 */
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                retirePrivateServices(privateServices);
+            }
+        }
+
+        /** 租约关闭后不得重新打开已退休的原生客户端 stdio。 */
+        private void requireOpen() {
+            if (closed.get()) throw new IllegalStateException("mcp_catalog_snapshot_closed");
         }
     }
 

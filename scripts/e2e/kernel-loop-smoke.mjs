@@ -96,7 +96,7 @@ function emptyConfiguration() {
     subagents: { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [],
     mcp_servers: [],
-    skills: [],
+    disabled_skills: [],
   };
 }
 

@@ -11,7 +11,6 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.conversation.port.out.ConversationRepository;
 
-import java.time.Instant;
 import java.util.List;
 
 /** 复用首版 Thread/Turn 身份语义，避免测试夹具生成不完整的请求事实。 */
@@ -35,7 +34,7 @@ public final class ConversationTestFixtures {
     /** 为持久化测试冻结完整 READY 游标；请求级 runtime 不再写入 Operation Common。 */
     public static TurnExecutionState.Ready execution(String generation) {
         TurnExecutionState.Common common = new TurnExecutionState.Common(0, 0, 1,
-                null, List.of(), Instant.parse("2099-01-01T00:00:00Z"),
+                null, List.of(),
                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
         return new TurnExecutionState.Ready(common, TurnExecutionState.Next.ASSISTANT, null);
     }

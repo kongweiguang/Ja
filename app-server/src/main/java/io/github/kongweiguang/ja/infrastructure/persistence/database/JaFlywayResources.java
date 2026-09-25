@@ -31,7 +31,15 @@ final class JaFlywayResources implements ResourceProvider {
             RESOURCE_ROOT + "V3__subagent_reasoning.sql",
             RESOURCE_ROOT + "V4__conversation_recovery_usage_projection.sql",
             RESOURCE_ROOT + "V6__conversation_current_path_reask.sql",
-            RESOURCE_ROOT + "V7__session_workspace_identity.sql");
+            RESOURCE_ROOT + "V7__session_workspace_identity.sql",
+            RESOURCE_ROOT + "V8__client_operation_receipts.sql",
+            RESOURCE_ROOT + "V9__goal_progress_counter.sql",
+            RESOURCE_ROOT + "V10__unbounded_round_counters.sql",
+            RESOURCE_ROOT + "V11__execution_cursor_without_budget.sql",
+            RESOURCE_ROOT + "V12__drop_execution_budgets.sql",
+            RESOURCE_ROOT + "V13__plan_evaluation_attempts.sql",
+            RESOURCE_ROOT + "V14__assistant_public_text_pages.sql",
+            RESOURCE_ROOT + "V15__input_operation_receipts.sql");
 
     /**
      * 只暴露版本化迁移闭集，因此 Native Image 和 JVM 不可能走出不同升级链。

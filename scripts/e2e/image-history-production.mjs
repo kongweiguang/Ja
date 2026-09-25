@@ -399,7 +399,7 @@ async function writeIsolatedSettings(home, baseUrl) {
     'default_model_id = "model_e2e"',
     "default_reasoning_level = { __ja_null = true }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
@@ -413,10 +413,6 @@ async function writeIsolatedSettings(home, baseUrl) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 4",
-    "max_tool_calls = 8",
-    "wall_timeout_ms = 30000",
     "[[providers.models]]",
     'model_id = "model_e2e"',
     'name = "Image History E2E Model"',
@@ -445,8 +441,8 @@ async function writeIsolatedSettings(home, baseUrl) {
 /** 读取生产主窗口与 Windows 覆盖，防止 E2E 用另一套窗口结构规避真实布局。 */
 async function readProductionMainWindowConfig() {
   const [base, windows] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
   ]);
   const baseWindow = base?.app?.windows?.find((candidate) => candidate?.label === "main");
   const windowsWindow = windows?.app?.windows?.find((candidate) => candidate?.label === "main");

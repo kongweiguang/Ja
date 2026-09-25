@@ -42,7 +42,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 /**
@@ -108,7 +107,7 @@ public final class HttpSummaryModel implements SummaryModel {
         }
         Invocation invocation = current.invocation();
         return executeBounded(invocation.configuration().requestTimeout(),
-                controller -> executeWithRetry(current, controller));
+                controller -> executeOnce(current, controller));
     }
 
     /**
@@ -143,36 +142,16 @@ public final class HttpSummaryModel implements SummaryModel {
     }
 
     /**
-     * 复用 Ja 的语义提交前重试门禁，禁止重放已接纳的摘要字节或 usage。
+     * 摘要 Adapter 只执行一次网络交换；调用方持久化每次请求身份后再决定恢复。
      */
-    private SummaryGenerator.SummaryResult executeWithRetry(
+    private SummaryGenerator.SummaryResult executeOnce(
             PreparedInvocation invocation, RequestController controller) {
-        AtomicBoolean semanticAccepted = new AtomicBoolean();
-        ProviderProtocolException last = null;
-        for (int attempt = 1; attempt <= AbstractStreamingModelAdapter.MAX_ATTEMPTS; attempt++) {
-            controller.throwIfStopped();
-            SummaryCollector collector = new SummaryCollector(
-                    invocation.invocation().prompt().maxOutputTokens());
-            StreamContext context = new StreamContext(
-                    collector, semanticAccepted, controller, invocation.invocation().stateRequest());
-            try {
-                ModelPort.ModelOutcome outcome = executeProviderAttempt(invocation, context, controller);
-                controller.throwIfStopped();
-                return collector.finish(outcome);
-            } catch (CancellationException cancelled) {
-                throw cancelled;
-            } catch (ProviderProtocolException failure) {
-                last = failure;
-                if (!failure.retryable() || semanticAccepted.get()
-                    || attempt == AbstractStreamingModelAdapter.MAX_ATTEMPTS) {
-                    throw failure;
-                }
-                AbstractStreamingModelAdapter.awaitBackoff(
-                        attempt, failure.retryAfter().orElse(null), controller);
-            }
-        }
-        throw new ProviderProtocolException(
-                "NETWORK_ERROR", "summary provider request failed before a response", true, last);
+        controller.throwIfStopped();
+        SummaryCollector collector = new SummaryCollector(invocation.invocation().prompt().maxOutputTokens());
+        StreamContext context = new StreamContext(collector, controller, invocation.invocation().stateRequest());
+        ModelPort.ModelOutcome outcome = executeProviderAttempt(invocation, context, controller);
+        controller.throwIfStopped();
+        return collector.finish(outcome);
     }
 
     /**
@@ -466,7 +445,8 @@ public final class HttpSummaryModel implements SummaryModel {
         if (failure instanceof ModelPort.ContextOverflowException) {
             return failure("summary model exceeded its context limit");
         }
-        return failure("summary model request failed");
+        return new ContextException(ContextException.Code.SUMMARY_FAILURE,
+                "summary model request failed", failure);
     }
 
     /**

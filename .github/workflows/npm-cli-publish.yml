@@ -1,0 +1,126 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Publish Ja CLI to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact verified main commit SHA
+        required: true
+        type: string
+      native_run_id:
+        description: Successful native-app-server push run for that commit
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ja-npm-kongweiguang-ja
+  cancel-in-progress: false
+
+jobs:
+  publish-windows-x64:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: Checkout the selected source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+
+      - name: Verify the commit and native evidence run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          JA_NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+        run: |
+          if ($env:JA_SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') { throw 'source_commit must be a full SHA' }
+          if ($env:JA_NATIVE_RUN_ID -notmatch '^[1-9][0-9]*$') { throw 'native_run_id is invalid' }
+          if ((git rev-parse HEAD).Trim() -cne $env:JA_SOURCE_COMMIT) { throw 'checkout differs from source_commit' }
+          git fetch origin main --depth=1
+          if ((git rev-parse origin/main).Trim() -cne $env:JA_SOURCE_COMMIT) { throw 'source_commit is not current main' }
+          $run = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:JA_NATIVE_RUN_ID" | ConvertFrom-Json
+          if ($run.head_sha -cne $env:JA_SOURCE_COMMIT -or $run.event -cne 'push' -or
+              $run.head_branch -cne 'main' -or $run.conclusion -cne 'success' -or
+              $run.name -cne 'Ja App Server native matrix') {
+            throw 'native run is not the successful main verification for this source'
+          }
+
+      - name: Install Node.js 24 for the npm launcher and publisher
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          registry-url: https://registry.npmjs.org
+
+      - name: Install the npm version required for Trusted Publishing
+        shell: pwsh
+        run: npm install -g npm@11.16.0
+
+      - name: Test npm package staging and metadata
+        shell: pwsh
+        run: node --test packages/ja-npm/tests/*.test.mjs
+
+      - name: Download the verified Windows x64 App Server
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ja-native-reuse-windows-x86_64
+          path: ${{ runner.temp }}/ja-native-reuse
+          run-id: ${{ inputs.native_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Build the matching Rust CLI
+        shell: pwsh
+        run: cargo build --locked --release -p ja-cli
+
+      - name: Stage, inspect, and install the npm tarball
+        shell: pwsh
+        env:
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-npm-stage'
+          $reuse = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
+          node packages/ja-npm/scripts/stage.mjs `
+            --cli 'target/release/ja.exe' `
+            --app-server (Join-Path $reuse 'app-server/target/ja-app-server.exe') `
+            --native-report (Join-Path $reuse 'native-evidence/build-report.json') `
+            --source-commit $env:JA_SOURCE_COMMIT `
+            --out $stage
+          if ($LASTEXITCODE -ne 0) { throw 'npm staging failed' }
+          Push-Location $stage
+          try {
+            node bin/verify.cjs
+            if ($LASTEXITCODE -ne 0) { throw 'npm native verification failed' }
+            npm pack --dry-run
+            if ($LASTEXITCODE -ne 0) { throw 'npm pack dry run failed' }
+            $packed = npm pack --json | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $packed.Count -ne 1) { throw 'npm pack failed' }
+            $archive = Join-Path $stage $packed[0].filename
+          } finally {
+            Pop-Location
+          }
+          $install = Join-Path $env:RUNNER_TEMP 'ja-npm-install'
+          New-Item -ItemType Directory -Path $install | Out-Null
+          npm install --offline --ignore-scripts --no-audit --no-fund --prefix $install $archive
+          if ($LASTEXITCODE -ne 0) { throw 'clean npm install failed' }
+          & (Join-Path $install 'node_modules/.bin/ja.cmd') --help
+          if ($LASTEXITCODE -ne 0) { throw 'installed Ja launcher failed' }
+
+      - name: Publish the verified public package through npm OIDC
+        shell: pwsh
+        run: |
+          Push-Location (Join-Path $env:RUNNER_TEMP 'ja-npm-stage')
+          try {
+            npm publish --access public
+            if ($LASTEXITCODE -ne 0) { throw 'npm publish failed' }
+          } finally {
+            Pop-Location
+          }

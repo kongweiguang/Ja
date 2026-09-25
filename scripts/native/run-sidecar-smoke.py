@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from typing import Any
 
 import jsonschema
@@ -37,41 +38,58 @@ READY_TOKEN = "0123456789abcdef0123456789abcdef"
 EXPECTED_ENGINE_VERSION = json.loads(
     (Path(__file__).parents[2] / "package.json").read_text(encoding="utf-8")
 )["version"]
-METHODS = [
-    "runtime/initialize", "runtime/health", "runtime/shutdown", "workspace/open", "workspace/list",
-    "workspace/path/search", "workspace/set-trust", "workspace/unregister", "thread/create", "thread/list", "thread/search",
-    "thread/read", "thread/usage/read", "thread/mcp/read", "thread/rename", "thread/pin", "thread/seen", "thread/preferences/update", "thread/archive",
-    "thread/restore", "thread/delete", "thread/compact",
-    "interaction/read", "interaction/observe", "interaction/unobserve", "interaction/draft/save",
-    "interaction/respond", "interaction/cancel",
-    "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read", "plan/revisions/list",
-    "plan/current/read", "plan/events/read", "plan/observe", "plan/unobserve", "plan/evidence/list",
-    "goal/evidence/list", "goal/create", "goal/plan/attach", "goal/plan/detach", "goal/pause", "goal/resume",
-    "goal/stop", "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute",
-    "plan/reject", "plan/pause", "plan/resume", "plan/stop",
-    "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
-    "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
-    "attachment/import", "attachment/discard", "attachment/preview/open", "attachment/preview/read",
-    "attachment/preview/close", "turn/start", "turn/continue", "turn/reask", "turn/resume", "turn/recovery/respond", "turn/cancel", "turn/input/enqueue",
-    "turn/input/prioritize", "turn/input/update", "turn/input/delete", "turn/change-set/read",
-    "approval/respond", "configuration/read", "configuration/patch", "configuration/replace",
-    "configuration/reset", "configuration/restore", "credential/set", "credential/delete", "credential/reveal-provider",
-    "skill/list", "mcp/list", "mcp/test", "model/test", "model/discover", "mcp/list-tools",
-    "tool/artifact/read",
-]
-EVENTS = [
-    "runtime/status-changed", "turn/state-changed", "turn/input-queue-changed", "turn/input-consumed",
-    "turn/retry-started",
-    "turn/messages_received",
-    "assistant/model-step-committed",
-    "assistant/text-delta", "assistant/reasoning-summary-delta", "tool/started", "tool/batch-committed",
-    "approval/requested", "approval/resolved", "context/compaction-started", "context/compacted",
-    "context/compaction-failed",
-    "workspace/dirty", "turn/terminal",
-    "thread/metadata-changed", "configuration/changed",
-    "task/activity", "task/progress", "task/mailbox-changed",
-    "goal/changed", "goal/activity", "interaction/changed", "plan/changed",
-]
+PROTOCOL_SCHEMA_PATH = (
+    Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
+)
+PROTOCOL_GOLDEN_PATH = (
+    Path(__file__).parents[2] / "contracts" / "golden" / "v1" / "valid" / "core.jsonl"
+)
+
+
+def load_capability_names(
+    schema_path: Path = PROTOCOL_SCHEMA_PATH,
+    golden_path: Path = PROTOCOL_GOLDEN_PATH,
+) -> tuple[list[str], list[str]]:
+    """Use golden handshake order and fail closed unless its names match the authoritative schema."""
+
+    try:
+        definitions = json.loads(schema_path.read_text(encoding="utf-8"))["$defs"]
+        schema_methods = definitions["methodName"]["enum"]
+        event_names = definitions["eventName"]["enum"]
+        golden_line = next(
+            line for line in golden_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+        golden_frame = json.loads(golden_line)
+        if golden_frame.get("jsonrpc") != "2.0" or golden_frame.get("method") != "runtime/initialize":
+            raise ValueError("golden first frame is not runtime/initialize")
+        golden_capabilities = golden_frame["params"]["capabilities"]
+        methods = golden_capabilities["methods"]
+        events = golden_capabilities["events"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, StopIteration, ValueError) as failure:
+        raise RuntimeError("JA-RPC v1 capability enums are unavailable") from failure
+    for label, values in (
+        ("methodName", schema_methods),
+        ("eventName", event_names),
+        ("golden methods", methods),
+        ("golden events", events),
+    ):
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value for value in values)
+            or len(values) != len(set(values))
+        ):
+            raise RuntimeError(f"JA-RPC v1 {label} enum is invalid")
+    if event_names.count("runtime/initialized") != 1:
+        raise RuntimeError("JA-RPC v1 runtime/initialized event is missing or duplicated")
+    # The schema includes this handshake frame in eventName, but Java advertises only later events.
+    schema_events = [name for name in event_names if name != "runtime/initialized"]
+    if set(methods) != set(schema_methods) or set(events) != set(schema_events):
+        raise RuntimeError("JA-RPC golden capability sets differ from the v1 schema")
+    return list(methods), list(events)
+
+
+METHODS, EVENTS = load_capability_names()
 SECRET_NAME_PARTS = (
     "API_KEY",
     "TOKEN",
@@ -325,6 +343,8 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
     The document contains no credential bytes and points only at servers owned by this smoke
     process. Keeping Provider and models in the same v2 batch as the MCP descriptor proves that the
     executable resolves one immutable generation instead of relying on a test-only provider hook.
+    Agent defaults retain only the schema-supported context policy; turn limits are not config fields.
+    The v2 document records skill suppression through disabled_skills; discovered skills stay in the workspace.
     """
 
     return {
@@ -344,11 +364,6 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
             "network_timeouts": {"connect_timeout_ms": 2_000, "request_timeout_ms": 10_000},
             "agent_defaults": {
                 "context": {"auto_compact": True},
-                "turn_limits": {
-                    "max_model_rounds": 8,
-                    "max_tool_calls": 8,
-                    "wall_timeout_ms": 30_000,
-                },
             },
             "models": [{
                 "model_id": MODEL_ID,
@@ -373,7 +388,7 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
             "auth": {"kind": "none"},
             "enabled": True,
         }],
-        "skills": [],
+        "disabled_skills": [],
         "subagents": {"enabled": False, "provider_id": None, "model_id": None, "reasoning_level": None},
     }
 
@@ -406,7 +421,7 @@ def configuration_replace_frame(
     """通过 v2 replace CAS 构造严格的本地探针配置文档。
 
     无法提供 loopback 探针的调用方使用合同测试所需的空目录；生产 smoke 在发送前必须同时
-    提供 Provider 与 MCP endpoint。
+    提供 Provider 与 MCP endpoint。空技能禁用集合仍显式传递，符合当前 v2 配置要求。
     """
 
     document = configuration_document(provider_endpoint, mcp_endpoint) \
@@ -420,7 +435,7 @@ def configuration_replace_frame(
             "default_reasoning_level": None,
             "providers": [],
             "mcp_servers": [],
-            "skills": [],
+            "disabled_skills": [],
             "subagents": {"enabled": False, "provider_id": None, "model_id": None, "reasoning_level": None},
         }
 
@@ -509,13 +524,13 @@ def mcp_tools_read_frame() -> dict[str, Any]:
 
 
 def turn_start_frame(thread_id: str, text: str) -> dict[str, Any]:
-    """Start a bounded workspace Turn through the public v1 RPC rather than a private test hook."""
+    """Keep timeout ownership in the harness; the v1 frame carries only admission identity and content."""
 
     return {
         "jsonrpc": "2.0", "id": "c:turn-start", "method": "turn/start",
         "params": {
             "threadId": thread_id, "content": [{"type": "text", "text": text}],
-            "deadlineMs": 15_000,
+            "clientOperationId": f"op_{uuid.uuid4().hex}",
         },
     }
 
@@ -535,13 +550,13 @@ def turn_cancel_frame(turn_id: str) -> dict[str, Any]:
 
 
 def approval_response_frame(approval_id: str, turn_id: str, expected_revision: int) -> dict[str, Any]:
-    """Approve exactly the fixture shell call before immediately exercising cancellation."""
+    """Approve one fixture call with a fresh idempotency key before exercising its outcome."""
 
     return {
         "jsonrpc": "2.0", "id": "c:approval", "method": "approval/respond",
         "params": {
             "approvalId": approval_id, "turnId": turn_id, "decision": "approve",
-            "expectedThreadRevision": expected_revision,
+            "expectedThreadRevision": expected_revision, "clientOperationId": f"op_{uuid.uuid4().hex}",
         },
     }
 

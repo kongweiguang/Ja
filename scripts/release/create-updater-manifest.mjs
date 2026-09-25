@@ -103,7 +103,7 @@ function parseMinisignPublicKey(text) {
 async function loadMinisignPublicKey({ publicKey, tauriConfig }) {
   if (typeof publicKey === "string" && publicKey.trim() !== "")
     return parseMinisignPublicKey(publicKey);
-  const configPath = resolve(tauriConfig ?? "src-tauri/tauri.conf.json");
+  const configPath = resolve(tauriConfig ?? "apps/desktop/src-tauri/tauri.conf.json");
   let config;
   try {
     config = JSON.parse(await readFile(configPath, "utf8"));

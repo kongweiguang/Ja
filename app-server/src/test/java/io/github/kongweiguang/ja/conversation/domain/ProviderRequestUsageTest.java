@@ -14,6 +14,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 /** Provider 请求用量首版不变量测试。 */
 final class ProviderRequestUsageTest {
 
+    /** 极端上游数字不能通过 long 加法回绕伪装成有效计量，再污染持久账本。 */
+    @Test
+    void rejectsOverflowedTokenTotals() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new ModelUsage(Long.MAX_VALUE, 1, Long.MAX_VALUE));
+    }
+
     /** UNKNOWN 仍是可靠事实，但必须保留 dispatch 时冻结的完整请求画像。 */
     @Test
     void acceptsUnknownUsageWithCompleteProfile() {

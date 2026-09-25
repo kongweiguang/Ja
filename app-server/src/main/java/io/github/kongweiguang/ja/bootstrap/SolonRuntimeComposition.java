@@ -460,12 +460,6 @@ public final class SolonRuntimeComposition {
                 goals, clock, generation.value(), service::publishCommitted);
         if (!AotSideEffectGuard.processing()) {
             loop.bindGoalToolExecution(ledger);
-            turns.bindPlanResumeBudget(turnId -> goals.findInternalTurnBinding(turnId)
-                    .filter(binding -> "PLAN_EXECUTION".equals(binding.origin()))
-                    .flatMap(binding -> goals.readPlanRunBudget(binding.planId(), binding.runId()))
-                    .map(budget -> new io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits(
-                            budget.remainingModelRounds(), budget.remainingToolCalls(), 4_000_000, 1_000_000,
-                            Duration.ofMillis(budget.remainingWallBudgetMillis()))));
         }
         return ledger;
     }
@@ -552,9 +546,8 @@ public final class SolonRuntimeComposition {
     @Bean(value = "jaPlanExecutionTurnAdapter", typed = true)
     public PlanExecutionTurnAdapter planExecutionTurnAdapter(
              TurnService turns, ConversationRepository conversations, WorkspaceUseCase workspaces,
-             MybatisGoalRepository plans, ObjectMapper mapper, Clock clock, TaskCoordinator tasks,
-             TurnRuntimeResolver runtimes) {
-        return new PlanExecutionTurnAdapter(turns, conversations, workspaces, plans, mapper, clock, tasks, runtimes);
+             MybatisGoalRepository plans, ObjectMapper mapper, Clock clock, TaskCoordinator tasks) {
+        return new PlanExecutionTurnAdapter(turns, conversations, workspaces, plans, mapper, clock, tasks);
     }
 
     /** 独立 Plan 只使用真实无工具模型验收，确定性前置门不能代替最终完成判断。 */
@@ -571,12 +564,8 @@ public final class SolonRuntimeComposition {
             ModelPort models, TurnRuntimeResolver runtimes, ConversationRepository conversations,
             WorkspaceUseCase workspaces, ObjectMapper mapper, Clock clock,
             io.github.kongweiguang.ja.goal.application.PlanEvaluationAuditPort audit) {
-        java.util.concurrent.ScheduledThreadPoolExecutor deadlines = new java.util.concurrent.ScheduledThreadPoolExecutor(
-                1, Thread.ofPlatform().daemon().name("ja-plan-evaluation-deadline-", 0).factory());
-        deadlines.setRemoveOnCancelPolicy(true);
-        lifecycle.own((AutoCloseable) deadlines::shutdownNow);
         return new io.github.kongweiguang.ja.goal.application.RuntimePlanEvaluatorAdapter(
-                models, runtimes, conversations, workspaces, mapper, clock, audit, deadlines);
+                models, runtimes, conversations, workspaces, mapper, clock, audit);
     }
 
     /** evaluator 复用当前配置模型，但强制无 Tool、无执行历史与 SINGLE_ATTEMPT。 */
@@ -647,10 +636,9 @@ public final class SolonRuntimeComposition {
     public GoalUseCase goalService(MybatisGoalRepository repository, ObjectMapper mapper, Clock clock,
                                    RuntimeProcessGeneration generation, GoalEventRegistry events,
                                    GoalContinuationGate continuations,
-                                   PlanExecutionCoordinator planExecutions, PlanEventRegistry planEvents,
-                                   PlanExecutionTurnAdapter planBudgets) {
+                                   PlanExecutionCoordinator planExecutions, PlanEventRegistry planEvents) {
         GoalService service = new GoalService(repository, mapper, clock, generation.value(), events, continuations,
-                planExecutions, planEvents, planBudgets);
+                planExecutions, planEvents);
         planExecutions.bindPlanCommitObserver(planId -> service.publishPlanCommittedAfterExecution(planId));
         return service;
     }

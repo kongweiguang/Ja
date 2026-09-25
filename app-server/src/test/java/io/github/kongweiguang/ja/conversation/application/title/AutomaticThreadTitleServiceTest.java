@@ -77,7 +77,7 @@ final class AutomaticThreadTitleServiceTest {
         assertNull(sent.configuration().generation().topP());
         assertNull(sent.configuration().generation().reasoningLevel());
         assertTrue(sent.tools().isEmpty());
-        assertEquals(ModelPort.RetryPolicy.SINGLE_ATTEMPT, sent.retryPolicy());
+        assertEquals(ModelPort.RequestDeadlinePolicy.CALL_BOUNDED, sent.deadlinePolicy());
         assertEquals("生产级 UI 重构", threads.summary.title());
         assertEquals(ThreadPreferences.TitleSource.AUTO, threads.preferences.titleSource());
         assertEquals(1, events.size());

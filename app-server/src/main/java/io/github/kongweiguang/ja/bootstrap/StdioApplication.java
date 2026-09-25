@@ -42,6 +42,7 @@ public final class StdioApplication {
     public int run(String[] args) {
         SolonApp app = null;
         RpcServer runtime = null;
+        TcpDaemon tcpDaemon = null;
         Logger logger = null;
         int exitCode = 0;
         boolean aotProcessing = AotSideEffectGuard.processing();
@@ -74,19 +75,33 @@ public final class StdioApplication {
                 if (!(configurationRuntime instanceof ConfigurationRuntimeAdapter) || workspaces == null) {
                     throw new IllegalStateException("Ja configuration change bridge is unavailable");
                 }
-                runtime = new RpcServer(System.in, System.out, configuration,
-                        adaptRuntimeFactory(factory), configurationUseCase,
-                        session -> bindConfigurationChangeNotifications(
-                                (ConfigurationRuntimeAdapter) configurationRuntime, workspaces, session));
-                exitCode = runtime.run();
+                RpcServer.SessionBinding binding = session -> bindConfigurationChangeNotifications(
+                        (ConfigurationRuntimeAdapter) configurationRuntime, workspaces, session);
+                if (java.util.Arrays.asList(args).contains("--ja-transport=tcp")) {
+                    tcpDaemon = new TcpDaemon(configuration, adaptRuntimeFactory(factory),
+                            configurationUseCase, binding);
+                    exitCode = tcpDaemon.run();
+                } else {
+                    runtime = new RpcServer(System.in, System.out, configuration,
+                            adaptRuntimeFactory(factory), configurationUseCase, binding);
+                    exitCode = runtime.run();
+                }
             }
-        } catch (RuntimeException failure) {
+        } catch (RuntimeException | java.io.IOException failure) {
             Logger activeLogger = logger == null ? LoggerFactory.getLogger(StdioApplication.class) : logger;
             activeLogger.error("Ja Kernel sidecar failed ({})", failure.getClass().getSimpleName());
             exitCode = 1;
         } finally {
             ShutdownDeadline shutdownDeadline = ShutdownDeadline.start();
             RuntimeException closeFailure = closeRuntime(runtime, shutdownDeadline);
+            if (tcpDaemon != null) {
+                try {
+                    tcpDaemon.close();
+                } catch (RuntimeException failure) {
+                    if (closeFailure == null) closeFailure = failure;
+                    else closeFailure.addSuppressed(failure);
+                }
+            }
             closeFailure = closeLifecycle(app, aotProcessing, shutdownDeadline, closeFailure);
             closeFailure = stopSolon(app, aotProcessing, shutdownDeadline, closeFailure);
             if (closeFailure != null) {

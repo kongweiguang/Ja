@@ -70,13 +70,6 @@ const configMapSchema = z
   .record(z.string().min(1).max(128), z.string().max(MAX_MAP_VALUE))
   .refine(safeConfigMap);
 const configContextSchema = z.object({ auto_compact: z.boolean() }).strict();
-const configTurnLimitsSchema = z
-  .object({
-    max_model_rounds: z.number().int().min(1).max(128),
-    max_tool_calls: z.number().int().min(0).max(1_024),
-    wall_timeout_ms: z.number().int().min(1_000).max(86_400_000),
-  })
-  .strict();
 const configNetworkTimeoutsSchema = z
   .object({
     connect_timeout_ms: z.number().int().min(100).max(120_000),
@@ -114,7 +107,6 @@ const configModelCapabilitiesSchema = z
 const configAgentDefaultsSchema = z
   .object({
     context: configContextSchema,
-    turn_limits: configTurnLimitsSchema,
   })
   .strict();
 
@@ -212,7 +204,7 @@ export const ConfigMcpServerSchema = z
     env: configMapSchema,
     headers: configMapSchema,
     auth: ConfigMcpAuthSchema,
-    enabled: z.boolean(),
+    enabled: z.boolean().default(true),
   })
   .strict();
 
@@ -229,12 +221,16 @@ export const ConfigDocumentSchema = z
     subagents: ConfigSubagentsSchema,
     providers: z.array(ConfigProviderSchema).max(MAX_CATALOG_ITEMS),
     mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS),
-    skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS),
+    disabled_skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS),
   })
   .strict()
   .superRefine((document, context) => {
-    if (new Set(document.skills).size !== document.skills.length) {
-      context.addIssue({ code: "custom", path: ["skills"], message: "duplicate skill reference" });
+    if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["disabled_skills"],
+        message: "duplicate skill reference",
+      });
     }
     if (
       new Set(document.providers.map((provider) => provider.provider_id)).size !==
@@ -327,15 +323,11 @@ export const ConfigProjectDocumentSchema = z
   .object({
     schema_version: z.literal(2),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
-    skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
-    disabled_skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
+    disabled_skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
     mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS).default([]),
   })
   .strict()
   .superRefine((document, context) => {
-    if (new Set(document.skills).size !== document.skills.length) {
-      context.addIssue({ code: "custom", path: ["skills"], message: "duplicate skill reference" });
-    }
     if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
       context.addIssue({
         code: "custom",

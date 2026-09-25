@@ -648,10 +648,21 @@ export function useTaskController({
     }
     let active = true;
     let observationId: string | undefined;
+    let transcriptObserved = false;
     setDetailLoading(true);
     const setup = async (): Promise<void> => {
       let initialTranscriptReady = false;
       try {
+        // Child 正文的连接订阅先于初始快照；Task Activity 的 observationId 不覆盖 Turn 流。
+        const transcriptAck = await transcriptPort.observe({ threadId: activeTaskThreadId });
+        if (!transcriptAck.accepted || transcriptAck.threadId !== activeTaskThreadId)
+          throw new Error("child transcript observation identity changed");
+        transcriptObserved = true;
+        if (!active || epoch !== detailEpochRef.current) {
+          transcriptObserved = false;
+          await transcriptPort.unobserve({ threadId: activeTaskThreadId }).catch(() => undefined);
+          return;
+        }
         const [detailResult, transcriptResult] = await Promise.allSettled([
           port.read({ taskThreadId: activeTaskThreadId, limit: 200 }),
           transcriptPort.read({ threadId: activeTaskThreadId, limit: 200 }),
@@ -731,6 +742,10 @@ export function useTaskController({
       if (observationRef.current === observationId) observationRef.current = undefined;
       if (observationId !== undefined)
         void port.unobserve({ observationId }).catch(() => undefined);
+      if (transcriptObserved) {
+        transcriptObserved = false;
+        void transcriptPort.unobserve({ threadId: activeTaskThreadId }).catch(() => undefined);
+      }
     };
   }, [
     activeTaskThreadId,

@@ -27,19 +27,16 @@ final class TolerantConfigurationDocumentReader {
     private static final int CURRENT_SCHEMA_VERSION = ConfigurationDocumentFactory.CURRENT_SCHEMA_VERSION;
     private static final long DEFAULT_CONNECT_TIMEOUT_MILLIS = 10_000L;
     private static final long DEFAULT_REQUEST_TIMEOUT_MILLIS = 300_000L;
-    private static final long DEFAULT_WALL_TIMEOUT_MILLIS = 3_600_000L;
     private static final long DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000L;
     private static final long DEFAULT_MAX_OUTPUT_TOKENS = 8_192L;
-    private static final int DEFAULT_MAX_MODEL_ROUNDS = 32;
-    private static final int DEFAULT_MAX_TOOL_CALLS = 128;
     private static final Set<String> REASONING_LEVELS = Set.of(
             "off", "minimal", "low", "medium", "high", "xhigh", "max");
     private static final Set<String> USER_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
             "default_model_id", "default_reasoning_level", "interaction", "subagents",
-            "providers", "mcp_servers", "skills");
+            "providers", "mcp_servers", "disabled_skills");
     private static final Set<String> PROJECT_ROOT_KEYS = Set.of(
-            "schema_version", "config_revision", "skills", "disabled_skills", "mcp_servers");
+            "schema_version", "config_revision", "disabled_skills", "mcp_servers");
     private static final Set<String> PROVIDER_KEYS = Set.of(
             "provider_id", "name", "api", "base_url", "credential_id", "network_timeouts",
             "agent_defaults", "models");
@@ -85,7 +82,7 @@ final class TolerantConfigurationDocumentReader {
         result.put("default_access_mode", accessMode);
         result.set("interaction", normalizeInteraction(source.get("interaction"), issues));
         result.set("subagents", normalizeSubagents());
-        result.set("skills", normalizeSkillReferences(source.get("skills"), ConfigurationScope.USER, false, issues));
+        result.set("disabled_skills", normalizeSkillReferences(source.get("disabled_skills"), ConfigurationScope.USER, issues));
 
         ArrayNode providers = result.putArray("providers");
         Set<String> providerIds = new HashSet<>();
@@ -134,10 +131,7 @@ final class TolerantConfigurationDocumentReader {
         }
         result.put("config_revision", positiveRevision(source.get("config_revision"), issues, "project", "config_revision"));
         copyUnknownRootFields(source, PROJECT_ROOT_KEYS, "project", issues);
-        result.set("skills", normalizeSkillReferences(source.get("skills"), ConfigurationScope.PROJECT, false, issues));
-        ArrayNode disabled = normalizeSkillReferences(source.get("disabled_skills"), ConfigurationScope.PROJECT,
-                true, issues);
-        if (!disabled.isEmpty()) result.set("disabled_skills", disabled);
+        result.set("disabled_skills", normalizeSkillReferences(source.get("disabled_skills"), ConfigurationScope.PROJECT, issues));
         ArrayNode servers = result.putArray("mcp_servers");
         Set<String> mcpIds = new HashSet<>();
         JsonNode sourceServers = source.get("mcp_servers");
@@ -187,7 +181,7 @@ final class TolerantConfigurationDocumentReader {
         }
         result.put("credential_id", credential);
         result.set("network_timeouts", normalizeNetworkTimeouts(source.get("network_timeouts"), id, issues));
-        result.set("agent_defaults", normalizeAgentDefaults(source.get("agent_defaults"), id, issues));
+        result.set("agent_defaults", normalizeAgentDefaults(source.get("agent_defaults")));
         ArrayNode models = result.putArray("models");
         Set<String> modelIds = new HashSet<>();
         JsonNode sourceModels = source.get("models");
@@ -261,7 +255,7 @@ final class TolerantConfigurationDocumentReader {
         result.put("transport", transport);
         result.put("endpoint", endpoint);
         JsonNode enabled = source.get("enabled");
-        if (enabled == null || !enabled.isBoolean()) {
+        if (enabled != null && !enabled.isBoolean()) {
             issue(issues, scope, "enabled", id, "INVALID_FIELD", "entry_skipped", "edit");
             return null;
         }
@@ -269,7 +263,7 @@ final class TolerantConfigurationDocumentReader {
         result.set("env", safeStringMap(source.get("env"), 8_192));
         result.set("headers", safeStringMap(source.get("headers"), 8_192));
         result.set("auth", auth);
-        result.put("enabled", enabled.booleanValue());
+        result.put("enabled", enabled == null || enabled.booleanValue());
         return result;
     }
 
@@ -285,24 +279,14 @@ final class TolerantConfigurationDocumentReader {
         return result;
     }
 
-    /** Agent 默认值只回退预算，不从损坏配置提升执行权限或启用额外目录。 */
-    private static ObjectNode normalizeAgentDefaults(JsonNode value, String entityId,
-                                                      List<ConfigurationData.Issue> issues) {
+    /** Agent 默认值只恢复上下文压缩开关，不从损坏配置提升权限或启用额外目录。 */
+    private static ObjectNode normalizeAgentDefaults(JsonNode value) {
         ObjectNode result = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
         ObjectNode source = value instanceof ObjectNode object ? object : null;
         ObjectNode context = result.putObject("context");
         JsonNode compact = source == null || !(source.get("context") instanceof ObjectNode sourceContext)
                 ? null : sourceContext.get("auto_compact");
         context.put("auto_compact", compact == null || !compact.isBoolean() || compact.booleanValue());
-        ObjectNode limits = result.putObject("turn_limits");
-        ObjectNode sourceLimits = source == null || !(source.get("turn_limits") instanceof ObjectNode object)
-                ? null : object;
-        limits.put("max_model_rounds", positiveInt(sourceLimits == null ? null : sourceLimits.get("max_model_rounds"),
-                DEFAULT_MAX_MODEL_ROUNDS, issues, "turn_limits", entityId));
-        limits.put("max_tool_calls", positiveInt(sourceLimits == null ? null : sourceLimits.get("max_tool_calls"),
-                DEFAULT_MAX_TOOL_CALLS, issues, "turn_limits", entityId));
-        limits.put("wall_timeout_ms", positive(sourceLimits == null ? null : sourceLimits.get("wall_timeout_ms"),
-                DEFAULT_WALL_TIMEOUT_MILLIS, issues, "turn_limits", entityId));
         return result;
     }
 
@@ -349,13 +333,13 @@ final class TolerantConfigurationDocumentReader {
         return result;
     }
 
-    /** 只接纳可由现有 SkillReference 精确解释的引用；错误条目不影响其它工具或模型。 */
-    private static ArrayNode normalizeSkillReferences(JsonNode value, ConfigurationScope scope, boolean disabled,
+    /** 停用名单只接受所属来源身份；旧启用字段作为未知字段报告，不能反向解释为停用。 */
+    private static ArrayNode normalizeSkillReferences(JsonNode value, ConfigurationScope scope,
                                                       List<ConfigurationData.Issue> issues) {
         ArrayNode result = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.arrayNode();
         if (value == null) return result;
         if (!(value instanceof ArrayNode entries)) {
-            issue(issues, scope.name().toLowerCase(java.util.Locale.ROOT), disabled ? "disabled_skills" : "skills",
+            issue(issues, scope.name().toLowerCase(java.util.Locale.ROOT), "disabled_skills",
                     null, "INVALID_FIELD", "default_in_use", "edit");
             return result;
         }
@@ -363,17 +347,16 @@ final class TolerantConfigurationDocumentReader {
         for (JsonNode entry : entries) {
             String reference = text(entry);
             try {
-                SkillReference parsed = reference == null ? null : SkillReference.parse(reference);
+                if (reference == null) throw new IllegalArgumentException("invalid skill reference");
+                SkillReference parsed = SkillReference.parse(reference);
                 boolean allowed = scope == ConfigurationScope.USER
-                        ? !disabled && (parsed.source() == SkillReference.Source.USER || parsed.source() == SkillReference.Source.JA)
-                        : disabled
-                                ? parsed.source() == SkillReference.Source.USER || parsed.source() == SkillReference.Source.JA
-                                : parsed.source() == SkillReference.Source.PROJECT;
+                        ? parsed.source() == SkillReference.Source.USER || parsed.source() == SkillReference.Source.JA
+                        : parsed.source() == SkillReference.Source.PROJECT;
                 if (!allowed || !identities.add(parsed.identifier())) throw new IllegalArgumentException();
                 result.add(reference);
             } catch (IllegalArgumentException invalid) {
                 issue(issues, scope.name().toLowerCase(java.util.Locale.ROOT),
-                        disabled ? "disabled_skills" : "skills", null, "INVALID_ENTRY", "entry_skipped", "edit");
+                        "disabled_skills", null, "INVALID_ENTRY", "entry_skipped", "edit");
             }
         }
         return result;
@@ -526,17 +509,6 @@ final class TolerantConfigurationDocumentReader {
     private static long positive(JsonNode value, long fallback, List<ConfigurationData.Issue> issues,
                                  String field, String entityId) {
         if (value != null && value.isIntegralNumber() && value.longValue() > 0) return value.longValue();
-        if (value != null) issue(issues, "user", field, entityId, "INVALID_FIELD", "default_in_use", "edit");
-        return fallback;
-    }
-
-    /** 上游配置以 long 表示预算，但 Catalog 的轮次和调用数只能安全映射到 Java int。 */
-    private static int positiveInt(JsonNode value, int fallback, List<ConfigurationData.Issue> issues,
-                                   String field, String entityId) {
-        if (value != null && value.isIntegralNumber() && value.longValue() > 0
-                && value.longValue() <= Integer.MAX_VALUE) {
-            return value.intValue();
-        }
         if (value != null) issue(issues, "user", field, entityId, "INVALID_FIELD", "default_in_use", "edit");
         return fallback;
     }

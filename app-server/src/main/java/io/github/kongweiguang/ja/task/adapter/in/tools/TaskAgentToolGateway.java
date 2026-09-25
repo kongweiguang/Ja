@@ -197,9 +197,7 @@ public final class TaskAgentToolGateway implements AgentCapability, TaskCapabili
                                 "taskName", property("string", "Unique sibling task name."),
                                 "brief", property("string", "Focused task brief; parent transcript is not copied."),
                                 "accessMode", enumProperty("Optional child access ceiling.",
-                                        "approval_required", "full_access"),
-                                "timeoutMs", property("integer",
-                                        "Positive timeout bounded by the parent turn.")),
+                                        "approval_required", "full_access")),
                                 List.of("taskName", "brief"))),
                 new ToolSpec("send_message", "Queue a message for another task without waking an idle task",
                         objectSchema(Map.of(
@@ -210,9 +208,7 @@ public final class TaskAgentToolGateway implements AgentCapability, TaskCapabili
                         objectSchema(Map.of(
                                 "targetThreadId", property("string", "Delegated subagent thread identity."),
                                 "message", property("string", "Continuation instruction."),
-                                "expectedTaskRevision", property("integer", "Latest observed task revision."),
-                                "timeoutMs", property("integer",
-                                        "Positive timeout bounded by the parent turn.")),
+                                "expectedTaskRevision", property("integer", "Latest observed task revision.")),
                                 List.of("targetThreadId", "message", "expectedTaskRevision"))),
                 new ToolSpec("wait_agent", "Wait for any selected subagent to complete or need attention",
                         objectSchema(Map.of(
@@ -452,7 +448,7 @@ public final class TaskAgentToolGateway implements AgentCapability, TaskCapabili
                     ThreadPreferences.TitleSource.MANUAL);
             TaskUseCase.StartResult result = requireTasks().spawnAgent(new TaskUseCase.SpawnCommand(
                     context.threadId(), context.turnId(), taskName, brief,
-                    boundedDeadline(invocation, context, "timeoutMs"), preferences,
+                    preferences,
                     binding.capabilityCeiling()));
             String path = taskPath(result.task());
             JsonObject structured = JsonObjects.builder()
@@ -496,8 +492,7 @@ public final class TaskAgentToolGateway implements AgentCapability, TaskCapabili
             TaskUseCase.FollowUpResult result = requireTasks().continueAgentFrom(context.threadId(),
                     new TaskUseCase.FollowUpCommand(
                             message(invocation, context), integer(invocation, "expectedTaskRevision", 0,
-                                    9_007_199_254_740_991L),
-                            boundedDeadline(invocation, context, "timeoutMs")));
+                                    9_007_199_254_740_991L)));
             JsonObject structured = JsonObjects.builder()
                     .putText("threadId", result.task().lineage().taskThreadId())
                     .putText("turnId", result.turnId()).putText("messageId", result.messageId())

@@ -5,6 +5,8 @@ package io.github.kongweiguang.ja.goal.application;
 
 import io.github.kongweiguang.ja.conversation.application.interaction.InteractionSuspendedException;
 import io.github.kongweiguang.ja.conversation.application.loop.AgentLoop;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationSource;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.Plan;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
@@ -17,7 +19,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
-import java.time.Duration;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -65,6 +66,7 @@ public final class PlanExecutionCoordinator {
         if (plan.status() != PlanStatus.EXECUTING || plan.activePlanRevisionId() == null
                 || plan.activeRunId() == null) throw new IllegalArgumentException("Plan run is not executable");
         Objects.requireNonNull(events, "events");
+        bindRunContext(plan);
         ExecutionRequest request = new ExecutionRequest(plan.planId(), plan.ownerThreadId(),
                 plan.activePlanRevisionId(), plan.activeRunId(), id("turn_"));
         // 预算已在 GoalService.executePlan 的同一事务内冻结；这里绝不能再次解析最新配置。
@@ -165,8 +167,6 @@ public final class PlanExecutionCoordinator {
         var snapshot = plans.readPlanSnapshot(plan.planId());
         var evidence = plans.listPlanEvidence(plan.planId(), plan.activeRunId(),
                 plan.activePlanRevisionId(), 512);
-        GoalRepository.PlanRunBudget budget = plans.readPlanRunBudget(plan.planId(), plan.activeRunId())
-                .orElseThrow(() -> new IllegalStateException("Plan execution budget is unavailable"));
         CancellationSource cancellation = new CancellationSource();
         String key = plan.planId() + ":" + plan.activeRunId();
         CancellationSource previous = activeEvaluations.putIfAbsent(key, cancellation);
@@ -174,8 +174,7 @@ public final class PlanExecutionCoordinator {
         // 在 evaluator 可能同步完成前注册屏障，暂停不能越过尚未结算的 Provider，也不会留下已完成 map 项。
         CompletableFuture<Plan> verificationBarrier = new CompletableFuture<>();
         evaluationCompletions.put(key, verificationBarrier);
-        PlanEvaluatorPort.EvaluationContext context = new PlanEvaluatorPort.EvaluationContext(cancellation,
-                Duration.ofMillis(budget.remainingWallBudgetMillis()));
+        PlanEvaluatorPort.EvaluationContext context = new PlanEvaluatorPort.EvaluationContext(cancellation);
         CompletionStage<PlanEvaluatorPort.Evaluation> evaluation;
         try {
             evaluation = evaluator.evaluate(snapshot, evidence, context);
@@ -316,6 +315,7 @@ public final class PlanExecutionCoordinator {
             throw new IllegalArgumentException("Plan run is not resumable");
         }
         Objects.requireNonNull(events, "events");
+        bindRunContext(plan);
         String freshTurnId = id("turn_");
         ExecutionRequest request = requestFor(plan, freshTurnId);
         boolean hasResumableTurn = !request.turnId().equals(freshTurnId);
@@ -351,6 +351,20 @@ public final class PlanExecutionCoordinator {
             turns.clearResumeContinuation(request);
             if (!isSuspended(failure)) settleIncomplete(request);
             return java.util.concurrent.CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    /**
+     * 首次执行与显式恢复绑定发起客户端，后续异步 Turn 沿用精确 Run 的内存快照；
+     * 共享后台重启后没有新连接时不得偷用自己的启动环境继续旧计划。
+     */
+    private static void bindRunContext(Plan plan) {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        NativeExecutionSnapshot current = bridge.current().orElse(null);
+        if (current != null) bridge.bindRun("plan", plan.planId(), plan.activeRunId(), current);
+        if (bridge.sharedMode()
+                && bridge.findRun("plan", plan.planId(), plan.activeRunId()).isEmpty()) {
+            throw new IllegalStateException("native execution context must be rebound before Plan execution");
         }
     }
 
@@ -435,26 +449,6 @@ public final class PlanExecutionCoordinator {
 
         /** 恢复默认启动新一轮；可恢复 SUSPENDED 的 adapter 应覆盖以调用 TurnService.resume。 */
         CompletionStage<Void> resume(ExecutionRequest request, PlanExecutionEventSink events);
-    }
-
-    /** 从真实 Turn runtime 取得并冻结的跨 Turn 上限；不得由 UI 或模型参数扩大。 */
-    public interface PlanExecutionBudgetPort {
-        /** 在首次 Turn admission 前解析当前有效 limits；repository 负责只初始化一次。 */
-        EffectiveBudget resolve(ExecutionRequest request);
-    }
-
-    /** 跨 Turn Run ledger 的累计上限，wall budget 以毫秒保存以便 SQLite 原子比较。 */
-    public record EffectiveBudget(int maxModelRounds, int maxToolCalls, long wallBudgetMillis,
-                                  int antiLoopTurnBudget) {
-        /** 预算值必须为正且保持与单 Turn domain limits 同量级，避免整数溢出。 */
-        public EffectiveBudget {
-            if (maxModelRounds < 1 || maxModelRounds > 1_000_000
-                    || maxToolCalls < 0 || maxToolCalls > 10_000_000
-                    || wallBudgetMillis <= 0 || wallBudgetMillis > 86_400_000L * 30
-                    || antiLoopTurnBudget < 1 || antiLoopTurnBudget > 256) {
-                throw new IllegalArgumentException("invalid Plan execution budget");
-            }
-        }
     }
 
     /** 请求冻结已批准 revision、Run 与 Turn identity，防止异步启动漂移到后来编辑的 Plan。 */

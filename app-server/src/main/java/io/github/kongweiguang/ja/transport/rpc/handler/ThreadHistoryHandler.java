@@ -92,7 +92,10 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     @Override
     public Set<RpcMethod> methods() {
         return Set.of(RpcMethod.THREAD_CREATE, RpcMethod.THREAD_LIST, RpcMethod.THREAD_SEARCH,
-                RpcMethod.THREAD_READ, RpcMethod.THREAD_USAGE_READ, RpcMethod.THREAD_RENAME, RpcMethod.THREAD_PREFERENCES_UPDATE,
+                RpcMethod.THREAD_READ, RpcMethod.THREAD_MESSAGE_CONTENT_READ,
+                RpcMethod.HISTORY_INPUT_SEARCH,
+                RpcMethod.THREAD_OBSERVE, RpcMethod.THREAD_UNOBSERVE,
+                RpcMethod.THREAD_USAGE_READ, RpcMethod.THREAD_RENAME, RpcMethod.THREAD_PREFERENCES_UPDATE,
                 RpcMethod.THREAD_PIN, RpcMethod.THREAD_SEEN, RpcMethod.THREAD_ARCHIVE, RpcMethod.THREAD_RESTORE,
                 RpcMethod.THREAD_DELETE, RpcMethod.TURN_CHANGE_SET_READ, RpcMethod.TOOL_ARTIFACT_READ);
     }
@@ -112,6 +115,10 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 case THREAD_LIST -> list(command.params());
                 case THREAD_SEARCH -> search(command.params());
                 case THREAD_READ -> read(command.params());
+                case THREAD_MESSAGE_CONTENT_READ -> readMessageContent(command.params());
+                case HISTORY_INPUT_SEARCH -> searchUserInputs(command.params());
+                case THREAD_OBSERVE -> observe(command.params(), true);
+                case THREAD_UNOBSERVE -> observe(command.params(), false);
                 case THREAD_USAGE_READ -> readUsageSummary(command.params());
                 case THREAD_RENAME -> rename(command.params());
                 case THREAD_PIN -> pin(command.params());
@@ -253,6 +260,21 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         return threadPage(page);
     }
 
+    /** 一页最多十条公开输入，防止长提示词搜索结果占满 JA-RPC 单帧。 */
+    private ObjectNode searchUserInputs(ObjectNode params) {
+        RpcParams.requireOnly(params, "query", "cursor", "limit");
+        String query = params.has("query") ? RpcParams.text(params, "query", 256, true) : "";
+        int limit = Math.min(RpcParams.pageLimit(params), 10);
+        var page = session.threads().searchUserInputs(query, RpcParams.optionalText(params, "cursor", 512), limit);
+        ObjectNode result = session.mapper().createObjectNode();
+        ArrayNode items = result.putArray("items");
+        page.items().forEach(item -> items.addObject().put("itemId", item.itemId())
+                .put("threadId", item.threadId()).put("text", item.text())
+                .put("createdAt", item.createdAt()).put("truncated", item.truncated()));
+        RpcResults.cursor(result, page.nextCursor());
+        return result;
+    }
+
     /** Thread 列表与搜索共用相同分页 envelope，避免两个入口出现字段或 cursor 漂移。 */
     private ObjectNode threadPage(CursorPage<ThreadSummary> page) {
         ObjectNode result = session.mapper().createObjectNode();
@@ -282,14 +304,32 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     }
 
     /**
-     * 返回一个 keyset 快照页，不保留旧 journal/delta replay 概念。
+     * 逐步缩小权威 keyset 页面直至放入 RPC 单帧；只改变页大小，不丢失条目或伪造游标。
      */
     private ObjectNode read(ObjectNode params) {
-        RpcParams.requireOnly(params, "threadId", "cursor", "limit");
+        RpcParams.requireOnly(params, "threadId", "cursor", "limit", "tail");
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
         String cursor = RpcParams.optionalText(params, "cursor", 512);
         int limit = RpcParams.pageLimit(params);
-        ConsistentRead consistent = readConsistent(threadId, cursor, limit);
+        boolean tail = params.has("tail");
+        if (tail && (!params.get("tail").isBoolean() || !params.get("tail").booleanValue())) {
+            throw JaRpcException.invalidParams();
+        }
+        for (int pageLimit = limit; ; pageLimit = Math.max(1, pageLimit / 2)) {
+            ObjectNode result = readPage(threadId, cursor, pageLimit, tail);
+            trimLiveStreamForFrameBudget(result);
+            ThreadReadContract.requireValidLiveStream(result);
+            if (serializedBytes(result) <= THREAD_READ_FRAME_BUDGET) return result;
+            if (pageLimit == 1) {
+                throw JaRpcException.of(JaErrorCatalog.FRAME_TOO_LARGE,
+                        "one history item exceeds the RPC frame");
+            }
+        }
+    }
+
+    /** 缩页重读时重新取得完整事务版本；不能直接截掉已投影数组尾部并沿用旧游标。 */
+    private ObjectNode readPage(String threadId, String cursor, int limit, boolean tail) {
+        ConsistentRead consistent = readConsistent(threadId, cursor, limit, tail);
         ThreadSnapshot snapshot = consistent.snapshot();
         ObjectNode result = session.mapper().createObjectNode()
                 .put("threadId", snapshot.thread().threadId())
@@ -324,9 +364,42 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         session.goals().listTerminalActivities(threadId, 128)
                 .forEach(value -> goalActivities.add(goalWire.terminalActivity(value)));
         RpcResults.cursor(result, snapshot.nextCursor());
-        trimLiveStreamForFrameBudget(result);
-        ThreadReadContract.requireValidLiveStream(result);
         return result;
+    }
+
+    /** 只接受当前路径的 Assistant 或公开摘要身份；分页正文不会挤占 thread/read 历史帧。 */
+    private ObjectNode readMessageContent(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId", "messageId", "offsetCharacters", "limitCharacters");
+        var page = session.threads().readMessageContent(
+                RpcParams.identifier(params, "threadId", "thr_", 128),
+                RpcParams.identifier(params, "messageId", "item_", 101),
+                RpcParams.integer(params, "offsetCharacters"), RpcParams.integer(params, "limitCharacters"))
+                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND,
+                        "message content is unavailable"));
+        return characterPageResult("messageId", page.messageId(), page.offsetCharacters(),
+                page.nextOffsetCharacters(), page.totalCharacters(), page.truncated(), page.content());
+    }
+
+    /** 按最终 JSON 字节数而非 Java 字符数判断帧大小，覆盖正文控制字符转义的放大效应。 */
+    private int serializedBytes(ObjectNode result) {
+        try {
+            return session.mapper().writeValueAsBytes(result).length;
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("thread history response could not be serialized", failure);
+        }
+    }
+
+    /**
+     * 观察确认与随后 thread/read 分开，使连接先收到事件，再从权威历史对账；
+     * 多客户端 daemon 广播所有 Thread 事件，所以这里仅校验身份并返回稳定确认。
+     */
+    private ObjectNode observe(ObjectNode params, boolean subscribing) {
+        RpcParams.requireExact(params, "threadId");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        if (subscribing && session.threads().readThread(threadId, null, 1).isEmpty()) {
+            throw JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND, "thread is unavailable");
+        }
+        return session.mapper().createObjectNode().put("accepted", true).put("threadId", threadId);
     }
 
     /**
@@ -348,9 +421,11 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
      * 在活动 Turn 存在时最多重读三次，等待提交 revision 与出站 registry 收敛；超过预算返回无基线，
      * 不阻塞 RPC worker，也不把跨 revision 的分页事实拼成一份假的恢复文本。
      */
-    private ConsistentRead readConsistent(String threadId, String cursor, int limit) {
+    private ConsistentRead readConsistent(String threadId, String cursor, int limit, boolean tail) {
         for (int attempt = 0; attempt < LIVE_STREAM_READ_ATTEMPTS; attempt++) {
-            ThreadSnapshot snapshot = session.threads().readThread(threadId, cursor, limit)
+            ThreadSnapshot snapshot = (tail
+                    ? session.threads().readThreadLatest(threadId, cursor, limit)
+                    : session.threads().readThread(threadId, cursor, limit))
                     .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND,
                             "thread is unavailable"));
             ActiveStreamRegistry streams = session.activeStreams();
@@ -523,11 +598,18 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                 RpcParams.identifier(params, "artifactId", "artifact_", 128),
                 RpcParams.integer(params, "offsetCharacters"), RpcParams.integer(params, "limitCharacters"))
                 .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.THREAD_NOT_FOUND, "artifact is unavailable"));
-        ObjectNode result = session.mapper().createObjectNode().put("artifactId", page.artifactId())
-                .put("offsetCharacters", page.offsetCharacters()).put("totalCharacters", page.totalCharacters())
-                .put("truncated", page.truncated()).put("content", page.content());
-        if (page.nextOffsetCharacters() == null) result.putNull("nextOffsetCharacters");
-        else result.put("nextOffsetCharacters", page.nextOffsetCharacters());
+        return characterPageResult("artifactId", page.artifactId(), page.offsetCharacters(),
+                page.nextOffsetCharacters(), page.totalCharacters(), page.truncated(), page.content());
+    }
+
+    /** 两种字符页沿用同一 nullable 游标投影；仅来源身份和授权路径各自独立。 */
+    private ObjectNode characterPageResult(String identityField, String identity, int offset,
+                                           Integer nextOffset, int total, boolean truncated, String content) {
+        ObjectNode result = session.mapper().createObjectNode().put(identityField, identity)
+                .put("offsetCharacters", offset).put("totalCharacters", total)
+                .put("truncated", truncated).put("content", content);
+        if (nextOffset == null) result.putNull("nextOffsetCharacters");
+        else result.put("nextOffsetCharacters", nextOffset);
         return result;
     }
 

@@ -60,6 +60,53 @@ final class ContextCompactorTest {
         return new ContextTokenMeter.Measurement(Math.max(1L, tokens), "0".repeat(64));
     }
 
+    /** 短对话没有淘汰对象时不能调用摘要、提交空检查点或把无收益误报为上下文溢出。 */
+    @Test
+    void manualForceWithoutSmallerEnvelopeKeepsOriginalPrompt() {
+        MemoryCheckpointStore store = new MemoryCheckpointStore("thread-ctx", INITIAL_REVISION);
+        AtomicBoolean summarized = new AtomicBoolean();
+        AtomicBoolean started = new AtomicBoolean();
+        ContextCompactionService service = service(store, request -> {
+            summarized.set(true);
+            throw new AssertionError("short prompt must not reach summary model");
+        });
+        List<ContextMessage> history = List.of(ContextMessage.text(
+                "msg-short", "turn-short", 1, ContextMessage.Role.USER, "hello", 2));
+
+        ContextCompactionService.CompactionResult result = service.compact(
+                request(store, history, true, Optional.empty()), ignored -> started.set(true));
+
+        assertFalse(result.compacted());
+        assertEquals(2, result.prompt().estimatedTokens());
+        assertEquals(history, result.prompt().messages());
+        assertTrue(result.committedReceipt().isEmpty());
+        assertTrue(store.appended().isEmpty());
+        assertFalse(summarized.get());
+        assertFalse(started.get());
+    }
+
+    /** 上游已明确溢出时不得把短提示的正常无收益再次发送，避免重复费用和伪恢复。 */
+    @Test
+    void overflowWithoutSmallerEnvelopeDoesNotRetrySamePrompt() {
+        MemoryCheckpointStore store = new MemoryCheckpointStore("thread-ctx", INITIAL_REVISION);
+        OverflowRecovery recovery = new OverflowRecovery(service(store, request -> {
+            throw new AssertionError("short prompt must not reach summary model");
+        }));
+        List<ContextMessage> history = List.of(ContextMessage.text(
+                "msg-short", "turn-short", 1, ContextMessage.Role.USER, "hello", 2));
+        int[] sends = {0};
+
+        ContextException failure = assertThrows(ContextException.class, () -> recovery.send(
+                request(store, history, false, Optional.empty()), prompt -> {
+                    sends[0]++;
+                    throw new ContextException(ContextException.Code.CONTEXT_LIMIT, "provider overflow");
+                }));
+
+        assertEquals(ContextException.Code.CONTEXT_LIMIT, failure.code());
+        assertEquals(1, sends[0]);
+        assertTrue(store.appended().isEmpty());
+    }
+
     /** 锁定压缩持久化 usage 并清除旧 continuation，避免恢复后续接失效响应。 */
     @Test
     void compactionPersistsUsageAndResetsContinuation() {

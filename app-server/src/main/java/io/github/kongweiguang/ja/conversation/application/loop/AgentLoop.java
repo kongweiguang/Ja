@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.conversation.application.context.ContextOrchest
 import io.github.kongweiguang.ja.conversation.application.observation.ExecutionObservers;
 import io.github.kongweiguang.ja.conversation.application.policy.ToolPolicyChain;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
+import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.conversation.domain.interaction.InteractionRequest;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
@@ -26,6 +27,7 @@ import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 
 import java.io.Serial;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -119,7 +121,22 @@ public final class AgentLoop implements DeadlineCloseable {
             java.util.function.BiConsumer<InteractionRequest, Long> interactionPublisher) {
         ModelPort requiredModel = Objects.requireNonNull(model, "model");
         ConversationRepository requiredStore = Objects.requireNonNull(store, "store");
-        approvalBroker.bindDecisionStore(requiredStore::resolveApproval);
+        // 用户提交携带持久操作身份；后台超时仍走原无身份入口，两者共享同一 SQLite decision gate。
+        approvalBroker.bindDecisionStore(new ApprovalBroker.DecisionStore() {
+            /** 原生超时与取消只需持久 decision，不能伪装成客户端 ACK。 */
+            @Override
+            public boolean persist(String approvalId, ApprovalDecision decision, Instant resolvedAt) {
+                return requiredStore.resolveApproval(approvalId, decision, resolvedAt);
+            }
+
+            /** 外部响应必须把 operation receipt 与 decision 一起提交后才唤醒 Tool。 */
+            @Override
+            public boolean persist(String approvalId, ApprovalDecision decision, Instant resolvedAt,
+                                   String clientOperationId, String requestFingerprint) {
+                return requiredStore.resolveApproval(approvalId, decision, resolvedAt,
+                        clientOperationId, requestFingerprint);
+            }
+        });
         Clock requiredClock = Objects.requireNonNull(clock, "clock");
         ContextOrchestratorFactory requiredContextFactory =
                 Objects.requireNonNull(contextFactory, "contextFactory");
@@ -379,14 +396,11 @@ public final class AgentLoop implements DeadlineCloseable {
         }
 
         /**
-         * 连续预留 Tool 序号区间，并在越过 Turn 上限前原子拒绝整个批次。
+         * 连续预留 Tool 序号区间；调用次数只计量，不决定任务何时停止。
          */
         int allocateToolOrdinals(int count) {
-            if (count < 0 || nextToolOrdinal + count > 1_024) {
-                throw new LoopFailure("BUDGET_EXCEEDED", "Tool ordinal limit reached");
-            }
             int base = nextToolOrdinal;
-            nextToolOrdinal += count;
+            nextToolOrdinal = Math.addExact(nextToolOrdinal, count);
             return base;
         }
     }

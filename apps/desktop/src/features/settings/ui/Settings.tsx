@@ -25,6 +25,8 @@ import type { ConfigurationIssue, SettingsSection, SettingsSnapshot } from "../d
 import type { SettingsDesktopPort, SettingsPorts } from "../application/ports";
 import type { SettingsInterfacePreferences } from "../application/ports";
 import type { ExecutionScope } from "../domain/executionScope";
+import type { WorkspaceProjection } from "@/features/workspace";
+import { CapabilityProjectPicker } from "./CapabilityProjectPicker";
 // 基础样式先于分类样式加载，避免通用旧选择器覆盖模型、Skills 和 MCP 的局部布局。
 import "./settings.css";
 import { ModelsSection } from "./models";
@@ -262,6 +264,10 @@ function issueDescription(issue: ConfigurationIssue): string {
  */
 export interface SettingsProps {
   snapshot: SettingsSnapshot;
+  projects?: readonly WorkspaceProjection[];
+  selectedProjectId?: string;
+  onSelectProject?: (workspaceId: string) => void;
+  projectLoading?: boolean;
   skillSettings?: {
     global: SettingsSnapshot["skills"];
     project?: SettingsSnapshot["skills"];
@@ -294,6 +300,10 @@ export interface SettingsProps {
  */
 export function Settings({
   snapshot,
+  projects = [],
+  selectedProjectId,
+  onSelectProject,
+  projectLoading = false,
   skillSettings = { global: snapshot.skills, projectAvailable: false },
   mcpSettings = { global: snapshot.mcpServers, projectAvailable: false },
   issues = [],
@@ -325,6 +335,30 @@ export function Settings({
     modelId?: string;
     requestId: number;
   }>();
+  const [mcpDraftDirty, setMcpDraftDirty] = useState(false);
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [skillsBusy, setSkillsBusy] = useState(false);
+  const [pendingProjectId, setPendingProjectId] = useState<string>();
+  /** 未保存 MCP 草稿改变目标前要求明确放弃，普通筛选直接切换且不会改会话。 */
+  const requestProjectSelection = (workspaceId: string): void => {
+    if (workspaceId === selectedProjectId) return;
+    if (mcpDraftDirty) setPendingProjectId(workspaceId);
+    else onSelectProject?.(workspaceId);
+  };
+  const projectPicker = (
+    <CapabilityProjectPicker
+      projects={projects}
+      selectedProjectId={selectedProjectId}
+      disabled={disabled || mcpBusy || skillsBusy}
+      onSelectProject={requestProjectSelection}
+    />
+  );
+  const projectUnavailableMessage =
+    selectedProjectId === undefined
+      ? "选择项目后管理项目能力"
+      : projectLoading
+        ? "正在读取项目设置…"
+        : "项目未获信任或配置不可用";
   const notificationsAvailable = desktopNotifications !== undefined;
   const usingLastKnownGood = issues.some((issue) => issue.impact === "snapshot_in_use");
   const indexedResults = useMemo(
@@ -733,7 +767,10 @@ export function Settings({
                 globalSkills={skillSettings.global}
                 projectSkills={skillSettings.project}
                 projectAvailable={skillSettings.projectAvailable}
+                projectUnavailableMessage={projectUnavailableMessage}
+                projectPicker={projectPicker}
                 disabled={disabled}
+                onBusyChange={setSkillsBusy}
                 onToggleSkill={ports.onToggleSkill}
               />
             </Tabs.Content>
@@ -742,7 +779,14 @@ export function Settings({
                 servers={mcpSettings.global}
                 projectServers={mcpSettings.project}
                 projectAvailable={mcpSettings.projectAvailable}
-                projectWorkspaceId={mcpSettings.projectWorkspaceId}
+                projectUnavailableMessage={projectUnavailableMessage}
+                projectPicker={projectPicker}
+                onDraftStateChange={setMcpDraftDirty}
+                onBusyChange={setMcpBusy}
+                projectWorkspaceId={selectedProjectId}
+                projectName={
+                  projects.find((project) => project.workspaceId === selectedProjectId)?.displayName
+                }
                 snapshotRevision={snapshot.revision}
                 onSaveMcp={ports.onSaveMcp}
                 onDeleteMcp={ports.onDeleteMcp}
@@ -771,6 +815,41 @@ export function Settings({
           </ScrollArea>
         </div>
       </Tabs.Root>
+      <Dialog
+        modal
+        open={pendingProjectId !== undefined}
+        onOpenChange={(open) => {
+          if (!open) setPendingProjectId(undefined);
+        }}
+      >
+        <DialogContent
+          className="ja-settings-dialog"
+          aria-describedby="ja-project-switch-description"
+        >
+          <DialogTitle>切换设置项目</DialogTitle>
+          <DialogDescription id="ja-project-switch-description">
+            MCP 编辑中有未保存的修改。切换项目会放弃这份草稿。
+          </DialogDescription>
+          <div className="ja-settings-dialog-actions">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => setPendingProjectId(undefined)}
+            >
+              继续编辑
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (pendingProjectId !== undefined) onSelectProject?.(pendingProjectId);
+                setPendingProjectId(undefined);
+              }}
+            >
+              放弃草稿并切换
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

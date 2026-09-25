@@ -4,12 +4,14 @@
 package io.github.kongweiguang.ja.conversation.port.in;
 
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
+import io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt;
 import io.github.kongweiguang.ja.conversation.domain.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.foundation.concurrent.DeadlineCloseable;
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 
 /**
@@ -21,11 +23,34 @@ public interface TurnUseCase extends DeadlineCloseable {
      */
     Accepted start(TurnStartRequest request, TurnEventSink sink);
 
+    /** 带持久客户端提交身份的启动；实现必须在同一事务绑定 Turn 准入和回执。 */
+    default Accepted start(TurnStartRequest request, TurnEventSink sink,
+                           String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
+    }
+
     /** 在已有问题下创建隐藏 Turn；source 由存储重新解析并在准入事务中校验。 */
     Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink);
 
+    /** 继续回复重试只复用已提交 Turn，不能再生成另一条隐藏执行链。 */
+    default Accepted continueQuestion(InternalTurnStartRequest request, TurnEventSink sink,
+                                      String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
+    }
+
     /** 仅重答当前路径最后一个失败问题，并在新 USER Turn 准入时切换旧后缀。 */
     Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink);
+
+    /** 重答重试只复用原路径切换结果，不能再次切走已改变的会话后缀。 */
+    default Accepted reask(TurnStartRequest request, String sourceMessageId, TurnEventSink sink,
+                           String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation admission is unavailable");
+    }
+
+    /** 返回持久提交身份；空值表示尚无可证实的业务提交，调用方不得据此盲目重发副作用。 */
+    default Optional<ClientOperationReceipt> readClientOperation(String clientOperationId) {
+        throw new UnsupportedOperationException("client operation read is unavailable");
+    }
 
     /** 显式恢复一个 SUSPENDED Turn；成功保持原 turnId 并重新进入同 Thread FIFO。 */
     default Accepted resume(String turnId, long expectedThreadRevision, TurnEventSink sink) {
@@ -45,15 +70,26 @@ public interface TurnUseCase extends DeadlineCloseable {
      */
     CancelResult cancel(String turnId);
 
-    /** 默认把消息作为普通后续输入加入活动 Turn 的权威队列。 */
-    default InputMutation enqueueInput(String turnId, UserContent content) {
+    /** 提交方式由用户按键冻结，存储层在同一事务决定安全点消费顺序。 */
+    enum InputKind {
+        /** 当前 Turn 的下一个安全点优先消费。 */
+        STEERING,
+        /** 排在当前任务之后，按提交顺序消费。 */
+        FOLLOW_UP
+    }
+
+    /** 问答期间的新指令携带连接出口，替代旧问题后继续原 Turn。 */
+    default InputMutation enqueueInput(String turnId, UserContent content, InputKind kind, TurnEventSink sink,
+                                       String clientOperationId, String requestFingerprint) {
         throw new UnsupportedOperationException("input queue is unavailable");
     }
 
-    /** 问答期间的新指令可携带当前连接出口，替代旧问题后继续原 Turn。 */
-    default InputMutation enqueueInput(String turnId, UserContent content, TurnEventSink sink) {
-        return enqueueInput(turnId, content);
-    }
+    /** 只读外部入队的同事务回执；未知状态必须由客户端保留输入等待核实。 */
+    default Optional<InputOperationReceipt> readInputOperation(String clientOperationId) { return Optional.empty(); }
+
+    /** 回执不包含用户正文或队列快照，避免断线查询扩大可见数据。 */
+    record InputOperationReceipt(String operationId, String fingerprint, String threadId,
+                                 String turnId, String inputId, InputKind kind) { }
 
     /** 把指定条目按点击顺序提升为下一个安全点的 Steering。 */
     default InputMutation prioritizeInput(String turnId, String inputId, long expectedInputRevision) {

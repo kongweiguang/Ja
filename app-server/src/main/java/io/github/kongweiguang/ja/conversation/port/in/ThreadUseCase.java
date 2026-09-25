@@ -8,6 +8,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary;
+import io.github.kongweiguang.ja.conversation.domain.UserInputHistory;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
 
@@ -39,6 +40,11 @@ public interface ThreadUseCase {
         throw new UnsupportedOperationException("thread discovery is unavailable");
     }
 
+    /** 在用户主会话中按最近优先搜索已提交输入，不从终端草稿建立第二份历史。 */
+    default CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) {
+        throw new UnsupportedOperationException("input history search is unavailable");
+    }
+
     /** 在一个 Workspace 内按归一化标题包含关系搜索，并保持最近更新时间 keyset 顺序。 */
     CursorPage<ThreadSummary> searchThreads(String workspaceId, String query, String cursor, int limit);
 
@@ -51,6 +57,14 @@ public interface ThreadUseCase {
      * 读取一个事务一致的 Thread 历史页面。
      */
     Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit);
+
+    /**
+     * 从权威历史末端反向分页，页面仍按旧到新发布；nextCursor 是继续读取更旧条目的边界。
+     * 最新页和普通向前分页独立，避免长会话打开时先物化全部历史。
+     */
+    default Optional<ThreadSnapshot> readThreadLatest(String threadId, String beforeCursor, int limit) {
+        throw new UnsupportedOperationException("latest thread history is unavailable");
+    }
 
     /**
      * 读取 Thread 的全量用量汇总而不物化历史页面；默认关闭，避免旧测试实现把缺失的
@@ -112,6 +126,12 @@ public interface ThreadUseCase {
         throw new UnsupportedOperationException("tool artifact persistence is unavailable");
     }
 
+    /** 只读取当前路径上的 Assistant 正文或公开摘要；Provider 私有 reasoning 永不进入公开页。 */
+    default Optional<MessageContentPage> readMessageContent(String threadId, String messageId,
+                                                             int offsetCharacters, int limitCharacters) {
+        throw new UnsupportedOperationException("message content persistence is unavailable");
+    }
+
     /** 通过严格三元身份与 artifact 内文件键一次读取完整冻结 Diff，不回退到当前工作区。 */
     default Optional<ChangeSetArtifactFile> readChangeSetArtifact(String threadId, String turnId, String artifactId,
                                                                   String filePath) {
@@ -121,6 +141,10 @@ public interface ThreadUseCase {
     /** Tool artifact 使用 code point 游标，避免切断 UTF-16 surrogate pair。 */
     record TextArtifactPage(String artifactId, int offsetCharacters, Integer nextOffsetCharacters,
                             int totalCharacters, boolean truncated, String content) { }
+
+    /** 最终答复和续写段共用消息身份；字符游标按 Unicode code point 单调推进。 */
+    record MessageContentPage(String messageId, int offsetCharacters, Integer nextOffsetCharacters,
+                              int totalCharacters, boolean truncated, String content) { }
 
     /** 冻结单文件以标准 Base64 携带原始 UTF-8 bytes，摘要只覆盖该文件 Diff。 */
     record ChangeSetArtifactFile(String artifactId, String filePath, int byteLength, String sha256,

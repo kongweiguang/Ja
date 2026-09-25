@@ -9,6 +9,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Objects;
 
 /**
  * Provider 原生 reasoning 内容块。
@@ -24,10 +25,9 @@ public record ReasoningContent(
         String endpointFingerprint,
         String wireField,
         String nativeJson) implements ModelContent {
-    private static final int MAX_NATIVE_JSON = 4_000_000;
-
     /**
-     * 冻结 Provider 身份与原生 JSON，并以统一上限阻止 opaque 状态绕过上下文容量边界。
+     * 冻结 Provider 身份与原生 JSON；容量由真实模型窗口和流式单帧资源边界负责，
+     * 这里不能再按累计字符数拒绝长思考。
      */
     public ReasoningContent {
         providerId = ContractChecks.identifier(providerId, "providerId");
@@ -42,7 +42,10 @@ public record ReasoningContent(
         if (!wireField.matches("[A-Za-z][A-Za-z0-9_.:-]*")) {
             throw new IllegalArgumentException("wireField must be a safe JSON field name");
         }
-        nativeJson = ContractChecks.text(nativeJson, "nativeJson", MAX_NATIVE_JSON, false);
+        Objects.requireNonNull(nativeJson, "nativeJson");
+        if (nativeJson.isEmpty() || nativeJson.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("nativeJson is not valid text");
+        }
     }
 
     /**

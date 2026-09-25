@@ -23,6 +23,8 @@ const REQUEST_METHODS: &[&str] = &[
     "runtime/initialize",
     "runtime/health",
     "runtime/shutdown",
+    "runtime/context/register",
+    "operation/read",
     "workspace/open",
     "workspace/list",
     "workspace/path/search",
@@ -32,6 +34,10 @@ const REQUEST_METHODS: &[&str] = &[
     "thread/list",
     "thread/search",
     "thread/read",
+    "thread/message-content/read",
+    "history/input/search",
+    "thread/observe",
+    "thread/unobserve",
     "thread/usage/read",
     "thread/mcp/read",
     "thread/rename",
@@ -42,6 +48,7 @@ const REQUEST_METHODS: &[&str] = &[
     "thread/restore",
     "thread/delete",
     "thread/compact",
+    "thread/compact/cancel",
     "interaction/read",
     "interaction/observe",
     "interaction/unobserve",
@@ -2327,7 +2334,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                     ],
                 )?;
                 require_text(item, "text")?;
-                if !integer_in_bounds(item.get("modelRound"), 1, 128) {
+                if !integer_in_bounds(item.get("modelRound"), 1, i32::MAX as u64) {
                     return Err("thread model round is invalid");
                 }
             }
@@ -2609,7 +2616,7 @@ fn validate_thread_context_usage(usage: Option<&Value>) -> Result<(), &'static s
     if !valid_prefixed_id(usage.get("turnId"), "turn_")
         || !valid_prefixed_id(usage.get("requestId"), "request_")
         || !integer_in_bounds(usage.get("requestOrdinal"), 1, 9_007_199_254_740_991)
-        || !integer_in_bounds(usage.get("modelRound"), 1, 128)
+        || !integer_in_bounds(usage.get("modelRound"), 1, i32::MAX as u64)
         || !matches!(
             usage.get("purpose").and_then(Value::as_str),
             Some("assistant" | "summary")
@@ -2839,7 +2846,10 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "limits",
         ]
         .as_slice(),
-        "runtime/health" | "runtime/shutdown" => [].as_slice(),
+        "runtime/health" => [].as_slice(),
+        "runtime/shutdown" => ["force"].as_slice(),
+        "runtime/context/register" => ["environment", "shell"].as_slice(),
+        "operation/read" => ["clientOperationId"].as_slice(),
         "workspace/open" => ["workspaceId", "cwd", "displayName"].as_slice(),
         "workspace/list" => ["kind", "cursor", "limit"].as_slice(),
         "mcp/list" => ["workspaceId", "cursor", "limit"].as_slice(),
@@ -2855,6 +2865,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         ]
         .as_slice(),
         "thread/search" => ["workspaceId", "workspaceKind", "query", "cursor", "limit"].as_slice(),
+        "history/input/search" => ["query", "cursor", "limit"].as_slice(),
         "workspace/set-trust" => ["workspaceId", "trust"].as_slice(),
         "workspace/unregister" => ["workspaceId", "expectedRevision"].as_slice(),
         "thread/create" => [
@@ -2867,7 +2878,8 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "collaborationMode",
         ]
         .as_slice(),
-        "thread/read" => ["threadId", "cursor", "limit"].as_slice(),
+        "thread/read" => ["threadId", "cursor", "limit", "tail"].as_slice(),
+        "thread/observe" | "thread/unobserve" => ["threadId"].as_slice(),
         "thread/usage/read" => ["threadId"].as_slice(),
         "thread/mcp/read" => ["threadId"].as_slice(),
         "thread/rename" => ["threadId", "title", "expectedThreadRevision"].as_slice(),
@@ -2883,6 +2895,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         ]
         .as_slice(),
         "thread/compact" => ["threadId", "expectedThreadRevision"].as_slice(),
+        "thread/compact/cancel" => ["threadId"].as_slice(),
         "interaction/read" => ["threadId", "requestId"].as_slice(),
         "interaction/observe" => ["threadId"].as_slice(),
         "interaction/unobserve" => ["observationId"].as_slice(),
@@ -3060,13 +3073,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "attachment/preview/open" => ["attachmentId", "authorization"].as_slice(),
         "attachment/preview/read" => ["previewSessionId", "offsetBytes", "limitBytes"].as_slice(),
         "attachment/preview/close" => ["previewSessionId"].as_slice(),
-        "turn/start" => ["threadId", "content", "deadlineMs"].as_slice(),
-        "turn/continue" => ["threadId", "expectedThreadRevision"].as_slice(),
+        "turn/start" => ["threadId", "content", "clientOperationId"].as_slice(),
+        "turn/continue" => ["threadId", "expectedThreadRevision", "clientOperationId"].as_slice(),
         "turn/reask" => [
             "threadId",
             "expectedThreadRevision",
             "sourceMessageId",
             "content",
+            "clientOperationId",
         ]
         .as_slice(),
         "turn/resume" => ["turnId", "expectedThreadRevision"].as_slice(),
@@ -3080,7 +3094,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         ]
         .as_slice(),
         "turn/cancel" => ["turnId"].as_slice(),
-        "turn/input/enqueue" => ["turnId", "content"].as_slice(),
+        "turn/input/enqueue" => ["turnId", "content", "kind", "clientOperationId"].as_slice(),
         "turn/input/prioritize" | "turn/input/delete" => {
             ["turnId", "inputId", "expectedInputRevision"].as_slice()
         }
@@ -3095,9 +3109,21 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "limitCharacters",
         ]
         .as_slice(),
-        "approval/respond" => {
-            ["approvalId", "turnId", "decision", "expectedThreadRevision"].as_slice()
-        }
+        "thread/message-content/read" => [
+            "threadId",
+            "messageId",
+            "offsetCharacters",
+            "limitCharacters",
+        ]
+        .as_slice(),
+        "approval/respond" => [
+            "approvalId",
+            "turnId",
+            "decision",
+            "expectedThreadRevision",
+            "clientOperationId",
+        ]
+        .as_slice(),
         "configuration/read" => ["workspaceId"].as_slice(),
         "configuration/patch" => ["scope", "workspaceId", "patch", "expectedVersion"].as_slice(),
         "configuration/replace" => {
@@ -3115,6 +3141,27 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         _ => return Err("request method is unknown"),
     };
     ensure_object_keys(params, allowed)?;
+    if matches!(
+        method,
+        "operation/read"
+            | "turn/start"
+            | "turn/continue"
+            | "turn/reask"
+            | "approval/respond"
+            | "turn/input/enqueue"
+    ) && !params
+        .get("clientOperationId")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            value.len() == 35
+                && value.starts_with("op_")
+                && value.as_bytes()[3..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        })
+    {
+        return Err("client operation identity is invalid");
+    }
     for field in ["limit"] {
         if let Some(limit) = params.get(field)
             && limit
@@ -3161,6 +3208,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 ]))
             {
                 return Err("task feature capability is not the v1 closure");
+            }
+        }
+        "thread/read" => {
+            if params
+                .get("tail")
+                .is_some_and(|tail| tail.as_bool() != Some(true))
+            {
+                return Err("tail must be true when present");
             }
         }
         "workspace/open" => {
@@ -3289,6 +3344,20 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                     .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
             {
                 return Err("thread search params are invalid");
+            }
+        }
+        "history/input/search" => {
+            if !bounded_string(params.get("query"), 0, 256)
+                || params
+                    .get("cursor")
+                    .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
+                || params.get("limit").is_some_and(|limit| {
+                    limit
+                        .as_u64()
+                        .is_none_or(|limit| !(1..=10).contains(&limit))
+                })
+            {
+                return Err("input history search params are invalid");
             }
         }
         "thread/mcp/read" if !valid_prefixed_id(params.get("threadId"), "thr_") => {
@@ -3447,13 +3516,6 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "turn/start" => {
             require_text(params, "threadId")?;
             validate_turn_content(params.get("content"))?;
-            if let Some(deadline) = params.get("deadlineMs")
-                && deadline
-                    .as_u64()
-                    .is_none_or(|value| !(1_000..=86_400_000).contains(&value))
-            {
-                return Err("turn deadline is invalid");
-            }
         }
         "turn/continue" => {
             if !valid_prefixed_id(params.get("threadId"), "thr_")
@@ -3648,6 +3710,10 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "turn/input/enqueue"
             if !valid_prefixed_id(params.get("turnId"), "turn_")
+                || !matches!(
+                    params.get("kind").and_then(Value::as_str),
+                    Some("steering" | "follow_up")
+                )
                 || validate_turn_content(params.get("content")).is_err()
                 || !queued_content_within_budget(params.get("content")) =>
         {
@@ -3695,6 +3761,15 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 return Err("tool artifact page is invalid");
             }
         }
+        "thread/message-content/read" => {
+            if !valid_prefixed_id(params.get("threadId"), "thr_")
+                || !valid_prefixed_id(params.get("messageId"), "item_")
+                || !integer_in_bounds(params.get("offsetCharacters"), 0, 9_007_199_254_740_991)
+                || !integer_in_bounds(params.get("limitCharacters"), 1, 65_536)
+            {
+                return Err("message content page is invalid");
+            }
+        }
         "thread/compact"
             if !valid_prefixed_id(params.get("threadId"), "thr_")
                 || !integer_in_bounds(
@@ -3704,6 +3779,9 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 ) =>
         {
             return Err("context compaction request is invalid");
+        }
+        "thread/compact/cancel" if !valid_prefixed_id(params.get("threadId"), "thr_") => {
+            return Err("context compaction cancel request is invalid");
         }
         "approval/respond" => {
             require_text(params, "approvalId")?;
@@ -4003,7 +4081,7 @@ fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
             "interaction",
             "providers",
             "mcp_servers",
-            "skills",
+            "disabled_skills",
             "subagents",
         ],
     )?;
@@ -4049,11 +4127,11 @@ fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
     validate_config_providers(object.get("providers"))?;
     validate_config_subagents(object.get("subagents"))?;
     validate_config_mcp_servers(object.get("mcp_servers"))?;
-    validate_config_skills(object.get("skills"))?;
+    validate_config_disabled_skills(object.get("disabled_skills"))?;
     validate_config_value(Some(document))
 }
 
-/// 项目层只存自身 Skill 与对全局 Skill 的收紧项，不能借完整用户文档扩大项目权限。
+/// 项目层只停用自身来源的 Skill；全局授权仍由用户文档持有，项目不能扩大其权限。
 fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &'static str> {
     let document = value.ok_or("project skill document is missing")?;
     let object = document
@@ -4064,8 +4142,8 @@ fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &
         &[
             "schema_version",
             "config_revision",
-            "skills",
             "disabled_skills",
+            "mcp_servers",
         ],
     )?;
     if object.get("schema_version").and_then(Value::as_u64) != Some(2)
@@ -4077,39 +4155,21 @@ fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &
         return Err("project skill document header is invalid");
     }
     let skills = object
-        .get("skills")
+        .get("disabled_skills")
         .and_then(Value::as_array)
         .filter(|skills| skills.len() <= 512)
-        .ok_or("project skills are invalid")?;
+        .ok_or("disabled project skills are invalid")?;
     let mut skill_ids = HashSet::with_capacity(skills.len());
     for skill in skills {
         if !skill.as_str().is_some_and(|reference| {
             reference.starts_with("project:") && valid_skill_reference(Some(skill))
         }) || !skill_ids.insert(skill.as_str().unwrap_or_default())
         {
-            return Err("project skill reference is invalid");
+            return Err("disabled project skill reference is invalid");
         }
     }
-    let disabled = object
-        .get("disabled_skills")
-        .map(|value| {
-            value
-                .as_array()
-                .ok_or("disabled project skills are invalid")
-        })
-        .transpose()?;
-    if let Some(disabled) = disabled {
-        if disabled.len() > 512 {
-            return Err("disabled project skills are invalid");
-        }
-        let mut disabled_ids = HashSet::with_capacity(disabled.len());
-        for skill in disabled {
-            if !valid_global_skill_reference(Some(skill))
-                || !disabled_ids.insert(skill.as_str().unwrap_or_default())
-            {
-                return Err("disabled project skill reference is invalid");
-            }
-        }
+    if let Some(mcp_servers) = object.get("mcp_servers") {
+        validate_config_mcp_servers(Some(mcp_servers))?;
     }
     validate_config_value(Some(document))
 }
@@ -4298,12 +4358,8 @@ fn validate_config_agent_defaults(value: Option<&Value>) -> Result<(), &'static 
     let defaults = value
         .and_then(Value::as_object)
         .ok_or("agent defaults are invalid")?;
-    ensure_object_keys(
-        value.ok_or("agent defaults are missing")?,
-        &["context", "turn_limits"],
-    )?;
-    validate_config_context(defaults.get("context"))?;
-    validate_config_turn_limits(defaults.get("turn_limits"))
+    ensure_object_keys(value.ok_or("agent defaults are missing")?, &["context"])?;
+    validate_config_context(defaults.get("context"))
 }
 
 /// 模型目录只允许稳定 ID、能力与思考档位，不得携带 Provider 凭据或端点。
@@ -4392,24 +4448,6 @@ fn validate_config_context(value: Option<&Value>) -> Result<(), &'static str> {
     )?;
     if !matches!(object.get("auto_compact"), Some(Value::Bool(_))) {
         return Err("provider context value is invalid");
-    }
-    Ok(())
-}
-
-/// 校验 v1 Document 中的 Model Round/Tool Call Budget Object，保持预算字段闭集。
-fn validate_config_turn_limits(value: Option<&Value>) -> Result<(), &'static str> {
-    let object = value
-        .and_then(Value::as_object)
-        .ok_or("provider turn limits are invalid")?;
-    ensure_object_keys(
-        value.ok_or("provider turn limits are missing")?,
-        &["max_model_rounds", "max_tool_calls", "wall_timeout_ms"],
-    )?;
-    if !integer_in_bounds(object.get("max_model_rounds"), 1, 128)
-        || !integer_in_bounds(object.get("max_tool_calls"), 0, 1_024)
-        || !integer_in_bounds(object.get("wall_timeout_ms"), 1_000, 86_400_000)
-    {
-        return Err("provider turn limits value is invalid");
     }
     Ok(())
 }
@@ -4540,8 +4578,8 @@ fn validate_config_mcp_auth(value: Option<&Value>) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 校验配置只保存全局来源限定引用，避免描述、路径或本项目授权副本进入用户文档。
-fn validate_config_skills(value: Option<&Value>) -> Result<(), &'static str> {
+/// 用户只显式保存已停用的全局来源引用，未列出的已发现 Skill 维持默认可用。
+fn validate_config_disabled_skills(value: Option<&Value>) -> Result<(), &'static str> {
     let skills = value
         .and_then(Value::as_array)
         .filter(|skills| skills.len() <= 512)
@@ -5477,7 +5515,7 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     ];
     match method {
         "turn/state-changed" => allowed.extend(["from", "to"]),
-        "turn/retry-started" => allowed.extend(["attempt", "maxAttempts"]),
+        "turn/retry-started" => allowed.push("attempt"),
         "assistant/model-step-committed" => allowed.extend([
             "messageId",
             "text",
@@ -5515,11 +5553,9 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     validate_turn_event_metadata(params)?;
     if method == "turn/retry-started" {
         let attempt = params.get("attempt").and_then(Value::as_u64);
-        let max_attempts = params.get("maxAttempts").and_then(Value::as_u64);
-        if !attempt.is_some_and(|value| (2..=6).contains(&value))
-            || !max_attempts.is_some_and(|value| (2..=6).contains(&value))
-            || attempt > max_attempts
-        {
+        // 外部重试由 Java 的恢复策略设上限，wire 只发布当前正整数序号；
+        // 不能以旧供应商固定次数重建一个已删除的 maxAttempts 合同。
+        if !attempt.is_some_and(|value| (2..=9_007_199_254_740_991).contains(&value)) {
             return Err("turn retry attempt boundary is invalid");
         }
     }
@@ -6387,6 +6423,38 @@ fn contains_unsupported_vocabulary(source: &[u8]) -> bool {
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
+}
+
+/// tail 是可选的反向分页开关；只有显式 true 才改变读取方向，缺省仍保留桌面既有分页。
+#[test]
+fn thread_read_tail_is_an_explicit_opt_in() {
+    let base = serde_json::json!({"threadId":"thr_fixture","limit":50});
+    let tail = serde_json::json!({"threadId":"thr_fixture","limit":50,"tail":true});
+    let false_tail = serde_json::json!({"threadId":"thr_fixture","tail":false});
+    let null_tail = serde_json::json!({"threadId":"thr_fixture","tail":null});
+    assert!(validate_request("thread/read", &base).is_ok());
+    assert!(validate_request("thread/read", &tail).is_ok());
+    assert!(validate_request("thread/read", &false_tail).is_err());
+    assert!(validate_request("thread/read", &null_tail).is_err());
+}
+
+/// 外部恢复次数来自 Java 权威策略，wire 只携带当前尝试序号；超过旧固定六次
+/// 仍是合法事件，删除的 maxAttempts 字段不能重新进入 JA-RPC。
+#[test]
+fn retry_started_accepts_large_attempt_without_removed_ceiling() {
+    let mut params = serde_json::json!({
+        "serverInstanceId":"srv_demo","eventId":"evt_demo","sequence":1,
+        "occurredAt":"2026-09-24T08:00:00Z","generation":1,
+        "workspaceId":"ws_demo","threadId":"thr_demo","turnId":"turn_demo",
+        "threadRevision":0,"attempt":7
+    });
+    assert!(validate_notification("turn/retry-started", &params).is_ok());
+    params["attempt"] = serde_json::json!(1);
+    assert!(validate_notification("turn/retry-started", &params).is_err());
+    params["attempt"] = serde_json::json!(9_007_199_254_740_991_u64);
+    assert!(validate_notification("turn/retry-started", &params).is_ok());
+    params["maxAttempts"] = serde_json::json!(9_007_199_254_740_991_u64);
+    assert!(validate_notification("turn/retry-started", &params).is_err());
 }
 
 /// ID-only reopen and project open are disjoint; displayName stays optional for Java-owned project identity.

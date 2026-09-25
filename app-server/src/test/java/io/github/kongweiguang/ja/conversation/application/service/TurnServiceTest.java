@@ -23,6 +23,8 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnLimits;
 import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadMetadataEvent;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 
@@ -86,6 +88,8 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -152,6 +156,154 @@ final class TurnServiceTest {
         }
     }
 
+    /**
+     * 两个客户端同时进入同一个 TurnService 时，执行环境在各自同步准入边界冻结；
+     * 连接即使随后释放，Resolver 收到的也只能是对应 Turn 的完整不可变快照。
+     */
+    @Test
+    void parallelTurnAdmissionsKeepClientEnvironmentsSeparate() throws Exception {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        String clientA = bridge.register(Map.of("PATH", "client-a-path", "JA_MARKER", "client-a"), null);
+        String clientB = bridge.register(Map.of("PATH", "client-b-path", "JA_MARKER", "client-b"), null);
+        String requestA = "test_client_a_" + java.util.UUID.randomUUID();
+        String requestB = "test_client_b_" + java.util.UUID.randomUUID();
+        bridge.bindRequest(requestA, clientA);
+        bridge.bindRequest(requestB, clientB);
+        CountDownLatch resolved = new CountDownLatch(2);
+        CountDownLatch releaseResolution = new CountDownLatch(1);
+        Map<String, String> observed = new ConcurrentHashMap<>();
+        TurnRuntimeResolver resolver = new TurnRuntimeResolver() {
+            /** 故意让两次解析交叠，暴露任何进程级环境切换或 ThreadLocal 串扰。 */
+            @Override public RuntimeLease resolve(TurnRuntimeRequest request) {
+                NativeExecutionSnapshot context = request.executionContext();
+                observed.put(request.turnId(), context.environment().get("JA_MARKER") + ":"
+                        + context.environment().get("PATH"));
+                resolved.countDown();
+                try {
+                    if (!releaseResolution.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("probe timed out");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("probe interrupted", interrupted);
+                }
+                throw new IllegalStateException("admission probe complete");
+            }
+
+            /** 准入隔离测试不预热 Workspace。 */
+            @Override public void prepareWorkspace(Path workspaceRoot) {
+            }
+        };
+        RecordingStore store = new RecordingStore();
+        ModelPort model = (request, sink, cancellation) ->
+                CompletableFuture.failedFuture(new AssertionError("admission must stop before model execution"));
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, resolver, CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES);
+             var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = workers.submit(() -> probeAdmission(bridge, requestA, service, "turn_client_a"));
+            var second = workers.submit(() -> probeAdmission(bridge, requestB, service, "turn_client_b"));
+            assertTrue(resolved.await(2, TimeUnit.SECONDS));
+            bridge.release(clientA);
+            bridge.release(clientB);
+            releaseResolution.countDown();
+            first.get(2, TimeUnit.SECONDS);
+            second.get(2, TimeUnit.SECONDS);
+            assertEquals(Map.of("turn_client_a", "client-a:client-a-path",
+                    "turn_client_b", "client-b:client-b-path"), observed);
+            assertEquals(0, store.revision());
+        } finally {
+            releaseResolution.countDown();
+            bridge.unbindRequest(requestA);
+            bridge.unbindRequest(requestB);
+            bridge.release(clientA);
+            bridge.release(clientB);
+        }
+    }
+
+    /** 每个请求用独立同步 Scope 调 TurnService，测试不借助真实 RPC 或付费 Provider。 */
+    private static void probeAdmission(NativeExecutionContext bridge, String requestId,
+                                       TurnService service, String turnId) {
+        try (var ignored = bridge.enterRequest(requestId)) {
+            assertThrows(IllegalStateException.class, () -> service.start(request(turnId),
+                    event -> CompletableFuture.completedFuture(null)));
+        }
+    }
+
+    /**
+     * Child Tool 在后台线程启动时没有 RPC ThreadLocal；它必须按明确父 Turn 身份继承
+     * 已准入快照，即使原客户端已经断开，也不能借用另一连接的环境。
+     */
+    @Test
+    void childAdmissionInheritsFrozenParentTurnEnvironment() throws Exception {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        String client = bridge.register(Map.of("PATH", "parent-only", "JA_MARKER", "parent"), null);
+        String requestId = "test_child_" + java.util.UUID.randomUUID();
+        bridge.bindRequest(requestId, client);
+        CompletableFuture<ModelPort.ModelOutcome> modelCompletion = new CompletableFuture<>();
+        CountDownLatch modelStarted = new CountDownLatch(1);
+        ModelPort model = (request, sink, cancellation) -> {
+            sink.onEvent(new ModelPort.TextDelta("done"));
+            modelStarted.countDown();
+            return modelCompletion;
+        };
+        RecordingStore store = new RecordingStore();
+        AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
+                argumentsCodec(), argumentValidator(), List.of(), List.of(), CLOCK);
+        TurnQueue queue = new TurnQueue(8, 4, 1);
+        DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
+        AtomicReference<NativeExecutionSnapshot> childContext = new AtomicReference<>();
+        TurnRuntimeResolver delegate = runtimeResolver();
+        TurnRuntimeResolver resolver = new TurnRuntimeResolver() {
+            /** 父 Turn 正常执行；Child 准入读取快照后停止，避免 fake repository 伪造 Child 事务。 */
+            @Override public RuntimeLease resolve(TurnRuntimeRequest request) {
+                if ("turn_child".equals(request.turnId())) {
+                    childContext.set(request.executionContext());
+                    throw new IllegalStateException("child context probe complete");
+                }
+                return delegate.resolve(request);
+            }
+
+            /** Workspace 预热保持与被委托 Resolver 相同的测试边界。 */
+            @Override public void prepareWorkspace(Path workspaceRoot) {
+                delegate.prepareWorkspace(workspaceRoot);
+            }
+        };
+        try (queue; loop; cancellations;
+             TurnService service = new TurnService(store, loop, queue, cancellations, resolver, CLOCK,
+                     AutomaticThreadTitleScheduler.disabled(), WORKSPACE_REFERENCES)) {
+            TurnUseCase.Accepted parent;
+            try (var ignored = bridge.enterRequest(requestId)) {
+                parent = service.start(request("turn_parent"), event -> CompletableFuture.completedFuture(null));
+            }
+            bridge.release(client);
+            assertTrue(modelStarted.await(2, TimeUnit.SECONDS));
+            TurnStartRequest child = new TurnStartRequest("thr_child", "turn_child", "ws_turn_service",
+                    Path.of("C:/workspace"), content("child"), "provider_test", "model_test", "medium",
+                    AccessMode.APPROVAL_REQUIRED,
+                    io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
+                    0, 0, CLOCK.instant());
+            assertThrows(IllegalStateException.class, () -> service.startChild(child,
+                    event -> CompletableFuture.completedFuture(null), admission -> {
+                        throw new AssertionError("child probe stops before admission");
+                    }, "thr_test", "turn_parent"));
+            assertEquals("parent", childContext.get().environment().get("JA_MARKER"));
+            assertEquals("parent-only", childContext.get().environment().get("PATH"));
+            modelCompletion.complete(new ModelPort.ModelOutcome(ModelPort.FinishReason.STOP, null,
+                    new ModelUsage(1, 1, 2)));
+            assertEquals(TurnState.COMPLETED,
+                    parent.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).state());
+        } finally {
+            modelCompletion.completeExceptionally(new CancellationException("test cleanup"));
+            bridge.unbindRequest(requestId);
+            bridge.release(client);
+        }
+    }
+
     /** Resume 只有真实 CAS 竞争映射为 FIFO 顺序冲突。 */
     @Test
     void resumeMapsOnlyStorageCasConflictToOrderConflict() {
@@ -211,7 +363,7 @@ final class TurnServiceTest {
     void resumeRestoresReferencedPromptAndUsesLatestSummaryForNextProvider() throws Exception {
         RecordingStore store = new RecordingStore();
         List<TurnExecutionState.ActiveSkill> activeSkills = List.of(
-                new TurnExecutionState.ActiveSkill("skill_review"));
+                new TurnExecutionState.ActiveSkill("ja:review"));
         store.prepareResumeCandidate("provider prompt summary", "latest checkpoint summary", activeSkills);
         TrackingPromptSession prompt = new TrackingPromptSession(activeSkills);
         ModelPort model = (request, sink, cancellation) -> {
@@ -797,9 +949,9 @@ final class TurnServiceTest {
         }
     }
 
-    /** 默认入队后通过 identity 提升，不能再从旧双入口直接创建 Steering。 */
+    /** Steering 直接由首次 SQLite 入队冻结，不能先成为 Follow-up 再靠第二次 RPC 提升。 */
     @Test
-    void enqueuesFollowUpsAndPrioritizesByIdentity() throws Exception {
+    void enqueuesSteeringAtomicallyWithFollowUps() throws Exception {
         BlockingModel model = new BlockingModel();
         RecordingStore store = new RecordingStore();
         AgentLoop loop = new AgentLoop(metered(model), new NoopApproval(), store, contextFactory(store),
@@ -813,9 +965,8 @@ final class TurnServiceTest {
                     event -> CompletableFuture.completedFuture(null));
             assertTrue(model.started.await(1, TimeUnit.SECONDS));
 
-            service.enqueueInput("turn_test", content("follow"));
-            TurnUseCase.InputMutation second = service.enqueueInput("turn_test", content("steer"));
-            service.prioritizeInput("turn_test", second.inputId(), 1);
+            service.enqueueInput("turn_test", content("follow"), TurnUseCase.InputKind.FOLLOW_UP, TurnEventSink.noop(), null, null);
+            service.enqueueInput("turn_test", content("steer"), TurnUseCase.InputKind.STEERING, TurnEventSink.noop(), null, null);
 
             assertEquals(List.of(ConversationRepository.InputKind.FOLLOW_UP,
                             ConversationRepository.InputKind.STEERING),
@@ -867,7 +1018,7 @@ final class TurnServiceTest {
 
             TurnUseCase.InputMutationException enqueueFailure = assertThrows(
                     TurnUseCase.InputMutationException.class,
-                    () -> service.enqueueInput("turn_resume", content("must wait for resume")));
+                    () -> service.enqueueInput("turn_resume", content("must wait for resume"), TurnUseCase.InputKind.FOLLOW_UP, TurnEventSink.noop(), null, null));
             assertEquals(TurnUseCase.InputMutationFailure.TURN_NOT_FOUND, enqueueFailure.failure());
 
             TurnUseCase.InputMutation deleted = service.deleteInput(
@@ -1074,8 +1225,7 @@ final class TurnServiceTest {
                 "thr_test", "turn_test", workspace, "ws_turn_service", "provider_test", "model_test", "medium",
                 AccessMode.APPROVAL_REQUIRED,
                 io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
-                TurnOrigin.USER,
-                TurnLimits.defaults().wallTimeout(), CLOCK.instant());
+                TurnOrigin.USER, CLOCK.instant());
         try (DefaultCancellationCoordinator cancellations = new DefaultCancellationCoordinator();
                 RuntimeLease lease = runtimeResolver().resolve(runtimeRequest)) {
             CancellationCoordinator.CancellationScope cancellation =
@@ -1083,7 +1233,6 @@ final class TurnServiceTest {
             try (cancellation) {
                 TurnExecutionState.Common common = new TurnExecutionState.Common(
                         0, 0, 1, null, List.of(),
-                        CLOCK.instant().plus(lease.limits().wallTimeout()),
                         io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
                 TurnExecutionState.Ready execution = new TurnExecutionState.Ready(
                         common, TurnExecutionState.Next.ASSISTANT, null);
@@ -1093,7 +1242,7 @@ final class TurnServiceTest {
                         lease.promptSession(), QueuedInputBoundary.plainTextOnly(),
                          lease.attachments(), lease.tools(), lease.generationId(),
                          lease.toolSessions(), lease.outputLimits(), lease.presentationSecrets(),
-                         CLOCK.instant().plus(lease.limits().wallTimeout()),
+                         CLOCK.instant().plus(lease.limits().requestWindow()),
                          (requestCommon, summary) -> {
                              throw new AssertionError("runtime refresh is outside emergency settlement test");
                          });
@@ -1103,7 +1252,7 @@ final class TurnServiceTest {
                             return CompletableFuture.completedFuture(null);
                         }, cancellation, new TerminalCoordinator(),
                         new CompletableFuture<>(), false,
-                        CLOCK.instant().plus(lease.limits().wallTimeout()), execution);
+                        CLOCK.instant().plus(lease.limits().requestWindow()), execution);
 
                 new TurnTerminalSettlement(store, CLOCK).settleEmergency(
                         owner, TurnState.FAILED, "INTERNAL_ERROR", "turn execution failed",
@@ -1286,7 +1435,6 @@ final class TurnServiceTest {
                 "provider_test", "model_test", "medium",
                 AccessMode.APPROVAL_REQUIRED,
                 io.github.kongweiguang.ja.conversation.domain.CollaborationMode.DEFAULT,
-                TurnLimits.defaults().wallTimeout(),
                 0, 0, CLOCK.instant());
     }
 
@@ -1721,9 +1869,7 @@ final class TurnServiceTest {
             state = TurnState.SUSPENDED;
             TurnExecutionState.Common common = new TurnExecutionState.Common(
                     0, 0, 1, promptSummary.isEmpty() ? null : "cp_prompt",
-                    activeSkills, CLOCK.instant().plus(TurnLimits.defaults().wallTimeout()),
-                    io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER,
-                    TurnLimits.defaults().wallTimeout());
+                    activeSkills, io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
             if (messages.isEmpty()) {
                 messages.add(new StoredMessage("item_user_resume", "turn_resume", 1,
                         new ModelMessage(ModelRole.USER, List.of(new TextContent("resume"))), CLOCK.instant()));

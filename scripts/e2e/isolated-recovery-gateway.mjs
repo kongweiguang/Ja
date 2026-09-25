@@ -178,7 +178,7 @@ export function selectConfiguredResponsesProfile(document) {
 }
 
 /**
- * 将隔离副本限制为单一 Provider，清空 MCP 与 Skill 网络入口，并强制只读权限。
+ * 将隔离副本限制为单一 Provider 和需审批权限；MCP 清空，Skills 由隔离目录发现。
  */
 export function isolatedProviderDocument(document, profile, loopbackBaseUrl) {
   return {
@@ -192,7 +192,7 @@ export function isolatedProviderDocument(document, profile, loopbackBaseUrl) {
     default_model_id: profile.modelId,
     providers: [{ ...profile.provider, base_url: loopbackBaseUrl, models: [profile.model] }],
     mcp_servers: [],
-    skills: [],
+    disabled_skills: [],
   };
 }
 

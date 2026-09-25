@@ -40,14 +40,15 @@ test("历史兼容实现不得重新进入生产源码", () => {
 });
 
 /** 固定已审定的迁移版本集合，避免把首版检查放宽为任意历史转换均可打包。 */
-test("真实目录检查只允许已审定的会话恢复和 Workspace 身份迁移", async () => {
+test("真实目录检查只允许已审定的会话恢复、Workspace 身份与操作回执迁移", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ja-baseline-policy-"));
   try {
     for (const directory of [
       "app-server/src/main/resources/db/migration",
       "apps/desktop/src",
       "crates/ja-runtime/src",
-      "src-tauri/src",
+      "apps/cli/src",
+      "apps/desktop/src-tauri/src",
       "contracts/ja-rpc/v1",
     ]) {
       await mkdir(path.join(root, directory), { recursive: true });
@@ -66,6 +67,14 @@ test("真实目录检查只允许已审定的会话恢复和 Workspace 身份迁
     );
     await writeFile(path.join(migrations, "V6__conversation_current_path_reask.sql"), "SELECT 1;");
     await writeFile(path.join(migrations, "V7__session_workspace_identity.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V8__client_operation_receipts.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V9__goal_progress_counter.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V10__unbounded_round_counters.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V11__execution_cursor_without_budget.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V12__drop_execution_budgets.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V13__plan_evaluation_attempts.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V14__assistant_public_text_pages.sql"), "SELECT 1;");
+    await writeFile(path.join(migrations, "V15__input_operation_receipts.sql"), "SELECT 1;");
     assert.deepEqual(await checkInitialBaseline(root), []);
     await writeFile(path.join(migrations, "V8__unreviewed.sql"), "SELECT 1;");
     await mkdir(path.join(root, "contracts/ja-rpc/v2"));

@@ -139,7 +139,7 @@ def main() -> int:
 
     signing_argument = " --no-sign" if args.no_sign else ""
     build_bundles = "app,dmg" if args.updater_signed and args.platform == "macos" else args.bundle
-    command = f"pnpm exec tauri build --ci{signing_argument} --bundles {build_bundles}"
+    command = f"pnpm tauri build --ci{signing_argument} --bundles {build_bundles}"
     report = {
         "schemaVersion": 1,
         "product": "Ja",

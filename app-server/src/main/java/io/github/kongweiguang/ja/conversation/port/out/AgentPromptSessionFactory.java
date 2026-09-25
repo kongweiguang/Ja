@@ -30,10 +30,12 @@ public interface AgentPromptSessionFactory {
             skillCatalog = Objects.requireNonNull(skillCatalog, "skillCatalog");
             skills = Objects.requireNonNull(skills, "skills");
             skillNamesById = Map.copyOf(Objects.requireNonNull(skillNamesById, "skillNamesById"));
-            if (skillNamesById.entrySet().stream().anyMatch(entry -> !entry.getKey().startsWith("skill_")
-                    || entry.getKey().length() > 128 || entry.getValue().isBlank())) {
-                throw new IllegalArgumentException("invalid Skill identity map");
-            }
+            skillNamesById.forEach((skillId, name) -> {
+                ContractChecks.runtimeSkillIdentifier(skillId);
+                if (name.isBlank() || !skillId.endsWith(":" + name)) {
+                    throw new IllegalArgumentException("invalid Skill identity map");
+                }
+            });
         }
     }
 }

@@ -212,10 +212,10 @@ final class CatalogServiceTest {
     }
 
     /**
-     * workspaceId 只能通过已打开 Workspace 能力解析，且同一规范根必须同时进入配置租约和发现端口。
+     * 设置目录通过已登记项目身份解析，同一规范根同时进入配置租约和发现端口。
      */
     @Test
-    void resolvesOpenProjectWorkspaceBeforeSkillDiscovery() {
+    void resolvesRegisteredProjectWorkspaceBeforeSkillDiscovery() {
         Path root = Path.of(System.getProperty("java.io.tmpdir"), "ja-catalog-project")
                 .toAbsolutePath().normalize();
         RecordingGenerationPort generations = new RecordingGenerationPort(root);
@@ -225,7 +225,7 @@ final class CatalogServiceTest {
         WorkspaceUseCase workspaces = (WorkspaceUseCase) Proxy.newProxyInstance(
                 CatalogServiceTest.class.getClassLoader(), new Class<?>[]{WorkspaceUseCase.class},
                 (proxy, method, arguments) -> switch (method.getName()) {
-                    case "requireOpenWorkspace" -> workspace;
+                    case "requireSettingsWorkspace" -> workspace;
                     default -> throw new AssertionError("unexpected workspace call: " + method.getName());
                 });
         CatalogService service = new CatalogService(
@@ -350,8 +350,7 @@ final class CatalogServiceTest {
                 new ConfigurationGenerationSnapshot.NetworkTimeouts(
                         Duration.ofSeconds(5), Duration.ofMinutes(2)),
                 new ConfigurationGenerationSnapshot.AgentDefaults(
-                        new ConfigurationGenerationSnapshot.Context(true),
-                        new ConfigurationGenerationSnapshot.TurnLimits(8, 32, Duration.ofMinutes(5))),
+                        new ConfigurationGenerationSnapshot.Context(true)),
                 List.of(model));
         return (ConfigurationGenerationSnapshot) Proxy.newProxyInstance(
                 CatalogServiceTest.class.getClassLoader(),

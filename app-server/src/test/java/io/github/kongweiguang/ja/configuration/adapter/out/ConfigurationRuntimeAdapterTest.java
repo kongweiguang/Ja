@@ -71,6 +71,39 @@ final class ConfigurationRuntimeAdapterTest {
         }
     }
 
+    /** 旧预算字段仅在其余配置有效时一次性备份并原子删除，第二次读取不产生重复备份。 */
+    @Test
+    void migratesRemovedTurnLimitsWithOneBackup() throws Exception {
+        Path config = homeDirectory().resolve("config.toml");
+        String previous = profileConfig("migrated-model").replace(
+                "[providers.agent_defaults.context]\nauto_compact = true\n",
+                "[providers.agent_defaults.context]\nauto_compact = true\n"
+                        + "[providers.agent_defaults.turn_limits]\nmax_model_rounds = 32\n"
+                        + "max_tool_calls = 128\nwall_timeout_ms = 3600000\n");
+        Files.writeString(config, previous);
+        try (ConfigurationRuntimeAdapter service = service()) {
+            assertFalse(node(service.read(null).effective()).path("providers").get(0)
+                    .path("agent_defaults").has("turn_limits"));
+            assertFalse(Files.readString(config).contains("turn_limits"));
+            assertEquals(1, backupCount());
+            service.read(null);
+            assertEquals(1, backupCount());
+        }
+        try (Stream<Path> backups = Files.list(homeDirectory())) {
+            Path backup = backups.filter(path -> path.getFileName().toString()
+                    .startsWith("config.toml.backup-")).findFirst().orElseThrow();
+            assertEquals(previous, Files.readString(backup));
+        }
+    }
+
+    /** 只统计本测试配置目录中的已提交备份，不扫描用户真实资料。 */
+    private long backupCount() throws Exception {
+        try (Stream<Path> backups = Files.list(homeDirectory())) {
+            return backups.filter(path -> path.getFileName().toString()
+                    .startsWith("config.toml.backup-")).count();
+        }
+    }
+
     /** 缺失普通字段和旧 schema 只回退受影响字段，且默认流空闲上限为 300 秒。 */
     @Test
     void missingFieldsAndLegacySchemaKeepUsableProviderProjection() throws Exception {
@@ -340,14 +373,14 @@ final class ConfigurationRuntimeAdapterTest {
         ObjectMapper mapper = new ObjectMapper();
         Path workspace = Files.createDirectory(temporaryRoot.resolve("workspace"));
         Files.writeString(homeDirectory().resolve("config.toml"), profileConfig("user-model")
-                .replace("skills = []", "skills = [\"user:global-fixture\"]"));
+                .replace("disabled_skills = []", "disabled_skills = [\"user:global-fixture\"]"));
         Path projectJa = Files.createDirectories(workspace.resolve(".ja"));
         Files.writeString(projectJa.resolve("config.toml"), projectSkillConfig());
 
         try (ConfigurationRuntimeAdapter service = service()) {
             ConfigurationUseCase.ReadResult untrusted = service.read(workspace);
             assertEquals(ConfigurationUseCase.LayerStatus.UNTRUSTED, untrusted.project().status());
-            assertEquals("user:global-fixture", node(untrusted.effective()).withArray("skills").get(0).textValue());
+            assertEquals("user:global-fixture", node(untrusted.effective()).withArray("disabled_skills").get(0).textValue());
             try (ConfigGeneration.Lease lease = service.acquire(workspace)) {
                 assertFalse(lease.snapshot().trusted());
             }
@@ -356,9 +389,8 @@ final class ConfigurationRuntimeAdapterTest {
             ConfigurationUseCase.ReadResult trusted = service.read(workspace);
             assertEquals(ConfigurationUseCase.LayerStatus.VALID, trusted.project().status());
             assertEquals("project:workspace-fixture", node(trusted.project().document())
-                    .withArray("skills").get(0).textValue());
-            assertEquals("user:global-fixture", node(trusted.project().document())
                     .withArray("disabled_skills").get(0).textValue());
+            assertEquals(2, node(trusted.effective()).withArray("disabled_skills").size());
             try (ConfigGeneration.Lease lease = service.acquire(workspace)) {
                 assertTrue(lease.snapshot().trusted());
             }
@@ -367,7 +399,7 @@ final class ConfigurationRuntimeAdapterTest {
             assertEquals(ConfigurationUseCase.LayerStatus.UNTRUSTED,
                     service.read(workspace).project().status());
             assertEquals("user:global-fixture", node(service.read(workspace).effective())
-                    .withArray("skills").get(0).textValue());
+                    .withArray("disabled_skills").get(0).textValue());
         }
     }
 
@@ -582,7 +614,8 @@ final class ConfigurationRuntimeAdapterTest {
                 try (ConfigGeneration.Lease missingLease = service.acquireGeneration(null)) {
                     ConfigGeneration missing = missingLease.generation();
                     assertTrue(missing.ready());
-                    assertTrue(missing.mcpServers().isEmpty());
+                    assertEquals(1, missing.mcpServers().size());
+                    assertTrue(missing.mcpServers().get(0).path("enabled").booleanValue());
                     assertTrue(missing.diagnostics().stream()
                             .noneMatch(diagnostic -> "CORRUPT_CONFIG".equals(diagnostic.code())));
                 }
@@ -679,7 +712,7 @@ final class ConfigurationRuntimeAdapterTest {
     @Test
     void badCatalogEntriesAreIsolatedFromRemainingProviderAndModel() throws Exception {
         String source = availabilityRegressionConfig()
-                .replace("skills = []", "skills = [\"user:valid\", \"project:invalid\"]")
+                .replace("disabled_skills = []", "disabled_skills = [\"user:valid\", \"project:invalid\"]")
                 .replace("https://beta.example.test/v1", "not-a-provider-url")
                 .replace("model = \"gamma-one\"", "model = \"\"")
                 .replace("enabled = true\nschema_version = 2", "enabled = \"yes\"\nschema_version = 2");
@@ -694,7 +727,7 @@ final class ConfigurationRuntimeAdapterTest {
             assertEquals(1, effective.withArray("providers").size());
             assertEquals("provider_alpha", effective.withArray("providers").get(0).path("provider_id").textValue());
             assertEquals(2, effective.withArray("providers").get(0).withArray("models").size());
-            assertEquals(List.of("user:valid"), effective.withArray("skills").valueStream()
+            assertEquals(List.of("user:valid"), effective.withArray("disabled_skills").valueStream()
                     .map(JsonNode::textValue).toList());
             assertTrue(effective.withArray("mcp_servers").isEmpty());
             assertTrue(read.issues().stream().anyMatch(issue -> "provider_unavailable".equals(issue.impact())));
@@ -892,7 +925,7 @@ final class ConfigurationRuntimeAdapterTest {
                 + "default_provider_id = \"provider_model\"\n"
                 + "default_model_id = \"model_model\"\n"
                 + "default_reasoning_level = \"medium\"\n"
-                + "mcp_servers = []\nskills = []\n"
+                + "mcp_servers = []\ndisabled_skills = []\n"
                 + "[subagents]\nenabled = true\nprovider_id = { __ja_null = true }\nmodel_id = { __ja_null = true }\nreasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\n"
                 + "provider_id = \"provider_model\"\n"
@@ -903,7 +936,7 @@ final class ConfigurationRuntimeAdapterTest {
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
                 + "[providers.agent_defaults]\n"
                 + "[providers.agent_defaults.context]\nauto_compact = true\n"
-                + "[providers.agent_defaults.turn_limits]\nmax_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+
                 + "[[providers.models]]\nmodel_id = \"model_model\"\nname = \"Test Model\"\n"
                 + "model = \"" + model + "\"\nreasoning_level_map = { medium = \"medium\" }\n"
                 + "default_reasoning_level = \"medium\"\n"
@@ -929,8 +962,8 @@ final class ConfigurationRuntimeAdapterTest {
                 + "api = \"openai_chat_completions\"\nbase_url = \"https://beta.example.test/v1\"\n"
                 + "credential_id = \"cred_beta\"\n[providers.network_timeouts]\n"
                 + "connect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n[providers.agent_defaults]\n"
-                + "[providers.agent_defaults.context]\nauto_compact = true\n[providers.agent_defaults.turn_limits]\n"
-                + "max_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+                + "[providers.agent_defaults.context]\nauto_compact = true\n"
+
                 + "[[providers.models]]\nmodel_id = \"model_beta_one\"\nname = \"Beta One\"\n"
                 + "model = \"beta-one\"\nreasoning_level_map = { medium = \"medium\" }\n"
                 + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
@@ -943,8 +976,8 @@ final class ConfigurationRuntimeAdapterTest {
                 + "api = \"anthropic_messages\"\nbase_url = \"https://gamma.example.test\"\n"
                 + "credential_id = \"cred_gamma\"\n[providers.network_timeouts]\n"
                 + "connect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n[providers.agent_defaults]\n"
-                + "[providers.agent_defaults.context]\nauto_compact = true\n[providers.agent_defaults.turn_limits]\n"
-                + "max_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+                + "[providers.agent_defaults.context]\nauto_compact = true\n"
+
                 + "[[providers.models]]\nmodel_id = \"model_gamma_one\"\nname = \"Gamma One\"\n"
                 + "model = \"gamma-one\"\nreasoning_level_map = { medium = \"medium\" }\n"
                 + "default_reasoning_level = \"medium\"\n[providers.models.capabilities]\n"
@@ -956,21 +989,20 @@ final class ConfigurationRuntimeAdapterTest {
 
     /** 项目层只持有其自身启用项和全局收紧项，禁止复制 Provider/MCP 或模型配置。 */
     private static String projectSkillConfig() {
-        return "schema_version = 2\nconfig_revision = 1\nskills = [\"project:workspace-fixture\"]\n"
-                + "disabled_skills = [\"user:global-fixture\"]\n";
+        return "schema_version = 2\nconfig_revision = 1\ndisabled_skills = [\"project:workspace-fixture\"]\n";
     }
 
     /** catalogConfig 固定 Provider/Model 与 Skill/MCP 引用闭包。 */
     private static String catalogConfig(String endpoint) {
         return "schema_version = 2\nconfig_revision = 1\ndefault_access_mode = \"full_access\"\n"
                 + "default_provider_id = \"provider_catalog\"\ndefault_model_id = \"model_catalog\"\n"
-                + "default_reasoning_level = \"medium\"\nskills = [\"user:catalog\"]\n"
+                + "default_reasoning_level = \"medium\"\ndisabled_skills = [\"user:catalog\"]\n"
                 + "[subagents]\nenabled = true\nprovider_id = { __ja_null = true }\nmodel_id = { __ja_null = true }\nreasoning_level = { __ja_null = true }\n"
                 + "[[providers]]\nprovider_id = \"provider_catalog\"\nname = \"Catalog\"\napi = \"openai_responses\"\nbase_url = \"http://127.0.0.1\"\ncredential_id = \"cred_model\"\n"
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
                 + "[providers.agent_defaults]\n"
                 + "[providers.agent_defaults.context]\nauto_compact = true\n"
-                + "[providers.agent_defaults.turn_limits]\nmax_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+
                 + "[[providers.models]]\nmodel_id = \"model_catalog\"\nname = \"Catalog Model\"\nmodel = \"fixture\"\nreasoning_level_map = { medium = \"medium\" }\ndefault_reasoning_level = \"medium\"\n"
                 + "[providers.models.capabilities]\ncontext_window_tokens = 128000\nmax_output_tokens = 8192\n"
                 + "[[mcp_servers]]\nmcp_id = \"mcp_catalog\"\nname = \"MCP\"\ntransport = \"stdio\"\n"
@@ -994,7 +1026,7 @@ final class ConfigurationRuntimeAdapterTest {
         root.putObject("subagents").put("enabled", true).put("provider_id", providerId).put("model_id", modelId)
                 .put("reasoning_level", "medium");
         root.putArray("mcp_servers");
-        root.putArray("skills");
+        root.putArray("disabled_skills");
         ObjectNode provider = root.putArray("providers").addObject();
         provider.put("provider_id", providerId).put("name", "Fixture")
                 .put("api", "openai_responses")
@@ -1003,8 +1035,6 @@ final class ConfigurationRuntimeAdapterTest {
                 .put("request_timeout_ms", 30_000);
         ObjectNode defaults = provider.putObject("agent_defaults");
         defaults.putObject("context").put("auto_compact", true);
-        defaults.putObject("turn_limits").put("max_model_rounds", 32)
-                .put("max_tool_calls", 128).put("wall_timeout_ms", 30_000);
         ObjectNode model = provider.putArray("models").addObject();
         model.put("model_id", modelId).put("name", "Fixture Model").put("model", upstreamModel)
                 .put("default_reasoning_level", "medium");

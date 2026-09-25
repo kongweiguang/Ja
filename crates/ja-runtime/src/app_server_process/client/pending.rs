@@ -4,7 +4,7 @@
 //! Rust client request 的有界 pending registry。
 //!
 //! Pending 是 session 的资源边界，不应借用 UI 或业务状态的生命周期；因此这里
-//! 只保存请求 ID、deadline 和一次性投递器，并用有限 tombstone 拒绝迟到副作用。
+//! 只保存请求 ID、可选请求 deadline 和一次性投递器，并用有限 tombstone 拒绝迟到副作用。
 
 use crate::app_server_process::error::AppServerProcessError;
 use crate::app_server_process::protocol::RpcFrame;
@@ -38,7 +38,7 @@ pub(crate) enum PendingRegisterError {
 
 #[derive(Debug)]
 pub(crate) struct PendingEntry {
-    deadline: Instant,
+    deadline: Option<Instant>,
     completion: SyncSender<Result<RpcFrame, AppServerProcessError>>,
 }
 
@@ -85,6 +85,23 @@ impl PendingRegistry {
         id: impl Into<String>,
         deadline: Instant,
     ) -> Result<Receiver<Result<RpcFrame, AppServerProcessError>>, PendingRegisterError> {
+        self.register_inner(id, Some(deadline))
+    }
+
+    /// 手动压缩只由结果、显式取消或连接关闭收口；pending 容量仍受相同注册表限制。
+    pub(crate) fn register_until_closed(
+        &mut self,
+        id: impl Into<String>,
+    ) -> Result<Receiver<Result<RpcFrame, AppServerProcessError>>, PendingRegisterError> {
+        self.register_inner(id, None)
+    }
+
+    /// 两种等待语义共享重复身份和容量门，不能因取消型请求绕过 registry。
+    fn register_inner(
+        &mut self,
+        id: impl Into<String>,
+        deadline: Option<Instant>,
+    ) -> Result<Receiver<Result<RpcFrame, AppServerProcessError>>, PendingRegisterError> {
         let id = id.into();
         if self.active.contains_key(&id) || self.tombstones.iter().any(|item| item.id == id) {
             return Err(PendingRegisterError::DuplicateRequest);
@@ -122,7 +139,7 @@ impl PendingRegistry {
         let expired: Vec<String> = self
             .active
             .iter()
-            .filter(|(_, entry)| entry.deadline <= now)
+            .filter(|(_, entry)| entry.deadline.is_some_and(|deadline| deadline <= now))
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {

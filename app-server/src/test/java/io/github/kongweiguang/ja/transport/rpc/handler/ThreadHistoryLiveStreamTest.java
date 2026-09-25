@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.transport.rpc.handler;
@@ -183,6 +184,25 @@ final class ThreadHistoryLiveStreamTest {
         }
     }
 
+    /** 多个合法大条目不得合成超帧响应；缩页后的游标仍能无重无漏地读完剩余项。 */
+    @Test
+    void largeHistoryPageShrinksWithoutLosingItems() {
+        List<ThreadSnapshot.Item> items = java.util.stream.IntStream.range(0, 8)
+                .mapToObj(index -> (ThreadSnapshot.Item) new ThreadSnapshot.TextItem(
+                        "item_large_" + index, NOW.plusSeconds(index), "turn_large",
+                        ThreadSnapshot.TextKind.FINAL_ANSWER, "x".repeat(600_000), null))
+                .toList();
+        try (Harness harness = new Harness(List.of(turn("turn_large", "completed")), items)) {
+            ObjectNode first = harness.read();
+            assertEquals(5, first.path("items").size());
+            assertEquals("offset_5", first.path("nextCursor").textValue());
+            ObjectNode second = harness.read("offset_5");
+            assertEquals(3, second.path("items").size());
+            assertTrue(second.path("nextCursor").isNull());
+            assertEquals("item_large_5", second.path("items").get(0).path("itemId").textValue());
+        }
+    }
+
     /** 构造真实连接级 Handler；除历史读取和 Task/Goal 空列表外的能力均明确拒绝。 */
     private static final class Harness implements AutoCloseable {
         private final RecordingThreads threads;
@@ -192,7 +212,12 @@ final class ThreadHistoryLiveStreamTest {
 
         /** 将 ThreadUseCase 读取和真实 Event Sink 接入同一 RpcSession 生命周期。 */
         private Harness(List<ThreadSnapshot.Turn> turns) {
-            threads = new RecordingThreads(turns);
+            this(turns, List.of());
+        }
+
+        /** 注入真实大小的历史页，保持其余连接与活动流装配路径一致。 */
+        private Harness(List<ThreadSnapshot.Turn> turns, List<ThreadSnapshot.Item> items) {
+            threads = new RecordingThreads(turns, items);
             RpcServiceBindings bindings = new RpcServiceBindings(
                     unsupported(WorkspaceUseCase.class), unsupported(WorkspacePathSearchUseCase.class), threads.proxy,
                     io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings.unsupportedThreadMcp(),
@@ -213,8 +238,15 @@ final class ThreadHistoryLiveStreamTest {
 
         /** 直接驱动 ThreadHistoryHandler，仍经过真实 RpcSession active stream owner。 */
         private ObjectNode read() {
+            return read(null);
+        }
+
+        /** 指定服务端返回的 keyset 游标，验证缩页后下一页不会重读前段。 */
+        private ObjectNode read(String cursor) {
+            ObjectNode params = MAPPER.createObjectNode().put("threadId", "thr_live").put("limit", 20);
+            if (cursor != null) params.put("cursor", cursor);
             return handler.handle(new RpcCommand(RpcMethod.THREAD_READ,
-                    MAPPER.createObjectNode().put("threadId", "thr_live").put("limit", 20)))
+                    params))
                     .toCompletableFuture().join();
         }
 
@@ -244,18 +276,25 @@ final class ThreadHistoryLiveStreamTest {
     /** 返回固定 revision 的历史快照；运行事件仍通过 RpcSession registry 进入 read。 */
     private static final class RecordingThreads implements ThreadUseCase {
         private final List<ThreadSnapshot.Turn> turns;
+        private final List<ThreadSnapshot.Item> items;
         private final AtomicLong revision = new AtomicLong(4);
         private final AtomicBoolean deleted = new AtomicBoolean();
         private final ThreadUseCase proxy;
 
         /** 只冻结历史 turns，避免测试 proxy 从内存 registry 反推页面状态。 */
-        private RecordingThreads(List<ThreadSnapshot.Turn> turns) {
+        private RecordingThreads(List<ThreadSnapshot.Turn> turns, List<ThreadSnapshot.Item> items) {
             this.turns = List.copyOf(turns);
+            this.items = List.copyOf(items);
             this.proxy = (ThreadUseCase) Proxy.newProxyInstance(
                     ThreadUseCase.class.getClassLoader(), new Class<?>[]{ThreadUseCase.class},
                     (ignored, method, args) -> {
                         if ("readThread".equals(method.getName())) {
-                            return Optional.of(snapshot(revision.get(), this.turns));
+                            int start = args[1] == null ? 0
+                                    : Integer.parseInt(((String) args[1]).substring("offset_".length()));
+                            int end = Math.min(this.items.size(), start + (int) args[2]);
+                            String next = end < this.items.size() ? "offset_" + end : null;
+                            return Optional.of(snapshot(revision.get(), this.turns,
+                                    this.items.subList(start, end), next));
                         }
                         if ("deleteThread".equals(method.getName())) {
                             deleted.set(true);
@@ -266,12 +305,13 @@ final class ThreadHistoryLiveStreamTest {
         }
 
         /** 以同一 Thread revision 返回真实 reader 会看到的 metadata 与 turns。 */
-        private static ThreadSnapshot snapshot(long revision, List<ThreadSnapshot.Turn> turns) {
+        private static ThreadSnapshot snapshot(long revision, List<ThreadSnapshot.Turn> turns,
+                                               List<ThreadSnapshot.Item> items, String nextCursor) {
             TurnState latest = turns.stream().anyMatch(turn -> "running".equals(turn.status()))
                     ? TurnState.RUNNING : TurnState.QUEUED;
             ThreadSummary thread = new ThreadSummary("thr_live", "ws_live", "Live stream", "project", null, preferences(),
                     ThreadSummary.Status.ACTIVE, false, latest, false, null, revision, NOW, NOW);
-            return new ThreadSnapshot(thread, turns, List.of(), null, null, null);
+            return new ThreadSnapshot(thread, turns, items, null, null, nextCursor);
         }
 
         /** 该回归只读取固定快照，不允许测试意外创建 Thread。 */

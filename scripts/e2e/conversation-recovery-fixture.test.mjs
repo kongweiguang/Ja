@@ -96,8 +96,8 @@ test("loopback permits five failures and success on retry six", async () => {
   }
 });
 
-/** 六次仍失败时保留失败终态，不为第七次 Provider 请求预留隐式额度。 */
-test("loopback exhausts exactly six requests when the sixth one still fails", async () => {
+/** 六次瞬时失败仍继续；第七次确定性拒绝才结束本次请求。 */
+test("loopback keeps retrying until a deterministic rejection", async () => {
   const fixture = await startRecoveryFixture();
   try {
     for (let requestNumber = 1; requestNumber <= RECOVERY_MAX_ATTEMPTS; requestNumber += 1) {
@@ -107,18 +107,23 @@ test("loopback exhausts exactly six requests when the sixth one still fails", as
       });
       assert.equal(response.status, 503);
     }
-    assert.equal(fixture.attempts.length, RECOVERY_MAX_ATTEMPTS);
+    const rejected = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ input: "JA_RECOVERY_RETRY_EXHAUSTED" }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(fixture.attempts.length, RECOVERY_MAX_ATTEMPTS + 1);
     assert.deepEqual(
       fixture.attempts.map((attempt) => attempt.requestNumber),
-      [1, 2, 3, 4, 5, 6],
+      [1, 2, 3, 4, 5, 6, 7],
     );
   } finally {
     await fixture.close();
   }
 });
 
-/** 真窗释放前，手动 continue 的成功响应必须保持挂起以便采样真实运行状态。 */
-test("loopback gates a manual continuation after its prior six failures", async () => {
+/** 确定性拒绝后，手动继续的成功响应保持挂起以采样真实运行状态。 */
+test("loopback gates a manual continuation after a deterministic rejection", async () => {
   const fixture = await startRecoveryFixture();
   try {
     for (let requestNumber = 1; requestNumber <= RECOVERY_MAX_ATTEMPTS; requestNumber += 1) {
@@ -128,6 +133,11 @@ test("loopback gates a manual continuation after its prior six failures", async 
       });
       assert.equal(response.status, 503);
     }
+    const rejected = await fetch(`${fixture.baseUrl}/responses`, {
+      method: "POST",
+      body: JSON.stringify({ input: "JA_RECOVERY_CONTINUE" }),
+    });
+    assert.equal(rejected.status, 400);
     let settled = false;
     const gated = fetch(`${fixture.baseUrl}/responses`, {
       method: "POST",
@@ -164,6 +174,7 @@ test("loopback emits an incomplete text delta followed by a clean successful res
     assert.equal(partial.status, 200);
     const brokenStream = await partial.text();
     assert.match(brokenStream, /JA_RECOVERY_PARTIAL_DRAFT_MUST_NOT_REPEAT/u);
+    assert.match(brokenStream, /"sequence_number":2,"delta":$/u);
     assert.doesNotMatch(brokenStream, /response\.completed/u);
 
     const recovered = await fetch(`${fixture.baseUrl}/responses`, {

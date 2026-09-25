@@ -217,7 +217,7 @@ final class MybatisGoalRepositoryCompletionGateTest {
                 "event_propose_" + suffix, "propose:" + suffix, NOW));
         return repository.executePlan(new GoalRepository.ExecutePlan(planId, 1,
                 proposed.planRevisionId(), proposed.planHash(), "approval:" + suffix, runId, 1,
-                "event_execute_" + suffix, "execute:" + suffix, NOW, 20, 20, 120_000L, 8));
+                "event_execute_" + suffix, "execute:" + suffix, NOW));
     }
 
     /** 创建两个不可变 Plan revision 并执行第二版，用旧版证据验证 revision 精确匹配。 */
@@ -240,7 +240,7 @@ final class MybatisGoalRepositoryCompletionGateTest {
                 "propose:current", NOW.plusSeconds(2)));
         Plan running = repository.executePlan(new GoalRepository.ExecutePlan(planId, rejected.revision() + 1,
                 current.planRevisionId(), current.planHash(), "approval_current", runId, 1,
-                "event_execute_current", "execute:current", NOW.plusSeconds(3), 20, 20, 120_000L, 8));
+                "event_execute_current", "execute:current", NOW.plusSeconds(3)));
         return new RevisionPlan(first, current, running);
     }
 

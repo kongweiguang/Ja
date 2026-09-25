@@ -6,6 +6,8 @@ package io.github.kongweiguang.ja.goal.application;
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.Goal;
 import io.github.kongweiguang.ja.conversation.application.service.TurnService;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
 import org.junit.jupiter.api.Test;
 
@@ -13,6 +15,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -59,6 +62,39 @@ final class GoalContinuationCoordinatorTest {
         assertEquals(1, repository.releases.get());
         assertEquals(1, notifications.get());
         coordinator.close();
+    }
+
+    /**
+     * 共享后台重启后的内存 Run 快照为空，自动续跑须停在 lease 前；新客户端
+     * 显式绑定同一 run 后才允许继续，不能退回后台的 PATH 和登录环境。
+     */
+    @Test
+    void sharedDaemonWaitsForClientRebindBeforeGoalContinuation() {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        bridge.enableSharedMode();
+        FakeRepository repository = new FakeRepository();
+        AtomicInteger starts = new AtomicInteger();
+        GoalContinuationCoordinator.ContinuationTurnPort turns = new GoalContinuationCoordinator.ContinuationTurnPort() {
+            /** 不绑定环境时即使 owner idle 也不能碰 lease。 */
+            @Override public boolean ownerIdle(String threadId) { return true; }
+            /** 重新绑定后才允许创建隐藏 Turn。 */
+            @Override public CompletionStage<Void> start(GoalContinuationCoordinator.ContinuationRequest request) {
+                starts.incrementAndGet();
+                return CompletableFuture.completedFuture(null);
+            }
+        };
+        try (GoalContinuationCoordinator coordinator = new GoalContinuationCoordinator(repository, turns,
+                Clock.fixed(NOW, ZoneOffset.UTC), 3)) {
+            assertTrue(coordinator.continueIfEligible("goal_one").isEmpty());
+            assertEquals(0, repository.releases.get());
+            bridge.bindRun("goal", "goal_one", "run_one",
+                    new NativeExecutionSnapshot(Map.of("JA_MARKER", "new-client"), null));
+            coordinator.continueIfEligible("goal_one").orElseThrow().toCompletableFuture().join();
+            assertEquals(1, starts.get());
+        } finally {
+            bridge.releaseRun("goal", "goal_one", "run_one");
+            bridge.disableSharedMode();
+        }
     }
 
     /** Turn barrier 未释放时 lease 保持 HELD，终态后必须先释放 lease 再开放 gate。 */
@@ -241,8 +277,6 @@ final class GoalContinuationCoordinatorTest {
         @Override public PlanObservation readPlanObservation(String planId) { throw unsupported(); }
         /** coordinator 的 Plan turn admission 必须由真实仓储提供，Goal-only fake 不返回空资格。 */
         @Override public Optional<PlanTurnClaim> claimPlanTurn(ClaimPlanTurn command) { throw unsupported(); }
-        /** 执行预算必须冻结，Goal-only fake 不接受隐式预算。 */
-        @Override public Optional<PlanRunBudget> readPlanRunBudget(String planId, String runId) { throw unsupported(); }
         /** 验收边界必须由真实仓储 CAS，Goal-only fake 不伪造当前状态。 */
         @Override public GoalModels.Plan beginPlanVerification(BeginPlanVerification command) { throw unsupported(); }
         /** 未使用的 reject 明确失败。 */

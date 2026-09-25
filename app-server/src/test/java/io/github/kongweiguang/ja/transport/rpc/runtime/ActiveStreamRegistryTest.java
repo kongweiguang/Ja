@@ -157,7 +157,7 @@ final class ActiveStreamRegistryTest {
         registry.observeTurnCommit("thr_retry", "turn_retry", 2, 2, 0, null, T0.plusSeconds(1));
         TurnEvent.RetryStarted retry = new TurnEvent.RetryStarted(
                 new TurnEvent.Context("evt_retry", "thr_retry", "turn_retry", 2, 2, T0.plusSeconds(1)),
-                2, 6);
+                2);
 
         registry.observe(retry, T0.plusSeconds(1));
         ActiveStreamRegistry.Snapshot cleared = registry.snapshot("thr_retry", 2,

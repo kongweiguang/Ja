@@ -9,6 +9,7 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
+import io.github.kongweiguang.ja.transport.rpc.protocol.ClientOperationFingerprint;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,6 +17,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
+import io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt;
 import io.github.kongweiguang.ja.conversation.domain.UserContent;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
 import io.github.kongweiguang.ja.conversation.port.in.TurnStartRequest;
@@ -25,7 +27,6 @@ import io.github.kongweiguang.ja.conversation.port.in.TurnUseCase;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 
-import java.time.Duration;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
@@ -51,7 +52,8 @@ public final class TurnApprovalHandler implements RpcHandler {
      */
     @Override
     public Set<RpcMethod> methods() {
-        return Set.of(RpcMethod.TURN_START, RpcMethod.TURN_CONTINUE, RpcMethod.TURN_REASK,
+        return Set.of(RpcMethod.OPERATION_READ, RpcMethod.TURN_START, RpcMethod.TURN_CONTINUE,
+                RpcMethod.TURN_REASK,
                 RpcMethod.TURN_RESUME, RpcMethod.TURN_RECOVERY_RESPOND, RpcMethod.TURN_CANCEL,
                 RpcMethod.TURN_INPUT_ENQUEUE, RpcMethod.TURN_INPUT_PRIORITIZE,
                 RpcMethod.TURN_INPUT_UPDATE, RpcMethod.TURN_INPUT_DELETE, RpcMethod.APPROVAL_RESPOND);
@@ -64,6 +66,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     public CompletionStage<ObjectNode> handle(RpcCommand command) {
         session.requireReady();
         return switch (command.method()) {
+            case OPERATION_READ -> CompletableFuture.completedFuture(readOperation(command.params()));
             case TURN_START -> CompletableFuture.completedFuture(start(command.params()));
             case TURN_CONTINUE -> CompletableFuture.completedFuture(continueQuestion(command.params()));
             case TURN_REASK -> CompletableFuture.completedFuture(reask(command.params()));
@@ -168,18 +171,15 @@ public final class TurnApprovalHandler implements RpcHandler {
      * 只映射 Wire 输入为 transport-free 启动意图；请求级运行时和资源释放由 TurnService 负责。
      */
     private ObjectNode start(ObjectNode params) {
-        RpcParams.requireOnly(params, "threadId", "content", "deadlineMs");
+        RpcParams.requireOnly(params, "threadId", "content", "clientOperationId");
+        String operationId = clientOperationId(params);
+        String fingerprint = ClientOperationFingerprint.sha256(session.mapper(), params);
+        ObjectNode committed = replayIfCommitted("turn/start", operationId, fingerprint);
+        if (committed != null) return committed;
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
-        Duration deadline = Duration.ofHours(24);
-        if (params.has("deadlineMs")) {
-            long deadlineMillis = RpcParams.wholeNumber(params, "deadlineMs");
-            if (deadlineMillis < 1_000 || deadlineMillis > 86_400_000) {
-                throw JaRpcException.invalidParams();
-            }
-            deadline = Duration.ofMillis(deadlineMillis);
-        }
         try {
-            return startCurrent(threadId, content(params.get("content")), deadline);
+            return startCurrent(threadId, content(params.get("content")),
+                    operationId, fingerprint);
         } catch (TurnUseCase.ContentValidationException failure) {
             throw contentFailure(failure.failure());
         }
@@ -187,7 +187,11 @@ public final class TurnApprovalHandler implements RpcHandler {
 
     /** 继续不携带用户正文；Java 从最后失败问题读取完整原历史并关联隐藏 Turn。 */
     private ObjectNode continueQuestion(ObjectNode params) {
-        RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
+        RpcParams.requireExact(params, "threadId", "expectedThreadRevision", "clientOperationId");
+        String operationId = clientOperationId(params);
+        String fingerprint = ClientOperationFingerprint.sha256(session.mapper(), params);
+        ObjectNode committed = replayIfCommitted("turn/continue", operationId, fingerprint);
+        if (committed != null) return committed;
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
         long expectedRevision = RpcParams.revision(params, "expectedThreadRevision");
         RecoveryContext recovery = prepareRecoveryContext(threadId, expectedRevision);
@@ -198,8 +202,9 @@ public final class TurnApprovalHandler implements RpcHandler {
             InternalTurnStartRequest request = new InternalTurnStartRequest(threadId, turnId,
                     workspace.workspaceId(), workspace.root(), preferences.providerId(), preferences.modelId(),
                     preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(),
-                    Duration.ofHours(24), expectedRevision, 0, session.clock().instant(), TurnOrigin.USER_CONTINUATION);
-            TurnUseCase.Accepted accepted = session.turns().continueQuestion(request, session.eventSink());
+                    expectedRevision, 0, session.clock().instant(), TurnOrigin.USER_CONTINUATION);
+            TurnUseCase.Accepted accepted = session.turns().continueQuestion(request, session.eventSink(),
+                    operationId, fingerprint);
             bindNotificationCleanup(turnId, accepted.completion());
             return acceptedResult(accepted);
         } catch (RuntimeException failure) {
@@ -210,7 +215,12 @@ public final class TurnApprovalHandler implements RpcHandler {
 
     /** 编辑只接受当前 revision 与最后源消息身份；切路径和新消息由一个 repository 事务负责。 */
     private ObjectNode reask(ObjectNode params) {
-        RpcParams.requireExact(params, "threadId", "expectedThreadRevision", "sourceMessageId", "content");
+        RpcParams.requireExact(params, "threadId", "expectedThreadRevision", "sourceMessageId", "content",
+                "clientOperationId");
+        String operationId = clientOperationId(params);
+        String fingerprint = ClientOperationFingerprint.sha256(session.mapper(), params);
+        ObjectNode committed = replayIfCommitted("turn/reask", operationId, fingerprint);
+        if (committed != null) return committed;
         String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
         long expectedRevision = RpcParams.revision(params, "expectedThreadRevision");
         String sourceMessageId = RpcParams.identifier(params, "sourceMessageId", "item_", 128);
@@ -223,8 +233,9 @@ public final class TurnApprovalHandler implements RpcHandler {
             TurnStartRequest request = new TurnStartRequest(threadId, turnId, workspace.workspaceId(),
                     workspace.root(), userContent, preferences.providerId(), preferences.modelId(),
                     preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(),
-                    Duration.ofHours(24), expectedRevision, 0, session.clock().instant());
-            TurnUseCase.Accepted accepted = session.turns().reask(request, sourceMessageId, session.eventSink());
+                    expectedRevision, 0, session.clock().instant());
+            TurnUseCase.Accepted accepted = session.turns().reask(request, sourceMessageId, session.eventSink(),
+                    operationId, fingerprint);
             bindNotificationCleanup(turnId, accepted.completion());
             return acceptedResult(accepted);
         } catch (TurnUseCase.ContentValidationException failure) {
@@ -271,7 +282,8 @@ public final class TurnApprovalHandler implements RpcHandler {
      * 人工标题或偏好更新若恰在读后提交，只对无副作用的 admission CAS 冲突重读一次，既避免
      * 自动标题让下一轮随机失败，也不对 Provider、Tool 或已接纳 Turn 做不安全重放。
      */
-    private ObjectNode startCurrent(String threadId, UserContent content, Duration deadline) {
+    private ObjectNode startCurrent(String threadId, UserContent content,
+                                    String operationId, String fingerprint) {
         StorageException firstConflict = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             ThreadSnapshot snapshot = session.threads()
@@ -287,9 +299,10 @@ public final class TurnApprovalHandler implements RpcHandler {
             TurnStartRequest request = new TurnStartRequest(threadId, turnId, workspace.workspaceId(),
                     workspace.root(), content,
                     preferences.providerId(), preferences.modelId(),
-                    preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(), deadline,
+                    preferences.reasoningLevel(), preferences.accessMode(), preferences.collaborationMode(),
                     snapshot.thread().revision(), 0, session.clock().instant());
-            TurnUseCase.Accepted accepted = session.turns().start(request, session.eventSink());
+            TurnUseCase.Accepted accepted = session.turns().start(request, session.eventSink(),
+                    operationId, fingerprint);
             bindNotificationCleanup(turnId, accepted.completion());
             return session.mapper().createObjectNode()
                     .put("accepted", true)
@@ -331,11 +344,28 @@ public final class TurnApprovalHandler implements RpcHandler {
                 .put("threadRevision", cancelled.threadRevision()));
     }
 
-    /** 默认入队为普通 FOLLOW_UP；返回全量投影让 ACK 与事件任意先后都可收敛。 */
+    /** 按明确的消费种类一次入队，ACK 与事件任意先后都从权威队列收敛。 */
     private ObjectNode enqueueInput(ObjectNode params) {
-        RpcParams.requireExact(params, "turnId", "content");
+        RpcParams.requireExact(params, "turnId", "content", "kind", "clientOperationId");
         String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
-        return inputResult(() -> session.turns().enqueueInput(turnId, content(params.get("content")), session.eventSink()));
+        String operationId = clientOperationId(params);
+        String fingerprint = ClientOperationFingerprint.sha256(session.mapper(), params);
+        var previous = session.turns().readInputOperation(operationId);
+        if (previous.isPresent()) {
+            var receipt = previous.orElseThrow();
+            if (!receipt.fingerprint().equals(fingerprint)) {
+                throw JaRpcException.of(JaErrorCatalog.CONFLICT, "client operation identity changed");
+            }
+            return inputReceiptResult(receipt);
+        }
+        String kind = RpcParams.text(params, "kind", 16, false);
+        TurnUseCase.InputKind inputKind = switch (kind) {
+            case "steering" -> TurnUseCase.InputKind.STEERING;
+            case "follow_up" -> TurnUseCase.InputKind.FOLLOW_UP;
+            default -> throw JaRpcException.invalidParams();
+        };
+        return inputResult(() -> session.turns().enqueueInput(turnId, content(params.get("content")),
+                inputKind, session.eventSink(), operationId, fingerprint));
     }
 
     /** “调整方向”按条目 revision 提升，重复点击已提升条目保持幂等。 */
@@ -420,7 +450,12 @@ public final class TurnApprovalHandler implements RpcHandler {
      * 只解决一次普通审批请求，并仅等待已提交审批事件的写出确认。
      */
     private CompletionStage<ObjectNode> respond(ObjectNode params) {
-        RpcParams.requireExact(params, "approvalId", "turnId", "decision", "expectedThreadRevision");
+        RpcParams.requireExact(params, "approvalId", "turnId", "decision", "expectedThreadRevision",
+                "clientOperationId");
+        String operationId = clientOperationId(params);
+        String fingerprint = ClientOperationFingerprint.sha256(session.mapper(), params);
+        ObjectNode committed = replayIfCommitted("approval/respond", operationId, fingerprint);
+        if (committed != null) return CompletableFuture.completedFuture(committed);
         String approvalId = RpcParams.identifier(params, "approvalId", "appr_", 108);
         String turnId = RpcParams.identifier(params, "turnId", "turn_", 101);
         long expected = RpcParams.revision(params, "expectedThreadRevision");
@@ -437,7 +472,8 @@ public final class TurnApprovalHandler implements RpcHandler {
             if (!turn.threadId().equals(pending.threadId()) || turn.threadRevision() != expected) {
                 throw JaRpcException.of(JaErrorCatalog.CONFLICT, "thread revision changed");
             }
-            if (!session.approvalUseCase().resolve(approvalId, decision, session.clock().instant())) {
+            if (!session.approvalUseCase().resolve(approvalId, decision, session.clock().instant(),
+                    operationId, fingerprint)) {
                 throw JaRpcException.of(JaErrorCatalog.APPROVAL_ALREADY_RESOLVED,
                         "approval could not be resolved");
             }
@@ -448,6 +484,64 @@ public final class TurnApprovalHandler implements RpcHandler {
             session.approvals().rejected(pending);
             throw failure;
         }
+    }
+
+    /**
+     * 断线后的查询只读持久业务同事务回执；unknown 不能证明未执行，客户端仍须保留
+     * 原输入并让用户核实，不能自动生成第二次副作用。
+     */
+    private ObjectNode readOperation(ObjectNode params) {
+        RpcParams.requireExact(params, "clientOperationId");
+        String operationId = clientOperationId(params);
+        ObjectNode ordinary = session.turns().readClientOperation(operationId)
+                .map(receipt -> {
+                    ObjectNode result = session.mapper().createObjectNode().put("status", "committed")
+                            .put("method", receipt.method()).put("threadId", receipt.threadId());
+                    result.set("result", receiptResult(receipt));
+                    return result;
+                }).orElse(null);
+        if (ordinary != null) return ordinary;
+        return session.turns().readInputOperation(operationId).map(receipt -> {
+            ObjectNode result = session.mapper().createObjectNode().put("status", "committed")
+                    .put("method", "turn/input/enqueue").put("threadId", receipt.threadId());
+            result.set("result", inputReceiptResult(receipt));
+            return result;
+        }).orElseGet(() -> session.mapper().createObjectNode().put("status", "unknown"));
+    }
+
+    /** 回放仅返回不可变输入身份和提交时的种类，队列可由后续权威 read 获取。 */
+    private ObjectNode inputReceiptResult(TurnUseCase.InputOperationReceipt receipt) {
+        return session.mapper().createObjectNode().put("accepted", true)
+                .put("turnId", receipt.turnId()).put("inputId", receipt.inputId())
+                .put("kind", receipt.kind() == TurnUseCase.InputKind.STEERING ? "steering" : "follow_up");
+    }
+
+    /** 同一 ID 的重发仅能复用原方法与规范化载荷，且必须早于任何 CAS、审批门闩或新 Turn ID。 */
+    private ObjectNode replayIfCommitted(String method, String operationId, String fingerprint) {
+        return session.turns().readClientOperation(operationId).map(receipt -> {
+            if (!receipt.matches(method, fingerprint)) {
+                throw JaRpcException.of(JaErrorCatalog.CONFLICT, "client operation identity changed");
+            }
+            return receiptResult(receipt);
+        }).orElse(null);
+    }
+
+    /** 四个有副作用入口共用唯一规范身份，拒绝任意字符串充当重试键。 */
+    private static String clientOperationId(ObjectNode params) {
+        String value = RpcParams.text(params, "clientOperationId", 35, false);
+        if (!value.matches("op_[0-9a-f]{32}")) throw JaRpcException.invalidParams();
+        return value;
+    }
+
+    /** 从持久回执重建原成功 DTO，不把指纹、数据库行或连接环境投影给客户端。 */
+    private ObjectNode receiptResult(ClientOperationReceipt receipt) {
+        ObjectNode result = session.mapper().createObjectNode().put("accepted", true);
+        if ("approval/respond".equals(receipt.method())) {
+            return result.put("approvalId", receipt.approvalId()).put("turnId", receipt.turnId())
+                    .put("decision", receipt.decision()).put("threadRevision", receipt.threadRevision());
+        }
+        return result.put("queued", receipt.queued()).put("turnId", receipt.turnId())
+                .put("threadRevision", receipt.threadRevision());
     }
 
     /** 首轮、队列与 Task 共用唯一结构化内容解析器，避免局部长度或判别闭集再次漂移。 */

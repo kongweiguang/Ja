@@ -17,6 +17,10 @@ public enum RpcMethod {
      * 初始化运行时并协商固定能力。
      */
     RUNTIME_INITIALIZE("runtime/initialize"),
+    /** 为认证连接登记仅在 Java 内存保存的完整原生执行环境。 */
+    RUNTIME_CONTEXT_REGISTER("runtime/context/register"),
+    /** 查询有副作用请求是否已有持久提交回执，断线后不能盲目重发。 */
+    OPERATION_READ("operation/read"),
     /**
      * 读取脱敏运行时健康状态。
      */
@@ -59,6 +63,14 @@ public enum RpcMethod {
      * 读取对话线程快照。
      */
     THREAD_READ("thread/read"),
+    /** 按已提交消息身份分页读取公开正文，单帧只交付一个 Unicode 字符片段。 */
+    THREAD_MESSAGE_CONTENT_READ("thread/message-content/read"),
+    /** 分页搜索主会话已提交的公开用户输入，供终端 Ctrl+R 恢复。 */
+    HISTORY_INPUT_SEARCH("history/input/search"),
+    /** 显式声明当前连接正在观察 Thread；事件基线仍由独立 read 获取。 */
+    THREAD_OBSERVE("thread/observe"),
+    /** 释放连接的观察意图，不影响后台 Turn 生命周期。 */
+    THREAD_UNOBSERVE("thread/unobserve"),
     /** 读取一个 Thread 的累计 Token 计量，不物化历史页。 */
     THREAD_USAGE_READ("thread/usage/read"),
     /** 读取当前 Thread 最近一次观测到的 MCP 目录，只返回脱敏状态。 */
@@ -85,6 +97,8 @@ public enum RpcMethod {
      * 在空闲 Thread 上显式压缩上下文。
      */
     THREAD_COMPACT("thread/compact"),
+    /** 停止当前连接正在运行的手动压缩，不影响其它会话和自动压缩。 */
+    THREAD_COMPACT_CANCEL("thread/compact/cancel"),
     /** 读取当前 Thread 的待回答请求或指定历史问答。 */
     INTERACTION_READ("interaction/read"),
     /** 先建立连接过滤再对账快照，避免提问创建与 UI 订阅竞态丢失。 */

@@ -56,4 +56,19 @@ class ShellCapabilityTest {
         assertTrue(executionEnvironment.contains("shell: unavailable"));
         assertFalse(executionEnvironment.endsWith("\n"));
     }
+
+    /** 显式客户端路径与环境必须一同冻结；预检失败时不能悄悄改用后台的另一方言。 */
+    @Test
+    void explicitClientShellKeepsItsEnvironmentAndFailsClosed() {
+        Path selected = Path.of(System.getProperty("java.io.tmpdir"), "ja-test-shell", "pwsh.exe")
+                .toAbsolutePath();
+        Map<String, String> environment = Map.of("PATH", "client-only-path", "JA_MARKER", "client-only");
+        ShellCapability accepted = ShellCapability.selectedAndPreflight("Windows 11", environment,
+                selected.toString(), candidate -> true);
+        ShellProfile profile = accepted.profile().orElseThrow();
+        assertEquals(selected, profile.executable());
+        assertEquals(environment, profile.environment());
+        assertTrue(ShellCapability.selectedAndPreflight("Windows 11", environment,
+                selected.toString(), candidate -> false).profile().isEmpty());
+    }
 }

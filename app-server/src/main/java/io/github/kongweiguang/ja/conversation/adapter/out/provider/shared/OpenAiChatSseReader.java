@@ -16,7 +16,7 @@ public final class OpenAiChatSseReader {
     private final StrictSseLineReader lines;
     private boolean done;
 
-    /** 将字节、事件数和响应总量限制留给外层 BoundedSseInputStream。 */
+    /** 字节容量由外层保护流约束，分片数量不限制合法的长响应。 */
     public OpenAiChatSseReader(InputStream input) {
         lines = new StrictSseLineReader(Objects.requireNonNull(input, "input"),
                 "OPENAI_CHAT_EVENT", "OpenAI Chat SSE is not valid UTF-8");
@@ -30,20 +30,26 @@ public final class OpenAiChatSseReader {
         while (true) {
             String line = lines.nextLine();
             if (line == null) {
-                if (!frameHasField) return null;
-                return finish(data, dataSeen);
+                if (!frameHasField || !dataSeen) return null;
+                return finish(data, dataSeen, true);
             }
             if (line.isEmpty()) {
                 if (!frameHasField) continue;
-                return finish(data, dataSeen);
+                if (!dataSeen) {
+                    frameHasField = false;
+                    continue;
+                }
+                return finish(data, dataSeen, false);
             }
             if (line.charAt(0) == ':') continue;
-            if (done) throw protocol("OpenAI Chat emitted data after [DONE]");
             frameHasField = true;
             int separator = line.indexOf(':');
-            if (separator <= 0 || !"data".equals(line.substring(0, separator))) {
+            if (separator <= 0) {
                 throw protocol("OpenAI Chat SSE field is unsupported");
             }
+            String field = line.substring(0, separator);
+            if ("id".equals(field) || "retry".equals(field)) continue;
+            if (!"data".equals(field)) throw protocol("OpenAI Chat SSE field is unsupported");
             String value = line.substring(separator + 1);
             if (value.startsWith(" ")) value = value.substring(1);
             if (dataSeen) data.append('\n');
@@ -53,10 +59,9 @@ public final class OpenAiChatSseReader {
     }
 
     /** 将 [DONE] 与 JSON chunk 分型，clean EOF 仍由状态机依据 finish_reason 判定。 */
-    private Event finish(StringBuilder data, boolean dataSeen) {
+    private Event finish(StringBuilder data, boolean dataSeen, boolean eofTerminated) {
         if (!dataSeen) throw protocol("OpenAI Chat SSE data is missing");
         if ("[DONE]".contentEquals(data)) {
-            if (done) throw protocol("OpenAI Chat repeated [DONE]");
             done = true;
             return Event.doneEvent();
         }
@@ -69,9 +74,18 @@ public final class OpenAiChatSseReader {
             return Event.chunk(root);
         } catch (ProviderProtocolException failure) {
             throw failure;
+        } catch (com.fasterxml.jackson.core.io.JsonEOFException failure) {
+            if (eofTerminated) throw truncated();
+            throw protocol("OpenAI Chat chunk is invalid");
         } catch (IOException | RuntimeException failure) {
             throw protocol("OpenAI Chat chunk is invalid");
         }
+    }
+
+    /** EOF 才有资格把不完整 JSON 帧归为断流；已闭合帧的坏 JSON 不应无限重试。 */
+    private static ProviderProtocolException truncated() {
+        return new ProviderProtocolException("STREAM_TRUNCATED",
+                "OpenAI Chat SSE chunk ended before completion", true, "MODEL_STREAM_INVALID");
     }
 
     /** 创建不携带 Provider 原始 payload 的稳定 Chat 协议错误。 */

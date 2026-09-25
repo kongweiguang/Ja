@@ -97,6 +97,13 @@ function fakeRuntime(initialState: RuntimeStatus = stopped): {
   const turnInputs: unknown[] = [];
   const projection = fakeProjection();
   const runtime: RuntimeHostPort = {
+    pendingOperations: vi.fn(async () => []),
+    recheckPendingOperations: vi.fn(async () => []),
+    acknowledgePendingOperation: vi.fn(async () => ({
+      status: "unknown_acknowledged" as const,
+      pending: [],
+    })),
+    subscribePendingOperations: vi.fn(() => () => undefined),
     recoveryState: vi.fn(async () => ({
       required: false,
       acknowledgeable: false,
@@ -231,6 +238,10 @@ function Probe(): ReactElement {
     <div>
       <output data-testid="boot">{state.boot.status}</output>
       <output data-testid="admission">{String(state.turnAdmissionReady)}</output>
+      <output data-testid="pending">{state.pendingClientOperations.length}</output>
+      <output data-testid="server-instance">
+        {state.runtimeState?.serverInstanceId ?? "none"}
+      </output>
       <button type="button" onClick={() => void lifecycle.startRuntime().catch(() => undefined)}>
         retry
       </button>
@@ -327,6 +338,64 @@ describe("RuntimeProvider v1 lifecycle", () => {
     expect(fake.calls).not.toContain("start");
     screen.getByRole("button", { name: "submit" }).click();
     await waitFor(() => expect(fake.calls).toContain("turnStart"));
+  });
+
+  /** 已连接共享后台不会重新 start；仍需回查持久关联 ID 并在新 renderer 中显示未知提交。 */
+  it("rehydrates opaque pending operations when WebView reloads over an already-ready daemon", async () => {
+    const fake = fakeRuntime(ready);
+    vi.mocked(fake.runtime.recheckPendingOperations).mockResolvedValue([
+      {
+        clientOperationId: "op_11111111111111111111111111111111",
+        method: "turn/start",
+        threadId: "thr_fixture",
+        createdAt: "2026-09-24T00:00:00.000Z",
+      },
+    ]);
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("boot")).toHaveTextContent("ready"));
+    await waitFor(() => expect(screen.getByTestId("pending")).toHaveTextContent("1"));
+    expect(fake.runtime.recheckPendingOperations).toHaveBeenCalledTimes(1);
+    expect(fake.calls).not.toContain("start");
+  });
+
+  /** 实例切换后旧代际数字不再可比；原生 state 对账决定是否接受较小新代际及丢弃晚到旧事件。 */
+  it("reconciles a lower generation from a new daemon instance without restoring stale status", async () => {
+    const oldStatus = { ...ready, generation: 9, serverInstanceId: "srv_old" };
+    const newStatus = { ...ready, generation: 1, serverInstanceId: "srv_new" };
+    const fake = fakeRuntime(oldStatus);
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("server-instance")).toHaveTextContent("srv_old"));
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+    fake.setState(newStatus);
+    act(() => {
+      fake.emit({
+        kind: "status",
+        status: newStatus,
+        eventId: "evt_new_instance",
+        occurredAt: "2026-09-24T00:00:01Z",
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId("server-instance")).toHaveTextContent("srv_new"));
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+    act(() => {
+      fake.emit({
+        kind: "status",
+        status: oldStatus,
+        eventId: "evt_stale_instance",
+        occurredAt: "2026-09-24T00:00:00Z",
+      });
+    });
+    await waitFor(() => expect(fake.runtime.state).toHaveBeenCalledTimes(3));
+    expect(screen.getByTestId("server-instance")).toHaveTextContent("srv_new");
+    expect(screen.getByTestId("admission")).toHaveTextContent("true");
   });
 
   /** Renderer 摘要只补齐 ACK 投影，传给 JA-RPC 的 turn/start 仍保持冻结 content 合同。 */

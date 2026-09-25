@@ -78,6 +78,13 @@ export interface TaskComposerEnvironment {
 export interface TaskTranscriptActions {
   readonly onOpenLink?: (url: string) => void | Promise<void>;
   readonly onCopyText?: (text: string) => Promise<void>;
+  readonly onReadMessageContent?: (threadId: string, messageId: string) => Promise<string>;
+  readonly onReadAnswerContent?: (
+    threadId: string,
+    finalMessageId: string,
+    minimumRevision?: number,
+    turnId?: string,
+  ) => Promise<string>;
   readonly onReadToolArtifact?: (input: {
     threadId: string;
     turnId: string;
@@ -392,6 +399,22 @@ export function TaskDetailPanel({
           }
           onOpenLink={transcriptActions?.onOpenLink}
           onCopyText={transcriptActions?.onCopyText}
+          onReadMessageContent={
+            transcriptActions?.onReadMessageContent === undefined || threadId === ""
+              ? undefined
+              : (messageId) => transcriptActions.onReadMessageContent!(threadId, messageId)
+          }
+          onReadAnswerContent={
+            transcriptActions?.onReadAnswerContent === undefined || threadId === ""
+              ? undefined
+              : (finalMessageId, minimumRevision, turnId) =>
+                  transcriptActions.onReadAnswerContent!(
+                    threadId,
+                    finalMessageId,
+                    minimumRevision,
+                    turnId,
+                  )
+          }
           onReadToolArtifact={transcriptActions?.onReadToolArtifact}
           onResolveToolRecovery={transcriptActions?.onResolveToolRecovery}
           onOpenAttachmentPreview={transcriptActions?.onOpenAttachmentPreview}

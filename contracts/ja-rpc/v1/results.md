@@ -96,6 +96,14 @@ or Provider configuration.
 authoritative reload state, not an event-stream guess. Cancelling a suspended Turn commits and returns
 `status:"cancelled"`; it never leaves a successfully cancelled Operation suspended.
 
+`thread/message-content/read` returns
+`{messageId,offsetCharacters,nextOffsetCharacters,totalCharacters,truncated,content}`.
+Offsets and total count Unicode code points; `nextOffsetCharacters` is null exactly on the final page.
+The result contains only public `TextContent` of a current-path Assistant message or a public
+reasoning summary. The
+`thread/read` and terminal answer text are safe previews, so callers must page this method
+before treating a long answer as complete.
+
 `tool/artifact/read` returns character pagination
 `{artifactId,offsetCharacters,nextOffsetCharacters,totalCharacters,truncated,content}` and is authorized by
 the exact Thread/Turn/Call/artifact tuple. `turn/change-set/read` is a separate complete-file contract returning

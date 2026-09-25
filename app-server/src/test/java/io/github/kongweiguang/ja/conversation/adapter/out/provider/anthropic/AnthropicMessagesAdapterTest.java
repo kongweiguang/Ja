@@ -274,6 +274,60 @@ final class AnthropicMessagesAdapterTest {
         }
     }
 
+    /** 多个合法小帧组成的长 thinking 不能因累计字符数超过旧阈值被当成协议错误。 */
+    @Test
+    void retainsThinkingAcrossMoreThanFourMillionStreamedCharacters() throws Exception {
+        String chunk = "x".repeat(100_000);
+        StringBuilder stream = new StringBuilder("""
+                event: message_start
+                data: {"type":"message_start","message":{"id":"msg_long_thinking","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":0}}}
+
+                event: content_block_start
+                data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+                """);
+        for (int index = 0; index < 41; index++) {
+            stream.append("event: content_block_delta\n")
+                    .append("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"")
+                    .append(chunk).append("\"}}\n\n");
+        }
+        stream.append("""
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"complete signature"}}
+
+                event: content_block_stop
+                data: {"type":"content_block_stop","index":0}
+
+                event: message_delta
+                data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+                event: message_stop
+                data: {"type":"message_stop"}
+
+                """);
+        List<ModelPort.ModelEvent> events = new CopyOnWriteArrayList<>();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream.toString(), 8_192))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.ANTHROPIC_MESSAGES, Duration.ofSeconds(30));
+            try (AnthropicMessagesAdapter adapter = new AnthropicMessagesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(
+                                ModelAdapterTestSupport.request(configuration), event -> {
+                                    events.add(event);
+                                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                                }, CancellationToken.none())
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+        }
+        ReasoningContent nativeBlock = events.stream()
+                .filter(ModelPort.ReasoningBlockReady.class::isInstance)
+                .map(event -> ((ModelPort.ReasoningBlockReady) event).content())
+                .findFirst().orElseThrow();
+        assertEquals(4_100_000, AbstractStreamingModelAdapter.JSON
+                .readTree(nativeBlock.nativeJson()).path("thinking").textValue().length());
+    }
+
     /** 初始 thinking、redacted thinking 和普通文本块均按 SSE 原始顺序发布对应语义事件。 */
     @Test
     void publishesInitialAndRedactedReasoningBlocksInOrder() throws Exception {
@@ -366,9 +420,9 @@ final class AnthropicMessagesAdapterTest {
         assertTrue(events.stream().noneMatch(ModelPort.ReasoningBlockReady.class::isInstance));
     }
 
-    /** 初始公开 thinking 在截断后可按摘要前缀去重重试，最终仍只保留一份摘要事件。 */
+    /** 初始公开 thinking 保留一次；截断由会话层以新请求恢复，Adapter 不自行回放。 */
     @Test
-    void acceptsInitialThinkingBeforeRetryableTruncation() throws Exception {
+    void reportsInitialThinkingBeforeRetryableTruncation() throws Exception {
         String stream = """
                 event: message_start
                 data: {"type":"message_start","message":{"id":"msg_initial_truncated","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":0}}}
@@ -391,7 +445,7 @@ final class AnthropicMessagesAdapterTest {
                 assertEquals("STREAM_TRUNCATED",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
             }
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
         assertEquals("initial semantic output",
                 assertInstanceOf(ModelPort.ReasoningSummaryDelta.class, events.getFirst()).text());
@@ -591,7 +645,7 @@ final class AnthropicMessagesAdapterTest {
                 assertTrue(!protocol.getMessage().contains("private-mismatch-sentinel"));
             }
             assertTrue(events.isEmpty());
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
         }
     }
 
@@ -766,31 +820,45 @@ final class AnthropicMessagesAdapterTest {
                                 .toCompletableFuture().get(5, TimeUnit.SECONDS));
                 assertEquals("STREAM_TRUNCATED",
                         assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
-                assertEquals(3, server.calls());
+                assertEquals(1, server.calls());
             }
         }
     }
 
-    /** 拒绝 Anthropic Core 可能静默忽略的事件名。 */
+    /** 未知扩展事件在字节保护内跳过，后续正式终态仍可正常完成。 */
     @Test
-    void rejectsUnknownSseEventName() throws Exception {
-        String unknown = "event: future_private_event\ndata: {\"type\":\"future_private_event\"}\n\n";
+    void ignoresUnknownSseEventName() throws Exception {
+        String unknown = "event: future_private_event\ndata: {\"type\":\"future_private_event\"}\n\n"
+                + SUCCESS;
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, unknown, 1))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.ANTHROPIC_MESSAGES, Duration.ofSeconds(5));
             try (AnthropicMessagesAdapter adapter = new AnthropicMessagesAdapter(configuration)) {
-                ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration),
-                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                        CancellationToken.none())
-                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                ProviderProtocolException protocol =
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause());
-                assertEquals("ANTHROPIC_EVENT", protocol.code());
-                assertTrue(!protocol.getMessage().contains("future_private_event"));
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.TOOL_CALLS, outcome.finishReason());
             }
-            assertEquals(3, server.calls());
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 完全相同的 message_stop 重复帧不改变工具调用和最终状态。 */
+    @Test
+    void acceptsRepeatedIdenticalMessageStop() throws Exception {
+        String stream = SUCCESS + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, stream, 11))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.ANTHROPIC_MESSAGES, Duration.ofSeconds(5));
+            try (AnthropicMessagesAdapter adapter = new AnthropicMessagesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.TOOL_CALLS, outcome.finishReason());
+            }
+            assertEquals(1, server.calls());
         }
     }
 
@@ -820,7 +888,7 @@ final class AnthropicMessagesAdapterTest {
                     assertEquals("ANTHROPIC_EVENT",
                             assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
                 }
-                assertEquals(3, server.calls());
+                assertEquals(1, server.calls());
             }
         }
     }
@@ -968,24 +1036,25 @@ final class AnthropicMessagesAdapterTest {
 
     /** 拒绝负数强类型 usage，不执行重试也不发布 usage 事件。 */
     @Test
-    void rejectsInvalidUsage() throws Exception {
+    void completesWithInvalidUsageAsUnknown() throws Exception {
         String invalid = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
                 + "{\"id\":\"msg_invalid_usage\",\"type\":\"message\",\"role\":\"assistant\","
                 + "\"content\":[],\"model\":\"claude-test\",\"stop_reason\":null,"
-                + "\"stop_sequence\":null,\"usage\":{\"input_tokens\":-1,\"output_tokens\":0}}}\n\n";
+                + "\"stop_sequence\":null,\"usage\":{\"input_tokens\":-1,\"output_tokens\":0}}}\n\n"
+                + "event: message_delta\ndata: {\"type\":\"message_delta\","
+                + "\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+                + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
                 (call, exchange) -> ModelAdapterTestSupport.sse(exchange, invalid, 3))) {
             ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
                     ModelPort.Api.ANTHROPIC_MESSAGES,
                     Duration.ofSeconds(5));
             try (AnthropicMessagesAdapter adapter = new AnthropicMessagesAdapter(configuration)) {
-                ExecutionException failure = assertThrows(ExecutionException.class, () ->
-                        adapter.start(ModelAdapterTestSupport.request(configuration),
-                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
-                                        CancellationToken.none())
-                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
-                assertEquals("USAGE",
-                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertNull(outcome.usage());
             }
             assertEquals(1, server.calls());
         }

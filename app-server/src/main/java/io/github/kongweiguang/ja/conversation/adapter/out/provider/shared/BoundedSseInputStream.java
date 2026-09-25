@@ -10,56 +10,33 @@ import java.io.InputStream;
 import java.util.Objects;
 
 /**
- * 在 Provider SSE 分帧和 JSON 解析前执行透明的原始字节边界保护。
+ * 在 Provider SSE 分帧和 JSON 解析前限制单帧资源；完整响应按流消费，不设置累计停机阈值。
  */
 final class BoundedSseInputStream extends FilterInputStream {
     private final long maxEventBytes;
-    private final long maxResponseBytes;
-    private final long maxEventCount;
 
-    private long responseBytes;
     private long eventBytes;
-    private long eventCount;
     private int lineBytes;
-    private boolean frameHasContent;
     private boolean previousWasCarriageReturn;
-    private boolean eofProcessed;
     private boolean closed;
 
     /**
-     * 创建仅向前读取的保护流，并分别限制单帧、整段响应和帧数量。
+     * 只限制当前帧占用；响应总长度与分片数量都不能成为长任务的隐式输出预算。
      */
-    BoundedSseInputStream(InputStream delegate, long maxEventBytes,
-                          long maxResponseBytes, long maxEventCount) {
+    BoundedSseInputStream(InputStream delegate, long maxEventBytes) {
         super(Objects.requireNonNull(delegate, "delegate"));
-        if (maxEventBytes <= 0 || maxResponseBytes <= 0 || maxEventCount <= 0) {
-            throw new IllegalArgumentException("SSE limits must be positive");
-        }
-        if (maxEventBytes > maxResponseBytes) {
-            throw new IllegalArgumentException("event limit must not exceed response limit");
-        }
+        if (maxEventBytes <= 0) throw new IllegalArgumentException("SSE event limit must be positive");
         this.maxEventBytes = maxEventBytes;
-        this.maxResponseBytes = maxResponseBytes;
-        this.maxEventCount = maxEventCount;
     }
 
     /**
-     * 串行读取一个原始字节并只结算一次 EOF 帧；同步边界保证意外的并发读取无法破坏累计状态。
+     * 单字节读取仍在交给解析器前计入当前帧，EOF 不制造额外语义事件。
      */
     @Override
     public synchronized int read() throws IOException {
         requireOpen();
-        if (responseBytes == maxResponseBytes) {
-            int value = in.read();
-            if (value < 0) {
-                finishEof();
-                return -1;
-            }
-            throw responseLimit();
-        }
         int value = in.read();
         if (value < 0) {
-            finishEof();
             return -1;
         }
         accept(value);
@@ -67,26 +44,15 @@ final class BoundedSseInputStream extends FilterInputStream {
     }
 
     /**
-     * 在向解析器暴露批量字节前，以同一把锁完成响应、事件和行状态的原子更新。
+     * 批量读取与单字节读取共享当前帧状态，不让 HTTP 分包方式影响容量判断。
      */
     @Override
     public synchronized int read(byte[] bytes, int offset, int length) throws IOException {
         requireOpen();
         Objects.checkFromIndexSize(offset, length, bytes.length);
         if (length == 0) return 0;
-        long remaining = maxResponseBytes - responseBytes;
-        if (remaining == 0) {
-            int value = in.read();
-            if (value < 0) {
-                finishEof();
-                return -1;
-            }
-            throw responseLimit();
-        }
-        int allowed = (int) Math.min((long) length, remaining);
-        int read = in.read(bytes, offset, allowed);
+        int read = in.read(bytes, offset, length);
         if (read < 0) {
-            finishEof();
             return -1;
         }
         for (int index = offset; index < offset + read; index++) {
@@ -155,10 +121,9 @@ final class BoundedSseInputStream extends FilterInputStream {
     }
 
     /**
-     * 结算一个原始字节，并识别 LF、CRLF 与 CR 三种行边界。
+     * 逐字节核算帧容量并识别 LF、CRLF 与 CR，避免不同换行方式绕过单帧保护。
      */
     private void accept(int value) {
-        responseBytes++;
         if (previousWasCarriageReturn) {
             previousWasCarriageReturn = false;
             if (value == '\n') {
@@ -177,7 +142,6 @@ final class BoundedSseInputStream extends FilterInputStream {
             endLine();
             return;
         }
-        frameHasContent = true;
         lineBytes++;
     }
 
@@ -193,26 +157,11 @@ final class BoundedSseInputStream extends FilterInputStream {
     }
 
     /**
-     * 计入一个非空原始帧，并在下一帧前重置单帧容量状态。
+     * 帧结束释放单帧计数；已处理的心跳和正文不会积累在输入流内。
      */
     private void finishFrame() {
-        if (frameHasContent && ++eventCount > maxEventCount) throw responseLimit();
         eventBytes = 0;
-        frameHasContent = false;
         lineBytes = 0;
-    }
-
-    /**
-     * 结算未终止的最后一行或帧，避免解析器静默丢弃容量事实。
-     */
-    private void finishEof() {
-        if (eofProcessed) return;
-        eofProcessed = true;
-        if (previousWasCarriageReturn) {
-            previousWasCarriageReturn = false;
-            endLine();
-        }
-        if (frameHasContent && ++eventCount > maxEventCount) throw responseLimit();
     }
 
     /**
@@ -231,11 +180,4 @@ final class BoundedSseInputStream extends FilterInputStream {
                 "EVENT_LIMIT", "provider event exceeds the size limit", false);
     }
 
-    /**
-     * 创建不包含响应内容的整段流容量异常。
-     */
-    private static ProviderProtocolException responseLimit() {
-        return new ProviderProtocolException(
-                "RESPONSE_LIMIT", "provider response exceeds the size or event-count limit", false);
-    }
 }

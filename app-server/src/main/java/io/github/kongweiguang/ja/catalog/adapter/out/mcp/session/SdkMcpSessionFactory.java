@@ -59,12 +59,24 @@ public final class SdkMcpSessionFactory implements McpSessionFactory {
     @Override
     public McpSession open(
             McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged) {
+        return open(definition, deadline, toolsChanged, System.getenv());
+    }
+
+    /**
+     * stdio 只继承当前 Turn 冻结的完整宿主环境，再叠加 Java 配置的 MCP 专属变量；
+     * HTTP 仍只使用配置的 endpoint/header，不能因环境快照触发额外透传。
+     */
+    @Override
+    public McpSession open(
+            McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged,
+            Map<String, String> hostEnvironment) {
         Objects.requireNonNull(deadline, "deadline");
         Objects.requireNonNull(toolsChanged, "toolsChanged");
+        Objects.requireNonNull(hostEnvironment, "hostEnvironment");
         McpClientTransport transport;
         if (definition.transport() == McpServerDefinition.Transport.STDIO) {
             Map<String, String> processEnvironment = inheritedEnvironment(
-                    System.getenv(), definition.environment());
+                    hostEnvironment, definition.environment());
             try {
                 WindowsProcessLauncher.verifyExecutableAvailable(
                         definition.command(), definition.workingDirectory(), processEnvironment);

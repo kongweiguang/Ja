@@ -7,10 +7,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelMessage;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
+import io.github.kongweiguang.ja.conversation.domain.model.PublicTextPreview;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelRole;
 import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 import io.github.kongweiguang.ja.conversation.domain.ToolPresentation;
+import io.github.kongweiguang.ja.conversation.domain.ClientOperationReceipt;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolResultContent;
 import io.github.kongweiguang.ja.conversation.domain.tool.ToolState;
 import io.github.kongweiguang.ja.conversation.domain.approval.ApprovalDecision;
@@ -128,9 +131,19 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     @Override
     public AdmissionReceipt admit(TurnAdmission admission) {
+        return admit(admission, null, null);
+    }
+
+    /** 幂等查重先于 Thread CAS，业务准入与回执随后同事务提交，响应丢失后可跨进程回读。 */
+    @Override
+    public AdmissionReceipt admit(TurnAdmission admission, String clientOperationId, String requestFingerprint) {
         ensureOpen();
         Objects.requireNonNull(admission, "admission");
+        requireOperationPair(clientOperationId, requestFingerprint);
         return transactions.required(mapper -> {
+            AdmissionReceipt existing = existingAdmission(mapper, clientOperationId,
+                    "turn/start", requestFingerprint);
+            if (existing != null) return existing;
             ThreadAdmissionContext context = prepareAdmission(mapper, admission.threadId(),
                     admission.expectedThreadRevision(), admission.turnId(), admission.initialExecution(),
                     admission.requestedAt(), null, "");
@@ -145,8 +158,12 @@ public final class MybatisConversationRepository implements ConversationReposito
             List<String> attachmentNames = bindAttachments(mapper, thread.workspaceId(), admission);
             String provisionalTitle = persistUserTimelineAndAdmissionTitle(
                     mapper, admission, thread, attachmentNames, ordinal, "thread admission ");
-            return new AdmissionReceipt(admission.threadId(), admission.turnId(),
+            AdmissionReceipt receipt = new AdmissionReceipt(admission.threadId(), admission.turnId(),
                     admission.expectedThreadRevision() + 1, 0, provisionalTitle);
+            persistOperation(mapper, clientOperationId, "turn/start", requestFingerprint,
+                    receipt.threadId(), receipt.turnId(), receipt.threadRevision(), true,
+                    null, null, admission.requestedAt());
+            return receipt;
         });
     }
 
@@ -156,9 +173,20 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     @Override
     public AdmissionReceipt admitContinuation(ContinuationAdmission admission) {
+        return admitContinuation(admission, null, null);
+    }
+
+    /** 用户继续与内部续跑共用业务事务，但只有外部操作携带并持久化客户端幂等身份。 */
+    @Override
+    public AdmissionReceipt admitContinuation(ContinuationAdmission admission,
+                                              String clientOperationId, String requestFingerprint) {
         ensureOpen();
         Objects.requireNonNull(admission, "admission");
+        requireOperationPair(clientOperationId, requestFingerprint);
         return transactions.required(mapper -> {
+            AdmissionReceipt existing = existingAdmission(mapper, clientOperationId,
+                    "turn/continue", requestFingerprint);
+            if (existing != null) return existing;
             String sourceMessageId = admission.sourceMessageId();
             if (sourceMessageId != null
                     && admission.initialExecution().common().origin()
@@ -206,8 +234,12 @@ public final class MybatisConversationRepository implements ConversationReposito
                             thread.modelId(), thread.reasoningLevel(), thread.accessMode(), thread.collaborationMode(),
                             null, admission.expectedThreadRevision(), instant(admission.requestedAt()))),
                     "continuation admission revision lost");
-            return new AdmissionReceipt(admission.threadId(), admission.turnId(),
+            AdmissionReceipt receipt = new AdmissionReceipt(admission.threadId(), admission.turnId(),
                     admission.expectedThreadRevision() + 1, 0, null);
+            persistOperation(mapper, clientOperationId, "turn/continue", requestFingerprint,
+                    receipt.threadId(), receipt.turnId(), receipt.threadRevision(), true,
+                    null, null, admission.requestedAt());
+            return receipt;
         });
     }
 
@@ -227,10 +259,21 @@ public final class MybatisConversationRepository implements ConversationReposito
     /** 编辑重答必须先验证源问题仍是当前路径末尾，再原子切旧后缀并接入带新身份的 USER Turn。 */
     @Override
     public AdmissionReceipt admitReask(ReaskAdmission reask) {
+        return admitReask(reask, null, null);
+    }
+
+    /** 重答先命中原 operation，再决定是否剪切路径，避免旧 revision 的幂等重试再次改变历史。 */
+    @Override
+    public AdmissionReceipt admitReask(ReaskAdmission reask,
+                                       String clientOperationId, String requestFingerprint) {
         ensureOpen();
         Objects.requireNonNull(reask, "reask");
+        requireOperationPair(clientOperationId, requestFingerprint);
         TurnAdmission admission = reask.turn();
         return transactions.required(mapper -> {
+            AdmissionReceipt existing = existingAdmission(mapper, clientOperationId,
+                    "turn/reask", requestFingerprint);
+            if (existing != null) return existing;
             io.github.kongweiguang.ja.infrastructure.persistence.repository.task.SideChatPersistence
                     .requireConversationAdmissionOpen(mapper, admission.threadId());
             PersistenceRecords.ThreadRow thread = requireThread(mapper, admission.threadId());
@@ -258,9 +301,69 @@ public final class MybatisConversationRepository implements ConversationReposito
                     sourceMessageId);
             String provisionalTitle = persistUserTimelineAndAdmissionTitle(
                     mapper, admission, thread, attachmentNames, ordinal, "reask admission ");
-            return new AdmissionReceipt(admission.threadId(), admission.turnId(),
+            AdmissionReceipt receipt = new AdmissionReceipt(admission.threadId(), admission.turnId(),
                     admission.expectedThreadRevision() + 1, 0, provisionalTitle);
+            persistOperation(mapper, clientOperationId, "turn/reask", requestFingerprint,
+                    receipt.threadId(), receipt.turnId(), receipt.threadRevision(), true,
+                    null, null, admission.requestedAt());
+            return receipt;
         });
+    }
+
+    /** 只把已提交的安全回执交给查询方；查不到时不得从 Turn 时间或连接状态推测成功。 */
+    @Override
+    public Optional<ClientOperationReceipt> readClientOperation(String clientOperationId) {
+        ensureOpen();
+        requireOperationId(clientOperationId);
+        return transactions.required(mapper -> Optional.ofNullable(
+                mapper.agent().selectClientOperation(clientOperationId)).map(MybatisConversationRepository::operation));
+    }
+
+    /** 两个可空值必须成对出现；内部 Turn 可无身份，外部入口使用严格固定长度随机 ID。 */
+    private static void requireOperationPair(String clientOperationId, String requestFingerprint) {
+        if (clientOperationId == null && requestFingerprint == null) return;
+        requireOperationId(clientOperationId);
+        if (requestFingerprint == null || !requestFingerprint.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("invalid client operation fingerprint");
+        }
+    }
+
+    /** 主键只接受客户端生成的固定形状，拒绝任意字符串进入持久查询和冲突诊断。 */
+    private static void requireOperationId(String clientOperationId) {
+        if (clientOperationId == null || !clientOperationId.matches("op_[0-9a-f]{32}")) {
+            throw new IllegalArgumentException("invalid client operation id");
+        }
+    }
+
+    /** 同一 SQLite 事务先检查旧提交，重复请求直接取得原 Turn 身份并跳过所有副作用。 */
+    private static AdmissionReceipt existingAdmission(PersistenceMappers mapper, String clientOperationId,
+                                                      String method, String requestFingerprint) {
+        if (clientOperationId == null) return null;
+        PersistenceRecords.ClientOperationRow row = mapper.agent().selectClientOperation(clientOperationId);
+        if (row == null) return null;
+        ClientOperationReceipt receipt = operation(row);
+        if (!receipt.matches(method, requestFingerprint)) {
+            throw new StorageException(StorageException.Code.CAS_CONFLICT, "client operation identity conflicts");
+        }
+        return new AdmissionReceipt(receipt.threadId(), receipt.turnId(), receipt.threadRevision(), 0, null);
+    }
+
+    /** 将同一事务成功结果写入不可改回执；插入失败必须回滚前面的 Turn/审批变更。 */
+    private static void persistOperation(PersistenceMappers mapper, String clientOperationId, String method,
+                                         String requestFingerprint, String threadId, String turnId,
+                                         long threadRevision, boolean queued,
+                                         String approvalId, String decision, Instant occurredAt) {
+        if (clientOperationId == null) return;
+        requireChanged(mapper.agent().insertClientOperation(new PersistenceRecords.ClientOperationRow(
+                clientOperationId, method, requestFingerprint, threadId, turnId, threadRevision,
+                queued, approvalId, decision, instant(occurredAt))), "client operation receipt was not persisted");
+    }
+
+    /** MyBatis 行到领域回执的唯一转换会重新校验闭集，避免损坏值被 operation/read 宣称成功。 */
+    private static ClientOperationReceipt operation(PersistenceRecords.ClientOperationRow row) {
+        return new ClientOperationReceipt(row.clientOperationId(), row.method(), row.requestFingerprint(),
+                row.threadId(), row.turnId(), row.threadRevision(), row.queued(),
+                row.approvalId(), row.decision());
     }
 
     /** 用户可见投影、首条标题与 revision CAS 共用事务实现，避免新增普通准入和重答的提交语义分叉。 */
@@ -992,7 +1095,7 @@ public final class MybatisConversationRepository implements ConversationReposito
                 insertMessage(mapper, request.threadId(), request.turnId(), request.finalMessageId(),
                         request.finalMessage(), request.occurredAt());
                 insertTimelineMessage(mapper, request.finalMessageId(), request.threadId(), request.turnId(),
-                        "FINAL_ANSWER", visibleText(request.finalMessage()), null, null, null,
+                        "FINAL_ANSWER", PublicTextPreview.from(request.finalMessage()), null, null, null,
                         request.occurredAt());
             }
             requireChanged(mapper.agent().compareAndSetTurn(new PersistenceRecords.TurnCas(
@@ -1509,11 +1612,29 @@ public final class MybatisConversationRepository implements ConversationReposito
      */
     @Override
     public boolean resolveApproval(String approvalId, ApprovalDecision decision, Instant resolvedAt) {
+        return resolveApproval(approvalId, decision, resolvedAt, null, null);
+    }
+
+    /** 审批决定与客户端回执共用 SQLite decision gate，重连回读不能再次唤醒 Tool。 */
+    @Override
+    public boolean resolveApproval(String approvalId, ApprovalDecision decision, Instant resolvedAt,
+                                   String clientOperationId, String requestFingerprint) {
         ensureOpen();
         Objects.requireNonNull(approvalId, "approvalId");
         Objects.requireNonNull(decision, "decision");
         Objects.requireNonNull(resolvedAt, "resolvedAt");
+        requireOperationPair(clientOperationId, requestFingerprint);
         return transactions.required(mapper -> {
+            if (clientOperationId != null) {
+                PersistenceRecords.ClientOperationRow previous = mapper.agent().selectClientOperation(clientOperationId);
+                if (previous != null) {
+                    if (!operation(previous).matches("approval/respond", requestFingerprint)) {
+                        throw new StorageException(StorageException.Code.CAS_CONFLICT,
+                                "client operation identity conflicts");
+                    }
+                    return true;
+                }
+            }
             PersistenceRecords.ApprovalDecisionRow row = mapper.agent().selectApprovalDecision(approvalId);
             if (row == null || row.decision() != null || !"WAITING_APPROVAL".equals(row.turnState())) return false;
             Instant expiresAt = Instant.parse(row.expiresAt());
@@ -1529,6 +1650,9 @@ public final class MybatisConversationRepository implements ConversationReposito
                 requireChanged(mapper.agent().resolveApproval(new PersistenceRecords.ApprovalResolve(
                         row.turnId(), approvalId, row.callId(), decision.name(), instant(resolvedAt))),
                         "cancelled approval response lost its pending row");
+                persistOperation(mapper, clientOperationId, "approval/respond", requestFingerprint,
+                        row.threadId(), row.turnId(), requireThread(mapper, row.threadId()).revision(), false,
+                        approvalId, decision.name().toLowerCase(java.util.Locale.ROOT), resolvedAt);
                 return true;
             }
             PersistenceRecords.TurnExecutionRow executionRow = mapper.agent().selectTurnExecution(row.turnId());
@@ -1552,7 +1676,10 @@ public final class MybatisConversationRepository implements ConversationReposito
                     row.threadId(), row.turnId(), TurnState.RUNNING.name(), row.turnMutationVersion(),
                     instant(resolvedAt), null, null, null, null)),
                     "approval response lost its Turn state gate");
-            allocateThreadRevision(mapper, row.threadId(), resolvedAt);
+            long threadRevision = allocateThreadRevision(mapper, row.threadId(), resolvedAt);
+            persistOperation(mapper, clientOperationId, "approval/respond", requestFingerprint,
+                    row.threadId(), row.turnId(), threadRevision, false,
+                    approvalId, decision.name().toLowerCase(java.util.Locale.ROOT), resolvedAt);
             return true;
         });
     }
@@ -1560,9 +1687,29 @@ public final class MybatisConversationRepository implements ConversationReposito
     /** 入队只推进独立 queue revision，绝不修改执行 mutation version 或中断当前 Provider/Tool。 */
     @Override
     public QueueMutation enqueueInput(PendingInput input) {
+        return enqueueInput(input, null, null);
+    }
+
+    /** 入队前查询同事务回执，重复操作只返回原条目身份且不再次推进 queue revision。 */
+    @Override
+    public QueueMutation enqueueInput(PendingInput input, String operationId, String requestFingerprint) {
         ensureOpen();
         Objects.requireNonNull(input, "input");
+        requireOperationPair(operationId, requestFingerprint);
         return transactions.required(mapper -> {
+            if (operationId != null) {
+                PersistenceRecords.InputOperationRow existing = mapper.agent().selectInputOperation(operationId);
+                if (existing != null) {
+                    if (!existing.requestFingerprint().equals(requestFingerprint)
+                        || !existing.threadId().equals(input.threadId()) || !existing.turnId().equals(input.turnId())) {
+                        throw new StorageException(StorageException.Code.CAS_CONFLICT, "input operation identity conflicts");
+                    }
+                    PersistenceRecords.TurnRow previous = mapper.agent().selectTurn(
+                            new PersistenceRecords.TurnKey(existing.threadId(), existing.turnId()));
+                    if (previous == null) throw corrupted("turn_id");
+                    return mutation(mapper, previous, existing.inputId(), false);
+                }
+            }
             PersistenceRecords.TurnRow turn = acceptingInputTurn(mapper, input.threadId(), input.turnId());
             boolean superseded = supersedeInteraction(mapper, turn, input.inputId(), input.createdAt());
             PersistenceRecords.PendingInputStats stats = mapper.agent().selectPendingInputStats(input.turnId());
@@ -1578,8 +1725,24 @@ public final class MybatisConversationRepository implements ConversationReposito
             PersistenceRecords.ThreadRow thread = requireThread(mapper, input.threadId());
             replaceAttachmentReservations(mapper, thread.workspaceId(), input.inputId(),
                     List.of(), input.content().attachmentIds(), input.createdAt());
-            return advanceQueue(mapper, turn, input.inputId(), input.createdAt(), true);
+            QueueMutation committed = advanceQueue(mapper, turn, input.inputId(), input.createdAt(), true);
+            if (operationId != null) {
+                requireChanged(mapper.agent().insertInputOperation(new PersistenceRecords.InputOperationRow(
+                    operationId, requestFingerprint, input.threadId(), input.turnId(), input.inputId(),
+                    input.kind().name(), instant(input.createdAt()))), "input operation receipt was not persisted");
+            }
+            return committed;
         });
+    }
+
+    /** 只读稳定入队身份供断线核实；正文和已消费队列均不进入回执。 */
+    @Override
+    public Optional<InputOperationReceipt> readInputOperation(String operationId) {
+        ensureOpen();
+        requireOperationId(operationId);
+        return transactions.required(mapper -> Optional.ofNullable(mapper.agent().selectInputOperation(operationId))
+            .map(row -> new InputOperationReceipt(row.clientOperationId(), row.requestFingerprint(),
+                row.threadId(), row.turnId(), row.inputId(), InputKind.valueOf(row.inputKind()))));
     }
 
     /** 新指令替代未决问题与原 ToolResult 同事务结算，不将自由聊天误匹配为某个选项。 */
@@ -2057,6 +2220,10 @@ public final class MybatisConversationRepository implements ConversationReposito
                         messageId, threadId, turnId, ordinal, message.role().name(), codec.writeMessage(message),
                         instant(occurredAt))),
                 "message identity or ordinal already exists");
+        if (message.role() == ModelRole.ASSISTANT) {
+            requireChanged(mapper.agent().insertAssistantPublicText(messageId, visibleText(message)),
+                    "assistant public text identity already exists");
+        }
     }
 
     /** UI 时间线文本写入独立表，确保历史读取不再解析 Provider 上下文 blocks。 */
@@ -2069,10 +2236,13 @@ public final class MybatisConversationRepository implements ConversationReposito
                 "timeline message identity already exists");
     }
 
-    /** 只拼接公开文本块；Tool arguments/result blocks 不得复制进 timeline_messages。 */
+    /** 只拼接公开文本块；Tool arguments/result blocks 不得复制进 Timeline 或正文分页。 */
     private static String visibleText(ModelMessage message) {
-        return message.content().stream().filter(TextContent.class::isInstance)
-                .map(TextContent.class::cast).map(TextContent::text).reduce("", String::concat);
+        StringBuilder result = new StringBuilder();
+        for (ModelContent block : message.content()) {
+            if (block instanceof TextContent text) result.append(text.text());
+        }
+        return result.toString();
     }
 
     /** 四元身份读取已脱敏 Tool artifact，供独立分页用例使用。 */

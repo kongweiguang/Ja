@@ -252,7 +252,7 @@ export type TimelineEvent =
       "turn/state-changed",
       SemanticBase & { from: TimelineTurnState; to: TimelineTurnState }
     >
-  | EventEnvelope<"turn/retry-started", SemanticBase & { attempt: number; maxAttempts: 6 }>
+  | EventEnvelope<"turn/retry-started", SemanticBase & { attempt: number }>
   | EventEnvelope<
       "assistant/model-step-committed",
       SemanticBase & {
@@ -550,9 +550,13 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
 
 /**
  * 返回稳定且不含业务正文的 Snapshot 拒绝原因，供 reducer 单测与隔离真窗诊断复用。
- * Production UI 只消费通过/拒绝结果；这里刻意不返回字段值，避免诊断 seam 变成数据旁路。
+ * Production UI 只消费通过/拒绝结果；已验证页面的本地合并可跨 200 条，其余 wire 页仍维持
+ * 单页合同。这里刻意不返回字段值，避免诊断 seam 变成数据旁路。
  */
-export function timelineSnapshotValidationReason(value: unknown): string | undefined {
+export function timelineSnapshotValidationReason(
+  value: unknown,
+  accumulatedHistory = false,
+): string | undefined {
   if (typeof value !== "object" || value === null) return "root_type";
   const root = value as Record<string, unknown>;
   if (
@@ -561,10 +565,12 @@ export function timelineSnapshotValidationReason(value: unknown): string | undef
     (root["revision"] as number) < 0
   )
     return "identity_or_revision";
-  if (!Array.isArray(root["turns"]) || root["turns"].length > 200) return "turns_shape";
+  if (!Array.isArray(root["turns"]) || (!accumulatedHistory && root["turns"].length > 200))
+    return "turns_shape";
   const invalidTurn = root["turns"].findIndex((turn) => !isTimelineSnapshotTurn(turn));
   if (invalidTurn >= 0) return `turn:${invalidTurn}`;
-  if (!Array.isArray(root["items"]) || root["items"].length > 200) return "items_shape";
+  if (!Array.isArray(root["items"]) || (!accumulatedHistory && root["items"].length > 200))
+    return "items_shape";
   if (!Array.isArray(root["taskActivities"]) || root["taskActivities"].length > 128)
     return "task_activities_shape";
   const invalidTaskActivity = root["taskActivities"].findIndex(
@@ -691,9 +697,12 @@ function isTimelineLiveStream(value: unknown): value is TimelineLiveStream {
   return previousStreamSeq === undefined || previousStreamSeq === (root["streamSeq"] as number);
 }
 
-/** 只接纳 reducer 投影所需的 snapshot 闭集，避免 domain 依赖 Zod 或 transport module。 */
-export function timelineSnapshotFromUnknown(value: unknown): TimelineSnapshot | undefined {
-  if (timelineSnapshotValidationReason(value) !== undefined) return undefined;
+/** 只接纳 reducer 投影所需的 snapshot 闭集；累计标记只用于已验证页的本地合并。 */
+export function timelineSnapshotFromUnknown(
+  value: unknown,
+  accumulatedHistory = false,
+): TimelineSnapshot | undefined {
+  if (timelineSnapshotValidationReason(value, accumulatedHistory) !== undefined) return undefined;
   return value as TimelineSnapshot;
 }
 
@@ -823,7 +832,6 @@ function isTimelineContextUsage(value: unknown): value is TimelineContextUsage {
     (usage["requestOrdinal"] as number) >= 1 &&
     Number.isSafeInteger(usage["modelRound"]) &&
     (usage["modelRound"] as number) >= 1 &&
-    (usage["modelRound"] as number) <= 128 &&
     (usage["purpose"] === "assistant" || usage["purpose"] === "summary") &&
     typeof usage["measuredAt"] === "string";
   if (!commonValid) return false;

@@ -838,7 +838,6 @@ export function providerConfigurationDocument({
         network_timeouts: { connect_timeout_ms: 5_000, request_timeout_ms: 120_000 },
         agent_defaults: {
           context: { auto_compact: true },
-          turn_limits: { max_model_rounds: 32, max_tool_calls: 128, wall_timeout_ms: 120_000 },
         },
         models: [
           {
@@ -856,7 +855,7 @@ export function providerConfigurationDocument({
       },
     ],
     mcp_servers: [],
-    skills: [],
+    disabled_skills: [],
   };
 }
 
@@ -895,7 +894,7 @@ function persistentConfigurationDocument(current, selected) {
         : { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [...providers, selectedDocument.providers[0]],
     mcp_servers: Array.isArray(base.mcp_servers) ? base.mcp_servers : [],
-    skills: Array.isArray(base.skills) ? base.skills : [],
+    disabled_skills: Array.isArray(base.disabled_skills) ? base.disabled_skills : [],
   };
 }
 

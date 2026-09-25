@@ -2,6 +2,28 @@
 <!-- @author kongweiguang -->
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.HistoryMapper">
+  <resultMap id="inputHistoryRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputHistoryRow">
+    <constructor>
+      <arg column="item_id" javaType="string"/><arg column="thread_id" javaType="string"/>
+      <arg column="public_text" javaType="string"/><arg column="created_at" javaType="string"/>
+      <arg column="truncated" javaType="_boolean"/>
+    </constructor>
+  </resultMap>
+  <select id="selectInputHistoryPage" resultMap="inputHistoryRow">
+    SELECT tm.item_id,tm.thread_id,substr(tm.public_text,1,32768) AS public_text,
+      tm.created_at,(length(CAST(tm.public_text AS BLOB))>32768 OR length(tm.public_text)>32768) AS truncated
+    FROM timeline_messages tm JOIN threads t ON t.thread_id=tm.thread_id
+    WHERE tm.message_kind='USER_INPUT' AND t.deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM temporary_side_chats s WHERE s.thread_id=tm.thread_id)
+      AND NOT EXISTS (SELECT 1 FROM thread_lineage l WHERE l.child_thread_id=tm.thread_id)
+      <if test="normalizedQuery != null and normalizedQuery != ''">
+        AND instr(lower(tm.public_text),#{normalizedQuery})>0
+      </if>
+      <if test="cursorTime != null">
+        AND (tm.created_at &lt; #{cursorTime} OR (tm.created_at=#{cursorTime} AND tm.item_id &lt; #{cursorId}))
+      </if>
+    ORDER BY tm.created_at DESC,tm.item_id DESC LIMIT #{limit}
+  </select>
   <resultMap id="workspaceRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceRow">
     <constructor>
       <arg column="workspace_id" javaType="string"/><arg column="root_path" javaType="string"/>
@@ -117,6 +139,33 @@
       (SELECT goal_id FROM goals WHERE owner_thread_id=threads.thread_id
         AND status IN ('DRAFT','ACTIVE','PAUSED') LIMIT 1) AS active_goal_id
     FROM threads WHERE thread_id=#{threadId} AND deleted_at IS NULL
+  </select>
+  <resultMap id="publicContentPageRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PublicContentPageRow">
+    <constructor><arg column="content" javaType="string"/><arg column="total_characters" javaType="_int"/></constructor>
+  </resultMap>
+  <!-- SQLite substr/length 按 Unicode code point 计；查询只交付一页，Tool/USER/旧路径不可借此导出。 -->
+  <select id="selectPublicContentPage" resultMap="publicContentPageRow">
+    SELECT substr(p.content, #{offsetCharacters}+1, #{limitCharacters}) AS content,
+      length(p.content) AS total_characters
+    FROM assistant_public_text p JOIN messages m ON m.message_id=p.message_id
+      JOIN timeline_messages tm ON tm.item_id=m.message_id AND tm.thread_id=m.thread_id
+        AND tm.turn_id=m.turn_id
+      JOIN turns t ON t.turn_id=m.turn_id AND t.thread_id=m.thread_id
+    WHERE m.thread_id=#{threadId} AND m.message_id=#{messageId} AND m.role='ASSISTANT'
+      AND tm.message_kind IN ('ASSISTANT_PROGRESS','FINAL_ANSWER') AND t.current_path=1
+    UNION ALL
+    SELECT substr(tm.public_text, #{offsetCharacters}+1, #{limitCharacters}) AS content,
+      length(tm.public_text) AS total_characters
+    FROM timeline_messages tm JOIN turns t ON t.turn_id=tm.turn_id AND t.thread_id=tm.thread_id
+    WHERE tm.thread_id=#{threadId} AND tm.item_id=#{messageId}
+      AND tm.message_kind='REASONING_SUMMARY' AND t.current_path=1
+  </select>
+  <select id="streamPublicContentIds" resultType="string">
+    SELECT tm.item_id FROM timeline_messages tm
+      JOIN turns t ON t.turn_id=tm.turn_id AND t.thread_id=tm.thread_id
+    WHERE tm.thread_id=#{threadId} AND t.current_path=1
+      AND tm.message_kind IN ('ASSISTANT_PROGRESS','FINAL_ANSWER','REASONING_SUMMARY')
+    ORDER BY tm.created_at DESC,tm.item_id DESC
   </select>
   <insert id="insertThread">
     INSERT INTO threads(thread_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,
@@ -489,11 +538,13 @@
     SELECT COUNT(*) FROM turns WHERE thread_id=#{threadId}
       AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL','SUSPENDED')
   </select>
-  <!-- 同一提交的摘要/正文先于 Tool，Tool 使用原始 ordinal；游标从原条目还原相同排序键，避免随机 ID 颠倒因果或分页漏行。 -->
-  <select id="selectSnapshotItems" resultMap="snapshotItemRow">
+  <!-- 两种分页共享持久条目和复合排序键，避免最新页与普通历史对同批摘要、正文、Tool 的次序产生分歧。 -->
+  <sql id="snapshotOrderedItems">
     WITH items AS (
       SELECT tm.item_id,'message' AS item_kind,tm.created_at,tm.turn_id,NULL AS call_id,NULL AS tool_name,
-        NULL AS tool_ordinal,NULL AS tool_state,tm.message_kind,tm.public_text,m.blocks_json,tm.model_round,
+        NULL AS tool_ordinal,NULL AS tool_state,tm.message_kind,
+        CASE WHEN tm.message_kind='REASONING_SUMMARY' THEN substr(tm.public_text,1,65536)
+          ELSE tm.public_text END AS public_text,m.blocks_json,tm.model_round,
         NULL AS presentation_json,
         NULL AS approval_id,NULL AS decision,NULL AS expires_at,
         CASE WHEN tm.message_kind='USER_INPUT' THEN COALESCE((
@@ -532,6 +583,10 @@
         COALESCE(tool_ordinal,-1) AS ordinal_order
       FROM items
     )
+  </sql>
+  <!-- 同一提交的摘要/正文先于 Tool，Tool 使用原始 ordinal；游标从原条目还原相同排序键，避免随机 ID 颠倒因果或分页漏行。 -->
+  <select id="selectSnapshotItems" resultMap="snapshotItemRow">
+    <include refid="snapshotOrderedItems"/>
     SELECT * FROM ordered_items
     <if test="cursorTime != null">
       WHERE (created_at,semantic_order,ordinal_order,item_id)&gt;(
@@ -541,6 +596,36 @@
         #{cursorId})
     </if>
     ORDER BY created_at,semantic_order,ordinal_order,item_id LIMIT #{limit}
+  </select>
+  <!-- SQLite 在数据库侧反向 keyset 取最近 N+1 项；额外项只用来判断是否存在更旧一页。 -->
+  <select id="selectSnapshotItemsLatest" resultMap="snapshotItemRow">
+    <include refid="snapshotOrderedItems"/>
+    SELECT * FROM ordered_items
+    <if test="cursorTime != null">
+      WHERE (created_at,semantic_order,ordinal_order,item_id)&lt;(
+        #{cursorTime},
+        (SELECT semantic_order FROM ordered_items WHERE item_id=#{cursorId}),
+        (SELECT ordinal_order FROM ordered_items WHERE item_id=#{cursorId}),
+        #{cursorId})
+    </if>
+    ORDER BY created_at DESC,semantic_order DESC,ordinal_order DESC,item_id DESC LIMIT #{limit}
+  </select>
+  <!-- 只对存在续答来源的 Turn 取 owner/旧 attempt 身份，不把全量 messages.blocks_json 拉到 Java。 -->
+  <select id="selectSupersededErrorTurnIds" resultType="string">
+    WITH latest_attempt AS (
+      SELECT source_message_id,MAX(turn_sequence) AS latest_sequence FROM turns
+      WHERE thread_id=#{threadId} AND current_path=1 AND source_message_id IS NOT NULL
+      GROUP BY source_message_id
+    )
+    SELECT owner.turn_id FROM latest_attempt attempt
+      JOIN messages source ON source.message_id=attempt.source_message_id
+        AND source.thread_id=#{threadId} AND source.role='USER'
+      JOIN turns owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+    UNION
+    SELECT previous.turn_id FROM latest_attempt attempt
+      JOIN turns previous ON previous.thread_id=#{threadId} AND previous.current_path=1
+        AND previous.source_message_id=attempt.source_message_id
+        AND previous.turn_sequence&lt;attempt.latest_sequence
   </select>
   <select id="selectLatestContextUsage" resultMap="contextUsageRow">
     SELECT u.turn_id,u.request_id,u.model_round,u.request_ordinal,u.purpose,u.certainty,

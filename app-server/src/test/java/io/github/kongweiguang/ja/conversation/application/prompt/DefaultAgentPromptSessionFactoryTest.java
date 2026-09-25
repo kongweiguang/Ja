@@ -268,7 +268,7 @@ final class DefaultAgentPromptSessionFactoryTest {
                     workspace, jaHome.resolve("agents"), jaHome.resolve("ja"), true));
             Map<String, String> skillNamesById = catalog.skills().stream().collect(
                     java.util.stream.Collectors.toUnmodifiableMap(
-                            descriptor -> "skill_" + descriptor.name(), SkillCatalog.SkillDescriptor::name));
+                            descriptor -> "bundled:" + descriptor.name(), SkillCatalog.SkillDescriptor::name));
             return sessionFactory.open(new AgentPromptSessionFactory.SessionRequest(
                      threadId, workspace, jaHome, true, "Windows 11; pwsh; cwd=" + workspace,
                      ContextBudget.capabilities(contextWindow, 0, true), skills, catalog, skillNamesById));

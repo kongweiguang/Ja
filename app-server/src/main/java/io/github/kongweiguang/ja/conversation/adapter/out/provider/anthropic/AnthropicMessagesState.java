@@ -45,6 +45,7 @@ final class AnthropicMessagesState {
     private boolean messageStarted;
     private boolean messageDeltaSeen;
     private boolean messageStopped;
+    private JsonNode messageStopPayload;
 
     /**
      * 绑定不可变请求身份，使完整原生 thinking 只能被同一 Provider 配置回放。
@@ -57,7 +58,11 @@ final class AnthropicMessagesState {
      * 归约文档化的 Messages 事件并返回语义效果，不在状态迁移中执行外部 IO。
      */
     List<ModelPort.ModelEvent> reduce(ProviderSseReader.Event event) {
-        if (messageStopped) throw protocol("Anthropic emitted data after message_stop");
+        if (messageStopped) {
+            if ("message_stop".equals(event.name())
+                    && event.data().equals(messageStopPayload)) return List.of();
+            throw protocol("Anthropic emitted data after message_stop");
+        }
         if (messageDeltaSeen && !"message_stop".equals(event.name())) {
             throw protocol("Anthropic emitted data after message_delta");
         }
@@ -69,7 +74,10 @@ final class AnthropicMessagesState {
             case "content_block_delta" -> contentDelta(data, effects);
             case "content_block_stop" -> contentStop(requiredIndex(data), effects);
             case "message_delta" -> messageDelta(data);
-            case "message_stop" -> messageStop();
+            case "message_stop" -> {
+                messageStop();
+                messageStopPayload = data.deepCopy();
+            }
             case "ping" -> {
                 // Keepalive 不携带语义状态，但上游仍限制其帧大小和数量。
             }
@@ -95,12 +103,18 @@ final class AnthropicMessagesState {
         }
         JsonNode usage = message.get("usage");
         if (usage != null && !usage.isNull()) {
-            if (!usage.isObject()) throw protocol("Anthropic message_start usage is invalid");
-            startInputTokens = requiredNonNegative(usage, "input_tokens");
-            requiredNonNegative(usage, "output_tokens");
-            startCacheCreationTokens = optionalNonNegative(usage, "cache_creation_input_tokens");
-            startCacheReadTokens = optionalNonNegative(usage, "cache_read_input_tokens");
-            startUsageSeen = true;
+            try {
+                if (!usage.isObject()) throw protocol("Anthropic message_start usage is invalid");
+                startInputTokens = requiredNonNegative(usage, "input_tokens");
+                requiredNonNegative(usage, "output_tokens");
+                startCacheCreationTokens = optionalNonNegative(usage, "cache_creation_input_tokens");
+                startCacheReadTokens = optionalNonNegative(usage, "cache_read_input_tokens");
+                startUsageSeen = true;
+            } catch (ProviderProtocolException invalidUsage) {
+                startUsageSeen = false;
+                startCacheCreationTokens = null;
+                startCacheReadTokens = null;
+            }
         }
         messageStarted = true;
     }
@@ -267,22 +281,26 @@ final class AnthropicMessagesState {
         }
         JsonNode value = event.get("usage");
         if (value != null && !value.isNull()) {
-            if (!value.isObject()) throw protocol("Anthropic message_delta usage is invalid");
-            long output = requiredNonNegative(value, "output_tokens");
-            if (startUsageSeen || value.has("input_tokens")) {
-                long input = optionalOr(value, "input_tokens", startInputTokens);
-                Long cacheWrite = optionalNonNegative(value, "cache_creation_input_tokens");
-                Long cacheRead = optionalNonNegative(value, "cache_read_input_tokens");
-                if (cacheWrite == null) cacheWrite = startCacheCreationTokens;
-                if (cacheRead == null) cacheRead = startCacheReadTokens;
-                long total = checkedAdd(input, output);
-                if (cacheWrite != null) total = checkedAdd(total, cacheWrite);
-                if (cacheRead != null) total = checkedAdd(total, cacheRead);
-                /* Anthropic 将常规 input、缓存创建与缓存读取分别报告；保留原始输入而不把缓存混入。 */
-                usage = cacheRead == null && cacheWrite == null
-                        ? new ModelUsage(input, output, total)
-                        : new ModelUsage(input, output, total, cacheRead, cacheWrite,
-                                ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE);
+            try {
+                if (!value.isObject()) throw protocol("Anthropic message_delta usage is invalid");
+                long output = requiredNonNegative(value, "output_tokens");
+                if (startUsageSeen || value.has("input_tokens")) {
+                    long input = optionalOr(value, "input_tokens", startInputTokens);
+                    Long cacheWrite = optionalNonNegative(value, "cache_creation_input_tokens");
+                    Long cacheRead = optionalNonNegative(value, "cache_read_input_tokens");
+                    if (cacheWrite == null) cacheWrite = startCacheCreationTokens;
+                    if (cacheRead == null) cacheRead = startCacheReadTokens;
+                    long total = checkedAdd(input, output);
+                    if (cacheWrite != null) total = checkedAdd(total, cacheWrite);
+                    if (cacheRead != null) total = checkedAdd(total, cacheRead);
+                    /* Anthropic 的缓存读写量独立于常规 input，不能重复计算。 */
+                    usage = cacheRead == null && cacheWrite == null
+                            ? new ModelUsage(input, output, total)
+                            : new ModelUsage(input, output, total, cacheRead, cacheWrite,
+                                    ModelUsage.InputAccounting.INPUT_EXCLUDES_CACHE);
+                }
+            } catch (ProviderProtocolException | IllegalArgumentException invalidUsage) {
+                usage = null;
             }
         }
         messageDeltaSeen = true;
@@ -574,10 +592,9 @@ final class AnthropicMessagesState {
     }
 
     /**
-     * 有界累积原生 thinking 及其签名，既保证完整块可回放，也阻止 Provider 无限占用内存。
+     * 累积原生 thinking 及其签名以保证完整块可回放；单帧解析和模型窗口负责资源边界。
      */
     private static final class ThinkingAccumulator {
-        private static final int MAX_PRIVATE_CHARACTERS = 4_000_000;
         private final StringBuilder value = new StringBuilder();
         private final StringBuilder signature = new StringBuilder();
 
@@ -610,12 +627,8 @@ final class AnthropicMessagesState {
             return block;
         }
 
-        /** 对 thinking 与 signature 共享单块内存上限，避免分片绕过边界。 */
+        /** 分片保持原始顺序；不能把累计长度误判为协议错误。 */
         private void append(StringBuilder target, String delta) {
-            if ((long) value.length() + signature.length() + delta.length() > MAX_PRIVATE_CHARACTERS) {
-                throw new ProviderProtocolException(
-                        "ANTHROPIC_REASONING", "Anthropic reasoning state exceeds the limit", false);
-            }
             target.append(delta);
         }
     }

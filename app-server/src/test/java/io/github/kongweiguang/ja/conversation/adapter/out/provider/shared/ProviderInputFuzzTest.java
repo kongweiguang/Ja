@@ -33,7 +33,7 @@ final class ProviderInputFuzzTest {
     void strictSseReaderFailsClosedForArbitraryBytes(byte[] input) throws IOException {
         byte[] bounded = Arrays.copyOf(input, Math.min(input.length, 16_384));
         ProviderSseReader reader = new ProviderSseReader(
-                new BoundedSseInputStream(new ByteArrayInputStream(bounded), 2_048, 16_384, 32),
+                new BoundedSseInputStream(new ByteArrayInputStream(bounded), 2_048),
                 Set.of("ping"), "FUZZ_EVENT");
         try {
             for (int event = 0; event < 32 && reader.next() != null; event++) {

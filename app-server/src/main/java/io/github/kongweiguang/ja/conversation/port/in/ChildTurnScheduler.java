@@ -18,7 +18,8 @@ public interface ChildTurnScheduler {
     /**
      * 复用普通 Turn 的请求级运行时、取消、Deadline 与执行循环，但由 Task 事务提交完整 Child 事实。
      */
-    TurnUseCase.Accepted startChild(TurnStartRequest request, TurnEventSink sink, Admission admission);
+    TurnUseCase.Accepted startChild(TurnStartRequest request, TurnEventSink sink, Admission admission,
+                                   String sourceThreadId, String sourceTurnId);
 
     /**
      * 回调只在 TurnService 已取得队列预留和取消作用域后执行；返回前必须提交全部 SQLite 事实。

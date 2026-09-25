@@ -5,6 +5,7 @@
 package io.github.kongweiguang.ja.goal.application;
 
 import io.github.kongweiguang.ja.goal.domain.GoalModels;
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
 import io.github.kongweiguang.ja.goal.port.in.PlanExecutionEventSink;
 import io.github.kongweiguang.ja.goal.port.out.GoalRepository;
 import io.github.kongweiguang.ja.goal.port.out.PlanEvaluatorPort;
@@ -31,6 +32,35 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 /** 验证 standalone Plan run 的连接级事件出口不会再借用 Goal observation。 */
 final class PlanExecutionCoordinatorTest {
     private static final Instant NOW = Instant.parse("2026-09-06T02:00:00Z");
+
+    /** 共享后台重启后不能为旧 Plan Run 以 daemon 环境领取新的执行 Turn。 */
+    @Test
+    void sharedDaemonRequiresClientRebindBeforePlanTurnClaim() {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        bridge.enableSharedMode();
+        GoalModels.Plan plan = new GoalModels.Plan("plan_rebind", "thr_rebind", "恢复计划",
+                GoalModels.PlanStatus.EXECUTING, 1, "planrev_rebind", "run_rebind", NOW, NOW);
+        GoalRepository repository = (GoalRepository) Proxy.newProxyInstance(
+                PlanExecutionCoordinatorTest.class.getClassLoader(), new Class<?>[]{GoalRepository.class},
+                (proxy, method, arguments) -> {
+                    throw new AssertionError("missing environment must stop before repository claim");
+                });
+        PlanExecutionCoordinator.PlanExecutionTurnPort turns =
+                (PlanExecutionCoordinator.PlanExecutionTurnPort) Proxy.newProxyInstance(
+                        PlanExecutionCoordinatorTest.class.getClassLoader(),
+                        new Class<?>[]{PlanExecutionCoordinator.PlanExecutionTurnPort.class},
+                        (proxy, method, arguments) -> {
+                            throw new AssertionError("missing environment must stop before Turn admission");
+                        });
+        try {
+            PlanExecutionCoordinator coordinator = new PlanExecutionCoordinator(repository, turns,
+                    Clock.fixed(NOW, ZoneOffset.UTC));
+            assertThrows(IllegalStateException.class,
+                    () -> coordinator.start(plan, PlanExecutionEventSink.noop()));
+        } finally {
+            bridge.disableSharedMode();
+        }
+    }
 
     /**
      * coordinator 必须把发起连接的出口原样交给 Turn adapter；正常 Turn 收口不能把仍可
@@ -60,8 +90,7 @@ final class PlanExecutionCoordinatorTest {
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield claimed.compareAndSet(false, true)
                                 ? Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 1, 31, 31, 127,
-                                1_800_000L)) : Optional.empty();
+                                command.planRevisionId(), command.turnId(), 1)) : Optional.empty();
                     }
                     case "settlePlanExecution" -> {
                         settlement.set((GoalRepository.SettlePlanExecution) arguments[0]);
@@ -136,8 +165,7 @@ final class PlanExecutionCoordinatorTest {
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield claimed.compareAndSet(false, true)
                                 ? Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 1, 31, 31, 127,
-                                1_800_000L)) : Optional.empty();
+                                command.planRevisionId(), command.turnId(), 1)) : Optional.empty();
                     }
                     case "settlePlanExecution" -> {
                         settlement.set((GoalRepository.SettlePlanExecution) arguments[0]);
@@ -205,7 +233,7 @@ final class PlanExecutionCoordinatorTest {
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield claimed.compareAndSet(false, true)
                                 ? Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 2, 7, 5, 11, 42_000L))
+                                command.planRevisionId(), command.turnId(), 2))
                                 : Optional.empty();
                     }
                     default -> throw new AssertionError("unexpected repository call: " + method.getName());
@@ -248,10 +276,7 @@ final class PlanExecutionCoordinatorTest {
 
         GoalRepository.PlanTurnClaim claim = observedClaim.get();
         assertEquals(2, claim.ordinal());
-        assertEquals(7, claim.remainingTurnBudget());
-        assertEquals(5, claim.remainingModelRounds());
-        assertEquals(11, claim.remainingToolCalls());
-        assertEquals(42_000L, claim.remainingWallBudgetMillis());
+        assertEquals(executing.activeRunId(), claim.runId());
     }
 
     /**
@@ -279,7 +304,7 @@ final class PlanExecutionCoordinatorTest {
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield claims.getAndIncrement() == 0
                                 ? Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 1, 31, 31, 127, 1_800_000L))
+                                command.planRevisionId(), command.turnId(), 1))
                                 : Optional.empty();
                     }
                     default -> throw new AssertionError("unexpected repository call: " + method.getName());
@@ -358,7 +383,7 @@ final class PlanExecutionCoordinatorTest {
                     case "claimPlanTurn" -> {
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 1, 31, 31, 127, 1_800_000L));
+                                command.planRevisionId(), command.turnId(), 1));
                     }
                     default -> throw new AssertionError("unexpected repository call: " + method.getName());
                 });
@@ -511,7 +536,7 @@ final class PlanExecutionCoordinatorTest {
                         claims.incrementAndGet();
                         GoalRepository.ClaimPlanTurn command = (GoalRepository.ClaimPlanTurn) arguments[0];
                         yield Optional.of(new GoalRepository.PlanTurnClaim(command.planId(), command.runId(),
-                                command.planRevisionId(), command.turnId(), 1, 31, 31, 127, 1_800_000L));
+                                command.planRevisionId(), command.turnId(), 1));
                     }
                     case "beginPlanVerification" -> {
                         verificationChecks.incrementAndGet();
@@ -549,7 +574,7 @@ final class PlanExecutionCoordinatorTest {
                                                            PlanExecutionEventSink events) {
                 claims.incrementAndGet();
                 return start(request, new GoalRepository.PlanTurnClaim(request.planId(), request.runId(),
-                        request.planRevisionId(), request.turnId(), 1, 31, 31, 127, 1_800_000L), events);
+                        request.planRevisionId(), request.turnId(), 1), events);
             }
         };
         PlanExecutionCoordinator coordinator = new PlanExecutionCoordinator(repository, turns,
@@ -586,8 +611,6 @@ final class PlanExecutionCoordinatorTest {
                     case "readPlanSnapshot" -> new GoalModels.PlanSnapshot(verifying, null, revision, null,
                             List.of(), 1);
                     case "listPlanEvidence" -> List.of();
-                    case "readPlanRunBudget" -> Optional.of(new GoalRepository.PlanRunBudget(
-                            verifying.planId(), verifying.activeRunId(), 8, 8, 60_000L));
                     case "findPlanTurnBinding" -> Optional.of(new GoalRepository.InternalTurnBinding(
                             "turn_owner_stop", "PLAN_EXECUTION", null, verifying.planId(),
                             verifying.activeRunId(), null, verifying.activePlanRevisionId(), "a".repeat(64), null));
@@ -665,7 +688,6 @@ final class PlanExecutionCoordinatorTest {
                 new Class<?>[]{GoalRepository.class}, (proxy, method, args) -> switch (method.getName()) {
                     case "readPlanSnapshot" -> new GoalModels.PlanSnapshot(verifying, null, revision, null, List.of(), 1);
                     case "listPlanEvidence" -> List.of();
-                    case "readPlanRunBudget" -> Optional.of(new GoalRepository.PlanRunBudget(planId, verifying.activeRunId(), 2, 1, 1000));
                     case "completePlanVerification" -> {
                         var command = (GoalRepository.CompletePlanVerification) args[0];
                         keys.add(command.idempotencyKey());

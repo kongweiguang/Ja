@@ -15,6 +15,10 @@ import java.time.Clock;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.time.Duration;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 将结构化摘要端口绑定到当前 Turn，并在模型调用前后执行取消、Deadline 与容量门禁。
@@ -218,17 +222,66 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
         if (expectedPromptFingerprint != null && !expectedPromptFingerprint.equals(promptFingerprint)) {
             throw failure("persisted summary prompt no longer matches the recorded substep", null);
         }
-        try (RequestRuntime runtime = openRuntime(prompt.threadId())) {
-            SummaryModel current = bind(runtime);
-            if (measure(current, runtime.binding(), prompt) > inputCeiling) {
-                throw failure("summary repair prompt exceeded the provider input window", null);
+        for (int attempt = 1; ; attempt++) {
+            try (RequestRuntime runtime = openRuntime(prompt.threadId())) {
+                SummaryModel current = bind(runtime);
+                if (measure(current, runtime.binding(), prompt) > inputCeiling) {
+                    throw failure("summary repair prompt exceeded the provider input window", null);
+                }
+                operation.begin(promptFingerprint, runtime.profile());
+                try {
+                    SummaryResult result = current.summarize(prompt);
+                    requireActiveBinding(prompt.threadId(), runtime.binding());
+                    if (result == null) throw failure("summary model returned no structured result", null);
+                    return result;
+                } catch (RuntimeException failure) {
+                    ModelPort.ModelUnavailableException provider = recoverableProviderFailure(failure);
+                    if (provider == null) throw failure;
+                    operation.retry();
+                    waitForRetry(retryDelay(provider, attempt), runtime.binding().cancellationToken());
+                }
             }
-            operation.begin(promptFingerprint, runtime.profile());
-            SummaryResult result = current.summarize(prompt);
-            requireActiveBinding(prompt.threadId(), runtime.binding());
-            if (result == null) throw failure("summary model returned no structured result", null);
-            return result;
         }
+    }
+
+    /** 只把真实瞬时 Provider 分类交给会话恢复，确定性摘要校验失败保持原样返回。 */
+    private static ModelPort.ModelUnavailableException recoverableProviderFailure(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof ModelPort.ModelUnavailableException provider) {
+                return switch (provider.terminalErrorCode()) {
+                    case "MODEL_UNAVAILABLE", "MODEL_STREAM_INVALID", "MODEL_IDLE_TIMEOUT" -> provider;
+                    default -> null;
+                };
+            }
+        }
+        return null;
+    }
+
+    /** 退避随连续失败增长但不形成任务截止；有效服务端等待时间优先。 */
+    private static Duration retryDelay(ModelPort.ModelUnavailableException failure, int failedAttempt) {
+        Optional<Duration> server = failure.retryAfterHint();
+        if (server.isPresent()) return server.get();
+        long multiplier = 1L << Math.min(Math.max(failedAttempt - 1, 0), 20);
+        long millis = Math.min(60_000L, 2_000L * multiplier);
+        return Duration.ofMillis((long) (millis
+                * java.util.concurrent.ThreadLocalRandom.current().nextDouble(0.75, 1.0)));
+    }
+
+    /** 取消令牌能立即唤醒退避，避免 Stop 后等待计时器结束才释放 Summary 请求。 */
+    private static void waitForRetry(Duration delay,
+                                     io.github.kongweiguang.ja.foundation.concurrent.CancellationToken cancellation) {
+        cancellation.throwIfCancellationRequested();
+        CountDownLatch wakeup = new CountDownLatch(1);
+        try (var ignored = cancellation.onCancellation(wakeup::countDown)) {
+            try {
+                if (wakeup.await(delay.toNanos(), TimeUnit.NANOSECONDS))
+                    cancellation.throwIfCancellationRequested();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new CancellationException("summary retry wait interrupted");
+            }
+        }
+        cancellation.throwIfCancellationRequested();
     }
 
     /**
@@ -420,6 +473,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
         /** 结算 Provider 用量并原子保存其结果对应的下一子阶段或已接纳游标。 */
         void settle(CheckpointUsage callUsage, Progress accepted);
 
+        /** 瞬时失败只推进 UNKNOWN 请求 ordinal，不把未完成摘要当作已接纳事实。 */
+        default void retry() { throw new IllegalStateException("summary retry settlement is unavailable"); }
+
         /** deterministic fallback 不产生 Provider 用量，只推进已接纳进度。 */
         void advance(Progress accepted);
 
@@ -451,6 +507,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
                 @Override public void settle(CheckpointUsage usage, Progress accepted) {
                     progress = Objects.requireNonNull(accepted, "accepted");
                 }
+
+                /** 手动压缩不持久化请求游标，下一尝试由同一调用栈重新打开模型租约。 */
+                @Override public void retry() { }
 
                 /** deterministic fallback 没有用量行，只替换当前内存进度。 */
                 @Override public void advance(Progress accepted) { progress = accepted; }

@@ -715,11 +715,11 @@ function Get-VitestTestEvidence {
     }
 }
 
-# Extracts Cargo's real test-result lines from sanitized logs, retaining passed/failed/ignored
-# counts without depending on a particular Cargo JSON schema or writing raw test output to JSON.
+# Extracts all Rust runtime, desktop, and CLI test-result lines from sanitized logs without
+# depending on a Cargo JSON schema or writing raw test output to JSON.
 function Get-RustTestEvidence {
     $entries = [System.Collections.Generic.List[object]]::new()
-    foreach ($result in $results | Where-Object { $_.name -in @('rust-runtime-tests', 'rust-tauri-tests', 'rust-host-integration') }) {
+    foreach ($result in $results | Where-Object { $_.name -in @('rust-runtime-tests', 'rust-tauri-tests', 'rust-host-integration', 'rust-cli-tests') }) {
         # PowerShell's regex operator writes the case-insensitive automatic `$Matches` variable.
         # A distinct name is required here or the first result line replaces this typed list.
         $testResults = [System.Collections.Generic.List[object]]::new()
@@ -820,7 +820,7 @@ function Test-GeneratedRepositoryPath {
 
     $path = $RelativePath.Replace('\', '/')
     if ($path.StartsWith('./', [System.StringComparison]::Ordinal)) { $path = $path.Substring(2) }
-    return $path -match '^(?:\.tmp|dist|node_modules|target(?:-[^/]+)?|src-tauri/target(?:-[^/]+)?|app-server/target|apps/desktop/dist)(?:/|$)'
+    return $path -match '^(?:\.tmp|dist|node_modules|target(?:-[^/]+)?|target(?:-[^/]+)?|app-server/target|apps/desktop/dist)(?:/|$)'
 }
 
 # Scans changed source and this run's evidence for credential-shaped literals while returning only
@@ -865,13 +865,14 @@ function Get-SecretGateEvidence {
     return [ordered]@{ passed = $findings.Count -eq 0; findingCount = $findings.Count; findings = @($findings) }
 }
 
-# Checks only product executables at their exact resolved paths; it never name-matches unrelated
-# processes and never records command lines. A surviving child is a residual-resource blocker.
+# Checks App Server, desktop, and local CLI executables by exact path; it never name-matches
+# unrelated processes or records command lines. A surviving child is a residual-resource blocker.
 function Get-ResidualProcessEvidence {
     $candidatePaths = @(
         (Join-Path $repositoryRoot 'app-server\target\ja-app-server.exe'),
-        (Join-Path $repositoryRoot 'src-tauri\target\debug\ja.exe'),
-        (Join-Path $repositoryRoot 'src-tauri\target\release\ja.exe')
+        (Join-Path $repositoryRoot 'target\debug\ja-desktop.exe'),
+        (Join-Path $repositoryRoot 'target\release\ja-desktop.exe'),
+        (Join-Path $repositoryRoot 'target\ja-cli\ja.exe')
     ) | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
     $count = 0
     try {
@@ -1427,10 +1428,11 @@ function Initialize-VerificationSteps {
     Add-VerificationStep -Name 'java-artifact-package' -Requested $true -Kind command -Command 'pwsh' -Arguments @('-NoProfile', '-File', 'scripts/verification/package-java-app-server.ps1', '-RepositoryRoot', $repositoryRoot, '-OutputDirectory', $javaArtifactDirectory) -Environment $commonEnvironment -DependsOn @('java-jvm')
     Add-VerificationStep -Name 'kernel-loop-smoke' -Requested $true -Kind command -Command 'node.exe' -Arguments @('scripts/e2e/kernel-loop-smoke.mjs') -Environment (Merge-Environment -Base $commonEnvironment -Overrides @{ JA_KERNEL_LOOP_CAPTURE = '' }) -DependsOn @('java-artifact-package')
     Add-VerificationStep -Name 'rust-fmt' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('fmt', '--all', '--', '--check') -Environment $commonEnvironment
-    Add-VerificationStep -Name 'rust-clippy' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('clippy', '-p', 'ja', '-p', 'ja-runtime', '--all-targets', '--locked', '--', '-D', 'warnings') -Environment $commonEnvironment
+    Add-VerificationStep -Name 'rust-clippy' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('clippy', '-p', 'ja-desktop', '-p', 'ja-cli', '-p', 'ja-runtime', '--all-targets', '--locked', '--', '-D', 'warnings') -Environment $commonEnvironment
     Add-VerificationStep -Name 'rust-runtime-tests' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja-runtime', '--all-targets', '--locked') -Environment $commonEnvironment
-    Add-VerificationStep -Name 'rust-tauri-tests' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja', '--lib', '--locked') -Environment $commonEnvironment
-    Add-VerificationStep -Name 'rust-host-integration' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja', '--test', 'unit', '--locked') -Environment $commonEnvironment -DependsOn @('java-artifact-package')
+    Add-VerificationStep -Name 'rust-tauri-tests' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja-desktop', '--lib', '--locked') -Environment $commonEnvironment
+    Add-VerificationStep -Name 'rust-host-integration' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja-desktop', '--test', 'unit', '--locked') -Environment $commonEnvironment -DependsOn @('java-artifact-package')
+    Add-VerificationStep -Name 'rust-cli-tests' -Requested $true -Kind command -Command 'cargo.exe' -Arguments @('test', '-p', 'ja-cli', '--all-targets', '--locked') -Environment $commonEnvironment
     Add-VerificationStep -Name 'typescript-typecheck' -Requested $true -Kind command -Command 'pnpm.cmd' -Arguments @('typecheck')
     Add-VerificationStep -Name 'typescript-lint' -Requested $true -Kind command -Command 'pnpm.cmd' -Arguments @('lint')
     Add-VerificationStep -Name 'typescript-tests' -Requested $true -Kind command -Command 'pnpm.cmd' -Arguments @('test', '--reporter=json', '--outputFile', (Join-Path $evidenceRoot 'vitest.json'))

@@ -177,15 +177,16 @@ async function captureResponsivePopover(
 }
 
 /** 新建 HTTP fixture 配置供探测回归使用，所有数据只写入当前隔离 App Server。 */
-async function createHttpServer(page, name, endpoint) {
-  await page.getByRole("button", { name: "新增服务", exact: true }).click();
+async function createHttpServer(page, name, endpoint, scope = "global") {
+  const group = page.getByRole("region", { name: scope === "project" ? "项目 MCP 服务" : "全局 MCP 服务" });
+  await group.getByRole("button", { name: "新增服务", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await dialog.getByRole("radio", { name: "Streamable HTTP", exact: true }).click();
   await dialog.getByLabel("名称", { exact: true }).fill(name);
   await dialog.getByLabel("服务地址").fill(endpoint);
   await dialog.getByRole("button", { name: "保存服务", exact: true }).click();
   await expect(dialog).not.toBeVisible();
-  return page.locator(".ja-mcp-row").filter({ hasText: name });
+  return group.locator(".ja-mcp-row").filter({ hasText: name });
 }
 
 /** 从本机已保存配置只取 Kerminal 的地址用于隔离窗口展示；不读取或复制凭据。 */
@@ -260,6 +261,18 @@ async function verify(page, fixture, evidenceDirectory) {
   await expect(row.locator(".ja-mcp-row-details")).toContainText("68 个工具");
   await expect(row.locator(".ja-mcp-tools")).toContainText("settings_echo");
   await expect(row.locator(".ja-mcp-tools .ja-mcp-chip")).toHaveCount(68);
+  const toolDisclosure = row.locator(".ja-mcp-tool-disclosure");
+  await expect(toolDisclosure).not.toHaveAttribute("open", "");
+  await toolDisclosure.locator("summary").click();
+  await expect(toolDisclosure).toHaveAttribute("open", "");
+  const toolViewport = await row.locator(".ja-mcp-tools").evaluate((element) => ({
+    visible: element.clientHeight,
+    total: element.scrollHeight,
+  }));
+  expect(toolViewport.visible).toBeLessThanOrEqual(220);
+  expect(toolViewport.total).toBeGreaterThan(toolViewport.visible);
+  await capture(page, "04-connected-68-tools-expanded", evidenceDirectory);
+  await toolDisclosure.locator("summary").click();
   expect(fixture.calls).toContainEqual({ method: "initialize", pathname: "/mcp" });
   expect(fixture.calls).toContainEqual({ method: "tools/list", pathname: "/mcp" });
   await capture(page, "04-connected-68-tools", evidenceDirectory);
@@ -269,7 +282,7 @@ async function verify(page, fixture, evidenceDirectory) {
     evidenceDirectory,
     "本地探测失败验收",
     "probe-failure",
-    "MCP Server 不可用。",
+    "MCP 服务不可用；请检查服务状态和连接配置。",
   );
   await verifyFailedCheck(
     page,
@@ -277,7 +290,7 @@ async function verify(page, fixture, evidenceDirectory) {
     evidenceDirectory,
     "本地目录失败验收",
     "catalog-failure",
-    "MCP 工具目录读取失败。",
+    "MCP 工具目录读取失败；请重试或检查 MCP 服务兼容性。",
   );
   expect(fixture.calls).toContainEqual({ method: "initialize", pathname: "/probe-failure" });
   expect(fixture.calls).toContainEqual({ method: "tools/list", pathname: "/catalog-failure" });
@@ -556,6 +569,25 @@ async function createProjectMcpHeaderThread(page, sourceThreadId, workspaceRoot)
   return project;
 }
 
+/** 只登记第二个可信项目；重载后显式回到 A Thread，保证设置筛选不借会话切换实现。 */
+async function registerAlternateProjectForSettings(page, workspaceRoot, activeProject) {
+  if (!workspaceRoot || !isAbsolute(workspaceRoot)) throw new Error("alternate project path is missing");
+  const alternate = await page.evaluate(async (cwd) => {
+    const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
+    return createHistoryAdapter().workspaceOpen({ cwd });
+  }, workspaceRoot);
+  if (alternate.kind !== "project" || alternate.trust !== "trusted") {
+    throw new Error("alternate project is not trusted");
+  }
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", {
+    name: `切换到项目：${activeProject.workspace.displayName}`,
+    exact: true,
+  }).click();
+  await selectMcpHeaderThread(page, activeProject.thread.threadId);
+  return alternate;
+}
+
 /** 通过会话列表切换到精确 Thread，确保 UI 消费事件而非旁路读取原生历史。 */
 async function selectMcpHeaderThread(page, threadId) {
   const thread = page.locator(`[aria-label="最近对话列表"] button[data-thread-id="${threadId}"]`);
@@ -611,7 +643,8 @@ async function installMcpCommandObserver(page) {
 }
 
 /** 执行真实 Thread MCP 顶栏链路并保留关键状态截图与脱敏计数报告。 */
-export async function runMcpConversationHeaderAcceptance({ page, evidenceDirectory, projectPath }) {
+export async function runMcpConversationHeaderAcceptance({ page, evidenceDirectory, projectPath,
+  alternateProjectPath }) {
   if (!page) throw new Error("page is required");
   if (!evidenceDirectory || !isAbsolute(evidenceDirectory)) {
     throw new Error("evidenceDirectory must be absolute");
@@ -624,20 +657,39 @@ export async function runMcpConversationHeaderAcceptance({ page, evidenceDirecto
   try {
     page.setDefaultTimeout(20_000);
     await section(page, "MCP");
-    await page.getByRole("tab", { name: "全局", exact: true }).click();
     const realKerminalEndpoint = await installedKerminalEndpoint();
     await createHttpServer(page, "Kerminal", realKerminalEndpoint);
     await page.getByRole("button", { name: "返回应用", exact: true }).click();
     const threads = await createMcpHeaderThreads(page);
     const project = await createProjectMcpHeaderThread(page, threads.threadIds[0], projectPath);
+    const alternate = alternateProjectPath === undefined ? undefined :
+      await registerAlternateProjectForSettings(page, alternateProjectPath, project);
     await installMcpCommandObserver(page);
 
     await section(page, "MCP");
-    await expect(page.getByRole("tab", { name: "当前项目" })).toBeVisible();
-    await page.getByRole("tab", { name: "当前项目" }).click();
-    const projectSettingsRow = await createHttpServer(page, "项目测试服务", fixture.url);
+    await expect(page.getByRole("region", { name: "项目 MCP 服务" })).toBeVisible();
+    const projectSettingsRow = await createHttpServer(page, "项目测试服务", fixture.url, "project");
     await expect(projectSettingsRow).toBeVisible();
+    if (alternate !== undefined) {
+      const projectGroup = page.getByRole("region", { name: "项目 MCP 服务" });
+      await projectGroup.getByRole("button", { name: /选择设置项目/u }).click();
+      await page.getByRole("option").filter({ hasText: alternate.root }).click();
+      await expect(projectGroup).not.toContainText("项目测试服务");
+      await expect(page.getByRole("region", { name: "全局 MCP 服务" })).toContainText("Kerminal");
+      await expect(projectGroup.getByRole("button", { name: "新增服务" })).toBeEnabled();
+      const alternateRow = await createHttpServer(page, "项目 B 过滤验收", fixture.url, "project");
+      await expect(alternateRow).toBeVisible();
+      await capture(page, "project-b-filter-with-a-thread", evidenceDirectory);
+      await projectGroup.getByRole("button", { name: /选择设置项目/u }).click();
+      await page.getByRole("option").filter({
+        has: page.getByText(project.workspace.displayName, { exact: true }),
+      }).click();
+      await expect(projectSettingsRow).toBeVisible();
+      await expect(projectGroup).not.toContainText("项目 B 过滤验收");
+    }
     await page.getByRole("button", { name: "返回应用", exact: true }).click();
+    await expect(page.locator(`[aria-label="最近对话列表"] button[data-thread-id="${project.thread.threadId}"]`))
+      .toHaveAttribute("aria-current", "page");
 
     const trigger = page.getByRole("button", { name: "打开上下文信息", exact: true });
     await trigger.click();
@@ -649,6 +701,7 @@ export async function runMcpConversationHeaderAcceptance({ page, evidenceDirecto
     await expect(kerminal).toContainText("全局");
     await expect(projectServer).toContainText("当前项目");
     await expect(projectServer).toContainText("未检查");
+    await expect(list).not.toContainText("项目 B 过滤验收");
     await expect(overview).not.toContainText("个工具");
     await expect(overview.getByRole("button", { name: /检查连接/ })).toHaveCount(0);
     expect(fixture.calls).toEqual([]);
@@ -666,7 +719,6 @@ export async function runMcpConversationHeaderAcceptance({ page, evidenceDirecto
     await trigger.click();
     await page.getByRole("button", { name: "管理 MCP", exact: true }).click();
     await expect(page.locator(".ja-settings")).toBeVisible();
-    await page.getByRole("tab", { name: "当前项目" }).click();
     await projectSettingsRow.getByRole("switch").click();
     await expect(projectSettingsRow.getByRole("switch")).not.toBeChecked();
     await page.getByRole("button", { name: "返回应用", exact: true }).click();
@@ -700,7 +752,8 @@ export async function runMcpConversationHeaderAcceptance({ page, evidenceDirecto
       mcpRpcCalls, hiddenReadDelta: hiddenRpcAfterWait - hiddenRpcBaseline,
       serverIoCount: fixture.calls.length, pageErrors,
       checks: ["project-and-global-list", "real-kerminal-name", "disabled", "thread-switch",
-        "read-only-overview", "hidden-zero-probe", "manage-settings", "keyboard-focus", "light-dark-narrow"],
+        "read-only-overview", "hidden-zero-probe", "manage-settings", "keyboard-focus", "light-dark-narrow",
+        "cross-project-filter-isolation"],
     };
     await writeFile(join(evidenceDirectory, "header-report.json"), JSON.stringify(report, null, 2));
     return report;  } catch (error) {

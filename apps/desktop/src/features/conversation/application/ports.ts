@@ -156,11 +156,30 @@ export interface ConversationHistoryPort {
     threadId: string;
     cursor?: string;
     limit?: number;
+    tail?: true;
   }): Promise<TimelineSnapshot>;
+  /** 旧测试端口可以不提供；生产按消息身份分页读取完整公开正文。 */
+  messageContentRead?: (input: {
+    threadId: string;
+    messageId: string;
+    offsetCharacters: number;
+    limitCharacters: number;
+  }) => Promise<{
+    messageId: string;
+    offsetCharacters: number;
+    nextOffsetCharacters: number | null;
+    totalCharacters: number;
+    truncated: boolean;
+    content: string;
+  }>;
+  /** 先确认连接订阅再读权威快照，隐藏时释放订阅而不取消后台任务。 */
+  threadObserve(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
+  threadUnobserve(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
   threadCompact(input: {
     threadId: string;
     expectedThreadRevision: number;
   }): Promise<ConversationCompactionResult>;
+  threadCompactCancel(input: { threadId: string }): Promise<{ accepted: boolean }>;
 }
 
 /** Conversation application 使用的模型选项，不反向依赖 Settings 的完整配置结构。 */

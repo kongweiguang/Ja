@@ -412,7 +412,7 @@ final class AgentCapabilityIntegrationTest extends PersistenceTestSupport {
                 QueuedInputBoundary.plainTextOnly(), request -> {
                     throw new AssertionError("fixture must not read attachments");
                 }, tools, "cfg_capability", toolSessions, new ToolProjectionLimits(64_000, 16_000),
-                List.of("test-only"), START.plus(limits.wallTimeout()), runtimeFactory);
+                List.of("test-only"), START.plus(limits.requestWindow()), runtimeFactory);
         holder.set(plan);
         return plan;
     }

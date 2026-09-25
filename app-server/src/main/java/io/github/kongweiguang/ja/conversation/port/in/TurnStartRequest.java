@@ -4,7 +4,6 @@
 package io.github.kongweiguang.ja.conversation.port.in;
 
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
@@ -26,7 +25,6 @@ public record TurnStartRequest(
         String reasoningLevel,
         AccessMode accessMode,
         CollaborationMode collaborationMode,
-        Duration deadline,
         long expectedThreadRevision,
         long initialTurnMutationVersion,
         Instant requestedAt) {
@@ -42,7 +40,7 @@ public record TurnStartRequest(
         content = Objects.requireNonNull(content, "content");
         providerId = TurnStartRequestValidation.identifier(providerId, "provider_", "providerId");
         modelId = TurnStartRequestValidation.identifier(modelId, "model_", "modelId");
-        TurnStartRequestValidation.validateRuntime(reasoningLevel, accessMode, collaborationMode, deadline,
+        TurnStartRequestValidation.validateRuntime(reasoningLevel, accessMode, collaborationMode,
                 expectedThreadRevision, initialTurnMutationVersion, requestedAt);
     }
 

@@ -155,7 +155,7 @@ function functionCallStream(id) {
     .join("");
 }
 
-/** 返回带首个正文 delta 但没有 terminal event 的 SSE，用于确认重试从干净历史重生。 */
+/** 首个正文 delta 后在下一 JSON 帧中途断开，验证半帧也能自动恢复且旧草稿不重复。 */
 function truncatedTextStream(id) {
   const response = {
     id: `resp_${id}`,
@@ -184,7 +184,7 @@ function truncatedTextStream(id) {
     .map(([type, payload], sequence_number) =>
       `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number, ...payload })}\n\n`,
     )
-    .join("");
+    .join("") + 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":2,"delta":';
 }
 
 /** 只启动随机 loopback listener；按每个原始 user marker 记录请求序号以检验六次预算。 */
@@ -239,15 +239,10 @@ export async function startRecoveryFixture() {
       } else if (step === "JA_RECOVERY_RETRY_SUCCESS" && requestNumber <= 5) {
         status = 503;
         mode = "retry-success-sequence";
-      } else if (step === "JA_RECOVERY_RETRY_EXHAUSTED" && requestNumber <= RECOVERY_MAX_ATTEMPTS) {
-        status = 503;
-        mode = "retry-exhaustion-sequence";
-      } else if (step === "JA_RECOVERY_CONTINUE" && requestNumber <= RECOVERY_MAX_ATTEMPTS) {
-        status = 503;
-        mode = "manual-continue-sequence";
-      } else if (step === "JA_RECOVERY_REASK_ORIGINAL" && requestNumber <= RECOVERY_MAX_ATTEMPTS) {
-        status = 503;
-        mode = "reask-source-failure";
+      } else if (["JA_RECOVERY_RETRY_EXHAUSTED", "JA_RECOVERY_CONTINUE",
+        "JA_RECOVERY_REASK_ORIGINAL"].includes(step) && requestNumber <= RECOVERY_MAX_ATTEMPTS + 1) {
+        status = requestNumber <= RECOVERY_MAX_ATTEMPTS ? 503 : 400;
+        mode = "transient-then-deterministic";
       } else if (step === "JA_RECOVERY_PARTIAL" && requestNumber === 1) {
         mode = "truncated-after-delta";
         body = truncatedTextStream(`partial_${requestNumber}`);
@@ -281,7 +276,10 @@ export async function startRecoveryFixture() {
       attempts.push(attempt);
 
       if (status !== 200) {
-        response.writeHead(status, { "content-type": "application/json" });
+        response.writeHead(status, {
+          "content-type": "application/json",
+          ...(status === 503 ? { "retry-after": "2" } : {}),
+        });
         response.end(
           JSON.stringify({
             error: {
@@ -295,7 +293,7 @@ export async function startRecoveryFixture() {
         return;
       }
 
-      if (step === "JA_RECOVERY_CONTINUE" && requestNumber > RECOVERY_MAX_ATTEMPTS && !gateReleased) {
+      if (step === "JA_RECOVERY_CONTINUE" && requestNumber > RECOVERY_MAX_ATTEMPTS + 1 && !gateReleased) {
         await gate;
       }
       if (body === undefined) {
@@ -308,8 +306,10 @@ export async function startRecoveryFixture() {
                 ? `JA_RECOVERY_CONTINUE_SUCCESS_${logicalTurn}`
                 : step === "JA_RECOVERY_CONTINUE"
                   ? "JA_RECOVERY_CONTINUE_SUCCESS"
-                  : step === "JA_RECOVERY_RETRY_SUCCESS"
-                    ? "JA_RECOVERY_RETRY_SUCCESS_AFTER_FIVE"
+              : step === "JA_RECOVERY_RETRY_SUCCESS"
+                ? "JA_RECOVERY_RETRY_SUCCESS_AFTER_FIVE"
+                : step === "JA_RECOVERY_LONG_OUTPUT"
+                  ? `JA_RECOVERY_LONG_START\n${"长".repeat(70_000)}\nJA_RECOVERY_LONG_END`
                     : step === "JA_RECOVERY_PARTIAL"
                       ? "JA_RECOVERY_PARTIAL_RETRY_SUCCESS"
                       : step === "JA_RECOVERY_TOOL_ONCE"

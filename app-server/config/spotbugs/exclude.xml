@@ -17,6 +17,13 @@
         <Class name="io.github.kongweiguang.ja.goal.adapter.out.persistence.GoalUnitOfWork"/>
     </Match>
 
+    <!-- 私有 MCP 捕获和 Goal evaluator 的短租约必须先逐项关闭，再原样重抛原异常；
+         这些精确类的 catch/rethrow 保留调用方可识别的错误身份。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.generation\.(GenerationCatalog|GenerationTurnMcpSessionFactory)|goal\.application\.RuntimeGoalEvaluatorAdapter)"/>
+    </Match>
+
     <!-- AbstractExecutorService 的 nullable 默认注解弱于本实现的显式 fail-fast 契约，两个 override 必须拒绝 null。 -->
     <Match>
         <Bug pattern="NP_PARAMETER_MUST_BE_NONNULL_BUT_MARKED_AS_NULLABLE"/>

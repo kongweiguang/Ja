@@ -41,7 +41,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
                     value.text(), value.reasoningSummary(), value.modelRound(), value.usage(), value.toolCalls());
             case TextDelta value -> value;
             case ReasoningSummaryDelta value -> value;
-            case RetryStarted value -> new RetryStarted(replacement, value.attempt(), value.maxAttempts());
+            case RetryStarted value -> new RetryStarted(replacement, value.attempt());
             case ToolStarted value -> new ToolStarted(replacement, value.callId(), value.ordinal());
             case ToolBatchCommitted value -> new ToolBatchCommitted(replacement,
                     value.results());
@@ -170,7 +170,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
         public AssistantSettlement {
             messageId = identifier(messageId, "messageId", "item_");
             text = boundedText(text, "text", 1_048_576, true);
-            if (modelRound < 1 || modelRound > 128) {
+            if (modelRound < 1) {
                 throw new IllegalArgumentException("modelRound is outside the turn bound");
             }
             Objects.requireNonNull(usage, "usage");
@@ -195,7 +195,7 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
             if (reasoningSummary != null) {
                 reasoningSummary = boundedText(reasoningSummary, "reasoningSummary", 1_048_576, false);
             }
-            if (modelRound < 1 || modelRound > 128) {
+            if (modelRound < 1) {
                 throw new IllegalArgumentException("modelRound is outside the turn bound");
             }
             Objects.requireNonNull(usage, "usage");
@@ -207,11 +207,11 @@ public sealed interface TurnEvent permits TurnEvent.StateChanged, TurnEvent.Mode
     }
 
     /** 流失败后清空未提交草稿，并在下一次 Provider dispatch 前展示一次轻量重试状态。 */
-    record RetryStarted(Context context, int attempt, int maxAttempts) implements TurnEvent {
-        /** 只允许 session retry 的第二至第六次尝试，避免把取消或终态失败伪装成重试。 */
+    record RetryStarted(Context context, int attempt) implements TurnEvent {
+        /** 重试至少从第二次尝试开始；次数不作为停止条件。 */
         public RetryStarted {
             Objects.requireNonNull(context, "context");
-            if (attempt < 2 || attempt > 6 || maxAttempts != 6) {
+            if (attempt < 2) {
                 throw new IllegalArgumentException("invalid retry attempt");
             }
         }

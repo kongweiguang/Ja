@@ -43,8 +43,8 @@ function renderMcp(overrides: Partial<SettingsPorts> = {}, servers = [SERVER]): 
 }
 
 describe("McpSection", () => {
-  /** 作用域切换只显示目标层条目，项目保存须携带项目作用域。 */
-  it("switches between global and project MCP without merging same names", async () => {
+  /** 两组同时可见，项目开关只提交项目身份。 */
+  it("shows global and project MCP together and routes the project switch", async () => {
     const user = userEvent.setup();
     const onSaveMcp = vi.fn(async () => undefined);
     render(
@@ -60,10 +60,13 @@ describe("McpSection", () => {
         onClearCredential={vi.fn(async () => undefined)}
       />,
     );
-    await user.click(screen.getByRole("tab", { name: "当前项目" }));
-    expect(screen.getByLabelText("当前项目 MCP 服务")).toHaveTextContent("文件工具");
-    expect(screen.getByLabelText("当前项目 MCP 服务")).not.toHaveTextContent("mcp-files");
-    await user.click(screen.getByRole("switch", { name: "文件工具：已启用" }));
+    expect(screen.getByRole("region", { name: "全局 MCP 服务" })).toHaveTextContent("文件工具");
+    expect(screen.getByRole("region", { name: "项目 MCP 服务" })).toHaveTextContent("文件工具");
+    await user.click(
+      within(screen.getByRole("region", { name: "项目 MCP 服务" })).getByRole("switch", {
+        name: "文件工具：已启用",
+      }),
+    );
     await waitFor(() =>
       expect(onSaveMcp).toHaveBeenCalledWith(
         expect.objectContaining({ mcpRevision: "mcp_project", enabled: false }),
@@ -77,6 +80,89 @@ describe("McpSection", () => {
 
     expect(screen.getAllByRole("button", { name: "新增服务" })).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "添加服务" })).toBeNull();
+  });
+
+  /** 后台项目读取完成只改变项目组可用性，不能吞掉正在编辑的全局草稿。 */
+  it("preserves a global draft while the project catalog becomes available", async () => {
+    const user = userEvent.setup();
+    const ports = {
+      onSaveMcp: vi.fn(async () => undefined),
+      onDeleteMcp: vi.fn(async () => undefined),
+      onTestMcp: vi.fn(async () => "connected" as const),
+      onReplaceCredential: vi.fn(async () => undefined),
+      onClearCredential: vi.fn(async () => undefined),
+    };
+    const { rerender } = render(
+      <McpSection servers={[]} projectAvailable={false} projectWorkspaceId="ws_other" {...ports} />,
+    );
+    await user.click(
+      within(screen.getByRole("region", { name: "全局 MCP 服务" })).getByRole("button", {
+        name: "新增服务",
+      }),
+    );
+    await user.type(screen.getByLabelText("名称", { exact: true }), "保留草稿");
+
+    rerender(
+      <McpSection
+        servers={[]}
+        projectServers={[]}
+        projectAvailable
+        projectWorkspaceId="ws_other"
+        {...ports}
+      />,
+    );
+
+    rerender(
+      <McpSection
+        servers={[]}
+        projectServers={[]}
+        projectAvailable
+        projectWorkspaceId="ws_next"
+        {...ports}
+      />,
+    );
+
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(screen.getByLabelText("名称", { exact: true })).toHaveValue("保留草稿");
+  });
+
+  /** 项目目标切换时不允许旧项目的未保存表单继续占用新项目编辑面。 */
+  it("closes a project draft when its target project changes", async () => {
+    const user = userEvent.setup();
+    const ports = {
+      onSaveMcp: vi.fn(async () => undefined),
+      onDeleteMcp: vi.fn(async () => undefined),
+      onTestMcp: vi.fn(async () => "connected" as const),
+      onReplaceCredential: vi.fn(async () => undefined),
+      onClearCredential: vi.fn(async () => undefined),
+    };
+    const { rerender } = render(
+      <McpSection
+        servers={[]}
+        projectServers={[]}
+        projectAvailable
+        projectWorkspaceId="ws_first"
+        {...ports}
+      />,
+    );
+    await user.click(
+      within(screen.getByRole("region", { name: "项目 MCP 服务" })).getByRole("button", {
+        name: "新增服务",
+      }),
+    );
+    await user.type(screen.getByLabelText("名称", { exact: true }), "旧项目草稿");
+
+    rerender(
+      <McpSection
+        servers={[]}
+        projectServers={[]}
+        projectAvailable
+        projectWorkspaceId="ws_second"
+        {...ports}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   /** 空 tools 投影在首次探测前代表未知，不应伪装成服务已返回零个工具。 */
@@ -104,7 +190,8 @@ describe("McpSection", () => {
   });
 
   /** 只有真正读取到目录后才展示其数量，包含 Kerminal 的 68 工具规模。 */
-  it("shows the exact number of tools after a successful catalog read", () => {
+  it("shows the count and keeps a large tool catalog collapsed until requested", async () => {
+    const user = userEvent.setup();
     const tools = Array.from({ length: 68 }, (_, index) => ({
       name: `tool_${index}`,
       policy: "ask" as const,
@@ -114,6 +201,11 @@ describe("McpSection", () => {
     expect(screen.getByText("68 个工具")).toBeInTheDocument();
     expect(screen.getByText("服务已连接")).toBeInTheDocument();
     expect(screen.getByText(/不代表当前会话已加载/)).toBeInTheDocument();
+    const disclosure = screen.getByText("查看工具目录").closest("details");
+    expect(disclosure).not.toHaveAttribute("open");
+    await user.click(screen.getByText("查看工具目录"));
+    expect(disclosure).toHaveAttribute("open");
+    expect(within(disclosure!).getAllByText(/tool_\d+/u)).toHaveLength(68);
   });
 
   /** 健康服务确实返回空工具目录时，零才是可见的真实数量。 */
@@ -132,7 +224,7 @@ describe("McpSection", () => {
 
     await user.click(screen.getByRole("button", { name: "测试" }));
 
-    expect(await screen.findByRole("status")).toHaveTextContent("文件工具：不可用。");
+    expect(await screen.findByText("文件工具：不可用。")).toBeInTheDocument();
     expect(screen.queryByText("文件工具 测试失败")).toBeNull();
   });
 
@@ -143,9 +235,7 @@ describe("McpSection", () => {
 
     await user.click(screen.getByRole("button", { name: "测试" }));
 
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "文件工具 服务已连接，工具目录已读取。",
-    );
+    expect(await screen.findByText("文件工具 服务已连接，工具目录已读取。")).toBeInTheDocument();
     expect(screen.getByText(/不代表当前会话已加载/)).toBeInTheDocument();
   });
 

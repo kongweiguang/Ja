@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
@@ -39,14 +40,14 @@ public final class StrictSseLineReader {
             int value = readByte();
             if (value < 0) {
                 eof = true;
-                return bytes.size() == 0 ? null : decode(bytes.toByteArray());
+                return bytes.size() == 0 ? null : decode(bytes.toByteArray(), true);
             }
-            if (value == '\n') return decode(bytes.toByteArray());
+            if (value == '\n') return decode(bytes.toByteArray(), false);
             if (value == '\r') {
                 int following = readByte();
                 if (following >= 0 && following != '\n') pendingByte = following;
                 if (following < 0) eof = true;
-                return decode(bytes.toByteArray());
+                return decode(bytes.toByteArray(), false);
             }
             bytes.write(value);
         }
@@ -62,15 +63,30 @@ public final class StrictSseLineReader {
         return input.read();
     }
 
-    /** 将畸形 UTF-8 归入调用方固定的脱敏协议类别，不使用替换字符继续解析。 */
-    private String decode(byte[] bytes) {
+    /** EOF 截断 UTF-8 尾字符可重试；完整行中的畸形字节仍按确定性协议错误处理。 */
+    private String decode(byte[] bytes, boolean eofTerminated) {
         try {
             return StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPORT)
                     .onUnmappableCharacter(CodingErrorAction.REPORT)
                     .decode(ByteBuffer.wrap(bytes)).toString();
         } catch (java.nio.charset.CharacterCodingException failure) {
+            if (eofTerminated && incompleteUtf8Suffix(bytes)) {
+                throw new ProviderProtocolException("STREAM_TRUNCATED",
+                        "provider SSE line ended inside UTF-8 text", true, "MODEL_STREAM_INVALID");
+            }
             throw new ProviderProtocolException(providerCode, invalidUtf8Message, false);
         }
+    }
+
+    /** 解码器以非终态检查剩余字节，仅未完成的合法尾前缀才属于传输截断。 */
+    private static boolean incompleteUtf8Suffix(byte[] bytes) {
+        ByteBuffer input = ByteBuffer.wrap(bytes);
+        CharBuffer output = CharBuffer.allocate(bytes.length);
+        var result = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(input, output, false);
+        return result.isUnderflow() && input.hasRemaining();
     }
 }

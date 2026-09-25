@@ -3,6 +3,8 @@
 
 package io.github.kongweiguang.ja.goal.application;
 
+import io.github.kongweiguang.ja.conversation.port.in.NativeExecutionContext;
+
 import io.github.kongweiguang.ja.goal.domain.GoalModels.Goal;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.GoalPhase;
 import io.github.kongweiguang.ja.goal.domain.GoalModels.GoalStatus;
@@ -50,6 +52,11 @@ public final class GoalContinuationCoordinator implements AutoCloseable {
         Goal goal = goals.findGoal(goalId).orElse(null);
         if (goal == null || goal.status() != GoalStatus.ACTIVE || goal.phase() != GoalPhase.WORKING
                 || goal.activeRunId() == null || goal.recoveryRequired()) return Optional.empty();
+        if (NativeExecutionContext.shared().sharedMode()
+                && NativeExecutionContext.shared().findRun("goal", goal.goalId(), goal.activeRunId()).isEmpty()) {
+            // 重启后内存环境消失；等待新客户端显式恢复同一 Goal，不能用 daemon 环境自动执行。
+            return Optional.empty();
+        }
         if (!turns.ownerIdle(goal.ownerThreadId())) {
             scheduleRetry(goalId);
             return Optional.empty();

@@ -21,6 +21,20 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** 验证 AgentRound 将公开文本与原生 reasoning 按 Provider 事件顺序冻结。 */
 final class AgentRoundReasoningTest {
+    /** 公开思考摘要跨越旧百万字符阈值仍正常结束，后续由分页读取完整内容。 */
+    @Test
+    void longPublicReasoningDoesNotStopTheRound() {
+        AgentRound round = new AgentRound(
+                "turn_long_reasoning", CancellationToken.none(),
+                event -> CompletableFuture.completedFuture(null), () -> false, 1,
+                idleTimer(), new Sequences());
+        String chunk = "思".repeat(600_000);
+        round.onEvent(new ModelPort.ReasoningSummaryDelta(chunk)).toCompletableFuture().join();
+        round.onEvent(new ModelPort.ReasoningSummaryDelta(chunk)).toCompletableFuture().join();
+        round.close();
+        assertEquals(1_200_000, round.reasoningSummary().length());
+    }
+
     /** reasoning block 必须切断相邻文本，保证 text -> reasoning -> text 的历史顺序可回放。 */
     @Test
     void freezesReasoningBetweenTextBlocks() {

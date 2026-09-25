@@ -7,6 +7,8 @@ import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProto
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
@@ -55,12 +57,16 @@ final class ProviderSseReaderTest {
                         .getBytes(StandardCharsets.UTF_8)).next());
     }
 
-    /** 未知 SSE 字段可能改变重放或路由语义，因此不得静默忽略。 */
+    /** 元数据字段和未知扩展事件不影响受支持事件的语义归约。 */
     @Test
-    void rejectsUnknownSseField() {
-        assertThrows(ProviderProtocolException.class, () ->
-                reader("event: ping\nid: 7\ndata: {\"type\":\"ping\"}\n\n"
-                        .getBytes(StandardCharsets.UTF_8)).next());
+    void skipsExtensionEventAndAcceptsSseMetadata() throws Exception {
+        ProviderSseReader reader = reader(("id: metadata-only\nretry: 1000\nfuture-field\n\n"
+                + "event: vendor.extension\ndata: arbitrary\n\n"
+                + "event: ping\nid: 7\nretry: 1000\nvendor-field: ignored\n"
+                + "data: {\"type\":\"ping\"}\n\n")
+                .getBytes(StandardCharsets.UTF_8));
+        assertEquals("ping", reader.next().name());
+        assertNull(reader.next());
     }
 
     /** 在任何状态变更选取值之前拒绝重复 JSON 键。 */
@@ -82,7 +88,26 @@ final class ProviderSseReaderTest {
         body[prefix.length] = (byte) 0x80;
         System.arraycopy(suffix, 0, body, prefix.length + 1, suffix.length);
 
-        assertThrows(ProviderProtocolException.class, () -> reader(body).next());
+        ProviderProtocolException malformed = assertThrows(ProviderProtocolException.class,
+                () -> reader(body).next());
+        assertEquals("TEST_EVENT", malformed.code());
+        assertFalse(malformed.retryable());
+    }
+
+    /** UTF-8 多字节字符只收到合法前缀后 EOF，必须等待新请求而不是要求用户手动继续。 */
+    @Test
+    void treatsUtf8CodePointCutByEofAsRecoverable() {
+        byte[] prefix = "event: ping\ndata: {\"type\":\"ping\",\"text\":\""
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] body = java.util.Arrays.copyOf(prefix, prefix.length + 2);
+        body[prefix.length] = (byte) 0xE4;
+        body[prefix.length + 1] = (byte) 0xB8;
+
+        ProviderProtocolException truncated = assertThrows(ProviderProtocolException.class,
+                () -> reader(body).next());
+        assertEquals("STREAM_TRUNCATED", truncated.code());
+        assertEquals("MODEL_STREAM_INVALID", truncated.terminalErrorCode());
+        assertTrue(truncated.retryable());
     }
 
     /** 由共享严格 Mapper 限制恶意 JSON 嵌套深度。 */
@@ -94,11 +119,45 @@ final class ProviderSseReaderTest {
                 reader(body.getBytes(StandardCharsets.UTF_8)).next());
     }
 
+    /** 传输在 JSON 值中途结束才自动恢复；明确闭合的坏帧保持确定性错误。 */
+    @Test
+    void distinguishesIncompleteEofFromMalformedCompleteFrame() {
+        ProviderProtocolException truncated = assertThrows(ProviderProtocolException.class, () ->
+                reader("event: ping\ndata: {\"type\":\"ping\",\"value\":"
+                        .getBytes(StandardCharsets.UTF_8)).next());
+        assertEquals("STREAM_TRUNCATED", truncated.code());
+        assertEquals("MODEL_STREAM_INVALID", truncated.terminalErrorCode());
+        assertTrue(truncated.retryable());
+
+        ProviderProtocolException malformed = assertThrows(ProviderProtocolException.class, () ->
+                reader("event: ping\ndata: {\"type\":\"ping\",\"value\":}\n\n"
+                        .getBytes(StandardCharsets.UTF_8)).next());
+        assertEquals("TEST_EVENT", malformed.code());
+        assertFalse(malformed.retryable());
+    }
+
+    /** Chat Completions 的 data-only SSE 使用相同的 EOF 判别，避免真实断流要求用户手动继续。 */
+    @Test
+    void chatReaderRetriesOnlyIncompleteEofFrames() {
+        ProviderProtocolException truncated = assertThrows(ProviderProtocolException.class, () ->
+                new OpenAiChatSseReader(new ByteArrayInputStream(
+                        "data: {\"choices\":[".getBytes(StandardCharsets.UTF_8))).next());
+        assertEquals("STREAM_TRUNCATED", truncated.code());
+        assertEquals("MODEL_STREAM_INVALID", truncated.terminalErrorCode());
+        assertTrue(truncated.retryable());
+
+        ProviderProtocolException malformed = assertThrows(ProviderProtocolException.class, () ->
+                new OpenAiChatSseReader(new ByteArrayInputStream(
+                        "data: {\"choices\":}\n\n".getBytes(StandardCharsets.UTF_8))).next());
+        assertEquals("OPENAI_CHAT_EVENT", malformed.code());
+        assertFalse(malformed.retryable());
+    }
+
     /** 在执行严格分帧解析前，用生产字节上限包装测试输入。 */
     private static ProviderSseReader reader(byte[] bytes) {
         return new ProviderSseReader(
                 new BoundedSseInputStream(
-                        new ByteArrayInputStream(bytes), 2_048, 16_384, 32),
+                        new ByteArrayInputStream(bytes), 2_048),
                 Set.of("ping"), "TEST_EVENT");
     }
 }

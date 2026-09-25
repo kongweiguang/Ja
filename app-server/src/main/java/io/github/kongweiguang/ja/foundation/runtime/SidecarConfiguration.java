@@ -85,6 +85,9 @@ public record SidecarConfiguration(Path homeDirectory,
                 rejectDuplicate(seen, "runtime-generation");
                 runtimeGeneration = parseRuntimeGeneration(
                         arg.substring("--ja-runtime-generation=".length()));
+            } else if ("--ja-transport=tcp".equals(arg)) {
+                // Transport 只影响外壳；目录与业务所有权仍由同一份配置决定。
+                rejectDuplicate(seen, "transport");
             } else {
                 throw new IllegalArgumentException("unsupported sidecar argument");
             }

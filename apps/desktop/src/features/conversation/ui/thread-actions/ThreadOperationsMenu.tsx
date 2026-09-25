@@ -11,6 +11,7 @@ export interface ThreadOperationsMenuProps {
   showCompactAction: boolean;
   compaction: ConversationCompactionView;
   onCompact: () => void | Promise<void>;
+  onCancelCompaction: () => void | Promise<void>;
   onDismissFeedback: () => void;
 }
 
@@ -22,6 +23,7 @@ export function ThreadOperationsMenu({
   showCompactAction,
   compaction,
   onCompact,
+  onCancelCompaction,
   onDismissFeedback,
 }: ThreadOperationsMenuProps): ReactElement | null {
   const pending = compaction.phase === "running";
@@ -67,6 +69,11 @@ export function ThreadOperationsMenu({
           aria-live="polite"
         >
           <span>{compaction.message}</span>
+          {pending && compaction.cancellable && compaction.message !== "正在停止上下文压缩…" ? (
+            <button type="button" onClick={() => void onCancelCompaction()}>
+              停止
+            </button>
+          ) : null}
           {compaction.retryable && showCompactAction ? (
             <button type="button" onClick={() => void onCompact()}>
               重试

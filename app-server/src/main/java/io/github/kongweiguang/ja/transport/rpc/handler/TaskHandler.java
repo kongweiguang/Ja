@@ -18,7 +18,6 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -27,7 +26,6 @@ import java.util.concurrent.CompletionStage;
 
 /** 用户可见 Task 的严格 JA-RPC 适配；Agent Tools 直接调用 TaskUseCase，不经过本 Handler。 */
 public final class TaskHandler implements RpcHandler {
-    private static final Duration DEFAULT_TASK_DEADLINE = Duration.ofMinutes(30);
     private final RpcSession session;
 
     /** Handler 只借用连接会话，不持有 Task observation 或数据库状态。 */
@@ -187,8 +185,7 @@ public final class TaskHandler implements RpcHandler {
         RpcParams.requireExact(params, "senderThreadId", "targetThreadId", "content", "idempotencyKey",
                 "expectedTaskRevision");
         TaskUseCase.FollowUpResult result = session.tasks().followUp(new TaskUseCase.FollowUpCommand(
-                messageCommand(params), RpcParams.revision(params, "expectedTaskRevision"),
-                DEFAULT_TASK_DEADLINE));
+                messageCommand(params), RpcParams.revision(params, "expectedTaskRevision")));
         return session.mapper().createObjectNode().put("accepted", true)
                 .put("messageId", result.messageId())
                 .put("turnId", result.turnId()).set("task", RpcResults.task(session.mapper(), result.task()));

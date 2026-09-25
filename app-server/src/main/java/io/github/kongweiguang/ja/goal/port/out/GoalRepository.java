@@ -78,12 +78,8 @@ public interface GoalRepository {
     Optional<PlanTurnClaim> claimPlanTurn(ClaimPlanTurn command);
 
     /** 首次执行冻结实际 RuntimeLease 上限，后续 Turn 不得因配置刷新扩大该 Run。 */
-    default void initializePlanBudget(InitializePlanBudget command) {
-        throw new UnsupportedOperationException("Plan budget initialization is unavailable");
-    }
 
     /** 读取当前 Run 的冻结剩余预算，验收 Provider 也必须受同一累计墙钟上限约束。 */
-    Optional<PlanRunBudget> readPlanRunBudget(String planId, String runId);
 
     /** Turn 终态结算真实 usage，并在同一事务内累计 Run 预算；重复回调必须幂等。 */
     default void settlePlanTurn(SettlePlanTurn command) {
@@ -295,22 +291,10 @@ public interface GoalRepository {
     /** 执行命令在同一事务中记录用户授权、复核 revision/hash，并分配 standalone run。 */
     record ExecutePlan(String planId, long expectedPlanRevision, String planRevisionId, String planHash,
                        String approvalId, String runId, long processGeneration,
-                       String eventId, String idempotencyKey, Instant at,
-                       Integer maxModelRounds, Integer maxToolCalls, Long wallBudgetMillis,
-                       Integer turnBudget) {
-        /** 执行事务必须携带完整冻结预算，缺失预算不能伪装为无限或旧格式执行。 */
+                       String eventId, String idempotencyKey, Instant at) {
+        /** 执行只冻结批准身份与 Run；模型/工具次数不参与准入。 */
         public ExecutePlan {
             Objects.requireNonNull(approvalId, "approvalId");
-            Objects.requireNonNull(maxModelRounds, "maxModelRounds");
-            Objects.requireNonNull(maxToolCalls, "maxToolCalls");
-            Objects.requireNonNull(wallBudgetMillis, "wallBudgetMillis");
-            Objects.requireNonNull(turnBudget, "turnBudget");
-            if (maxModelRounds < 1 || maxModelRounds > 1_000_000
-                    || maxToolCalls < 0 || maxToolCalls > 10_000_000
-                    || wallBudgetMillis <= 0 || wallBudgetMillis > 86_400_000L * 30
-                    || turnBudget < 1 || turnBudget > 256) {
-                throw new IllegalArgumentException("invalid Plan execution budget");
-            }
         }
     }
     /** completion callback 精确绑定本次 run，迟到 callback 不能停止后续执行。 */
@@ -320,8 +304,6 @@ public interface GoalRepository {
     record ClaimPlanTurn(String planId, long expectedPlanRevision, String runId, String planRevisionId,
                          String turnId, String eventId, String idempotencyKey, Instant at) { }
     /** effective runtime limits 只允许初始化一次，防止跨 Turn 读取漂移配置。 */
-    record InitializePlanBudget(String planId, String runId, int maxModelRounds, int maxToolCalls,
-                                long wallBudgetMillis, int antiLoopTurnBudget, Instant at) { }
     /** Turn 完成后只携带不可变身份和活动墙钟增量，模型/Tool 用量由仓储从权威账本读取。 */
     record SettlePlanTurn(String planId, String runId, String turnId, long activeMillis,
                           String eventId, String idempotencyKey, Instant at) {
@@ -338,30 +320,15 @@ public interface GoalRepository {
             if (activeMillis < 0) throw new IllegalArgumentException("activeMillis must be non-negative");
         }
     }
-    /** Run budget 的只读投影；所有 remaining 值均由 SQLite 已用账本计算。 */
-    record PlanRunBudget(String planId, String runId, int remainingModelRounds,
-                         int remainingToolCalls, long remainingWallBudgetMillis) {
-        /** 验收调用允许零剩余预算，但绝不允许负值。 */
-        public PlanRunBudget {
-            if (remainingModelRounds < 0 || remainingToolCalls < 0 || remainingWallBudgetMillis < 0) {
-                throw new IllegalArgumentException("invalid Plan run budget");
-            }
-        }
-    }
     /** pause fence 不增加 Plan revision，允许随后使用同一 expectedPlanRevision 完成状态 CAS。 */
     record RequestPlanPause(String planId, long expectedPlanRevision, String runId,
                             String eventId, String idempotencyKey, Instant at) { }
-    /** 已持久化的 Turn ordinal 与本次剩余预算，供调度器决定是否继续。 */
+    /** 已持久化的 Turn ordinal 与身份，供调度器精确结算和恢复。 */
     record PlanTurnClaim(String planId, String runId, String planRevisionId,
-                         String turnId, int ordinal, int remainingTurnBudget,
-                         int remainingModelRounds, int remainingToolCalls,
-                         long remainingWallBudgetMillis) {
-        /** 剩余预算允许为零，但不能出现负数或溢出值。 */
+                         String turnId, int ordinal) {
+        /** 序号从一开始单调前进，不再夹带预算。 */
         public PlanTurnClaim {
-            if (ordinal < 1 || remainingTurnBudget < 0 || remainingModelRounds < 0
-                    || remainingToolCalls < 0 || remainingWallBudgetMillis < 0) {
-                throw new IllegalArgumentException("invalid remaining Plan budget");
-            }
+            if (ordinal < 1) throw new IllegalArgumentException("invalid Plan Turn ordinal");
         }
     }
     /** 拒绝只写用户决定，不创建 run。 */

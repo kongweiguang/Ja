@@ -88,7 +88,7 @@ try {
         'node-manifest' = 'package.json'
         'node-lock' = 'pnpm-lock.yaml'
         'cargo-workspace-manifest' = 'Cargo.toml'
-        'cargo-package-manifest' = 'src-tauri/Cargo.toml'
+        'cargo-package-manifest' = 'apps/desktop/src-tauri/Cargo.toml'
         'cargo-lock' = 'Cargo.lock'
         'maven-manifest' = 'app-server/pom.xml'
         'maven-bom' = 'app-server/target/ja-app-server-bom.json'

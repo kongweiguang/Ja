@@ -38,7 +38,7 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
                 throw new IllegalArgumentException("invalid errorCode");
             }
             if (mutationVersion < 0) throw new IllegalArgumentException("invalid mutationVersion");
-            if (modelRound < 0 || modelRound > 128) throw new IllegalArgumentException("invalid modelRound");
+            if (modelRound < 0) throw new IllegalArgumentException("invalid modelRound");
             if (sourceMessageId != null) requireIdentifier(sourceMessageId, "item_", "sourceMessageId");
         }
 
@@ -123,7 +123,7 @@ public record ThreadSnapshot(ThreadSummary thread, List<Turn> turns, List<Item> 
             requireIdentifier(turnId, "turn_", "turnId");
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(text, "text");
-            if (modelRound != null && (modelRound < 1 || modelRound > 128)) {
+            if (modelRound != null && modelRound < 1) {
                 throw new IllegalArgumentException("invalid modelRound");
             }
             if ((kind == TextKind.ASSISTANT_PROGRESS || kind == TextKind.REASONING_SUMMARY)

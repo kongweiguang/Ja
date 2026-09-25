@@ -37,7 +37,7 @@ const emptyDocument: SettingsDocument = {
   subagents: { enabled: true, providerId: null, modelId: null, reasoningLevel: null },
   providers: [],
   mcpServers: [],
-  skills: [],
+  disabledSkills: [],
   window: { width: 1280, height: 800, maximized: false },
 };
 const configuredDocument: SettingsDocument = {
@@ -58,7 +58,6 @@ const configuredDocument: SettingsDocument = {
       networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
       agentDefaults: {
         context: { autoCompact: true },
-        turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3_600_000 },
       },
       models: [
         {
@@ -98,6 +97,13 @@ function runtime(
   };
   let remainingStartFailures = startFailures;
   return {
+    pendingOperations: vi.fn(async () => []),
+    recheckPendingOperations: vi.fn(async () => []),
+    acknowledgePendingOperation: vi.fn(async () => ({
+      status: "unknown_acknowledged" as const,
+      pending: [],
+    })),
+    subscribePendingOperations: vi.fn(() => () => undefined),
     recoveryState: vi.fn(async () => ({
       required: false,
       acknowledgeable: false,
@@ -309,6 +315,8 @@ async function selectSessionThread(
 /** 组合测试只模拟 App Server 权威查询，不在 Renderer 内派生会话状态。 */
 function history(): HistoryAdapter {
   return {
+    threadObserve: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
+    threadUnobserve: vi.fn(async ({ threadId }) => ({ accepted: true as const, threadId })),
     workspaceList: vi.fn(async () => ({ items: [], nextCursor: null })),
     threadList: vi.fn(async () => ({ items: [], nextCursor: null })),
     threadSearch: vi.fn(async () => ({ items: [], nextCursor: null })),
@@ -339,6 +347,7 @@ function history(): HistoryAdapter {
       inputTokensBefore: 0,
       inputTokensAfter: 0,
     })),
+    threadCompactCancel: vi.fn(async () => ({ accepted: false })),
     threadPin: vi.fn(async () => {
       throw new Error("unused");
     }),
@@ -385,6 +394,40 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   });
 
   afterEach(() => cleanup());
+
+  it("启动残留未知提交时显示待核实提示，重新检查不触发新 Turn", async () => {
+    const runtimePort = runtime();
+    const pending = [
+      {
+        clientOperationId: "op_0123456789abcdef0123456789abcdef",
+        method: "approval/respond" as const,
+        threadId: null,
+        createdAt: "2026-09-24T00:00:00.000Z",
+      },
+    ];
+    vi.mocked(runtimePort.recheckPendingOperations).mockResolvedValue(pending);
+    render(
+      <App
+        runtime={runtimePort}
+        settingsAdapter={settings(configuredDocument)}
+        historyAdapter={history()}
+        projectPicker={{ pick: vi.fn(async () => null) }}
+      />,
+    );
+    expect(await screen.findByText(/上一次操作结果待核实，可能已产生副作用/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "重新检查" }));
+    await waitFor(() => expect(runtimePort.recheckPendingOperations).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "我已检查，允许新操作" }));
+    expect(screen.getByText(/原操作仍可能已经执行/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认解除阻挡" }));
+    await waitFor(() =>
+      expect(runtimePort.acknowledgePendingOperation).toHaveBeenCalledWith(
+        pending[0]?.clientOperationId,
+      ),
+    );
+    expect(await screen.findByText(/原操作是否执行仍未确认/)).toBeVisible();
+    expect(runtimePort.turnStart).not.toHaveBeenCalled();
+  });
 
   /** 必填设置独占可见区域，但保留隐藏工作区树以统一主题切换与正常设置导航的挂载语义。 */
   it("keeps Settings reachable with an empty app-server-owned configuration", async () => {
@@ -638,7 +681,11 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
 
     await selectSessionThread("新对话", runtimePort);
     await waitFor(() =>
-      expect(historyAdapter.threadRead).toHaveBeenCalledWith({ threadId: "thr_fixture" }),
+      expect(historyAdapter.threadRead).toHaveBeenCalledWith({
+        threadId: "thr_fixture",
+        tail: true,
+        limit: 200,
+      }),
     );
     const trigger = await screen.findByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
@@ -1172,6 +1219,8 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(historyAdapter.threadCreate).not.toHaveBeenCalled();
     expect(historyAdapter.threadRead).toHaveBeenLastCalledWith({
       threadId: projectThread.threadId,
+      tail: true,
+      limit: 200,
     });
     expect(recentThreads.querySelectorAll("button[data-thread-id]")).toHaveLength(
       threadCountBefore,
@@ -1187,6 +1236,8 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     await waitFor(() =>
       expect(historyAdapter.threadRead).toHaveBeenLastCalledWith({
         threadId: secondaryProjectThread.threadId,
+        tail: true,
+        limit: 200,
       }),
     );
     await waitFor(() => expect(screen.getByRole("textbox", { name: "消息" })).toHaveFocus());
@@ -1224,7 +1275,11 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       expect(screen.getByRole("button", { name: "显示工作区面板" })).toBeInTheDocument(),
     );
     await waitFor(() =>
-      expect(historyAdapter.threadRead).toHaveBeenCalledWith({ threadId: "thr_fixture" }),
+      expect(historyAdapter.threadRead).toHaveBeenCalledWith({
+        threadId: "thr_fixture",
+        tail: true,
+        limit: 200,
+      }),
     );
     screen.getByRole("button", { name: "显示工作区面板" }).click();
     const workspacePanels = container.querySelector<HTMLElement>("#ja-workspace-layout");

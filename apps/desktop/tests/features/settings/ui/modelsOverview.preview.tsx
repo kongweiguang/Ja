@@ -17,7 +17,6 @@ const provider: ProviderProjection = {
   networkTimeouts: { connectTimeoutMs: 10000, requestTimeoutMs: 120000 },
   agentDefaults: {
     context: { autoCompact: true },
-    turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3600000 },
   },
   models: ["gpt-5.6-sol", "gpt-5.6-mini"].map((model) => ({
     modelId: model,

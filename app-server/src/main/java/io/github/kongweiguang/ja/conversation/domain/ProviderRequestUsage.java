@@ -25,7 +25,7 @@ public record ProviderRequestUsage(
                 || !requestId.substring("request_".length()).matches("[A-Za-z0-9][A-Za-z0-9._-]*")) {
             throw new IllegalArgumentException("invalid requestId");
         }
-        if (requestOrdinal < 1 || requestOrdinal > 1_024 || modelRound < 1 || modelRound > 128) {
+        if (requestOrdinal < 1 || modelRound < 1) {
             throw new IllegalArgumentException("invalid Provider request ordinal");
         }
         Objects.requireNonNull(purpose, "purpose");

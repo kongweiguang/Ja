@@ -20,6 +20,7 @@ describe("ThreadOperationsMenu", () => {
         showCompactAction
         compaction={{ phase, message: "压缩反馈", retryable: false }}
         onCompact={onCompact}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={onDismissFeedback}
       />,
     );
@@ -42,6 +43,7 @@ describe("ThreadOperationsMenu", () => {
         showCompactAction
         compaction={{ phase: "idle", retryable: false }}
         onCompact={onCompact}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={vi.fn()}
       />,
     );
@@ -62,6 +64,7 @@ describe("ThreadOperationsMenu", () => {
           retryable: true,
         }}
         onCompact={onCompact}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={vi.fn()}
       />,
     );
@@ -79,6 +82,7 @@ describe("ThreadOperationsMenu", () => {
           retryable: true,
         }}
         onCompact={onCompact}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={vi.fn()}
       />,
     );
@@ -92,6 +96,7 @@ describe("ThreadOperationsMenu", () => {
         showCompactAction={false}
         compaction={{ phase: "running", message: "正在压缩上下文…", retryable: false }}
         onCompact={vi.fn()}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={vi.fn()}
       />,
     );
@@ -108,9 +113,42 @@ describe("ThreadOperationsMenu", () => {
           retryable: false,
         }}
         onCompact={vi.fn()}
+        onCancelCompaction={vi.fn()}
         onDismissFeedback={vi.fn()}
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("12,000 → 5,000 Token");
+  });
+
+  /** 活动手动压缩保留停止入口，自动压缩没有错误的跨任务取消按钮。 */
+  it("stops only a cancellable manual compaction", async () => {
+    const user = userEvent.setup();
+    const onCancelCompaction = vi.fn();
+    const { rerender } = render(
+      <ThreadOperationsMenu
+        showCompactAction={false}
+        compaction={{
+          phase: "running",
+          message: "正在压缩上下文…",
+          retryable: false,
+          cancellable: true,
+        }}
+        onCompact={vi.fn()}
+        onCancelCompaction={onCancelCompaction}
+        onDismissFeedback={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "停止" }));
+    expect(onCancelCompaction).toHaveBeenCalledOnce();
+    rerender(
+      <ThreadOperationsMenu
+        showCompactAction={false}
+        compaction={{ phase: "running", message: "正在压缩上下文…", retryable: false }}
+        onCompact={vi.fn()}
+        onCancelCompaction={onCancelCompaction}
+        onDismissFeedback={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "停止" })).not.toBeInTheDocument();
   });
 });

@@ -17,7 +17,6 @@ const provider = {
   networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
   agentDefaults: {
     context: { autoCompact: true },
-    turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3_600_000 },
   },
 } as const;
 const model = {

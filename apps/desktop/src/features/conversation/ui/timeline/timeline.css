@@ -259,6 +259,54 @@
   animation: ja-chat-response-content-enter 140ms var(--ja-ease-native) both;
 }
 
+/* 长正文由用户按需展开；单个文本节点和独立滚动区避免 Markdown 巨树拖慢整条会话。 */
+.ja-chat-response__long-text {
+  max-height: min(65vh, 42rem);
+  overflow: auto;
+  margin: 0.6rem 0 0;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-lg);
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.ja-chat-response__full-action {
+  margin-top: 0.5rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ja-accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ja-chat-response__full-action:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.ja-chat-response__full-error {
+  margin: 0.35rem 0 0;
+  color: var(--ja-danger);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-public-text-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+}
+
+.ja-chat-response__full-note {
+  margin: 0.35rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
 @keyframes ja-chat-response-content-enter {
   from {
     opacity: 0;

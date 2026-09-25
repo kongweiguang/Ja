@@ -479,7 +479,7 @@ impl Session {
         params: Value,
         timeout: Duration,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        self.request_inner(method, params, timeout, None)
+        self.request_inner(method, params, Some(timeout), None)
     }
 
     /// 在线性化准入锁内完成 pending 注册与 writer 入队；该入口保持 crate 私有，
@@ -491,21 +491,33 @@ impl Session {
         timeout: Duration,
         gate: &Mutex<bool>,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        self.request_inner(method, params, timeout, Some(gate))
+        self.request_inner(method, params, Some(timeout), Some(gate))
     }
 
-    /// 共用 request 编码、pending 注册和关闭准入约束，等待路径只接收对应 response。
+    /// `thread/compact` 的 Provider 恢复不受 RPC 等待时长中断；Session 关闭仍立刻唤醒 waiter。
+    pub(crate) fn request_compaction_with_gate(
+        &self,
+        params: Value,
+        gate: &Mutex<bool>,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        self.request_inner("thread/compact", params, None, Some(gate))
+    }
+
+    /// 共用 request 编码、pending 注册和关闭准入约束；None 只允许取消型手动压缩。
     fn request_inner(
         &self,
         method: &str,
         params: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
         admission: Option<&Mutex<bool>>,
     ) -> Result<RpcFrame, AppServerProcessError> {
         let request_timeout_limit =
             Duration::from_millis(self.inner.limits.request_deadline_ms).min(MAX_OPERATION_TIMEOUT);
-        if timeout > request_timeout_limit {
+        if timeout.is_some_and(|value| value > request_timeout_limit) {
             return Err(AppServerProcessError::InvalidTimeout);
+        }
+        if timeout.is_none() && method != "thread/compact" {
+            return Err(AppServerProcessError::ProtocolFault);
         }
         let admission_guard = if let Some(gate) = admission {
             let guard = match gate.lock() {
@@ -556,8 +568,8 @@ impl Session {
                 return Err(error.into());
             }
         };
-        // Deadline 在 pending 注册和入队前开始；后续阶段不得为同一 request 新建超时窗口。
-        let deadline = deadline_after(timeout)?;
+        // 普通请求只建立一个 deadline；压缩只由完成或 Session 关闭收口。
+        let deadline = timeout.map(deadline_after).transpose()?;
         let receiver = {
             let pending = self.inner.pending.lock();
             let mut pending = match pending {
@@ -570,7 +582,10 @@ impl Session {
                     return Err(AppServerProcessError::ProtocolFault);
                 }
             };
-            pending.register(id, deadline)?
+            match deadline {
+                Some(deadline) => pending.register(id, deadline)?,
+                None => pending.register_until_closed(id)?,
+            }
         };
         let priority = if method == "runtime/shutdown" || method.starts_with("runtime/") {
             EventPriority::Control
@@ -594,6 +609,11 @@ impl Session {
         }
         // 只串行化 admission，response 等待仍保持并发，避免持锁跨越外部响应时间。
         drop(admission_guard);
+        let Some(deadline) = deadline else {
+            return receiver
+                .recv()
+                .map_err(|_| AppServerProcessError::SessionClosed)?;
+        };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let pending = self.inner.pending.lock();

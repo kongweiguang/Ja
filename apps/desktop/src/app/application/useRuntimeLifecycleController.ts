@@ -18,6 +18,8 @@ import {
   type RuntimeSettingsParams,
   type RuntimeSettingsResult,
   type RuntimeStorageInfo,
+  type RuntimePendingClientOperation,
+  type RuntimePendingAcknowledgementResult,
 } from "./runtimePorts";
 import type { BootState } from "../bootState";
 import {
@@ -38,6 +40,7 @@ export interface RuntimeStateController {
   readonly turnAdmissionReady: boolean;
   readonly runtimeState: RuntimeStatus | undefined;
   readonly recovery: RuntimeRecoveryState | undefined;
+  readonly pendingClientOperations: readonly RuntimePendingClientOperation[];
   /** 只发布 Settings 真正消费的配置失效事件，避免流式 Turn 事件让整个应用壳重渲染。 */
   readonly lastConfigurationEvent: RuntimeHostEvent | undefined;
   /**
@@ -56,6 +59,10 @@ export interface RuntimeLifecycleController {
   readonly queryRuntime: RuntimeQuery;
   readonly readRuntimeStorage: () => Promise<RuntimeStorageInfo>;
   readonly acknowledgeRecovery: (reason: RecoveryReason) => Promise<RuntimeRecoveryState>;
+  readonly recheckPendingOperations: () => Promise<readonly RuntimePendingClientOperation[]>;
+  readonly acknowledgePendingOperation: (
+    clientOperationId: string,
+  ) => Promise<RuntimePendingAcknowledgementResult>;
 }
 
 export interface RuntimeControllers {
@@ -180,6 +187,31 @@ export function useRuntimeLifecycleController(
   const [turnAdmissionReady, setTurnAdmissionReady] = useState(false);
   const [runtimeState, setRuntimeState] = useState<RuntimeStatus>();
   const [recovery, setRecovery] = useState<RuntimeRecoveryState>();
+  const [pendingClientOperations, setPendingClientOperations] = useState<
+    readonly RuntimePendingClientOperation[]
+  >([]);
+
+  /** 同一窗口内提交/回查立即更新提示，正文仍由 Timeline 的服务端快照独立读取。 */
+  useEffect(() => runtime.subscribePendingOperations(setPendingClientOperations), [runtime]);
+
+  /** 待核实状态只投影本地 opaque 身份；每次重查都必须先询问 Java 的事务回执。 */
+  const recheckPendingOperations = useCallback(async (): Promise<
+    readonly RuntimePendingClientOperation[]
+  > => {
+    const pending = await runtime.recheckPendingOperations();
+    setPendingClientOperations(pending);
+    return pending;
+  }, [runtime]);
+
+  /** 用户确认只解除本地待核实阻挡；服务端回执仍须再次读取，不自动重发原请求。 */
+  const acknowledgePendingOperation = useCallback(
+    async (clientOperationId: string): Promise<RuntimePendingAcknowledgementResult> => {
+      const outcome = await runtime.acknowledgePendingOperation(clientOperationId);
+      setPendingClientOperations(outcome.pending);
+      return outcome;
+    },
+    [runtime],
+  );
   const [lastConfigurationEvent, setLastConfigurationEvent] = useState<RuntimeHostEvent>();
   const [lastThreadMetadataEvent, setLastThreadMetadataEvent] =
     useState<RuntimeThreadMetadataEvent>();
@@ -326,6 +358,7 @@ export function useRuntimeLifecycleController(
         (gate.lifecycleEpoch !== lifecycleEpoch ||
           gate.runtime !== runtime ||
           gate.generation !== status.generation ||
+          gate.serverInstanceId !== status.serverInstanceId ||
           !["ready", "busy"].includes(status.status))
       ) {
         revokeTurnGate();
@@ -436,7 +469,7 @@ export function useRuntimeLifecycleController(
       return observed;
     });
     const startupResult = pending.promise
-      .then((status) => {
+      .then(async (status) => {
         const startupLifecycleEpoch =
           lifecycleActiveRef.current &&
           configurationIntentRef.current === configurationIntent &&
@@ -446,6 +479,7 @@ export function useRuntimeLifecycleController(
         if (!commitConfiguredReady(status, startupLifecycleEpoch, configurationIntent)) {
           throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时启动已取消", true);
         }
+        await recheckPendingOperations();
         return status;
       })
       .catch((error: unknown) => {
@@ -465,6 +499,7 @@ export function useRuntimeLifecycleController(
     enqueueOperation,
     isCurrentOperation,
     revokeTurnGate,
+    recheckPendingOperations,
     runtime,
     updateBoot,
   ]);
@@ -478,11 +513,16 @@ export function useRuntimeLifecycleController(
       const pending = enqueueOperation("activateWorkspace", () =>
         runtime.activateWorkspace(workspaceId),
       );
-      return pending.promise.catch((error: unknown) => {
-        throw safeError(error);
-      });
+      return pending.promise
+        .then(async (activation) => {
+          await recheckPendingOperations();
+          return activation;
+        })
+        .catch((error: unknown) => {
+          throw safeError(error);
+        });
     },
-    [enqueueOperation, runtime],
+    [enqueueOperation, recheckPendingOperations, runtime],
   );
 
   /** 通过 start 共用的串行 lane 停止当前 sidecar，避免 start/stop 交错。 */
@@ -633,6 +673,25 @@ export function useRuntimeLifecycleController(
           revokeTurnGate();
         }
         const current = runtimeStateRef.current;
+        // 不同 Java 实例的 generation 不能直接比较；先读原生当前事实，旧连接晚事件
+        // 和新实例较小 generation 都由同一权威状态裁决，避免回滚或永远卡在旧代际。
+        if (
+          current?.generation !== 0 &&
+          event.status.generation !== 0 &&
+          current?.serverInstanceId != null &&
+          event.status.serverInstanceId != null &&
+          current.serverInstanceId !== event.status.serverInstanceId
+        ) {
+          void refreshState(lifecycleEpoch)
+            .then(async (observed) => {
+              if (isReadyStatus(observed)) {
+                commitConfiguredReady(observed, lifecycleEpoch, configurationIntentRef.current);
+                await recheckPendingOperations();
+              }
+            })
+            .catch(() => undefined);
+          return;
+        }
         const stopPending = inFlightRef.current.has("stop");
         // startRuntime 拥有 start command 的 operation key；旧 stopped event 不能覆盖正在 admission 的 generation。
         const startPending = inFlightRef.current.has("startRuntime");
@@ -718,11 +777,13 @@ export function useRuntimeLifecycleController(
         if (current.status === "stopped") {
           // Startup 与 config validity 解耦，使 Settings 能在 host 健康时加载并修复缺失或损坏的 Provider/Model。
           await startRuntime();
-        } else if (
-          isReadyStatus(current) &&
-          !commitConfiguredReady(current, lifecycleEpoch, configurationIntentRef.current)
-        ) {
-          throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时就绪状态已失效，请重试", true);
+        } else if (isReadyStatus(current)) {
+          if (!commitConfiguredReady(current, lifecycleEpoch, configurationIntentRef.current)) {
+            throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时就绪状态已失效，请重试", true);
+          }
+          // 共享后台在 renderer 重载期间保持 Ready；这条路径也必须查询持久操作回执，
+          // 否则本地 opaque 待核实记录虽存在却不会进入可见状态。
+          await recheckPendingOperations();
         }
       } catch (error: unknown) {
         const normalized = safeError(error);
@@ -778,6 +839,7 @@ export function useRuntimeLifecycleController(
     commitStatus,
     enqueueOperation,
     isCurrentOperation,
+    recheckPendingOperations,
     refreshState,
     revokeTurnGate,
     projection,
@@ -794,6 +856,7 @@ export function useRuntimeLifecycleController(
       turnAdmissionReady,
       runtimeState,
       recovery,
+      pendingClientOperations,
       lastConfigurationEvent,
       lastThreadMetadataEvent,
     },
@@ -804,6 +867,8 @@ export function useRuntimeLifecycleController(
       queryRuntime,
       readRuntimeStorage,
       acknowledgeRecovery,
+      recheckPendingOperations,
+      acknowledgePendingOperation,
     },
     turns,
   };

@@ -59,8 +59,8 @@ $baseEvidence = Join-Path $scratchRoot 'list-base'
 $allEvidence = Join-Path $scratchRoot 'list-all'
 $base = @(Get-ListOnlyInventory -EvidenceDirectory $baseEvidence)
 $all = @(Get-ListOnlyInventory -EvidenceDirectory $allEvidence -AllOptional)
-Assert-VerificationInvariant -Condition ($base.Count -eq 40 -and @($base | Where-Object requested).Count -eq 27) -Name 'base-inventory-count'
-Assert-VerificationInvariant -Condition ($all.Count -eq 40 -and @($all | Where-Object requested).Count -eq 40) -Name 'all-inventory-count'
+Assert-VerificationInvariant -Condition ($base.Count -eq 41 -and @($base | Where-Object requested).Count -eq 28) -Name 'base-inventory-count'
+Assert-VerificationInvariant -Condition ($all.Count -eq 41 -and @($all | Where-Object requested).Count -eq 41) -Name 'all-inventory-count'
 Assert-VerificationInvariant -Condition (-not (Test-Path -LiteralPath $baseEvidence) -and -not (Test-Path -LiteralPath $allEvidence)) -Name 'list-only-no-write'
 
 $nativeBuilds = @($all | Where-Object name -eq 'java-native-build')
@@ -150,7 +150,7 @@ Assert-VerificationInvariant -Condition ($LASTEXITCODE -ne 0 -and (Get-Content -
 Assert-VerificationInvariant -Condition (-not (Test-Path -LiteralPath (Join-Path $staleEvidence 'summary.json'))) -Name 'stale-evidence-no-overwrite'
 $staleSummary = $staleOutput | ConvertFrom-Json
 Assert-VerificationInvariant -Condition ($staleSummary.blocker -eq 'evidence-directory-not-fresh' -and -not $staleSummary.evidenceWritten) -Name 'stale-evidence-semantics'
-Assert-VerificationInvariant -Condition (@($staleSummary.results).Count -eq 40 `
+Assert-VerificationInvariant -Condition (@($staleSummary.results).Count -eq 41 `
         -and @($staleSummary.results | Where-Object { $null -eq $_.PSObject.Properties['requested'] -or $null -eq $_.PSObject.Properties['executed'] -or $null -eq $_.PSObject.Properties['blocked'] }).Count -eq 0) -Name 'requested-executed-blocked-shape'
 Assert-VerificationInvariant -Condition (@($staleSummary.results | Where-Object { -not $_.requested -and $_.passed }).Count -eq 0) -Name 'nonrequested-is-not-passed'
 
@@ -638,7 +638,7 @@ Assert-VerificationInvariant -Condition (@($completeLicense.arguments) -contains
         -and @($completeLicense.arguments) -contains '-ArtifactPath' `
         -and (@($completeLicense.dependsOn) -contains 'sbom-inputs')) -Name 'sbom-complete-fixture-forwarded-to-generator'
 
-$fakeExecutable = Join-Path $scratchRoot 'fake-ja.exe'
+$fakeExecutable = Join-Path $scratchRoot 'fake-ja-desktop.exe'
 [System.IO.File]::WriteAllBytes($fakeExecutable, [byte[]](1, 2, 3, 4))
 $fakeHash = (Get-FileHash -LiteralPath $fakeExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
 $fakeFile = Get-Item -LiteralPath $fakeExecutable

@@ -941,7 +941,7 @@ final class AgentToolRunnerTest {
                 request -> { throw new AssertionError("attachment read is outside this test"); },
                 List.of(tool), "cfg_test", AgentToolRunnerTest::emptyToolSession,
                 new ToolProjectionLimits(64_000, 16_000), List.of("test-only"),
-                NOW.plus(TurnLimits.defaults().wallTimeout()),
+                NOW.plus(TurnLimits.defaults().requestWindow()),
                 (common, summary) -> { throw new AssertionError("runtime refresh is outside Tool runner test"); });
     }
 

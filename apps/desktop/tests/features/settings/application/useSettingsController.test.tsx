@@ -35,7 +35,6 @@ const DOCUMENT: SettingsDocument = {
       networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
       agentDefaults: {
         context: { autoCompact: true },
-        turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3_600_000 },
       },
       models: [
         {
@@ -53,7 +52,7 @@ const DOCUMENT: SettingsDocument = {
     },
   ],
   mcpServers: [],
-  skills: [],
+  disabledSkills: [],
   window: { width: 1280, height: 800, maximized: false },
 };
 
@@ -1056,16 +1055,15 @@ describe("useSettingsController v1", () => {
     expect(save).toHaveBeenCalledTimes(1);
   });
 
-  it("separates global authorization from project tightening with source-qualified references", async () => {
+  it("keeps global and project disable lists independent", async () => {
     let loaded = loadedSettings("Project B");
-    loaded.userDocument.skills = ["user:review"];
+    loaded.userDocument.disabledSkills = [];
     loaded.projectSkillDocument = {
       schemaVersion: 2,
       revision: 1,
-      skills: [],
-      disabledSkills: ["user:review"],
+      disabledSkills: ["project:review"],
     };
-    loaded.projectOverrides.disabledSkillReferences = ["user:review"];
+    loaded.projectOverrides.disabledSkillReferences = ["project:review"];
     const save = vi.fn(async (document: SettingsDocument) => {
       loaded = { ...loaded, userDocument: structuredClone(document) };
       return "cfg_user_next";
@@ -1088,6 +1086,14 @@ describe("useSettingsController v1", () => {
           status: "healthy" as const,
           description: "Review changes",
         },
+        {
+          skillId: "project:review",
+          name: "Review",
+          scope: "project" as const,
+          enabled: false,
+          status: "healthy" as const,
+          description: "Project review",
+        },
       ],
       nextCursor: null,
     }));
@@ -1097,7 +1103,7 @@ describe("useSettingsController v1", () => {
     expect(result.current.skillSettings.global[0]?.enabled).toBe(true);
     expect(result.current.skillSettings.project?.[0]?.enabled).toBe(false);
 
-    await act(async () => result.current.ports.onToggleSkill("user:review", true, "project"));
+    await act(async () => result.current.ports.onToggleSkill("project:review", true, "project"));
     expect(saveProjectSkills).toHaveBeenCalledWith(
       expect.objectContaining({ disabledSkills: [] }),
       "ws_project",
@@ -1107,9 +1113,9 @@ describe("useSettingsController v1", () => {
 
     await act(async () => result.current.ports.onToggleSkill("user:review", false, "user"));
     expect(save).toHaveBeenCalledWith(
-      expect.objectContaining({ skills: [] }),
+      expect.objectContaining({ disabledSkills: ["user:review"] }),
       "cfg_user_Project B",
-      expect.objectContaining({ skills: ["user:review"] }),
+      expect.objectContaining({ disabledSkills: [] }),
     );
   });
 

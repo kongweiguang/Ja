@@ -26,13 +26,13 @@ import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** 验证 Settings 目录复用 Skill 元数据发现，并把发现与持久授权保持为两个独立事实。 */
+/** 验证 Settings 目录复用 Skill 元数据发现，并把发现与持久停用保持为两个独立事实。 */
 final class GenerationCatalogSkillDiscoveryTest {
     @TempDir
     private Path temporary;
 
     /**
-     * 可授权来源才映射到 Settings；授权必须同时匹配来源和名称，内置项和未登记项不能获得开关。
+     * 可管理来源才映射到 Settings；未登记项默认开启，停用必须同时匹配来源和名称。
      */
     @Test
     void mapsFourDiscoveryScopesAndMergesConfiguredAuthorizationByName() {
@@ -55,10 +55,11 @@ final class GenerationCatalogSkillDiscoveryTest {
                             Map.Entry::getKey, entry -> entry.getValue().scope())));
             assertFalse(byName.containsKey("builtin-tool"));
             assertEquals("ja:ja-tool", byName.get("ja-tool").skillId());
-            assertTrue(byName.get("ja-tool").enabled());
+            assertFalse(byName.get("ja-tool").enabled());
             assertEquals("user:agents-tool", byName.get("agents-tool").skillId());
-            assertFalse(byName.get("agents-tool").enabled());
+            assertTrue(byName.get("agents-tool").enabled());
             assertEquals("project:project-tool", byName.get("project-tool").skillId());
+            assertTrue(byName.get("project-tool").enabled());
             assertFalse(byName.containsKey("missing-tool"));
             assertTrue(page.items().stream().allMatch(item -> item.status().equals("healthy")));
             assertEquals(project, skills.lastRequest.get().workspaceDirectory());

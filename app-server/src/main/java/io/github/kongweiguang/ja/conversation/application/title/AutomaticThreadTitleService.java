@@ -178,7 +178,7 @@ public final class AutomaticThreadTitleService implements AutomaticThreadTitleSc
                 configuration,
                 new ModelPort.PromptPayload(SYSTEM_PROMPT, PROMPT_REVISION),
                 List.of(new ModelMessage(ModelRole.USER, List.of(new TextContent(titleInput(request))))),
-                List.of(), null, 1, ModelPort.RetryPolicy.SINGLE_ATTEMPT);
+                List.of(), null, 1);
         TitleCollector collector = new TitleCollector();
         CompletionStage<ModelPort.ModelOutcome> stage;
         try {

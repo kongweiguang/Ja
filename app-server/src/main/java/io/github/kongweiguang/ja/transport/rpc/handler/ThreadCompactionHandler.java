@@ -5,6 +5,8 @@ package io.github.kongweiguang.ja.transport.rpc.handler;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.port.in.ContextCompactionUseCase;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationSource;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
@@ -17,38 +19,57 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** 将空闲 Thread 压缩用例映射为严格 JA-RPC DTO，不接触 Repository、配置或 Provider。 */
 public final class ThreadCompactionHandler implements RpcHandler {
     private final RpcSession session;
+    private final ConcurrentHashMap<String, CancellationSource> active = new ConcurrentHashMap<>();
 
     /** 仅绑定连接代际，压缩资源和状态生命周期继续由应用用例独占。 */
     public ThreadCompactionHandler(RpcSession session) {
         this.session = Objects.requireNonNull(session, "session");
     }
 
-    /** 声明唯一的显式压缩方法，避免历史 Handler 演变为跨域 service locator。 */
+    /** 压缩及其取消只作用于当前连接，避免别的客户端停止不属于自己的请求。 */
     @Override
     public Set<RpcMethod> methods() {
-        return Set.of(RpcMethod.THREAD_COMPACT);
+        return Set.of(RpcMethod.THREAD_COMPACT, RpcMethod.THREAD_COMPACT_CANCEL);
     }
 
-    /** 严格解析 CAS 输入并把应用失败收敛为冻结错误目录。 */
+    /** 取消必须与压缩在同一连接并发分发，且只返回意图受理，不伪称 Checkpoint 未提交。 */
     @Override
     public CompletionStage<ObjectNode> handle(RpcCommand command) {
         session.requireReady();
+        if (command.method() == RpcMethod.THREAD_COMPACT_CANCEL) return cancel(command.params());
         if (command.method() != RpcMethod.THREAD_COMPACT) throw JaRpcException.methodNotFound();
         ObjectNode params = command.params();
         RpcParams.requireExact(params, "threadId", "expectedThreadRevision");
         ContextCompactionUseCase.Command request = new ContextCompactionUseCase.Command(
                 RpcParams.identifier(params, "threadId", "thr_", 100),
                 RpcParams.revision(params, "expectedThreadRevision"));
-        try {
+        CancellationSource source = new CancellationSource();
+        if (active.putIfAbsent(request.threadId(), source) != null) {
+            throw JaRpcException.of(JaErrorCatalog.THREAD_BUSY, "context compaction is already running");
+        }
+        try (CancellationToken.Registration ignored = session.cancellationToken().onCancellation(
+                () -> source.cancel("session_closed"))) {
             return CompletableFuture.completedFuture(result(session.compactions().compact(
-                    request, session::publish, session.cancellationToken())));
+                    request, session::publish, source)));
         } catch (ContextCompactionUseCase.Failure failure) {
             throw map(failure);
+        } finally {
+            active.remove(request.threadId(), source);
         }
+    }
+
+    /** 仅当前连接持有的活动压缩可取消；完成竞态由原请求的最终结果说明。 */
+    private CompletionStage<ObjectNode> cancel(ObjectNode params) {
+        RpcParams.requireExact(params, "threadId");
+        String threadId = RpcParams.identifier(params, "threadId", "thr_", 100);
+        CancellationSource source = active.get(threadId);
+        boolean accepted = source != null && source.cancel("user_stop").changed();
+        return CompletableFuture.completedFuture(session.mapper().createObjectNode().put("accepted", accepted));
     }
 
     /** 输出精确成功闭集；nullable 身份使用 JSON null，禁止缺字段造成三端解释分叉。 */

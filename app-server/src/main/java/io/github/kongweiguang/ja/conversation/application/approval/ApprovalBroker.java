@@ -39,6 +39,12 @@ public interface ApprovalBroker extends ApprovalUseCase {
     interface DecisionStore {
         /** 返回 false 表示该审批已过期、重复或不再持有 WAITING_APPROVAL 状态门。 */
         boolean persist(String approvalId, ApprovalDecision decision, Instant resolvedAt);
+
+        /** 外部操作须显式传入持久身份；未实现的注入式测试 store 不能伪造幂等保障。 */
+        default boolean persist(String approvalId, ApprovalDecision decision, Instant resolvedAt,
+                                String clientOperationId, String requestFingerprint) {
+            throw new UnsupportedOperationException("client operation approval is unavailable");
+        }
     }
 
     /**

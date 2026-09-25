@@ -28,11 +28,6 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_JAVA_HOME = "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const DEFAULT_IGNORED_FILES = 4_500;
 const DEFAULT_UNTRACKED_FILES = 1_800;
-const DEFAULT_MAX_MODEL_ROUNDS = 4;
-const MAX_MODEL_ROUNDS = 128;
-const DEFAULT_WALL_TIMEOUT_MS = 30_000;
-const MIN_WALL_TIMEOUT_MS = 1_000;
-const MAX_WALL_TIMEOUT_MS = 86_400_000;
 const STABLE_PORT_RANGE = Object.freeze({ start: 41_000, size: 8_000 });
 
 /** 只接受命名参数，scope 必须显式声明，避免 Git-only 被误认为完整验收。 */
@@ -289,39 +284,11 @@ export async function createReviewGitFixture(
   };
 }
 
-/** 校验隔离验收专用模型轮次覆盖，沿用产品配置的 1..128 硬边界。 */
-export function validateMaxModelRounds(value = DEFAULT_MAX_MODEL_ROUNDS) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_MODEL_ROUNDS) {
-    throw new Error(`maxModelRounds must be an integer between 1 and ${MAX_MODEL_ROUNDS}`);
-  }
-  return value;
-}
-
-/**
- * 校验隔离 fixture 的总 Turn 预算；边界与 App Server 配置合同一致，避免测试为了等待问题而写入
- * 无界超时，默认值仍保留 Review 场景原有的 30 秒。
- */
-export function validateWallTimeoutMs(value = DEFAULT_WALL_TIMEOUT_MS) {
-  if (!Number.isSafeInteger(value) || value < MIN_WALL_TIMEOUT_MS || value > MAX_WALL_TIMEOUT_MS) {
-    throw new Error(
-      `wallTimeoutMs must be an integer between ${MIN_WALL_TIMEOUT_MS} and ${MAX_WALL_TIMEOUT_MS}`,
-    );
-  }
-  return value;
-}
-
-/**
- * 写入只供 runtime 启动的最小合法配置；Provider endpoint 只允许 runner 自己的 loopback fixture，
- * 模型轮次和总 Turn 预算只可在调用方显式覆盖，默认保持 Review 原有的 4 轮/30 秒预算。
- */
+/** 写入隔离 runtime 的最小合法配置，并将 Provider endpoint 固定到 runner 的 loopback fixture。 */
 export async function writeIsolatedSettings(
   home,
   providerBaseUrl = "http://127.0.0.1:9/v1",
-  maxModelRounds = DEFAULT_MAX_MODEL_ROUNDS,
-  wallTimeoutMs = DEFAULT_WALL_TIMEOUT_MS,
 ) {
-  validateMaxModelRounds(maxModelRounds);
-  validateWallTimeoutMs(wallTimeoutMs);
   if (
     typeof providerBaseUrl !== "string" ||
     !/^https?:\/\/(?:127\.0\.0\.1|localhost):[1-9]\d{0,4}\/v1$/u.test(providerBaseUrl)
@@ -338,7 +305,7 @@ export async function writeIsolatedSettings(
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
@@ -352,10 +319,6 @@ export async function writeIsolatedSettings(
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    `max_model_rounds = ${maxModelRounds}`,
-    "max_tool_calls = 8",
-    `wall_timeout_ms = ${wallTimeoutMs}`,
     "[[providers.models]]",
     'model_id = "model_e2e"',
     'name = "Review E2E Model"',
@@ -408,8 +371,8 @@ async function reservePort(excludedPorts = new Set()) {
 /** 读取 Tauri 基础与 Windows 覆盖后的主窗口，避免验收悄悄启动另一套窗口配置。 */
 async function readProductionMainWindowConfig() {
   const [baseConfig, windowsConfig] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
   ]);
   const baseWindow = baseConfig?.app?.windows?.find((window) => window?.label === "main");
   const windowsWindow = windowsConfig?.app?.windows?.find((window) => window?.label === "main");
@@ -440,7 +403,7 @@ async function writeTauriOverlay(directories, frontendPort, useEdgeDriver, hidde
       windows: [
         {
           ...mainWindow,
-          ...(hiddenWindow ? { visible: false, focus: false, skipTaskbar: true } : {}),
+          ...(hiddenWindow ? { visible: true, focus: false, skipTaskbar: true } : {}),
         },
       ],
       security: {
@@ -546,7 +509,8 @@ export function buildLaunchEnvironment({
     ...(edgeDriver === undefined
       ? {
           WEBVIEW2_USER_DATA_FOLDER: directories.webview,
-          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-address=127.0.0.1 --remote-debugging-port=${cdpPort}`,
+          // UI Automation 在 CDP 被宿主环境阻断时仍需看到真实 DOM 控件；此标志只开启辅助功能树。
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --force-renderer-accessibility=complete --remote-debugging-address=127.0.0.1 --remote-debugging-port=${cdpPort}`,
         }
       : {
           JA_E2E_CARGO_COMMAND: cargo,
@@ -748,8 +712,6 @@ export async function runProduction(options) {
         writeIsolatedSettings(
           directories.home,
           options.providerBaseUrl,
-          options.maxModelRounds,
-          options.wallTimeoutMs,
         ),
       ]);
       if (options.prepareIsolatedHome !== undefined) {

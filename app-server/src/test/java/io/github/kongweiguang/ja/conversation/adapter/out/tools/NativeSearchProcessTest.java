@@ -11,10 +11,14 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证 native 搜索进程在输出消费者较慢时仍能及时响应取消和 Turn Deadline。 */
@@ -49,6 +53,24 @@ class NativeSearchProcessTest {
 
         assertTrue(consumed.get(), "the child must have delivered a line before cancellation");
         assertTrue(result.cancelled(), "consumer cancellation must be preserved in the result");
+    }
+
+    /** 原生进程收到指定 Turn 的私有环境，证明后台启动环境不会替换客户端变量。 */
+    @Test
+    void nativeProcessUsesFrozenClientEnvironment() throws Exception {
+        Map<String, String> environment = new HashMap<>(System.getenv());
+        environment.put("JA_NATIVE_CLIENT_MARKER", "isolated-client-value");
+        String command = isWindows() ? "echo %JA_NATIVE_CLIENT_MARKER%"
+                : "printf '%s\\n' \"$JA_NATIVE_CLIENT_MARKER\"";
+        AtomicReference<String> output = new AtomicReference<>();
+        NativeSearchProcess.Result result = NativeSearchProcess.run(shell(), shellArguments(command),
+                temporary, CancellationToken.none(), Instant.now().plusSeconds(5), 4_096, 4_096,
+                environment, line -> {
+                    output.set(line.trim());
+                    return true;
+                });
+        assertEquals(0, result.exitCode());
+        assertEquals("isolated-client-value", output.get());
     }
 
     /** 根据当前宿主选择命令解释器，测试进程边界本身而不把 fd/rg 安装位置写死。 */

@@ -24,12 +24,12 @@ public final class ConfigurationPolicy {
     private static final Set<String> USER_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
             "default_model_id", "default_reasoning_level", "interaction", "subagents",
-            "providers", "mcp_servers", "skills");
+            "providers", "mcp_servers", "disabled_skills");
     private static final Set<String> PROJECT_ROOT_KEYS = Set.of(
-            "schema_version", "config_revision", "skills", "disabled_skills", "mcp_servers");
+            "schema_version", "config_revision", "disabled_skills", "mcp_servers");
     private static final Set<String> USER_REQUIRED_ROOT_KEYS = Set.of(
             "schema_version", "config_revision", "default_access_mode", "default_provider_id",
-            "default_model_id", "default_reasoning_level", "subagents", "providers", "mcp_servers", "skills");
+            "default_model_id", "default_reasoning_level", "subagents", "providers", "mcp_servers", "disabled_skills");
     private static final Set<String> SUBAGENT_KEYS = Set.of("enabled", "provider_id", "model_id",
             "reasoning_level");
     private static final Set<String> INTERACTION_KEYS = Set.of("clarification_enabled");
@@ -41,11 +41,8 @@ public final class ConfigurationPolicy {
             "default_reasoning_level");
     private static final Set<String> CAPABILITY_KEYS = Set.of(
             "context_window_tokens", "max_output_tokens");
-    private static final Set<String> AGENT_DEFAULT_KEYS = Set.of(
-            "context", "turn_limits");
+    private static final Set<String> AGENT_DEFAULT_KEYS = Set.of("context");
     private static final Set<String> CONTEXT_KEYS = Set.of("auto_compact");
-    private static final Set<String> TURN_LIMIT_KEYS = Set.of(
-            "max_model_rounds", "max_tool_calls", "wall_timeout_ms");
     private static final Set<String> NETWORK_TIMEOUT_KEYS = Set.of(
             "connect_timeout_ms", "request_timeout_ms");
     private static final Set<String> MCP_KEYS = Set.of(
@@ -79,10 +76,9 @@ public final class ConfigurationPolicy {
         requireCurrentSchema(document);
         if (scope == ConfigurationScope.PROJECT) {
             rejectUnknown(document, PROJECT_ROOT_KEYS);
-            requireKeys(document, Set.of("schema_version", "config_revision", "skills"));
+            requireKeys(document, Set.of("schema_version", "config_revision", "disabled_skills"));
             validateRevision(document.get("config_revision"));
-            validateSkillReferences(document.get("skills"), scope, false);
-            validateSkillReferences(document.get("disabled_skills"), scope, true);
+            validateDisabledSkills(document.get("disabled_skills"), scope);
             validateArray(document.get("mcp_servers"), MCP_KEYS, "mcp_id");
             validateUserMcpServers(document.get("mcp_servers"));
             scanForLiteralSecrets(document);
@@ -95,12 +91,10 @@ public final class ConfigurationPolicy {
         validateAccessMode(document.get("default_access_mode"));
         validateArray(document.get("providers"), PROVIDER_KEYS, "provider_id");
         validateArray(document.get("mcp_servers"), MCP_KEYS, "mcp_id");
-        validateSkillReferences(document.get("skills"), scope, false);
-        validateSkillReferences(document.get("disabled_skills"), scope, true);
+        validateDisabledSkills(document.get("disabled_skills"), scope);
         validateUserProviders(document);
         validateUniqueProviderCredentials(document.get("providers"));
         validateUserMcpServers(document.get("mcp_servers"));
-        validateCatalogEnabled(document.get("mcp_servers"), scope);
         validateDefaultSelection(document, scope == ConfigurationScope.USER);
         validateSubagents(document, scope);
         scanForLiteralSecrets(document);
@@ -232,12 +226,6 @@ public final class ConfigurationPolicy {
         } else if (complete) {
             throw error(ConfigurationError.Code.INVALID_DOCUMENT, "provider context is missing");
         }
-        if (defaults.get("turn_limits") instanceof ObjectNode limits) {
-            rejectUnknown(limits, TURN_LIMIT_KEYS);
-            requirePositiveIntegers(limits, TURN_LIMIT_KEYS, complete);
-        } else if (complete) {
-            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "provider turn limits are missing");
-        }
     }
 
     /** Model 完整文档声明能力，项目 overlay 只允许提交需要收紧的字段。 */
@@ -284,27 +272,19 @@ public final class ConfigurationPolicy {
             validateStringMap(server.get("env"), 8_192);
             validateStringMap(server.get("headers"), 8_192);
             validateMcpAuth(requireObject(server, "auth"));
-            requireBoolean(server, "enabled");
+            if (server.has("enabled")) requireBoolean(server, "enabled");
         }
     }
 
     /**
-     * 校验只携带来源与名称的 Skill 授权，拒绝旧对象数组以避免描述、路径与开关副本继续进入配置。
-     * 项目层只可登记本项目 Skill，或以 `disabled_skills` 收紧已经存在的全局引用。
+     * 只校验所属来源的停用引用；未列出的已发现 Skill 默认可用，旧启用名单不参与授权。
      */
-    private static void validateSkillReferences(
-            JsonNode value, ConfigurationScope scope, boolean disabled) {
+    private static void validateDisabledSkills(JsonNode value, ConfigurationScope scope) {
         if (value == null) {
-            if (scope == ConfigurationScope.USER && !disabled) {
-                throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill references are missing");
-            }
-            return;
+            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "disabled skills are missing");
         }
         if (!(value instanceof ArrayNode references) || references.size() > MAX_ARRAY_ITEMS) {
             throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill references are invalid");
-        }
-        if (scope == ConfigurationScope.USER && disabled) {
-            throw error(ConfigurationError.Code.INVALID_DOCUMENT, "user disabled skills are unsupported");
         }
         Set<String> unique = new HashSet<>();
         for (JsonNode valueNode : references) {
@@ -319,10 +299,7 @@ public final class ConfigurationPolicy {
             }
             boolean allowed = scope == ConfigurationScope.USER
                     ? reference.source() == SkillReference.Source.USER || reference.source() == SkillReference.Source.JA
-                    : disabled
-                            ? reference.source() == SkillReference.Source.USER
-                                    || reference.source() == SkillReference.Source.JA
-                            : reference.source() == SkillReference.Source.PROJECT;
+                    : reference.source() == SkillReference.Source.PROJECT;
             if (!allowed || !unique.add(reference.identifier())) {
                 throw error(ConfigurationError.Code.INVALID_DOCUMENT, "skill reference is invalid");
             }
@@ -483,32 +460,6 @@ public final class ConfigurationPolicy {
         return null;
     }
 
-    /**
-     * 根级 enabled 是唯一启用事实；用户文档必须显式给出布尔值，项目 overlay 只允许写 false，
-     * true 由缺失覆盖表示继承，避免项目层以冗余真值制造扩权歧义。
-     */
-    private static void validateCatalogEnabled(JsonNode values, ConfigurationScope scope) {
-        if (!(values instanceof ArrayNode array)) return;
-        for (JsonNode value : array) {
-            ObjectNode entry = (ObjectNode) value;
-            JsonNode enabled = value.get("enabled");
-            if (scope == ConfigurationScope.USER) {
-                if (enabled == null || !enabled.isBoolean()) {
-                    throw error(ConfigurationError.Code.INVALID_DOCUMENT, "catalog enabled state is invalid");
-                }
-            } else {
-                Set<String> fields = new HashSet<>();
-                entry.fieldNames().forEachRemaining(fields::add);
-                boolean sparseShape = fields.equals(Set.of("mcp_id", "enabled"))
-                                      || fields.equals(Set.of("skill_id", "enabled"));
-                if (!sparseShape || enabled == null || !enabled.isBoolean() || enabled.booleanValue()) {
-                    throw error(ConfigurationError.Code.INVALID_DOCUMENT,
-                            "project catalog may only disable entries");
-                }
-            }
-        }
-    }
-
     /** reasoning map 使用逻辑七档键和有界上游文本值；缺失键就是不支持。 */
     private static void validateReasoningMap(JsonNode value, boolean required) {
         if (value == null) {
@@ -654,7 +605,6 @@ public final class ConfigurationPolicy {
         if (user == null) return;
         validateDocument(user, ConfigurationScope.USER);
         validateDocument(project, ConfigurationScope.PROJECT);
-        compareDisabledSkillReferences(user.get("skills"), project.get("disabled_skills"));
         Set<String> userMcpIds = new HashSet<>();
         if (user.get("mcp_servers") instanceof ArrayNode userServers) {
             userServers.forEach(server -> userMcpIds.add(server.path("mcp_id").asText()));
@@ -664,23 +614,6 @@ public final class ConfigurationPolicy {
                 if (userMcpIds.contains(server.path("mcp_id").asText())) {
                     throw escalation("project MCP identity conflicts with user MCP");
                 }
-            }
-        }
-    }
-
-    /**
-     * 项目禁用引用必须已经在用户层显式启用；否则项目文件会从“收紧”变成可观察的虚假状态。
-     */
-    private static void compareDisabledSkillReferences(JsonNode user, JsonNode disabled) {
-        if (disabled == null) return;
-        if (!(user instanceof ArrayNode userReferences) || !(disabled instanceof ArrayNode disabledReferences)) {
-            throw escalation("project skill references are invalid");
-        }
-        Set<String> enabled = new HashSet<>();
-        userReferences.forEach(value -> enabled.add(value.textValue()));
-        for (JsonNode value : disabledReferences) {
-            if (!enabled.contains(value.textValue())) {
-                throw escalation("project disabled skill is unavailable");
             }
         }
     }
@@ -717,46 +650,30 @@ public final class ConfigurationPolicy {
     }
 
     /**
-     * 深度合并已验证项目定义；MCP 身份在合并前已校验，不能覆盖全局路由。
-     * `disabled_skills` 是项目层控制事实，不得泄漏进 effective 文档或 generation。
+     * 深度合并已验证项目定义；Skill 停用引用按来源并集，MCP 身份在合并前已校验。
      */
     static ObjectNode mergeDocuments(ObjectNode base, ObjectNode overlay) {
         ObjectNode result = base.deepCopy();
-        appendProjectSkillReferences(result, overlay.get("skills"));
-        removeDisabledSkillReferences(result, overlay.get("disabled_skills"));
+        appendDisabledSkillReferences(result, overlay.get("disabled_skills"));
         if (overlay.get("mcp_servers") instanceof ArrayNode projectServers) {
             ArrayNode effectiveServers = result.withArray("mcp_servers");
             projectServers.forEach(server -> effectiveServers.add(server.deepCopy()));
         }
-        result.remove("disabled_skills");
         return result;
     }
 
     /**
-     * 将项目显式授权追加到用户引用集，不按名称折叠，从而让同名不同来源仍由发现优先级裁决。
+     * 将项目停用引用追加到用户停用集；来源限定身份确保同名项仍由发现优先级单独裁决。
      */
-    private static void appendProjectSkillReferences(ObjectNode target, JsonNode projectReferences) {
+    private static void appendDisabledSkillReferences(ObjectNode target, JsonNode projectReferences) {
         if (!(projectReferences instanceof ArrayNode references)) return;
-        ArrayNode effective = target.withArray("skills");
+        ArrayNode effective = target.withArray("disabled_skills");
         Set<String> existing = new HashSet<>();
         effective.forEach(value -> existing.add(value.textValue()));
         references.forEach(value -> {
             String reference = value.textValue();
             if (existing.add(reference)) effective.add(reference);
         });
-    }
-
-    /**
-     * 项目停用只能移除已存在的全局授权；项目 Skill 不会因禁用列表而被新增或被其它项目影响。
-     */
-    private static void removeDisabledSkillReferences(ObjectNode target, JsonNode disabledReferences) {
-        if (!(disabledReferences instanceof ArrayNode disabled)) return;
-        Set<String> removed = new HashSet<>();
-        disabled.forEach(value -> removed.add(value.textValue()));
-        ArrayNode effective = target.withArray("skills");
-        for (int index = effective.size() - 1; index >= 0; index--) {
-            if (removed.contains(effective.get(index).textValue())) effective.remove(index);
-        }
     }
 
     /** 凭据文档只允许有界 credential ID 到文本 Secret 的映射。 */

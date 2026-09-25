@@ -29,14 +29,12 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.SocketTimeoutException;
 import java.net.URI;
-import java.time.Duration;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -51,11 +49,8 @@ import java.util.function.Supplier;
  */
 public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractStreamingModelAdapter.class);
-    public static final int MAX_ATTEMPTS = 3;
     static final int MAX_REQUEST_BYTES = 16 * 1024 * 1024;
     static final int MAX_EVENT_BYTES = 2 * 1024 * 1024;
-    static final long MAX_RESPONSE_BYTES = 64L * 1024L * 1024L;
-    static final int MAX_EVENT_COUNT = 8_192;
     public static final int MAX_ERROR_BODY_BYTES = 1024 * 1024;
     public static final ObjectMapper JSON = strictJsonMapper();
 
@@ -136,7 +131,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
                                                          CancellationToken cancellationToken) {
         Objects.requireNonNull(eventSink, "eventSink");
         return submit(request, cancellationToken,
-                controller -> executeWithRetry(request, eventSink, controller));
+                controller -> executeOnce(request, eventSink, controller));
     }
 
     /**
@@ -187,72 +182,37 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 对传输故障和有界 Provider 格式损坏执行最多三次重试；已送达的纯文本只按前缀去重，
-     * 任何 Tool、opaque reasoning、Usage 或 sink 失败都关闭自动回放边界。
+     * Adapter 只拥有一次网络交换；可恢复分类交由持久会话决定下一次请求身份与退避。
      */
-    private ModelPort.ModelOutcome executeWithRetry(ModelPort.ModelRequest request,
+    private ModelPort.ModelOutcome executeOnce(ModelPort.ModelRequest request,
                                                     ModelEventSink eventSink,
                                                     RequestController controller) {
         controller.bindThread(Thread.currentThread());
-        AtomicBoolean semanticAccepted = new AtomicBoolean();
-        ModelAttemptReplay replay = new ModelAttemptReplay();
-        Throwable last = null;
-        int attempts = request.retryPolicy() == ModelPort.RetryPolicy.SINGLE_ATTEMPT ? 1 : MAX_ATTEMPTS;
-        for (int attempt = 1; attempt <= attempts; attempt++) {
-            controller.throwIfStopped();
-            try {
-                StreamContext context = new StreamContext(
-                        eventSink, semanticAccepted, controller, request, replay, attempt > 1);
-                ModelPort.ModelOutcome outcome = executeProviderAttempt(request, context, controller);
-                context.verifyReplayComplete();
-                return outcome;
-            } catch (CancellationException cancelled) {
-                throw cancelled;
-            } catch (ProviderProtocolException failure) {
-                last = failure;
-                if (!shouldRetry(failure, semanticAccepted.get(), replay, attempt, attempts)) {
-                    ProviderProtocolException terminalFailure = terminalFailure(failure);
-                    /*
-                     * 只有已校验机器码进入诊断；Provider 正文、端点、异常消息和 cause 均保持隔离，
-                     * 使线上故障可分类且不削弱脱敏边界。
-                     */
-                    LOGGER.warn(
-                            "Provider request stopped provider_failure_code={} provider_failure_detail={} "
-                            + "terminal_error_code={} semantic_accepted={} attempt={}",
-                            failure.code(), failure.getMessage(), terminalFailure.terminalErrorCode(),
-                            semanticAccepted.get(), attempt);
-                    throw terminalFailure;
-                }
-                awaitBackoff(attempt, failure.retryAfter().orElse(null), controller);
-            }
+        controller.throwIfStopped();
+        try {
+            return executeProviderAttempt(request, new StreamContext(eventSink, controller, request), controller);
+        } catch (CancellationException cancelled) {
+            throw cancelled;
+        } catch (ProviderProtocolException failure) {
+            ProviderProtocolException classified = terminalFailure(failure);
+            LOGGER.warn("Provider request stopped provider_failure_code={} terminal_error_code={}",
+                    failure.code(), classified.terminalErrorCode());
+            throw classified;
         }
-        throw new ProviderProtocolException("NETWORK_ERROR", "provider request failed before a response", true, last);
     }
 
     /**
-     * 只把可恢复传输故障和明确的流格式/截断错误纳入重试；其它协议拒绝保持 fail-closed。
-     */
-    private static boolean shouldRetry(ProviderProtocolException failure, boolean semanticAccepted,
-                                       ModelAttemptReplay replay, int attempt, int attempts) {
-        if (attempt >= attempts) return false;
-        boolean recoverableShape = recoverableShape(failure);
-        if (!failure.retryable() && !recoverableShape) return false;
-        if (!semanticAccepted) return true;
-        return recoverableShape && replay.canRetryAfterSemantic();
-    }
-
-    /**
-     * Provider 的事件类型错误和 clean-EOF 截断只重试有限次数，显式 error/HTTP/Tool 错误不在此列。
+     * 可恢复的流格式/截断错误只分类，是否重试由会话根据已提交事实判定。
      */
     private static boolean recoverableShape(ProviderProtocolException failure) {
         return switch (failure.code()) {
             case "STREAM_TRUNCATED", "TRUNCATED_STREAM", "INCOMPLETE_STREAM",
-                    "INCOMPLETE_RESPONSE", "OPENAI_EVENT", "OPENAI_CHAT_EVENT", "ANTHROPIC_EVENT" -> true;
+                    "INCOMPLETE_RESPONSE" -> true;
             default -> false;
         };
     }
 
-    /** 将 Adapter 已耗尽的可恢复流错误标为外层 Agent 重试可识别的 Provider 中立类别。 */
+    /** 将可恢复流错误标为外层 Agent 可识别的 Provider 中立类别。 */
     private static ProviderProtocolException terminalFailure(ProviderProtocolException failure) {
         if (!recoverableShape(failure)) return failure;
         return new ProviderProtocolException(failure.code(), failure.getMessage(), true,
@@ -260,7 +220,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 各 Provider 只负责 wire 映射，重试和取消仍共享同一门禁。
+     * 各 Provider 只负责一次 wire 映射，取消共用请求 Controller。
      */
     protected abstract ModelPort.ModelOutcome executeProviderAttempt(
             ModelPort.ModelRequest request, StreamContext context, RequestController controller);
@@ -304,7 +264,8 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
 
     /**
      * 统一单次 SSE HTTP 交换、受限流、取消与资源释放；协议 Reader 只消费已经通过状态和
-     * Content-Type 校验的 bounded body；子类只获得一次性输入流，不能绕过容量和清理边界。
+     * Content-Type 校验的单帧受限 body；子类只获得一次性输入流，不能绕过清理边界。
+     * 按帧背压消费，不按累计字节或上游任意拆分的 SSE 帧数截断长思考。
      */
     protected static void executeSseBody(
             OkHttpClient client, Request request, RequestController controller,
@@ -313,8 +274,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         executeHttp(client, request, controller, errorMapper, "provider network exchange failed", response -> {
             requireEventStream(response);
             InputStream source = response.body().byteStream();
-            try (BoundedSseInputStream bounded = new BoundedSseInputStream(
-                    source, MAX_EVENT_BYTES, MAX_RESPONSE_BYTES, MAX_EVENT_COUNT)) {
+            try (BoundedSseInputStream bounded = new BoundedSseInputStream(source, MAX_EVENT_BYTES)) {
                 bodyConsumer.consume(bounded);
             }
             return null;
@@ -428,31 +388,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 使用 1s/2s 的有界指数退避等待，给短暂代理重启留下恢复窗口；jitter 只打散并发 Turn，
-     * Controller 仍在每个切片前复核取消与请求总 Deadline，且不改变三次尝试和语义接纳门禁。
-     */
-    public static void awaitBackoff(int attempt, Duration retryAfter, RequestController controller) {
-        long baseMillis = attempt == 1 ? 1_000L : 2_000L;
-        long hintMillis = retryAfter == null ? 0L : retryAfter.toMillis();
-        long delayMillis = Math.min(60_000L,
-                Math.max(baseMillis, hintMillis) + ThreadLocalRandom.current().nextLong(0L, 26L));
-        long remaining = TimeUnit.MILLISECONDS.toNanos(delayMillis);
-        while (remaining > 0) {
-            controller.throwIfStopped();
-            long slice = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(25));
-            long before = System.nanoTime();
-            java.util.concurrent.locks.LockSupport.parkNanos(slice);
-            if (Thread.interrupted()) {
-                Thread.currentThread().interrupt();
-                controller.throwIfStopped();
-                throw new ProviderProtocolException(
-                        "NETWORK_INTERRUPTED", "provider retry wait was interrupted", true);
-            }
-            remaining -= Math.max(1L, System.nanoTime() - before);
-        }
-    }
-
-    /**
      * 关闭活动请求及隔离传输所有者；共享传输继续由 Factory 持有。
      */
     @Override
@@ -487,26 +422,21 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             throw new ProviderProtocolException(
                     "CONTENT_TYPE", "provider streaming response has an invalid content type", false);
         }
-        long declared = response.body().contentLength();
-        if (declared > MAX_RESPONSE_BYTES) {
-            throw new ProviderProtocolException(
-                    "RESPONSE_LIMIT", "provider response exceeds the size limit", false);
-        }
     }
 
     /**
-     * 只读取受限错误文档，并丢弃畸形或非对象载荷。
+     * 错误正文只是可选诊断；超大正文不读取也不覆盖 HTTP 状态分类，避免 429/5xx 被误判为永久失败。
      */
     private static JsonNode readErrorBody(Response response) throws IOException {
         long declared = response.body().contentLength();
         if (declared > MAX_ERROR_BODY_BYTES) {
-            throw new ProviderProtocolException(
-                    "RESPONSE_LIMIT", "provider error response exceeds the size limit", false);
+            return null;
         }
         byte[] bytes;
         try (InputStream input = response.body().byteStream()) {
-            bytes = readLimited(input, MAX_ERROR_BODY_BYTES);
+            bytes = input.readNBytes(MAX_ERROR_BODY_BYTES + 1);
         }
+        if (bytes.length > MAX_ERROR_BODY_BYTES) return null;
         if (bytes.length == 0) return null;
         try {
             JsonNode value = JSON.readTree(bytes);
@@ -537,25 +467,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 非流式正文超过上限前停止分配；LimitedOutput 不持有文件、Socket 等外部资源。
-     */
-    @SuppressWarnings("PMD.CloseResource")
-    private static byte[] readLimited(InputStream input, int limit) throws IOException {
-        LimitedOutput output = new LimitedOutput(limit);
-        byte[] buffer = new byte[8_192];
-        while (true) {
-            int read = input.read(buffer, 0, Math.min(buffer.length, limit - output.size() + 1));
-            if (read < 0) return output.toByteArray();
-            try {
-                output.write(buffer, 0, read);
-            } catch (LimitExceeded failure) {
-                throw new ProviderProtocolException(
-                        "RESPONSE_LIMIT", "provider error response exceeds the size limit", false);
-            }
-        }
-    }
-
-    /**
      * 构造严格 Mapper，使重复键和恶意嵌套在状态变更前失败，并保留 Tool JSON 的十进制 scale。
      */
     private static ObjectMapper strictJsonMapper() {
@@ -563,7 +474,6 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
                 .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
                 .streamReadConstraints(StreamReadConstraints.builder()
                         .maxNestingDepth(64)
-                        .maxStringLength(4_000_000)
                         .maxNumberLength(1_000)
                         .build())
                 .build();

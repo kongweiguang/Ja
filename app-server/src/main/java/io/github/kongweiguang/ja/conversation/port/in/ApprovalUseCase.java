@@ -16,4 +16,10 @@ public interface ApprovalUseCase {
      * 仅解析仍处于等待状态的审批；迟到或重复响应返回 {@code false}，由入站适配器映射为冲突错误。
      */
     boolean resolve(String approvalId, ApprovalDecision decision, Instant resolvedAt);
+
+    /** 外部审批的决定与客户端提交身份同事务落库，供响应丢失后按原提交事实回读。 */
+    default boolean resolve(String approvalId, ApprovalDecision decision, Instant resolvedAt,
+                            String clientOperationId, String requestFingerprint) {
+        throw new UnsupportedOperationException("client operation approval is unavailable");
+    }
 }

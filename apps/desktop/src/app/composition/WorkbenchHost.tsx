@@ -235,6 +235,13 @@ export interface WorkbenchHostProps {
   readonly parentThreadRevision?: number;
   readonly taskPort: TaskPort;
   readonly taskTranscriptPort: TaskTranscriptPort;
+  readonly taskMessageContentRead?: (threadId: string, messageId: string) => Promise<string>;
+  readonly taskAnswerContentRead?: (
+    threadId: string,
+    finalMessageId: string,
+    minimumRevision?: number,
+    turnId?: string,
+  ) => Promise<string>;
   readonly taskThreadRenamePort: TaskThreadRenamePort;
   readonly taskAttachmentPort?: ConversationAttachmentPort;
   readonly taskArtifactPort?: ConversationArtifactPort;
@@ -325,6 +332,8 @@ export function WorkbenchHost({
   parentThreadRevision,
   taskPort,
   taskTranscriptPort,
+  taskMessageContentRead,
+  taskAnswerContentRead,
   taskThreadRenamePort,
   taskAttachmentPort,
   taskArtifactPort,
@@ -958,6 +967,8 @@ export function WorkbenchHost({
     () => ({
       onOpenLink: onOpenExternalUrl,
       onCopyText,
+      onReadMessageContent: taskMessageContentRead,
+      onReadAnswerContent: taskAnswerContentRead,
       onReadToolArtifact:
         taskArtifactPort === undefined
           ? undefined
@@ -990,6 +1001,8 @@ export function WorkbenchHost({
       onOpenExternalUrl,
       runtimeTurns,
       taskArtifactPort,
+      taskMessageContentRead,
+      taskAnswerContentRead,
       workspace.workspaceId,
     ],
   );

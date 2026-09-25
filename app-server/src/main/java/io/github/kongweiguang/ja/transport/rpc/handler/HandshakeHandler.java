@@ -25,12 +25,14 @@ import java.util.concurrent.CompletionStage;
  */
 public final class HandshakeHandler implements RpcHandler {
     static final List<String> METHODS = List.of(
-            "runtime/initialize", "runtime/health", "runtime/shutdown",
+            "runtime/initialize", "runtime/health", "runtime/shutdown", "runtime/context/register",
+            "operation/read",
             "workspace/open", "workspace/list", "workspace/path/search",
             "workspace/set-trust", "workspace/unregister",
-            "thread/create", "thread/list", "thread/search", "thread/read", "thread/usage/read",
+            "thread/create", "thread/list", "thread/search", "thread/read", "thread/message-content/read", "history/input/search",
+            "thread/observe", "thread/unobserve", "thread/usage/read",
             "thread/mcp/read", "thread/rename", "thread/pin", "thread/seen",
-            "thread/preferences/update", "thread/archive", "thread/restore", "thread/delete", "thread/compact",
+            "thread/preferences/update", "thread/archive", "thread/restore", "thread/delete", "thread/compact", "thread/compact/cancel",
             "interaction/read", "interaction/observe", "interaction/unobserve",
             "interaction/draft/save", "interaction/respond", "interaction/cancel",
             "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read", "plan/revisions/list",
@@ -178,7 +180,7 @@ public final class HandshakeHandler implements RpcHandler {
     /**
      * 构造返回给 Rust 的精确能力词汇表；数组顺序与 golden corpus 一致，禁止端侧自行排序。
      */
-    static ObjectNode capabilities(com.fasterxml.jackson.databind.ObjectMapper mapper) {
+    public static ObjectNode capabilities(com.fasterxml.jackson.databind.ObjectMapper mapper) {
         ObjectNode result = mapper.createObjectNode();
         ArrayNode methods = result.putArray("methods");
         METHODS.forEach(methods::add);
@@ -196,7 +198,7 @@ public final class HandshakeHandler implements RpcHandler {
     /**
      * 构造 Java、Rust 与 TypeScript 共同遵守的精确传输和队列限制。
      */
-    static ObjectNode limits(com.fasterxml.jackson.databind.ObjectMapper mapper) {
+    public static ObjectNode limits(com.fasterxml.jackson.databind.ObjectMapper mapper) {
         return mapper.createObjectNode().put("maxFrameBytes", 4 * 1024 * 1024)
                 .put("maxInFlightRequests", 64).put("maxInboundQueueFrames", 256)
                 .put("maxControlOutboundQueueFrames", 64).put("maxDataOutboundQueueFrames", 1_024)

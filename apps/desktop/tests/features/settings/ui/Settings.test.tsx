@@ -30,7 +30,6 @@ const SNAPSHOT: SettingsSnapshot = {
       networkTimeouts: { connectTimeoutMs: 10_000, requestTimeoutMs: 120_000 },
       agentDefaults: {
         context: { autoCompact: true },
-        turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3_600_000 },
       },
       models: [
         {
@@ -435,8 +434,7 @@ describe("Settings v1 UI", () => {
     await user.click(screen.getByRole("switch", { name: "review：已停用" }));
     await waitFor(() => expect(onToggleSkill).toHaveBeenCalledWith("user:review", true, "user"));
 
-    await user.click(screen.getByRole("tab", { name: "当前项目" }));
-    expect(screen.getByText("项目")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "项目 Skills" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "project-rules" })).toBeInTheDocument();
     await user.click(screen.getByRole("switch", { name: "project-rules：已启用" }));
     await waitFor(() =>
@@ -458,9 +456,9 @@ describe("Settings v1 UI", () => {
         executionScope={EXECUTION_SCOPE}
       />,
     );
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("tab", { name: "当前项目" }));
-    expect(screen.getByRole("status")).toHaveTextContent("暂无 Skills");
+    expect(
+      within(screen.getByRole("region", { name: "项目 Skills" })).getByRole("status"),
+    ).toHaveTextContent("未发现项目 Skills");
   });
 
   it("shows one return action without duplicate heading, scope, or conversation controls", async () => {
@@ -984,7 +982,6 @@ describe("Settings v1 UI", () => {
       />,
     );
 
-    expect(screen.getByRole("tab", { name: "全局" })).toBeDisabled();
     expect(screen.getByRole("switch", { name: "review：已停用" })).toBeDisabled();
   });
 

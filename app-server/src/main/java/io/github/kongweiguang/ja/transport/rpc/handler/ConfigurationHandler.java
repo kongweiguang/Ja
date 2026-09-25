@@ -199,7 +199,7 @@ public final class ConfigurationHandler implements RpcHandler {
             return null;
         }
         String workspaceId = RpcParams.text(params, "workspaceId", 100, false);
-        Workspace workspace = session.workspaces().requireOpenWorkspace(workspaceId);
+        Workspace workspace = session.workspaces().requireSettingsWorkspace(workspaceId);
         if (workspace.kind() != Workspace.Kind.PROJECT) throw JaRpcException.invalidParams();
         if (workspace.trust() != Workspace.Trust.TRUSTED) {
             throw JaRpcException.of(JaErrorCatalog.WORKSPACE_TRUST_REQUIRED,
@@ -211,7 +211,7 @@ public final class ConfigurationHandler implements RpcHandler {
     /** 读取允许省略 workspaceId 表示用户层投影；显式身份必须是已打开的 PROJECT。 */
     private Workspace optionalWorkspace(ObjectNode params) {
         if (!params.has("workspaceId")) return null;
-        Workspace workspace = session.workspaces().requireOpenWorkspace(
+        Workspace workspace = session.workspaces().requireSettingsWorkspace(
                 RpcParams.text(params, "workspaceId", 100, false));
         if (workspace.kind() != Workspace.Kind.PROJECT) throw JaRpcException.invalidParams();
         return workspace;

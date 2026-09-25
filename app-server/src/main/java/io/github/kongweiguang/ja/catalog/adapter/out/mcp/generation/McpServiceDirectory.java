@@ -6,17 +6,21 @@ package io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpRuntime;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.McpSessionFactory;
+import io.github.kongweiguang.ja.catalog.adapter.out.mcp.session.McpSession;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpDeadline;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpLimits;
 import io.github.kongweiguang.ja.catalog.adapter.out.mcp.support.McpServerDefinition;
 import io.github.kongweiguang.ja.conversation.port.out.McpGateway;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 持久拥有一个 `{workspace, serverId, definitionRevision}` 服务目录及其可接收通知的 Session。
+ * 拥有一个服务目录及其可接收通知的 Session；stdio 主进程路径可按代际缓存，
+ * 原生客户端路径仅归本次请求租约所有，关闭时不泄漏至其它客户端。
  */
 final class McpServiceDirectory implements AutoCloseable {
     private final McpServerDefinition definition;
@@ -33,9 +37,25 @@ final class McpServiceDirectory implements AutoCloseable {
             McpServerDefinition definition,
             McpLimits limits,
             ObjectMapper objectMapper,
-            McpSessionFactory sessionFactory) {
+            McpSessionFactory sessionFactory,
+            Map<String, String> hostEnvironment) {
         this.definition = definition;
-        this.runtime = new McpRuntime(List.of(definition), limits, objectMapper, sessionFactory, null,
+        Map<String, String> frozenEnvironment = Map.copyOf(
+                Objects.requireNonNull(hostEnvironment, "hostEnvironment"));
+        McpSessionFactory boundFactory = new McpSessionFactory() {
+            /** 两参数探测仍使用该目录冻结的环境，不能退回全局 System.getenv。 */
+            @Override
+            public McpSession open(McpServerDefinition source, McpDeadline deadline) {
+                return sessionFactory.open(source, deadline, () -> { }, frozenEnvironment);
+            }
+
+            /** list_changed 通知保持原有回调，同时把环境固定在创建目录的 Turn。 */
+            @Override
+            public McpSession open(McpServerDefinition source, McpDeadline deadline, Runnable toolsChanged) {
+                return sessionFactory.open(source, deadline, toolsChanged, frozenEnvironment);
+            }
+        };
+        this.runtime = new McpRuntime(List.of(definition), limits, objectMapper, boundFactory, null,
                 McpDeadline.forServiceDirectory(System::nanoTime));
     }
 

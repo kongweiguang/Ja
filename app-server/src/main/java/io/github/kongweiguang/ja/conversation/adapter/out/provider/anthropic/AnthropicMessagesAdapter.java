@@ -119,7 +119,8 @@ public final class AnthropicMessagesAdapter extends AbstractStreamingModelAdapte
      * 映射 HTTP 状态，但绝不依据自由文本判断 Anthropic 上下文溢出。
      */
     private static RuntimeException serviceFailure(int status, Headers headers, JsonNode error) {
-        boolean retryable = status == 429 || status >= 500 && status <= 599;
+        boolean retryable = status == 408 || status == 409 || status == 429
+                || status >= 500 && status <= 599;
         return new ProviderProtocolException(
                 "HTTP_STATUS", serviceFailureDetail(status, error), retryable,
                 RetryAfter.parse(headers.get("Retry-After")));

@@ -153,6 +153,16 @@ final class WorkspaceSessionRpcTest {
         Path project = Files.createDirectory(temporaryRoot.resolve("project"));
         WorkspaceHistory history = new WorkspaceHistory();
         String workspaceId = new WorkspacePolicy().workspaceId(project.toRealPath());
+        WorkspaceHistory nameValidation = new WorkspaceHistory();
+        RunResult nullDisplayName = run(configuration, nameValidation, mapper,
+                request(mapper, "c:open-null-name", "workspace/open", mapper.createObjectNode()
+                        .put("cwd", project.toString()).putNull("displayName")));
+        assertEquals("INVALID_PARAMS", errorCode(nullDisplayName.frames(), "c:open-null-name"));
+        RunResult omittedDisplayName = run(configuration, nameValidation, mapper,
+                request(mapper, "c:open-omitted-name", "workspace/open", mapper.createObjectNode()
+                        .put("cwd", project.toString())));
+        assertEquals(workspaceId, result(omittedDisplayName.frames(), "c:open-omitted-name")
+                .path("workspaceId").textValue());
         RunResult openedRun = run(configuration, history, mapper,
                 request(mapper, "c:open", "workspace/open", mapper.createObjectNode()
                         .put("cwd", project.toString()).put("displayName", "项目")));

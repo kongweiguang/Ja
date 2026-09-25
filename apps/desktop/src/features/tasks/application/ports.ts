@@ -79,6 +79,9 @@ export type TaskTranscriptSnapshot = TimelineSnapshot;
 
 /** Child transcript 复用 thread/read，但应用层只依赖窄读取端口，不知道 History adapter。 */
 export interface TaskTranscriptPort {
+  /** Child Thread 自己持有连接级详情订阅，父任务活动观察不能替代正文流。 */
+  observe(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
+  unobserve(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
   read(input: {
     threadId: string;
     cursor?: string;

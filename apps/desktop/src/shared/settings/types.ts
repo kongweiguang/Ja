@@ -27,7 +27,6 @@ export interface ProviderModelSave {
 
 interface AgentDefaults {
   context: { autoCompact: boolean };
-  turnLimits: { maxModelRounds: number; maxToolCalls: number; wallTimeoutMs: number };
 }
 
 export interface ProviderSave {

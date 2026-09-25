@@ -7,6 +7,7 @@ import io.github.kongweiguang.ja.conversation.domain.model.ToolCallContent;
 import io.github.kongweiguang.ja.conversation.domain.model.TextContent;
 
 import io.github.kongweiguang.ja.conversation.domain.model.ModelContent;
+import io.github.kongweiguang.ja.conversation.domain.model.ModelUsage;
 
 import io.github.kongweiguang.ja.conversation.port.in.TurnEvent;
 import io.github.kongweiguang.ja.conversation.port.in.TurnEventSink;
@@ -32,6 +33,23 @@ import org.junit.jupiter.api.Test;
 
 /** Agent 单轮流式批处理回归集，锁定顺序、背压、取消、大小上限与关闭排空。 */
 final class AgentRoundBatchingTest {
+  /** Usage 重复只是供应商的快照更新；终局值优先且不应中断已收到的正文。 */
+  @Test
+  void repeatedUsageKeepsLatestSnapshotAndAnswer() {
+    AgentRound round = round(new ManualTimer(), CancellationToken.none(),
+        event -> CompletableFuture.completedFuture(null));
+    round.onEvent(new ModelPort.TextDelta("answer")).toCompletableFuture().join();
+    round.onEvent(new ModelPort.UsageEvent(new ModelUsage(2, 1, 3)))
+        .toCompletableFuture().join();
+    round.onEvent(new ModelPort.UsageEvent(new ModelUsage(2, 2, 4)))
+        .toCompletableFuture().join();
+    round.recordOutcomeUsage(new ModelUsage(2, 3, 5));
+    round.close();
+
+    assertEquals(new ModelUsage(2, 3, 5), round.usage());
+    assertEquals("answer", round.terminalText());
+  }
+
   /** 锁定同类 delta 在截止点合批，跨类型事件仍共享单调 stream sequence。 */
   @Test
   void batchesSameKindAtDeadlineAndSharesSequenceAcrossKinds() {
@@ -317,9 +335,9 @@ final class AgentRoundBatchingTest {
     assertTrue(publishedEvents.get() <= 14);
   }
 
-  /** 锁定助手文本超过四百万字符时失败关闭，避免无界内存物化。 */
+  /** 超过旧四百万字符阈值仍完整保留，并限制单个块大小，不把长度当作协议错误。 */
   @Test
-  void assistantTextBlockAboveFourMillionCharactersFailsClosed() {
+  void assistantTextAboveFourMillionCharactersUsesBoundedBlocks() {
     ManualTimer timer = new ManualTimer();
     AgentRound round =
         round(
@@ -331,19 +349,16 @@ final class AgentRoundBatchingTest {
       round.onEvent(new ModelPort.TextDelta(million)).toCompletableFuture().join();
     }
 
-    RuntimeException overflow =
-        assertThrows(
-            RuntimeException.class,
-            () -> round.onEvent(new ModelPort.TextDelta("overflow")).toCompletableFuture().join());
-    assertInstanceOf(AgentLoop.LoopFailure.class, overflow.getCause());
-    round.onEvent(new ModelPort.TextDelta("late and ignored")).toCompletableFuture().join();
+    round.onEvent(new ModelPort.TextDelta("beyond old limit")).toCompletableFuture().join();
     round.close();
 
-    assertEquals(1, round.textBlockMaterializations());
-    TextContent retained =
-        assertInstanceOf(TextContent.class, round.assistantContent().getFirst());
-    assertEquals(4_000_000, retained.text().length());
-    assertFalse(retained.text().endsWith("late and ignored"));
+    List<ModelContent> retained = round.assistantContent();
+    assertTrue(retained.size() > 1);
+    assertTrue(retained.stream().allMatch(block ->
+        block instanceof TextContent text && text.text().length() <= 262_144));
+    assertEquals(4_000_000 + "beyond old limit".length(),
+        retained.stream().map(TextContent.class::cast).mapToInt(block -> block.text().length()).sum());
+    assertTrue(assertInstanceOf(TextContent.class, retained.getLast()).text().endsWith("beyond old limit"));
     assertTrue(timer.closed);
   }
 

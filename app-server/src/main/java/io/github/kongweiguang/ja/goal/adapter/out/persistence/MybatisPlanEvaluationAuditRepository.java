@@ -50,23 +50,40 @@ public final class MybatisPlanEvaluationAuditRepository implements PlanEvaluatio
                         prior(row)));
     }
 
-    /** intent 先原子预留 Run 的模型轮次，再插入审计身份；任一步失败都会回滚预留。 */
+    /** 精确输入的最大 ordinal 决定新请求身份；读失败不能回退到第一尝试。 */
+    @Override
+    public Optional<Prior> findLatest(String planId, String planRevisionId, String runId, String inputDigest) {
+        var key = new PersistenceRecords.PlanEvaluationLatestLookup(planId, planRevisionId, runId, inputDigest);
+        return transactions.required(mappers -> Optional.ofNullable(
+                mappers.planEvaluations().selectLatest(key)).map(this::prior));
+    }
+
+    /** 旧进程失去运行所有权后只结算不确定终态，不能把原 requestId 再交给 Provider。 */
+    @Override
+    public boolean markInterrupted(String requestId, java.time.Instant observedAt) {
+        var values = new PersistenceRecords.PlanEvaluationInterruptedUpdate(requestId,
+                Objects.requireNonNull(observedAt, "observedAt").toString());
+        return transactions.required(mappers -> mappers.planEvaluations().markInterrupted(values) == 1);
+    }
+
+    /** intent 先原子记录模型请求，再插入审计身份；任一步失败都会回滚计数。 */
     @Override
     public void recordIntent(Intent intent) {
         String profile = profileJson(intent.profile());
         transactions.required(mappers -> {
             PersistenceRecords.PlanEvaluationIntentInsert values = new PersistenceRecords.PlanEvaluationIntentInsert(
                     intent.requestId(), intent.planId(), intent.planRevisionId(), intent.runId(),
-                    intent.ownerThreadId(), intent.inputDigest(), profile, intent.startedAt().toString());
-            int reserved = mappers.planEvaluations().reserveModelRound(values);
-            if (reserved != 1) throw new IllegalStateException("Plan evaluator model budget is exhausted");
+                    intent.ownerThreadId(), intent.inputDigest(), intent.attemptOrdinal(), profile,
+                    intent.startedAt().toString());
+            int reserved = mappers.planEvaluations().recordModelRequest(values);
+            if (reserved != 1) throw new IllegalStateException("Plan evaluator admission is closed");
             int inserted = mappers.planEvaluations().insertIntent(values);
             if (inserted != 1) throw new IllegalStateException("Plan evaluator intent already exists");
             return null;
         });
     }
 
-    /** usage 先原子结算活动时间再结算请求终态，UNKNOWN 也计入预算且重复提交不重复计量。 */
+    /** usage 先原子记录活动时间再结算请求终态，UNKNOWN 也保留诊断且重复提交不重复计量。 */
     @Override
     public void recordUsage(Usage usage) {
         ProviderRequestUsage facts = usage.providerUsage();
@@ -83,7 +100,7 @@ public final class MybatisPlanEvaluationAuditRepository implements PlanEvaluatio
                     usage.evaluation() == null ? null : usage.evaluation().summary(),
                     usage.completedAt().toString());
             int activeUpdated = mappers.planEvaluations().settleActiveMillis(values);
-            if (activeUpdated != 1) throw new IllegalStateException("Plan evaluator active budget settlement is stale");
+            if (activeUpdated != 1) throw new IllegalStateException("Plan evaluator activity settlement is stale");
             int updated = mappers.planEvaluations().settleUsage(values);
             if (updated != 1) throw new IllegalStateException("Plan evaluator usage settlement is stale");
             return null;
@@ -92,6 +109,7 @@ public final class MybatisPlanEvaluationAuditRepository implements PlanEvaluatio
 
     /** 将持久行恢复为严格结构化结论；损坏审计记录必须让恢复路径停在 INCONCLUSIVE。 */
     private Prior prior(PersistenceRecords.PlanEvaluationPriorRow row) {
+        if (row.attemptOrdinal() == null) throw new IllegalStateException("evaluator attempt ordinal is missing");
         Outcome outcome = Outcome.valueOf(row.outcome());
         EvaluationResult evaluation = null;
         if (outcome == Outcome.SUCCEEDED) {
@@ -102,7 +120,7 @@ public final class MybatisPlanEvaluationAuditRepository implements PlanEvaluatio
         } else if (row.verdict() != null || row.criteriaJson() != null || row.summary() != null) {
             throw new IllegalStateException("non-success evaluator audit has a result");
         }
-        return new Prior(row.requestId(), outcome, evaluation);
+        return new Prior(row.requestId(), row.attemptOrdinal(), outcome, evaluation);
     }
 
     /** criteria JSON 是仅供审计恢复的固定三字段数组，不接受未知字段或重复 criterion。 */

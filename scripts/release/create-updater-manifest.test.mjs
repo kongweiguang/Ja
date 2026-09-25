@@ -91,7 +91,7 @@ async function fixture() {
   ];
   for (const target of targets) {
     const artifactRoot = join(input, target.directory);
-    const bundle = join(artifactRoot, "src-tauri", "target", "release", "bundle");
+    const bundle = join(artifactRoot, "target", "release", "bundle");
     const updaterRoot = join(bundle, target.updaterDirectory);
     const installerRoot = join(bundle, target.bundle);
     const updaterBytes = Buffer.from(`updater:${target.directory}`);
@@ -194,7 +194,6 @@ test("fails closed when one platform signature is missing", async () => {
       join(
         paths.input,
         "ja-native-app-server-macos-arm64",
-        "src-tauri",
         "target",
         "release",
         "bundle",
@@ -222,7 +221,6 @@ test("rejects an artifact whose updater signature does not verify", async () => 
     const artifact = join(
       paths.input,
       "ja-native-app-server-windows-x86_64",
-      "src-tauri",
       "target",
       "release",
       "bundle",

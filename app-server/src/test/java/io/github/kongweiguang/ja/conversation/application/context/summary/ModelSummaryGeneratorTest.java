@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.conversation.application.context.summary;
 
 import io.github.kongweiguang.ja.conversation.application.context.ContextException;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.ProviderProtocolException;
 import io.github.kongweiguang.ja.conversation.application.context.ContextMessage;
 import io.github.kongweiguang.ja.conversation.application.context.checkpoint.CheckpointUsage;
 import io.github.kongweiguang.ja.conversation.domain.CollaborationMode;
@@ -57,6 +58,46 @@ final class ModelSummaryGeneratorTest {
         assertEquals(500, observed.get().maxOutputTokens());
         assertEquals(List.of(1L), observed.get().evictedMessages().stream()
                 .map(ContextMessage::ordinal).toList());
+    }
+
+    /** 六次瞬时断流后仍使用新请求重试，不能由旧 Adapter 三次上限结束压缩。 */
+    @Test
+    void retriesRecoverableSummaryRequestsBeyondOldAttemptLimit() {
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicInteger unknownSettlements = new AtomicInteger();
+        SummaryDocument document = document("recovered");
+        ModelSummaryGenerator.SummaryOperation operation = new ModelSummaryGenerator.SummaryOperation() {
+            private Progress progress;
+
+            /** 保留同一块的已接纳进度，重试不可重置压缩计划。 */
+            @Override public Progress start(String fingerprint, SummaryDocument initial) {
+                if (progress == null) progress = Progress.candidate(initial, CheckpointUsage.none(), 0, 0, fingerprint);
+                return progress;
+            }
+
+            /** 模拟每次请求前持久化独立 intent。 */
+            @Override public void begin(String fingerprint, Optional<ProviderRequestProfile> profile) { }
+
+            /** 只在成功响应后接受最终摘要。 */
+            @Override public void settle(CheckpointUsage usage, Progress accepted) { progress = accepted; }
+
+            /** 瞬时失败留下 UNKNOWN 审计，不把不完整文档放入上下文。 */
+            @Override public void retry() { unknownSettlements.incrementAndGet(); }
+
+            /** 此夹具不进入确定性回退路径。 */
+            @Override public void advance(Progress accepted) { progress = accepted; }
+        };
+        ModelSummaryGenerator generator = new ModelSummaryGenerator(model(prompt -> {
+            if (attempts.incrementAndGet() <= 6) {
+                throw new ContextException(ContextException.Code.SUMMARY_FAILURE, "transient",
+                        new ProviderProtocolException("HTTP_STATUS", "provider unavailable", true, Duration.ZERO));
+            }
+            return new SummaryGenerator.SummaryResult(document, CheckpointUsage.none());
+        }), BINDING, CLOCK, new ModelSummaryGenerator.Limits(10, 1_000, 500), operation);
+
+        assertEquals(document, generator.generate(request(message(100))).document());
+        assertEquals(7, attempts.get());
+        assertEquals(6, unknownSettlements.get());
     }
 
     /** 锁定超大输入在调用模型前失败，避免发送已知超限的付费请求。 */

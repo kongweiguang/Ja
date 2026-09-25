@@ -26,13 +26,19 @@ public interface PlanEvaluationAuditPort {
     /** Provider 终态登记真实计量或 UNKNOWN，禁止把缺失计量伪装为零。 */
     void recordUsage(Usage usage);
 
-    /** 查询同一 plan/revision/run 的历史 intent，UNKNOWN 或已完成请求不得重复付费调用。 */
+    /** 查询单次已登记请求；成功结论可恢复，失败请求永不以原身份重发。 */
     Optional<Prior> find(String requestId);
+
+    /** 按冻结输入读取最新尝试，恢复时用更大的 ordinal 建立新请求身份。 */
+    Optional<Prior> findLatest(String planId, String planRevisionId, String runId, String inputDigest);
+
+    /** 进程重启后把失去 owner 的 RUNNING 请求标为 UNKNOWN，才能用新身份继续。 */
+    boolean markInterrupted(String requestId, Instant observedAt);
 
     /** evaluator 调用前的不可变 intent；不包含端点、凭据或用户正文。 */
     record Intent(String requestId, String planId, String planRevisionId, String runId,
                   String ownerThreadId, ProviderRequestProfile profile, String inputDigest,
-                  Instant startedAt) {
+                  int attemptOrdinal, Instant startedAt) {
         /** 请求 identity 必须可跨重启去重，digest 必须绑定完整冻结输入。 */
         public Intent {
             requireRequestId(requestId);
@@ -42,6 +48,7 @@ public interface PlanEvaluationAuditPort {
             requireId(ownerThreadId, "ownerThreadId");
             Objects.requireNonNull(profile, "profile");
             requireDigest(inputDigest, "inputDigest");
+            if (attemptOrdinal < 1) throw new IllegalArgumentException("invalid evaluator attempt ordinal");
             Objects.requireNonNull(startedAt, "startedAt");
         }
     }
@@ -82,20 +89,16 @@ public interface PlanEvaluationAuditPort {
         SUCCEEDED,
         /** Provider 明确失败且没有可恢复结论。 */
         FAILED,
-        /** 计量或响应边界不确定，禁止自动重试。 */
+        /** 计量或响应边界不确定；原请求不能重放，新身份可恢复纯模型验收。 */
         UNKNOWN
     }
 
     /** 仅返回重试门所需的结果状态，不把 Provider 正文重新暴露给 evaluator。 */
-    record Prior(String requestId, Outcome outcome, EvaluationResult evaluation) {
-        /** 保持仅检查状态的旧构造形状；历史 UNKNOWN/运行中没有结论可恢复。 */
-        public Prior(String requestId, Outcome outcome) {
-            this(requestId, outcome, null);
-        }
-
+    record Prior(String requestId, int attemptOrdinal, Outcome outcome, EvaluationResult evaluation) {
         /** 历史状态必须绑定同一稳定 request identity。 */
         public Prior {
             requireRequestId(requestId);
+            if (attemptOrdinal < 1) throw new IllegalArgumentException("invalid evaluator attempt ordinal");
             Objects.requireNonNull(outcome, "outcome");
             if ((outcome == Outcome.SUCCEEDED) != (evaluation != null)) {
                 throw new IllegalArgumentException("successful prior requires a result");

@@ -1,5 +1,5 @@
-{"jsonrpc":"2.0","id":"c:queue-empty","method":"turn/input/enqueue","params":{"turnId":"turn_queue_demo","content":[]}}
-{"jsonrpc":"2.0","id":"c:queue-enqueue-extra","method":"turn/input/enqueue","params":{"turnId":"turn_queue_demo","content":[{"type":"text","text":"x"}],"kind":"steering"}}
+{"jsonrpc":"2.0","id":"c:queue-empty","method":"turn/input/enqueue","params":{"turnId":"turn_queue_demo","content":[],"kind":"follow_up","clientOperationId":"op_e2d2029b342e37a57f06974593a360df"}}
+{"jsonrpc":"2.0","id":"c:queue-enqueue-extra","method":"turn/input/enqueue","params":{"turnId":"turn_queue_demo","content":[{"type":"text","text":"x"}],"kind":"invalid","clientOperationId":"op_b10748c83e5089d4412849495c5738d7"}}
 {"jsonrpc":"2.0","id":"c:queue-prioritize-missing-cas","method":"turn/input/prioritize","params":{"turnId":"turn_queue_demo","inputId":"input_queue_demo"}}
 {"jsonrpc":"2.0","id":"c:queue-update-empty","method":"turn/input/update","params":{"turnId":"turn_queue_demo","inputId":"input_queue_demo","expectedInputRevision":1,"content":[]}}
 {"jsonrpc":"2.0","id":"c:queue-delete-extra","method":"turn/input/delete","params":{"turnId":"turn_queue_demo","inputId":"input_queue_demo","expectedInputRevision":1,"text":"removed"}}

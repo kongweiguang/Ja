@@ -140,9 +140,9 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
     }
 }
 
-/// Session 的全局硬上限只为五分钟手动压缩留出响应余量；普通调用仍传入各自短 deadline。
+/// 全局数值只约束显式传入 deadline 的请求；压缩走结果或连接关闭驱动的专用等待。
 #[test]
-fn default_session_limit_can_cover_manual_compaction() {
+fn default_session_limit_only_bounds_timed_requests() {
     assert_eq!(Limits::default().request_deadline_ms, 305_000);
 }
 

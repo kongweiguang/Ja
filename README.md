@@ -1,7 +1,7 @@
 <!-- @author kongweiguang -->
 
 <div align="center">
-  <img src="src-tauri/icons/icon.png" width="80" alt="Ja 图标" />
+  <img src="apps/desktop/src-tauri/icons/icon.png" width="80" alt="Ja 图标" />
   <h1>Ja · 驾</h1>
   <p><strong>把想法交给 Agent，把过程和结果留在眼前。</strong></p>
   <p>一个运行在你电脑上的 AI Agent 工作台。</p>
@@ -69,6 +69,21 @@ Ja 不要求注册账号。模型服务由你选择，请求费用由对应服�
 选择“无项目对话”，或在左侧添加本地项目，然后输入你的需求。初次尝试建议先让它只读分析，熟悉后再允许修改文件、执行命令。
 
 输入框中的执行确认选项决定工具是否需要你逐次批准。选择“完全访问”时，Agent 可以直接使用当前用户的文件与命令权限。
+
+### 命令行客户端（Windows x64）
+
+仓库内提供独立的 `ja` 命令行客户端。它和 `ja-desktop` 连接同一个本机 App Server，共享模型配置与会话；退出界面不会取消正在运行的任务。Windows x64 npm 包 `@kongweiguang/ja` 目前处于发布前验证，尚未公开；发布后需要 Node.js 24.x，不需要另装 JDK。发布前的本地打包与安装说明见 [`packages/ja-npm/PUBLISHING.md`](packages/ja-npm/PUBLISHING.md)。
+
+```text
+ja                         # 在当前目录开始交互会话
+ja -C <目录>                # 在指定目录开始会话
+ja resume [thread-id]       # 恢复已有会话
+ja exec "任务内容"           # 非交互执行，只向 stdout 输出最终回答
+ja exec --json "任务内容"    # 输出带终态的版本化 JSONL 事件
+ja server status            # 查看本机后台状态
+```
+
+交互界面使用 `/` 查找命令、`@` 引用文件；`Ctrl+J` 换行，`Ctrl+D` 在输入为空时退出。首次运行会引导配置模型。需要审批或澄清时，非交互命令会返回会话标识，供交互界面或桌面继续处理。
 
 ## 数据留在哪里？
 

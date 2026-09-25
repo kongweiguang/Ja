@@ -5015,8 +5015,13 @@ async function reservePort(excludedPorts = new Set()) {
  */
 async function readProductionMainWindowConfig() {
   const [baseConfig, windowsConfig] = await Promise.all([
-    readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(
+      JSON.parse,
+    ),
+    readFile(
+      join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"),
+      "utf8",
+    ).then(JSON.parse),
   ]);
   const baseWindow = baseConfig?.app?.windows?.find((window) => window?.label === "main");
   const windowsWindow = windowsConfig?.app?.windows?.find((window) => window?.label === "main");
@@ -5080,7 +5085,10 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
     build: {
       // devUrl 固定为 IPv4 loopback；预热服务器也必须同址监听，避免 Windows 上 localhost
       // 优先解析到仅 IPv6 的地址后 Tauri 永远等不到自己的 dev origin。
-      beforeDevCommand: "pnpm exec vite --config apps/desktop/vite.config.ts --host 127.0.0.1",
+      beforeDevCommand: {
+        script: "pnpm exec vite --config apps/desktop/vite.config.ts --host 127.0.0.1",
+        cwd: "../../..",
+      },
       devUrl: origin,
       ...(useEdgeDriver
         ? {
@@ -5112,11 +5120,7 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
  */
 function buildSettingsDocument(
   providerConfig,
-  {
-    defaultAccessMode = "approval_required",
-    includeComposerContextSkill = false,
-    turnWallTimeoutMs = 30_000,
-  } = {},
+  { defaultAccessMode = "approval_required", turnWallTimeoutMs = 30_000 } = {},
 ) {
   if (!new Set(["approval_required", "full_access"]).has(defaultAccessMode)) {
     throw new Error(`E2E 设置 fixture 不支持访问模式 ${defaultAccessMode}`);
@@ -5136,9 +5140,7 @@ function buildSettingsDocument(
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "interaction = { clarification_enabled = true }",
     "mcp_servers = []",
-    ...(includeComposerContextSkill
-      ? [`skills = [${tomlString(composerContextSkill.skillId)}]`]
-      : ["skills = []"]),
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_e2e"',
@@ -5154,10 +5156,6 @@ function buildSettingsDocument(
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 32",
-    "max_tool_calls = 128",
-    `wall_timeout_ms = ${turnWallTimeoutMs}`,
     "[[providers.models]]",
     'model_id = "model_e2e"',
     `name = ${tomlString(real ? "E2E Real Model" : "E2E Fake Model")}`,
@@ -5195,10 +5193,6 @@ function buildRuntimeRefreshSettingsDocument(baseUrl, controlPath, reportPath, r
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 32",
-    "max_tool_calls = 128",
-    "wall_timeout_ms = 180000",
     "[[providers.models]]",
     `model_id = ${tomlString(modelId)}`,
     `name = ${tomlString(name)}`,
@@ -5246,7 +5240,7 @@ function buildRuntimeRefreshSettingsDocument(baseUrl, controlPath, reportPath, r
     'auth = { kind = "none" }',
     "enabled = true",
     "",
-    'skills = ["user:runtime-refresh"]',
+    "disabled_skills = []",
     "",
   ].join("\n");
 }
@@ -5596,16 +5590,18 @@ function sameProcessIdentity(expected, actual) {
 }
 
 /**
- * 在本 runner 创建 launcher 根进程前，冻结所有可见 Ja 实例。
- * 同名但身份不完整的行会阻止启动，因为仅凭 PID 的保护无法证明 cleanup 保留了用户的准确进程。
+ * 在创建 launcher 前冻结可见的 Ja CLI 与桌面进程；两者共享用户数据，清理必须保留宿主已有实例。
+ * 身份不完整时阻止启动，避免仅凭 PID 无法证明 cleanup 保留了准确进程。
  */
 function selectPreexistingJaIdentities(snapshot) {
   const candidates = snapshot.filter(
-    (entry) => typeof entry?.name === "string" && entry.name.toLowerCase() === "ja.exe",
+    (entry) =>
+      typeof entry?.name === "string" &&
+      ["ja.exe", "ja-desktop.exe"].includes(entry.name.toLowerCase()),
   );
   const incomplete = candidates.filter((entry) => !hasProcessIdentity(entry));
   if (incomplete.length > 0)
-    throw new Error(`启动前有 ${incomplete.length} 个 ja.exe 缺少完整进程身份`);
+    throw new Error("启动前有 " + incomplete.length + " 个 Ja CLI/桌面进程缺少完整身份");
   return candidates.map((entry) => Object.freeze({ ...entry }));
 }
 
@@ -5719,42 +5715,57 @@ function assertCreationBoundaryContract() {
 function containsNameScopedJaTermination(source) {
   const value = String(source ?? "");
   return (
-    /\/IM["'\s,]+ja\.exe/iu.test(value) ||
-    /Get-Process[^;\n]*(?:-Name\s+)?["']?ja(?:\.exe)?\b/iu.test(value) ||
-    /Stop-Process[^;\n]*(?:-Name\s+)?["']?ja(?:\.exe)?\b/iu.test(value) ||
-    /Win32_Process[^;\n]*ja\.exe[^;\n]*(?:Terminate|Delete)/iu.test(value)
+    /\/IM["'\s,]+(?:ja-desktop|ja)\.exe(?![\w-])/iu.test(value) ||
+    /Get-Process[^;\n]*(?:-Name\s+)?["']?(?:ja-desktop|ja)(?:\.exe)?(?![\w-])/iu.test(value) ||
+    /Stop-Process[^;\n]*(?:-Name\s+)?["']?(?:ja-desktop|ja)(?:\.exe)?(?![\w-])/iu.test(value) ||
+    /Win32_Process[^;\n]*(?:ja-desktop|ja)\.exe(?![\w-])[^;\n]*(?:Terminate|Delete)/iu.test(value)
   );
 }
 
 /**
- * 在启动任何 launcher 前运行纯负向 fixture。除身份结果外，还将托盘退出/force cleanup
- * 限定到准确 owned PID，并拒绝未来出现按名称终止机器上全部 Ja 实例的实现。
+ * 在启动前验证 CLI 与桌面进程都会被基线保护，并拒绝按名称终止任一 Ja 进程的实现。
+ * 托盘退出与 force cleanup 仍必须限定到准确 owned PID。
  */
 function assertPreexistingJaGuardContract() {
   const original = {
     pid: 106_952,
     parentPid: 4_000,
-    name: "ja.exe",
-    commandLine: "C:\\Program Files\\Ja\\ja.exe --profile existing",
+    name: "ja-desktop.exe",
+    commandLine: "C:\\Program Files\\Ja\\ja-desktop.exe --profile existing",
     creationDate: "2026-08-24T03:00:00.000Z",
+  };
+  const cli = {
+    ...original,
+    pid: 106_953,
+    name: "ja.exe",
+    commandLine: "C:\\Program Files\\Ja\\ja.exe --help",
   };
   const selected = selectPreexistingJaIdentities([
     original,
-    { ...original, pid: 106_953, name: "other.exe" },
+    cli,
+    { ...original, pid: 106_954, name: "other.exe" },
   ]);
-  if (selected.length !== 1 || !sameProcessIdentity(selected[0], original))
-    throw new Error("preexisting Ja baseline selection contract failed");
-  const preserved = evaluatePreexistingJaIdentities(selected, [original]);
   if (
-    preserved.preserved.length !== 1 ||
+    selected.length !== 2 ||
+    !sameProcessIdentity(selected[0], original) ||
+    !sameProcessIdentity(selected[1], cli)
+  )
+    throw new Error("preexisting Ja baseline selection contract failed");
+  const preserved = evaluatePreexistingJaIdentities(selected, [original, cli]);
+  if (
+    preserved.preserved.length !== 2 ||
     preserved.missing.length + preserved.reused.length + preserved.incomplete.length !== 0
   ) {
     throw new Error("preexisting Ja preserved fixture failed");
   }
-  if (evaluatePreexistingJaIdentities(selected, []).missing.length !== 1)
+  if (evaluatePreexistingJaIdentities(selected, []).missing.length !== 2)
     throw new Error("preexisting Ja missing fixture was accepted");
   const reused = evaluatePreexistingJaIdentities(selected, [
-    { ...original, commandLine: "C:\\other\\ja.exe", creationDate: "2026-08-24T03:00:01.000Z" },
+    {
+      ...original,
+      commandLine: "C:\\other\\ja-desktop.exe",
+      creationDate: "2026-08-24T03:00:01.000Z",
+    },
   ]);
   if (reused.reused.length !== 1) throw new Error("preexisting Ja PID reuse fixture was accepted");
   const incomplete = evaluatePreexistingJaIdentities(selected, [{ ...original, commandLine: "" }]);
@@ -5792,7 +5803,9 @@ function assertPreexistingJaGuardContract() {
   if (
     containsNameScopedJaTermination(cleanupSource) ||
     !containsNameScopedJaTermination("taskkill.exe /IM ja.exe /F") ||
-    !containsNameScopedJaTermination("Get-Process -Name ja | Stop-Process")
+    !containsNameScopedJaTermination("taskkill.exe /IM ja-desktop.exe /F") ||
+    !containsNameScopedJaTermination("Get-Process -Name ja | Stop-Process") ||
+    !containsNameScopedJaTermination("Get-Process -Name ja-desktop | Stop-Process")
   ) {
     throw new Error("preexisting Ja name-scoped termination contract failed");
   }
@@ -6269,8 +6282,7 @@ function buildTauriEnv(
       rootProcessEnv.JA_E2E_APP_SERVER_JAR?.trim() ||
       join(repoRoot, "app-server", "target", "ja-app-server.jar"),
     CARGO_TARGET_DIR: resolve(
-      rootProcessEnv.JA_E2E_CARGO_TARGET_DIR?.trim() ||
-        join(repoRoot, "src-tauri", "target", "e2e"),
+      rootProcessEnv.JA_E2E_CARGO_TARGET_DIR?.trim() || join(repoRoot, "target", "e2e"),
     ),
     // Chrome 136+ 只在非默认 UDF 上接受 remote-debugging；Tauri 2.11 当前配置转换
     // 会丢弃 dataDirectory，因此 direct 模式通过同一组官方环境 override 绑定 UDF 与端口。
@@ -6326,8 +6338,7 @@ async function warmTauriBinary(directories, rootProcessEnv, cargoCommand, signal
     CARGO_HOME: rootProcessEnv.CARGO_HOME?.trim() || join(rootProcessEnv.USERPROFILE, ".cargo"),
     RUSTUP_HOME: rootProcessEnv.RUSTUP_HOME?.trim() || join(rootProcessEnv.USERPROFILE, ".rustup"),
     CARGO_TARGET_DIR: resolve(
-      rootProcessEnv.JA_E2E_CARGO_TARGET_DIR?.trim() ||
-        join(repoRoot, "src-tauri", "target", "e2e"),
+      rootProcessEnv.JA_E2E_CARGO_TARGET_DIR?.trim() || join(repoRoot, "target", "e2e"),
     ),
     JAVA_HOME: java25Home,
     JA_E2E_JAVA_HOME: java25Home,
@@ -6336,7 +6347,7 @@ async function warmTauriBinary(directories, rootProcessEnv, cargoCommand, signal
   };
   if (Object.hasOwn(env, "Path")) delete env.Path;
   // 预编译只生成本轮真实启动将使用的 binary，不创建窗口、listener 或应用数据。
-  await execFileAsync(cargoCommand, ["build", "-p", "ja", "--bin", "ja"], {
+  await execFileAsync(cargoCommand, ["build", "-p", "ja-desktop", "--bin", "ja-desktop"], {
     cwd: repoRoot,
     env,
     windowsHide: true,
@@ -7220,7 +7231,7 @@ async function waitForCdp(
         try {
           const session = parseEdgeDriverSession(await readFile(edgeDriverSessionPath, "utf8"));
           const appIdentity = tree.get(session.appPid);
-          if (appIdentity !== undefined && appIdentity.name.toLowerCase() === "ja.exe") {
+          if (appIdentity !== undefined && appIdentity.name.toLowerCase() === "ja-desktop.exe") {
             const endpoint = `http://127.0.0.1:${session.debuggerPort}`;
             const probeSignal = AbortSignal.any([
               signal,
@@ -7346,7 +7357,7 @@ async function waitForWebViewProfileReady(
           windowsPathKey(entry.commandLine).includes(expectedProfileKey),
       );
       const renderer = browsers.find((entry) => entry.commandLine.includes("--type=renderer"));
-      const app = products.find((entry) => entry.name.toLowerCase() === "ja.exe");
+      const app = products.find((entry) => entry.name.toLowerCase() === "ja-desktop.exe");
       let localState;
       let preferences;
       try {
@@ -9312,15 +9323,15 @@ function assertApprovalParallelEvidence(events) {
 }
 
 /**
- * 在本轮后代进程中查找已编译 Tauri 进程。名称检查只用于选择窗口目标，
+ * 在本轮后代进程中查找 ja-desktop.exe。名称检查只用于选择窗口目标，
  * ownership 仍来自已记录的根后代 closure。
  */
 function tauriProcessIds(tree, snapshot, preexistingJaIdentities = []) {
   return [...tree.values()]
     .filter(
       (entry) =>
-        (entry.name.toLowerCase() === "ja.exe" ||
-          /\\target\\(?:debug|release)\\ja\.exe/i.test(entry.commandLine)) &&
+        (entry.name.toLowerCase() === "ja-desktop.exe" ||
+          /\\target\\(?:debug|release)\\ja-desktop\.exe/i.test(entry.commandLine)) &&
         snapshot.some((candidate) => sameProcessIdentity(entry, candidate)) &&
         !isProtectedPreexistingJa(entry, preexistingJaIdentities),
     )
@@ -10661,7 +10672,7 @@ function productProcessEntries(observed, directories, preexistingJaIdentities = 
     if (isProtectedPreexistingJa(entry, preexistingJaIdentities)) return false;
     const name = entry.name.toLowerCase();
     const commandLine = entry.commandLine.toLowerCase();
-    if (name === "ja.exe") {
+    if (name === "ja-desktop.exe") {
       return true;
     }
     if (name === "java.exe") {
@@ -12565,13 +12576,15 @@ async function startWindowsClipboardFixtureBroker(signal) {
   };
 }
 
-/** 刷新准确的 spawned closure，并返回其中唯一的 Ja 窗口 owner。 */
+/** 刷新准确的 spawned closure，并按 ja-desktop.exe 返回唯一桌面窗口 owner。 */
 async function resolveOwnedJaWindow(scope, signal) {
   const snapshot = await processSnapshot(signal);
   const tree = processTree(scope.rootIdentity, snapshot, scope.incompleteObserved);
   if (tree === undefined) throw new Error("无法重验本次 Tauri launcher 的进程树");
   for (const [pid, entry] of tree) scope.observed.set(pid, entry);
-  const candidates = [...tree.values()].filter((entry) => entry.name.toLowerCase() === "ja.exe");
+  const candidates = [...tree.values()].filter(
+    (entry) => entry.name.toLowerCase() === "ja-desktop.exe",
+  );
   if (candidates.length !== 1)
     throw new Error(`本次 launcher 下 Ja 窗口进程数量异常：${candidates.length}`);
   return candidates[0];
@@ -12580,7 +12593,7 @@ async function resolveOwnedJaWindow(scope, signal) {
 /**
  * 只有 PowerShell 重新验证本轮 launcher 下观察到的准确 CIM 名称、command line 与创建时间后，
  * 才执行 Win32 窗口操作。该身份 fence 防止 resize/focus 触碰 PID 106952
- * 或其他恰好同名 ja.exe 的开发者窗口。resize 选择已连接显示器中 DPI 最低者，
+ * 或其他恰好同名 ja-desktop.exe 的开发者窗口。resize 选择已连接显示器中 DPI 最低者，
  * 使固定 CSS 矩阵在混合 DPI 开发工作站上仍是真实 HWND/WebView 测量。
  */
 async function invokeOwnedWindowAction(identity, action, signal, size) {
@@ -14655,13 +14668,13 @@ async function exerciseNativeShortcutHardReload(page, workbench, identity, deadl
   return { status: "passed", leaseRebound: true, command: result.command, terminalInputDelta: 0 };
 }
 
-/** 只返回本轮已复验 ja.exe 的后代 terminal shell，避免按名称误收宿主进程。 */
+/** 只返回本轮 ja-desktop.exe 的后代 terminal shell，避免按名称误收宿主进程。 */
 async function captureOwnedTerminalShells(scope, signal) {
   const snapshot = await processSnapshot(signal);
   const tree = processTree(scope.rootIdentity, snapshot, scope.incompleteObserved);
   if (tree === undefined) throw new Error("无法读取本次 Tauri 进程树中的 PTY");
   for (const [pid, entry] of tree) scope.observed.set(pid, entry);
-  const ja = [...tree.values()].filter((entry) => entry.name.toLowerCase() === "ja.exe");
+  const ja = [...tree.values()].filter((entry) => entry.name.toLowerCase() === "ja-desktop.exe");
   if (ja.length !== 1) throw new Error(`PTY owner 数量异常：${ja.length}`);
   const descendants = new Set([ja[0].pid]);
   let changed = true;
@@ -23384,10 +23397,7 @@ async function executeComposerCommand(page, command, deadline) {
   const composer = page.getByRole("textbox", { name: "消息", exact: true });
   await composer.fill(`/${command}`);
   const list = await waitForComposerSuggestionList(page, "指令", deadline);
-  const option = list
-    .getByRole("option")
-    .filter({ hasText: label })
-    .first();
+  const option = list.getByRole("option").filter({ hasText: label }).first();
   await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   if ((await option.getAttribute("aria-disabled")) === "true") {
     throw new Error(`/${command} 在预期可执行状态下被禁用：${await option.innerText()}`);
@@ -28007,6 +28017,7 @@ function assertThemeMatrixContract() {
 
 /**
  * 以纯源码与 fixture 断言 Composer context 聚焦模式已经接入真实两阶段桌面生命周期；
+ * Skills 由目录自动发现；检查真实种子文件和禁用列表，不再要求已删除的显式注册参数。
  * 这里不替代真窗，只防止完整交互 helper 因遗漏 main 分派而再次成为不可执行的死代码。
  */
 function assertComposerContextContract() {
@@ -28016,11 +28027,9 @@ function assertComposerContextContract() {
   const invokeProbeSource = String(installTauriInvokeProbeInPage);
   const skillFixtureSource = String(writeComposerContextSkill);
   const mainSource = String(main);
-  const settingsFixture = buildSettingsDocument(undefined, {
-    includeComposerContextSkill: true,
-  });
+  const settingsFixture = buildSettingsDocument(undefined);
   const checks = {
-    settingsSkillId: settingsFixture.includes(`skills = ["${composerContextSkill.skillId}"]`),
+    settingsSkillDefaultEnabled: settingsFixture.includes("disabled_skills = []"),
     settingsSkillName: skillFixtureSource.includes("composerContextSkill.name"),
     imeComposition: sessionSource.includes("Input.imeSetComposition"),
     workspaceSearch: sessionSource.includes("ja_runtime_workspace_path_search"),
@@ -28044,7 +28053,7 @@ function assertComposerContextContract() {
     mainEnvironmentCleanup: mainSource.includes("delete process.env.JA_E2E_COMPOSER_CONTEXT_ONLY"),
     mainSkillFixture: mainSource.includes("writeComposerContextSkill(directories.home)"),
     mainSettingsFixture: mainSource.includes(
-      "includeComposerContextSkill: composerContextAcceptanceMode",
+      "await writeSettings(directories.home, providerConfig,",
     ),
     mainFirstSession: mainSource.includes("runComposerContextAcceptanceSession"),
     mainRestartSession: mainSource.includes("runComposerContextRestartSession"),
@@ -28862,7 +28871,6 @@ async function main() {
           turnChangeReviewAcceptanceMode
             ? "full_access"
             : "approval_required",
-        includeComposerContextSkill: composerContextAcceptanceMode,
         turnWallTimeoutMs:
           taskThreadsAcceptanceMode || planGoalAcceptanceMode || turnChangeReviewAcceptanceMode
             ? 180_000

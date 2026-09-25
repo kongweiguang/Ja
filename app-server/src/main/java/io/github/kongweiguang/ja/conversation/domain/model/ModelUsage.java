@@ -30,10 +30,11 @@ public record ModelUsage(long inputTokens, long outputTokens, long totalTokens,
     }
 
     /**
-     * 总量允许包含缓存或推理开销，但不得小于显式输入与输出之和。
+     * 总量允许包含缓存或推理开销；用减法校验避免上游超大计数在 long 加法中回绕。
      */
     public ModelUsage {
-        if (inputTokens < 0 || outputTokens < 0 || totalTokens < inputTokens + outputTokens
+        if (inputTokens < 0 || outputTokens < 0 || totalTokens < inputTokens
+                || outputTokens > totalTokens - inputTokens
                 || cacheReadTokens != null && cacheReadTokens < 0
                 || cacheWriteTokens != null && cacheWriteTokens < 0) {
             throw new IllegalArgumentException("invalid model usage");

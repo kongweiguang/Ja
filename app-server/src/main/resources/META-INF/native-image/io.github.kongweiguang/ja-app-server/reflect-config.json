@@ -10,6 +10,8 @@
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionEventInsert","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationIntentInsert","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationLatestLookup","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationInterruptedUpdate","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationUsageUpdate","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationPriorRow","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
   {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper","allDeclaredConstructors":true,"allDeclaredMethods":true,"allDeclaredFields":true},
@@ -294,6 +296,11 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PublicContentPageRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -308,6 +315,9 @@
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputHistoryPage","allDeclaredConstructors":true,"allDeclaredMethods":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputHistoryRow","allDeclaredConstructors":true,"allDeclaredMethods":true},
+  {"name":"io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputOperationRow","allDeclaredConstructors":true,"allDeclaredMethods":true},
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputStats",
     "allDeclaredConstructors": true,
@@ -315,6 +325,11 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotItemRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ClientOperationRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },

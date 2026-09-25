@@ -16,6 +16,7 @@ import io.github.kongweiguang.ja.catalog.adapter.out.mcp.testsupport.McpStdioFix
 import io.github.kongweiguang.ja.conversation.adapter.out.tools.NetworkntToolArgumentValidation;
 import io.github.kongweiguang.ja.conversation.application.loop.McpAgentTool;
 import io.github.kongweiguang.ja.conversation.domain.permission.AccessMode;
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.configuration.domain.ConfigurationGenerationSnapshot;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
@@ -35,6 +36,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -47,6 +50,76 @@ import org.junit.jupiter.api.io.TempDir;
 final class TurnMcpSessionFactoryTest {
     private static final ObjectMapper JSON = new ObjectMapper()
             .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+
+    /** 同一工作区和配置下的两个客户端必须创建独立 stdio，并在各自 Turn 租约结束时
+     * 只回收自己的进程；客户端源 Map 的后续变化不能重写已冻结环境。 */
+    @Test
+    void nativeClientsKeepDistinctMcpEnvironmentsAndReleaseAtTerminal(@TempDir Path workspace) throws Exception {
+        Path report = workspace.resolve("client-mcp-report.txt");
+        Path classes = Path.of(McpStdioFixture.class
+                .getProtectionDomain().getCodeSource().getLocation().toURI());
+        Path home = Files.createDirectories(workspace.resolve("home"));
+        Path data = Files.createDirectories(workspace.resolve("data"));
+        Path run = Files.createDirectories(workspace.resolve("run"));
+        Path logs = Files.createDirectories(workspace.resolve("logs"));
+        Files.writeString(home.resolve("config.toml"), generationConfig(report, classes));
+        SidecarConfiguration configuration = new SidecarConfiguration(home, data, run, logs);
+        long firstPid;
+        long secondPid;
+        try (ConfigurationRuntimeAdapter adapter = new ConfigurationRuntimeAdapter(configuration, JSON);
+             GenerationCatalog catalog = new GenerationCatalog(workspace, JSON, McpLimits.DEFAULT)) {
+            ConfigurationApplicationService owner = new ConfigurationApplicationService(adapter);
+            ConfigurationUseCase.CredentialResult model = owner.setCredential(
+                    "cred_model", "model-secret", "cfg_missing");
+            owner.setCredential("cred_mcp", "mcp-secret", model.version());
+            try (ConfigurationGenerationPort.Lease lease = new TestGenerationLease(owner.acquire(null))) {
+                GenerationTurnMcpSessionFactory factory = new GenerationTurnMcpSessionFactory(
+                        JSON, McpLimits.DEFAULT, catalog);
+                Map<String, String> firstEnvironment = new HashMap<>(System.getenv());
+                firstEnvironment.put("USERPROFILE", workspace.resolve("first-profile").toString());
+                firstEnvironment.put("JA_CLIENT_PRIVATE", "first-private-value");
+                NativeExecutionSnapshot firstSnapshot = new NativeExecutionSnapshot(firstEnvironment, null);
+                firstEnvironment.remove("USERPROFILE");
+                firstEnvironment.put("JA_CLIENT_PRIVATE", "mutated-private-value");
+                Map<String, String> secondEnvironment = new HashMap<>(System.getenv());
+                secondEnvironment.remove("USERPROFILE");
+                secondEnvironment.put("JA_CLIENT_PRIVATE", "second-private-value");
+                NativeExecutionSnapshot secondSnapshot = new NativeExecutionSnapshot(secondEnvironment, null);
+                Instant deadline = Instant.now().plus(Duration.ofSeconds(20));
+                TurnMcpSessionFactory.Context first = new TurnMcpSessionFactory.Context(
+                        "provider_turn_mcp", "model_turn_mcp", workspace, deadline, firstSnapshot);
+                TurnMcpSessionFactory.Context second = new TurnMcpSessionFactory.Context(
+                        "provider_turn_mcp", "model_turn_mcp", workspace, deadline, secondSnapshot);
+                try (GenerationTurnMcpSessionFactory.CatalogSnapshot firstCatalog = factory.catalog(first, lease);
+                     TurnMcpSessionFactory.Session firstSession =
+                             factory.open(firstCatalog, CancellationToken.none())) {
+                    assertTrue(awaitObservation(report, "parent=true"));
+                    firstPid = Long.parseLong(Files.readAllLines(report, StandardCharsets.UTF_8).getFirst());
+                    assertTrue(ProcessHandle.of(firstPid).orElseThrow().isAlive());
+                    try (GenerationTurnMcpSessionFactory.CatalogSnapshot secondCatalog = factory.catalog(second, lease);
+                         TurnMcpSessionFactory.Session secondSession =
+                                 factory.open(secondCatalog, CancellationToken.none())) {
+                        assertTrue(awaitObservation(report, "parent=false"));
+                        secondPid = Long.parseLong(Files.readAllLines(report, StandardCharsets.UTF_8).getFirst());
+                        assertTrue(firstPid != secondPid, "client environments must not share one stdio process");
+                        assertTrue(ProcessHandle.of(firstPid).orElseThrow().isAlive(),
+                                "first in-flight Turn remains alive after second client connects");
+                        assertTrue(ProcessHandle.of(secondPid).orElseThrow().isAlive());
+                        String observation = Files.readString(report, StandardCharsets.UTF_8);
+                        assertFalse(observation.contains("first-private-value"));
+                        assertFalse(observation.contains("second-private-value"));
+                        assertFalse(observation.contains("mutated-private-value"));
+                        assertEquals(1, firstSession.snapshot().tools().size());
+                        assertEquals(1, secondSession.snapshot().tools().size());
+                    }
+                    assertTrue(awaitExit(secondPid));
+                    assertTrue(ProcessHandle.of(firstPid).orElseThrow().isAlive(),
+                            "closing one client must not cancel the other Turn");
+                }
+            }
+            assertTrue(awaitExit(firstPid));
+        }
+    }
 
     /** 验证同一代际复用选定 stdio，batch 取消只释放 pin，catalog 关闭才回收进程。 */
     @Test
@@ -77,7 +150,7 @@ final class TurnMcpSessionFactoryTest {
                         lease.snapshot().requireModel(provider.providerId(), "model_turn_mcp");
                 TurnMcpSessionFactory.Context context = new TurnMcpSessionFactory.Context(
                         provider.providerId(), modelDefinition.modelId(), workspace.toAbsolutePath(),
-                        Instant.now().plus(Duration.ofSeconds(20)));
+                        Instant.now().plus(Duration.ofSeconds(20)), null);
                 catalog.prepareWorkspace(workspace, lease);
                 assertFalse(Files.exists(report), "workspace prepare must not start MCP IO");
                 GenerationTurnMcpSessionFactory factory = new GenerationTurnMcpSessionFactory(
@@ -147,7 +220,7 @@ final class TurnMcpSessionFactoryTest {
                         JSON, McpLimits.DEFAULT, catalog, generation);
                 TurnMcpSessionFactory.Context context = new TurnMcpSessionFactory.Context(
                         "provider_turn_mcp", "model_turn_mcp", workspace,
-                        Instant.now().plus(Duration.ofSeconds(20)));
+                        Instant.now().plus(Duration.ofSeconds(20)), null);
                 catalog.prepareWorkspace(workspace, lease);
                 GenerationTurnMcpSessionFactory.CatalogSnapshot discovered = factory.catalog(context, lease);
                 assertEquals(1, discovered.snapshot().tools().size());
@@ -206,7 +279,7 @@ final class TurnMcpSessionFactoryTest {
                 + "default_provider_id = \"provider_turn_mcp\"\n"
                 + "default_model_id = \"model_turn_mcp\"\n"
                 + "default_reasoning_level = \"medium\"\n"
-                + "skills = []\n"
+                + "disabled_skills = []\n"
                 + "interaction = { clarification_enabled = true }\n"
                 + "[subagents]\n"
                 + "enabled = true\n"
@@ -222,7 +295,7 @@ final class TurnMcpSessionFactoryTest {
                 + "[providers.network_timeouts]\nconnect_timeout_ms = 10000\nrequest_timeout_ms = 120000\n"
                 + "[providers.agent_defaults]\n"
                 + "[providers.agent_defaults.context]\nauto_compact = true\n"
-                + "[providers.agent_defaults.turn_limits]\nmax_model_rounds = 32\nmax_tool_calls = 128\nwall_timeout_ms = 3600000\n"
+
                 + "[[providers.models]]\nmodel_id = \"model_turn_mcp\"\nname = \"Turn MCP Model\"\n"
                 + "model = \"fixture\"\nreasoning_level_map = { medium = \"medium\" }\n"
                 + "default_reasoning_level = \"medium\"\n"

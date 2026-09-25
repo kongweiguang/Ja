@@ -5,6 +5,11 @@
   display: contents;
 }
 
+/* 反馈占用 header 自身的第二行，避免浮层盖住顶部的用户消息。 */
+.ja-conversation-header:has(.ja-thread-compaction-feedback) {
+  padding-bottom: 2.65rem;
+}
+
 .ja-thread-operations-menu {
   z-index: 92;
   min-width: 11.5rem;
@@ -44,7 +49,7 @@
 .ja-thread-compaction-feedback {
   position: absolute;
   z-index: 4;
-  top: calc(100% + 0.35rem);
+  bottom: 0.35rem;
   right: 0.75rem;
   display: flex;
   max-width: min(30rem, calc(100vw - 2rem));
@@ -75,6 +80,12 @@
   font: inherit;
   font-weight: var(--ja-weight-semibold);
   cursor: pointer;
+}
+
+.ja-thread-compaction-feedback > button:not(.ja-icon-button):focus-visible {
+  border-radius: var(--ja-radius-sm);
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
 }
 
 .ja-thread-compaction-feedback .ja-icon-button {

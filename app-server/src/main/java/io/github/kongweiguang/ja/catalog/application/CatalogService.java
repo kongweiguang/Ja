@@ -180,7 +180,7 @@ public final class CatalogService implements CatalogUseCase {
      */
     private Workspace skillWorkspace(String workspaceId) {
         if (workspaceId == null) return null;
-        Workspace workspace = workspaces.requireOpenWorkspace(workspaceId);
+        Workspace workspace = workspaces.requireSettingsWorkspace(workspaceId);
         return workspace.kind() == Workspace.Kind.PROJECT ? workspace : null;
     }
 

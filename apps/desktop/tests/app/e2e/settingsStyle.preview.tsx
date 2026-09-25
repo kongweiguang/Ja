@@ -43,7 +43,6 @@ const SETTINGS_STYLE_SNAPSHOT: SettingsSnapshot = {
       networkTimeouts: { connectTimeoutMs: 10000, requestTimeoutMs: 120000 },
       agentDefaults: {
         context: { autoCompact: true },
-        turnLimits: { maxModelRounds: 32, maxToolCalls: 128, wallTimeoutMs: 3600000 },
       },
       models: [
         {
@@ -74,7 +73,6 @@ const SETTINGS_STYLE_SNAPSHOT: SettingsSnapshot = {
       networkTimeouts: { connectTimeoutMs: 10000, requestTimeoutMs: 120000 },
       agentDefaults: {
         context: { autoCompact: true },
-        turnLimits: { maxModelRounds: 16, maxToolCalls: 64, wallTimeoutMs: 1800000 },
       },
       models: [],
     },
@@ -202,7 +200,7 @@ const SETTINGS_STYLE_SKILLS: {
       name: "removed-skill-record",
       source: "user",
       description: "",
-      enabled: true,
+      enabled: false,
       missing: true,
       status: "error",
       error: "文件已移除",
@@ -217,14 +215,6 @@ const SETTINGS_STYLE_SKILLS: {
       enabled: true,
       status: "error",
       error: "本次预览故意保留的恢复状态：规则加载失败，可重试。",
-    },
-    {
-      id: "ja:ja-tools",
-      name: "ja-tools",
-      source: "ja",
-      description: "Ja 内置工具和桌面工作流能力。",
-      enabled: true,
-      status: "ready",
     },
   ],
   projectAvailable: true,
@@ -319,14 +309,70 @@ function PreviewThemeBridge({ children }: { children: React.ReactNode }): React.
 /** 受控分类保留真实导航行为，支持脚本逐分类截图、键盘切换和搜索定位。 */
 function SettingsStylePreview(): React.ReactElement {
   const [section, setSection] = useState<SettingsSection>("general");
+  const [projectId, setProjectId] = useState("ws_preview_a");
   const isEmptyState = new URLSearchParams(window.location.search).get("state") === "empty";
   return (
     <PreviewThemeBridge>
       <Settings
         snapshot={isEmptyState ? EMPTY_SETTINGS_STYLE_SNAPSHOT : SETTINGS_STYLE_SNAPSHOT}
         skillSettings={
-          isEmptyState ? { global: [], projectAvailable: false } : SETTINGS_STYLE_SKILLS
+          isEmptyState
+            ? { global: [], projectAvailable: false }
+            : {
+                ...SETTINGS_STYLE_SKILLS,
+                project:
+                  projectId === "ws_preview_a"
+                    ? SETTINGS_STYLE_SKILLS.project
+                    : [
+                        {
+                          ...SETTINGS_STYLE_SKILLS.project[0]!,
+                          id: "project:beta-rules",
+                          name: "beta-rules",
+                        },
+                      ],
+              }
         }
+        mcpSettings={
+          isEmptyState
+            ? { global: [], projectAvailable: false }
+            : {
+                global: SETTINGS_STYLE_SNAPSHOT.mcpServers,
+                project: [
+                  {
+                    ...SETTINGS_STYLE_SNAPSHOT.mcpServers[0]!,
+                    id: "mcp_project_preview",
+                    mcpRevision: "mcp_project_preview",
+                    name: projectId === "ws_preview_a" ? "项目 A 文件工具" : "项目 B 文件工具",
+                  },
+                ],
+                projectAvailable: true,
+                projectWorkspaceId: projectId,
+              }
+        }
+        projects={
+          isEmptyState
+            ? []
+            : [
+                {
+                  kind: "project",
+                  workspaceId: "ws_preview_a",
+                  legacySharedWorkspaceId: null,
+                  rootPath: "C:\\projects\\alpha",
+                  displayName: "Alpha",
+                  trust: "trusted",
+                },
+                {
+                  kind: "project",
+                  workspaceId: "ws_preview_b",
+                  legacySharedWorkspaceId: null,
+                  rootPath: "C:\\projects\\beta",
+                  displayName: "Beta",
+                  trust: "trusted",
+                },
+              ]
+        }
+        selectedProjectId={isEmptyState ? undefined : projectId}
+        onSelectProject={setProjectId}
         interfacePreferences={interfacePreferences}
         executionScope={{
           scopedDefault: "approval_required",

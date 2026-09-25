@@ -39,7 +39,7 @@ final class ConfigurationDocumentFactory {
                 .putNull("reasoning_level");
         root.putArray("providers");
         root.putArray("mcp_servers");
-        root.putArray("skills");
+        root.putArray("disabled_skills");
         return root;
     }
 
@@ -48,7 +48,7 @@ final class ConfigurationDocumentFactory {
         ObjectNode root = mapper.createObjectNode();
         root.put("schema_version", CURRENT_SCHEMA_VERSION);
         root.put("config_revision", 0);
-        root.putArray("skills");
+        root.putArray("disabled_skills");
         root.putArray("mcp_servers");
         return root;
     }

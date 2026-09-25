@@ -28,6 +28,9 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static io.github.kongweiguang.ja.transport.rpc.runtime.RpcRuntimeTestAccess.markReady;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -96,6 +99,34 @@ final class ThreadCompactionHandlerTest {
             JaRpcException failure = assertThrows(JaRpcException.class,
                     () -> harness.handler.handle(new RpcCommand(RpcMethod.THREAD_COMPACT, params)));
             assertEquals("INVALID_PARAMS", failure.errorCode());
+        }
+    }
+
+    /** 取消只触达本连接的活动摘要；ACK 不代替原请求的 CANCELLED 终态。 */
+    @Test
+    void cancelsActiveCompactionWithoutClosingSession() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch stopped = new CountDownLatch(1);
+        ContextCompactionUseCase useCase = (command, events, cancellation) -> {
+            try (var ignored = cancellation.onCancellation(stopped::countDown)) {
+                started.countDown();
+                if (!stopped.await(3, TimeUnit.SECONDS)) throw new AssertionError("cancel did not reach compaction");
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(failure);
+            }
+            throw new ContextCompactionUseCase.Failure(ContextCompactionUseCase.Code.CANCELLED);
+        };
+        try (Harness harness = new Harness(useCase)) {
+            CompletableFuture<Void> running = CompletableFuture.runAsync(() ->
+                    assertEquals("CANCELLED", assertThrows(JaRpcException.class,
+                            () -> harness.handler.handle(command(7))).errorCode()));
+            assertEquals(true, started.await(3, TimeUnit.SECONDS));
+            RpcCommand cancel = new RpcCommand(RpcMethod.THREAD_COMPACT_CANCEL,
+                    MAPPER.createObjectNode().put("threadId", "thr_test"));
+            assertEquals(true, harness.handler.handle(cancel).toCompletableFuture().join().path("accepted").booleanValue());
+            running.get(3, TimeUnit.SECONDS);
+            assertEquals(false, harness.handler.handle(cancel).toCompletableFuture().join().path("accepted").booleanValue());
         }
     }
 

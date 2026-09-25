@@ -10,6 +10,7 @@ use crate::app_server_process::protocol::{
     Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, contains_secret_marker,
     validate_initialize_params,
 };
+use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
@@ -87,6 +88,42 @@ where
 }
 
 impl SidecarConfig {
+    /// 将四个 Java-owned 目录编码为同一生产启动合同；CLI 与桌面由此共享数据位置，
+    /// 但进程身份及环境仍由各自可信宿主在连接时验证和绑定。
+    pub fn with_shared_directories(
+        executable: impl Into<PathBuf>,
+        home_dir: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+        run_dir: impl Into<PathBuf>,
+        log_dir: impl Into<PathBuf>,
+    ) -> Result<Self, AppServerProcessError> {
+        let mut config = Self::with_directories(executable, home_dir, data_dir, run_dir, log_dir);
+        let encoded = [
+            &config.home_dir,
+            &config.data_dir,
+            &config.run_dir,
+            &config.log_dir,
+        ]
+        .into_iter()
+        .map(|path| {
+            path.to_str()
+                .filter(|value| !value.is_empty())
+                .map(|value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value))
+                .ok_or(AppServerProcessError::InvalidConfig)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        config.args = [
+            format!("--home-dir-base64={}", encoded[0]),
+            format!("--data-dir-base64={}", encoded[1]),
+            format!("--run-dir-base64={}", encoded[2]),
+            format!("--log-dir-base64={}", encoded[3]),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        Ok(config)
+    }
+
     /// 创建 home/data/run/log 相互独立的 canonical 边界，并冻结创建时的宿主环境快照；
     /// Rust 不解析其内容，避免进程策略复制或改写 Java 配置事实。
     pub fn with_directories(
@@ -137,12 +174,12 @@ impl SidecarConfig {
     }
 
     /// 返回构造时冻结的 executable，spawn 不再信任外部可变 PathBuf。
-    pub(super) fn canonical_executable(&self) -> &PathBuf {
+    pub(crate) fn canonical_executable(&self) -> &PathBuf {
         &self.canonical_executable
     }
 
     /// 返回构造时冻结的 run directory，避免符号链接替换改变 sidecar 工作目录。
-    pub(super) fn canonical_run_dir(&self) -> &PathBuf {
+    pub(crate) fn canonical_run_dir(&self) -> &PathBuf {
         &self.canonical_run_dir
     }
 
@@ -222,6 +259,8 @@ impl SidecarConfig {
             contains_secret_marker(&value)
                 || value == "--ja-runtime-generation"
                 || value.starts_with("--ja-runtime-generation=")
+                || value == "--ja-transport"
+                || value.starts_with("--ja-transport=")
         }) {
             return Err(AppServerProcessError::InvalidConfig);
         }

@@ -159,8 +159,8 @@ export function StreamingStabilityBrowserFixture() {
             noProjectSelected={false}
             projectSectionCollapsed={false}
             historySectionCollapsed={false}
-            runtimeLabel="工作中"
-            runtimeTone="busy"
+            runtimeLabel={turn.status === "running" ? "工作中" : "已连接"}
+            runtimeTone={turn.status === "running" ? "busy" : "ready"}
             currentThreadId={THREAD_ID}
             threads={threads}
             historyBusy={historyBusy}
@@ -216,7 +216,7 @@ export function StreamingStabilityBrowserFixture() {
                   threadId={THREAD_ID}
                   workspaceId={WORKSPACE_ID}
                   runtimeGeneration={1}
-                  activeTurn
+                  activeTurn={turn.status === "running"}
                   onSend={() => undefined}
                 />
               </div>

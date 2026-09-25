@@ -17,6 +17,11 @@ public interface SkillCatalog {
      */
     Catalog discover(DiscoveryRequest request);
 
+    /** 管理页需要看见被同名来源覆盖的条目；普通实现可沿用胜出目录。 */
+    default List<SkillDescriptor> discoverAll(DiscoveryRequest request) {
+        return discover(request).skills();
+    }
+
     /**
      * 创建不扫描任何来源的空目录，供禁用 Skill 的 Provider 保持最小启动面。
      */

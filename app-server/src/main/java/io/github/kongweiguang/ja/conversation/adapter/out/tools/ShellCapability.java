@@ -3,6 +3,8 @@
 
 package io.github.kongweiguang.ja.conversation.adapter.out.tools;
 
+import io.github.kongweiguang.ja.conversation.domain.NativeExecutionSnapshot;
+
 import java.io.File;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
@@ -38,6 +40,19 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
     public static ShellCapability detectAndPreflight() {
         return detectAndPreflight(System.getProperty("os.name", ""), System.getenv(),
                 ShellProfile::preflight);
+    }
+
+    /**
+     * 每个 Turn 使用客户端冻结的环境重新探测，避免长驻后台把首个启动者的 PATH 和代理
+     * 误用于其他客户端；显式 Shell 路径失败时不偷偷切换方言。
+     */
+    public static ShellCapability forClient(NativeExecutionSnapshot context) {
+        Objects.requireNonNull(context, "context");
+        String osName = System.getProperty("os.name", "");
+        if (context.shell() == null) {
+            return detectAndPreflight(osName, context.environment(), ShellProfile::preflight);
+        }
+        return selectedAndPreflight(osName, context.environment(), context.shell(), ShellProfile::preflight);
     }
 
     /** 构造已验证能力，供组合边界和不启动真实进程的测试显式注入。 */
@@ -93,6 +108,57 @@ public record ShellCapability(ShellProfile.OperatingSystem os, String pathStyle,
             }
         }
         return unavailable(os, pathStyle);
+    }
+
+    /**
+     * 显式客户端 Shell 只接受当前平台已支持的方言和绝对可执行路径；拒绝未知名字
+     * 防止模型提示与真实启动器的语法分叉。
+     */
+    static ShellCapability selectedAndPreflight(String osName, Map<String, String> environment,
+                                                 String shell, Predicate<ShellProfile> preflight) {
+        Objects.requireNonNull(environment, "environment");
+        Objects.requireNonNull(preflight, "preflight");
+        String normalizedOs = Objects.requireNonNullElse(osName, "").toLowerCase(Locale.ROOT);
+        ShellProfile.OperatingSystem os = normalizedOs.contains("win")
+                ? ShellProfile.OperatingSystem.WINDOWS
+                : normalizedOs.contains("mac") || normalizedOs.contains("darwin")
+                ? ShellProfile.OperatingSystem.MACOS : ShellProfile.OperatingSystem.LINUX;
+        String pathStyle = os == ShellProfile.OperatingSystem.WINDOWS ? "windows" : "posix";
+        Path executable;
+        try {
+            executable = Path.of(Objects.requireNonNull(shell, "shell"));
+        } catch (InvalidPathException invalidPath) {
+            return unavailable(os, pathStyle);
+        }
+        Path fileName = executable.getFileName();
+        if (!executable.isAbsolute() || fileName == null) {
+            return unavailable(os, pathStyle);
+        }
+        String name = fileName.toString().toLowerCase(Locale.ROOT);
+        ShellProfile.Dialect dialect;
+        List<String> arguments;
+        if (os == ShellProfile.OperatingSystem.WINDOWS && name.equals("pwsh.exe")) {
+            dialect = ShellProfile.Dialect.POWERSHELL;
+            arguments = List.of("-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command");
+        } else if (os == ShellProfile.OperatingSystem.WINDOWS && name.equals("powershell.exe")) {
+            dialect = ShellProfile.Dialect.WINDOWS_POWERSHELL;
+            arguments = List.of("-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command");
+        } else if (os != ShellProfile.OperatingSystem.WINDOWS && name.equals("zsh")) {
+            dialect = ShellProfile.Dialect.ZSH;
+            arguments = List.of("-lc");
+        } else if (os != ShellProfile.OperatingSystem.WINDOWS && name.equals("bash")) {
+            dialect = ShellProfile.Dialect.BASH;
+            arguments = List.of("-lc");
+        } else {
+            return unavailable(os, pathStyle);
+        }
+        ShellProfile candidate = new ShellProfile(os, dialect, executable, arguments, pathStyle,
+                ShellProcessEnvironment.capture(os, environment));
+        try {
+            return preflight.test(candidate) ? available(candidate) : unavailable(os, pathStyle);
+        } catch (RuntimeException ignored) {
+            return unavailable(os, pathStyle);
+        }
     }
 
     /** PowerShell 7 优先；只有所有 pwsh 候选失败后才尝试 Windows PowerShell 5.1。 */

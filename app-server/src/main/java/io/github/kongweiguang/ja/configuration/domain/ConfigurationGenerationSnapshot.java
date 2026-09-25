@@ -19,7 +19,7 @@ public interface ConfigurationGenerationSnapshot {
     /** 返回不透明代际标识。 */
     String generationId();
 
-    /** 返回冻结的 Skill 定义。 */
+    /** 返回冻结的 Skill 停用引用；发现目录会据此排除来源后再处理同名覆盖。 */
     List<Skill> skillDefinitions();
 
     /** 返回冻结的 MCP 定义。 */
@@ -66,7 +66,7 @@ public interface ConfigurationGenerationSnapshot {
     Model requireModel(String providerId, String modelId);
 
     /**
-     * 冻结来源限定的 Skill 授权；描述与正文仍从本 Turn 的发现结果取得，防止配置副本漂移。
+     * 冻结来源限定的 Skill 停用身份；描述与正文仍从本 Turn 的发现结果取得。
      */
     record Skill(SkillReference reference) {
         /** 防御性拒绝空引用，Turn 不得从不完整配置猜测来源。 */
@@ -135,21 +135,16 @@ public interface ConfigurationGenerationSnapshot {
         }
     }
 
-    /** Provider 级 Agent 默认值不参与连接身份，可被项目层单调收紧。 */
-    record AgentDefaults(Context context, TurnLimits turnLimits) {
+    /** Provider 级 Agent 默认值只保留实际可配置的上下文压缩开关。 */
+    record AgentDefaults(Context context) {
         /** 只冻结真实 Provider 默认值；目录开关从根级代际读取。 */
         public AgentDefaults {
             Objects.requireNonNull(context, "context");
-            Objects.requireNonNull(turnLimits, "turnLimits");
         }
     }
 
     /** 压缩策略只暴露用户可控开关，算法阈值由应用版本统一管理。 */
     record Context(boolean autoCompact) {
-    }
-
-    /** Agent Loop 的轮次、Tool 调用和墙钟截止约束。 */
-    record TurnLimits(int maxModelRounds, int maxToolCalls, Duration wallTimeout) {
     }
 
     /** Provider 网络连接和完整请求的独立超时。 */

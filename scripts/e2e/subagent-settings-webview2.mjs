@@ -272,7 +272,7 @@ async function writeSettings(directories, provider) {
     "clarification_enabled = true",
     "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
     "mcp_servers = []",
-    "skills = []",
+    "disabled_skills = []",
     "",
     "[[providers]]",
     'provider_id = "provider_subagent_e2e"',
@@ -286,10 +286,6 @@ async function writeSettings(directories, provider) {
     "[providers.agent_defaults]",
     "[providers.agent_defaults.context]",
     "auto_compact = true",
-    "[providers.agent_defaults.turn_limits]",
-    "max_model_rounds = 8",
-    "max_tool_calls = 16",
-    "wall_timeout_ms = 30000",
     "[[providers.models]]",
     'model_id = "model_parent"',
     'name = "Parent Model"',
@@ -357,7 +353,7 @@ async function createDirectories() {
     local: join(root, "appdata", "local"),
     artifacts: resolve(
       process.env.JA_E2E_SUBAGENT_SETTINGS_ARTIFACT_DIR ??
-        repoPath("src-tauri/target/subagent-settings-evidence"),
+        repoPath("target/subagent-settings-evidence"),
     ),
   };
   await Promise.all(Object.values(directories).map((path) => mkdir(path, { recursive: true })));
@@ -385,8 +381,8 @@ async function resolveJava25() {
 
 /** 读取生产窗口事实，只替换本轮 dev origin/CSP/identifier。 */
 async function writeTauriOverlay(directories, frontendPort, useEdgeDriver) {
-  const base = JSON.parse(await readFile(repoPath("src-tauri/tauri.conf.json"), "utf8"));
-  const windows = JSON.parse(await readFile(repoPath("src-tauri/tauri.windows.conf.json"), "utf8"));
+  const base = JSON.parse(await readFile(repoPath("apps/desktop/src-tauri/tauri.conf.json"), "utf8"));
+  const windows = JSON.parse(await readFile(repoPath("apps/desktop/src-tauri/tauri.windows.conf.json"), "utf8"));
   const baseWindow = base?.app?.windows?.find((candidate) => candidate?.label === "main");
   const windowsWindow = windows?.app?.windows?.find((candidate) => candidate?.label === "main");
   if (!baseWindow) throw new Error("生产 main window 配置缺失");
@@ -468,7 +464,7 @@ function buildEnvironment(directories, ports, java, provider, tauriConfig, edgeD
       process.env.JA_E2E_APP_SERVER_JAR?.trim() || repoPath("app-server/target/ja-app-server.jar"),
     ),
     CARGO_TARGET_DIR: resolve(
-      process.env.JA_E2E_CARGO_TARGET_DIR?.trim() || repoPath("src-tauri/target/subagent-settings"),
+      process.env.JA_E2E_CARGO_TARGET_DIR?.trim() || repoPath("target/subagent-settings"),
     ),
     NO_PROXY: ["127.0.0.1", "localhost", "::1", process.env.NO_PROXY]
       .filter((value) => typeof value === "string" && value.trim().length > 0)

@@ -183,8 +183,12 @@ export function ConversationWorkspace({
   interactionPort,
   onOpenGoal,
 }: ConversationWorkspaceProps): ReactElement {
-  const { boot, turnAdmissionReady, runtimeState } = useRuntimeState();
-  const { queryRuntime } = useRuntimeLifecycle();
+  const { boot, turnAdmissionReady, runtimeState, pendingClientOperations } = useRuntimeState();
+  const { queryRuntime, recheckPendingOperations, acknowledgePendingOperation } =
+    useRuntimeLifecycle();
+  const [recheckedPendingId, setRecheckedPendingId] = useState<string>();
+  const [confirmPendingId, setConfirmPendingId] = useState<string>();
+  const [acknowledgedUnknownNotice, setAcknowledgedUnknownNotice] = useState<string>();
   const turnPort = useRuntimeTurns();
   // 后台对账提示沿用现有 inline error 展示，不新增常驻控件或改变 Composer 的发送准入。
   const visibleConversationError = conversation.error ?? conversation.backgroundError;
@@ -654,6 +658,9 @@ export function ConversationWorkspace({
   // 生命周期故障统一在侧栏解释，避免同一原因再次占据对话正文。
   const scopeError =
     boot.status === "ready" || boot.status === "busy" ? workspace.error : undefined;
+  const pendingOperationForThread = pendingClientOperations.find(
+    (record) => record.threadId === null || record.threadId === conversation.currentThreadId,
+  );
 
   /** Composer 可用性只作为壳层快捷键 capability 发布，卸载时立即撤销。 */
   useEffect(() => {
@@ -852,6 +859,7 @@ export function ConversationWorkspace({
             showCompactAction={conversation.canCompact}
             compaction={conversation.compaction}
             onCompact={conversation.compact}
+            onCancelCompaction={conversation.cancelCompaction}
             onDismissFeedback={conversation.dismissCompactionFeedback}
           />
           {inspectorOpen ? null : (
@@ -868,6 +876,70 @@ export function ConversationWorkspace({
       {scopeError === undefined ? null : (
         <p className="ja-inline-error" role="alert">
           {scopeError}
+        </p>
+      )}
+      {pendingOperationForThread !== undefined && (
+        <div className="ja-inline-attention" role="status">
+          上一次操作结果待核实，可能已产生副作用。
+          {pendingOperationForThread.threadId === null
+            ? "审批可能属于其他会话，请检查相关会话。"
+            : "请先查看当前会话状态。"}
+          <button
+            className="ja-button ja-button-sm ja-button-ghost"
+            type="button"
+            onClick={() =>
+              void recheckPendingOperations()
+                .then((pending) => {
+                  if (
+                    pending.some(
+                      (record) =>
+                        record.clientOperationId === pendingOperationForThread.clientOperationId,
+                    )
+                  )
+                    setRecheckedPendingId(pendingOperationForThread.clientOperationId);
+                })
+                .catch(() => undefined)
+            }
+          >
+            重新检查
+          </button>
+          {recheckedPendingId === pendingOperationForThread.clientOperationId &&
+            confirmPendingId !== pendingOperationForThread.clientOperationId && (
+              <button
+                className="ja-button ja-button-sm ja-button-ghost"
+                type="button"
+                onClick={() => setConfirmPendingId(pendingOperationForThread.clientOperationId)}
+              >
+                我已检查，允许新操作
+              </button>
+            )}
+          {confirmPendingId === pendingOperationForThread.clientOperationId && (
+            <span>
+              原操作仍可能已经执行。确认后仅解除本机阻挡，不会重发原请求。
+              <button
+                className="ja-button ja-button-sm ja-button-ghost"
+                type="button"
+                onClick={() =>
+                  void acknowledgePendingOperation(pendingOperationForThread.clientOperationId)
+                    .then((outcome) => {
+                      setConfirmPendingId(undefined);
+                      if (outcome.status === "unknown_acknowledged")
+                        setAcknowledgedUnknownNotice(
+                          "已解除本机阻挡；原操作是否执行仍未确认。请避免重复同一副作用。",
+                        );
+                    })
+                    .catch(() => undefined)
+                }
+              >
+                确认解除阻挡
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+      {acknowledgedUnknownNotice !== undefined && (
+        <p className="ja-inline-error" role="status">
+          {acknowledgedUnknownNotice}
         </p>
       )}
       {visibleConversationError === undefined ? null : (
@@ -900,6 +972,10 @@ export function ConversationWorkspace({
         ) : (
           <ConversationTimelineSurface
             threadId={threadId === "" ? undefined : threadId}
+            hasOlderHistory={conversation.hasOlderHistory}
+            loadingOlderHistory={conversation.loadingOlderHistory}
+            olderHistoryError={conversation.olderHistoryError}
+            onLoadOlderHistory={conversation.loadOlderHistory}
             scrollCache={timelineScrollCache}
             disclosureCache={timelineDisclosureCache}
             answeredRequest={clarification.answeredRequest}
@@ -920,6 +996,8 @@ export function ConversationWorkspace({
             onOpenLink={onOpenLink}
             onOpenFile={onOpenFile}
             onCopyText={onCopyText}
+            onReadMessageContent={conversation.readMessageContent}
+            onReadAnswerContent={conversation.readAnswerContent}
             onOpenAttachmentPreview={
               onOpenAttachmentPreview === undefined
                 ? undefined

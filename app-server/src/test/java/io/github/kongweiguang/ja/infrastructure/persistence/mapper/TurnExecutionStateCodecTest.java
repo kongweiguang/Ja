@@ -11,8 +11,6 @@ import io.github.kongweiguang.ja.conversation.domain.turn.TurnExecutionState;
 import io.github.kongweiguang.ja.foundation.error.StorageException;
 import org.junit.jupiter.api.Test;
 
-import java.time.Instant;
-import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,8 +24,7 @@ final class TurnExecutionStateCodecTest {
     @Test
     void roundTripsEveryExecutionVariant() {
         TurnExecutionState.Common common = new TurnExecutionState.Common(2, 3, 4, "checkpoint_1",
-                List.of(new TurnExecutionState.ActiveSkill("skill_java")),
-                Instant.parse("2026-09-01T00:17:00Z"),
+                List.of(new TurnExecutionState.ActiveSkill("ja:java")),
                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.GOAL_CONTINUATION);
         TurnExecutionState.Ready ready = new TurnExecutionState.Ready(common,
                 TurnExecutionState.Next.ASSISTANT, null);
@@ -55,7 +52,7 @@ final class TurnExecutionStateCodecTest {
     @Test
     void rejectsUnknownFieldsAndVersions() {
         TurnExecutionState.Common common = new TurnExecutionState.Common(0, 0, 1,
-                null, List.of(), Instant.parse("2026-09-01T00:01:00Z"),
+                null, List.of(),
                 io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.USER);
         String valid = codec.write(new TurnExecutionState.Ready(
                 common, TurnExecutionState.Next.ASSISTANT, null));
@@ -64,16 +61,16 @@ final class TurnExecutionStateCodecTest {
         assertThrows(StorageException.class, () -> codec.read(valid.replace("\"schemaVersion\":1", "\"schemaVersion\":2")));
     }
 
-    /** 挂起时冻结的活动预算必须独立于 wall-clock deadline 无损恢复。 */
+    /** 挂起恢复只依赖已提交的游标，旧时间预算不能再成为持久事实。 */
     @Test
-    void preservesPausedActiveBudget() {
+    void persistsCursorWithoutTurnBudget() {
         TurnExecutionState.Common common = new TurnExecutionState.Common(1, 2, 3, null, List.of(),
-                Instant.parse("2026-09-10T00:20:00Z"),
-                io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION,
-                Duration.ofSeconds(17));
+                io.github.kongweiguang.ja.conversation.domain.turn.TurnOrigin.PLAN_EXECUTION);
         TurnExecutionState.Ready state = new TurnExecutionState.Ready(
                 common, TurnExecutionState.Next.ASSISTANT, null);
         assertEquals(state, codec.read(codec.write(state)));
+        org.junit.jupiter.api.Assertions.assertFalse(codec.write(state).contains("Budget"));
+        org.junit.jupiter.api.Assertions.assertFalse(codec.write(state).contains("deadlineAt"));
     }
 
     /** ProviderPending 冻结完整非敏感请求画像，恢复时不依赖可变的 Turn 级 runtime。 */

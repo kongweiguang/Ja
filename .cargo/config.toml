@@ -1,6 +1,6 @@
 # @author kongweiguang
 
-# Preserve the established Tauri/CI artifact location after introducing a
-# workspace; all members must share one target tree for reproducible builds.
+# Desktop and CLI share the workspace target tree; neither application owns
+# the other's build output. Explicit isolated target directories remain supported.
 [build]
-target-dir = "src-tauri/target"
+target-dir = "target"

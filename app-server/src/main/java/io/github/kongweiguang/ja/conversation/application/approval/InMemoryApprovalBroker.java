@@ -156,6 +156,13 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
      */
     @Override
     public boolean resolve(String approvalId, ApprovalDecision response, Instant resolvedAt) {
+        return resolve(approvalId, response, resolvedAt, null, null);
+    }
+
+    /** 外部响应把操作身份送入持久决定闸门；内存 pending 仅决定谁能唤醒原 waiter。 */
+    @Override
+    public boolean resolve(String approvalId, ApprovalDecision response, Instant resolvedAt,
+                           String clientOperationId, String requestFingerprint) {
         Objects.requireNonNull(approvalId, "approvalId");
         Objects.requireNonNull(response, "response");
         Objects.requireNonNull(resolvedAt, "resolvedAt");
@@ -170,7 +177,7 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
             finishDurably(approval, ApprovalDecision.DENY, approval.request.expiresAt());
             return false;
         }
-        return finishDurably(approval, response, resolvedAt);
+        return finishDurably(approval, response, resolvedAt, clientOperationId, requestFingerprint);
     }
 
     /**
@@ -248,12 +255,21 @@ public final class InMemoryApprovalBroker implements ApprovalBroker, AutoCloseab
 
     /** 自动拒绝与外部响应共享 persist-before-wake；失败保留 waiter 供恢复或后续重试。 */
     private boolean finishDurably(PendingApproval approval, ApprovalDecision response, Instant resolvedAt) {
+        return finishDurably(approval, response, resolvedAt, null, null);
+    }
+
+    /** 决定提交和 ledger 使用同一个 Repository 事务；成功后才完成内存 Future。 */
+    private boolean finishDurably(PendingApproval approval, ApprovalDecision response, Instant resolvedAt,
+                                  String clientOperationId, String requestFingerprint) {
         if (!approval.resolving.compareAndSet(false, true)) return false;
         try {
             if (approval.finished.get()) return false;
             DecisionStore durable = decisionStore.get();
             return durable != null
-                    && durable.persist(approval.request.approvalId(), response, resolvedAt)
+                    && (clientOperationId == null
+                            ? durable.persist(approval.request.approvalId(), response, resolvedAt)
+                            : durable.persist(approval.request.approvalId(), response, resolvedAt,
+                                    clientOperationId, requestFingerprint))
                     && finish(approval, response, resolvedAt);
         } finally {
             approval.resolving.set(false);

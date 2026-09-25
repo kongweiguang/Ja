@@ -53,6 +53,11 @@ import java.util.Set;
 
 /** V1 Goal/Plan SQLite adapter；所有公开 mutation 由同一 MyBatis session transaction 包围。 */
 public final class MybatisGoalRepository implements GoalRepository {
+    private static final String GOAL_SELECT = "SELECT goals.*, COALESCE((SELECT count FROM "
+            + "goal_no_progress_counts WHERE goal_id=goals.goal_id),"
+            + "goals.progress_turns_without_change) AS progress_count,"
+            + "COALESCE((SELECT count FROM goal_repeated_failure_counts WHERE goal_id=goals.goal_id),"
+            + "goals.repeated_failure_count) AS failure_count FROM goals";
     private final GoalUnitOfWork transactions;
     private final ObjectMapper json;
 
@@ -71,7 +76,7 @@ public final class MybatisGoalRepository implements GoalRepository {
     /** Goal 创建原子冻结 definition、criteria、Goal-only run 与首事件。 */
     @Override public Goal create(CreateGoal command) {
         return transactions.required(c -> {
-            Goal replay = queryOne(c, "SELECT * FROM goals WHERE owner_thread_id=? AND create_idempotency_key=?", this::mapGoal, command.ownerThreadId(), command.idempotencyKey());
+            Goal replay = queryOne(c, GOAL_SELECT + " WHERE owner_thread_id=? AND create_idempotency_key=?", this::mapGoal, command.ownerThreadId(), command.idempotencyKey());
             if (replay != null) return replay;
             Owner owner = queryOne(c, "SELECT t.revision,l.task_kind,l.lifecycle FROM threads t LEFT JOIN thread_lineage l ON l.child_thread_id=t.thread_id WHERE t.thread_id=? AND t.deleted_at IS NULL",
                     r -> new Owner(r.getLong(1), r.getString(2), r.getString(3)), command.ownerThreadId());
@@ -85,6 +90,8 @@ public final class MybatisGoalRepository implements GoalRepository {
             String at = at(command.at());
             one(update(c, "INSERT INTO goals(goal_id,owner_thread_id,owner_kind,objective,goal_definition_revision,create_idempotency_key,status,phase,revision,active_run_id,created_at,updated_at) VALUES(?,?,?,?,1,?,'ACTIVE','WORKING',0,?,?,?)",
                     command.goalId(), command.ownerThreadId(), command.ownerKind().name(), command.objective(), command.idempotencyKey(), command.runId(), at, at));
+            one(update(c, "INSERT INTO goal_no_progress_counts(goal_id,count) VALUES(?,0)", command.goalId()));
+            one(update(c, "INSERT INTO goal_repeated_failure_counts(goal_id,count) VALUES(?,0)", command.goalId()));
             one(update(c, "INSERT INTO goal_definition_revisions(goal_id,revision_number,objective,created_at) VALUES(?,1,?,?)", command.goalId(), command.objective(), at));
             for (int i=0;i<command.acceptanceCriteria().size();i++) {
                 AcceptanceCriterion item=command.acceptanceCriteria().get(i);
@@ -114,7 +121,7 @@ public final class MybatisGoalRepository implements GoalRepository {
         });
     }
     /** 按 identity 读取 Goal。 */
-    @Override public Optional<Goal> findGoal(String goalId) { return transactions.required(c->Optional.ofNullable(queryOne(c,"SELECT * FROM goals WHERE goal_id=?",this::mapGoal,goalId))); }
+    @Override public Optional<Goal> findGoal(String goalId) { return transactions.required(c->Optional.ofNullable(queryOne(c,GOAL_SELECT + " WHERE goal_id=?",this::mapGoal,goalId))); }
     /** 精确读取 Goal definition revision。 */
     @Override public GoalDefinition readGoalDefinition(String goalId, long revision) { return transactions.required(c->definition(c,goalId,revision)); }
     /** 单事务组装 Goal snapshot。 */
@@ -229,11 +236,11 @@ public final class MybatisGoalRepository implements GoalRepository {
     /** 批准只记录 USER_UI decision。 */
     @Override public Plan approve(ApprovePlan command) { return planMutation(command.planId(),command.expectedPlanRevision(),command.idempotencyKey(),Set.of("plan_approved"),c->{Plan before=requirePlan(c,command.planId());if(before.status()!=PlanStatus.AWAITING_APPROVAL)throw invalid("Plan is not awaiting approval");PlanRevision rev=requireLatest(c,command.planId(),command.planRevisionId(),command.planHash());one(update(c,"INSERT INTO plan_approvals(approval_id,plan_id,plan_revision_id,plan_hash,actor,decision,created_at) VALUES(?,?,?,?,'USER_UI','APPROVED',?)",command.approvalId(),command.planId(),rev.planRevisionId(),rev.planHash(),at(command.at())));planCas(c,before,PlanStatus.APPROVED,rev.planRevisionId(),null,command.at());planEvent(c,command.planId(),before.revision()+1,"plan_approved",command.eventId(),command.idempotencyKey(),at(command.at()));return requirePlan(c,command.planId());}); }
     /**
-     * 执行是唯一的用户授权边界：AWAITING_APPROVAL 在此事务内同时写入审计、Run 和冻结预算，
+     * 执行是唯一的用户授权边界：AWAITING_APPROVAL 在此事务内同时写入审计与 Run，
      * 防止前端先批准再执行造成双击、丢响应或版本竞态；APPROVED 仅用于恢复既有数据库事实。
      */
-    @Override public Plan executePlan(ExecutePlan command) { return planMutation(command.planId(),command.expectedPlanRevision(),command.idempotencyKey(),Set.of("plan_execution_started"),c->{Plan before=requirePlan(c,command.planId());requireOwnerAdmissionOpen(c,before.ownerThreadId());if(before.status()!=PlanStatus.AWAITING_APPROVAL&&before.status()!=PlanStatus.APPROVED)throw invalid("Plan is not ready to execute");requireNoActiveGoalForPlan(c, command.planId());requireNoActiveStandaloneRun(c, command.planId());PlanRevision rev=before.status()==PlanStatus.AWAITING_APPROVAL?requireLatest(c,command.planId(),command.planRevisionId(),command.planHash()):requireApproved(c,command.planId(),command.planRevisionId(),command.planHash());if(before.status()==PlanStatus.AWAITING_APPROVAL)one(update(c,"INSERT INTO plan_approvals(approval_id,plan_id,plan_revision_id,plan_hash,actor,decision,created_at) VALUES(?,?,?,?,'USER_UI','APPROVED',?)",command.approvalId(),command.planId(),rev.planRevisionId(),rev.planHash(),at(command.at())));insertRun(c,command.runId(),null,command.planId(),null,rev.planRevisionId(),rev.planHash(),command.processGeneration(),at(command.at()));freezePlanBudget(c,command);insertSteps(c,command.runId(),rev,command.at());planCas(c,before,PlanStatus.EXECUTING,rev.planRevisionId(),command.runId(),command.at());planEvent(c,command.planId(),before.revision()+1,"plan_execution_started",command.eventId(),command.idempotencyKey(),at(command.at()));return requirePlan(c,command.planId());}); }
-    /** 未完成 Turn 进入可恢复暂停；原 Run、冻结预算和 revision 保留，继续动作不会重置累计用量。 */
+    @Override public Plan executePlan(ExecutePlan command) { return planMutation(command.planId(),command.expectedPlanRevision(),command.idempotencyKey(),Set.of("plan_execution_started"),c->{Plan before=requirePlan(c,command.planId());requireOwnerAdmissionOpen(c,before.ownerThreadId());if(before.status()!=PlanStatus.AWAITING_APPROVAL&&before.status()!=PlanStatus.APPROVED)throw invalid("Plan is not ready to execute");requireNoActiveGoalForPlan(c, command.planId());requireNoActiveStandaloneRun(c, command.planId());PlanRevision rev=before.status()==PlanStatus.AWAITING_APPROVAL?requireLatest(c,command.planId(),command.planRevisionId(),command.planHash()):requireApproved(c,command.planId(),command.planRevisionId(),command.planHash());if(before.status()==PlanStatus.AWAITING_APPROVAL)one(update(c,"INSERT INTO plan_approvals(approval_id,plan_id,plan_revision_id,plan_hash,actor,decision,created_at) VALUES(?,?,?,?,'USER_UI','APPROVED',?)",command.approvalId(),command.planId(),rev.planRevisionId(),rev.planHash(),at(command.at())));insertRun(c,command.runId(),null,command.planId(),null,rev.planRevisionId(),rev.planHash(),command.processGeneration(),at(command.at()));insertSteps(c,command.runId(),rev,command.at());planCas(c,before,PlanStatus.EXECUTING,rev.planRevisionId(),command.runId(),command.at());planEvent(c,command.planId(),before.revision()+1,"plan_execution_started",command.eventId(),command.idempotencyKey(),at(command.at()));return requirePlan(c,command.planId());}); }
+    /** 未完成 Turn 进入可恢复暂停；原 Run 与 revision 保留，继续动作不会重置累计用量。 */
     @Override public Plan settlePlanExecution(SettlePlanExecution command) { return planMutation(command.planId(),command.expectedPlanRevision(),command.idempotencyKey(),Set.of("plan_execution_incomplete"),c->{Plan before=requirePlan(c,command.planId());if((before.status()!=PlanStatus.EXECUTING&&before.status()!=PlanStatus.VERIFYING)||!Objects.equals(before.activeRunId(),command.runId()))return before;settleOrAbandonPlanClaims(c,command.runId());transitionRun(c,command.runId(),"PAUSED",command.at());planCas(c,before,PlanStatus.PAUSED,before.activePlanRevisionId(),before.activeRunId(),command.at());planEvent(c,command.planId(),before.revision()+1,"plan_execution_incomplete",command.eventId(),command.idempotencyKey(),at(command.at()));return requirePlan(c,command.planId());}); }
     /** 原子领取一个隐藏 Turn；预算耗尽时在同一事务暂停 Plan，不能靠重启清零计数。 */
     @Override public Optional<PlanTurnClaim> claimPlanTurn(ClaimPlanTurn command) {
@@ -246,122 +253,46 @@ public final class MybatisGoalRepository implements GoalRepository {
             ClaimRow existing = queryOne(c, "SELECT ordinal,state FROM plan_turn_claims WHERE run_id=? AND turn_id=?",
                     r -> new ClaimRow(r.getInt(1), r.getString(2)), command.runId(), command.turnId());
             if (existing != null && "CLAIMED".equals(existing.state())) {
-                RunBudget existingBudget = queryOne(c,
-                        "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                                + "max_model_rounds,max_tool_calls,wall_budget_millis,"
+                RunState existingRun = queryOne(c,
+                        "SELECT status,plan_id,plan_revision_id,pause_requested,"
                                 + "used_model_rounds,used_tool_calls,used_active_millis "
-                                + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, command.runId());
-                if (existingBudget == null) return Optional.empty();
+                                + "FROM execution_runs WHERE run_id=?", this::mapRunState, command.runId());
+                if (existingRun == null) return Optional.empty();
                 return Optional.of(new PlanTurnClaim(command.planId(), command.runId(),
-                        command.planRevisionId(), command.turnId(), existing.ordinal(),
-                        Math.max(0, existingBudget.turnBudget() - existingBudget.turnsUsed()),
-                        remaining(existingBudget.maxModelRounds(), existingBudget.usedModelRounds()),
-                        remaining(existingBudget.maxToolCalls(), existingBudget.usedToolCalls()),
-                        remaining(existingBudget.wallBudgetMillis(), existingBudget.usedActiveMillis())));
+                        command.planRevisionId(), command.turnId(), existing.ordinal()));
             }
             // SETTLED/ABANDONED claim 已经有终态事实，不能让重试用同一 turnId 重新执行。
             if (existing != null) return Optional.empty();
             Integer activeClaim = queryOne(c, "SELECT 1 FROM plan_turn_claims WHERE run_id=? AND state='CLAIMED' LIMIT 1",
                     r -> r.getInt(1), command.runId());
             if (activeClaim != null) return Optional.empty();
-            RunBudget budget = queryOne(c,
-                    "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                            + "max_model_rounds,max_tool_calls,wall_budget_millis,"
+            RunState run = queryOne(c,
+                    "SELECT status,plan_id,plan_revision_id,pause_requested,"
                             + "used_model_rounds,used_tool_calls,used_active_millis "
-                            + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, command.runId());
-            if (budget == null || !Objects.equals(budget.planId(), command.planId())
-                    || !Objects.equals(budget.planRevision(), command.planRevisionId())
-                    || !"RUNNING".equals(budget.status()) || budget.pauseRequested()) return Optional.empty();
-            if (budget.turnsUsed() >= budget.turnBudget() || exhausted(budget)) {
-                if (before.status() == PlanStatus.EXECUTING) {
-                    transitionRun(c, command.runId(), "PAUSED", command.at());
-                    planCas(c, before, PlanStatus.PAUSED, before.activePlanRevisionId(), before.activeRunId(), command.at());
-                    planEvent(c, command.planId(), before.revision() + 1, "plan_budget_exhausted",
-                            command.eventId(), command.idempotencyKey(), at(command.at()));
-                }
-                return Optional.empty();
-            }
-            int ordinal = budget.turnsUsed() + 1;
-            one(update(c, "UPDATE execution_runs SET turns_used=turns_used+1,updated_at=? "
-                    + "WHERE run_id=? AND status='RUNNING' AND pause_requested=0 AND turns_used=?",
-                    at(command.at()), command.runId(), budget.turnsUsed()));
+                            + "FROM execution_runs WHERE run_id=?", this::mapRunState, command.runId());
+            if (run == null || !Objects.equals(run.planId(), command.planId())
+                    || !Objects.equals(run.planRevision(), command.planRevisionId())
+                    || !"RUNNING".equals(run.status()) || run.pauseRequested()) return Optional.empty();
+            int ordinal = Math.toIntExact(scalar(c,
+                    "SELECT COALESCE(MAX(ordinal),0)+1 FROM plan_turn_claims WHERE run_id=?", command.runId()));
+            one(update(c, "UPDATE execution_runs SET updated_at=? "
+                    + "WHERE run_id=? AND status='RUNNING' AND pause_requested=0",
+                    at(command.at()), command.runId()));
             one(update(c, "INSERT INTO plan_turn_claims(run_id,turn_id,ordinal,claimed_at) VALUES(?,?,?,?)",
                     command.runId(), command.turnId(), ordinal, at(command.at())));
             return Optional.of(new PlanTurnClaim(command.planId(), command.runId(), command.planRevisionId(),
-                    command.turnId(), ordinal, budget.turnBudget() - ordinal,
-                    remaining(budget.maxModelRounds(), budget.usedModelRounds()),
-                    remaining(budget.maxToolCalls(), budget.usedToolCalls()),
-                    remaining(budget.wallBudgetMillis(), budget.usedActiveMillis())));
+                    command.turnId(), ordinal));
         });
     }
 
-    /** 首次 Plan Turn 原子冻结 RuntimeLease limits；turn_budget 是唯一 anti-loop 预算列。 */
-    @Override public void initializePlanBudget(InitializePlanBudget command) {
-        if (command.maxModelRounds() < 1 || command.maxToolCalls() < 0
-                || command.wallBudgetMillis() <= 0 || command.antiLoopTurnBudget() < 1) {
-            throw invalid("Plan execution budget is invalid");
-        }
-        transactions.required(c -> {
-            int changed = update(c, "UPDATE execution_runs SET max_model_rounds=?,max_tool_calls=?,"
-                            + "wall_budget_millis=?,turn_budget=?,updated_at=? "
-                    + "WHERE run_id=? AND plan_id=? AND max_model_rounds IS NULL",
-                    command.maxModelRounds(), command.maxToolCalls(), command.wallBudgetMillis(),
-                    command.antiLoopTurnBudget(), at(command.at()), command.runId(), command.planId());
-            if (changed == 1) return null;
-            Integer rounds = queryOne(c, "SELECT max_model_rounds FROM execution_runs WHERE run_id=? AND plan_id=?",
-                    r -> r.getInt(1), command.runId(), command.planId());
-            if (rounds == null) throw invalid("Plan execution run is unavailable");
-            Integer tools = queryOne(c, "SELECT max_tool_calls FROM execution_runs WHERE run_id=?",
-                    r -> r.getInt(1), command.runId());
-            Long wall = queryOne(c, "SELECT wall_budget_millis FROM execution_runs WHERE run_id=?",
-                    r -> r.getLong(1), command.runId());
-            Integer antiLoop = queryOne(c, "SELECT turn_budget FROM execution_runs WHERE run_id=?",
-                    r -> r.getInt(1), command.runId());
-            if (tools == null || wall == null || antiLoop == null
-                    || rounds != command.maxModelRounds() || tools != command.maxToolCalls()
-                    || wall != command.wallBudgetMillis() || antiLoop != command.antiLoopTurnBudget()) {
-                throw invalid("Plan execution budget conflicts with frozen limits");
-            }
-            return null;
-        });
-    }
-
-    /** execute 事务内冻结服务端解析的预算，防止首个 Turn 前配置刷新改变 Run 上限。 */
-    private void freezePlanBudget(Connection c, ExecutePlan command) throws SQLException {
-        one(update(c, "UPDATE execution_runs SET max_model_rounds=?,max_tool_calls=?,"
-                        + "wall_budget_millis=?,turn_budget=?,updated_at=? WHERE run_id=? AND plan_id=?",
-                command.maxModelRounds(), command.maxToolCalls(), command.wallBudgetMillis(),
-                command.turnBudget(), at(command.at()), command.runId(), command.planId()));
-    }
-
-    /** 只读返回冻结 Run 的剩余模型、Tool 和墙钟预算，缺失冻结值时 fail closed。 */
-    @Override public Optional<PlanRunBudget> readPlanRunBudget(String planId, String runId) {
-        return transactions.required(c -> {
-            RunBudget budget = queryOne(c,
-                    "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                            + "max_model_rounds,max_tool_calls,wall_budget_millis,"
-                            + "used_model_rounds,used_tool_calls,used_active_millis "
-                            + "FROM execution_runs WHERE run_id=? AND plan_id=?", this::mapRunBudget, runId, planId);
-            if (budget == null || budget.maxModelRounds() == null || budget.maxToolCalls() == null
-                    || budget.wallBudgetMillis() == null) return Optional.empty();
-            return Optional.of(new PlanRunBudget(planId, runId,
-                    remaining(budget.maxModelRounds(), budget.usedModelRounds()),
-                    remaining(budget.maxToolCalls(), budget.usedToolCalls()),
-                    remaining(budget.wallBudgetMillis(), budget.usedActiveMillis())));
-        });
-    }
-
-    /**
-     * Turn 终态只结算一次：plan_events 的唯一幂等键先挡住重试，再从 usage/tools 账本读取真实计数，
-     * 通过 CAS 累加 Run 预算；超额时一并写 pause fence 和 Plan PAUSED，避免进程内计数被重启绕过。
-     */
+    /** Turn 终态只结算一次，实际模型、Tool 和活动时间继续记账但不作停机门。 */
     @Override public void settlePlanTurn(SettlePlanTurn command) {
         transactions.required(c -> {
             PlanSettlementContext context = planSettlementContext(c, command.planId(), command.runId(),
                     command.idempotencyKey());
             if (context == null) return null;
             Plan before = context.plan();
-            RunBudget budget = context.budget();
+            RunState run = context.run();
             Integer claimed = queryOne(c, "SELECT 1 FROM plan_turn_claims WHERE run_id=? AND turn_id=? AND state='CLAIMED'",
                     r -> r.getInt(1), command.runId(), command.turnId());
             if (claimed == null) return null;
@@ -370,31 +301,15 @@ public final class MybatisGoalRepository implements GoalRepository {
                     command.turnId()));
             int toolCalls = Math.toIntExact(scalar(c,
                     "SELECT COUNT(*) FROM tools WHERE turn_id=?", command.turnId()));
-            int nextRounds = Math.addExact(budget.usedModelRounds(), modelRounds);
-            int nextTools = Math.addExact(budget.usedToolCalls(), toolCalls);
-            long nextWall = Math.addExact(budget.usedActiveMillis(), command.activeMillis());
+            int nextRounds = Math.addExact(run.usedModelRounds(), modelRounds);
+            int nextTools = Math.addExact(run.usedToolCalls(), toolCalls);
+            long nextWall = Math.addExact(run.usedActiveMillis(), command.activeMillis());
             one(update(c, "UPDATE execution_runs SET used_model_rounds=?,used_tool_calls=?,"
                             + "used_active_millis=?,updated_at=? WHERE run_id=? AND status IN ('RUNNING','PAUSED')",
                     nextRounds, nextTools, nextWall, at(command.at()), command.runId()));
             // Claim 与 Turn usage 在同一事务释放；挂起不会调用该入口，因而保留同一 turnId 继续。
             one(update(c, "UPDATE plan_turn_claims SET state='SETTLED' WHERE run_id=? AND turn_id=? AND state='CLAIMED'",
                     command.runId(), command.turnId()));
-            boolean exhausted = budget.maxModelRounds() != null && nextRounds >= budget.maxModelRounds()
-                    || budget.maxToolCalls() != null && budget.maxToolCalls() > 0
-                    && nextTools >= budget.maxToolCalls()
-                    || budget.wallBudgetMillis() != null && nextWall >= budget.wallBudgetMillis()
-                    || budget.turnsUsed() >= budget.turnBudget();
-            if (exhausted && before.status() == PlanStatus.EXECUTING) {
-                transitionRun(c, command.runId(), "PAUSED", command.at());
-                Plan current = requirePlan(c, command.planId());
-                if (current.status() == PlanStatus.EXECUTING
-                        && Objects.equals(current.activeRunId(), command.runId())) {
-                    planCas(c, current, PlanStatus.PAUSED, current.activePlanRevisionId(), current.activeRunId(), command.at());
-                    planEvent(c, command.planId(), current.revision() + 1, "plan_budget_exhausted",
-                            command.eventId(), command.idempotencyKey(), at(command.at()));
-                    return null;
-                }
-            }
             planEvent(c, command.planId(), before.revision(), "plan_turn_settled",
                     command.eventId(), command.idempotencyKey(), at(command.at()));
             return null;
@@ -411,11 +326,11 @@ public final class MybatisGoalRepository implements GoalRepository {
                     command.idempotencyKey());
             if (context == null) return null;
             Plan before = context.plan();
-            RunBudget budget = context.budget();
+            RunState run = context.run();
             Integer claimed = queryOne(c, "SELECT 1 FROM plan_turn_claims WHERE run_id=? AND turn_id=?",
                     r -> r.getInt(1), command.runId(), command.turnId());
             if (claimed == null) return null;
-            long nextWall = Math.addExact(budget.usedActiveMillis(), command.activeMillis());
+            long nextWall = Math.addExact(run.usedActiveMillis(), command.activeMillis());
             one(update(c, "UPDATE execution_runs SET used_active_millis=?,updated_at=? "
                             + "WHERE run_id=? AND status IN ('RUNNING','PAUSED')",
                     nextWall, at(command.at()), command.runId()));
@@ -448,7 +363,7 @@ public final class MybatisGoalRepository implements GoalRepository {
     /** Goal 状态转换受完成门保护。 */
     @Override public Goal transition(Transition command) { String activity=command.phase().name().toLowerCase(Locale.ROOT);return goalMutation(command.goalId(),command.expectedGoalRevision(),command.idempotencyKey(),Set.of(activity),c->{Goal before=requireGoal(c,command.goalId());if(command.status()==GoalStatus.ACTIVE)requireOwnerAdmissionOpen(c,before.ownerThreadId());if(!GoalStateMachine.mayTransition(before.status(),command.status()))throw invalid("Goal transition is invalid");GoalStateMachine.requireCombination(command.status(),command.phase());if(command.status()==GoalStatus.ACHIEVED)requireCompletion(c,before);if(before.recoveryRequired()&&command.status()==GoalStatus.ACTIVE)throw error(GoalRepositoryException.Code.GOAL_RECOVERY_REQUIRED,"Goal recovery is required");if(before.status()!=command.status())transitionRun(c,before.activeRunId(),switch(command.status()){case ACTIVE->"RUNNING";case PAUSED->"PAUSED";case ACHIEVED->"COMPLETED";case STOPPED->"STOPPED";},command.at());goalCas(c,before,command.status(),command.phase(),before.activeRunId(),command.recoveryRequired(),before.turnsWithoutProgress(),before.repeatedFailureCount(),before.lastFailureSignature(),command.at());goalEvent(c,command.goalId(),before.revision()+1,"CHANGED",activity,command.eventId(),command.idempotencyKey(),at(command.at()));return requireGoal(c,command.goalId());}); }
     /** linked Goal 步骤在同一事务更新状态、挂接本 Run 证据并累计同签名失败，第三次失败必须暂停。 */
-    @Override public Goal updateStep(UpdateStep command) { return goalMutation(command.goalId(),command.expectedGoalRevision(),command.idempotencyKey(),Set.of("step_updated"),c->{Goal before=requireGoal(c,command.goalId());GoalPlanLink link=activeLink(c,command.goalId());if(link==null||!before.activeRunId().equals(command.runId()))throw stale();stepCas(c,command.runId(),command.stepId(),command.expectedStatus(),command.status(),command.failureSignature(),command.at());appendClaims(c,command.evidenceClaims(),command.runId(),command.goalId(),link.planId(),before.goalDefinitionRevision(),link.planRevisionId(),command.stepId(),command.at());boolean failed=command.status()==StepStatus.FAILED;boolean retrying=command.status()==StepStatus.READY||command.status()==StepStatus.RUNNING;boolean same=failed&&Objects.equals(command.failureSignature(),before.lastFailureSignature());int failures=failed?(same?Math.min(3,before.repeatedFailureCount()+1):1):(retrying?before.repeatedFailureCount():0);String signature=failed?command.failureSignature():(retrying?before.lastFailureSignature():null);boolean pause=failed&&failures>=3;goalCas(c,before,pause?GoalStatus.PAUSED:GoalStatus.ACTIVE,pause?GoalPhase.NEEDS_ATTENTION:GoalPhase.WORKING,before.activeRunId(),false,0,failures,signature,command.at());goalEvent(c,command.goalId(),before.revision()+1,"CHANGED","step_updated",command.eventId(),command.idempotencyKey(),at(command.at()));return requireGoal(c,command.goalId());}); }
+    @Override public Goal updateStep(UpdateStep command) { return goalMutation(command.goalId(),command.expectedGoalRevision(),command.idempotencyKey(),Set.of("step_updated"),c->{Goal before=requireGoal(c,command.goalId());GoalPlanLink link=activeLink(c,command.goalId());if(link==null||!before.activeRunId().equals(command.runId()))throw stale();stepCas(c,command.runId(),command.stepId(),command.expectedStatus(),command.status(),command.failureSignature(),command.at());appendClaims(c,command.evidenceClaims(),command.runId(),command.goalId(),link.planId(),before.goalDefinitionRevision(),link.planRevisionId(),command.stepId(),command.at());boolean failed=command.status()==StepStatus.FAILED;boolean retrying=command.status()==StepStatus.READY||command.status()==StepStatus.RUNNING;boolean same=failed&&Objects.equals(command.failureSignature(),before.lastFailureSignature());int failures=failed?(same?Math.addExact(before.repeatedFailureCount(),1):1):(retrying?before.repeatedFailureCount():0);String signature=failed?command.failureSignature():(retrying?before.lastFailureSignature():null);goalCas(c,before,GoalStatus.ACTIVE,GoalPhase.WORKING,before.activeRunId(),false,0,failures,signature,command.at());goalEvent(c,command.goalId(),before.revision()+1,"CHANGED","step_updated",command.eventId(),command.idempotencyKey(),at(command.at()));return requireGoal(c,command.goalId());}); }
     /** Plan step 只写入步骤与证据；当前 Tool 尚未完成时不能提前进入 VERIFYING。 */
     @Override public Plan updatePlanStep(UpdatePlanStep command) { return planMutation(command.planId(),command.expectedPlanRevision(),command.idempotencyKey(),Set.of("step_updated"),c->{Plan before=requirePlan(c,command.planId());if(before.status()!=PlanStatus.EXECUTING||!Objects.equals(before.activeRunId(),command.runId()))throw invalid("Plan run is not active");stepCas(c,command.runId(),command.stepId(),command.expectedStatus(),command.status(),command.failureSignature(),command.at());appendClaims(c,command.evidenceClaims(),command.runId(),null,command.planId(),null,before.activePlanRevisionId(),command.stepId(),command.at());planCas(c,before,PlanStatus.EXECUTING,before.activePlanRevisionId(),before.activeRunId(),command.at());planEvent(c,command.planId(),before.revision()+1,"step_updated",command.eventId(),command.idempotencyKey(),at(command.at()));return requirePlan(c,command.planId());}); }
 
@@ -566,7 +481,7 @@ public final class MybatisGoalRepository implements GoalRepository {
         });
     }
     /** owner 唯一非终态 Goal。 */
-    @Override public Optional<Goal> findActiveGoalByOwner(String ownerThreadId) { return transactions.required(c->Optional.ofNullable(queryOne(c,"SELECT * FROM goals WHERE owner_thread_id=? AND status IN ('ACTIVE','PAUSED')",this::mapGoal,ownerThreadId))); }
+    @Override public Optional<Goal> findActiveGoalByOwner(String ownerThreadId) { return transactions.required(c->Optional.ofNullable(queryOne(c,GOAL_SELECT + " WHERE owner_thread_id=? AND status IN ('ACTIVE','PAUSED')",this::mapGoal,ownerThreadId))); }
     /** 只按 owner 查询正在执行的独立 Plan，避免 continuation 错把任意最新 Plan 当作活动 Run。 */
     @Override public Optional<Plan> findExecutingPlanByOwner(String ownerThreadId) { return transactions.required(c->Optional.ofNullable(queryOne(c,"SELECT * FROM plans WHERE owner_thread_id=? AND status='EXECUTING' ORDER BY updated_at DESC LIMIT 1",this::mapPlan,ownerThreadId))); }
     /** 内部 Turn binding 从不可变 context 读取；Goal continuation 的旧/已释放 fencing lease 直接失效。 */
@@ -719,8 +634,8 @@ public final class MybatisGoalRepository implements GoalRepository {
     @Override public Optional<ContinuationLease> releaseLease(String goalId, String leaseId, long token, boolean abandoned, Instant at) { return transactions.required(c->update(c,"UPDATE goal_continuation_leases SET state=?,heartbeat_at=?,released_at=? WHERE goal_id=? AND lease_id=? AND fencing_token=? AND state='HELD'",abandoned?"ABANDONED":"RELEASED",at(at),at(at),goalId,leaseId,token)==1?Optional.of(requireLease(c,leaseId)):Optional.empty()); }
     /** 有界读取旧 generation lease。 */
     @Override public List<ContinuationLease> listHeldLeases(long generation, int limit) { return transactions.required(c->queryList(c,"SELECT * FROM goal_continuation_leases WHERE process_generation<>? AND state='HELD' ORDER BY acquired_at,lease_id LIMIT ?",this::mapLease,generation,limit)); }
-    /** 第三次无进展进入 attention。 */
-    @Override public Goal recordContinuationNoProgress(String goalId,long expected,String eventId,String key,Instant at) { return goalMutation(goalId,expected,key,Set.of("continuation_no_progress"),c->{Goal before=requireGoal(c,goalId);int count=Math.min(3,before.turnsWithoutProgress()+1);boolean pause=count>=3;goalCas(c,before,pause?GoalStatus.PAUSED:GoalStatus.ACTIVE,pause?GoalPhase.NEEDS_ATTENTION:GoalPhase.WORKING,before.activeRunId(),false,count,before.repeatedFailureCount(),before.lastFailureSignature(),at);goalEvent(c,goalId,before.revision()+1,"ACTIVITY","continuation_no_progress",eventId,key,at(at));return requireGoal(c,goalId);}); }
+    /** 无进展次数单独累加且不暂停 Goal；旧列只保留兼容数据库 CHECK 的投影。 */
+    @Override public Goal recordContinuationNoProgress(String goalId,long expected,String eventId,String key,Instant at) { return goalMutation(goalId,expected,key,Set.of("continuation_no_progress"),c->{Goal before=requireGoal(c,goalId);int count=Math.addExact(before.turnsWithoutProgress(),1);update(c,"INSERT OR IGNORE INTO goal_no_progress_counts(goal_id,count) VALUES(?,?)",goalId,before.turnsWithoutProgress());one(update(c,"UPDATE goal_no_progress_counts SET count=? WHERE goal_id=?",count,goalId));goalCas(c,before,GoalStatus.ACTIVE,GoalPhase.WORKING,before.activeRunId(),false,Math.min(3,count),before.repeatedFailureCount(),before.lastFailureSignature(),at);goalEvent(c,goalId,before.revision()+1,"ACTIVITY","continuation_no_progress",eventId,key,at(at));return requireGoal(c,goalId);}); }
     /** Tool approval phase 不消耗 Goal mutation revision。 */
     @Override public Goal projectContinuationPhase(ProjectContinuationPhase command) { return transactions.required(c->{String expectedActivity=command.phase()==GoalPhase.WAITING_APPROVAL?"tool_approval_requested":"tool_approval_resolved";String replay=queryOne(c,"SELECT json_extract(payload_json,'$.activity') FROM goal_events WHERE goal_id=? AND idempotency_key=?",r->r.getString(1),command.goalId(),command.idempotencyKey());if(replay!=null){if(!expectedActivity.equals(replay))throw invalid("Goal idempotency key was reused");return requireGoal(c,command.goalId());}int changed=update(c,"UPDATE goals SET phase=?,updated_at=? WHERE goal_id=? AND revision=? AND status='ACTIVE' AND phase=?",command.phase().name(),at(command.at()),command.goalId(),command.expectedGoalRevision(),command.expectedPhase().name());if(changed!=1)throw invalid("Goal continuation phase is stale");goalEvent(c,command.goalId(),command.expectedGoalRevision(),"ACTIVITY",expectedActivity,command.eventId(),command.idempotencyKey(),at(command.at()));return requireGoal(c,command.goalId());}); }
 
@@ -764,7 +679,7 @@ public final class MybatisGoalRepository implements GoalRepository {
         });
     }
     /** Goal CAS 以旧 revision 为条件同时持久化状态、Run 与熔断计数，防止并发 mutation 拆分事实。 */
-    private static void goalCas(Connection c,Goal before,GoalStatus status,GoalPhase phase,String run,boolean recovery,int noProgress,int failures,String signature,Instant at)throws SQLException{GoalStateMachine.requireCombination(status,phase);one(update(c,"UPDATE goals SET status=?,phase=?,revision=revision+1,active_run_id=?,progress_turns_without_change=?,repeated_failure_count=?,last_failure_signature=?,recovery_required=?,updated_at=? WHERE goal_id=? AND revision=? AND status NOT IN ('ACHIEVED','STOPPED')",status.name(),phase.name(),run,noProgress,failures,signature,recovery?1:0,at(at),before.goalId(),before.revision()));}
+    private static void goalCas(Connection c,Goal before,GoalStatus status,GoalPhase phase,String run,boolean recovery,int noProgress,int failures,String signature,Instant at)throws SQLException{GoalStateMachine.requireCombination(status,phase);one(update(c,"UPDATE goals SET status=?,phase=?,revision=revision+1,active_run_id=?,progress_turns_without_change=?,repeated_failure_count=?,last_failure_signature=?,recovery_required=?,updated_at=? WHERE goal_id=? AND revision=? AND status NOT IN ('ACHIEVED','STOPPED')",status.name(),phase.name(),run,noProgress,Math.min(3,failures),signature,recovery?1:0,at(at),before.goalId(),before.revision()));update(c,"INSERT OR IGNORE INTO goal_repeated_failure_counts(goal_id,count) VALUES(?,0)",before.goalId());one(update(c,"UPDATE goal_repeated_failure_counts SET count=? WHERE goal_id=?",failures,before.goalId()));if(noProgress==0){update(c,"INSERT OR IGNORE INTO goal_no_progress_counts(goal_id,count) VALUES(?,0)",before.goalId());one(update(c,"UPDATE goal_no_progress_counts SET count=0 WHERE goal_id=?",before.goalId()));}}
     /** 活动 Plan link 依赖部分唯一索引保持单值，读取层不对多行结果做任意取舍。 */
     private static GoalPlanLink activeLink(Connection c,String goalId)throws SQLException{return queryOne(c,"SELECT * FROM goal_plan_links WHERE goal_id=? AND detached_at IS NULL",r->new GoalPlanLink(r.getString("goal_id"),r.getString("plan_id"),r.getString("plan_revision_id"),r.getString("plan_hash"),r.getLong("link_revision"),Instant.parse(r.getString("attached_at"))),goalId);}
     /** Run 状态转换在同一事务写入终态时间，恢复逻辑不会观察到终态与完成时间分离。 */
@@ -878,7 +793,7 @@ public final class MybatisGoalRepository implements GoalRepository {
     /** Run owner 映射保留 SQL null，避免把 Goal-only 与 Plan-only 执行错误合并成同一种 owner。 */
     private Run mapRun(ResultSet r)throws SQLException{long definition=r.getLong("goal_definition_revision");Long boxed=r.wasNull()?null:definition;return new Run(r.getString("goal_id"),r.getString("plan_id"),boxed,r.getString("plan_revision_id"));}
     /** Goal row 映射后验证状态/phase 组合。 */
-    private Goal mapGoal(ResultSet r)throws SQLException{Goal value=new Goal(r.getString("goal_id"),r.getString("owner_thread_id"),OwnerKind.valueOf(r.getString("owner_kind")),r.getString("objective"),r.getLong("goal_definition_revision"),GoalStatus.valueOf(r.getString("status")),GoalPhase.valueOf(r.getString("phase")),r.getLong("revision"),r.getString("active_run_id"),r.getInt("progress_turns_without_change"),r.getInt("repeated_failure_count"),r.getString("last_failure_signature"),r.getInt("recovery_required")==1,Instant.parse(r.getString("created_at")),Instant.parse(r.getString("updated_at")));GoalStateMachine.requireCombination(value.status(),value.phase());return value;}
+    private Goal mapGoal(ResultSet r)throws SQLException{Goal value=new Goal(r.getString("goal_id"),r.getString("owner_thread_id"),OwnerKind.valueOf(r.getString("owner_kind")),r.getString("objective"),r.getLong("goal_definition_revision"),GoalStatus.valueOf(r.getString("status")),GoalPhase.valueOf(r.getString("phase")),r.getLong("revision"),r.getString("active_run_id"),r.getInt("progress_count"),r.getInt("failure_count"),r.getString("last_failure_signature"),r.getInt("recovery_required")==1,Instant.parse(r.getString("created_at")),Instant.parse(r.getString("updated_at")));GoalStateMachine.requireCombination(value.status(),value.phase());return value;}
     /** Plan row 映射保持 active identity 不变量。 */
     private Plan mapPlan(ResultSet r)throws SQLException{return new Plan(r.getString("plan_id"),r.getString("owner_thread_id"),r.getString("objective"),PlanStatus.valueOf(r.getString("status")),r.getLong("revision"),r.getString("active_plan_revision_id"),r.getString("active_run_id"),Instant.parse(r.getString("created_at")),Instant.parse(r.getString("updated_at")));}
     /** canonical JSON 是 Plan revision 权威源。 */
@@ -1028,7 +943,7 @@ public final class MybatisGoalRepository implements GoalRepository {
     /** 精确 revision 查询绝不跟随 latest，批准、执行与恢复必须继续绑定原始 planRevisionId。 */
     private PlanRevision requireRevision(Connection c,String planId,String revision)throws SQLException{PlanRevision value=queryOne(c,"SELECT * FROM plan_revisions WHERE plan_id=? AND plan_revision_id=?",this::mapRevision,planId,revision);if(value==null)throw stale();return value;}
     /** Goal 必需读取统一返回稳定 GOAL_NOT_FOUND，避免 JDBC 空结果泄漏为不确定内部错误。 */
-    private Goal requireGoal(Connection c,String id)throws SQLException{Goal value=queryOne(c,"SELECT * FROM goals WHERE goal_id=?",this::mapGoal,id);if(value==null)throw error(GoalRepositoryException.Code.GOAL_NOT_FOUND,"Goal is unavailable");return value;}
+    private Goal requireGoal(Connection c,String id)throws SQLException{Goal value=queryOne(c,GOAL_SELECT + " WHERE goal_id=?",this::mapGoal,id);if(value==null)throw error(GoalRepositoryException.Code.GOAL_NOT_FOUND,"Goal is unavailable");return value;}
     /** Plan 缺失归类为 PLAN_INVALID 而不是 Goal 错误，保持 RPC 调用方可稳定区分聚合边界。 */
     private Plan requirePlan(Connection c,String id)throws SQLException{Plan value=queryOne(c,"SELECT * FROM plans WHERE plan_id=?",this::mapPlan,id);if(value==null)throw error(GoalRepositoryException.Code.PLAN_INVALID,"Plan is unavailable");return value;}
     /** Plan mutation 在进入写事务后重验 expected revision，防止基于过期 draft 或批准继续写入。 */
@@ -1096,11 +1011,9 @@ public final class MybatisGoalRepository implements GoalRepository {
     private record Run(String goalId,String planId,Long definition,String planRevision){}
     /** Plan Turn claim 的状态与 ordinal 共同构成重试和恢复的稳定 admission identity。 */
     private record ClaimRow(int ordinal, String state) {}
-    /** Plan 调度领取只读取 run budget 与 pause fence，不把执行计数混入 Plan 读模型。 */
-    private record RunBudget(String status,String planId,String planRevision,int turnBudget,
-                             int turnsUsed,boolean pauseRequested,Integer maxModelRounds,
-                             Integer maxToolCalls,Long wallBudgetMillis,int usedModelRounds,
-                             int usedToolCalls,long usedActiveMillis){}
+    /** Plan 调度只读取 Run 状态、暂停 fence 与累计诊断，不解释旧预算列。 */
+    private record RunState(String status,String planId,String planRevision,boolean pauseRequested,
+                            int usedModelRounds,int usedToolCalls,long usedActiveMillis){}
 
     /**
      * 两类 Turn 结算必须读取同一 Plan/Run 快照；幂等键或 revision 不匹配时统一返回无副作用的空结果。
@@ -1110,54 +1023,24 @@ public final class MybatisGoalRepository implements GoalRepository {
         if (queryOne(c, "SELECT 1 FROM plan_events WHERE plan_id=? AND idempotency_key=?",
                 r -> r.getInt(1), planId, idempotencyKey) != null) return null;
         Plan plan = requirePlan(c, planId);
-        RunBudget budget = queryOne(c,
-                "SELECT status,plan_id,plan_revision_id,turn_budget,turns_used,pause_requested,"
-                        + "max_model_rounds,max_tool_calls,wall_budget_millis,"
+        RunState run = queryOne(c,
+                "SELECT status,plan_id,plan_revision_id,pause_requested,"
                         + "used_model_rounds,used_tool_calls,used_active_millis "
-                        + "FROM execution_runs WHERE run_id=?", this::mapRunBudget, runId);
-        if (budget == null || !Objects.equals(budget.planId(), planId)
-                || !Objects.equals(budget.planRevision(), plan.activePlanRevisionId())) return null;
-        return new PlanSettlementContext(plan, budget);
+                        + "FROM execution_runs WHERE run_id=?", this::mapRunState, runId);
+        if (run == null || !Objects.equals(run.planId(), planId)
+                || !Objects.equals(run.planRevision(), plan.activePlanRevisionId())) return null;
+        return new PlanSettlementContext(plan, run);
     }
 
     /** 结算上下文只在当前 JDBC 事务内有效，禁止跨事务保存可变 Run 状态。 */
-    private record PlanSettlementContext(Plan plan, RunBudget budget) {
+    private record PlanSettlementContext(Plan plan, RunState run) {
     }
-    /** run budget 行严格读取列类型，损坏预算不能静默退化为默认值。 */
-    private RunBudget mapRunBudget(ResultSet r) throws SQLException {
-        return new RunBudget(r.getString("status"), r.getString("plan_id"),
-                r.getString("plan_revision_id"), r.getInt("turn_budget"), r.getInt("turns_used"),
-                r.getInt("pause_requested") == 1, nullableInt(r, "max_model_rounds"),
-                nullableInt(r, "max_tool_calls"), nullableLong(r, "wall_budget_millis"),
+    /** Run 行只映射当前执行状态和统计，旧预算字段不得影响准入。 */
+    private RunState mapRunState(ResultSet r) throws SQLException {
+        return new RunState(r.getString("status"), r.getString("plan_id"),
+                r.getString("plan_revision_id"), r.getInt("pause_requested") == 1,
                 r.getInt("used_model_rounds"), r.getInt("used_tool_calls"),
                 r.getLong("used_active_millis"));
-    }
-    /** 尚未冻结的预算列必须与合法零值区分，不能在查询时伪装为无限预算。 */
-    private static Integer nullableInt(ResultSet r, String column) throws SQLException {
-        int value = r.getInt(column);
-        return r.wasNull() ? null : value;
-    }
-    /** 时间预算保留 null 状态，准入才能拒绝缺失的冻结执行约束。 */
-    private static Long nullableLong(ResultSet r, String column) throws SQLException {
-        long value = r.getLong(column);
-        return r.wasNull() ? null : value;
-    }
-    /** 剩余额度使用饱和减法；缺失预算必须拒绝，不能为测试放宽生产执行上限。 */
-    private static int remaining(Integer maximum, int used) {
-        if (maximum == null) throw invalid("Plan execution budget is not frozen");
-        return Math.max(0, maximum - used);
-    }
-    /** 迟到结算不能使时间预算下溢后变成正值，未冻结的 Run 也不得执行。 */
-    private static long remaining(Long maximum, long used) {
-        if (maximum == null) throw invalid("Plan execution budget is not frozen");
-        return Math.max(0L, maximum - used);
-    }
-    /** 任一累计上限耗尽就停止准入，多个新 Turn 不能绕过同一 Run 预算。 */
-    private static boolean exhausted(RunBudget budget) {
-        return budget.maxModelRounds() != null && budget.usedModelRounds() >= budget.maxModelRounds()
-                || budget.maxToolCalls() != null && budget.maxToolCalls() > 0
-                && budget.usedToolCalls() >= budget.maxToolCalls()
-                || budget.wallBudgetMillis() != null && budget.usedActiveMillis() >= budget.wallBudgetMillis();
     }
     /** internal Turn context 保留 origin 与原始 JSON，严格解析在事务内完成。 */
     private record InternalContext(String origin,String contextJson){}

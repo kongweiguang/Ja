@@ -115,8 +115,8 @@ export interface SettingsDocument {
   subagents: SubagentSettings;
   providers: ProviderProjection[];
   mcpServers: SettingsMcpServer[];
-  /** 只保存 `user:name` 或 `ja:name` 引用，描述、路径和开关均来自运行时发现。 */
-  skills: string[];
+  /** 只保存已停用的 `user:name` 或 `ja:name` 引用；发现的有效项默认开启。 */
+  disabledSkills: string[];
   window: { width: number; height: number; maximized: boolean };
 }
 
@@ -137,7 +137,6 @@ export interface SettingsMcpServer {
 export interface ProjectSkillSettingsDocument {
   schemaVersion: 2;
   revision: number;
-  skills: string[];
   disabledSkills: string[];
 }
 

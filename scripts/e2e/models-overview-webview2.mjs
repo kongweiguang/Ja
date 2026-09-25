@@ -51,7 +51,7 @@ async function writeSettings(home, catalogBaseUrl) {
       "default_reasoning_level = { __ja_null = true }",
       "subagents = { enabled = true, provider_id = { __ja_null = true }, model_id = { __ja_null = true }, reasoning_level = { __ja_null = true } }",
       "mcp_servers = []",
-      "skills = []",
+      "disabled_skills = []",
       "",
       "[[providers]]",
       'provider_id = "provider_models_e2e"',
@@ -65,10 +65,6 @@ async function writeSettings(home, catalogBaseUrl) {
       "[providers.agent_defaults]",
       "[providers.agent_defaults.context]",
       "auto_compact = true",
-      "[providers.agent_defaults.turn_limits]",
-      "max_model_rounds = 1",
-      "max_tool_calls = 1",
-      "wall_timeout_ms = 1000",
       "[[providers.models]]",
       'model_id = "model_primary"',
       'name = "Primary"',
@@ -146,16 +142,18 @@ async function startModelCatalogFixture() {
 
 /** 只生成临时 Tauri overlay，身份、配置、WebView UDF 和端口均属于本轮实例。 */
 async function writeTauriConfig(directory, frontendPort) {
-  const base = JSON.parse(await readFile(join(root, "src-tauri", "tauri.conf.json"), "utf8"));
+  const base = JSON.parse(
+    await readFile(join(root, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8"),
+  );
   const windows = JSON.parse(
-    await readFile(join(root, "src-tauri", "tauri.windows.conf.json"), "utf8"),
+    await readFile(join(root, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"), "utf8"),
   );
   const origin = `http://127.0.0.1:${frontendPort}`;
   const websocket = `ws://127.0.0.1:${frontendPort}`;
   const config = {
     ...base,
     identifier: `io.github.kongweiguang.ja.e2e.models${frontendPort}`,
-    build: { beforeDevCommand: "pnpm dev", devUrl: origin },
+    build: { beforeDevCommand: base.build.beforeDevCommand, devUrl: origin },
     app: {
       ...base.app,
       windows: windows.app.windows,

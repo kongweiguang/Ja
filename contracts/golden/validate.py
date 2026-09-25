@@ -115,12 +115,15 @@ def sub_validator(schema: dict[str, Any], definition: str) -> Draft202012Validat
 
 
 PARAM_DEFS = {
-    "runtime/initialize": "initializeParams", "runtime/health": "emptyParams", "runtime/shutdown": "emptyParams",
+    "runtime/initialize": "initializeParams", "runtime/health": "emptyParams",
+    "runtime/shutdown": "runtimeShutdownParams", "runtime/context/register": "runtimeContextRegisterParams",
+    "operation/read": "operationReadParams",
     "workspace/open": "workspaceOpenParams", "workspace/list": "workspaceListParams",
     "workspace/path/search": "workspacePathSearchParams",
     "workspace/set-trust": "workspaceTrustParams",
     "workspace/unregister": "workspaceUnregisterParams", "thread/create": "threadCreateParams",
-    "thread/read": "threadReadParams", "thread/usage/read": "threadUsageReadParams",
+    "thread/read": "threadReadParams", "thread/observe": "threadObserveParams",
+    "thread/unobserve": "threadObserveParams", "thread/usage/read": "threadUsageReadParams",
     "thread/mcp/read": "threadMcpReadParams",
     "thread/seen": "threadMutationParams",
     "thread/archive": "threadMutationParams", "thread/restore": "threadMutationParams",
@@ -175,14 +178,19 @@ EVENT_PARAM_DEFS: dict[str, str] = {
 }
 
 RESULT_DEFS = {
+    "runtime/shutdown": "runtimeShutdownResult",
+    "runtime/context/register": "runtimeContextRegisterResult",
+    "operation/read": "operationReadResult",
     "workspace/list": "workspacePageResult",
     "workspace/path/search": "workspacePathSearchResult",
     "thread/list": "threadListResult", "thread/search": "threadPageResult",
+    "history/input/search": "inputHistorySearchResult",
     "thread/create": "threadResult", "thread/rename": "threadResult",
     "thread/preferences/update": "threadResult", "thread/pin": "threadResult",
     "thread/seen": "threadResult", "thread/archive": "threadResult",
     "thread/restore": "threadResult",
-    "thread/read": "threadReadResult", "thread/usage/read": "threadUsageSummary",
+    "thread/read": "threadReadResult", "thread/observe": "threadObservationResult",
+    "thread/unobserve": "threadObservationResult", "thread/usage/read": "threadUsageSummary",
     "thread/mcp/read": "threadMcpStatusResult",
     "goal/read": "goalProjectionResult",
     "goal/events/read": "goalEventsResult",
@@ -225,10 +233,11 @@ RESULT_DEFS = {
     "turn/reask": "turnAcceptedResult", "turn/resume": "turnResumeResult",
     "turn/recovery/respond": "turnRecoveryRespondResult",
     "turn/cancel": "turnCancelResult",
-    "turn/input/enqueue": "turnInputMutationResult",
+    "turn/input/enqueue": "turnInputEnqueueResult",
     "turn/input/prioritize": "turnInputMutationResult",
     "turn/input/update": "turnInputMutationResult",
     "turn/input/delete": "turnInputMutationResult",
+    "approval/respond": "approvalRespondResult",
     "turn/change-set/read": "changeSetArtifactReadResult",
     "configuration/read": "configReadResult",
     "configuration/patch": "configMutationResult",
@@ -257,6 +266,9 @@ def has_secret(value: Any, allowed: bool = False) -> bool:
 def validate_secret_boundary(frame: dict[str, Any]) -> None:
     """禁止协议帧泄漏 Secret，同时区分附件预览的严格资源授权判别对象。"""
     method = frame.get("method")
+    # 原生连接的完整环境仅进入 Java 内存，不能按公开 WebView Secret 字段规则删减。
+    if method == "runtime/context/register":
+        return
     allowed = method == "credential/set" and isinstance(frame.get("params"), dict)
     params = frame.get("params")
     if method == "attachment/preview/open" and isinstance(params, dict):

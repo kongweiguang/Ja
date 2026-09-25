@@ -112,6 +112,8 @@ interface RuntimeProjection {
 interface HostProjection {
   phase: "disconnected" | "ready";
   generation: number;
+  /** 后台实例身份跨断线保留，数字代际只在同一实例内比较。 */
+  serverInstanceId?: string;
 }
 
 /** Thread 投影只属于 Renderer 状态；持久元数据必须通过 History Read 刷新。 */
@@ -182,6 +184,8 @@ export interface TimelineDraftProjection {
 /** Snapshot 读取分为健康对账与真实恢复；只有真实恢复允许用 baseline 重置瞬态流状态。 */
 export interface ApplySnapshotOptions {
   mode?: "health" | "recovery";
+  /** 只对已逐页验证、同 revision 的本地合并历史开放跨页条目数。 */
+  accumulatedHistory?: true;
 }
 
 /** Zustand 只保存这份状态；Draft 与 Stream Cursor 明确属于瞬态。 */
@@ -213,9 +217,9 @@ export interface TimelineState {
   /** 未提交的 Assistant/Reasoning segments；发生重连或 Gap 时必须整体丢弃。 */
   draftByTurn: Record<string, readonly TimelineDraftProjection[]>;
   /** 同一模型请求的尝试计数在首次新 Delta 后仍保留，直到成功提交/终态。 */
-  retryAttemptByTurn: Record<string, { attempt: number; maxAttempts: 6 }>;
+  retryAttemptByTurn: Record<string, { attempt: number }>;
   /** 仅在 retry-started 到新请求首个 Delta 之间显示；重试事实不进入 thread/read。 */
-  retryingByTurn: Record<string, { attempt: number; maxAttempts: 6; occurredAt: string }>;
+  retryingByTurn: Record<string, { attempt: number; occurredAt: string }>;
   seenEventIds: Record<string, true>;
   seenEventOrder: string[];
   resyncRequired: Record<string, ResyncReason>;
@@ -447,7 +451,7 @@ function safeRuntimeReason(reason: string | undefined): string | undefined {
   return SAFE_RUNTIME_REASONS.has(reason) ? reason : "unknown";
 }
 
-/** 投影一次原生 Lifecycle 状态，并在 Generation 变化时清理旧 Entity。 */
+/** 设计原因：共享后台重启可重新从较小代际计数，必须先按实例身份分域，再比较代际并清理旧事实。 */
 export function applyRuntimeStatus(state: TimelineState, status: HostRuntimeStatus): TimelineState {
   const generationValid =
     status.status === "starting" ||
@@ -455,13 +459,20 @@ export function applyRuntimeStatus(state: TimelineState, status: HostRuntimeStat
     status.status === "recovery_required"
       ? Number.isSafeInteger(status.generation) && status.generation >= 0
       : Number.isSafeInteger(status.generation) && status.generation > 0;
-  if (!generationValid || status.generation < state.handshake.generation)
+  const incomingInstanceId = status.serverInstanceId ?? undefined;
+  const previousInstanceId = state.handshake.serverInstanceId;
+  const instanceChanged =
+    incomingInstanceId !== undefined &&
+    previousInstanceId !== undefined &&
+    incomingInstanceId !== previousInstanceId;
+  if (!generationValid || (!instanceChanged && status.generation < state.handshake.generation))
     return outcome(state, "rejected");
   const ready = status.status === "ready" || status.status === "busy";
-  const changed = status.generation !== state.handshake.generation;
+  const changed = instanceChanged || status.generation !== state.handshake.generation;
   const handshake: HostProjection = {
     phase: ready ? "ready" : "disconnected",
     generation: status.generation,
+    serverInstanceId: incomingInstanceId ?? previousInstanceId,
   };
   const base = ready && !changed ? state : clearBusinessProjection({ ...state, handshake });
   return outcome(
@@ -657,11 +668,13 @@ function isTerminalToolPresentation(presentation: ToolPresentation): boolean {
 /**
  * 转换持久 Snapshot 事实，但不假装它仍携带 Live Event Stream 的逐 Turn 进度。
  * Tool 历史按 callId 只投影一行，presentation 已包含最新持久状态，与 Live 原位更新保持一致。
+ * 完整续写正文只在同页事实证明其顺序与身份后作为 final 文本覆盖，不改动存储行。
  */
 function projectSnapshotItem(
   item: TimelineSnapshotItem,
   threadId: string,
   failureReply = false,
+  visibleFinalText?: string,
 ): TimelineItemAdapter {
   const base = {
     itemId: item.itemId,
@@ -707,7 +720,7 @@ function projectSnapshotItem(
       return {
         ...base,
         kind: "agent_message",
-        text: item.text,
+        text: visibleFinalText ?? item.text,
         final: true,
         title: "Final",
         ...(failureReply ? { metadata: { failureReply: true } } : {}),
@@ -744,6 +757,43 @@ function projectSnapshotItem(
         },
       };
   }
+}
+
+/**
+ * 只把同一 Turn 中没有跨过 Tool 或新用户输入的已提交纯文本段接回最终答复；旧库里已合并的
+ * final_answer 保持原文，避免升级后重复前缀。页首缺失的更早段不会被猜测或伪造。
+ */
+function continuationFinalTexts(
+  items: readonly TimelineSnapshotItem[],
+  failedTurnIds: ReadonlySet<string>,
+): ReadonlyMap<string, string> {
+  const progressByTurn = new Map<string, string>();
+  const finalTexts = new Map<string, string>();
+  for (const item of items) {
+    if (item.kind === "assistant_progress") {
+      progressByTurn.set(item.turnId, (progressByTurn.get(item.turnId) ?? "") + item.text);
+    } else if (
+      item.kind === "tool_call" ||
+      item.kind === "user_input" ||
+      item.kind === "thread_message"
+    ) {
+      progressByTurn.delete(item.turnId);
+    } else if (item.kind === "final_answer") {
+      const progress = progressByTurn.get(item.turnId);
+      if (progress !== undefined && !failedTurnIds.has(item.turnId)) {
+        finalTexts.set(
+          item.itemId,
+          item.text.startsWith(progress)
+            ? item.text
+            : progress.endsWith(item.text)
+              ? progress
+              : progress + item.text,
+        );
+      }
+      progressByTurn.delete(item.turnId);
+    }
+  }
+  return finalTexts;
 }
 
 /** 将 Wire baseline 映射为 Renderer 的 Draft segment，保持同一段正文的对象身份可复用。 */
@@ -815,6 +865,7 @@ function shouldPreserveLiveDraft(
  * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权；已提交的 live 修改摘要
  * 只有在同一 runtime 身份且 Turn 仍可持有 tracker 时保留，避免恢复读取让摘要在 Tool 间歇消失。
  * 健康快照还保留同一 active Turn 已知重试次数，避免瞬时通知因对账丢失后产生 attempt gap。
+ * 仅调用方已逐页校验同 revision 时允许合并快照超过单页 200 条，不放松 wire 边界。
  */
 export function applySnapshot(
   state: TimelineState,
@@ -822,7 +873,7 @@ export function applySnapshot(
   workspaceId: string,
   options: ApplySnapshotOptions = {},
 ): TimelineState {
-  const parsed = timelineSnapshotFromUnknown(value);
+  const parsed = timelineSnapshotFromUnknown(value, options.accumulatedHistory === true);
   if (parsed === undefined || parsed.nextCursor !== null || state.handshake.phase !== "ready") {
     return outcome(
       state,
@@ -1037,12 +1088,43 @@ export function applySnapshot(
     activeTurnId: undefined,
     latestTurnId: snapshot.turns.at(-1)?.turnId,
   };
+  // 同一权威页集合只做一次 Item 投影；逐条 putItem 会反复复制累计 Map，使历史翻页平方级变慢。
+  const failedTurnIds = new Set(
+    snapshot.turns.filter((turn) => turn.status === "failed").map((turn) => turn.turnId),
+  );
+  const failureReplyByTurn = new Map<string, string>();
+  for (const item of snapshot.items) {
+    if (item.kind === "final_answer" && failedTurnIds.has(item.turnId))
+      failureReplyByTurn.set(item.turnId, item.itemId);
+  }
+  const failureReplyItemIds = new Set(failureReplyByTurn.values());
+  const continuedFinalTexts = continuationFinalTexts(snapshot.items, failedTurnIds);
+  const projectedItemIds: string[] = [];
+  const seenProjectedItems = new Set<string>();
+  for (const item of snapshot.items) {
+    const projected = projectSnapshotItem(
+      item,
+      snapshot.threadId,
+      failureReplyItemIds.has(item.itemId),
+      continuedFinalTexts.get(item.itemId),
+    );
+    const existingOwner = itemThreadById[projected.itemId];
+    if (existingOwner !== undefined && existingOwner !== snapshot.threadId)
+      return outcome(state, "invalid");
+    items[projected.itemId] = projected;
+    itemThreadById[projected.itemId] = snapshot.threadId;
+    itemUtf8BytesById[projected.itemId] = utf8ByteLength(projected.text ?? "");
+    if (!seenProjectedItems.has(projected.itemId)) {
+      seenProjectedItems.add(projected.itemId);
+      projectedItemIds.push(projected.itemId);
+    }
+  }
   next = {
     ...next,
     items,
     itemThreadById,
     itemUtf8BytesById,
-    itemIdsByThread: { ...next.itemIdsByThread, [snapshot.threadId]: [] },
+    itemIdsByThread: { ...next.itemIdsByThread, [snapshot.threadId]: projectedItemIds },
     turns: {
       ...turns,
       ...Object.fromEntries(
@@ -1097,21 +1179,6 @@ export function applySnapshot(
           Object.entries(next.resyncRequired).filter(([id]) => id !== snapshot.threadId),
         ),
   };
-  // 失败 Turn 可能已因队列输入产生过早期 Final；只有终态事务最后追加的 Final 才是安全收口回复。
-  const failedTurnIds = new Set(
-    snapshot.turns.filter((turn) => turn.status === "failed").map((turn) => turn.turnId),
-  );
-  const failureReplyByTurn = new Map<string, string>();
-  for (const item of snapshot.items) {
-    if (item.kind === "final_answer" && failedTurnIds.has(item.turnId))
-      failureReplyByTurn.set(item.turnId, item.itemId);
-  }
-  const failureReplyItemIds = new Set(failureReplyByTurn.values());
-  for (const item of snapshot.items)
-    next = putItem(
-      next,
-      projectSnapshotItem(item, snapshot.threadId, failureReplyItemIds.has(item.itemId)),
-    );
   return outcome(next, recoveryNeedsBaseline ? "resync_required" : "applied");
 }
 
@@ -1923,6 +1990,7 @@ function applyMessagesReceived(
  * 只有 gap、缺失关联或非法事实才请求权威快照；每轮终态后再读历史会造成第二次可见重投影，
  * 却不能补充 v1 terminal 合同之外的信息。重试事件只替换临时草稿并沿用 Turn 全局 stream 序号，
  * 使半截输出不会进入下一次尝试的视图或有效历史。
+ * 输出额度续写的终态只确认最后一段；健康 live 草稿仅在前缀或后缀吻合时组成完整答复。
  */
 function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): TimelineState {
   const currentRevision = state.threadRevisionByThread[event.params.threadId] ?? 0;
@@ -1974,8 +2042,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         turn === undefined ||
         turn.status !== "running" ||
         params.attempt < 2 ||
-        params.attempt > 6 ||
-        params.maxAttempts !== 6 ||
+        !Number.isSafeInteger(params.attempt) ||
         (previousAttempt !== undefined && params.attempt !== previousAttempt + 1)
       )
         return resync(state, params.threadId, "invalid_event");
@@ -1986,13 +2053,12 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         draftByTurn,
         retryAttemptByTurn: {
           ...next.retryAttemptByTurn,
-          [params.turnId]: { attempt: params.attempt, maxAttempts: params.maxAttempts },
+          [params.turnId]: { attempt: params.attempt },
         },
         retryingByTurn: {
           ...next.retryingByTurn,
           [params.turnId]: {
             attempt: params.attempt,
-            maxAttempts: params.maxAttempts,
             occurredAt: params.occurredAt,
           },
         },
@@ -2144,6 +2210,10 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         !isLegalTransition(turn.status, params.state)
       )
         return resync(state, params.threadId, "invalid_event");
+      const liveAnswer = (next.draftByTurn[params.turnId] ?? [])
+        .filter((segment) => segment.kind === "assistant")
+        .map((segment) => segment.text)
+        .join("");
       next = settleTerminalDraft(next, params.turnId, params.state);
       const terminalStatus: TimelineItemStatus =
         params.state === "completed"
@@ -2157,10 +2227,19 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         next = recorded;
       }
       const terminalText = params.finalMessage?.text;
+      // 输出额度耗尽的前段已经作为独立模型步提交；健康 live 草稿含完整可见答复，
+      // 终态只带最后一轮，或单轮公开文本的受限前缀；仅在与草稿边界一致时沿用完整可见文本。
+      const visibleTerminalText =
+        params.state === "completed" &&
+        terminalText !== undefined &&
+        liveAnswer.length > terminalText.length &&
+        (liveAnswer.endsWith(terminalText) || liveAnswer.startsWith(terminalText))
+          ? liveAnswer
+          : terminalText;
       const terminalItemId =
         params.finalMessage?.messageId ?? `item_${params.eventId.slice("evt_".length)}`;
       const terminalItem =
-        terminalText === undefined || terminalText.trim() === ""
+        visibleTerminalText === undefined || visibleTerminalText.trim() === ""
           ? undefined
           : {
               ...projectItem(
@@ -2170,7 +2249,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
                 params.turnId,
                 "agent_message",
                 terminalStatus,
-                terminalText,
+                visibleTerminalText,
                 {
                   final: true,
                   title: "Final",

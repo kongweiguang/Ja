@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.conversation.domain.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.ThreadUsageSummary;
 import io.github.kongweiguang.ja.conversation.domain.ThreadDiscovery;
+import io.github.kongweiguang.ja.conversation.domain.UserInputHistory;
 import io.github.kongweiguang.ja.conversation.domain.TurnSummary;
 import io.github.kongweiguang.ja.conversation.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.port.in.ThreadUseCase;
@@ -29,6 +30,7 @@ import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.port.out.WorkspaceRepository;
 import org.apache.ibatis.session.SqlSessionFactory;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -245,6 +247,30 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                 query.limit()));
     }
 
+    /** 公开 USER timeline 倒序索引提供输入历史，超出编辑预算的输入明确标记不可直接恢复。 */
+    @Override
+    public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) {
+        String normalized = Objects.requireNonNull(query, "query").strip().toLowerCase(Locale.ROOT);
+        if (normalized.length() > 256 || normalized.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("invalid input history query");
+        }
+        checkLimit(limit);
+        Cursor key = decode(cursor);
+        return transactions.required(mapper -> {
+            var rows = mapper.history().selectInputHistoryPage(new PersistenceRecords.InputHistoryPage(
+                    normalized, key == null ? null : key.time(), key == null ? null : key.id(), limit + 1));
+            boolean more = rows.size() > limit;
+            var visible = rows.subList(0, Math.min(limit, rows.size()));
+            String next = null;
+            if (more) {
+                var last = visible.getLast();
+                next = encode(last.createdAt(), last.itemId());
+            }
+            return new CursorPage<>(visible.stream().map(row -> new UserInputHistory(
+                    row.itemId(), row.threadId(), row.publicText(), row.createdAt(), row.truncated())).toList(), next);
+        });
+    }
+
     /** 查询词在应用层使用 Locale.ROOT 归一化；SQLite 只执行有界 contains 与既有 keyset。 */
     @Override
     public CursorPage<ThreadSummary> searchThreads(String workspaceId, String query, String cursor, int limit) {
@@ -280,47 +306,61 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
      */
     @Override
     public Optional<ThreadSnapshot> readThread(String threadId, String cursor, int limit) {
+        return readThreadPage(threadId, cursor, limit, false);
+    }
+
+    /**
+     * 从末端按持久复合键倒序取一页，再翻回旧到新；这样首屏不经由逐页扫描才能到最新内容。
+     */
+    @Override
+    public Optional<ThreadSnapshot> readThreadLatest(String threadId, String beforeCursor, int limit) {
+        return readThreadPage(threadId, beforeCursor, limit, true);
+    }
+
+    /**
+     * 两种方向只改变 SQL keyset 与页面边界，Turn、用量及输入队列仍在同一事务中投影。
+     */
+    private Optional<ThreadSnapshot> readThreadPage(String threadId, String cursor, int limit, boolean latest) {
         checkLimit(limit);
         Cursor key = decode(cursor);
         return transactions.required(mapper -> {
             PersistenceRecords.ThreadRow row = mapper.history().selectThread(threadId);
             if (row == null) return Optional.empty();
-            List<PersistenceRecords.SnapshotItemRow> rows = mapper.history().selectSnapshotItems(
-                    new PersistenceRecords.SnapshotPage(threadId, key == null ? null : key.time(),
-                            key == null ? null : key.id(), limit + 1));
+            // 响应最多允许 200 个 Turn；为真实最新、待处理和最近用量 Turn 预留身份位置。
+            int itemLimit = latest ? Math.min(limit, 197) : limit;
+            PersistenceRecords.SnapshotPage page = new PersistenceRecords.SnapshotPage(
+                    threadId, key == null ? null : key.time(), key == null ? null : key.id(), itemLimit + 1);
+            List<PersistenceRecords.SnapshotItemRow> rows = latest
+                    ? mapper.history().selectSnapshotItemsLatest(page)
+                    : mapper.history().selectSnapshotItems(page);
             String next = null;
-            if (rows.size() > limit) {
-                rows = new ArrayList<>(rows.subList(0, limit));
+            if (rows.size() > itemLimit) {
+                rows = new ArrayList<>(rows.subList(0, itemLimit));
                 PersistenceRecords.SnapshotItemRow last = rows.getLast();
                 next = encode(requiredText(last.createdAt(), "created_at"),
                         requiredText(last.itemId(), "item_id"));
             }
-            List<PersistenceRecords.TurnRow> turnRows = mapper.agent().selectTurns(threadId);
+            if (latest) {
+                rows = new ArrayList<>(rows);
+                java.util.Collections.reverse(rows);
+            }
+            PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
+            List<String> selectedTurnIds = new ArrayList<>(rows.stream()
+                    .map(PersistenceRecords.SnapshotItemRow::turnId).distinct().toList());
+            if (usageRow != null) selectedTurnIds.add(requiredText(usageRow.turnId(), "turn_id"));
+            // MyBatis OGNL 只读取显式布尔值，不能在 Native Image 对 JDK immutable List 反射调用 size()。
+            List<String> boundTurnIds = new ArrayList<>(new java.util.LinkedHashSet<>(selectedTurnIds));
+            List<PersistenceRecords.TurnRow> turnRows = latest
+                    ? mapper.agent().selectSnapshotTurns(threadId, boundTurnIds, !boundTurnIds.isEmpty())
+                    : mapper.agent().selectTurns(threadId);
             List<PersistenceRecords.TurnRow> currentPathRows = turnRows.stream()
                     .filter(PersistenceRecords.TurnRow::currentPath).toList();
-            Map<String, String> latestAttemptBySource = new java.util.HashMap<>();
-            currentPathRows.stream().filter(value -> value.sourceMessageId() != null)
-                    .forEach(value -> latestAttemptBySource.put(value.sourceMessageId(), value.turnId()));
-            Map<String, String> ownerTurnByMessage = mapper.agent().selectMessages(threadId).stream()
-                    .filter(value -> "USER".equals(value.role()))
-                    .collect(java.util.stream.Collectors.toMap(PersistenceRecords.MessageRow::messageId,
-                            PersistenceRecords.MessageRow::turnId, (first, ignored) -> first));
-            Set<String> supersededErrorTurns = new java.util.HashSet<>();
-            latestAttemptBySource.forEach((sourceId, latestTurnId) -> {
-                String ownerTurnId = ownerTurnByMessage.get(sourceId);
-                if (ownerTurnId != null) supersededErrorTurns.add(ownerTurnId);
-                for (PersistenceRecords.TurnRow candidate : currentPathRows) {
-                    if (sourceId.equals(candidate.sourceMessageId())
-                            && !latestTurnId.equals(candidate.turnId())) {
-                        supersededErrorTurns.add(candidate.turnId());
-                    }
-                }
-            });
+            Set<String> supersededErrorTurns = Set.copyOf(
+                    mapper.history().selectSupersededErrorTurnIds(threadId));
             List<ThreadSnapshot.Turn> turns = currentPathRows.stream()
                     .map(rowValue -> snapshotTurn(mapper, rowValue, supersededErrorTurns.contains(rowValue.turnId())))
                     .toList();
             List<ThreadSnapshot.Item> items = rows.stream().map(this::snapshotItem).toList();
-            PersistenceRecords.ContextUsageRow usageRow = mapper.history().selectLatestContextUsage(threadId);
             ThreadSnapshot.ContextUsage contextUsage = usageRow == null ? null
                     : contextUsage(usageRow, mapper.checkpoint().selectCheckpoint(threadId));
             PersistenceRecords.TurnRow queueTurn = turnRows.stream()
@@ -519,6 +559,46 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
             return new TextArtifactPage(row.artifactId(), startPoint,
                     endPoint < total ? endPoint : null, total, endPoint < total, content.substring(start, end));
         });
+    }
+
+    /**
+     * 以当前路径的真实 item 身份按 code point 切页；SQLite 只交付请求片段，Java 不物化
+     * 整条模型消息或 Thread，Provider 私有 reasoning 与 Tool 内容不进入公开正文。
+     */
+    @Override
+    public Optional<MessageContentPage> readMessageContent(String threadId, String messageId,
+                                                            int offsetCharacters, int limitCharacters) {
+        if (offsetCharacters < 0 || limitCharacters < 1 || limitCharacters > 65_536) {
+            throw new IllegalArgumentException("invalid message content page");
+        }
+        return transactions.required(mapper -> {
+            var page = mapper.history().selectPublicContentPage(
+                    threadId, messageId, offsetCharacters, limitCharacters);
+            if (page == null) {
+                String rawId = resolvePublicContentId(mapper, threadId, messageId);
+                if (rawId != null) page = mapper.history().selectPublicContentPage(
+                        threadId, rawId, offsetCharacters, limitCharacters);
+            }
+            if (page == null) return Optional.empty();
+            int total = page.totalCharacters();
+            if (offsetCharacters > total) throw new IllegalArgumentException("message content offset is past end");
+            int next = offsetCharacters + page.content().codePointCount(0, page.content().length());
+            return Optional.of(new MessageContentPage(messageId, offsetCharacters,
+                    next < total ? next : null, total, next < total, page.content()));
+        });
+    }
+
+    /** 历史 ItemId 是稳定哈希而非数据库主键；只流式查当前路径 ID，命中后仍由正文 SQL 复核身份。 */
+    private static String resolvePublicContentId(PersistenceMappers mapper, String threadId, String itemId) {
+        try (var candidates = mapper.history().streamPublicContentIds(threadId)) {
+            for (String candidate : candidates) {
+                if (SnapshotItemIdentity.of("message", candidate).equals(itemId)) return candidate;
+            }
+            return null;
+        } catch (IOException failure) {
+            throw new StorageException(StorageException.Code.IO,
+                    "cannot close public content identity cursor", failure);
+        }
     }
 
     /**

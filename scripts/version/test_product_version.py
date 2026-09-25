@@ -15,17 +15,20 @@ from scripts.version.product_version import (
 
 
 def _fixture(**overrides: str) -> dict[str, str]:
-    """Cover preserved dependency projections and independent protocol client/engine examples."""
+    """保留 Ja 版本投影与协议样例，并固定桌面 crate 的专属包名。"""
     sources = {
         "package_json": '{"name":"ja","version":"0.1.0"}\n',
+        "npm_package_json": (
+            '{"name":"@kongweiguang/ja","version":"9.9.9","private":true}\n'
+        ),
         "tauri_config": '{\n  "productName": "Ja",\n  "version": "9.9.9"\n}\n',
         "cargo_workspace": (
             '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "9.9.9"\n'
         ),
-        "desktop_cargo": '[package]\nname = "ja"\nversion.workspace = true\n',
+        "desktop_cargo": '[package]\nname = "ja-desktop"\nversion.workspace = true\n',
         "runtime_cargo": '[package]\nname = "ja-runtime"\nversion.workspace = true\n',
         "cargo_lock": (
-            'version = 4\n\n[[package]]\nname = "ja"\nversion = "9.9.9"\n\n'
+            'version = 4\n\n[[package]]\nname = "ja-desktop"\nversion = "9.9.9"\n\n'
             '[[package]]\nname = "ja-runtime"\nversion = "9.9.9"\n\n'
             '[[package]]\nname = "serde"\nversion = "1.0.229"\n'
         ),
@@ -72,6 +75,10 @@ class ProductVersionTest(unittest.TestCase):
         updated = synchronize_product_version_sources(_fixture())
 
         self.assertEqual(inspect_product_version_sources(updated)[1], [])
+        npm_package = json.loads(updated["npm_package_json"])
+        self.assertEqual(npm_package["name"], "@kongweiguang/ja")
+        self.assertEqual(npm_package["version"], "0.1.0")
+        self.assertTrue(npm_package["private"])
         self.assertIn("<parent><version>4.0.6</version></parent>", updated["maven_pom"])
         self.assertIn("<dependency><version>7.0.0</version>", updated["maven_pom"])
         self.assertIn('name = "serde"\nversion = "1.0.229"', updated["cargo_lock"])
@@ -118,11 +125,14 @@ class ProductVersionTest(unittest.TestCase):
         self.assertTrue(any(entry.startswith("release tag:") for entry in drift))
         self.assertTrue(any(entry.startswith("app-server/pom.xml") for entry in drift))
         self.assertTrue(any(entry.startswith("Cargo.lock ja-runtime") for entry in drift))
+        self.assertTrue(
+            any(entry.startswith("packages/ja-npm/package.json version:") for entry in drift)
+        )
 
     def test_check_requires_cargo_workspace_inheritance(self) -> None:
         """Crate manifests cannot reintroduce separately maintained product versions."""
         sources = _fixture(
-            desktop_cargo='[package]\nname = "ja"\nversion = "0.1.0"\n'
+            desktop_cargo='[package]\nname = "ja-desktop"\nversion = "0.1.0"\n'
         )
 
         with self.assertRaisesRegex(ValueError, "package.version.workspace"):
