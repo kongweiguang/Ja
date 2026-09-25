@@ -5,6 +5,8 @@
 
 use super::*;
 
+const THREAD_CREATE_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttachmentWireResult {
@@ -276,8 +278,9 @@ pub(super) fn attachment_preview_close_runtime(
 }
 
 /// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
-/// 发送一个固定 history query/mutation，并复用 bridge 既有 session deadline 与 RPC error
-/// 投影；Rust 不为 history 建立第二套 transport、database 或 request registry。
+/// `thread/create` 会同步准备 Workspace 并提交首条 Thread；首次使用的磁盘初始化可能超过
+/// 4 秒 Turn deadline。仅为该写入提供 10 秒冷启动预算，仍低于 15 秒 bridge 命令上限，
+/// 且退出 deadline 可以进一步收紧；其他 History 请求沿用既有短预算。
 pub(super) fn history_request_runtime(
     config: &LaunchConfig,
     runtime: &mut Option<RunningRuntime>,
@@ -293,7 +296,15 @@ pub(super) fn history_request_runtime(
         exit_control.attach_session(session);
     }
     let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
-    let timeout = operation_timeout(config.request_timeout, exit_control)
+    let request_budget = if method == HistoryMethod::ThreadCreate {
+        config
+            .request_timeout
+            .max(THREAD_CREATE_REQUEST_DEADLINE)
+            .min(COMMAND_DEADLINE)
+    } else {
+        config.request_timeout
+    };
+    let timeout = operation_timeout(request_budget, exit_control)
         .map_err(|error| history_request_failed(method, "deadline", error))?;
     let response = current
         .client
