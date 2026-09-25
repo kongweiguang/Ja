@@ -27,6 +27,10 @@ const ready: RuntimeStatus = {
   serverInstanceId: "srv_fixture",
   features: ["task_threads_v1", "plan_goal_v1"],
 };
+const starting: RuntimeStatus = {
+  ...ready,
+  status: "starting",
+};
 const stopped: RuntimeStatus = {
   status: "stopped",
   generation: 0,
@@ -335,6 +339,34 @@ describe("RuntimeProvider v1 lifecycle", () => {
     );
     await waitFor(() => expect(screen.getByTestId("boot")).toHaveTextContent("ready"));
     await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+    expect(fake.calls).not.toContain("start");
+    screen.getByRole("button", { name: "submit" }).click();
+    await waitFor(() => expect(fake.calls).toContain("turnStart"));
+  });
+
+  /** 首次 state 读到 starting 时，后续 ready 通知仍须通过原生 state fence 恢复 Turn 准入。 */
+  it("confirms Turn admission when ready arrives after the initial starting snapshot", async () => {
+    const fake = fakeRuntime(starting);
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("boot")).toHaveTextContent("connecting"));
+    expect(screen.getByTestId("admission")).toHaveTextContent("false");
+    fake.setState(ready);
+    act(() => {
+      fake.emit({
+        kind: "status",
+        status: ready,
+        eventId: "evt_ready_after_starting",
+        occurredAt: "2026-09-25T00:00:00Z",
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+    expect(fake.runtime.state).toHaveBeenCalledTimes(2);
     expect(fake.calls).not.toContain("start");
     screen.getByRole("button", { name: "submit" }).click();
     await waitFor(() => expect(fake.calls).toContain("turnStart"));

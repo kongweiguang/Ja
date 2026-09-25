@@ -48,7 +48,7 @@ struct Interactive {
     next_refresh: Instant,
 }
 
-/// 新会话与恢复会话共用同一事件循环；恢复列表按启动目录或已恢复 Thread 的 Workspace identity 分页。
+/// 恢复候选绑定启动目录或 Thread 的 Workspace identity，避免全局历史混入其他项目；分页复用同一身份。
 pub fn run(
     cwd: Option<PathBuf>,
     initial_prompt: Option<String>,
@@ -90,7 +90,7 @@ pub fn run(
     };
     snapshot.has_older_history = history.get("nextCursor").and_then(Value::as_str).is_some();
     if resume_mode && thread.is_none() && choices.is_empty() {
-        snapshot.notice = Some("还没有可恢复的会话；输入 /new 创建会话".into());
+        snapshot.notice = Some("当前项目暂无可恢复会话；可用 /new 新建，或 /resume 重试".into());
     }
     snapshot.thread_choices = choices;
     snapshot.thread_next_cursor = thread_next_cursor;

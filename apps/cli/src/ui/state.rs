@@ -598,6 +598,15 @@ impl UiState {
                 self.panel,
                 Some(Panel::Choices { .. } | Panel::Help | Panel::Details { .. })
             ) {
+                if matches!(
+                    self.panel.as_ref(),
+                    Some(Panel::Choices {
+                        kind: ChoiceKind::Threads,
+                        ..
+                    })
+                ) {
+                    self.set_resume_picker_exit_notice();
+                }
                 self.panel = None;
                 return Vec::new();
             }
@@ -868,7 +877,7 @@ impl UiState {
         }
     }
 
-    /// 候选面板只接受 controller 提供的身份，附件面板另提供预览和移除动作。
+    /// 候选面板只接受 controller 提供的身份；无活动 Thread 时退出恢复面板要给出可继续的下一步。
     fn choice_panel_key(
         &mut self,
         key: KeyEvent,
@@ -965,6 +974,9 @@ impl UiState {
                     self.reference_popup_dismissed = true;
                     self.active_query_id = None;
                 }
+                if kind == ChoiceKind::Threads {
+                    self.set_resume_picker_exit_notice();
+                }
                 self.panel = if kind == ChoiceKind::Reasoning {
                     Some(Panel::Choices {
                         kind: ChoiceKind::Models,
@@ -1019,6 +1031,24 @@ impl UiState {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// 仅 startup resume 没有活动 Thread；取消时恢复项目空态或未选择提示，并清掉旧搜索游标。
+    fn set_resume_picker_exit_notice(&mut self) {
+        if self.snapshot.thread_id.is_some() {
+            return;
+        }
+        let notice = if !self.thread_query.is_empty() {
+            "当前项目没有匹配项；可用 /new 新建，或 /resume 重试"
+        } else if self.snapshot.thread_choices.is_empty() {
+            "当前项目暂无可恢复会话；可用 /new 新建，或 /resume 重试"
+        } else {
+            "未选择会话；可用 /resume 重新查找，或 /new 新建"
+        };
+        self.snapshot.notice = Some(notice.to_owned());
+        self.thread_query.clear();
+        self.snapshot.thread_choices.clear();
+        self.snapshot.thread_next_cursor = None;
     }
 
     /// 审批和澄清以独立键盘状态处理，避免普通 Submit 意外响应服务端交互。

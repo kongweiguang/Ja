@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ja_cli::ui::{
     EventDelivery, InteractionQuestion, InteractionQuestionKind, PendingPrompt, TimelineEntry,
     TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice, UiCommand, UiEvent, UiEventSender,
-    UiSnapshot, UiState, insert_scrollback, render,
+    UiSnapshot, UiState, desired_viewport_height, insert_scrollback, render,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1222,11 +1222,17 @@ fn resume_chooser_searches_and_pages_without_losing_draft() {
         append: true,
     });
     let output = screen_text(&state, 80, 18);
+    let compact = output
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
     assert!(!output.contains("thr_"));
     assert!(
         output.contains("测 试 一") && output.contains("测 试 二"),
         "{output}"
     );
+    assert!(compact.contains("当前项目"), "{output}");
+    assert!(compact.contains("PgDn加载更多"), "{output}");
     assert_eq!(
         state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
         vec![UiAction::SelectThread { id: "thr_1".into() }]
@@ -1242,6 +1248,59 @@ fn resume_chooser_searches_and_pages_without_losing_draft() {
         loaded.contains("gpt-6-luna") && !loaded.contains("未 配 置 模 型"),
         "{loaded}"
     );
+}
+
+/// 没有活动 Thread 时 Esc 和 Ctrl+C 都必须关闭恢复页、清除旧搜索并保留下一步指引。
+#[test]
+fn resume_picker_cancel_resets_search_and_shows_next_action() {
+    for cancel in [
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut state = UiState::new(UiSnapshot {
+            thread_choices: vec![choice("thr_old", "旧任务")],
+            thread_next_cursor: Some("old-page".into()),
+            ..UiSnapshot::default()
+        });
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            vec![UiAction::SearchThreads {
+                query: "x".into(),
+                cursor: None,
+            }]
+        );
+        state.apply(UiEvent::SetThreadPage {
+            query: "x".into(),
+            choices: Vec::new(),
+            next_cursor: None,
+            append: false,
+        });
+
+        assert!(state.handle_key(cancel).is_empty());
+        assert_eq!(
+            state.snapshot().notice.as_deref(),
+            Some("当前项目没有匹配项；可用 /new 新建，或 /resume 重试")
+        );
+        assert!(state.snapshot().thread_choices.is_empty());
+        assert!(state.snapshot().thread_next_cursor.is_none());
+    }
+}
+
+/// 窄终端也必须同时显示恢复选择所需的导航、确认和返回按键。
+#[test]
+fn resume_chooser_keeps_actions_visible_at_narrow_width() {
+    let state = UiState::new(UiSnapshot {
+        thread_choices: vec![choice("thr_one", "一个会话")],
+        ..UiSnapshot::default()
+    });
+    let screen = screen_text(&state, 22, 18)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+
+    assert!(screen.contains("↑↓选"), "{screen}");
+    assert!(screen.contains("Enter恢复"), "{screen}");
+    assert!(screen.contains("Esc"), "{screen}");
 }
 
 /// 连续分页只保留有界窗口，换页后仍能选择新结果而不会选到已移除的旧行。
@@ -1682,6 +1741,43 @@ fn stable_history_is_inserted_before_inline_viewport_once() {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
     assert_eq!(output.matches("已完成的稳定回答").count(), 1, "{output:?}");
+}
+
+/// 活动回复按内容取得可见高度；终态提交后收回多余行，并为 Composer 保留一行呼吸空间。
+#[test]
+fn completed_reply_compacts_inline_viewport_after_scrollback_commit() {
+    let mut state = UiState::new(UiSnapshot {
+        thread_id: Some("thr_viewport".to_owned()),
+        turn_state: TurnState::Working,
+        timeline: vec![TimelineEntry {
+            id: "answer".to_owned(),
+            kind: TimelineKind::Assistant,
+            text: "你好".to_owned(),
+            detail: None,
+            status: Some(TimelineStatus::Running),
+        }],
+        ..UiSnapshot::default()
+    });
+    let working_height = desired_viewport_height(&state, 80, 16);
+    assert!(
+        working_height > 3 && working_height < 16,
+        "{working_height}"
+    );
+
+    state.apply(UiEvent::UpsertEntry(TimelineEntry {
+        id: "answer".to_owned(),
+        kind: TimelineKind::Assistant,
+        text: "你好".to_owned(),
+        detail: None,
+        status: Some(TimelineStatus::Complete),
+    }));
+    state.apply(UiEvent::SetTurnState(TurnState::Idle));
+    assert_eq!(state.take_scrollback_entries().len(), 1);
+    let completed_height = desired_viewport_height(&state, 80, 16);
+    assert_eq!(completed_height, 4);
+    let rows = screen_rows(&state, 80, completed_height);
+    assert!(rows[0].trim().is_empty(), "{rows:?}");
+    assert!(rows[1].contains('›'), "{rows:?}");
 }
 
 /// Codex 时间线把用户、过程、工具输出和最终回答按原序写入终端历史，终态不重复。

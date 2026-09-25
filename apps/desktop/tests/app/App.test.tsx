@@ -480,34 +480,21 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(screen.queryByRole("heading", { name: "设置暂时不可用" })).not.toBeInTheDocument();
   });
 
-  /** 启动失败不能替换对话，恢复动作必须由左下角状态提供。 */
-  it("keeps the conversation visible with a retryable sidebar runtime failure", async () => {
+  /** 启动失败仍保留对话与发送门禁，导航中不再渲染运行时状态块。 */
+  it("keeps the conversation visible without a sidebar runtime status block", async () => {
     const runtimeAdapter = runtime(1);
-    const settingsAdapter = settings();
     render(
-      <App
-        runtime={runtimeAdapter}
-        settingsAdapter={settingsAdapter}
-        historyAdapter={history()}
-        projectPicker={{ pick: vi.fn(async () => null) }}
-      />,
+      <App runtime={runtimeAdapter} settingsAdapter={settings()} historyAdapter={history()} />,
     );
 
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "运行时异常详情" })).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(runtimeAdapter.start).toHaveBeenCalledOnce());
     expect(screen.getByRole("region", { name: "coding 对话" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "本地运行时启动失败" })).not.toBeInTheDocument();
     expect(screen.queryByText("正在读取本地设置…")).not.toBeInTheDocument();
-    expect(settingsAdapter.snapshot).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "运行时异常详情" }));
-    fireEvent.click(screen.getByRole("button", { name: "重新启动" }));
-    await waitFor(() =>
-      expect(screen.getByRole("region", { name: "设置页面" })).toBeInTheDocument(),
-    );
-    expect(screen.queryByRole("button", { name: "返回应用" })).not.toBeInTheDocument();
-    expect(settingsAdapter.snapshot).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("status", { name: /本地运行时/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "运行时异常详情" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "设置" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "消息" })).toBeDisabled();
   });
 
   /** 延迟启动用于证明首屏不依赖 runtime promise 完成，且发送准入没有被视图改动放开。 */
@@ -518,7 +505,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       <App runtime={runtimeAdapter} settingsAdapter={settings()} historyAdapter={history()} />,
     );
     expect(screen.getByRole("region", { name: "coding 对话" })).toBeInTheDocument();
-    expect(screen.getByRole("status", { name: /本地运行时/ })).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /本地运行时/ })).not.toBeInTheDocument();
     expect(screen.queryByText("正在启动本地运行时…")).not.toBeInTheDocument();
     expect(screen.queryByText("正在读取本地设置…")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "运行时异常详情" })).not.toBeInTheDocument();
@@ -588,8 +575,9 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     );
   });
 
-  /** 人工恢复只在用户打开状态详情后出现，首屏直达不能自动确认恢复。 */
-  it("keeps manual recovery behind the sidebar warning", async () => {
+  /** 人工恢复仍由 Settings 的 RecoveryPanel 提供，移除侧栏状态不触发自动确认。 */
+  it("keeps manual recovery available from Settings", async () => {
+    const user = userEvent.setup();
     const runtimeAdapter = runtime();
     runtimeAdapter.recoveryState = vi.fn(async () => ({
       required: true,
@@ -600,13 +588,12 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     render(
       <App runtime={runtimeAdapter} settingsAdapter={settings()} historyAdapter={history()} />,
     );
-    const warning = await screen.findByRole("button", { name: "运行时异常详情" });
     expect(screen.getByRole("region", { name: "coding 对话" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "运行时需要人工恢复" })).not.toBeInTheDocument();
     expect(runtimeAdapter.start).not.toHaveBeenCalled();
     expect(runtimeAdapter.acknowledgeRecovery).not.toHaveBeenCalled();
-    fireEvent.click(warning);
-    expect(screen.getByRole("heading", { name: "运行时需要人工恢复" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    expect(await screen.findByRole("heading", { name: "运行时需要人工恢复" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "系统已重启" })).toBeEnabled();
   });
 

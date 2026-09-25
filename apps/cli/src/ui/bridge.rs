@@ -16,7 +16,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::model::{UiAction, UiEvent, UiSnapshot};
-use super::render::{WORKING_INDICATOR_INTERVAL, insert_scrollback, render};
+use super::render::{
+    WORKING_INDICATOR_INTERVAL, desired_viewport_height, insert_scrollback, render,
+};
 use super::state::UiState;
 
 const EVENT_QUEUE_CAPACITY: usize = 32;
@@ -378,8 +380,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// 终端只占用底部最多 16 行，让 insert_before 写入的稳定对话留在可见区域上方；
-/// 活动回复按固定间隔重绘临时状态点，选择器和审批布局仍共享同一有界 viewport。
+/// 终端只占用当前 UI 实际需要的行数，让稳定对话紧接输入历史，交互面板仍可扩展到有界上限。
 fn terminal_loop(
     snapshot: UiSnapshot,
     events: UiEventSender,
@@ -393,8 +394,9 @@ fn terminal_loop(
             return Err(TuiError::Io(error));
         }
     };
-    let viewport_height = rows.saturating_sub(1).clamp(1, MAX_INLINE_VIEWPORT_HEIGHT);
-    let mut state = UiState::new_for_terminal(snapshot, columns, viewport_height);
+    let maximum_viewport_height = rows.saturating_sub(1).clamp(1, MAX_INLINE_VIEWPORT_HEIGHT);
+    let mut state = UiState::new_for_terminal(snapshot, columns, maximum_viewport_height);
+    let viewport_height = desired_viewport_height(&state, columns, maximum_viewport_height);
     let initial_scrollback = state.take_scrollback_entries();
     let setup = (|| {
         // Ratatui 的整屏 insert_before 路径会把宽字符后继占位 cell 输出为额外空格；
@@ -414,6 +416,7 @@ fn terminal_loop(
             return Err(error);
         }
     };
+    let mut current_viewport_height = viewport_height;
     if ready_tx.send(Ok(())).is_err() {
         drop(guard);
         return Err(TuiError::StartupTimeout);
@@ -486,6 +489,19 @@ fn terminal_loop(
                 now.saturating_duration_since(previous) >= MIN_FRAME_INTERVAL
             })
         {
+            terminal.autoresize().map_err(TuiError::Io)?;
+            let screen = terminal.size().map_err(TuiError::Io)?;
+            state.set_terminal_width(screen.width);
+            let maximum_viewport_height = screen
+                .height
+                .saturating_sub(1)
+                .clamp(1, MAX_INLINE_VIEWPORT_HEIGHT);
+            let desired_height =
+                desired_viewport_height(&state, screen.width, maximum_viewport_height);
+            if desired_height != current_viewport_height {
+                resize_inline_viewport(&mut terminal, desired_height).map_err(TuiError::Io)?;
+                current_viewport_height = desired_height;
+            }
             terminal
                 .draw(|frame| render(frame, &state))
                 .map_err(TuiError::Io)?;
@@ -495,5 +511,25 @@ fn terminal_loop(
     }
     drop(terminal);
     drop(guard);
+    Ok(())
+}
+
+/** Ratatui 的 inline 高度在创建时固定；重建 viewport 前清除旧区域，稳定 scrollback 保留在其上方。 */
+fn resize_inline_viewport(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    height: u16,
+) -> io::Result<()> {
+    let area = terminal.get_frame().area();
+    execute!(
+        terminal.backend_mut(),
+        crossterm::cursor::MoveTo(0, area.y),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+    )?;
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )?;
     Ok(())
 }

@@ -273,7 +273,7 @@ export function JaApplication({
     lastConfigurationEvent,
     lastThreadMetadataEvent,
   } = useRuntimeState();
-  const { startRuntime, activateWorkspace, queryRuntime } = useRuntimeLifecycle();
+  const { activateWorkspace, queryRuntime } = useRuntimeLifecycle();
   const resolvedWorkbenchAdapters = workbenchAdapters ?? DEFAULT_WORKBENCH_ADAPTERS;
   const resolvedHistoryAdapter = historyAdapter ?? DEFAULT_HISTORY_ADAPTER;
   /**
@@ -736,10 +736,6 @@ export function JaApplication({
     void retryWorkspaceCatalog();
   }, [conversation.currentThreadId, retryWorkspaceCatalog, workspace.workspace]);
 
-  /** 复用 RuntimeProvider 的串行 lifecycle lane，拒绝在视图层直接调用 raw Tauri start。 */
-  const retryRuntime = useCallback((): void => {
-    void startRuntime().catch(() => undefined);
-  }, [startRuntime]);
   const required = settings.scopeReady && activeModel === undefined;
   const pageNavigation = usePageNavigationController(required);
   const { settingsVisible, settingsSection, setSettingsSection, navigate, goBack, goForward } =
@@ -1787,32 +1783,6 @@ export function JaApplication({
     nativeShortcutContext,
   );
 
-  const runtimeIssue =
-    boot.status === "failed" || boot.status === "degraded" ? (
-      <section>
-        <p>{boot.message}</p>
-        <Button type="button" variant="secondary" onClick={retryRuntime}>
-          重新启动
-        </Button>
-      </section>
-    ) : boot.status === "recovery_required" ? (
-      <RecoveryPanel />
-    ) : boot.status === "stopped" ? (
-      <section>
-        <p>本地运行时已停止。</p>
-        <Button type="button" variant="secondary" onClick={retryRuntime}>
-          重新启动
-        </Button>
-      </section>
-    ) : undefined;
-  const runtimeIssueReason =
-    boot.status === "failed" || boot.status === "degraded"
-      ? boot.message
-      : boot.status === "recovery_required"
-        ? "上一次关闭尚未确认 Ja App Server 已清理，需要人工恢复。"
-        : boot.status === "stopped"
-          ? "本地运行时已停止，点击可重新启动。"
-          : undefined;
   const settingsMainView = settings.loading ? (
     <section className="ja-loading-state" role="status">
       正在读取本地设置…
@@ -2008,10 +1978,7 @@ export function JaApplication({
               noProjectSelected={workspace.workspace?.kind !== "project"}
               projectSectionCollapsed={projectSectionCollapsed}
               historySectionCollapsed={historySectionCollapsed}
-              runtimeLabel={runtimeLabel(boot.status)}
               runtimeTone={runtimeTone(boot.status)}
-              runtimeIssueReason={runtimeIssueReason}
-              runtimeIssueContent={runtimeIssue}
               currentThreadId={conversation.currentThreadId}
               threads={conversation.threads}
               historyBusy={
@@ -2062,7 +2029,15 @@ export function JaApplication({
         )}
         <div className="ja-workspace-stage">
           {settingsVisible ? (
-            <main className="ja-main ja-settings-layer">{settingsMainView}</main>
+            <main className="ja-main ja-settings-layer">
+              {boot.status === "recovery_required" ? (
+                <section className="ja-settings-view" aria-label="设置页面">
+                  <RecoveryPanel />
+                </section>
+              ) : (
+                settingsMainView
+              )}
+            </main>
           ) : null}
           <div
             id="ja-workspace-layout"

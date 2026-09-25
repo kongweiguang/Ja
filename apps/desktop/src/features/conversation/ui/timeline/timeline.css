@@ -1401,6 +1401,13 @@
   animation: ja-tool-overview-spin 900ms linear infinite;
 }
 
+.ja-chat-timeline__history-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  stroke-width: 1.9;
+  animation: ja-tool-overview-spin 900ms linear infinite;
+}
+
 @keyframes ja-tool-overview-spin {
   to {
     transform: rotate(360deg);
@@ -1865,6 +1872,7 @@
   .ja-tool-details__content,
   .ja-tool-details__summary svg,
   .ja-tool-details__overview-spinner,
+  .ja-chat-timeline__history-spinner,
   .ja-tool-details__expand,
   .ja-turn-changes,
   .ja-turn-changes__files li > button,

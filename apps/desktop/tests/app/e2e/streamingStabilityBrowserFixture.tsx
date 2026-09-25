@@ -159,7 +159,6 @@ export function StreamingStabilityBrowserFixture() {
             noProjectSelected={false}
             projectSectionCollapsed={false}
             historySectionCollapsed={false}
-            runtimeLabel={turn.status === "running" ? "工作中" : "已连接"}
             runtimeTone={turn.status === "running" ? "busy" : "ready"}
             currentThreadId={THREAD_ID}
             threads={threads}

@@ -17,5 +17,5 @@ pub use model::{
     TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice, UiCommand, UiEvent, UiReference,
     UiReferenceKind, UiSnapshot, UiSubmitMode,
 };
-pub use render::{insert_scrollback, render};
+pub use render::{desired_viewport_height, insert_scrollback, render};
 pub use state::UiState;

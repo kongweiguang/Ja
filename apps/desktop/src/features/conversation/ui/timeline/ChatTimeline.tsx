@@ -13,7 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, Copy, Paperclip, Pencil } from "lucide-react";
+import { ArrowDown, Copy, LoaderCircle, Paperclip, Pencil } from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
 import { MenuItem, MenuSeparator, PointerContextMenu } from "@/shared/ui/primitives";
 import type { UserApprovalDecision } from "../approval/ApprovalCard";
@@ -1250,7 +1250,8 @@ function AssistantResponse({
 
 /**
  * 对长对话做 Virtualization，同时保留 Turn 级分组、本地 Stream 更新以及桌面端共用的
- * Disclosure/Approval 组件。隐藏 continuation 先归并到源问题，避免恢复流程增加一条无意义的用户气泡。
+ * Disclosure/Approval 组件。顶部旧页读取入口在请求期间以原位圆圈表达状态，避免加载文字插入时间线造成跳动；
+ * 隐藏 continuation 先归并到源问题，避免恢复流程增加一条无意义的用户气泡。
  */
 export function ChatTimeline({
   threadId,
@@ -1528,10 +1529,20 @@ export function ChatTimeline({
             <button
               className="ja-button ja-button-sm ja-button-ghost"
               type="button"
+              aria-label={loadingOlderHistory ? "正在加载…" : "加载更早的记录"}
+              aria-busy={loadingOlderHistory || undefined}
               disabled={loadingOlderHistory}
               onClick={() => void loadOlderHistory()}
             >
-              {loadingOlderHistory ? "正在加载…" : "加载更早的记录"}
+              {loadingOlderHistory ? (
+                <LoaderCircle
+                  className="ja-chat-timeline__history-spinner"
+                  aria-hidden="true"
+                  focusable="false"
+                />
+              ) : (
+                "加载更早的记录"
+              )}
             </button>
           )}
           {olderHistoryError !== undefined && <span role="status">{olderHistoryError}</span>}

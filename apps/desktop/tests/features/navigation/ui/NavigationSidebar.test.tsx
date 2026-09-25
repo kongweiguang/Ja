@@ -38,7 +38,6 @@ function sidebarProps(overrides: Partial<NavigationSidebarProps> = {}): Navigati
     noProjectSelected: false,
     projectSectionCollapsed: false,
     historySectionCollapsed: false,
-    runtimeLabel: "已连接",
     runtimeTone: "ready",
     currentThreadId: thread.threadId,
     threads: [thread],
@@ -160,22 +159,14 @@ afterEach(() => {
 });
 
 describe("NavigationSidebar", () => {
-  /** 原因必须支持悬停与键盘读取，状态恢复后不能留下过期告警入口。 */
-  it("shows runtime failure details on hover and clears the indicator after recovery", async () => {
-    const user = userEvent.setup();
-    const { rerender } = render(
-      <NavigationSidebar
-        {...sidebarProps({
-          runtimeLabel: "连接失败",
-          runtimeTone: "danger",
-          runtimeIssueReason: "运行时需要重新启动",
-        })}
-      />,
-    );
-    await user.hover(screen.getByRole("button", { name: "运行时异常详情" }));
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("运行时需要重新启动");
-    rerender(<NavigationSidebar {...sidebarProps()} />);
+  /** Runtime 展示已移出导航，底部只保留设置入口。 */
+  it("omits the runtime status block while keeping Settings available", () => {
+    render(<NavigationSidebar {...sidebarProps({ runtimeTone: "danger" })} />);
+
+    expect(screen.queryByRole("status", { name: /本地运行时/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "运行时异常详情" })).not.toBeInTheDocument();
+    expect(screen.getByRole("contentinfo").querySelector(".ja-navigation-runtime")).toBeNull();
+    expect(screen.getByRole("button", { name: "设置" })).toBeVisible();
   });
 
   it("keeps new conversation and general history available without an active project", () => {
@@ -251,12 +242,8 @@ describe("NavigationSidebar", () => {
     expect(props.onSelectProject).toHaveBeenCalledWith("workspace-2");
     expect(props.onOpenSettings).toHaveBeenCalledOnce();
     expect(props.onSelectConversation).toHaveBeenCalledWith("thread-1");
-    expect(screen.getByRole("status", { name: "本地运行时：已连接" })).toHaveTextContent(
-      "本地运行时已连接",
-    );
 
     const footer = screen.getByRole("contentinfo");
-    expect(within(footer).getByRole("status")).toHaveAccessibleName("本地运行时：已连接");
     expect(within(footer).getByRole("button")).toHaveAccessibleName("设置");
   });
 

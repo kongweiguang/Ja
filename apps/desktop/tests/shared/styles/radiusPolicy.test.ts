@@ -16,7 +16,6 @@ const SUMMARY_STYLE = join(
   "summary",
   "ConversationSummaryPopover.css",
 );
-const NAVIGATION_STYLE = join("features", "navigation", "ui", "navigation.css");
 const MCP_STYLE = join("features", "settings", "ui", "mcp.css");
 const MODELS_STYLE = join("features", "settings", "ui", "models-overview.css");
 const PROVIDER_EDITOR_STYLE = join("features", "settings", "ui", "provider-editor.css");
@@ -174,18 +173,6 @@ function approvedUserMessageRadius(
   );
 }
 
-/** 运行态恢复详情是独立的短内容浮层；白名单绑定导航样式、选择器与精确 14px，避免放宽全局上限。 */
-function approvedNavigationPopoverRadius(
-  file: string,
-  source: string,
-  valueOffset: number,
-  pixels: number,
-): boolean {
-  if (relative(DESKTOP_SOURCE, file) !== NAVIGATION_STYLE || pixels !== 14) return false;
-  const selector = radiusSelector(source, valueOffset);
-  return selector === ".ja-popover-content.ja-navigation-runtime-popover";
-}
-
 /** 摘要浮层的状态胶囊与统计卡保留精确几何，其余工作台仍受紧凑半径约束。 */
 function approvedConversationSummaryRadius(
   file: string,
@@ -228,7 +215,6 @@ describe("shared desktop radius policy", () => {
           !approvedSettingsRadius(file, source, offset, pixels) &&
           !approvedComposerRadius(file, source, offset, pixels) &&
           !approvedUserMessageRadius(file, source, offset, value) &&
-          !approvedNavigationPopoverRadius(file, source, offset, pixels) &&
           !approvedConversationSummaryRadius(file, source, offset, value)
         ) {
           violations.push(`${relative(DESKTOP_SOURCE, file)}: ${value}`);

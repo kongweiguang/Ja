@@ -27,7 +27,6 @@ import {
   type KeyboardEvent,
   type MouseEvent,
   type ReactElement,
-  type ReactNode,
   type SyntheticEvent,
 } from "react";
 import {
@@ -40,9 +39,6 @@ import {
   MenuItem,
   MenuTrigger,
   PointerContextMenu,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
   Tooltip,
 } from "@/shared/ui/primitives";
 import { WorkspaceScopeRow } from "@/features/workspace";
@@ -144,9 +140,6 @@ export interface NavigationSidebarProps {
   noProjectSelected: boolean;
   projectSectionCollapsed: boolean;
   historySectionCollapsed: boolean;
-  runtimeLabel: string;
-  runtimeIssueReason?: string;
-  runtimeIssueContent?: ReactNode;
   runtimeTone: "ready" | "busy" | "warning" | "danger" | "idle";
   currentThreadId?: string;
   threads: ThreadProjection[];
@@ -879,43 +872,6 @@ export const NavigationSidebar = memo(function NavigationSidebar(
       </div>
 
       <footer className="ja-navigation-footer">
-        <div
-          className="ja-navigation-runtime"
-          role="status"
-          aria-label={`本地运行时：${props.runtimeLabel}`}
-          title={`本地运行时：${props.runtimeLabel}`}
-        >
-          <span className={`ja-navigation-status-dot is-${props.runtimeTone}`} aria-hidden="true" />
-          <span className="ja-navigation-runtime-label">
-            <strong>本地运行时</strong>
-            <small aria-live="polite">{props.runtimeLabel}</small>
-          </span>
-          {props.runtimeIssueReason === undefined ? null : (
-            <Popover>
-              <Tooltip content={props.runtimeIssueReason}>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    className="ja-navigation-runtime-issue"
-                    aria-label="运行时异常详情"
-                  >
-                    <CircleAlert aria-hidden="true" />
-                  </button>
-                </PopoverTrigger>
-              </Tooltip>
-              <PopoverContent
-                className="ja-navigation-runtime-popover"
-                side="top"
-                align="center"
-                sideOffset={10}
-                collisionPadding={12}
-                aria-label="运行时异常详情"
-              >
-                {props.runtimeIssueContent ?? props.runtimeIssueReason}
-              </PopoverContent>
-            </Popover>
-          )}
-        </div>
         <button
           type="button"
           className="ja-navigation-settings"

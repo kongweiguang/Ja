@@ -163,7 +163,6 @@ export function ReadmeBrowserFixture() {
             noProjectSelected={false}
             projectSectionCollapsed={false}
             historySectionCollapsed={false}
-            runtimeLabel="已连接"
             runtimeTone="ready"
             currentThreadId={THREAD_ID}
             threads={[thread]}

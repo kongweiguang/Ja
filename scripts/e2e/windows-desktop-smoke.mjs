@@ -557,10 +557,10 @@ async function acquireDesktopSmokeLock() {
 }
 
 /**
- * 仅在显式启用时，于协议已验证的状态捕获产品 viewport 截图。
- * 将目录置于临时运行根之外，便于 Design QA 保留证据，同时不改变冒烟测试默认的产物策略。
+ * 仅在显式启用时捕获产品 viewport 截图。普通验收仍成功后统一发布；preserveOnFailure
+ * 只用于显式 UX 审查，使启动失败时已验证的当前画面也能保留在仓库外供诊断。
  */
-async function captureVisualEvidence(page, filename) {
+async function captureVisualEvidence(page, filename, preserveOnFailure = false) {
   if (visualEvidenceDirectory === undefined) {
     return;
   }
@@ -568,7 +568,12 @@ async function captureVisualEvidence(page, filename) {
     throw new Error("视觉证据 staging 尚未初始化");
   }
   await mkdir(visualEvidenceRunDirectory, { recursive: true });
-  await page.screenshot({ path: join(visualEvidenceRunDirectory, filename), fullPage: false });
+  const stagedPath = join(visualEvidenceRunDirectory, filename);
+  await page.screenshot({ path: stagedPath, fullPage: false });
+  if (preserveOnFailure) {
+    await mkdir(visualEvidenceDirectory, { recursive: true });
+    await copyFile(stagedPath, join(visualEvidenceDirectory, filename));
+  }
 }
 
 /**
@@ -11413,10 +11418,9 @@ async function captureRuntimeStartupState(page) {
 }
 
 /**
- * 侧栏把 runtime 健康度建模为只读 status，设置入口是相邻的独立按钮；轮询同时监听
- * crashed/incompatible/faulted/recovery_required 与产品失败页，使确定失败立即携带现场退出。
- * 失败摘要额外读取 probe 已捕获的 start 阶段与稳定错误码，不重试有副作用的启动命令；
- * 正常冷启动仍拥有独立局部预算，不会消耗整轮场景期限。
+ * 健康态可从精简侧栏中隐藏，因此以 native ready snapshot 和同 generation 的 ready 事件
+ * 判断启动完成；轮询同时监听 crashed/incompatible/faulted/recovery_required 与产品失败页，
+ * 失败摘要只读取 probe 已捕获的 start 阶段和稳定错误码，不重试有副作用的启动命令。
  */
 async function waitForRuntimeReady(page, deadline, signal) {
   const readyDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
@@ -11433,7 +11437,13 @@ async function waitForRuntimeReady(page, deadline, signal) {
       captureRuntimeStartupState(page),
     ]);
     diagnostic = observed;
-    if (connected) return;
+    const readyGeneration = observed.nativeState.generation;
+    const readyEvent = observed.statusEvents.some(
+      (event) =>
+        event.status === "ready" &&
+        (readyGeneration === undefined || event.generation === readyGeneration),
+    );
+    if (connected || (observed.nativeState.status === "ready" && readyEvent)) return;
     const terminalEvent = observed.statusEvents.findLast((event) =>
       terminalFailures.has(event.status),
     );
@@ -23330,15 +23340,26 @@ async function waitForComposerSuggestionList(page, accessibleName, deadline) {
 }
 
 /**
- * 通过原生 textarea 输入 token 并定位产品 option；键盘路径额外往返一次 active descendant，
- * 证明 Arrow 导航没有把焦点移入面板，鼠标路径则使用真实 pointer click。
+ * 通过原生 textarea 输入 token 并定位产品 option；可选截图仅在明确配置视觉证据目录时写入，
+ * 查询延迟从输入到候选面板可见计量，键盘与鼠标仍分别走真实交互路径。
  */
-async function selectComposerSuggestion(page, token, listName, optionText, method, deadline) {
+async function selectComposerSuggestion(
+  page,
+  token,
+  listName,
+  optionText,
+  method,
+  deadline,
+  screenshotName,
+) {
   const composer = page.getByRole("textbox", { name: "消息", exact: true });
+  const searchStartedAt = Date.now();
   await composer.fill(token);
   const list = await waitForComposerSuggestionList(page, listName, deadline);
   const option = list.getByRole("option").filter({ hasText: optionText }).first();
   await option.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  const searchLatencyMs = Date.now() - searchStartedAt;
+  if (screenshotName !== undefined) await captureVisualEvidence(page, screenshotName, true);
   if (method === "keyboard") {
     const initial = await composer.getAttribute("aria-activedescendant");
     await composer.press("ArrowDown");
@@ -23375,6 +23396,7 @@ async function selectComposerSuggestion(page, token, listName, optionText, metho
     { expectedToken: token, expectedLabel: optionText },
     { timeout: Math.max(1, deadline - Date.now()) },
   );
+  return searchLatencyMs;
 }
 
 /**
@@ -23387,7 +23409,7 @@ async function executeComposerCommand(page, command, deadline) {
     files: "打开文件",
     new: "新建对话",
     plan: "计划",
-    project: "切换项目",
+    project: "关联项目",
     search: "搜索对话",
     settings: "打开设置",
     sidebar: "切换侧栏",
@@ -23406,17 +23428,22 @@ async function executeComposerCommand(page, command, deadline) {
 }
 
 /**
- * 读取 Chip 的可见、tooltip 与按钮语义，不复制 workspace 绝对路径；返回值只包含计划中固定的
- * 相对路径和 Skill 元数据。
+ * 分别读取 Chip 的预览/定位动作与移除动作，避免依赖 DOM 顺序；不复制 Workspace 绝对路径，
+ * 返回值只包含计划中固定的相对路径和 Skill 元数据。
  */
 async function readComposerChipEvidence(page) {
   return page.locator(".ja-composer-context__chip").evaluateAll((chips) =>
     chips.map((chip) => {
       const copy = chip.querySelector(".ja-composer-context__copy");
-      const remove = chip.querySelector("button");
+      const buttons = [...chip.querySelectorAll("button")];
+      const remove = buttons.find((button) =>
+        button.getAttribute("aria-label")?.startsWith("移除上下文 "),
+      );
+      const open = buttons.find((button) => button !== remove);
       return {
         label: copy?.querySelector("strong")?.textContent?.trim(),
         title: copy?.getAttribute("title"),
+        openLabel: open?.getAttribute("aria-label"),
         removeLabel: remove?.getAttribute("aria-label"),
         removeTitle: remove?.getAttribute("title"),
       };
@@ -23556,7 +23583,8 @@ async function exerciseComposerVisualMatrix(page, deadline, recordStage) {
 
 /**
  * 逐项驱动 @/$// 的真实 WebView2 交互、Provider 暂停队列与 reload 恢复；所有负向 IO
- * 断言都读取 Tauri adapter probe 的命令计数，不以源代码搜索替代运行证据。
+ * 断言都读取 Tauri adapter probe 的命令计数，不以源代码搜索替代运行证据。隔离 Home 没有历史 Thread，
+ * 因此用工具栏的真实“新会话”动作创建 Thread；若该入口被准入门禁关闭，先经过设置入口检查后再重试。
  */
 async function runComposerContextAcceptanceSession(
   page,
@@ -23576,7 +23604,47 @@ async function runComposerContextAcceptanceSession(
     undefined,
     { timeout: timeout() },
   );
+  await captureVisualEvidence(page, "composer-context-00-initial-state.png", true);
   await waitForRuntimeReady(page, deadline, signal);
+  await captureVisualEvidence(page, "composer-context-01-runtime-ready.png", true);
+  const newConversationButton = page.getByRole("button", { name: "新会话", exact: true });
+  await newConversationButton.waitFor({ state: "visible", timeout: timeout() });
+  let settingsRecoveryUsed = false;
+  await page
+    .waitForFunction(
+      () => {
+        const button = [...globalThis.document.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent?.trim() === "新会话",
+        );
+        return button !== undefined && !button.disabled;
+      },
+      undefined,
+      { timeout: Math.min(timeout(), 5_000) },
+    )
+    .catch(() => undefined);
+  if (await newConversationButton.isDisabled()) {
+    settingsRecoveryUsed = true;
+    stage("settings_recovery");
+    await page.getByRole("button", { name: "设置", exact: true }).click();
+    await page.locator(".ja-settings-view").waitFor({ state: "visible", timeout: timeout() });
+    await page.waitForFunction(
+      () =>
+        globalThis.document.querySelector('input[aria-label="搜索设置"]') instanceof
+          globalThis.HTMLElement ||
+        globalThis.document.querySelector('.ja-error-state[role="alert"]') instanceof
+          globalThis.HTMLElement,
+      undefined,
+      { timeout: Math.min(timeout(), 20_000) },
+    );
+    await captureVisualEvidence(page, "composer-context-02-settings-recovery.png", true);
+    await page.getByRole("button", { name: "返回应用", exact: true }).click();
+    await captureVisualEvidence(page, "composer-context-03-returned-state.png", true);
+    if (await newConversationButton.isDisabled()) {
+      throw new Error("运行时 ready 且设置已加载后，新会话入口仍禁用");
+    }
+  }
+  stage("new_conversation");
+  await newConversationButton.click();
   await waitForInitialThread(page, deadline, signal);
   await assertGeneralConversationScope(page, deadline);
   await waitForComposerAdmission(page, deadline);
@@ -23672,13 +23740,20 @@ async function runComposerContextAcceptanceSession(
   for (const [name, reason] of Object.entries({
     审查本轮修改: "本轮没有可审查的修改",
     打开预览: "当前没有可预览目标",
-    后退: "没有更早的页面",
     前进: "没有可前进的页面",
     返回对话: "当前已在对话",
   })) {
     if (disabledReasons[name] !== reason) {
       throw new Error(`${name} 未展示真实不可用原因：${JSON.stringify(disabledReasons)}`);
     }
+  }
+  const backUnavailableReason = disabledReasons["后退"];
+  if (
+    settingsRecoveryUsed
+      ? backUnavailableReason !== undefined
+      : backUnavailableReason !== "没有更早的页面"
+  ) {
+    throw new Error(`后退可用状态与真实导航历史不符：${JSON.stringify(disabledReasons)}`);
   }
   const selectionBeforeEscape = await composer.evaluate((input) => ({
     start: input.selectionStart,
@@ -23819,14 +23894,23 @@ async function runComposerContextAcceptanceSession(
     page,
     "ja_runtime_workspace_path_search",
   );
-  await selectComposerSuggestion(page, "@sample", "文件与目录", "sample.ts", "keyboard", deadline);
-  await selectComposerSuggestion(
+  const fileSearchLatencyMs = await selectComposerSuggestion(
+    page,
+    "@sample",
+    "文件与目录",
+    "sample.ts",
+    "keyboard",
+    deadline,
+    "composer-context-file-suggestions.png",
+  );
+  const directorySearchLatencyMs = await selectComposerSuggestion(
     page,
     "@folder-fixture",
     "文件与目录",
     "folder-fixture",
     "mouse",
     deadline,
+    "composer-context-directory-suggestions.png",
   );
   const chipsBeforeDuplicate = await readComposerChipEvidence(page);
   await selectComposerSuggestion(page, "@sample", "文件与目录", "sample.ts", "mouse", deadline);
@@ -23849,11 +23933,13 @@ async function runComposerContextAcceptanceSession(
   ) {
     throw new Error(`Workspace Chip 去重或可访问语义失败：${JSON.stringify(chipsAfterDuplicate)}`);
   }
+  await captureVisualEvidence(page, "composer-context-selected-references.png", true);
   await page.getByRole("button", { name: "移除上下文 folder-fixture", exact: true }).click();
   if ((await readComposerChipEvidence(page)).some(({ label }) => label === "folder-fixture")) {
     throw new Error("Workspace Chip 移除未收敛");
   }
   await page.getByRole("button", { name: "移除上下文 sample.ts", exact: true }).click();
+  await captureVisualEvidence(page, "composer-context-references-removed.png", true);
 
   stage("visual_matrix");
   const visualMatrix = await exerciseComposerVisualMatrix(page, deadline, recordStage);
@@ -24052,6 +24138,7 @@ async function runComposerContextAcceptanceSession(
       pathSearchCount:
         (await tauriInvokeCount(page, "ja_runtime_workspace_path_search")) -
         pathSearchBeforeReferences,
+      searchLatencyMs: { file: fileSearchLatencyMs, directory: directorySearchLatencyMs },
       chips: chipsAfterDuplicate,
       duplicateSuppressed: chipsAfterDuplicate.length === chipsBeforeDuplicate.length,
       removeCompleted: true,

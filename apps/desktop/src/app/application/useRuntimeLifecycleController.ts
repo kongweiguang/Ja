@@ -646,7 +646,10 @@ export function useRuntimeLifecycleController(
     let active = true;
     let unsubscribe: (() => void | Promise<void>) | undefined;
 
-    /** 仅在 subscription generation 仍为当前 owner 时应用 event，晚事件直接失效。 */
+    /**
+     * 仅在 subscription generation 仍为当前 owner 时应用 event，晚事件直接失效。ready 事件可能
+     * 先于首次 native state 查询到达；没有 Turn gate 时必须在同一串行 lane 再核验身份后才能解锁。
+     */
     const handleEvent = (event: RuntimeHostEvent): void => {
       if (!active || lifecycleEpochRef.current !== lifecycleEpoch) {
         return;
@@ -705,6 +708,24 @@ export function useRuntimeLifecycleController(
         updateRuntimeState(event.status);
         stateProjection(projection, event.status, event.eventId, event.occurredAt, event.reason);
         updateBoot(bootForStatus(event.status));
+        const readyEventStatus = isReadyStatus(event.status) ? event.status : undefined;
+        if (readyEventStatus !== undefined && turnGateRef.current === undefined && !startPending) {
+          const admissionIntent = configurationIntentRef.current;
+          void refreshState(lifecycleEpoch)
+            .then(async (observed) => {
+              if (
+                !active ||
+                lifecycleEpochRef.current !== lifecycleEpoch ||
+                observed.generation !== readyEventStatus.generation ||
+                observed.serverInstanceId !== readyEventStatus.serverInstanceId ||
+                !commitConfiguredReady(observed, lifecycleEpoch, admissionIntent)
+              ) {
+                return;
+              }
+              await recheckPendingOperations();
+            })
+            .catch(() => undefined);
+        }
         if (event.status.status === "recovery_required") {
           const pending = enqueueOperation("recoveryState", () => runtime.recoveryState());
           void pending.promise

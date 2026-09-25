@@ -10,8 +10,6 @@ import type {
 } from "@/features/settings";
 import { capabilitySettingsPorts } from "../application/capabilitySettingsPorts";
 import type { WorkspaceProjection } from "@/features/workspace";
-import { useRuntimeState } from "../RuntimeProvider";
-import { RecoveryPanel } from "./RecoveryPanel";
 import type { SettingsInterfacePreferences, ExecutionScope } from "@/features/settings";
 
 /** Settings editor 及 Radix/form 依赖只在专属页面进入 bundle。 */
@@ -56,7 +54,6 @@ export function SettingsView({
   desktopNotifications,
   desktop,
 }: SettingsViewProps): ReactElement {
-  const { boot } = useRuntimeState();
   /** 作用域路由只随两端权威动作变化，避免设置视图自己构造配置快照。 */
   const ports = useMemo(
     () => capabilitySettingsPorts(settings.ports, projectSettings.ports),
@@ -64,7 +61,6 @@ export function SettingsView({
   );
   return (
     <section className="ja-settings-view" aria-label="设置页面">
-      {boot.status === "recovery_required" ? <RecoveryPanel /> : null}
       <Suspense
         fallback={
           <section className="ja-loading-state" role="status">

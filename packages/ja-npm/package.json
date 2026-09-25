@@ -1,6 +1,6 @@
 {
   "name": "@kongweiguang/ja",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "private": true,
   "description": "Ja native command-line interface for Windows x64",
   "license": "GPL-3.0-or-later",

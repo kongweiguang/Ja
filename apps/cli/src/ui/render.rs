@@ -37,8 +37,80 @@ struct SelectionRow {
 /// 仿照 Pi 编辑器与 Codex 命令列表，把候选接在输入框下方；对话保持原终端滚动历史。
 pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
-    if area.width == 0 || area.height == 0 {
+    let Some(plan) = render_plan(area, state) else {
         return;
+    };
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(plan.leading_height),
+            Constraint::Length(plan.history_height),
+            Constraint::Length(plan.welcome_gap_height),
+            Constraint::Length(plan.first_height),
+            Constraint::Length(plan.second_height),
+            Constraint::Length(plan.footer_height),
+        ])
+        .split(area);
+    if plan.history_height > 0 {
+        render_history(frame, regions[1], &plan.history);
+    }
+    if plan.pending {
+        if plan.panel_height > 0 {
+            render_pending_inline(frame, regions[3], state);
+        }
+        if plan.show_composer {
+            render_composer(
+                frame,
+                regions[4],
+                state,
+                plan.width,
+                &plan.composer_lines,
+                plan.visible_composer_lines,
+            );
+        }
+    } else if plan.full_choice {
+        render_choice_view(frame, regions[3], state);
+    } else {
+        render_composer(
+            frame,
+            regions[3],
+            state,
+            plan.width,
+            &plan.composer_lines,
+            plan.visible_composer_lines,
+        );
+        if plan.panel_height > 0 {
+            render_selector(frame, regions[4], state);
+        }
+    }
+    if plan.footer_height > 0 {
+        render_footer(frame, regions[5], state);
+    }
+    render_panel(frame, area, state);
+}
+
+struct RenderPlan {
+    width: usize,
+    composer_lines: Vec<String>,
+    visible_composer_lines: usize,
+    pending: bool,
+    full_choice: bool,
+    show_composer: bool,
+    composer_height: u16,
+    panel_height: u16,
+    footer_height: u16,
+    history: Vec<Line<'static>>,
+    history_height: u16,
+    leading_height: u16,
+    welcome_gap_height: u16,
+    first_height: u16,
+    second_height: u16,
+}
+
+/** 共享渲染与视口测量的同一份几何预算，避免动态高度偏离真实控件布局。 */
+fn render_plan(area: Rect, state: &UiState) -> Option<RenderPlan> {
+    if area.width == 0 || area.height == 0 {
+        return None;
     }
     let width = area.width.max(4) as usize;
     let composer_lines = state.composer().visual_lines(width);
@@ -110,53 +182,58 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     } else {
         panel_height
     };
-    let regions = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(leading_height),
-            Constraint::Length(history_height),
-            Constraint::Length(welcome_gap_height),
-            Constraint::Length(first_height),
-            Constraint::Length(second_height),
-            Constraint::Length(footer_height),
-        ])
-        .split(area);
-    if history_height > 0 {
-        render_history(frame, regions[1], &history);
+    Some(RenderPlan {
+        width,
+        composer_lines,
+        visible_composer_lines,
+        pending,
+        full_choice,
+        show_composer,
+        composer_height,
+        panel_height,
+        footer_height,
+        history,
+        history_height,
+        leading_height,
+        welcome_gap_height,
+        first_height,
+        second_height,
+    })
+}
+
+/** 只占用实际内容所需的行数，并给已提交回复与编辑区留一行间距；长草稿和详情保留完整空间。 */
+pub fn desired_viewport_height(state: &UiState, width: u16, max_height: u16) -> u16 {
+    let max_height = max_height.max(1);
+    if state
+        .composer()
+        .visual_lines(usize::from(width.max(4)))
+        .len()
+        > 1
+        || matches!(
+            state.panel(),
+            Some(Panel::Help | Panel::Details { .. } | Panel::ChoiceDetail { .. })
+        )
+    {
+        return max_height;
     }
-    if pending {
-        if panel_height > 0 {
-            render_pending_inline(frame, regions[3], state);
-        }
-        if show_composer {
-            render_composer(
-                frame,
-                regions[4],
-                state,
-                width,
-                &composer_lines,
-                visible_composer_lines,
-            );
-        }
-    } else if full_choice {
-        render_choice_view(frame, regions[3], state);
-    } else {
-        render_composer(
-            frame,
-            regions[3],
-            state,
-            width,
-            &composer_lines,
-            visible_composer_lines,
-        );
-        if panel_height > 0 {
-            render_selector(frame, regions[4], state);
-        }
-    }
-    if footer_height > 0 {
-        render_footer(frame, regions[5], state);
-    }
-    render_panel(frame, area, state);
+    let area = Rect::new(0, 0, width.max(1), max_height);
+    let Some(plan) = render_plan(area, state) else {
+        return 1;
+    };
+    let content_height = plan
+        .history_height
+        .saturating_add(plan.composer_height)
+        .saturating_add(plan.panel_height)
+        .saturating_add(plan.footer_height)
+        .max(1);
+    let separates_scrollback_from_composer = plan.history_height == 0
+        && state.snapshot().turn_state != TurnState::Working
+        && state.panel().is_none()
+        && !state.snapshot().timeline.is_empty()
+        && content_height < max_height;
+    content_height
+        .saturating_add(u16::from(separates_scrollback_from_composer))
+        .min(max_height)
 }
 
 /// 首屏卡片留在终端历史起点，其余活动消息贴近底部输入区；空白只能位于二者之间。
@@ -650,7 +727,7 @@ fn render_composer(
     }
 }
 
-/// 底栏保留模型和目录；窄屏或草稿输入时才在这里显示可用的工作快捷键。
+/// 底栏按当前面板给出下一步按键，恢复选择明确显示导航、确认和返回动作。
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -705,6 +782,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             kind: ChoiceKind::Models | ChoiceKind::Permissions,
             ..
         }) => Some("  Enter 确认 · F2 说明 · Esc 返回"),
+        Some(Panel::Choices {
+            kind: ChoiceKind::Threads,
+            ..
+        }) if area.width < 22 => Some("Enter恢复 Esc"),
+        Some(Panel::Choices {
+            kind: ChoiceKind::Threads,
+            ..
+        }) if area.width < 29 => Some("↑↓选 · Enter恢复 · Esc"),
+        Some(Panel::Choices {
+            kind: ChoiceKind::Threads,
+            ..
+        }) => Some("  ↑↓ 选择 · Enter 恢复 · Esc 返回"),
         Some(Panel::Choices { .. }) => Some("  Enter 确认或 Esc 返回"),
         Some(Panel::Pending) => Some(pending_footer_hint(state, area.width)),
         Some(Panel::Help | Panel::Details { .. } | Panel::ChoiceDetail { .. }) => {
@@ -838,7 +927,7 @@ fn pending_footer_hint(state: &UiState, width: u16) -> &'static str {
     }
 }
 
-/// Codex CommandPopup 的八行窗口与名称/描述列只投影 Ja 实际可执行的命令。
+/// 候选行共享名称/描述列；会话空态区分项目无历史与当前搜索无匹配项。
 fn selector_rows(state: &UiState) -> Option<(Vec<SelectionRow>, Option<usize>)> {
     match state.panel()? {
         Panel::Commands { selected } => {
@@ -867,7 +956,11 @@ fn selector_rows(state: &UiState) -> Option<(Vec<SelectionRow>, Option<usize>)> 
             let selected = (!choices.is_empty()).then_some(*selected);
             let rows = if choices.is_empty() {
                 vec![SelectionRow {
-                    name: empty_choice_label(*kind).to_owned(),
+                    name: if *kind == ChoiceKind::Threads && !state.thread_query().is_empty() {
+                        "当前项目没有匹配的会话".to_owned()
+                    } else {
+                        empty_choice_label(*kind).to_owned()
+                    },
                     description: None,
                     tag: None,
                 }]
@@ -1054,10 +1147,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             "按模型实际支持的等级选择",
         ),
         ChoiceKind::Permissions => ("选择权限".to_owned(), "更改当前会话的执行权限"),
-        ChoiceKind::Threads => (
-            "恢复会话".to_owned(),
-            "搜索标题 · PgDn 更多 · 列表保留最近 64 条",
-        ),
+        ChoiceKind::Threads => ("恢复会话".to_owned(), "当前项目 · 搜索标题 · PgDn 加载更多"),
         ChoiceKind::InputHistory => (
             "搜索输入历史".to_owned(),
             "搜索输入 · PgDn 更多 · 列表保留最近 64 条",
@@ -1073,7 +1163,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 state.input_history_query()
             )
         } else if *kind == ChoiceKind::Threads && !state.thread_query().is_empty() {
-            format!("搜索：{} · PgDn 更多 · 最近 64 条", state.thread_query())
+            format!("当前项目 · 搜索：{} · PgDn 加载更多", state.thread_query())
         } else {
             description.to_owned()
         };
@@ -1344,13 +1434,13 @@ fn choice_label(choice: &UiChoice) -> String {
         .unwrap_or_else(|| choice.label.clone())
 }
 
-/// 空列表说明真实能力的下一步，避免各选择器只出现不知如何处理的通用空状态。
+/// 空列表指出当前项目没有可选会话，避免用户误以为列表仍在加载或搜索失效。
 fn empty_choice_label(kind: ChoiceKind) -> &'static str {
     match kind {
         ChoiceKind::Models => "暂无可用模型，请先配置供应商",
         ChoiceKind::Reasoning => "当前模型没有可选推理等级",
         ChoiceKind::Permissions => "权限选项暂不可用",
-        ChoiceKind::Threads => "暂无可恢复会话",
+        ChoiceKind::Threads => "当前项目暂无可恢复会话",
         ChoiceKind::InputHistory => "暂无匹配的输入历史",
         ChoiceKind::Files => "没有匹配的文件",
         ChoiceKind::Skills => "没有匹配的技能",
