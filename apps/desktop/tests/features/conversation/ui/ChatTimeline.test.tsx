@@ -4,7 +4,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import type {
   TimelineApproval as ApprovalSummary,
   TimelineItemAdapter,
@@ -28,6 +28,13 @@ const baseItem = (item: Partial<TimelineItemAdapter>): TimelineItemAdapter => ({
 
 describe("ChatTimeline", () => {
   afterEach(() => cleanup());
+
+  /** Drain TanStack Virtual's fallback scroll-end timeout before Vitest removes this file's JSDOM window. */
+  async function drainVirtualizerScrollEndTimeout() {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  afterAll(drainVirtualizerScrollEndTimeout);
 
   it("只在旧页可用时提供单次按需加载入口", async () => {
     let release!: () => void;

@@ -19,6 +19,7 @@ import { randomBytes } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
+  createClientOperationId,
   createIsolatedDirectories,
   initializeParams,
   JsonlSession,
@@ -737,6 +738,7 @@ export async function withSelectedCredentialSecret(authPath, credentialId, useSe
 
 /**
  * 仅拷贝 config.toml；宿主 Secret 经内存回调写入隔离 auth.json，再用生产 JA-RPC 和隔离 SQLite。
+ * 所有有副作用 Turn 请求使用唯一 v1 operation identity，遵守服务端的重试去重边界。
  */
 export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "preflight" }) {
   if (mode === "real") {
@@ -958,6 +960,7 @@ export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "pref
     const seed = resultOf(
       await session.request("turn/start", {
         threadId: thread.threadId,
+        clientOperationId: createClientOperationId(),
         content: [
           {
             type: "text",
@@ -1091,6 +1094,7 @@ export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "pref
       await session.request("turn/continue", {
         threadId: thread.threadId,
         expectedThreadRevision: seedHistory.revision,
+        clientOperationId: createClientOperationId(),
       }),
       "turn/continue",
     );

@@ -8,6 +8,7 @@
  * inside the v1 credential/set request on stdin.
  */
 
+import { randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -19,6 +20,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+/** Generate the required v1 identity so transport retries cannot replay a side effect without deduplication. */
+export function createClientOperationId() {
+  return `op_${randomBytes(16).toString("hex")}`;
+}
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDirectory, "..", "..");
@@ -1261,7 +1267,10 @@ async function startProductionSession({ command, prefixArgs, directories, apiKey
   }
 }
 
-/** Runs text plus approved Tool Turns, reopens the same SQLite home, and checks durable recovery. */
+/**
+ * Runs text and approved Tool Turns with unique operation identities required by v1 mutation handling,
+ * then reopens the same SQLite home and checks durable recovery.
+ */
 export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   if (process.env.JA_REAL_PROVIDER_AUTHORIZED !== "1") {
     throw new Error("JA_REAL_PROVIDER_AUTHORIZED=1 is required for paid provider traffic");
@@ -1417,6 +1426,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const textAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
+        clientOperationId: createClientOperationId(),
         content: [{ type: "text", text: `Reply with exactly ${textMarker}. Do not call tools.` }],
       }),
       "turn/start",
@@ -1461,6 +1471,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const toolAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
+        clientOperationId: createClientOperationId(),
         content: [
           {
             type: "text",
@@ -1512,6 +1523,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const failedToolAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
+        clientOperationId: createClientOperationId(),
         content: [
           {
             type: "text",

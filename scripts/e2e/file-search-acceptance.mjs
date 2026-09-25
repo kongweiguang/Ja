@@ -15,6 +15,7 @@ import {
 } from "./fixtures/file-search-acceptance.mjs";
 import {
   committedTerminalReply,
+  createClientOperationId,
   createIsolatedDirectories,
   initializeParams,
   JsonlSession,
@@ -455,7 +456,10 @@ async function cleanupDirectories(root) {
   await rm(target, { recursive: true, force: false });
 }
 
-/** 运行真实 JVM/Native App Server、确定性 loopback Provider、压力 Workspace 与重启历史回读闭环。 */
+/**
+ * Run a real JVM/Native App Server acceptance with a unique v1 operation identity so the tested
+ * mutation follows production deduplication semantics before checking search and restart recovery.
+ */
 export async function runAcceptance(options = {}) {
   const parsed = {
     ...parseArguments([]),
@@ -538,6 +542,7 @@ export async function runAcceptance(options = {}) {
     const accepted = rpcResult(
       await session.request("turn/start", {
         threadId: created.threadId,
+        clientOperationId: createClientOperationId(),
         content: [
           {
             type: "text",

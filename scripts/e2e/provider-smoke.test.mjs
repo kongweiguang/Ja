@@ -14,6 +14,7 @@ import {
   assertWindowsPowerShellSelection,
   collectToolEvidence,
   committedTerminalReply,
+  createClientOperationId,
   initializeParams,
   providerConfigurationDocument,
   providerFailingToolTurnInput,
@@ -95,6 +96,15 @@ test("initialize envelope contains only the current configuration-free contract"
   for (const forbidden of ["configSnapshot", "apiKey", "minimumCompatibleMinor"]) {
     assert.equal(forbidden in params, false);
   }
+});
+
+/** Mutating requests carry a fresh opaque operation key; format is part of the strict JA-RPC contract. */
+test("client operation identities use the frozen v1 format", () => {
+  const first = createClientOperationId();
+  const second = createClientOperationId();
+  assert.match(first, /^op_[0-9a-f]{32}$/u);
+  assert.match(second, /^op_[0-9a-f]{32}$/u);
+  assert.notEqual(first, second);
 });
 
 /** 终答只从 terminal 的完整持久消息读取，流式 delta 如何切分或模型如何措辞都不得影响验收。 */
