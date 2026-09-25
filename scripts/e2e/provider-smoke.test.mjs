@@ -4,6 +4,7 @@
 /** Unit gates for the real-provider smoke's loopback, evidence, and secret boundaries. */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import process from "node:process";
 import test from "node:test";
 
@@ -21,9 +22,27 @@ import {
   validatedLoopbackBaseUrl,
 } from "./real-provider-smoke.mjs";
 
-/** 冻结真实 Provider smoke 的完整 v1 能力词汇表，避免新增持久接口后付费验收在握手前失效。 */
-test("direct capabilities retain only the minimal v1 surface", () => {
+/**
+ * Smoke 必须提交服务端完整且有序的 v1 词汇表；直接比对 Java 握手 owner 可避免只维护
+ * 被当前场景使用的子集，导致后续集成验收在开始前被 stale capability 拒绝。
+ */
+test("direct capabilities match the server handshake vocabulary", () => {
   const capabilities = initializeParams().capabilities;
+  const handshakeSource = readFileSync(
+    new URL(
+      "../../app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/HandshakeHandler.java",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  for (const name of ["METHODS", "EVENTS"]) {
+    const match = handshakeSource.match(
+      new RegExp(`static final List<String> ${name} = List\\.of\\(([\\s\\S]*?)\\);`, "u"),
+    );
+    assert.ok(match, `server ${name} vocabulary is present`);
+    const serverItems = [...match[1].matchAll(/"([^"]+)"/gu)].map((entry) => entry[1]);
+    assert.deepEqual(capabilities[name.toLowerCase()], serverItems);
+  }
   assert.deepEqual(capabilities.accessModes, ["approval_required", "full_access"]);
   assert.deepEqual(capabilities.collaborationModes, ["default", "plan"]);
   assert.deepEqual(capabilities.features, ["task_threads_v1", "plan_goal_v1", "interaction_v1"]);

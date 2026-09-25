@@ -40,6 +40,8 @@ const methods = [
   "runtime/initialize",
   "runtime/health",
   "runtime/shutdown",
+  "runtime/context/register",
+  "operation/read",
   "workspace/open",
   "workspace/list",
   "workspace/path/search",
@@ -49,6 +51,10 @@ const methods = [
   "thread/list",
   "thread/search",
   "thread/read",
+  "thread/message-content/read",
+  "history/input/search",
+  "thread/observe",
+  "thread/unobserve",
   "thread/usage/read",
   "thread/mcp/read",
   "thread/rename",
@@ -59,6 +65,7 @@ const methods = [
   "thread/restore",
   "thread/delete",
   "thread/compact",
+  "thread/compact/cancel",
   "interaction/read",
   "interaction/observe",
   "interaction/unobserve",
@@ -770,7 +777,10 @@ export function assertDirectProviderCapabilities(capabilities) {
   return capabilities;
 }
 
-/** Builds the strict capability/limit offer used by the direct provider gate. */
+/**
+ * Uses the server's complete ordered v1 vocabulary because handshake validation treats capability
+ * lists as a frozen protocol contract, even when this smoke exercises only a subset of methods.
+ */
 export function initializeParams() {
   const capabilities = assertDirectProviderCapabilities({
     methods: [...methods],
