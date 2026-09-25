@@ -18,6 +18,7 @@ import io.github.kongweiguang.ja.foundation.json.JsonObjectBuilder;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
 import io.github.kongweiguang.ja.foundation.json.JsonText;
 import io.github.kongweiguang.ja.foundation.json.JsonValue;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchToolResolver;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBoundary;
 
 import java.io.ByteArrayOutputStream;

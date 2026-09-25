@@ -5,6 +5,7 @@ package io.github.kongweiguang.ja.conversation.adapter.out.tools;
 
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationSource;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-package io.github.kongweiguang.ja.conversation.adapter.out.tools;
+package io.github.kongweiguang.ja.foundation.search;
 
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 

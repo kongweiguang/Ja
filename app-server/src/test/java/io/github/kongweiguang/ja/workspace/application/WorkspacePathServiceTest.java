@@ -5,8 +5,10 @@ package io.github.kongweiguang.ja.workspace.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.kongweiguang.ja.foundation.pagination.CursorPage;
+import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.workspace.domain.Workspace;
 import io.github.kongweiguang.ja.workspace.domain.WorkspaceEntryKind;
 import io.github.kongweiguang.ja.workspace.domain.WorkspacePathFailure;
@@ -18,6 +20,12 @@ import io.github.kongweiguang.ja.workspace.port.out.WorkspacePathPort;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -59,6 +67,30 @@ final class WorkspacePathServiceTest {
         assertEquals(List.of(new WorkspacePathSearchUseCase.Entry(
                 "src/Main.java", WorkspaceEntryKind.FILE)), result.items());
         assertEquals(temporaryDirectory.toAbsolutePath().normalize(), paths.searchedRoot);
+    }
+
+    /** 同一 Thread 的新输入应中止旧扫描，避免快速键入时并发占用 fd 与目录 IO。 */
+    @Test
+    void supersedesPreviousSearchForSameThread() throws Exception {
+        paths.waitForFirstCancellation = true;
+        paths.searchResult = new WorkspacePathPort.SearchOutcome(List.of(
+                new WorkspacePathPort.PathEntry("src/New.java", WorkspaceEntryKind.FILE)), false, 1);
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<WorkspacePathSearchUseCase.SearchResult> previous = executor.submit(() -> service.search(
+                    new WorkspacePathSearchUseCase.SearchRequest(
+                            "thr_test", "ws_test", 17, "old", 10)));
+            assertTrue(paths.firstSearchEntered.await(5, TimeUnit.SECONDS));
+
+            WorkspacePathSearchUseCase.SearchResult latest = service.search(
+                    new WorkspacePathSearchUseCase.SearchRequest(
+                            "thr_test", "ws_test", 17, "new", 10));
+            WorkspacePathSearchUseCase.SearchResult stale = previous.get(5, TimeUnit.SECONDS);
+
+            assertTrue(paths.firstSearchCancellation.get().isCancellationRequested());
+            assertEquals("new", latest.query());
+            assertEquals("old", stale.query());
+            assertTrue(stale.truncated());
+        }
     }
 
     /** Thread Workspace 不一致必须在 adapter IO 前失败，避免跨 Workspace 探测。 */
@@ -172,11 +204,29 @@ final class WorkspacePathServiceTest {
         private ValidatedPath validated = new ValidatedPath("src/Main.java", WorkspaceEntryKind.FILE);
         private Path searchedRoot;
         private int validationCalls;
+        private boolean waitForFirstCancellation;
+        private final CountDownLatch firstSearchEntered = new CountDownLatch(1);
+        private final CountDownLatch firstSearchCancelled = new CountDownLatch(1);
+        private final AtomicReference<CancellationToken> firstSearchCancellation = new AtomicReference<>();
 
         /** 记录搜索根并返回测试设置的结果。 */
         @Override
-        public SearchOutcome search(Path workspaceRoot, String query, int limit) {
+        public SearchOutcome search(Path workspaceRoot, String query, int limit,
+                                    CancellationToken cancellationToken) {
             searchedRoot = workspaceRoot;
+            if (waitForFirstCancellation && firstSearchCancellation.compareAndSet(null, cancellationToken)) {
+                firstSearchEntered.countDown();
+                try (CancellationToken.Registration ignored = cancellationToken.onCancellation(
+                        firstSearchCancelled::countDown)) {
+                    if (!firstSearchCancelled.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("old workspace search was not cancelled");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("old workspace search was interrupted", interrupted);
+                }
+                return new SearchOutcome(List.of(), true, 0);
+            }
             return searchResult;
         }
 

@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-package io.github.kongweiguang.ja.conversation.adapter.out.tools;
+package io.github.kongweiguang.ja.foundation.search;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -167,7 +167,7 @@ public final class NativeSearchToolResolver {
     }
 
     /** 由文件 Tool 使用的闭集查找错误，明确说明 fd/rg 安装缺失。 */
-    static final class SearchToolUnavailableException extends IOException {
+    public static final class SearchToolUnavailableException extends IOException {
         private final String toolName;
 
         /** 将工具名限制在可信小集合内，渲染诊断时不会泄露路径。 */
@@ -180,7 +180,7 @@ public final class NativeSearchToolResolver {
         }
 
         /** 返回固定工具名，供模型可见的安全诊断使用。 */
-        String toolName() {
+        public String toolName() {
             return toolName;
         }
     }

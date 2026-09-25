@@ -70,9 +70,9 @@ Ja 不要求注册账号。模型服务由你选择，请求费用由对应服�
 
 输入框中的执行确认选项决定工具是否需要你逐次批准。选择“完全访问”时，Agent 可以直接使用当前用户的文件与命令权限。
 
-### 命令行客户端（Windows x64）
+### 命令行客户端（开发中）
 
-仓库内提供独立的 `ja` 命令行客户端。它和 `ja-desktop` 连接同一个本机 App Server，共享模型配置与会话；退出界面不会取消正在运行的任务。Windows x64 npm 包 `@kongweiguang/ja` 目前处于发布前验证，尚未公开；发布后需要 Node.js 24.x，不需要另装 JDK。发布前的本地打包与安装说明见 [`packages/ja-npm/PUBLISHING.md`](packages/ja-npm/PUBLISHING.md)。
+仓库包含仍在开发中的 `ja` 命令行客户端；它不属于 Ja 0.1.20 正式桌面版交付范围，也尚未正式发布。Windows x64 npm 包 `@kongweiguang/ja` 尚未公开。如后续单独发布，该包需要 Node.js 24.x，不需要另装 JDK。开发者本地打包与验收说明见 [`packages/ja-npm/PUBLISHING.md`](packages/ja-npm/PUBLISHING.md)。
 
 ```text
 ja                         # 在当前目录开始交互会话

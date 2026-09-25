@@ -9,6 +9,8 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonObject;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchProcess;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchToolResolver;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;

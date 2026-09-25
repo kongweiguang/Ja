@@ -12,6 +12,8 @@ import io.github.kongweiguang.ja.conversation.port.out.AgentTool;
 import io.github.kongweiguang.ja.foundation.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.foundation.json.JsonObjectBuilder;
 import io.github.kongweiguang.ja.foundation.json.JsonObjects;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchProcess;
+import io.github.kongweiguang.ja.foundation.search.NativeSearchToolResolver;
 import io.github.kongweiguang.ja.workspace.adapter.out.filesystem.WorkspaceBoundary;
 
 import java.io.IOException;
