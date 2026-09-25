@@ -152,7 +152,10 @@ public final class NioWorkspacePathAdapter implements WorkspacePathPort {
         return new SearchOutcome(entries, truncated, outputLines.get());
     }
 
-    /** 解析 fd 的相对路径格式，并以同一已验证根校验有限返回候选。 */
+    /**
+     * 解析 fd 的相对路径并复核物理 containment；不可信候选若是 symlink 或发生竞争，
+     * 只丢弃该项并由调用方标记结果截断，直接引用校验仍会向用户返回安全拒绝。
+     */
     private Candidate candidate(WorkspaceBoundary boundary, String output, String query) {
         if (output == null || output.isEmpty()) return null;
         String value = output.endsWith("\r") ? output.substring(0, output.length() - 1) : output;
@@ -168,7 +171,7 @@ public final class NioWorkspacePathAdapter implements WorkspacePathPort {
             ValidatedPath validated = validate(boundary, relative, expected);
             return new Candidate(validated.relativePath(), validated.kind(), rank(relative, query),
                     depth(relative));
-        } catch (WorkspacePathFailure | InvalidPathException | IOException invalid) {
+        } catch (WorkspacePathFailure | InvalidPathException | IOException | SecurityException invalid) {
             return null;
         }
     }
