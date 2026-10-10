@@ -70,10 +70,12 @@ function answeredInteractionItem(
   };
   if (existing === undefined) {
     return {
-      itemId: "interaction_result_" + request.requestId,
+      itemId: "interaction_result_" + request.interactionId,
       threadId: request.threadId,
       turnId: request.turnId!,
       kind: "tool_call",
+      // ACK 缺口的临时投影属于当前本地执行，不能被误当成冻结继承历史。
+      origin: "native",
       status: "completed",
       title: "询问用户",
       metadata: {

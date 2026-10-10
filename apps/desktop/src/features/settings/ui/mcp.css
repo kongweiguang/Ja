@@ -8,7 +8,7 @@
   z-index: 1301;
 }
 
-/* MCP uses solid, scannable rows; only the editor and controls receive elevation. */
+/* MCP 采用实色、便于扫描的行布局；只有编辑器和控件使用阴影层级。 */
 .ja-mcp-section {
   gap: 20px;
 }

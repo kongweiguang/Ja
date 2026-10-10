@@ -18,11 +18,22 @@ export type TimelineItemKind =
 
 export type TimelineItemStatus = "started" | "in_progress" | "completed" | "failed" | "cancelled";
 
+/** 历史投影标明执行所有权，避免把继承记录误当成本 Thread 可控制的运行资源。 */
+export type TimelineOrigin = "native" | "inherited";
+
 /** 问答 Tool 只向 UI 暴露可见文案；稳定 ID 与模型结果仍留在 App Server。 */
 export interface ToolInteractionAnswer {
   question: string;
   answers: string[];
   skipped: boolean;
+}
+
+/** Tool 媒体只保留受控附件引用，正文仍由 App Server 按归属校验后读取。 */
+export interface ToolMedia {
+  attachmentId: string;
+  displayName: string;
+  mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  sizeBytes: number;
 }
 
 export interface ToolPresentation {
@@ -35,6 +46,7 @@ export interface ToolPresentation {
   /** Java 仅从受控 metadata 生成的结果摘要；UI 不能以正文或参数自行补造。 */
   summary?: string;
   interactionAnswers?: ToolInteractionAnswer[];
+  media?: ToolMedia[];
   relativePaths: string[];
   command?: string;
   relativeCwd?: string;
@@ -84,6 +96,8 @@ export interface TurnChangeSet {
 
 export interface ItemMetadata {
   callId?: string;
+  /** 同一 Turn 可能有多个等待审批的工具，用稳定审批身份定位卡片。 */
+  approvalId?: string;
   toolName?: string;
   toolKind?: string;
   toolOutcome?: "succeeded" | "failed" | "cancelled";
@@ -117,14 +131,31 @@ export interface ItemMetadata {
   failureReply?: boolean;
 }
 
+/** TimelineStore 按 Thread/Item 持有的公开正文分页状态；offset 始终是 Unicode code point。 */
+export interface TimelineItemContentHydration {
+  status: "idle" | "loading" | "error" | "complete";
+  text: string;
+  offsetCharacters: number;
+  totalCharacters?: number;
+}
+
 /** 由已提交 Protocol Event 组装、且仅由 Renderer 持有的 Item。 */
 export interface TimelineItemAdapter {
   itemId: string;
   threadId: string;
   turnId: string;
+  /** 继承内容是只读上下文快照；复制、预览和再次分叉可用，执行类操作不可用。 */
+  origin: TimelineOrigin;
   kind: TimelineItemKind;
   status: TimelineItemStatus;
   text?: string;
+  /** 初始快照只含该公开正文预览；全文只能在显式读取后投影。 */
+  bodyTruncated?: boolean;
+  bodyTotalCharacters?: number;
+  /** 完整正文按需分页读取；snapshot 中的 preview 不会被误认为已完整加载。 */
+  bodyHydration?: TimelineItemContentHydration;
+  /** 多个公开 Item 组成的最终答复由 TimelineStore 单独缓存，避免混入最终 Item 的真实正文。 */
+  answerHydration?: TimelineItemContentHydration;
   /** 用户消息的结构化引用与正文并列展示，永远不包含预读文件或 Skill 正文。 */
   contextReferences?: import("./userContent").ConversationContextReference[];
   /** 跨会话消息保留服务端冻结的来源事实，不能被渲染层降级成用户或系统身份。 */
@@ -149,6 +180,7 @@ export type WorkStepAdapter = TimelineItemAdapter;
 export type TimelineTurnState =
   | "queued"
   | "running"
+  | "waiting_input"
   | "waiting_approval"
   | "suspended"
   | "completed"
@@ -173,10 +205,21 @@ export interface ProviderRequestProfile {
 
 /** Usage 公共身份字段把计量绑定到唯一 Provider 请求，而不是整个 Turn。 */
 interface TimelineContextUsageBase {
-  requestId: string;
-  requestOrdinal: number;
+  modelRequestId: string;
+  modelRequestOrdinal: number;
   modelRound: number;
   purpose: "assistant" | "summary";
+  measuredAt: string;
+  /** Dispatch 与 Thread 快照可携带完整请求 envelope 的本地估算；它不属于 Provider 计量。 */
+  contextEstimate?: TimelineContextEstimate | null;
+}
+
+/** 完整 Provider envelope 或压缩检查点预算，来源必须明确标为本地估算。 */
+export interface TimelineContextEstimate {
+  certainty: "estimated";
+  source: "local";
+  usedTokens: number;
+  limitTokens: number;
   measuredAt: string;
 }
 
@@ -203,13 +246,19 @@ export type TimelineThreadContextUsage = TimelineContextUsage & { turnId: string
 export interface TimelineTurn {
   turnId: string;
   threadId: string;
+  /** 冻结继承 Turn 只用于展示来源过程，不代表目标 Thread 拥有其执行生命周期。 */
+  origin: TimelineOrigin;
   /** 隐藏续答指向原始 USER item，使当前路径和 thread/read 重载都归到同一问题 exchange。 */
   sourceMessageId?: string | null;
   status: TimelineTurnState;
+  /** 终态安全摘要及其源正文长度；即使失败态没有 Final Item，也保留完整预览事实。 */
+  summary?: string;
+  summaryTotalCharacters?: number;
+  summaryTruncated?: boolean;
   threadRevision?: number;
   startedAt?: string;
   completedAt?: string;
-  error?: { code: string; retryable: boolean };
+  error?: { code: string; message?: string; retryable: boolean };
   /** undefined 表示 terminal 后仍在重读；null 表示权威历史确认该 Turn 没有差异记录。 */
   changeSet?: TurnChangeSet | null;
 }
@@ -224,6 +273,8 @@ export interface TimelineApproval {
   toolName: string;
   reason: string;
   expiresAt: string;
+  /** 最终关闭来源于持久审批等待事件时保留确切原因，系统关闭不伪装为用户选择。 */
+  closedReason?: "cancelled" | "superseded" | "expired";
 }
 
 export type ApprovalDecision = "approve" | "deny";
@@ -353,13 +404,15 @@ function boundedMetric(value: number | undefined): number | undefined {
   return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-/** 将六种权威 Turn 状态映射为简洁中文 UI 文案。 */
+/** 权威运行态统一为“正在工作”，不因生成阶段暴露第二套执行提示。 */
 export function turnStatusLabel(status: TimelineTurnState): string {
   switch (status) {
     case "queued":
       return "排队中";
     case "running":
-      return "生成中";
+      return "正在工作";
+    case "waiting_input":
+      return "等待你的输入";
     case "waiting_approval":
       return "等待确认";
     case "suspended":

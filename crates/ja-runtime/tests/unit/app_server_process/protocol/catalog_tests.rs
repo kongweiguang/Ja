@@ -3,14 +3,14 @@
 
 // 私有算法单元测试；与生产实现分文件，避免测试 seam 扩大公共 API。
 
-use super::{V1_CLIENT_METHODS, catalog_entry};
+use super::{CLIENT_METHODS, EVENT_METHODS, catalog_entry};
 
 /// 已读边界是 App Server 持久化方法，必须出现在握手与 decoder 共用的唯一闭集中。
 #[test]
 fn thread_seen_is_a_canonical_client_method() {
-    assert!(V1_CLIENT_METHODS.contains(&"thread/seen"));
+    assert!(CLIENT_METHODS.contains(&"thread/seen"));
     assert_eq!(
-        V1_CLIENT_METHODS
+        CLIENT_METHODS
             .iter()
             .filter(|method| **method == "thread/seen")
             .count(),
@@ -18,13 +18,24 @@ fn thread_seen_is_a_canonical_client_method() {
     );
 }
 
-/// Hidden continuation and source-bound reask are distinct fixed methods and must each appear once
-/// in both handshake capabilities and decoder admission.
+/// Native 生命周期关闭必须只在冻结握手/decoder 闭集中出现一次，防止增加平行的 close alias。
+#[test]
+fn native_client_close_is_a_canonical_method() {
+    assert_eq!(
+        CLIENT_METHODS
+            .iter()
+            .filter(|method| **method == "runtime/client/close")
+            .count(),
+        1
+    );
+}
+
+/// 隐藏续接与基于来源的重新询问属于不同的固定方法，必须在握手能力和解码器准入表中各出现一次。
 #[test]
 fn recovery_admission_methods_are_canonical() {
     for method in ["turn/continue", "turn/reask"] {
         assert_eq!(
-            V1_CLIENT_METHODS
+            CLIENT_METHODS
                 .iter()
                 .filter(|candidate| **candidate == method)
                 .count(),
@@ -34,17 +45,43 @@ fn recovery_admission_methods_are_canonical() {
     }
 }
 
-/// Thread MCP status is a fixed method in the decoder/handshake closure.
+/// Thread 的 MCP 状态查询是解码器和握手闭包中的固定方法。
 #[test]
 fn thread_mcp_status_methods_are_canonical() {
     let method = "thread/mcp/read";
     assert_eq!(
-        V1_CLIENT_METHODS
+        CLIENT_METHODS
             .iter()
             .filter(|candidate| **candidate == method)
             .count(),
         1,
         "thread MCP method must appear exactly once: {method}"
+    );
+}
+
+/// Workspace read/update and metadata invalidation stay in the same closed protocol catalog used by handshake and decoder.
+#[test]
+fn workspace_metadata_methods_are_canonical() {
+    for method in ["workspace/read", "workspace/update"] {
+        assert_eq!(
+            CLIENT_METHODS
+                .iter()
+                .filter(|candidate| **candidate == method)
+                .count(),
+            1,
+            "workspace method must appear exactly once: {method}"
+        );
+    }
+    assert_eq!(
+        EVENT_METHODS
+            .iter()
+            .filter(|candidate| **candidate == "workspace/metadata-changed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        catalog_entry(-32_100, "WORKSPACE_BUSY", "conflict", true),
+        Some(("WORKSPACE_BUSY", "workspace has active operations"))
     );
 }
 
@@ -135,7 +172,7 @@ fn task_thread_methods_are_canonical() {
     ];
     for method in expected {
         assert_eq!(
-            V1_CLIENT_METHODS
+            CLIENT_METHODS
                 .iter()
                 .filter(|candidate| **candidate == method)
                 .count(),
@@ -144,7 +181,7 @@ fn task_thread_methods_are_canonical() {
         );
     }
     assert_eq!(
-        V1_CLIENT_METHODS
+        CLIENT_METHODS
             .iter()
             .filter(|candidate| **candidate == "thread/message/send")
             .count(),

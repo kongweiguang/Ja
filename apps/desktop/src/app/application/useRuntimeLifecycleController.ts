@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { storageRecoveryMessage } from "@/shared/runtime/storageRecovery";
 import {
   normalizeRuntimeApplicationError as normalizeRuntimeError,
   RuntimeApplicationError as RuntimeHostError,
@@ -18,13 +19,13 @@ import {
   type RuntimeSettingsParams,
   type RuntimeSettingsResult,
   type RuntimeStorageInfo,
-  type RuntimePendingClientOperation,
+  type RuntimePendingOperation,
   type RuntimePendingAcknowledgementResult,
 } from "./runtimePorts";
 import type { BootState } from "../bootState";
 import {
   useRuntimeTurnController,
-  type RuntimePendingOperation,
+  type RuntimePendingOperation as RuntimeTurnPendingOperation,
   type RuntimeTurnController,
 } from "./useRuntimeTurnController";
 
@@ -33,6 +34,10 @@ type RuntimeThreadMetadataEvent = Extract<
   RuntimeTimelineHostEvent["event"],
   { method: "thread/metadata-changed" }
 >;
+type RuntimeWorkspaceMetadataEvent = Extract<
+  RuntimeTimelineHostEvent["event"],
+  { method: "workspace/metadata-changed" }
+>;
 
 export interface RuntimeStateController {
   readonly boot: BootState;
@@ -40,13 +45,15 @@ export interface RuntimeStateController {
   readonly turnAdmissionReady: boolean;
   readonly runtimeState: RuntimeStatus | undefined;
   readonly recovery: RuntimeRecoveryState | undefined;
-  readonly pendingClientOperations: readonly RuntimePendingClientOperation[];
+  readonly pendingClientOperations: readonly RuntimePendingOperation[];
   /** 只发布 Settings 真正消费的配置失效事件，避免流式 Turn 事件让整个应用壳重渲染。 */
   readonly lastConfigurationEvent: RuntimeHostEvent | undefined;
   /**
    * 标题事件拥有独立投影，避免紧随其后的 Turn/流式事件在 React 批处理中覆盖唯一刷新信号。
    */
   readonly lastThreadMetadataEvent: RuntimeThreadMetadataEvent | undefined;
+  /** 项目资料回读拥有独立刷新槽位，避免紧随的 Turn 事件吞掉目录变更。 */
+  readonly lastWorkspaceMetadataEvent: RuntimeWorkspaceMetadataEvent | undefined;
 }
 
 export interface RuntimeLifecycleController {
@@ -58,10 +65,12 @@ export interface RuntimeLifecycleController {
   /** 通过当前 Ready generation 读取固定 Skills/MCP 设置面，防止绕过 Runtime owner。 */
   readonly queryRuntime: RuntimeQuery;
   readonly readRuntimeStorage: () => Promise<RuntimeStorageInfo>;
+  readonly openStorageBackup?: (recoveryId: string) => Promise<void>;
+  readonly retryStorage?: () => Promise<void>;
   readonly acknowledgeRecovery: (reason: RecoveryReason) => Promise<RuntimeRecoveryState>;
-  readonly recheckPendingOperations: () => Promise<readonly RuntimePendingClientOperation[]>;
+  readonly recheckPendingOperations: () => Promise<readonly RuntimePendingOperation[]>;
   readonly acknowledgePendingOperation: (
-    clientOperationId: string,
+    operationKey: string,
   ) => Promise<RuntimePendingAcknowledgementResult>;
 }
 
@@ -80,6 +89,12 @@ interface TurnAdmissionGate {
 
 /** 将 native state 映射到 UI state，同时不向 WebView 暴露进程诊断。 */
 function bootForStatus(status: RuntimeStatus): BootState {
+  if (status.storageRecovery?.phase === "blocked") {
+    return { status: "failed", message: storageRecoveryMessage(status.storageRecovery) };
+  }
+  if (status.storageRecovery !== undefined && status.storageRecovery.phase !== "ready") {
+    return { status: "connecting" };
+  }
   switch (status.status) {
     case "ready":
       return { status: "ready" };
@@ -188,7 +203,7 @@ export function useRuntimeLifecycleController(
   const [runtimeState, setRuntimeState] = useState<RuntimeStatus>();
   const [recovery, setRecovery] = useState<RuntimeRecoveryState>();
   const [pendingClientOperations, setPendingClientOperations] = useState<
-    readonly RuntimePendingClientOperation[]
+    readonly RuntimePendingOperation[]
   >([]);
 
   /** 同一窗口内提交/回查立即更新提示，正文仍由 Timeline 的服务端快照独立读取。 */
@@ -196,7 +211,7 @@ export function useRuntimeLifecycleController(
 
   /** 待核实状态只投影本地 opaque 身份；每次重查都必须先询问 Java 的事务回执。 */
   const recheckPendingOperations = useCallback(async (): Promise<
-    readonly RuntimePendingClientOperation[]
+    readonly RuntimePendingOperation[]
   > => {
     const pending = await runtime.recheckPendingOperations();
     setPendingClientOperations(pending);
@@ -205,8 +220,8 @@ export function useRuntimeLifecycleController(
 
   /** 用户确认只解除本地待核实阻挡；服务端回执仍须再次读取，不自动重发原请求。 */
   const acknowledgePendingOperation = useCallback(
-    async (clientOperationId: string): Promise<RuntimePendingAcknowledgementResult> => {
-      const outcome = await runtime.acknowledgePendingOperation(clientOperationId);
+    async (operationKey: string): Promise<RuntimePendingAcknowledgementResult> => {
+      const outcome = await runtime.acknowledgePendingOperation(operationKey);
       setPendingClientOperations(outcome.pending);
       return outcome;
     },
@@ -215,6 +230,8 @@ export function useRuntimeLifecycleController(
   const [lastConfigurationEvent, setLastConfigurationEvent] = useState<RuntimeHostEvent>();
   const [lastThreadMetadataEvent, setLastThreadMetadataEvent] =
     useState<RuntimeThreadMetadataEvent>();
+  const [lastWorkspaceMetadataEvent, setLastWorkspaceMetadataEvent] =
+    useState<RuntimeWorkspaceMetadataEvent>();
 
   const bootRef = useRef<BootState>({ status: "idle" });
   const runtimeStateRef = useRef<RuntimeStatus | undefined>(undefined);
@@ -222,7 +239,7 @@ export function useRuntimeLifecycleController(
   const lifecycleEpochRef = useRef(0);
   const operationEpochRef = useRef(0);
   const serialQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const inFlightRef = useRef<Map<string, RuntimePendingOperation<unknown>>>(new Map());
+  const inFlightRef = useRef<Map<string, RuntimeTurnPendingOperation<unknown>>>(new Map());
   const cleanupRef = useRef<Promise<void>>(Promise.resolve());
   const lifecycleActiveRef = useRef(false);
   const turnGateRef = useRef<TurnAdmissionGate | undefined>(undefined);
@@ -292,10 +309,10 @@ export function useRuntimeLifecycleController(
 
   /** 把 native call 放入唯一串行队列，并按 key 合并相同 in-flight intent。 */
   const enqueueOperation = useCallback(
-    <T>(key: string, operation: () => Promise<T>): RuntimePendingOperation<T> => {
+    <T>(key: string, operation: () => Promise<T>): RuntimeTurnPendingOperation<T> => {
       const existing = inFlightRef.current.get(key);
       if (existing !== undefined) {
-        return existing as RuntimePendingOperation<T>;
+        return existing as RuntimeTurnPendingOperation<T>;
       }
 
       const epoch = operationEpochRef.current + 1;
@@ -307,8 +324,8 @@ export function useRuntimeLifecycleController(
           inFlightRef.current.delete(key);
         }
       });
-      const pending: RuntimePendingOperation<T> = { epoch, promise: settled };
-      inFlightRef.current.set(key, pending as RuntimePendingOperation<unknown>);
+      const pending: RuntimeTurnPendingOperation<T> = { epoch, promise: settled };
+      inFlightRef.current.set(key, pending as RuntimeTurnPendingOperation<unknown>);
       // 队列内部消费 failure，避免一次 rejected command 污染后续命令；原调用方仍收到原始 rejection。
       serialQueueRef.current = settled.then(
         () => undefined,
@@ -359,7 +376,8 @@ export function useRuntimeLifecycleController(
           gate.runtime !== runtime ||
           gate.generation !== status.generation ||
           gate.serverInstanceId !== status.serverInstanceId ||
-          !["ready", "busy"].includes(status.status))
+          !["ready", "busy"].includes(status.status) ||
+          (status.storageRecovery !== undefined && status.storageRecovery.phase !== "ready"))
       ) {
         revokeTurnGate();
       }
@@ -389,6 +407,12 @@ export function useRuntimeLifecycleController(
       }
       updateRuntimeState(status);
       stateProjection(projection, status);
+      if (status.storageRecovery?.phase === "blocked") {
+        turnGateRef.current = undefined;
+        updateBoot({ status: "failed", message: storageRecoveryMessage(status.storageRecovery) });
+        updateTurnAdmissionReady(false);
+        return true;
+      }
       updateBoot({ status: "ready" });
       turnGateRef.current = {
         lifecycleEpoch,
@@ -414,12 +438,13 @@ export function useRuntimeLifecycleController(
         .catch((error: unknown) => {
           const normalized = safeError(error);
           if (isCurrentOperation(pending.epoch, lifecycleEpoch)) {
+            revokeTurnGate();
             updateBoot({ status: "failed", message: normalized.message });
           }
           throw normalized;
         });
     },
-    [commitStatus, enqueueOperation, isCurrentOperation, runtime, updateBoot],
+    [commitStatus, enqueueOperation, isCurrentOperation, revokeTurnGate, runtime, updateBoot],
   );
 
   /**
@@ -479,7 +504,7 @@ export function useRuntimeLifecycleController(
         if (!commitConfiguredReady(status, startupLifecycleEpoch, configurationIntent)) {
           throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时启动已取消", true);
         }
-        await recheckPendingOperations();
+        if (status.storageRecovery?.phase !== "blocked") await recheckPendingOperations();
         return status;
       })
       .catch((error: unknown) => {
@@ -583,16 +608,35 @@ export function useRuntimeLifecycleController(
     [enqueueOperation, runtime],
   );
 
-  /**
-   * 通过同一 operation queue 读取 native storage projection，防止 shutdown 与旧 settings
-   * update 竞态并把过期结果写入当前页面。
-   */
+  /** 打开备份使用固定的原生能力，不进入生命周期修改队列。 */
+  const openStorageBackup = useCallback(
+    (id: string): Promise<void> => {
+      const open = runtime.openStorageBackup;
+      return open === undefined
+        ? Promise.reject(new Error("backup opening unavailable"))
+        : open.call(runtime, id);
+    },
+    [runtime],
+  );
+
+  /** 存储读取共用命令队列，防止关闭流程与过期设置投影竞争。 */
   const readRuntimeStorage = useCallback((): Promise<RuntimeStorageInfo> => {
     const pending = enqueueOperation("runtimeStorage", () => runtime.storageInfo());
     return pending.promise.catch((error: unknown) => {
       throw safeError(error);
     });
   }, [enqueueOperation, runtime]);
+
+  /** 恢复操作共用生命周期队列；服务装配完成后再次检查业务准入条件。 */
+  const retryStorage = useCallback(async (): Promise<void> => {
+    const retry = runtime.retryStorage;
+    if (retry === undefined) throw new Error("storage retry unavailable");
+    revokeTurnGate();
+    await enqueueOperation("storageRetry", () => retry.call(runtime)).promise;
+    const status = await startRuntime();
+    if (status.storageRecovery?.phase === "blocked")
+      throw new Error(storageRecoveryMessage(status.storageRecovery));
+  }, [runtime, revokeTurnGate, enqueueOperation, startRuntime]);
 
   /** 只确认用户实际看到的 recovery revision，拒绝替更新恢复事实代签。 */
   const acknowledgeRecovery = useCallback(
@@ -749,6 +793,9 @@ export function useRuntimeLifecycleController(
       if (event.kind === "timeline" && event.event.method === "thread/metadata-changed") {
         setLastThreadMetadataEvent(event.event);
       }
+      if (event.kind === "timeline" && event.event.method === "workspace/metadata-changed") {
+        setLastWorkspaceMetadataEvent(event.event);
+      }
       if (event.kind === "timeline" && event.event.method === "configuration/changed") {
         setLastConfigurationEvent(event);
       }
@@ -804,7 +851,7 @@ export function useRuntimeLifecycleController(
           }
           // 共享后台在 renderer 重载期间保持 Ready；这条路径也必须查询持久操作回执，
           // 否则本地 opaque 待核实记录虽存在却不会进入可见状态。
-          await recheckPendingOperations();
+          if (current.storageRecovery?.phase !== "blocked") await recheckPendingOperations();
         }
       } catch (error: unknown) {
         const normalized = safeError(error);
@@ -880,6 +927,7 @@ export function useRuntimeLifecycleController(
       pendingClientOperations,
       lastConfigurationEvent,
       lastThreadMetadataEvent,
+      lastWorkspaceMetadataEvent,
     },
     lifecycle: {
       startRuntime,
@@ -887,6 +935,8 @@ export function useRuntimeLifecycleController(
       stop,
       queryRuntime,
       readRuntimeStorage,
+      openStorageBackup: runtime.openStorageBackup === undefined ? undefined : openStorageBackup,
+      retryStorage: runtime.retryStorage === undefined ? undefined : retryStorage,
       acknowledgeRecovery,
       recheckPendingOperations,
       acknowledgePendingOperation,

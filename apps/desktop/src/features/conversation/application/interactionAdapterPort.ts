@@ -18,25 +18,25 @@ interface InteractionAdapterLike {
   unobserve(input: { observationId: string }): Promise<unknown>;
   draftSave(input: {
     threadId: string;
-    requestId: string;
+    interactionId: string;
     expectedDraftRevision: number;
     answers: readonly InteractionAnswer[];
     page: number;
     collapsed: boolean;
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
   respond(input: {
     threadId: string;
-    requestId: string;
-    expectedRevision: number;
+    interactionId: string;
+    expectedInteractionRevision: number;
     answers: readonly InteractionAnswer[];
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
   cancel(input: {
     threadId: string;
-    requestId: string;
-    expectedRevision: number;
-    idempotencyKey: string;
+    interactionId: string;
+    expectedInteractionRevision: number;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
 }
 
@@ -57,7 +57,7 @@ export function createInteractionPort(
 ): InteractionPort {
   /** 冲突必须回读同一请求，保留用户本地编辑且不给错误附加猜测快照。 */
   const mutate = async (
-    input: { threadId: string; requestId: string },
+    input: { threadId: string; interactionId: string },
     action: () => Promise<InteractionSnapshot>,
   ): Promise<InteractionSnapshot> => {
     try {
@@ -118,34 +118,34 @@ export function createInteractionPort(
       };
     },
     saveDraft: (input) =>
-      mutate({ threadId: input.threadId, requestId: input.requestId }, () =>
+      mutate({ threadId: input.threadId, interactionId: input.interactionId }, () =>
         adapter.draftSave({
           threadId: input.threadId,
-          requestId: input.requestId,
+          interactionId: input.interactionId,
           expectedDraftRevision: input.expectedDraftRevision,
           answers: input.answers.map(toWireAnswer),
           page: input.page,
           collapsed: input.collapsed,
-          idempotencyKey: input.idempotencyKey,
+          operationKey: input.operationKey,
         }),
       ),
     submit: (input) =>
-      mutate({ threadId: input.threadId, requestId: input.requestId }, () =>
+      mutate({ threadId: input.threadId, interactionId: input.interactionId }, () =>
         adapter.respond({
           threadId: input.threadId,
-          requestId: input.requestId,
-          expectedRevision: input.expectedRevision,
+          interactionId: input.interactionId,
+          expectedInteractionRevision: input.expectedInteractionRevision,
           answers: input.answers.map(toWireAnswer),
-          idempotencyKey: input.idempotencyKey,
+          operationKey: input.operationKey,
         }),
       ),
     cancel: (input) =>
-      mutate({ threadId: input.threadId, requestId: input.requestId }, () =>
+      mutate({ threadId: input.threadId, interactionId: input.interactionId }, () =>
         adapter.cancel({
           threadId: input.threadId,
-          requestId: input.requestId,
-          expectedRevision: input.expectedRevision,
-          idempotencyKey: input.idempotencyKey,
+          interactionId: input.interactionId,
+          expectedInteractionRevision: input.expectedInteractionRevision,
+          operationKey: input.operationKey,
         }),
       ),
   };

@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":"c:task-waiting-input","method":"task/list","params":{"rootThreadId":"thr_root"}}
+{"jsonrpc":"2.0","id":"c:task-waiting-input","result":{"items":[{"taskThreadId":"thr_side_1","parentThreadId":"thr_root","rootThreadId":"thr_root","originTurnId":"turn_parent","taskName":"Inspect parser","depth":1,"taskKind":"side_task","lifecycle":"independent","state":"waiting_input","revision":3,"latestActivitySequence":3,"unreadCount":1,"descendantCount":0,"runningDescendantCount":0,"needsAttentionCount":1,"latestSafeSummary":"Waiting for an answer","startedAt":"2026-09-03T08:00:00Z","completedAt":null,"updatedAt":"2026-09-03T08:00:02Z"}]}}
+

@@ -14,11 +14,19 @@ import {
   Pencil,
   Play,
   Plus,
+  Search,
   Server,
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from "react";
+import {
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react";
 import { toast } from "sonner";
 import {
   Button,
@@ -43,8 +51,12 @@ import type {
 } from "@/shared/settings/types";
 import { modelSelectionId } from "@/shared/settings/types";
 import { isSafeHttpUrl } from "@/shared/settings/validation";
-import type { ProviderProjection, SettingsSnapshot } from "../domain/types";
-import type { SettingsPorts } from "../application/ports";
+import type {
+  ProjectProviderRuntimeOverride,
+  ProviderProjection,
+  SettingsSnapshot,
+} from "../domain/types";
+import type { ModelDiscoveryResult, SettingsPorts } from "../application/ports";
 import { getModelBudgetRecommendation } from "../domain/modelBudgetRecommendations";
 import {
   apiOptions,
@@ -238,7 +250,8 @@ function validateProviderDraft(draft: ProviderEditorDraft): string | undefined {
 }
 
 /**
- * 统一 sheet 中的模型行。高频标识与预算直接可见，高级思考档位渐进展开，
+ * 统一 sheet 中的模型行。全局与项目范围共享能力编辑，新增声明保守默认关闭并随模型草稿一并保存，
+ * 高频标识与预算直接可见，高级终答与思考能力渐进展开，
  * 只修改父级草稿以保证供应商和多个模型作为一个完整聚合提交。
  */
 function ProviderModelDraftRow({
@@ -343,7 +356,11 @@ function ProviderModelDraftRow({
               }
             />
           </Field>
-          <Field id={`model-output-${model.modelId}`} label="最大输出 Tokens">
+          <Field
+            id={`model-output-${model.modelId}`}
+            label="单次最大输出 Tokens"
+            hint="达到此上限后，Ja 会自动继续当前回复。"
+          >
             <input
               id={`model-output-${model.modelId}`}
               className="ja-settings-input"
@@ -416,8 +433,23 @@ function ProviderModelDraftRow({
       </div>
       <details className="ja-provider-advanced">
         <summary>
-          高级能力 <span>思考档位</span>
+          高级能力 <span>结构化终答与思考档位</span>
         </summary>
+        <fieldset className="ja-settings-choice-group">
+          <legend>终答能力</legend>
+          <label>
+            <input
+              type="checkbox"
+              aria-label="支持结构化终答"
+              checked={model.capabilities.supportsOutputSchema}
+              disabled={disabled}
+              onChange={(event) =>
+                updateCapabilities({ supportsOutputSchema: event.target.checked })
+              }
+            />
+            支持结构化终答 Schema
+          </label>
+        </fieldset>
         <fieldset className="ja-settings-choice-group">
           <legend>支持的思考档位</legend>
           {reasoningLevels.map((item) => (
@@ -467,6 +499,11 @@ function ModelEditor({
   replacementChoices,
   ports,
   onEdit,
+  projectScope,
+  projectModelOverride,
+  isGlobalModel,
+  onInheritProjectModel,
+  onHideProjectModel,
 }: {
   providerId: string;
   model: ProviderModelSave;
@@ -476,6 +513,11 @@ function ModelEditor({
   replacementChoices: ModelChoice[];
   ports: SettingsPorts;
   onEdit: (modelId?: string) => void;
+  projectScope: boolean;
+  projectModelOverride: boolean;
+  isGlobalModel: boolean;
+  onInheritProjectModel?: SettingsPorts["onInheritProjectModelOverride"];
+  onHideProjectModel?: SettingsPorts["onHideProjectModel"];
 }): ReactElement {
   const draft = model;
   const [busy, setBusy] = useState(false);
@@ -552,7 +594,7 @@ function ModelEditor({
         type="button"
         className="ja-models-summary"
         onClick={() => onEdit(model.modelId)}
-        aria-label={`编辑模型 ${draft.model} ${draft.name !== draft.model ? draft.name : ""}`}
+        aria-label={`${projectScope ? "编辑项目模型" : "编辑模型"} ${draft.model} ${draft.name !== draft.model ? draft.name : ""}`}
       >
         <span className="ja-models-identity">
           <strong>{draft.model}</strong>
@@ -586,30 +628,57 @@ function ModelEditor({
             设为默认
           </Button>
         )}
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          disabled={busy}
-          onClick={() => setTestOpen(true)}
-        >
-          <Play size={14} aria-hidden="true" />
-          验证模型
-        </Button>
-        <ObjectActions
-          label={`模型 ${model.model} `}
-          index={index}
-          total={total}
-          busy={busy}
-          canDelete={total > 1}
-          onMove={(direction) =>
-            void mutateModel(() => ports.onMoveModel(providerId, model.modelId, direction))
-          }
-          onDelete={(trigger) => {
-            deleteOpener.current = trigger;
-            setDeleteOpen(true);
-          }}
-        />
+        {projectScope && projectModelOverride && onInheritProjectModel !== undefined ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            onClick={() => void mutateModel(() => onInheritProjectModel(providerId, model.modelId))}
+          >
+            继承全局模型
+          </Button>
+        ) : null}
+        {projectScope && isGlobalModel && onHideProjectModel !== undefined ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={busy || selected}
+            title={selected ? "请先将当前项目默认模型切换到其他模型" : undefined}
+            onClick={() => void mutateModel(() => onHideProjectModel(providerId, model.modelId))}
+          >
+            从当前项目隐藏
+          </Button>
+        ) : null}
+        {!projectScope ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            onClick={() => setTestOpen(true)}
+          >
+            <Play size={14} aria-hidden="true" />
+            验证模型
+          </Button>
+        ) : null}
+        {!projectScope ? (
+          <ObjectActions
+            label={`模型 ${model.model} `}
+            index={index}
+            total={total}
+            busy={busy}
+            canDelete={total > 1}
+            onMove={(direction) =>
+              void mutateModel(() => ports.onMoveModel(providerId, model.modelId, direction))
+            }
+            onDelete={(trigger) => {
+              deleteOpener.current = trigger;
+              setDeleteOpen(true);
+            }}
+          />
+        ) : null}
       </div>
       {testResult === undefined ? null : (
         <p className="ja-settings-feedback" role="status">
@@ -707,6 +776,13 @@ function ProviderCard({
   replacementChoices,
   ports,
   onEdit,
+  projectScope,
+  projectProviderOverride,
+  globalProvider,
+  onInheritProjectModel,
+  onInheritProjectModels,
+  onRestoreProjectModel,
+  onHideProjectModel,
 }: {
   provider: ProviderProjection;
   index: number;
@@ -715,6 +791,13 @@ function ProviderCard({
   replacementChoices: ModelChoice[];
   ports: SettingsPorts;
   onEdit: (modelId?: string) => void;
+  projectScope: boolean;
+  projectProviderOverride: ProjectProviderRuntimeOverride | undefined;
+  globalProvider: ProviderProjection | undefined;
+  onInheritProjectModel?: SettingsPorts["onInheritProjectModelOverride"];
+  onInheritProjectModels?: SettingsPorts["onInheritProjectProviderModels"];
+  onRestoreProjectModel?: SettingsPorts["onRestoreProjectModel"];
+  onHideProjectModel?: SettingsPorts["onHideProjectModel"];
 }): ReactElement {
   const providerChoices = replacementChoices.filter(
     (choice) => choice.selection.providerId !== provider.providerId,
@@ -722,6 +805,17 @@ function ProviderCard({
   const [busy, setBusy] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const deleteOpener = useRef<HTMLButtonElement | null>(null);
+  /** 项目模型目录操作保留原视图状态，失败时用就地 Toast 提供明确重试反馈。 */
+  const mutateProjectCatalog = async (action: () => Promise<unknown>): Promise<void> => {
+    setBusy(true);
+    try {
+      await action();
+    } catch (error) {
+      toast.error(settingsMutationErrorMessage(error, "项目模型目录未保存，请重试"));
+    } finally {
+      setBusy(false);
+    }
+  };
   /** 排序失败保留原列表并允许重试，避免未处理的异步拒绝丢失用户反馈。 */
   const moveProvider = async (direction: -1 | 1): Promise<void> => {
     setBusy(true);
@@ -780,27 +874,47 @@ function ProviderCard({
           </div>
         </div>
         <div className="ja-settings-card-actions">
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            aria-label="编辑供应商"
-            onClick={() => onEdit()}
-          >
-            <Pencil aria-hidden="true" />
-            编辑供应商
-          </Button>
-          <ObjectActions
-            label={`供应商 ${provider.name} `}
-            index={index}
-            total={total}
-            busy={busy}
-            onMove={(direction) => void moveProvider(direction)}
-            onDelete={(trigger) => {
-              deleteOpener.current = trigger;
-              setDeleteOpen(true);
-            }}
-          />
+          {projectScope ? (
+            <>
+              <span className="ja-models-hint">连接使用全局设置</span>
+              {projectProviderOverride?.models !== undefined ||
+              (projectProviderOverride?.removedModelIds?.length ?? 0) > 0 ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy || onInheritProjectModels === undefined}
+                  onClick={() => void onInheritProjectModels?.(provider.providerId)}
+                >
+                  继承全局模型目录
+                </Button>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                aria-label="编辑供应商"
+                onClick={() => onEdit()}
+              >
+                <Pencil aria-hidden="true" />
+                编辑供应商
+              </Button>
+              <ObjectActions
+                label={`供应商 ${provider.name} `}
+                index={index}
+                total={total}
+                busy={busy}
+                onMove={(direction) => void moveProvider(direction)}
+                onDelete={(trigger) => {
+                  deleteOpener.current = trigger;
+                  setDeleteOpen(true);
+                }}
+              />
+            </>
+          )}
         </div>
       </div>
       <section className="ja-settings-model-list" aria-label={`${provider.name} 模型`}>
@@ -818,7 +932,11 @@ function ProviderCard({
             <ChevronRight size={14} aria-hidden="true" />
           </Button>
         </div>
-        <p className="ja-models-hint">选择模型名称可编辑配置，默认模型用于新对话。</p>
+        <p className="ja-models-hint">
+          {projectScope
+            ? "点击模型可编辑当前项目覆盖；未覆盖模型继承全局。项目默认模型用于本项目的新对话。"
+            : "选择模型名称可编辑配置，默认模型用于新对话。"}
+        </p>
         <div className="ja-models-group">
           {provider.models.length === 0 ? (
             <p className="ja-settings-empty">此 Provider 尚无模型</p>
@@ -841,11 +959,57 @@ function ProviderCard({
                     choice.selection.modelId !== model.modelId,
                 )}
                 ports={ports}
+                projectScope={projectScope}
+                projectModelOverride={
+                  projectProviderOverride?.models?.some(
+                    (item) => item.modelId === model.modelId,
+                  ) === true
+                }
+                isGlobalModel={
+                  globalProvider?.models.some((item) => item.modelId === model.modelId) === true
+                }
+                onInheritProjectModel={onInheritProjectModel}
+                onHideProjectModel={onHideProjectModel}
               />
             ))
           )}
         </div>
       </section>
+      {projectScope && (projectProviderOverride?.removedModelIds?.length ?? 0) > 0 ? (
+        <section className="ja-settings-model-list" aria-label={`${provider.name} 项目隐藏模型`}>
+          <div className="ja-settings-subsection-heading">
+            <h3>本项目已隐藏</h3>
+          </div>
+          <div className="ja-models-group">
+            {(projectProviderOverride?.removedModelIds ?? []).map((modelId) => {
+              const hiddenModel = globalProvider?.models.find((item) => item.modelId === modelId);
+              return hiddenModel === undefined ? null : (
+                <div className="ja-models-row" key={modelId}>
+                  <span className="ja-models-identity">
+                    <strong>{hiddenModel.model}</strong>
+                    {hiddenModel.name !== hiddenModel.model ? (
+                      <small>{hiddenModel.name}</small>
+                    ) : null}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy || onRestoreProjectModel === undefined}
+                    onClick={() =>
+                      void mutateProjectCatalog(async () => {
+                        await onRestoreProjectModel?.(provider.providerId, modelId);
+                      })
+                    }
+                  >
+                    恢复模型
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
       <AlertDialog.Root open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialog.Portal>
           <AlertDialog.Overlay className="ja-settings-dialog-overlay" />
@@ -904,6 +1068,157 @@ function ProviderCard({
   );
 }
 
+/** 目录选择只维护临时筛选和勾选，关闭后丢弃，避免未确认的发现结果污染 Provider 草稿。 */
+function ModelCatalogPicker({
+  items,
+  truncated,
+  emptyDirectory,
+  onClose,
+  onAdd,
+  onCloseAutoFocus,
+}: {
+  items: readonly string[];
+  truncated: boolean;
+  emptyDirectory: boolean;
+  onClose: () => void;
+  onAdd: (items: string[]) => void;
+  onCloseAutoFocus: (event: Event) => void;
+}): ReactElement {
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(items));
+  const searchRef = useRef<HTMLInputElement>(null);
+  const visibleItems = items.filter((item) =>
+    item.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+  );
+  const allVisibleSelected =
+    visibleItems.length > 0 && visibleItems.every((item) => selected.has(item));
+  /** 批量操作仅作用于当前搜索结果，保留筛选之外的选择以免搜索时意外丢失。 */
+  const toggleVisible = (): void => {
+    setSelected((current) => {
+      const next = new Set(current);
+      for (const item of visibleItems) {
+        if (allVisibleSelected) next.delete(item);
+        else next.add(item);
+      }
+      return next;
+    });
+  };
+  /** 单项勾选使用上游原始 ID 作为身份，不依赖列表索引或显示顺序。 */
+  const toggleItem = (item: string, checked: boolean): void => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (checked) next.add(item);
+      else next.delete(item);
+      return next;
+    });
+  };
+  return (
+    <Dialog
+      modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent
+        className="ja-settings-model-picker"
+        overlayClassName="ja-settings-dialog-overlay ja-settings-model-picker-overlay"
+        aria-describedby="model-picker-description"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          searchRef.current?.focus();
+        }}
+        onCloseAutoFocus={onCloseAutoFocus}
+      >
+        <div className="ja-settings-dialog-header">
+          <div>
+            <DialogTitle className="ja-settings-dialog-title">选择要添加的模型</DialogTitle>
+            <DialogDescription
+              id="model-picker-description"
+              className="ja-settings-dialog-description"
+            >
+              从上游目录选择模型，添加后仍需保存供应商。
+            </DialogDescription>
+          </div>
+          <IconButton
+            type="button"
+            label="关闭模型选择"
+            className="ja-model-picker-close"
+            onClick={onClose}
+          >
+            <X aria-hidden="true" />
+          </IconButton>
+        </div>
+        <div className="ja-model-picker-controls">
+          <div className="ja-model-picker-search">
+            <Search size={17} aria-hidden="true" />
+            <input
+              ref={searchRef}
+              type="search"
+              aria-label="搜索模型"
+              placeholder="搜索模型"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={visibleItems.length === 0}
+            onClick={toggleVisible}
+          >
+            {allVisibleSelected ? "取消全选" : "全选"}
+          </Button>
+        </div>
+        <div className="ja-model-picker-list" role="group" aria-label="可添加模型">
+          {items.length === 0 ? (
+            <p className="ja-model-picker-empty">
+              {emptyDirectory
+                ? "上游目录没有返回模型。"
+                : truncated
+                  ? "前 200 项均已添加。"
+                  : "上游模型均已添加。"}
+            </p>
+          ) : visibleItems.length === 0 ? (
+            <p className="ja-model-picker-empty">没有匹配的模型。</p>
+          ) : (
+            visibleItems.map((item) => (
+              <label key={item} className="ja-model-picker-option">
+                <input
+                  type="checkbox"
+                  checked={selected.has(item)}
+                  onChange={(event) => toggleItem(item, event.target.checked)}
+                />
+                <span>{item}</span>
+              </label>
+            ))
+          )}
+        </div>
+        <div className="ja-model-picker-footer">
+          <span role="status" aria-live="polite">
+            已选 {selected.size} 个{truncated ? " · 仅显示前 200 项" : ""}
+          </span>
+          <div className="ja-model-picker-actions">
+            <Button type="button" variant="secondary" size="sm" onClick={onClose}>
+              取消
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              disabled={selected.size === 0}
+              onClick={() => onAdd(items.filter((item) => selected.has(item)))}
+            >
+              添加所选
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /**
  * 新增、后续添加模型和编辑连接共用一张 sheet，保存时提交完整 Provider 聚合，
  * 从而保留 defaults、网络配置与所有模型稳定 ID。
@@ -913,6 +1228,8 @@ function ProviderEditorSheet({
   provider,
   initialModelId,
   ports,
+  projectScope,
+  projectOverrideModelIds,
   onOpenChange,
   onSaved,
   onPartialSaved,
@@ -921,11 +1238,14 @@ function ProviderEditorSheet({
   provider?: ProviderProjection;
   initialModelId?: string;
   ports: SettingsPorts;
+  projectScope: boolean;
+  projectOverrideModelIds: readonly string[];
   onOpenChange: (open: boolean) => void;
   onSaved: (providerId: string) => void;
   onPartialSaved: (providerId: string) => void;
 }): ReactElement {
   const isNew = provider === undefined;
+  const providerId = provider?.providerId;
   const [draft, setDraft] = useState<ProviderEditorDraft>(() =>
     provider === undefined ? emptyProviderEditorDraft() : draftForProvider(provider),
   );
@@ -934,17 +1254,25 @@ function ProviderEditorSheet({
   const [catalogFeedback, setCatalogFeedback] = useState<
     { message: string; tone: "success" | "error" } | undefined
   >();
+  const [catalogResult, setCatalogResult] = useState<ModelDiscoveryResult>();
   const [secret, setSecret] = useState("");
   const [secretVisible, setSecretVisible] = useState(false);
-  const [secretLoading, setSecretLoading] = useState(!isNew);
+  const [secretLoading, setSecretLoading] = useState(!isNew && !projectScope);
   const savedSecretRef = useRef("");
+  const savedProviderRef = useRef<ProviderSave | null>(null);
   const openerRef = useRef(document.activeElement);
   const pendingModelFocusRef = useRef<string | null>(null);
+  const pendingProviderNameFocusRef = useRef(false);
+  const pendingProviderNameFocusOriginRef = useRef<Element | null>(null);
+  const pendingSaveFailureFocusRef = useRef(false);
+  const catalogFocusAfterConfirmRef = useRef<string | null>(null);
+  const discoverButtonId = `provider-model-discover-${draft.providerId}`;
   /**
    * 上游目录只可使用 App Server 已保存的连接，任何协议、端点或 API Key 草稿变化都必须先显式
    * 保存，避免用户误以为本地草稿已经生效，且不把秘密作为目录请求参数。
    */
   const canDiscoverModels =
+    !projectScope &&
     provider !== undefined &&
     provider.credentialConfigured &&
     !secretLoading &&
@@ -953,13 +1281,15 @@ function ProviderEditorSheet({
     secret === savedSecretRef.current;
   const catalogReadinessMessage = isNew
     ? "保存供应商后可从上游获取模型。"
-    : secretLoading
-      ? "正在读取已保存的连接信息。"
-      : !provider?.credentialConfigured
-        ? "请先保存 API Key 后再从上游获取。"
-        : !canDiscoverModels
-          ? "连接信息已修改，保存后可再次从上游获取。"
-          : "上游模型会先加入草稿，保存后生效。";
+    : projectScope
+      ? "此处的模型改动只覆盖当前项目；连接与凭据仍继承全局设置。"
+      : secretLoading
+        ? "正在读取已保存的连接信息。"
+        : !provider?.credentialConfigured
+          ? "请先保存 API Key 后再从上游获取。"
+          : !canDiscoverModels
+            ? "连接信息已修改，保存后可再次从上游获取。"
+            : "从上游获取后选择模型，保存后生效。";
   /** 新行挂载后直接定位真实模型输入，不让用户在长表单里寻找刚添加的项目。 */
   useLayoutEffect(() => {
     const modelId = pendingModelFocusRef.current;
@@ -972,7 +1302,9 @@ function ProviderEditorSheet({
       new Set(
         provider === undefined
           ? [draft.models[0]?.modelId].filter((value): value is string => value !== undefined)
-          : [],
+          : projectScope
+            ? [...projectOverrideModelIds]
+            : [],
       ),
   );
   /** API Key 只留在当前编辑 sheet；关闭、卸载或切换 Provider 时不写入全局状态。 */
@@ -981,12 +1313,16 @@ function ProviderEditorSheet({
     setSecret("");
     setSecretVisible(false);
   };
+  /** 最新端口只承担真实回显能力，端口对象刷新不能重新初始化同一编辑会话或覆盖 Secret 草稿。 */
+  const revealProviderCredential = useEffectEvent((requestedProviderId: string) =>
+    ports.onRevealProviderCredential(requestedProviderId),
+  );
   /**
-   * 编辑已有 Provider 时按身份短时读取已保存 API Key；加载完成前禁止保存，避免空输入被误判为
-   * 用户主动清空。返回值只保留在本组件，取消或切换编辑对象后丢弃迟到结果。
+   * 凭据仅在 Sheet 开启、Provider 身份或作用域变化时初始化；配置保存后的同身份投影刷新不能
+   * 回显旧 Key 覆盖待重试 Secret。加载期间禁止保存，关闭或切换后丢弃旧读取的迟到结果。
    */
   useEffect(() => {
-    if (isNew || provider === undefined) {
+    if (!open || isNew || providerId === undefined || projectScope) {
       savedSecretRef.current = "";
       setSecret("");
       setSecretLoading(false);
@@ -994,8 +1330,7 @@ function ProviderEditorSheet({
     }
     let active = true;
     setSecretLoading(true);
-    void ports
-      .onRevealProviderCredential(provider.providerId)
+    void revealProviderCredential(providerId)
       .then((value) => {
         if (!active) return;
         const revealed = value ?? "";
@@ -1014,11 +1349,46 @@ function ProviderEditorSheet({
     return () => {
       active = false;
     };
-  }, [isNew, ports, provider]);
-  /** 忙时禁止关闭和修改，失败时保留非敏感草稿供原地重试。 */
+  }, [isNew, open, projectScope, providerId]);
+  /**
+   * 编辑供应商时连接字段会随凭据读取暂时禁用；解禁后仅在焦点仍停在弹窗初始落点时转向名称字段，
+   * 避免异步读取完成后抢走用户已经主动移动的焦点。
+   */
+  useEffect(() => {
+    if (
+      !open ||
+      projectScope ||
+      initialModelId !== undefined ||
+      secretLoading ||
+      !pendingProviderNameFocusRef.current
+    )
+      return;
+    pendingProviderNameFocusRef.current = false;
+    const focusOrigin = pendingProviderNameFocusOriginRef.current;
+    pendingProviderNameFocusOriginRef.current = null;
+    const nameInput = document.getElementById("provider-name");
+    if (nameInput instanceof HTMLInputElement && document.activeElement === focusOrigin)
+      nameInput.focus();
+  }, [initialModelId, open, projectScope, secretLoading]);
+  /** busy 解除后只修复失焦或失效焦点；弹窗内仍可操作的用户选择保持原位。 */
+  useEffect(() => {
+    if (!open || busy || !pendingSaveFailureFocusRef.current) return;
+    pendingSaveFailureFocusRef.current = false;
+    const active = document.activeElement;
+    const hasOperableFocus =
+      active instanceof HTMLElement &&
+      active.closest(".ja-settings-provider-sheet") !== null &&
+      active.matches("button, input, select, textarea") &&
+      !active.matches(":disabled");
+    if (!hasOperableFocus) document.getElementById("provider-editor-save")?.focus();
+  }, [busy, open]);
+  /** 忙时禁止关闭；显式关闭时清理仅驻留本 sheet 的 Secret 与临时发现结果。 */
   const changeOpen = (nextOpen: boolean): void => {
     if (!nextOpen && busy) return;
-    if (!nextOpen) resetSecret();
+    if (!nextOpen) {
+      resetSecret();
+      setCatalogResult(undefined);
+    }
     onOpenChange(nextOpen);
   };
   /** 构造完整 ProviderSave，编辑时从快照保留 network 与 agent defaults。 */
@@ -1038,7 +1408,11 @@ function ProviderEditorSheet({
       })),
     };
   };
-  /** 新增和编辑都由同一保存闭环处理，保留凭据部分成功错误和稳定草稿。 */
+  /**
+   * 凭据与配置分属不同持久化端口；记住已提交的纯配置快照，使凭据失败后的原样重试不重复写配置，
+   * 而用户改过草稿时仍先提交新配置。Secret 留在本组件直到成功或取消关闭。失败后仅当 busy 造成焦点失效时恢复保存按钮，
+   * 弹窗内仍有效的用户焦点不被覆盖。
+   */
   const save = async (): Promise<void> => {
     if (busy) return;
     const validation = validateProviderDraft(draft);
@@ -1055,13 +1429,20 @@ function ProviderEditorSheet({
     }
     setFeedback(undefined);
     setBusy(true);
+    let next: ProviderSave | undefined;
     try {
-      const next = buildProvider();
-      if (isNew) {
+      next = buildProvider();
+      const savedProvider = savedProviderRef.current;
+      const configurationAlreadySaved =
+        savedProvider !== null && JSON.stringify(savedProvider) === JSON.stringify(next);
+      if (isNew && savedProvider === null) {
         await ports.onCreateProvider(next, secret);
       } else {
-        await ports.onSaveProvider(next);
-        if (secret !== savedSecretRef.current) {
+        if (!configurationAlreadySaved) {
+          await ports.onSaveProvider(next);
+          savedProviderRef.current = next;
+        }
+        if (!projectScope && (isNew || secret !== savedSecretRef.current)) {
           try {
             if (secret === "") await ports.onClearCredential(next.credentialId);
             else await ports.onReplaceCredential(next.credentialId, secret);
@@ -1076,7 +1457,9 @@ function ProviderEditorSheet({
         }
       }
       onSaved(next.providerId);
-      toast.success(isNew ? "供应商和模型已保存" : "供应商与模型已保存");
+      if (!projectScope) {
+        toast.success(isNew ? "供应商和模型已保存" : "供应商与模型已保存");
+      }
       resetSecret();
       onOpenChange(false);
     } catch (error) {
@@ -1086,16 +1469,17 @@ function ProviderEditorSheet({
           : undefined;
       const message =
         code === "provider_saved_credential_failed"
-          ? "Provider 已保存，但密钥保存失败，请重新输入后重试"
+          ? "供应商配置已保存，密钥操作未完成。输入已保留，可再次保存重试。"
           : settingsMutationErrorMessage(error, isNew ? "服务商添加失败" : "服务商配置保存失败");
       setFeedback(message);
       toast.error(message);
+      pendingSaveFailureFocusRef.current = true;
       if (code === "provider_saved_credential_failed") {
+        if (next !== undefined) savedProviderRef.current = next;
         setRemovableModelIds(new Set());
-        onPartialSaved(draft.providerId);
+        onPartialSaved(next?.providerId ?? draft.providerId);
       }
     } finally {
-      resetSecret();
       setBusy(false);
     }
   };
@@ -1128,46 +1512,14 @@ function ProviderEditorSheet({
       models: current.models.filter((item) => item.modelId !== model.modelId),
     }));
   };
-  /**
-   * 将上游目录增量合并到当前草稿。已有模型的稳定 ID、预算与思考配置保持不变，新增项采用当前
-   * 推荐起始预算；请求和合并都不触发保存，用户仍可检查后再提交。
-   */
+  /** 发现请求只打开选择弹框；用户未确认前既不生成模型 ID，也不修改供应商草稿。 */
   const discoverModels = async (): Promise<void> => {
     if (provider === undefined || !canDiscoverModels || busy) return;
     setBusy(true);
     setCatalogFeedback(undefined);
     try {
       const result = await ports.onDiscoverModels(provider.providerId);
-      const existing = new Set(draft.models.map((model) => model.model.trim()));
-      const additions = result.items
-        .filter((upstream) => !existing.has(upstream))
-        .map((upstream) => {
-          const recommendation = getModelBudgetRecommendation(upstream, draft.baseUrl);
-          return {
-            ...createModelDraft(),
-            name: upstream,
-            model: upstream,
-            capabilities: {
-              contextWindowTokens: recommendation.contextWindowTokens,
-              maxOutputTokens: recommendation.maxOutputTokens,
-            },
-          };
-        });
-      if (additions.length > 0) {
-        setDraft((current) => ({ ...current, models: [...current.models, ...additions] }));
-        setRemovableModelIds(
-          (current) => new Set([...current, ...additions.map((model) => model.modelId)]),
-        );
-      }
-      const summary =
-        additions.length === 0
-          ? "上游目录没有新的模型标识。"
-          : `已添加 ${additions.length} 个上游模型，保存后生效。`;
-      setCatalogFeedback({
-        message: result.truncated ? `${summary} 当前结果已截断为前 200 项。` : summary,
-        tone: "success",
-      });
-      toast.success(additions.length === 0 ? "上游模型已是最新" : "上游模型已填入草稿");
+      setCatalogResult(result);
     } catch (error) {
       const message = settingsMutationErrorMessage(
         error,
@@ -1179,6 +1531,40 @@ function ProviderEditorSheet({
       setBusy(false);
     }
   };
+  /** 确认时按当前草稿再次去重，避免重复的上游标识占用新模型身份。 */
+  const addDiscoveredModels = (selectedItems: string[]): void => {
+    const existing = new Set(draft.models.map((model) => model.model.trim()));
+    const additions = selectedItems
+      .filter((item) => {
+        if (existing.has(item)) return false;
+        existing.add(item);
+        return true;
+      })
+      .map((upstream) => {
+        const recommendation = getModelBudgetRecommendation(upstream, draft.baseUrl);
+        return {
+          ...createModelDraft(),
+          name: upstream,
+          model: upstream,
+          capabilities: {
+            contextWindowTokens: recommendation.contextWindowTokens,
+            maxOutputTokens: recommendation.maxOutputTokens,
+            supportsOutputSchema: false,
+          },
+        };
+      });
+    if (additions.length === 0) return;
+    catalogFocusAfterConfirmRef.current = additions[0]!.modelId;
+    setDraft((current) => ({ ...current, models: [...current.models, ...additions] }));
+    setRemovableModelIds(
+      (current) => new Set([...current, ...additions.map((model) => model.modelId)]),
+    );
+    setCatalogFeedback({
+      message: `已添加 ${additions.length} 个上游模型，保存后生效。`,
+      tone: "success",
+    });
+    setCatalogResult(undefined);
+  };
   return (
     <Dialog modal open={open} onOpenChange={changeOpen}>
       <DialogContent
@@ -1186,13 +1572,26 @@ function ProviderEditorSheet({
         overlayClassName="ja-settings-dialog-overlay"
         aria-describedby="provider-editor-description"
         onOpenAutoFocus={(event) => {
-          // 从模型进入时直接定位该行，避免长表单把用户送回连接设置。
-          if (initialModelId === undefined) return;
-          const input = document.getElementById(`model-id-${initialModelId}`);
-          if (input !== null) {
+          /** 新增/编辑先落在供应商名称；从模型进入则保留该模型的直接编辑上下文。 */
+          const targetId =
+            initialModelId === undefined ? "provider-name" : `model-id-${initialModelId}`;
+          const input = document.getElementById(targetId);
+          if (!(input instanceof HTMLInputElement)) return;
+          if (input.matches(":disabled")) {
+            if (initialModelId === undefined && !projectScope) {
+              pendingProviderNameFocusRef.current = true;
+              pendingProviderNameFocusOriginRef.current = document.activeElement;
+            }
             event.preventDefault();
-            input.focus();
+            const focusFallback =
+              document.querySelector<HTMLElement>('[aria-label="关闭供应商编辑"]');
+            focusFallback?.focus();
+            if (pendingProviderNameFocusRef.current && focusFallback !== null)
+              pendingProviderNameFocusOriginRef.current = focusFallback;
+            return;
           }
+          event.preventDefault();
+          input.focus();
         }}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
@@ -1203,13 +1602,15 @@ function ProviderEditorSheet({
         <div className="ja-settings-dialog-header">
           <div>
             <DialogTitle className="ja-settings-dialog-title">
-              {isNew ? "新增供应商" : "编辑供应商"}
+              {isNew ? "新增供应商" : projectScope ? "编辑项目模型" : "编辑供应商"}
             </DialogTitle>
             <DialogDescription
               id="provider-editor-description"
               className="ja-settings-dialog-description"
             >
-              连接一次，添加多个模型。
+              {projectScope
+                ? "模型能力仅覆盖当前项目；连接和凭据保持全局。"
+                : "连接一次，添加多个模型。"}
             </DialogDescription>
           </div>
           <DialogClose asChild>
@@ -1225,71 +1626,82 @@ function ProviderEditorSheet({
           </DialogClose>
         </div>
         <div className="ja-settings-sheet-body ja-provider-editor-body">
-          <section
-            className="ja-provider-connection-section"
-            aria-labelledby="provider-connection-heading"
-          >
-            <div className="ja-provider-section-heading">
-              <div>
-                <h3 id="provider-connection-heading">连接信息</h3>
-                <p>先连接供应商，再为它添加一个或多个模型。</p>
+          {projectScope ? (
+            <section className="ja-provider-connection-section" aria-label="项目模型覆盖范围">
+              <div className="ja-provider-section-heading">
+                <div>
+                  <h3>当前项目的模型覆盖</h3>
+                  <p>连接地址、协议和凭据仍由全局设置管理。</p>
+                </div>
               </div>
-            </div>
-            <fieldset disabled={busy || secretLoading} className="ja-provider-connection-fields">
-              <div className="ja-settings-form-grid">
-                <Field id="provider-name" label="供应商名称">
-                  <input
-                    id="provider-name"
-                    className="ja-settings-input"
-                    value={draft.name}
-                    placeholder="例如：公司网关"
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                    required
-                  />
-                </Field>
-                <Field id="provider-api" label="API 规范">
-                  <SettingsSelect
-                    id="provider-api"
-                    value={draft.api}
-                    options={apiOptions}
-                    onValueChange={(value) => setDraft({ ...draft, api: value as ProviderApi })}
-                  />
-                </Field>
-                <Field id="provider-url" label="Base URL">
-                  <input
-                    id="provider-url"
-                    className="ja-settings-input"
-                    value={draft.baseUrl}
-                    placeholder="https://api.example.com/v1"
-                    onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
-                    required
-                  />
-                </Field>
-                <Field id="provider-secret" label="API Key">
-                  <div className="ja-provider-api-key-control">
+            </section>
+          ) : (
+            <section
+              className="ja-provider-connection-section"
+              aria-labelledby="provider-connection-heading"
+            >
+              <div className="ja-provider-section-heading">
+                <div>
+                  <h3 id="provider-connection-heading">连接信息</h3>
+                  <p>先连接供应商，再为它添加一个或多个模型。</p>
+                </div>
+              </div>
+              <fieldset disabled={busy || secretLoading} className="ja-provider-connection-fields">
+                <div className="ja-settings-form-grid">
+                  <Field id="provider-name" label="供应商名称">
                     <input
-                      id="provider-secret"
+                      id="provider-name"
                       className="ja-settings-input"
-                      type={secretVisible ? "text" : "password"}
-                      autoComplete={isNew ? "new-password" : "current-password"}
-                      value={secret}
-                      placeholder="输入 API Key"
-                      onChange={(event) => setSecret(event.target.value)}
+                      value={draft.name}
+                      placeholder="例如：公司网关"
+                      onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                      required
                     />
-                    <IconButton
-                      type="button"
-                      label={secretVisible ? "隐藏 API Key" : "显示 API Key"}
-                      className="ja-provider-api-key-toggle"
-                      disabled={secretLoading}
-                      onClick={() => setSecretVisible((visible) => !visible)}
-                    >
-                      {secretVisible ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
-                    </IconButton>
-                  </div>
-                </Field>
-              </div>
-            </fieldset>
-          </section>
+                  </Field>
+                  <Field id="provider-api" label="API 规范">
+                    <SettingsSelect
+                      id="provider-api"
+                      value={draft.api}
+                      options={apiOptions}
+                      onValueChange={(value) => setDraft({ ...draft, api: value as ProviderApi })}
+                    />
+                  </Field>
+                  <Field id="provider-url" label="Base URL">
+                    <input
+                      id="provider-url"
+                      className="ja-settings-input"
+                      value={draft.baseUrl}
+                      placeholder="https://api.example.com/v1"
+                      onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
+                      required
+                    />
+                  </Field>
+                  <Field id="provider-secret" label="API Key">
+                    <div className="ja-provider-api-key-control">
+                      <input
+                        id="provider-secret"
+                        className="ja-settings-input"
+                        type={secretVisible ? "text" : "password"}
+                        autoComplete={isNew ? "new-password" : "current-password"}
+                        value={secret}
+                        placeholder="输入 API Key"
+                        onChange={(event) => setSecret(event.target.value)}
+                      />
+                      <IconButton
+                        type="button"
+                        label={secretVisible ? "隐藏 API Key" : "显示 API Key"}
+                        className="ja-provider-api-key-toggle"
+                        disabled={secretLoading}
+                        onClick={() => setSecretVisible((visible) => !visible)}
+                      >
+                        {secretVisible ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
+                      </IconButton>
+                    </div>
+                  </Field>
+                </div>
+              </fieldset>
+            </section>
+          )}
           <section className="ja-provider-models-section" aria-labelledby="provider-models-heading">
             <div className="ja-provider-section-heading ja-provider-models-heading">
               <div>
@@ -1305,22 +1717,25 @@ function ProviderEditorSheet({
                 <p>使用供应商提供的模型标识，额度可分别调整。</p>
               </div>
               <div className="ja-provider-model-actions" role="group" aria-label="模型操作">
-                <Button
-                  type="button"
-                  variant="primary"
-                  size="sm"
-                  loading={busy}
-                  disabled={busy || !canDiscoverModels}
-                  title={
-                    canDiscoverModels
-                      ? "从已保存的上游供应商获取模型"
-                      : "请先保存连接信息和 API Key 后再获取"
-                  }
-                  onClick={() => void discoverModels()}
-                >
-                  <Download aria-hidden="true" />
-                  从上游获取
-                </Button>
+                {!projectScope ? (
+                  <Button
+                    id={discoverButtonId}
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    loading={busy}
+                    disabled={busy || !canDiscoverModels}
+                    title={
+                      canDiscoverModels
+                        ? "从已保存的上游供应商获取模型"
+                        : "请先保存连接信息和 API Key 后再获取"
+                    }
+                    onClick={() => void discoverModels()}
+                  >
+                    <Download aria-hidden="true" />
+                    从上游获取
+                  </Button>
+                ) : null}
                 <Button
                   type="button"
                   variant="secondary"
@@ -1357,6 +1772,24 @@ function ProviderEditorSheet({
             </div>
           </section>
         </div>
+        {catalogResult !== undefined ? (
+          <ModelCatalogPicker
+            items={catalogResult.items.filter(
+              (item) => !draft.models.some((model) => model.model.trim() === item),
+            )}
+            truncated={catalogResult.truncated}
+            emptyDirectory={catalogResult.items.length === 0}
+            onClose={() => setCatalogResult(undefined)}
+            onAdd={addDiscoveredModels}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              const modelId = catalogFocusAfterConfirmRef.current;
+              catalogFocusAfterConfirmRef.current = null;
+              if (modelId !== null) document.getElementById(`model-id-${modelId}`)?.focus();
+              else document.getElementById(discoverButtonId)?.focus();
+            }}
+          />
+        ) : null}
         <div className="ja-settings-sheet-footer">
           {feedback === undefined ? null : (
             <p className="ja-settings-feedback ja-provider-editor-feedback" role="alert">
@@ -1373,13 +1806,14 @@ function ProviderEditorSheet({
             取消
           </Button>
           <Button
+            id="provider-editor-save"
             type="button"
             variant="primary"
             size="sm"
             loading={busy}
             onClick={() => void save()}
           >
-            {isNew ? "保存供应商" : "保存更改"}
+            {isNew ? "保存供应商" : projectScope ? "保存项目模型" : "保存更改"}
           </Button>
         </div>
       </DialogContent>
@@ -1390,21 +1824,28 @@ function ProviderEditorSheet({
 /** 主从选择保留供应商上下文，新增和编辑沿用同一草稿路由，不增加配置写入来源。 */
 export function ModelsSection({
   providers,
+  globalProviders = providers,
   defaultSelection,
   focusRequest,
   ports,
+  projectScope = false,
+  projectProviderOverrides = [],
 }: {
   providers: SettingsSnapshot["providers"];
+  globalProviders?: SettingsSnapshot["providers"];
   defaultSelection: SettingsSnapshot["defaultSelection"];
   snapshotRevision: number;
   focusRequest?: { providerId: string; modelId?: string; requestId: number };
   ports: SettingsPorts;
+  projectScope?: boolean;
+  projectProviderOverrides?: readonly ProjectProviderRuntimeOverride[];
 }): ReactElement {
   const [selectedProviderId, setSelectedProviderId] = useState<string | undefined>(
     defaultSelection?.providerId ?? providers[0]?.providerId,
   );
   const [sheetProviderId, setSheetProviderId] = useState<string | null>(null);
   const [sheetModelId, setSheetModelId] = useState<string>();
+  const [projectSaveNotice, setProjectSaveNotice] = useState<string>();
   const consumedFocusRequestRef = useRef<number | null>(null);
   const [dismissedFocusRequestId, setDismissedFocusRequestId] = useState<number>();
   const requestedProviderId =
@@ -1429,6 +1870,12 @@ export function ModelsSection({
       label: `${provider.name} · ${model.name}`,
     })),
   );
+  /** 项目保存反馈留在页面内短暂展示，避免全局 toast 遮挡设置页标题与搜索入口。 */
+  useEffect(() => {
+    if (projectSaveNotice === undefined) return;
+    const timeoutId = window.setTimeout(() => setProjectSaveNotice(undefined), 5000);
+    return () => window.clearTimeout(timeoutId);
+  }, [projectSaveNotice]);
   /** 搜索请求先切换主从选择，再在下一次布局提交后滚动和聚焦目标入口。 */
   useLayoutEffect(() => {
     if (focusRequest === undefined) return;
@@ -1439,31 +1886,43 @@ export function ModelsSection({
     focusModelSearchTarget(provider.providerId, focusRequest.modelId);
     consumedFocusRequestRef.current = focusRequest.requestId;
   }, [focusRequest, providers, selectedProvider]);
-  /** 保存成功或凭据部分成功后保留 Provider 选择，关闭当前 sheet。 */
+  /** 保存成功或凭据部分成功后保留 Provider 选择；项目保存结果以内联状态就地反馈。 */
   const handleSaved = (providerId: string): void => {
     setSelectedProviderId(providerId);
+    setProjectSaveNotice(projectScope ? "项目模型已保存" : undefined);
     setSheetProviderId(null);
   };
   return (
     <div className="ja-settings-section ja-models-page">
       <SectionHeader
         title="模型与供应商"
-        description="连接供应商，选择适合你的模型。"
+        description={
+          projectScope
+            ? "编辑当前项目的模型能力与默认模型；连接和凭据由全局设置管理。"
+            : "连接供应商，选择适合你的模型。"
+        }
         action={
-          <Button
-            type="button"
-            variant="primary"
-            size="sm"
-            onClick={() => {
-              setSheetModelId(undefined);
-              setSheetProviderId("__new__");
-            }}
-          >
-            <Plus aria-hidden="true" />
-            新增供应商
-          </Button>
+          projectScope ? undefined : (
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                setSheetModelId(undefined);
+                setSheetProviderId("__new__");
+              }}
+            >
+              <Plus aria-hidden="true" />
+              新增供应商
+            </Button>
+          )
         }
       />
+      {projectSaveNotice !== undefined ? (
+        <p className="ja-settings-feedback" role="status" aria-live="polite">
+          {projectSaveNotice}
+        </p>
+      ) : null}
       <div className="ja-settings-provider-layout">
         <aside className="ja-settings-provider-sidebar" aria-label="Provider 列表">
           <div className="ja-models-sidebar-heading">
@@ -1508,6 +1967,17 @@ export function ModelsSection({
               defaultSelection={defaultSelection}
               replacementChoices={modelChoices}
               ports={ports}
+              projectScope={projectScope}
+              projectProviderOverride={projectProviderOverrides.find(
+                (entry) => entry.providerId === selectedProvider.providerId,
+              )}
+              globalProvider={globalProviders.find(
+                (entry) => entry.providerId === selectedProvider.providerId,
+              )}
+              onInheritProjectModel={ports.onInheritProjectModelOverride}
+              onInheritProjectModels={ports.onInheritProjectProviderModels}
+              onRestoreProjectModel={ports.onRestoreProjectModel}
+              onHideProjectModel={ports.onHideProjectModel}
               onEdit={(modelId) => {
                 setSheetModelId(modelId);
                 setSheetProviderId(selectedProvider.providerId);
@@ -1522,6 +1992,12 @@ export function ModelsSection({
         provider={sheetProvider}
         initialModelId={sheetModelId}
         ports={ports}
+        projectScope={projectScope}
+        projectOverrideModelIds={
+          projectProviderOverrides
+            .find((entry) => entry.providerId === sheetProviderId)
+            ?.models?.map((model) => model.modelId) ?? []
+        }
         onOpenChange={(open) => {
           if (!open) setSheetProviderId(null);
         }}

@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":"c:item-content-first","method":"thread/item-content/read","params":{"threadId":"thr_demo","itemId":"item_answer","offsetCharacters":0,"limitCharacters":2}}
+{"jsonrpc":"2.0","id":"c:item-content-first","result":{"itemId":"item_answer","offsetCharacters":0,"nextOffsetCharacters":2,"totalCharacters":3,"truncated":true,"content":"甲😀"}}
+{"jsonrpc":"2.0","id":"c:item-content-last","method":"thread/item-content/read","params":{"threadId":"thr_demo","itemId":"item_answer","offsetCharacters":2,"limitCharacters":2}}
+{"jsonrpc":"2.0","id":"c:item-content-last","result":{"itemId":"item_answer","offsetCharacters":2,"nextOffsetCharacters":null,"totalCharacters":3,"truncated":false,"content":"乙"}}
+

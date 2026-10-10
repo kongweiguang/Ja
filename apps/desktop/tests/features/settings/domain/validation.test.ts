@@ -26,6 +26,7 @@ const model = {
   capabilities: {
     contextWindowTokens: 256_000,
     maxOutputTokens: 32_000,
+    supportsOutputSchema: false,
   },
   reasoningLevelMap: { low: "low", high: "high" },
   defaultReasoningLevel: "high",

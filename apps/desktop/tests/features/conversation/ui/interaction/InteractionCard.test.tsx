@@ -14,7 +14,7 @@ import type {
 } from "@/features/conversation/application/interactionPort";
 
 const REQUEST = {
-  requestId: "req_demo",
+  interactionId: "interaction_demo",
   threadId: "thr_one",
   turnId: "turn_one",
   toolCallId: "call_one",
@@ -51,7 +51,7 @@ const REQUEST = {
   ],
   answers: [],
   status: "pending" as const,
-  revision: 1,
+  interactionRevision: 1,
   createdAt: "2026-09-10T00:00:00Z",
   updatedAt: "2026-09-10T00:00:00Z",
 };
@@ -62,7 +62,7 @@ function createPort(initial?: Partial<InteractionSnapshot>): InteractionPort {
     threadId: "thr_one",
     eventSequence: 1,
     request: REQUEST,
-    draft: { revision: 1, answers: [] },
+    draft: { interactionId: REQUEST.interactionId, draftRevision: 1, answers: [] },
     ...initial,
   };
   return {
@@ -71,7 +71,11 @@ function createPort(initial?: Partial<InteractionSnapshot>): InteractionPort {
     saveDraft: vi.fn(async ({ answers }: { answers: readonly InteractionAnswer[] }) => {
       snapshot = {
         ...snapshot,
-        draft: { revision: (snapshot.draft?.revision ?? 1) + 1, answers },
+        draft: {
+          interactionId: REQUEST.interactionId,
+          draftRevision: (snapshot.draft?.draftRevision ?? 1) + 1,
+          answers,
+        },
         eventSequence: snapshot.eventSequence + 1,
       };
       return snapshot;
@@ -80,7 +84,11 @@ function createPort(initial?: Partial<InteractionSnapshot>): InteractionPort {
       snapshot = {
         ...snapshot,
         request: snapshot.request === null ? null : { ...snapshot.request, status: "answered" },
-        draft: { revision: (snapshot.draft?.revision ?? 1) + 1, answers },
+        draft: {
+          interactionId: REQUEST.interactionId,
+          draftRevision: (snapshot.draft?.draftRevision ?? 1) + 1,
+          answers,
+        },
         eventSequence: snapshot.eventSequence + 1,
       };
       return snapshot;

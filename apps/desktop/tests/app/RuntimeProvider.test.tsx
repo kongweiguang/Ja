@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StrictMode, type ReactElement } from "react";
 import {
@@ -25,7 +25,7 @@ const ready: RuntimeStatus = {
   status: "ready",
   generation: 1,
   serverInstanceId: "srv_fixture",
-  features: ["task_threads_v1", "plan_goal_v1"],
+  features: ["task_threads", "plan"],
 };
 const starting: RuntimeStatus = {
   ...ready,
@@ -40,7 +40,6 @@ const stopped: RuntimeStatus = {
 const sessionWorkspace = {
   workspaceId: "ws_runtime_a" as const,
   kind: "session" as const,
-  legacySharedWorkspaceId: null,
   displayName: "会话 A" as const,
   trust: "trusted" as const,
   rootPath: "C:\\data\\ja\\workspaces\\thr_runtime_a",
@@ -249,13 +248,18 @@ function Probe(): ReactElement {
       <button type="button" onClick={() => void lifecycle.startRuntime().catch(() => undefined)}>
         retry
       </button>
+      <button type="button" onClick={() => void lifecycle.retryStorage?.().catch(() => undefined)}>
+        retry storage
+      </button>
       <button
         type="button"
         onClick={() =>
-          void turns.submitTurn({
-            threadId: "thr_fixture",
-            content: [{ type: "text", text: "hello" }],
-          })
+          void turns
+            .submitTurn({
+              threadId: "thr_fixture",
+              content: [{ type: "text", text: "hello" }],
+            })
+            .catch(() => undefined)
         }
       >
         submit
@@ -307,9 +311,87 @@ function RuntimeStateRenderProbe({ onRender }: { onRender: () => void }): ReactE
   return <output data-testid="state-render-boot">{state.boot.status}</output>;
 }
 
+/** 只投影 workspace metadata 槽位，证明 workspace 级事件无需选中 Thread 即可抵达 Provider。 */
+function WorkspaceMetadataProbe(): ReactElement {
+  const event = useRuntimeState().lastWorkspaceMetadataEvent;
+  return (
+    <output data-testid="workspace-metadata-event">
+      {event === undefined ? "none" : `${event.params.workspaceId}:${event.params.revision}`}
+    </output>
+  );
+}
+
 describe("RuntimeProvider v1 lifecycle", () => {
   afterEach(() => {
     cleanup();
+  });
+
+  it("publishes workspace metadata events without requiring a selected Thread", async () => {
+    const fake = fakeRuntime(ready);
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <WorkspaceMetadataProbe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("workspace-metadata-event")).toHaveTextContent("none"));
+
+    act(() => {
+      fake.emit({
+        kind: "timeline",
+        event: {
+          jsonrpc: "2.0",
+          method: "workspace/metadata-changed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_workspace_metadata",
+            sequence: 7,
+            occurredAt: "2026-10-10T00:00:00Z",
+            generation: 1,
+            workspaceId: "ws_runtime_a",
+            revision: 7,
+          },
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-metadata-event")).toHaveTextContent("ws_runtime_a:7"),
+    );
+  });
+
+  /** 进程虽已认证但存储不可用时，不能视为业务就绪。 */
+  it("blocks turns until explicit storage retry installs and confirms the complete runtime", async () => {
+    const blocked: RuntimeStatus = {
+      ...ready,
+      storageRecovery: {
+        id: "11111111-1111-1111-1111-111111111111",
+        phase: "blocked",
+        reason: "DISK_FULL",
+        historyAvailable: true,
+        backupAvailable: false,
+        rebuilt: false,
+      },
+    };
+    const fake = fakeRuntime(blocked);
+    fake.runtime.retryStorage = vi.fn(async () => {
+      fake.setState(ready);
+      return ready;
+    });
+    render(
+      <RuntimeProvider runtime={fake.runtime} projection={fake.projection.port}>
+        <Probe />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("boot")).toHaveTextContent("failed"));
+    expect(screen.getByTestId("admission")).toHaveTextContent("false");
+    fireEvent.click(screen.getByRole("button", { name: /^submit$/ }));
+    await act(async () => undefined);
+    expect(fake.runtime.turnStart).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "retry storage" }));
+    await waitFor(() => expect(screen.getByTestId("admission")).toHaveTextContent("true"));
+    expect(fake.runtime.retryStorage).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: /^submit$/ }));
+    await waitFor(() => expect(fake.runtime.turnStart).toHaveBeenCalledTimes(1));
   });
 
   it("starts a stopped sidecar without a configuration snapshot and opens turn admission", async () => {
@@ -377,7 +459,7 @@ describe("RuntimeProvider v1 lifecycle", () => {
     const fake = fakeRuntime(ready);
     vi.mocked(fake.runtime.recheckPendingOperations).mockResolvedValue([
       {
-        clientOperationId: "op_11111111111111111111111111111111",
+        operationKey: "op_11111111111111111111111111111111",
         method: "turn/start",
         threadId: "thr_fixture",
         createdAt: "2026-09-24T00:00:00.000Z",
@@ -623,7 +705,14 @@ describe("RuntimeProvider v1 lifecycle", () => {
           occurredAt: "2026-08-26T00:00:02Z",
           state: "completed",
           summary: "done",
-          finalMessage: { messageId: "item_final", text: "done" },
+          summaryTotalCharacters: 4,
+          summaryTruncated: false,
+          finalMessage: {
+            messageId: "item_final",
+            text: "done",
+            totalCharacters: 4,
+            truncated: false,
+          },
           changeSet: {
             state: "complete",
             incompleteReasons: [],
@@ -719,6 +808,8 @@ describe("RuntimeProvider v1 lifecycle", () => {
               itemId: "item_follow_up",
               createdAt: "2026-09-01T00:00:02Z",
               turnId: "turn_fixture",
+              truncated: false,
+              totalCharacters: 9,
               kind: "user_input",
               content: [{ type: "text", text: "follow up" }],
               attachments: [],
@@ -765,7 +856,7 @@ describe("RuntimeProvider v1 lifecycle", () => {
       status: "ready" as const,
       generation: 2,
       serverInstanceId: "srv_current",
-      features: ["task_threads_v1", "plan_goal_v1"] as const,
+      features: ["task_threads", "plan"] as const,
     };
     const fake = fakeRuntime(current);
     render(

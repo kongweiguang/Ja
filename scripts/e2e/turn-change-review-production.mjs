@@ -445,10 +445,10 @@ export async function findMissingIntegrationHooks(root = repoRoot, desktopRunner
       forbiddenTokens: ["live_turn", "openLive", "readLiveFile", "closeLive"],
     },
     {
-      path: join(root, "contracts", "ja-rpc", "v1", "schema", "ja-rpc-v1.schema.json"),
-      label: "ja-rpc-1.0-frozen-read-contract",
+      path: join(root, "contracts", "ja-rpc", "v2", "schema", "ja-rpc-v2.schema.json"),
+      label: "ja-rpc-2.0-frozen-read-contract",
       tokens: [
-        '"const": 1',
+        '"const": 2',
         "turn/change-set/read",
         '"byteLength"',
         '"sha256"',
@@ -457,9 +457,14 @@ export async function findMissingIntegrationHooks(root = repoRoot, desktopRunner
       forbiddenTokens: ["turn_change_preview_v1", "turn/change-preview"],
     },
     {
-      path: join(root, "contracts", "golden", "v1", "valid", "core.jsonl"),
-      label: "initialize-1.0-fixture",
-      tokens: ['"protocolMinor":0', `"engineVersion":"${productVersion}"`, "turn/change-set/read"],
+      path: join(root, "contracts", "golden", "v2", "valid", "core.jsonl"),
+      label: "initialize-2.0-fixture",
+      tokens: [
+        '"protocolMajor":2',
+        '"protocolMinor":0',
+        `"engineVersion":"${productVersion}"`,
+        "turn/change-set/read",
+      ],
       forbiddenTokens: ["turn_change_preview_v1", "turn/change-preview"],
     },
   ];

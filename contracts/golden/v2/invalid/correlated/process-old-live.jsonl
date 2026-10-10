@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:process-list","method":"process/list","params":{"workspaceId":"ws_demo","threadId":"thr_demo","limit":50,"cursor":null}}
+{"jsonrpc":"2.0","id":"c:process-list","result":{"workspaceId":"ws_demo","threadId":"thr_demo","generation":3,"sessions":[{"workspaceId":"ws_demo","threadId":"thr_demo","generation":2,"sessionId":"proc_0123456789abcdef0123456789abcdef","startedTurnId":"turn_build","startedCallId":"toolu_build","createdAt":"2026-10-06T10:00:02Z","state":"running","outputSequence":19,"outputTruncated":false,"exitCode":null}],"nextCursor":null}}

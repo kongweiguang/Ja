@@ -174,13 +174,15 @@
   min-width: 0;
   min-height: 0;
   flex: 1;
+  /* 面板缩窄时仍保持左侧编辑、右侧资源树，避免拖动宽度改变阅读顺序。 */
+  flex-direction: row;
 }
 .ja-files-workspace-explorer {
   display: flex;
   min-width: 11rem;
-  width: 32%;
   min-height: 0;
-  flex: 0 1 15rem;
+  /* 保留资源树的可操作宽度，同时在窄面板为编辑区腾出空间。 */
+  flex: 0 1 clamp(11rem, 32%, 15rem);
   order: 2;
   border-left: 1px solid var(--ja-border);
   overflow: hidden;
@@ -304,6 +306,60 @@
 .ja-files-editor-status[data-status="saveError"],
 .ja-files-editor-status[data-status="conflict"] {
   color: var(--ja-danger);
+}
+.ja-files-markdown-mode {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 0.12rem;
+  margin-left: auto;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  padding: 0.1rem;
+  background: var(--ja-background);
+}
+.ja-files-markdown-mode button {
+  min-height: 1.35rem;
+  border: 0;
+  border-radius: calc(var(--ja-radius-sm) - 2px);
+  padding: 0 0.42rem;
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.ja-files-markdown-mode button[aria-pressed="true"] {
+  color: var(--ja-foreground);
+  background: var(--ja-surface-muted);
+}
+.ja-files-markdown-mode button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+.ja-files-markdown-source {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+.ja-files-markdown-source[hidden] {
+  display: none;
+}
+.ja-files-markdown-source > .ja-code-editor {
+  min-height: 0;
+  height: 100%;
+}
+.ja-files-markdown-preview {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 1rem clamp(0.75rem, 4vw, 2rem);
+  color: var(--ja-foreground);
+  background: var(--ja-background);
+}
+.ja-files-markdown-preview > .ja-markdown {
+  width: min(100%, 58rem);
+  margin: 0 auto;
+  overflow-wrap: anywhere;
 }
 .ja-files-conflict,
 .ja-files-save-error {
@@ -802,34 +858,6 @@
 }
 
 @container (max-width: 680px) {
-  .ja-files-workspace-body {
-    flex-direction: column;
-  }
-  .ja-files-workspace-explorer {
-    min-width: 0;
-    width: 100%;
-    max-width: none;
-    flex: 1 1 auto;
-    order: 1;
-    border-left: 0;
-    border-bottom: 1px solid var(--ja-border);
-  }
-  /* 没有打开文档时不让空编辑器抢占纵向空间；文件树/搜索先使用全部可用高度。 */
-  .ja-files-workspace-body.is-browser-only .ja-files-workspace-explorer {
-    flex: 1;
-    border-bottom: 0;
-  }
-  .ja-files-workspace-body.is-browser-only .ja-files-workspace-editor {
-    display: none;
-  }
-  .ja-files-workspace-editor {
-    min-height: 12rem;
-    order: 2;
-  }
-  /* 打开文档后只给编辑器保留可工作的有界高度，其余纵向空间全部归资源树/搜索。 */
-  .ja-files-workspace-body.has-open-document .ja-files-workspace-editor {
-    flex: 0 0 clamp(12rem, 32%, 17rem);
-  }
   .ja-files-recovery-gate {
     align-items: flex-start;
     flex-direction: column;

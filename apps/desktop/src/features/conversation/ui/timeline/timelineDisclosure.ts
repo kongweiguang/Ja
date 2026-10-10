@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-export type TimelineDisclosureKind = "process" | "tool";
+export type TimelineDisclosureKind = "process" | "tool" | "changes";
 
 const MAX_TIMELINE_DISCLOSURES = 512;
 

@@ -25,9 +25,8 @@ function readWorkflowText(path) {
 }
 
 /**
- * Extract one workflow step without parsing arbitrary YAML so the regression stays dependency-free.
- * The test only inspects the bounded step body and therefore cannot accidentally approve a setting
- * placed in an unrelated job or global default.
+ * 不解析任意 YAML，直接提取一个 workflow 步骤，避免回归测试引入额外依赖。
+ * 测试只检查该步骤的限定内容，因此不会误把写在其他 job 或全局默认值中的设置判为有效。
  */
 function workflowStepBody(source, name) {
   const marker = `      - name: ${name}`;
@@ -38,8 +37,8 @@ function workflowStepBody(source, name) {
 }
 
 /**
- * Exercise the exact PowerShell preference used by CI with a real native exit 7. A later success
- * marker must not appear, proving the gate cannot report green after an intermediate native error.
+ * 使用真实的原生命令退出码 7，验证 CI 使用的 PowerShell 偏好设置。
+ * 后续成功标记不得出现，以证明门禁不会在中间原生命令失败后仍报告通过。
  */
 function assertNativeFailureStopsImmediately() {
   if (process.platform !== "win32") return;
@@ -116,6 +115,23 @@ function assertFastChecksPrecedeHeavyVerification() {
 test(
   "fast checks run before heavyweight verification",
   assertFastChecksPrecedeHeavyVerification,
+);
+
+/** 将 Provider fuzz 门禁锁定到 Core 模块的现存测试，避免重命名后 CI 静默跳过。 */
+function assertProviderFuzzStepsTargetCurrentCoreTests() {
+  const source = readWorkflowText(WORKFLOW_PATH);
+  const retryAfter = workflowStepBody(source, "Fuzz Provider Retry-After parsing");
+  const eventJson = workflowStepBody(source, "Fuzz Provider event JSON parsing");
+  assert.match(retryAfter, /-pl :ja-agent-core -am/u);
+  assert.match(retryAfter, /ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget/u);
+  assert.match(eventJson, /-pl :ja-agent-core -am/u);
+  assert.match(eventJson, /ProviderInputFuzzTest#providerJsonFailsClosedForArbitraryBytes/u);
+  assert.doesNotMatch(source, /strictSseReaderFailsClosedForArbitraryBytes/u);
+}
+
+test(
+  "Provider fuzz steps select current Core tests",
+  assertProviderFuzzStepsTargetCurrentCoreTests,
 );
 
 /** 发布只能复用同一 SHA 的成功 main CI 精简 artifact，并保留签名矩阵的真实后续门禁。 */

@@ -15,6 +15,7 @@ function parentMessage(
   createdAt: string,
 ): TimelineItemAdapter {
   return {
+    origin: "native" as const,
     itemId,
     threadId: "thr_root",
     turnId,

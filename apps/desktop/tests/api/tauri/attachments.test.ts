@@ -156,7 +156,7 @@ describe("attachment native adapter", () => {
     ).rejects.toMatchObject({ code: "ATTACHMENT_RUNTIME_FAILED" });
   });
 
-  /** native message 与未知 code 都不能穿透 allow-list，避免路径或内部错误进入 UI。 */
+  /** 原生错误消息与未知错误码都不能穿透白名单，避免路径或内部错误进入界面。 */
   it("normalizes failed channel frames to a safe retryable error", async () => {
     native.invoke.mockImplementationOnce(async (_command, args) => {
       args.onEvent.onmessage({

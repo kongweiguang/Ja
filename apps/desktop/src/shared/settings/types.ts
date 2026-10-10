@@ -14,6 +14,7 @@ export type McpAuth =
 interface ModelCapabilities {
   contextWindowTokens: number;
   maxOutputTokens: number;
+  supportsOutputSchema: boolean;
 }
 
 export interface ProviderModelSave {

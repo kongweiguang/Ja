@@ -1,6 +1,6 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Validate the breaking JA RPC v1 schema, golden frames, and Secret boundary."""
+"""Validate the breaking JA RPC v2 schema, golden frames, and Secret boundary."""
 
 from __future__ import annotations
 
@@ -17,10 +17,16 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 CONTRACTS = Path(__file__).resolve().parents[1]
 GOLDEN = Path(__file__).resolve().parent
-V1_GOLDEN = GOLDEN / "v1"
-SCHEMA_PATH = CONTRACTS / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
-ERROR_CATALOG_PATH = CONTRACTS / "ja-rpc" / "v1" / "error-catalog.json"
+V2_GOLDEN = GOLDEN / "v2"
+SCHEMA_PATH = CONTRACTS / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
+ERROR_CATALOG_PATH = CONTRACTS / "ja-rpc" / "v2" / "error-catalog.json"
 SECRET_KEYS = {"secret", "secretvalue", "credentialvalue", "token", "tokenvalue", "password", "authorization", "apikey", "api_key"}
+JSON_SCHEMA_MAP_KEYS = {"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
+JSON_SCHEMA_SUBSCHEMA_KEYS = {
+    "additionalProperties", "unevaluatedProperties", "propertyNames", "items", "contains",
+    "unevaluatedItems", "not", "if", "then", "else", "contentSchema",
+}
+JSON_SCHEMA_SUBSCHEMA_ARRAY_KEYS = {"allOf", "anyOf", "oneOf", "prefixItems"}
 
 
 class CorpusError(RuntimeError):
@@ -48,25 +54,31 @@ def parse_json(raw: str) -> dict[str, Any]:
     return value
 
 
-def raw_documents(path: Path) -> Iterable[dict[str, Any]]:
-    """按 JSON/JSONL 边界逐条读取 corpus。"""
+def raw_json_texts(path: Path) -> Iterable[str]:
+    """先保留原始帧边界，使负例也能验证语法错误而非仅验证合法 JSON 的字段约束。"""
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".json":
-        yield parse_json(text)
+        yield text
         return
     for line in text.splitlines():
         if line.strip():
-            yield parse_json(line)
+            yield line
+
+
+def raw_documents(path: Path) -> Iterable[dict[str, Any]]:
+    """正例必须完整解析成功，语法失败不能被字段校验误认为有效合同。"""
+    for raw in raw_json_texts(path):
+        yield parse_json(raw)
 
 
 def corpus_files(invalid: bool) -> list[Path]:
-    """只选择 v1 子目录，目录外的历史 fixture 不会成为当前协议输入。"""
-    if not V1_GOLDEN.is_dir():
+    """只选择 v2 子目录，目录外的历史 fixture 不会成为当前协议输入。"""
+    if not V2_GOLDEN.is_dir():
         return []
     return sorted(
-        path for path in V1_GOLDEN.rglob("*")
+        path for path in V2_GOLDEN.rglob("*")
         if path.is_file() and path.suffix in {".json", ".jsonl"}
-        and (("invalid" in path.relative_to(V1_GOLDEN).parts) == invalid)
+        and (("invalid" in path.relative_to(V2_GOLDEN).parts) == invalid)
     )
 
 
@@ -91,7 +103,7 @@ def load_catalog() -> dict[int, tuple[str, str, bool]]:
             or any(not isinstance(category, str) or re.fullmatch(r"[a-z][a-z_]{1,31}", category) is None
                    for category in categories) \
             or not isinstance(value.get("errors"), list):
-        raise CorpusError("invalid v1 error catalog")
+        raise CorpusError("invalid v2 error catalog")
     result: dict[int, tuple[str, str, bool]] = {}
     names: set[str] = set()
     for item in value["errors"]:
@@ -108,6 +120,14 @@ def load_catalog() -> dict[int, tuple[str, str, bool]]:
     return result
 
 
+def validate_error_schema_parity(schema: dict[str, Any], catalog: dict[int, tuple[str, str, bool]]) -> None:
+    """Keep the JSON Schema's stable RPC error names in the same order and closure as the frozen catalog."""
+    codes = schema.get("$defs", {}).get("rpcErrorData", {}).get("properties", {}).get("errorCode", {}).get("enum")
+    expected = [entry[0] for entry in catalog.values()]
+    if codes != expected:
+        raise CorpusError("RPC error schema does not match the frozen catalog")
+
+
 def sub_validator(schema: dict[str, Any], definition: str) -> Draft202012Validator:
     """Validates one named method shape against the schema's shared definitions."""
     return Draft202012Validator({"$schema": schema["$schema"], "$defs": schema["$defs"],
@@ -116,13 +136,19 @@ def sub_validator(schema: dict[str, Any], definition: str) -> Draft202012Validat
 
 PARAM_DEFS = {
     "runtime/initialize": "initializeParams", "runtime/health": "emptyParams",
+    "runtime/storage/retry": "emptyParams",
     "runtime/shutdown": "runtimeShutdownParams", "runtime/context/register": "runtimeContextRegisterParams",
+    "runtime/client/close": "runtimeClientCloseParams",
     "operation/read": "operationReadParams",
     "workspace/open": "workspaceOpenParams", "workspace/list": "workspaceListParams",
+    "workspace/read": "workspaceReadParams", "workspace/update": "workspaceUpdateParams",
     "workspace/path/search": "workspacePathSearchParams",
     "workspace/set-trust": "workspaceTrustParams",
     "workspace/unregister": "workspaceUnregisterParams", "thread/create": "threadCreateParams",
+    "thread/fork": "threadForkParams",
+    "review/start": "reviewStartParams", "review/read": "reviewReadParams",
     "thread/read": "threadReadParams", "thread/observe": "threadObserveParams",
+    "thread/item-content/read": "itemContentReadParams",
     "thread/unobserve": "threadObserveParams", "thread/usage/read": "threadUsageReadParams",
     "thread/mcp/read": "threadMcpReadParams",
     "thread/seen": "threadMutationParams",
@@ -131,17 +157,12 @@ PARAM_DEFS = {
     "interaction/read": "interactionReadParams", "interaction/observe": "interactionObserveParams",
     "interaction/unobserve": "interactionUnobserveParams", "interaction/draft/save": "interactionDraftSaveParams",
     "interaction/respond": "interactionRespondParams", "interaction/cancel": "interactionCancelParams",
-    "goal/read": "goalReadParams", "plan/read": "planReadParams", "plan/current/read": "planCurrentReadParams",
-    "goal/events/read": "goalPageParams", "plan/revisions/list": "planPageParams",
-    "goal/observe": "goalObserveParams", "goal/unobserve": "goalUnobserveParams",
-    "goal/evidence/list": "goalEvidenceListParams", "goal/create": "goalCreateParams",
-    "goal/plan/attach": "goalPlanAttachParams", "goal/plan/detach": "goalMutationParams",
-    "goal/pause": "goalMutationParams", "goal/resume": "goalMutationParams",
-    "goal/stop": "goalMutationParams",
+    "plan/read": "planReadParams", "plan/current/read": "planCurrentReadParams",
+    "plan/revisions/list": "planPageParams",
     "plan/create": "planCreateParams", "plan/draft/save": "planDraftSaveParams",
     "plan/draft/discard": "planMutationParams", "plan/propose": "planMutationParams",
     "plan/execute": "planExecuteParams", "plan/observe": "planReadParams",
-    "plan/unobserve": "goalUnobserveParams", "plan/events/read": "planPageParams",
+    "plan/unobserve": "planUnobserveParams", "plan/events/read": "planPageParams",
     "plan/evidence/list": "planEvidenceListParams", "plan/pause": "planControlParams",
     "plan/resume": "planControlParams", "plan/stop": "planControlParams",
     "plan/reject": "planRejectParams",
@@ -156,14 +177,19 @@ PARAM_DEFS = {
     "configuration/read": "configurationReadParams", "configuration/patch": "configurationPatchParams",
     "configuration/replace": "configurationReplaceParams", "configuration/reset": "configurationResetParams",
     "credential/set": "credentialSetParams", "credential/delete": "credentialDeleteParams",
+    "process/list": "processListParams", "process/read": "processReadParams",
+    "process/write": "processWriteParams", "process/stop": "processStopParams",
 }
 EVENT_PARAM_DEFS: dict[str, str] = {
     "turn/state-changed": "turnStateChangedParams",
     "turn/retry-started": "turnRetryStartedParams",
+    "assistant/context-estimated": "assistantContextEstimatedParams",
     "turn/input-queue-changed": "turnInputQueueChangedParams",
     "turn/input-consumed": "turnInputConsumedParams",
     "turn/messages_received": "turnMessagesReceivedParams",
     "tool/started": "toolStartedParams",
+    "tool/recovery-changed": "toolRecoveryChangedParams",
+    "approval/closed": "approvalClosedParams",
     "context/compaction-started": "contextCompactionStartedParams",
     "context/compacted": "contextCompactedParams",
     "context/compaction-failed": "contextCompactionFailedParams",
@@ -171,37 +197,33 @@ EVENT_PARAM_DEFS: dict[str, str] = {
     "task/activity": "taskActivityParams",
     "task/progress": "taskProgressParams",
     "task/mailbox-changed": "taskMailboxChangedParams",
-    "goal/changed": "goalChangedParams",
-    "goal/activity": "goalActivityParams",
     "interaction/changed": "interactionChangedParams",
     "plan/changed": "planChangedParams",
 }
 
 RESULT_DEFS = {
+    "runtime/health": "runtimeHealthResult",
+    "runtime/storage/retry": "runtimeHealthResult",
     "runtime/shutdown": "runtimeShutdownResult",
     "runtime/context/register": "runtimeContextRegisterResult",
+    "runtime/client/close": "taskAcceptedResult",
     "operation/read": "operationReadResult",
     "workspace/list": "workspacePageResult",
     "workspace/path/search": "workspacePathSearchResult",
     "thread/list": "threadListResult", "thread/search": "threadPageResult",
     "history/input/search": "inputHistorySearchResult",
-    "thread/create": "threadResult", "thread/rename": "threadResult",
+    "thread/create": "threadResult", "thread/fork": "threadForkResult",
+    "review/start": "reviewStartResult", "review/read": "reviewReadResult",
+    "thread/rename": "threadResult",
     "thread/preferences/update": "threadResult", "thread/pin": "threadResult",
     "thread/seen": "threadResult", "thread/archive": "threadResult",
     "thread/restore": "threadResult",
-    "thread/read": "threadReadResult", "thread/observe": "threadObservationResult",
+    "thread/read": "threadReadResult", "thread/item-content/read": "itemContentReadResult",
+    "thread/observe": "threadObservationResult",
     "thread/unobserve": "threadObservationResult", "thread/usage/read": "threadUsageSummary",
     "thread/mcp/read": "threadMcpStatusResult",
-    "goal/read": "goalProjectionResult",
-    "goal/events/read": "goalEventsResult",
-    "goal/observe": "goalObserveResult",
-    "goal/unobserve": "taskAcceptedResult",
     "plan/read": "planProjection", "plan/current/read": "planCurrentReadResult",
     "plan/revisions/list": "planRevisionsResult",
-    "goal/evidence/list": "goalEvidenceResult",
-    "goal/create": "goalProjectionResult", "goal/plan/attach": "goalProjectionResult",
-    "goal/plan/detach": "goalProjectionResult", "goal/pause": "goalProjectionResult",
-    "goal/resume": "goalProjectionResult", "goal/stop": "goalProjectionResult",
     "interaction/read": "interactionSnapshot", "interaction/observe": "interactionObserveResult",
     "interaction/unobserve": "interactionAcceptedResult", "interaction/draft/save": "interactionSnapshot",
     "interaction/respond": "interactionSnapshot", "interaction/cancel": "interactionSnapshot",
@@ -227,6 +249,7 @@ RESULT_DEFS = {
     "mcp/test": "mcpTestResult",
     "mcp/list-tools": "mcpToolsResult",
     "workspace/open": "workspaceResult",
+    "workspace/read": "workspaceResult", "workspace/update": "workspaceResult",
     "thread/compact": "threadCompactResult",
     "attachment/import": "attachmentResult", "attachment/discard": "attachmentResult",
     "turn/start": "turnAcceptedResult", "turn/continue": "turnAcceptedResult",
@@ -245,22 +268,50 @@ RESULT_DEFS = {
     "configuration/reset": "configMutationResult",
     "credential/set": "credentialMutationResult",
     "credential/delete": "credentialMutationResult",
+    "process/list": "processListResult", "process/read": "processSnapshot",
+    "process/write": "processSnapshot", "process/stop": "processStopResult",
 }
 
 
-def has_secret(value: Any, allowed: bool = False) -> bool:
-    """递归检查 Secret 名称，只有 credential/set.secret 请求可进入该边界。"""
-    if isinstance(value, dict):
-        for key, child in value.items():
-            normalized = key.lower()
-            if normalized in SECRET_KEYS:
-                if not (allowed and normalized == "secret"):
+def has_secret(value: Any, allowed: bool = False, allow_output_schema_names: bool = False,
+               path: tuple[str, ...] = ()) -> bool:
+    """Scan Secret-shaped keys while allowing JSON Schema property names at one exact request path."""
+    def visit(current: Any, current_path: tuple[str, ...], schema_node: bool = False,
+              schema_map: bool = False, schema_list: bool = False) -> bool:
+        if isinstance(current, dict):
+            for key, child in current.items():
+                normalized = key.lower()
+                output_schema_root = (
+                    allow_output_schema_names
+                    and current_path == ("params", "runtimeOverrides")
+                    and key == "outputSchema"
+                )
+                is_schema_map = schema_node and key in JSON_SCHEMA_MAP_KEYS
+                is_schema_list = (
+                    schema_node and key in JSON_SCHEMA_SUBSCHEMA_ARRAY_KEYS and isinstance(child, list)
+                )
+                allowed_schema_name = (
+                    schema_map
+                    and allow_output_schema_names
+                    and current_path[:3] == ("params", "runtimeOverrides", "outputSchema")
+                )
+                if normalized in SECRET_KEYS and not (allowed and normalized == "secret") \
+                        and not allowed_schema_name:
                     return True
-            if has_secret(child, allowed):
-                return True
-    elif isinstance(value, list):
-        return any(has_secret(child, allowed) for child in value)
-    return False
+                child_is_schema_object = (
+                    output_schema_root
+                    or schema_map
+                    or schema_list
+                    or (schema_node and key in JSON_SCHEMA_SUBSCHEMA_KEYS)
+                )
+                if visit(child, current_path + (key,), child_is_schema_object,
+                         is_schema_map, is_schema_list):
+                    return True
+        elif isinstance(current, list):
+            return any(visit(child, current_path, schema_list) for child in current)
+        return False
+
+    return visit(value, path)
 
 
 def validate_secret_boundary(frame: dict[str, Any]) -> None:
@@ -273,8 +324,8 @@ def validate_secret_boundary(frame: dict[str, Any]) -> None:
     params = frame.get("params")
     if method == "attachment/preview/open" and isinstance(params, dict):
         params = {key: value for key, value in params.items() if key != "authorization"}
-    if has_secret(params, allowed):
-        raise CorpusError("secret crossed v1 boundary")
+    if has_secret(params, allowed, method == "turn/start", ("params",)):
+        raise CorpusError("secret crossed v2 boundary")
     if method == "configuration/patch" and isinstance(frame.get("params"), dict):
         path = str(frame["params"].get("path", "")).lower()
         if any(token in path for token in ("secret", "token", "password", "authorization", "api_key", "apikey")):
@@ -292,15 +343,16 @@ def contract_vocabulary(schema: dict[str, Any], definition: str) -> set[str]:
 
 def validate_frame(frame: dict[str, Any], schema: dict[str, Any],
                    catalog: dict[int, tuple[str, str, bool]], methods: set[str], events: set[str]) -> None:
-    """执行 schema、方向闭集、host body、v1 cwd/credential 边界和错误目录校验。"""
+    """执行 Schema 与协议语义校验；标准 JSON Schema 无法表达 Task 关闭的跨字段身份约束。"""
     errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(frame))
     if errors:
         raise CorpusError("schema rejection")
+    validate_tool_media_references(frame)
     validate_secret_boundary(frame)
     if "method" in frame:
         method = frame["method"]
         if method not in methods and method not in events:
-            raise CorpusError("method outside v1 closure")
+            raise CorpusError("method outside v2 closure")
         if "id" in frame:
             identifier = frame["id"]
             if not identifier.startswith("c:"):
@@ -312,20 +364,29 @@ def validate_frame(frame: dict[str, Any], schema: dict[str, Any],
         if method in EVENT_PARAM_DEFS:
             if list(sub_validator(schema, EVENT_PARAM_DEFS[method]).iter_errors(params)):
                 raise CorpusError("event params rejected")
+        if method == "turn/state-changed":
+            validate_turn_state_transition(params)
         if method == "task/tree/delete" \
                 and params.get("confirmTaskThreadId") != params.get("taskThreadId"):
             raise CorpusError("task tree confirmation identity mismatch")
+        if method == "task/closed":
+            closed_ids = params.get("closedThreadIds")
+            if params.get("rootThreadId") == params.get("taskThreadId") \
+                    or not isinstance(closed_ids, list) \
+                    or params.get("taskThreadId") not in closed_ids:
+                raise CorpusError("task close identity set does not contain its root")
         if method in {"turn/input-queue-changed", "turn/input-consumed"}:
             validate_input_event(method, params)
         if method == "turn/messages_received":
             validate_thread_messages_received(params)
         if method == "runtime/initialize" and (
-            params.get("protocolMajor") != 1 or params.get("protocolMinor") != 0
+            params.get("protocolMajor") != 2 or params.get("protocolMinor") != 0
         ):
             raise CorpusError("wrong protocol major")
         if method == "turn/start" and any(key in params for key in ("cwd", "profileId", "configRevision")):
-            raise CorpusError("turn override crossed v1 boundary")
+            raise CorpusError("turn override crossed v2 boundary")
         if method == "turn/start":
+            validate_turn_runtime_overrides(params.get("runtimeOverrides"))
             validate_turn_content(params.get("content"))
         if method in {"turn/input/enqueue", "turn/input/update"}:
             validate_turn_content(params.get("content"), queued=True)
@@ -351,7 +412,7 @@ def validate_frame(frame: dict[str, Any], schema: dict[str, Any],
         expected = catalog.get(error["code"])
         if expected is None or not isinstance(data, dict) \
                 or (data.get("errorCode"), data.get("category"), data.get("retryable")) != expected:
-            raise CorpusError("error outside v1 catalog")
+            raise CorpusError("error outside v2 catalog")
 
 
 def validate_turn_content(value: Any, queued: bool = False) -> None:
@@ -378,6 +439,43 @@ def validate_turn_content(value: Any, queued: bool = False) -> None:
         raise CorpusError("turn content lacks a sendable block")
     if queued and len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 524288:
         raise CorpusError("queued content byte budget exceeded")
+
+
+def validate_turn_runtime_overrides(value: Any) -> None:
+    """Keep per-Turn override fields closed while JSON Schema semantics remain Java-owned."""
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) - {"modelId", "accessMode", "outputSchema"}:
+        raise CorpusError("turn runtime overrides are invalid")
+    model_id = value.get("modelId")
+    if model_id is not None and (
+        not isinstance(model_id, str)
+        or re.fullmatch(r"^model_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$", model_id) is None
+    ):
+        raise CorpusError("turn runtime model identity is invalid")
+    if value.get("accessMode") is not None and value["accessMode"] not in {
+        "approval_required", "full_access",
+    }:
+        raise CorpusError("turn runtime access mode is invalid")
+    if value.get("outputSchema") is not None and not isinstance(value["outputSchema"], dict):
+        raise CorpusError("turn output schema must be an object")
+
+
+def validate_tool_media_references(value: Any) -> None:
+    """Enforce unique managed attachment identities in every Tool media projection."""
+    if isinstance(value, dict):
+        media = value.get("media")
+        if media is not None:
+            if not isinstance(media, list) or len(media) > 10:
+                raise CorpusError("tool media list is invalid")
+            attachment_ids = [item.get("attachmentId") for item in media if isinstance(item, dict)]
+            if len(attachment_ids) != len(media) or len(attachment_ids) != len(set(attachment_ids)):
+                raise CorpusError("tool media attachment identity is duplicated")
+        for child in value.values():
+            validate_tool_media_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            validate_tool_media_references(child)
 
 
 def validate_config_document(value: Any) -> None:
@@ -433,7 +531,7 @@ def validate_live_stream(value: Any, turns: Any) -> None:
             or type(stream_seq) is not int or not 0 <= stream_seq <= 9_007_199_254_740_991 \
             or not isinstance(segments, list) or len(segments) > 256:
         raise CorpusError("live stream identity or capacity is invalid")
-    active_statuses = {"queued", "running", "waiting_approval", "suspended"}
+    active_statuses = {"queued", "running", "waiting_input", "waiting_approval", "suspended"}
     if not isinstance(turns, list) or not any(
         isinstance(turn, dict)
         and turn.get("turnId") == turn_id
@@ -467,6 +565,24 @@ def validate_live_stream(value: Any, turns: Any) -> None:
         raise CorpusError("live stream segments do not reach baseline")
     if total_bytes > 1024 * 1024:
         raise CorpusError("live stream byte budget exceeded")
+
+
+def validate_turn_state_transition(params: dict[str, Any]) -> None:
+    """用唯一状态转换表区分澄清等待与工具审批，拒绝仅字段合法但业务非法的跳转。"""
+    transitions = {
+        "queued": {"running", "suspended", "completed", "failed", "cancelled"},
+        "running": {"waiting_input", "waiting_approval", "suspended", "completed", "failed", "cancelled"},
+        "waiting_input": {"running", "suspended", "completed", "failed", "cancelled"},
+        "waiting_approval": {"running", "suspended", "completed", "failed", "cancelled"},
+        "suspended": {"queued", "cancelled"},
+        "completed": set(),
+        "failed": set(),
+        "cancelled": set(),
+    }
+    source = params.get("from")
+    target = params.get("to")
+    if target not in transitions.get(source, set()):
+        raise CorpusError("illegal turn state transition")
 
 
 def validate_input_event(method: str, params: dict[str, Any]) -> None:
@@ -565,7 +681,8 @@ def validate_change_set_file(result: dict[str, Any]) -> None:
         raise CorpusError("change-set content digest mismatch")
 
 
-def validate_result(method: str, result: Any, schema: dict[str, Any]) -> None:
+def validate_result(method: str, result: Any, schema: dict[str, Any],
+                    request_params: dict[str, Any] | None = None) -> None:
     """按请求方法绑定成功结果，并在漂移时保留方法与首个字段路径以缩短三端合同定位。"""
     if method == "runtime/initialize":
         if not isinstance(result, dict) or not isinstance(result.get("capabilities"), dict):
@@ -578,6 +695,14 @@ def validate_result(method: str, result: Any, schema: dict[str, Any]) -> None:
         first = errors[0]
         location = ".".join(str(part) for part in first.absolute_path) or "<root>"
         raise CorpusError(f"result schema rejection method={method} path={location}: {first.message}")
+    if method in {"runtime/health", "runtime/storage/retry"}:
+        components = result.get("components", [])
+        names = [component.get("name") for component in components if isinstance(component, dict)]
+        if len(names) != 4 or len(set(names)) != 4:
+            raise CorpusError("health component names must be unique")
+        if any("diagnostics" in component and component.get("name") != "configuration"
+               for component in components):
+            raise CorpusError("health diagnostics are only valid for configuration")
     if method == "credential/set" and result.get("configured") is not True:
         raise CorpusError("credential/set result did not report configured=true")
     if method == "credential/delete" and result.get("configured") is not False:
@@ -595,6 +720,28 @@ def validate_result(method: str, result: Any, schema: dict[str, Any]) -> None:
         validate_live_stream(result.get("liveStream"), result.get("turns"))
     if method == "thread/seen" and result.get("latestTurnSeen") is not True:
         raise CorpusError("thread/seen did not advance the durable seen boundary")
+    if method == "thread/fork":
+        source = result["source"]
+        if request_params is None or source != {
+            "threadId": request_params.get("sourceThreadId"),
+            "itemId": request_params.get("sourceItemId"),
+            "threadRevision": request_params.get("expectedThreadRevision"),
+        } or result["thread"].get("threadId") == source["threadId"]:
+            raise CorpusError("fork result is not bound to the frozen source")
+    if method == "operation/read" and result.get("status") == "committed":
+        is_fork = result.get("method") == "thread/fork"
+        expected_source = (request_params or {}).get("sourceThreadId")
+        if expected_source is not None:
+            fork = result.get("result", {})
+            source = fork.get("source", {}) if isinstance(fork, dict) else {}
+            if not is_fork or result.get("threadId") != expected_source or source.get("threadId") != expected_source:
+                raise CorpusError("operation/read fork receipt crossed its source owner")
+        elif is_fork:
+            raise CorpusError("operation/read fork lookup omitted its source owner")
+    if method.startswith("process/"):
+        validate_process_result(method, request_params, result)
+    if method.startswith("review/"):
+        validate_review_result(method, request_params, result)
     if method.startswith("turn/input/"):
         validate_input_queue(result.get("inputQueue"))
         identifiers = {item["inputId"] for item in result["inputQueue"]["items"]}
@@ -613,18 +760,115 @@ def validate_result(method: str, result: Any, schema: dict[str, Any]) -> None:
         validate_change_set_file(result)
 
 
-def validate_response_correlation(frame: dict[str, Any], pending: dict[str, str], schema: dict[str, Any],
+def validate_process_result(method: str, request: dict[str, Any] | None,
+                            result: dict[str, Any]) -> None:
+    """校验进程结果的拥有者、恢复状态、字节预算及停止空输出不变量。"""
+    if request is None:
+        raise CorpusError("process result lacks its request identity")
+    workspace_id = request.get("workspaceId")
+    thread_id = request.get("threadId")
+    generation = request.get("generation")
+    if result.get("workspaceId") != workspace_id or result.get("threadId") != thread_id:
+        raise CorpusError("process result crossed its workspace or thread owner")
+    if method == "process/list":
+        sessions = result.get("sessions")
+        current_generation = result.get("generation")
+        if type(current_generation) is not int or current_generation < 1 or not isinstance(sessions, list):
+            raise CorpusError("process list generation is inconsistent")
+        session_ids: set[str] = set()
+        for session in sessions:
+            if session.get("workspaceId") != workspace_id or session.get("threadId") != thread_id \
+                    or session.get("generation", current_generation + 1) > current_generation \
+                    or session.get("sessionId") in session_ids:
+                raise CorpusError("process list contains a foreign session")
+            session_ids.add(session["sessionId"])
+            if session["generation"] < current_generation \
+                    and session["state"] in {"running", "stopping"}:
+                raise CorpusError("old live process was not recovered as interrupted")
+        return
+    if result.get("sessionId") != request.get("sessionId"):
+        raise CorpusError("process result session identity mismatch")
+    if method in {"process/write", "process/stop"} and result.get("generation") != generation:
+        raise CorpusError("process mutation crossed runtime generation")
+    if result.get("generation", generation + 1) > generation:
+        raise CorpusError("process session comes from a future runtime generation")
+    if result.get("generation") < generation and result.get("state") in {"running", "stopping"}:
+        raise CorpusError("old live process was not recovered as interrupted")
+    if method == "process/stop" and (
+        result.get("state") not in {"stopping", "exited"}
+        or result.get("output") != ""
+        or result.get("outputTruncated") is not False
+    ):
+        raise CorpusError("process stop returned an output-bearing snapshot")
+    output = result.get("output")
+    if not isinstance(output, str) or len(output.encode("utf-8")) > 65_536:
+        raise CorpusError("process output exceeds its UTF-8 byte budget")
+    after_sequence = request.get("afterSequence")
+    next_sequence = result.get("nextSequence")
+    if isinstance(after_sequence, int) and isinstance(next_sequence, int) \
+            and next_sequence < after_sequence:
+        raise CorpusError("process output cursor regressed")
+
+
+def validate_review_result(method: str, request: dict[str, Any] | None,
+                           result: dict[str, Any]) -> None:
+    """Bind Review acknowledgements and reports to the exact frozen Thread/Turn and source coverage."""
+    if request is None or result.get("threadId") != request.get("threadId"):
+        raise CorpusError("review result crossed its thread owner")
+    if method == "review/start":
+        if type(result.get("queued")) is not bool \
+                or result.get("threadRevision", -1) < request.get("expectedThreadRevision", 0):
+            raise CorpusError("review start result is inconsistent with its CAS")
+        return
+    if result.get("turnId") != request.get("turnId"):
+        raise CorpusError("review result crossed its turn identity")
+    report = result.get("report")
+    if result.get("status") == "completed" and not isinstance(report, dict):
+        raise CorpusError("completed review lacks its frozen report")
+    if report is None:
+        return
+    serialized = json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(serialized) > 3 * 1024 * 1024:
+        raise CorpusError("review report exceeds its UTF-8 byte budget")
+    coverage = report["coverage"]
+    partial_reasons = coverage["partialReasons"]
+    files_reviewed = coverage["filesReviewed"]
+    if coverage["complete"] != (len(partial_reasons) == 0) \
+            or len(files_reviewed) > coverage["files"] \
+            or coverage["reviewComplete"] != (
+                coverage["complete"] and len(files_reviewed) == coverage["files"]
+            ):
+        raise CorpusError("review coverage completeness is inconsistent")
+    coverage_identities = {
+        (entry["path"], entry["layer"])
+        for entry in files_reviewed
+    }
+    if len(coverage_identities) != len(files_reviewed):
+        raise CorpusError("review coverage contains duplicate file identities")
+    covered_paths = coverage_identities
+    findings = report["findings"]
+    finding_ids: set[str] = set()
+    for finding in findings:
+        if finding["findingId"] in finding_ids:
+            raise CorpusError("review report contains duplicate finding identity")
+        finding_ids.add(finding["findingId"])
+        if (finding["path"], finding["layer"]) not in covered_paths \
+                or finding["endLine"] < finding["startLine"]:
+            raise CorpusError("review finding is outside covered evidence")
+
+
+def validate_response_correlation(frame: dict[str, Any], pending: dict[str, tuple[str, dict[str, Any]]], schema: dict[str, Any],
                                   catalog: dict[int, tuple[str, str, bool]], methods: set[str],
                                   events: set[str]) -> None:
     """把无 method 的 JSON-RPC response 绑定到同文件请求并锁定 c/h namespace。"""
     identifier = frame.get("id")
     if not isinstance(identifier, str) or identifier not in pending:
         raise CorpusError("response is not correlated")
-    method = pending.pop(identifier)
+    method, request_params = pending.pop(identifier)
     if not identifier.startswith("c:"):
         raise CorpusError("response must use client namespace")
     if "result" in frame:
-        validate_result(method, frame["result"], schema)
+        validate_result(method, frame["result"], schema, request_params)
     elif "error" in frame:
         validate_frame(frame, schema, catalog, methods, events)
     else:
@@ -632,10 +876,11 @@ def validate_response_correlation(frame: dict[str, Any], pending: dict[str, str]
 
 
 def main() -> int:
-    """执行唯一的 v1 schema/golden 验证，并显式锁定 breaking 负例与 digest。"""
+    """执行唯一的 v2 schema/golden 验证，并显式锁定 breaking 负例与 digest。"""
     schema = parse_json(SCHEMA_PATH.read_text(encoding="utf-8"))
     Draft202012Validator.check_schema(schema)
     catalog = load_catalog()
+    validate_error_schema_parity(schema, catalog)
     methods = contract_vocabulary(schema, "methodName")
     events = contract_vocabulary(schema, "eventName")
     valid_paths = corpus_files(False)
@@ -646,12 +891,12 @@ def main() -> int:
     observed_input_contract: set[str] = set()
     observed_task_methods: set[str] = set()
     observed_task_events: set[str] = set()
-    observed_goal_methods: set[str] = set()
-    observed_goal_events: set[str] = set()
+    observed_plan_methods: set[str] = set()
+    observed_plan_events: set[str] = set()
     observed_interaction_methods: set[str] = set()
     observed_interaction_events: set[str] = set()
     for path in valid_paths:
-        pending: dict[str, str] = {}
+        pending: dict[str, tuple[str, dict[str, Any]]] = {}
         for frame in raw_documents(path):
             validate_frame(frame, schema, catalog, methods, events)
             valid_frames += 1
@@ -663,19 +908,18 @@ def main() -> int:
                     and (frame["method"].startswith("task/") or frame["method"] == "thread/message/send"):
                 target = observed_task_methods if "id" in frame else observed_task_events
                 target.add(frame["method"])
-            if isinstance(frame.get("method"), str) \
-                    and (frame["method"].startswith("goal/") or frame["method"].startswith("plan/")):
-                target = observed_goal_methods if "id" in frame else observed_goal_events
+            if isinstance(frame.get("method"), str) and frame["method"].startswith("plan/"):
+                target = observed_plan_methods if "id" in frame else observed_plan_events
                 target.add(frame["method"])
             if isinstance(frame.get("method"), str) and frame["method"].startswith("interaction/"):
                 target = observed_interaction_methods if "id" in frame else observed_interaction_events
                 target.add(frame["method"])
             if "method" in frame and "id" in frame:
-                pending[frame["id"]] = frame["method"]
+                pending[frame["id"]] = (frame["method"], frame.get("params", {}))
             elif "id" in frame:
                 validate_response_correlation(frame, pending, schema, catalog, methods, events)
     if not valid_frames or not saw_initialized or not saw_config_changed:
-        raise CorpusError("positive corpus lacks v1 handshake/config coverage")
+        raise CorpusError("positive corpus lacks v2 handshake/config coverage")
     required_input_contract = {"turn/input/enqueue", "turn/input/prioritize", "turn/input/update",
                                "turn/input/delete", "turn/input-queue-changed", "turn/input-consumed"}
     if not required_input_contract <= observed_input_contract:
@@ -683,38 +927,39 @@ def main() -> int:
     required_task_methods = {"task/create", "task/list", "task/read", "task/observe", "task/unobserve",
                              "task/seen", "thread/message/send", "task/followup", "task/cancel",
                              "task/tree/delete", "task/close"}
-    required_task_events = {"task/activity", "task/progress", "task/mailbox-changed"}
+    required_task_events = {"task/activity", "task/progress", "task/mailbox-changed", "task/closed"}
     if not required_task_methods <= observed_task_methods or not required_task_events <= observed_task_events:
         raise CorpusError("positive corpus lacks task thread coverage")
-    required_goal_methods = {"goal/read", "goal/events/read", "goal/observe", "goal/unobserve",
-                             "plan/read", "plan/revisions/list", "goal/evidence/list", "goal/create",
-                             "goal/plan/attach", "goal/plan/detach", "goal/pause", "goal/resume",
-                             "goal/stop", "plan/create", "plan/draft/save", "plan/draft/discard",
-                             "plan/propose", "plan/execute", "plan/observe", "plan/unobserve",
-                             "plan/events/read", "plan/evidence/list", "plan/pause", "plan/resume",
-                             "plan/stop", "plan/reject"}
-    required_goal_events = {"goal/changed", "goal/activity", "plan/changed"}
-    if not required_goal_methods <= observed_goal_methods or not required_goal_events <= observed_goal_events:
-        raise CorpusError("positive corpus lacks plan goal coverage")
+    required_plan_methods = {"plan/read", "plan/current/read", "plan/revisions/list", "plan/create",
+                             "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute",
+                             "plan/observe", "plan/unobserve", "plan/events/read", "plan/evidence/list",
+                             "plan/pause", "plan/resume", "plan/stop", "plan/reject"}
+    if not required_plan_methods <= observed_plan_methods or "plan/changed" not in observed_plan_events:
+        raise CorpusError("positive corpus lacks Plan coverage")
     required_interaction_methods = {"interaction/read", "interaction/observe", "interaction/unobserve",
                                    "interaction/draft/save", "interaction/respond", "interaction/cancel"}
     if not required_interaction_methods <= observed_interaction_methods \
             or "interaction/changed" not in observed_interaction_events:
         raise CorpusError("positive corpus lacks interaction coverage")
     invalid_frames = 0
-    illegal_methods_path = V1_GOLDEN / "invalid" / "illegal-methods.jsonl"
+    illegal_methods_path = V2_GOLDEN / "invalid" / "illegal-methods.jsonl"
     if illegal_methods_path not in invalid_paths:
         raise CorpusError("missing illegal-method fail-closed corpus")
     illegal_methods: set[str] = set()
     for path in invalid_paths:
-        correlated = "correlated" in path.relative_to(V1_GOLDEN).parts
-        pending: dict[str, str] = {}
-        for frame in raw_documents(path):
+        correlated = "correlated" in path.relative_to(V2_GOLDEN).parts
+        pending: dict[str, tuple[str, dict[str, Any]]] = {}
+        for raw in raw_json_texts(path):
+            try:
+                frame = parse_json(raw)
+            except CorpusError:
+                invalid_frames += 1
+                continue
             if path == illegal_methods_path and isinstance(frame.get("method"), str):
                 illegal_methods.add(frame["method"])
             if correlated and "method" in frame and "id" in frame:
                 validate_frame(frame, schema, catalog, methods, events)
-                pending[frame["id"]] = frame["method"]
+                pending[frame["id"]] = (frame["method"], frame.get("params", {}))
                 continue
             try:
                 validate_frame(frame, schema, catalog, methods, events)

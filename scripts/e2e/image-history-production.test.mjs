@@ -74,7 +74,7 @@ test("参数要求显式 JAR 与持久证据目录", () => {
     "--evidence-directory",
     "target/evidence",
     "--jar",
-    "app-server/target/ja-app-server.jar",
+    "ja-agent/ja-app-server/target/ja-app-server.jar",
   ]);
   assert.match(options.evidenceDirectory, /target[\\/]evidence$/u);
   assert.match(options.jar, /app-server[\\/]target[\\/]ja-app-server\.jar$/u);

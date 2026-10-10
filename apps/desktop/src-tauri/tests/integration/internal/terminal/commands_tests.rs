@@ -164,7 +164,7 @@ fn command_host_reuses_workspace_until_session_budget() {
     fs::remove_dir_all(root).expect("remove terminal root");
 }
 
-/// A per-thread supervisor must not multiply the host-wide PTY budget after workspace switching.
+/// 每个 Thread 各自创建 supervisor 不得在切换工作区后扩大宿主级 PTY 预算。
 #[test]
 fn command_host_enforces_session_budget_across_workspaces() {
     let first_root = std::env::temp_dir().join(format!(

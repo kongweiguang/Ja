@@ -11,12 +11,23 @@ import type {
 } from "../application/types";
 import type { FilesOpenTarget } from "../application/ports";
 import type { WorkspaceFileNode } from "../domain/types";
+import type { MarkdownFileTarget } from "@/shared/ui/markdown/SharedMarkdown";
 
 /** FilesWorkspace 纯视图只接收 controller 输出，不接收 operations、timer 或 native port。 */
 export interface FilesWorkspaceViewProps {
   viewModel: FilesViewModel;
   actions: FilesActions;
   onAddToConversation?: (node: Pick<WorkspaceFileNode, "path" | "kind">) => void;
+  /** Markdown 文档中的本机链接仍通过 Workbench Host 解析，不给 Renderer 文件系统能力。 */
+  onOpenMarkdownFile?: (
+    target: MarkdownFileTarget,
+    source: HTMLElement,
+    mode?: "explorer" | "browser",
+  ) => void | Promise<void>;
+  /** Markdown 文档内 HTTP(S) 链接复用 Thread 当前的隔离 Preview。 */
+  onOpenMarkdownLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
+  /** 代码块和路径菜单复制沿用桌面 Clipboard capability。 */
+  onCopyText?: (text: string) => Promise<void>;
 }
 
 /** SearchPanel 只消费 application projection 和语义 intent，不直接读取 Runtime。 */
@@ -62,6 +73,8 @@ export interface TrashConfirmDialogProps {
 export interface FileTreeProps {
   nodes: readonly WorkspaceFileNode[];
   selectedPath?: string;
+  /** 仅显式打开的目录请求会展开必要祖先并滚动定位，不触发全树扫描。 */
+  revealRequest?: { path: string; sequence: number };
   loading?: boolean;
   error?: string;
   onSelect?: (node: WorkspaceFileNode) => void;

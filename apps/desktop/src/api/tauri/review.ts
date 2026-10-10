@@ -8,6 +8,12 @@ import {
   RuntimeHostError,
   type RuntimeNativeBridge,
 } from "./runtime";
+import {
+  parseMethodParams,
+  parseMethodResult,
+  type MethodParams,
+  type MethodResult,
+} from "@/api/protocol/methods";
 import { WorkspaceNonEmptyRelativePathSchema } from "./workspace";
 
 const WorkspaceIdSchema = z
@@ -28,6 +34,75 @@ const StableTokenSchema = z
   );
 const RevisionSchema = StableTokenSchema;
 const OperationIdSchema = StableTokenSchema.max(128);
+
+const ReviewCaptureInputSchema = z
+  .object({
+    workspaceId: WorkspaceIdSchema,
+    source: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("uncommitted") }).strict(),
+      z.object({ kind: z.literal("unstaged") }).strict(),
+      z.object({ kind: z.literal("staged") }).strict(),
+      z.object({ kind: z.literal("branch"), refId: StableTokenSchema }).strict(),
+      z.object({ kind: z.literal("commit"), commitId: StableTokenSchema }).strict(),
+    ]),
+    expectedSnapshotRevision: RevisionSchema,
+    operationId: OperationIdSchema,
+  })
+  .strict();
+export type ReviewCaptureInput = z.infer<typeof ReviewCaptureInputSchema>;
+const FrozenReviewSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("uncommitted") }).strict(),
+  z.object({ kind: z.literal("unstaged") }).strict(),
+  z.object({ kind: z.literal("staged") }).strict(),
+  z.object({ kind: z.literal("base"), commitId: z.string().regex(/^[0-9a-f]{40,64}$/) }).strict(),
+  z.object({ kind: z.literal("commit"), commitId: z.string().regex(/^[0-9a-f]{40,64}$/) }).strict(),
+]);
+const ReviewCaptureCoverageSchema = z
+  .object({
+    complete: z.boolean(),
+    files: z.number().int().min(0).max(2_000),
+    bytes: z
+      .number()
+      .int()
+      .min(0)
+      .max(64 * 1024 * 1024),
+    maxFiles: z.literal(2_000),
+    maxBytes: z.literal(64 * 1024 * 1024),
+    partialReasons: z
+      .array(
+        z.enum([
+          "binary_file",
+          "non_utf8",
+          "file_limit",
+          "byte_limit",
+          "content_unavailable",
+          "patch_unavailable",
+        ]),
+      )
+      .max(6)
+      .refine((values) => new Set(values).size === values.length),
+  })
+  .strict()
+  .superRefine((coverage, context) => {
+    if (coverage.complete !== (coverage.partialReasons.length === 0))
+      context.addIssue({
+        code: "custom",
+        path: ["complete"],
+        message: "inconsistent review coverage",
+      });
+  });
+const ReviewCaptureResultSchema = z
+  .object({
+    workspaceId: WorkspaceIdSchema,
+    source: FrozenReviewSourceSchema,
+    snapshotId: z.string().regex(/^rev_[0-9a-f]{24}$/),
+    snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
+    revision: RevisionSchema,
+    attachmentId: z.string().regex(/^att_[A-Za-z0-9_.:-]{1,124}$/),
+    coverage: ReviewCaptureCoverageSchema,
+  })
+  .strict();
+export type ReviewCaptureResult = z.infer<typeof ReviewCaptureResultSchema>;
 
 const ReviewSourceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("uncommitted") }).strict(),
@@ -261,6 +336,7 @@ export type ReviewNativeBridge = Pick<RuntimeNativeBridge, "invoke" | "listen">;
 export const JA_REVIEW_COMMANDS = {
   catalog: "ja_review_catalog",
   snapshot: "ja_review_snapshot",
+  captureSnapshot: "ja_review_capture_snapshot",
   fileDiff: "ja_review_file_diff",
   apply: "ja_review_apply",
   cancel: "ja_review_cancel",
@@ -271,21 +347,30 @@ export const JA_REVIEW_EVENTS = {
   invalidated: "review/invalidated",
 } as const;
 
-/** 将原生 Review 故障映射为安全消息，不泄漏路径或 Git 诊断。 */
+/** 将 Tauri wire 错误转换为 Review feature 码和安全文案，不让原生诊断进入 UI。 */
 export function normalizeReviewError(error: unknown): RuntimeHostError {
   if (error instanceof RuntimeHostError) {
     const safe = REVIEW_ERRORS[error.code];
-    if (safe !== undefined) return new RuntimeHostError(error.code, safe.message, safe.retryable);
+    if (safe !== undefined) {
+      return new RuntimeHostError(safe.featureCode ?? error.code, safe.message, safe.retryable);
+    }
   }
   const candidate =
     error !== null && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
   const code = typeof candidate?.["code"] === "string" ? candidate["code"] : undefined;
   const safe = code === undefined ? undefined : REVIEW_ERRORS[code];
-  if (safe !== undefined) return new RuntimeHostError(code!, safe.message, safe.retryable);
+  if (safe !== undefined) {
+    return new RuntimeHostError(safe.featureCode ?? code!, safe.message, safe.retryable);
+  }
   return normalizeRuntimeError(error);
 }
 
-const REVIEW_ERRORS: Record<string, { message: string; retryable: boolean }> = {
+const REVIEW_ERRORS: Readonly<
+  Record<
+    string,
+    { readonly featureCode?: string; readonly message: string; readonly retryable: boolean }
+  >
+> = {
   REVIEW_STALE: { message: "工作区已经变化，请重新读取 Review。", retryable: true },
   REVIEW_CONFLICT: { message: "当前文件存在重叠修改，无法安全应用。", retryable: false },
   REVIEW_READ_ONLY: { message: "此 Review 来源为只读。", retryable: false },
@@ -296,6 +381,11 @@ const REVIEW_ERRORS: Record<string, { message: string; retryable: boolean }> = {
   WORKSPACE_ESCAPE: { message: "请求路径不在工作区内。", retryable: false },
   HOST_BUSY: { message: "工作区正被其他操作占用，请稍后重试。", retryable: true },
   CANCELLED: { message: "Review 操作已取消。", retryable: true },
+  PARSE_ERROR: {
+    featureCode: "PARSE",
+    message: "Git 输出解析失败",
+    retryable: false,
+  },
 };
 
 /** 将畸形 renderer 输入收敛为稳定边界错误，不回显输入细节。 */
@@ -330,9 +420,12 @@ async function invokeReview<T>(
 export interface ReviewAdapter {
   catalog(input: ReviewCatalogInput): Promise<ReviewCatalog>;
   snapshot(input: ReviewSnapshotInput): Promise<ReviewSnapshot>;
+  captureSnapshot(input: ReviewCaptureInput): Promise<ReviewCaptureResult>;
   fileDiff(input: ReviewFileDiffInput): Promise<ReviewFileDiff>;
   apply(input: ReviewApplyInput): Promise<ReviewApplyResult>;
   cancel(input: ReviewCancelInput): Promise<ReviewCancelResult>;
+  startAiReview(input: MethodParams<"review/start">): Promise<MethodResult<"review/start">>;
+  readAiReview(input: MethodParams<"review/read">): Promise<MethodResult<"review/read">>;
   subscribeInvalidated(
     listener: (event: ReviewInvalidatedEvent) => void,
   ): Promise<ReviewUnsubscribe>;
@@ -364,6 +457,32 @@ export class TauriReviewAdapter implements ReviewAdapter {
     );
   }
 
+  /**
+   * 输入 revision 是原生采集的 source CAS 围栏，返回 revision 标识冻结工件；二者语义不同，只校验工作区与来源。
+   */
+  async captureSnapshot(input: ReviewCaptureInput): Promise<ReviewCaptureResult> {
+    const result = await invokeReview(
+      this.bridge,
+      JA_REVIEW_COMMANDS.captureSnapshot,
+      input,
+      ReviewCaptureInputSchema,
+      ReviewCaptureResultSchema,
+    );
+    if (result.workspaceId !== input.workspaceId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时返回的审查快照身份无效。", true);
+    }
+    const sourceMatches =
+      input.source.kind === "branch"
+        ? result.source.kind === "base"
+        : input.source.kind === "commit"
+          ? result.source.kind === "commit"
+          : result.source.kind === input.source.kind;
+    if (!sourceMatches) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时返回的审查快照来源无效。", true);
+    }
+    return result;
+  }
+
   /** 只在已知 snapshot revision 后加载单个文件的有界 old/new 内容。 */
   async fileDiff(input: ReviewFileDiffInput): Promise<ReviewFileDiff> {
     return invokeReview(
@@ -375,7 +494,7 @@ export class TauriReviewAdapter implements ReviewAdapter {
     );
   }
 
-  /** 应用由原生层拥有的 all/file/hunk 操作，并只接受其返回的新 snapshot。 */
+  /** 应用原生层持有的 all/file/hunk 操作，并只接受其返回的新快照。 */
   async apply(input: ReviewApplyInput): Promise<ReviewApplyResult> {
     return invokeReview(
       this.bridge,
@@ -409,6 +528,34 @@ export class TauriReviewAdapter implements ReviewAdapter {
     } catch (error) {
       throw normalizeReviewError(error);
     }
+  }
+
+  /** 使用固定 Tauri command 与 JA-RPC validator，避免 AI 审查成为 renderer 可调用的通用 RPC 通道。 */
+  async startAiReview(input: MethodParams<"review/start">): Promise<MethodResult<"review/start">> {
+    return invokeAiReview(this.bridge, "review/start", "ja_ai_review_start", input);
+  }
+
+  /** 历史报告只按冻结的 Thread/Turn 身份读取，不能改绑到当前工作区快照。 */
+  async readAiReview(input: MethodParams<"review/read">): Promise<MethodResult<"review/read">> {
+    return invokeAiReview(this.bridge, "review/read", "ja_ai_review_read", input);
+  }
+}
+
+/** AI Review 只经固定 command 和协议校验调用，renderer 不获得可任意选择方法的 RPC 通道。 */
+async function invokeAiReview<M extends "review/start" | "review/read">(
+  bridge: ReviewNativeBridge,
+  method: M,
+  command: string,
+  input: MethodParams<M>,
+): Promise<MethodResult<M>> {
+  const parsedInput = parseMethodParams(method, input);
+  try {
+    const result = await bridge.invoke<unknown>(command, { input: parsedInput });
+    return parseMethodResult(method, result);
+  } catch (error) {
+    if (error instanceof z.ZodError)
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时返回的审查结果无效。", true);
+    throw normalizeReviewError(error);
   }
 }
 

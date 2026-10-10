@@ -11,7 +11,7 @@ pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod process;
 pub(crate) mod protocol;
-mod shared;
+pub(crate) mod shared;
 
 pub use client::{EventPump, Session, SessionEvent};
 pub use error::AppServerProcessError;
@@ -23,8 +23,18 @@ pub use protocol::{
     ATTACHMENT_PREVIEW_READ_MAX_BYTES, ATTACHMENT_PREVIEW_READ_MIN_BYTES,
     AttachmentPreviewCloseParams, AttachmentPreviewCloseResult, AttachmentPreviewContractError,
     AttachmentPreviewOpenParams, AttachmentPreviewOpenResult, AttachmentPreviewReadParams,
-    AttachmentPreviewReadResult, CodecError, Limits, RpcFrame, TURN_CHANGE_SET_MAX_BYTES,
-    TurnChangeSetContractError, TurnChangeSetReadParams, TurnChangeSetReadResult,
-    valid_protocol_timestamp, valid_ready_token,
+    AttachmentPreviewReadResult, CodecError, ForkAccessMode, ForkCollaborationMode,
+    ForkThreadStatus, ForkTitleSource, ForkTurnStatus, ForkWorkspaceKind, Limits,
+    ProcessSessionListParams, ProcessSessionListResult, ProcessSessionReadParams,
+    ProcessSessionSnapshot, ProcessSessionState, ProcessSessionStopParams, ProcessSessionSummary,
+    ProcessSessionWriteParams, ProviderRequestProfileDto, ReviewCoverage, ReviewCoverageFile,
+    ReviewFinding, ReviewLayer, ReviewPartialReason, ReviewReadParams, ReviewReadResult,
+    ReviewReport, ReviewSeverity, ReviewSide, ReviewStartParams, ReviewStartResult,
+    ReviewTurnStatus, RpcFrame, TURN_CHANGE_SET_MAX_BYTES, ThreadContextEstimateDto,
+    ThreadContextUsageDto, ThreadForkParams, ThreadForkPreferences, ThreadForkResult,
+    ThreadForkSource, ThreadForkThread, ThreadUsageSummary, TurnChangeSetContractError,
+    TurnChangeSetReadParams, TurnChangeSetReadResult, UsageProtocolError,
+    parse_thread_context_usage, parse_thread_usage_summary, valid_protocol_timestamp,
+    valid_ready_token,
 };
-pub use shared::SharedAppServerClient;
+pub use shared::{NativeClientIdentity, SharedAppServerClient};

@@ -652,7 +652,7 @@ async function sha256(path) {
 }
 
 /** 启动共享 STA clipboard broker；broker 自己保存并恢复用户原始 IDataObject。 */
-async function startClipboardBroker() {
+export async function startClipboardBroker() {
   const script = join(repoRoot, "scripts", "e2e", "windows-clipboard-fixture.ps1");
   const child = spawn(
     "powershell.exe",
@@ -722,6 +722,13 @@ async function startClipboardBroker() {
   const ready = await next("startup");
   if (ready.status !== "ready") throw new Error("clipboard broker did not become ready");
   return {
+    /** 只比较已知 fixture 文本并返回布尔值，不把系统剪贴板正文写入验收日志。 */
+    async matchesText(expected) {
+      await writeCommand({ action: "matches_text", expected });
+      const result = await next("matches_text");
+      assert.equal(result.status, "matches_text");
+      return result.matches === true;
+    },
     /** 把本轮私有 PNG 作为 CF_HDROP 写入剪贴板，真实 Composer paste 再调用 Rust import。 */
     async setFileDrop(path) {
       await writeCommand({ action: "set", kind: "file_drop", path });
@@ -799,7 +806,7 @@ async function selectThread(page, threadId, deadline) {
 }
 
 /** 通过 Ctrl+V 触发真实 Composer paste，再等待 Rust/App Server 返回可见草稿附件。 */
-async function pasteImageAttachment(page, imagePath, deadline) {
+export async function pasteImageAttachment(page, imagePath, deadline) {
   const broker = await startClipboardBroker();
   try {
     await broker.setFileDrop(imagePath);

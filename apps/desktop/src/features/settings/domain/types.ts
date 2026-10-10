@@ -28,6 +28,7 @@ export type SettingsSection =
   | "permissions"
   | "skills"
   | "mcp"
+  | "storage"
   | "about";
 export type AccessMode = "approval_required" | "full_access";
 export type SkillSource = "builtin" | "user" | "ja" | "project";
@@ -140,6 +141,20 @@ export interface ProjectSkillSettingsDocument {
   disabledSkills: string[];
 }
 
+/** Project Provider 稀疏覆盖可调整运行参数或绑定显式凭据的完整连接目标。 */
+export interface ProjectProviderRuntimeOverride {
+  providerId: string;
+  connection?: {
+    api: ProviderProjection["api"];
+    baseUrl: string;
+    credentialId: string;
+  };
+  models?: ProviderProjection["models"];
+  removedModelIds?: string[];
+  networkTimeouts?: Partial<ProviderProjection["networkTimeouts"]>;
+  autoCompact?: boolean;
+}
+
 /** App Server 问题投影只描述当前影响与可执行动作，永不携带配置正文、路径或 Secret。 */
 export interface ConfigurationIssue {
   id: string;
@@ -150,7 +165,7 @@ export interface ConfigurationIssue {
   column: number | null;
   reason: string;
   impact: string;
-  actions: Array<"edit" | "retry" | "restore">;
+  actions: Array<"edit" | "retry" | "repair">;
 }
 
 export interface LoadedSettings {
@@ -160,6 +175,8 @@ export interface LoadedSettings {
   projectMcpServers?: SettingsMcpServer[];
   projectOverrides: ProjectSettingsOverrides;
   cas: { userVersion: string; projectVersion: string; credentialVersion: string };
+  /** App Server 的权威字段来源，界面据此显示默认、全局或项目来源。 */
+  sources?: Record<string, "default" | "user" | "project">;
   /** 问题不改变可编辑 userDocument；保存路径必须只提交用户明确的变化。 */
   issues: ConfigurationIssue[];
 }
@@ -168,6 +185,11 @@ export interface LoadedSettings {
 interface ProjectSettingsOverrides {
   defaultSelection: boolean;
   accessMode: boolean;
+  clarification?: boolean;
+  subagents?: boolean;
+  providerIds?: string[];
+  providerRuntime?: ProjectProviderRuntimeOverride[];
+  disabledSkillList?: boolean;
   disabledSkillReferences: string[];
 }
 export interface SettingsConfigurationChange {

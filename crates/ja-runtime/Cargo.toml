@@ -17,6 +17,7 @@ fs2 = "=0.4.3"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tracing = "=0.1.44"
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 
 # 黑盒进程与协议语料测试显式归入 integration 目录，避免 Cargo 根级自动发现
 # 掩盖测试层次，也确保目录调整不会让测试静默漏跑。

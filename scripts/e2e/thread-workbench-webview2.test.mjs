@@ -61,6 +61,17 @@ function validReport() {
       bCloseResolved: 1,
       aSessionSurvivedBClosure: true,
     },
+    retainedFiles: {
+      retainedThreadCount: 2, dirtyDocumentCount: 2, injectedFailure: "transport_before_commit",
+      closeCancelledDraftRetained: true, failedSwitchDraftsRetained: true,
+      failedSwitchResourcesRetained: true, savedNativeFiles: 2, switchedAfterSave: true,
+    },
+    retainedExit: {
+      retainedThreadCount: 2, dirtyDocumentCount: 2, entry: "native_window_close",
+      injectedFailure: "transport_before_commit", failedExitDraftsRetained: true,
+      failedExitCancelled: true, savedNativeFiles: 2, committedAfterSave: true,
+      windowDestroyed: true,
+    },
     pageErrors: [],
   };
 }
@@ -121,4 +132,30 @@ test("B 与 A 复用同一 native Terminal session 时报告失败关闭", () =>
   const report = validReport();
   report.nativeTerminal.bSessionFingerprint = report.nativeTerminal.aSessionFingerprint;
   assert.throws(() => validateThreadWorkbenchReport(report));
+});
+
+/** PASS 必须同时证明隐藏 Thread 草稿、取消、失败资源保留和真实保存，不能靠成功切换掩盖缺口。 */
+test("拒绝缺少多 Thread 保存、取消或失败保留事实的报告", () => {
+  for (const patch of [
+    { retainedThreadCount: 1 }, { dirtyDocumentCount: 1 }, { savedNativeFiles: 1 },
+    { closeCancelledDraftRetained: false }, { failedSwitchDraftsRetained: false },
+    { failedSwitchResourcesRetained: false }, { switchedAfterSave: false },
+  ]) {
+    const report = validReport();
+    Object.assign(report.retainedFiles, patch);
+    assert.throws(() => validateThreadWorkbenchReport(report));
+  }
+});
+
+/** 退出必须发生真实窗口销毁，失败时必须经过原生取消并保留两份草稿。 */
+test("拒绝省略实际退出、保存重试或隐藏草稿保留的报告", () => {
+  for (const patch of [
+    { retainedThreadCount: 1 }, { dirtyDocumentCount: 1 }, { entry: "renderer_event" },
+    { savedNativeFiles: 1 }, { failedExitDraftsRetained: false },
+    { failedExitCancelled: false }, { committedAfterSave: false }, { windowDestroyed: false },
+  ]) {
+    const report = validReport();
+    Object.assign(report.retainedExit, patch);
+    assert.throws(() => validateThreadWorkbenchReport(report));
+  }
 });

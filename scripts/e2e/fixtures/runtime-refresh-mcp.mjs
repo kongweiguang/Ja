@@ -131,7 +131,7 @@ async function handleRequest(frame) {
   send({ jsonrpc: "2.0", id: frame.id, result: {} });
 }
 
-/** JSONL framing mirrors the Java MCP integration fixture and serializes handlers to preserve request order. */
+/** JSONL 分帧与 Java MCP 集成 fixture 保持一致，并串行处理请求以保留顺序。 */
 async function consumeInput(chunk) {
   inputBuffer += chunk;
   while (true) {
@@ -167,4 +167,3 @@ process.stdin.on("end", async () => {
   await record({ kind: "stopped", revision: currentRevision });
   await reportTail;
 });
-

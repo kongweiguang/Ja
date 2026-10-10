@@ -17,7 +17,7 @@
 
 Ja 可以帮你读懂项目、修改代码、整理文档、执行命令。你用自然语言说明想做什么，它在本地工作区里动手；执行过程可以查看，方向可以随时补充，完成后再一起检查结果。
 
-*截图使用当前界面与示例内容，不包含真实用户对话或密钥。*
+_截图使用当前界面与示例内容，不包含真实用户对话或密钥。_
 
 ## 从一句话，到一件事做完
 
@@ -40,7 +40,7 @@ Ja 可以帮你读懂项目、修改代码、整理文档、执行命令。你�
 - **自由接入模型**：支持 Anthropic Messages、OpenAI Chat Completions 和 OpenAI Responses 接口，使用你自己的服务地址与 API Key。
 - **一个窗口完成协作**：对话、文件编辑、代码审查、终端和网页预览放在一起；不同会话保留各自的工作台。
 - **按需扩展**：用 Skills 提供可复用的做事方法，用 MCP 接入更多工具。
-- **长任务有落点**：用 `/goal` 设置持续目标，通过计划确认步骤，也可以用子任务分担独立工作。
+- **任务直接在对话里完成**：提出要实施的任务后，Ja 会在当前对话中推进、验证并交付；复杂任务可选用 `/plan` 先确认步骤，也可以用子任务分担独立工作。
 
 ## 开始使用
 
@@ -48,11 +48,11 @@ Ja 可以帮你读懂项目、修改代码、整理文档、执行命令。你�
 
 从 [最新版本](https://github.com/kongweiguang/Ja/releases/latest) 下载适合设备的安装包：
 
-| 设备 | 安装包文件名结尾 |
-| --- | --- |
-| Windows 11 · x64 | `windows_x86_64-setup.exe` |
-| Mac · Apple Silicon | `darwin_aarch64.dmg` |
-| Mac · Intel | `darwin_x86_64.dmg` |
+| 设备                | 安装包文件名结尾           |
+| ------------------- | -------------------------- |
+| Windows 11 · x64    | `windows_x86_64-setup.exe` |
+| Mac · Apple Silicon | `darwin_aarch64.dmg`       |
+| Mac · Intel         | `darwin_x86_64.dmg`        |
 
 安装版已包含运行环境，不需要自行安装 Java、Rust 或 Node.js。
 
@@ -72,18 +72,19 @@ Ja 不要求注册账号。模型服务由你选择，请求费用由对应服�
 
 ### 命令行客户端（开发中）
 
-仓库包含仍在开发中的 `ja` 命令行客户端；它不属于 Ja 0.1.20 正式桌面版交付范围，也尚未正式发布。Windows x64 npm 包 `@kongweiguang/ja` 尚未公开。如后续单独发布，该包需要 Node.js 24.x，不需要另装 JDK。开发者本地打包与验收说明见 [`packages/ja-npm/PUBLISHING.md`](packages/ja-npm/PUBLISHING.md)。
+仓库包含 `ja` 命令行客户端，Windows x64 npm 包名为 `@kongweiguang/ja`，当前尚未公开。GitHub **Release Ja** 工作流会按同一版本和源码同步发布 npm CLI 与桌面端；完成首次发布认证配置后即可使用。CLI 需要 Node.js 24.x，包内包含原生 App Server 和文件搜索工具，无需另装 JDK。发布配置、安装与本地验收说明见 [`packages/ja-npm/PUBLISHING.md`](packages/ja-npm/PUBLISHING.md)。
 
 ```text
 ja                         # 在当前目录开始交互会话
 ja -C <目录>                # 在指定目录开始会话
 ja resume [thread-id]       # 恢复已有会话
+ja setup                    # 管理全局供应商、模型、API Key 与默认模型
 ja exec "任务内容"           # 非交互执行，只向 stdout 输出最终回答
 ja exec --json "任务内容"    # 输出带终态的版本化 JSONL 事件
 ja server status            # 查看本机后台状态
 ```
 
-交互界面使用 `/` 查找命令、`@` 引用文件；`Ctrl+J` 换行，`Ctrl+D` 在输入为空时退出。首次运行会引导配置模型。需要审批或澄清时，非交互命令会返回会话标识，供交互界面或桌面继续处理。
+交互界面使用 `/` 查找命令、`@` 引用文件；`Ctrl+J` 换行，`Ctrl+D` 在输入为空时退出。运行 `ja setup` 可随时管理模型；会话内 `/model` 可切换会话模型或进入“管理模型”。没有可用模型时仍可浏览历史并打开设置。需要审批或澄清时，非交互命令会返回会话标识，供交互界面或桌面继续处理。
 
 ## 数据留在哪里？
 

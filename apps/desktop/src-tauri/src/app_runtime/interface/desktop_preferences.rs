@@ -202,7 +202,7 @@ fn atomic_replace(temp: &Path, target: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // SAFETY: buffers are NUL-terminated and live for the synchronous Win32 call.
+    // SAFETY: 缓冲区以 NUL 结尾，并在同步 Win32 调用期间保持有效。
     if unsafe {
         MoveFileExW(
             source.as_ptr(),

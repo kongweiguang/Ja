@@ -49,7 +49,11 @@ const SETTINGS_STYLE_SNAPSHOT: SettingsSnapshot = {
           modelId: "model_sol",
           name: "GPT 5.6 Sol · 当前默认",
           model: "gpt-5.6-sol",
-          capabilities: { contextWindowTokens: 256000, maxOutputTokens: 32000 },
+          capabilities: {
+            contextWindowTokens: 256000,
+            maxOutputTokens: 32000,
+            supportsOutputSchema: false,
+          },
           reasoningLevelMap: { low: "low", medium: "medium", high: "high" },
           defaultReasoningLevel: "high",
         },
@@ -57,7 +61,11 @@ const SETTINGS_STYLE_SNAPSHOT: SettingsSnapshot = {
           modelId: "model_mini",
           name: "GPT 5.6 Mini · 快速回复",
           model: "gpt-5.6-mini",
-          capabilities: { contextWindowTokens: 128000, maxOutputTokens: 8192 },
+          capabilities: {
+            contextWindowTokens: 128000,
+            maxOutputTokens: 8192,
+            supportsOutputSchema: false,
+          },
           reasoningLevelMap: {},
           defaultReasoningLevel: null,
         },
@@ -356,7 +364,6 @@ function SettingsStylePreview(): React.ReactElement {
                 {
                   kind: "project",
                   workspaceId: "ws_preview_a",
-                  legacySharedWorkspaceId: null,
                   rootPath: "C:\\projects\\alpha",
                   displayName: "Alpha",
                   trust: "trusted",
@@ -364,7 +371,6 @@ function SettingsStylePreview(): React.ReactElement {
                 {
                   kind: "project",
                   workspaceId: "ws_preview_b",
-                  legacySharedWorkspaceId: null,
                   rootPath: "C:\\projects\\beta",
                   displayName: "Beta",
                   trust: "trusted",

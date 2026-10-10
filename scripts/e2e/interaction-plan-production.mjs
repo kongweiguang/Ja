@@ -6,7 +6,7 @@
  *
  * 这个 runner 只描述可观察证据，不实现生产状态机。生产 runner 必须把真实
  * Tauri/WebView2、隔离 Native Image sidecar 和确定性 Provider 的结果投影到这里，
- * 这样 source/static 检查不能伪造生产通过，且 Interaction 与 Goal/Plan 的边界保持清晰。
+ * 这样 source/static 检查不能伪造生产通过，且 Interaction 与 Plan 的边界保持清晰。
  */
 
 import assert from "node:assert/strict";
@@ -35,7 +35,6 @@ export const INTERACTION_PLAN_RPC_CONTRACT = Object.freeze({
     planPause: "plan/pause",
     planResume: "plan/resume",
     planStop: "plan/stop",
-    goalRead: "goal/read",
   }),
   commands: Object.freeze({
     interactionRead: "ja_runtime_interaction_read",
@@ -51,7 +50,6 @@ export const INTERACTION_PLAN_RPC_CONTRACT = Object.freeze({
     planPause: "ja_runtime_plan_pause",
     planResume: "ja_runtime_plan_resume",
     planStop: "ja_runtime_plan_stop",
-    goalRead: "ja_runtime_goal_read",
   }),
   errors: Object.freeze({
     revisionConflict: "INTERACTION_REVISION_CONFLICT",
@@ -119,48 +117,6 @@ function assertInteractionPlanAccessibilityEvidence(evidence) {
   assert.equal(Number.isSafeInteger(evidence.roleCounts.radio), true);
   assert.equal(Number.isSafeInteger(evidence.roleCounts.checkbox), true);
   assert.equal(evidence.roleCounts.radio + evidence.roleCounts.checkbox, evidence.controlCount);
-}
-
-/** 校验无 Plan Goal 的完成证据必须来自同一 Goal definition revision 与 Run，且只产生一次 achieved。 */
-function assertGoalOnlyCompletionProof(proof) {
-  assert.equal(isObject(proof), true, "goalRegression.completionProof must be an object");
-  assert.equal(proof.achieved, true);
-  assert.equal(proof.planLinkNull, true);
-  assert.equal(proof.completionGateVerified, true);
-  assert.equal(typeof proof.goalId, "string");
-  assert.equal(Number.isSafeInteger(proof.goalDefinitionRevision), true);
-  assert.equal(typeof proof.runId, "string");
-  const identity = (value, label) => {
-    assert.equal(isObject(value), true, `${label} must be an object`);
-    assert.equal(value.goalId, proof.goalId, `${label}.goalId`);
-    assert.equal(
-      value.goalDefinitionRevision,
-      proof.goalDefinitionRevision,
-      `${label}.goalDefinitionRevision`,
-    );
-    assert.equal(value.runId, proof.runId, `${label}.runId`);
-  };
-  identity(proof.evidence, "goalRegression.completionProof.evidence");
-  assert.equal(proof.evidence.count > 0, true);
-  assert.equal(
-    Array.isArray(proof.evidence.criterionIds) && proof.evidence.criterionIds.length > 0,
-    true,
-  );
-  assert.equal(
-    Array.isArray(proof.evidence.sourceIds) && proof.evidence.sourceIds.length > 0,
-    true,
-  );
-  identity(proof.evaluation, "goalRegression.completionProof.evaluation");
-  assert.equal(proof.evaluation.count > 0, true);
-  assert.equal(proof.evaluation.metCount > 0, true);
-  assert.equal(typeof proof.evaluation.evaluationId, "string");
-  assert.equal(proof.evaluation.verdict, "MET");
-  identity(proof.completionEvent, "goalRegression.completionProof.completionEvent");
-  assert.equal(proof.completionEvent.count, 1);
-  assert.equal(typeof proof.completionEvent.eventId, "string");
-  assert.equal(Number.isSafeInteger(proof.completionEvent.eventSequence), true);
-  assert.equal(proof.pendingToolCount, 0);
-  assert.equal(proof.pendingInteractionCount, 0);
 }
 
 /**
@@ -244,12 +200,11 @@ export function validateInteractionPlanAcceptanceReport(
       "atomicExecute",
       "executionAuthorizationRecorded",
       "singleRunCreated",
-      "continuationKeptBudget",
+      "continuationKeptLedger",
       "pauseSettledBeforeVisible",
       "resumeUsedSameRun",
       "stopPreservedHistory",
       "versionConflictDidNotExecuteLatest",
-      "goalNotImplicitlyCreated",
     ],
     "execution",
   );
@@ -259,8 +214,7 @@ export function validateInteractionPlanAcceptanceReport(
   assert.equal(report.execution.completionProof?.turnCount >= 2, true);
   assert.equal(report.execution.completionProof?.notMetEvaluationCount >= 1, true);
   assert.equal(report.execution.completionProof?.metEvaluationCount >= 1, true);
-  assert.equal(report.execution.continuationTurnCount >= 2, true);
-  assert.equal(report.execution.remainingBudgetNonNegative, true);
+  assert.equal(report.execution.continuationTurnCount >= 1, true);
 
   assertBooleanRecord(
     report.recovery,
@@ -279,8 +233,7 @@ export function validateInteractionPlanAcceptanceReport(
   assertBooleanRecord(
     report.isolation,
     [
-      "goalWithoutPlan",
-      "planWithoutGoal",
+      "planOwnedByThread",
       "threadAQuestionNotVisibleInThreadB",
       "threadBQuestionNotVisibleInThreadA",
       "hiddenThreadDidNotMaterializePlan",
@@ -421,9 +374,6 @@ export function validateInteractionPlanAcceptanceReport(
     }
   }
 
-  assert.deepEqual(report.goalRegression?.statuses, ["active", "paused", "active"]);
-  assert.equal(report.goalRegression?.planLinkUnchanged, true);
-  assertGoalOnlyCompletionProof(report.goalRegression?.completionProof);
   if (scope === "functional") {
     assert.equal(expectedSoakMinutes, 0);
     assert.equal(report.scope, "functional");
@@ -555,7 +505,7 @@ export async function findMissingInteractionPlanHooks(root = repoRoot, desktopRu
     },
     {
       label: "plan-execution",
-      path: join(root, "apps", "desktop", "src", "features", "goals"),
+      path: join(root, "apps", "desktop", "src", "features", "plans"),
       tokens: ["ja-plan-timeline", "ja-plan-workbench", "执行"],
     },
   ];
@@ -563,7 +513,7 @@ export async function findMissingInteractionPlanHooks(root = repoRoot, desktopRu
   for (const check of checks) {
     let source;
     try {
-      if (check.path.endsWith("conversation") || check.path.endsWith("goals")) {
+      if (check.path.endsWith("conversation") || check.path.endsWith("plans")) {
         source = "";
         const { readdir } = await import("node:fs/promises");
         const entries = await readdir(check.path, { recursive: true, withFileTypes: true });
@@ -703,6 +653,9 @@ export async function readStagedInteractionPlanSidecar(sidecarDirectory) {
   };
 }
 
+/**
+ * 仅按固定顺序收集交互与独立 Plan 证据，防止报告混入未由该 driver 验证的状态。
+ */
 export async function collectInteractionPlanAcceptanceReport(
   driver,
   { expectedSoakMinutes = 120, scope = "production" } = {},
@@ -716,7 +669,6 @@ export async function collectInteractionPlanAcceptanceReport(
     ["recoveryEvidence", "recovery"],
     ["isolationEvidence", "isolation"],
     ["visualEvidence", "visualMatrix"],
-    ["goalRegressionEvidence", "goalRegression"],
     ["soakEvidence", "soak"],
   ];
   for (const [method] of stages)

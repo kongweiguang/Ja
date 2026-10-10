@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:health-upgrading","method":"runtime/health","params":{}}
+{"jsonrpc":"2.0","id":"c:health-upgrading","result":{"status":"blocked","components":[{"name":"sidecar","status":"healthy"},{"name":"sqlite","status":"unavailable"},{"name":"kernel","status":"unavailable"},{"name":"configuration","status":"healthy"}],"storageRecovery":{"id":"11111111-1111-4111-8111-111111111111","phase":"upgrading","reason":"INITIALIZATION_FAILED","historyAvailable":false,"backupAvailable":false,"rebuilt":false}}}

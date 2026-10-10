@@ -8,6 +8,7 @@ import {
   CircleAlert,
   Bot,
   Cloud,
+  Database,
   Info,
   Laptop,
   Server,
@@ -38,6 +39,7 @@ export const sections: ReadonlyArray<{ id: SettingsSection; label: string; icon:
   { id: "permissions", label: "执行确认", icon: <Shield size={16} aria-hidden="true" /> },
   { id: "skills", label: "Skills", icon: <Sparkles size={16} aria-hidden="true" /> },
   { id: "mcp", label: "MCP", icon: <Server size={16} aria-hidden="true" /> },
+  { id: "storage", label: "数据与存储", icon: <Database size={16} aria-hidden="true" /> },
   { id: "about", label: "关于", icon: <Info size={16} aria-hidden="true" /> },
 ];
 
@@ -98,14 +100,15 @@ export function emptyProviderDraft(): ProviderDraft {
   };
 }
 
-/** 新模型按未知自定义模型创建为 text-only，但默认开放七档推理选择并把 medium 作为默认档位。 */
+/** 新模型对结构化终答默认关闭，避免仅凭未知模型名称宣称能力；思考档位保留现有默认策略。 */
 export function emptyProviderModelDraft(): ProviderModelDraft {
   return {
     name: "",
     model: "",
     capabilities: {
       contextWindowTokens: 128_000,
-      maxOutputTokens: 8_192,
+      maxOutputTokens: 16_384,
+      supportsOutputSchema: false,
     },
     reasoningLevelMap: {
       off: "off",

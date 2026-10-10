@@ -81,7 +81,7 @@ fn task_message_and_followup_share_bounded_content_without_wake_flag() {
         content: vec![TurnContentPart::Text {
             text: "继续检查".to_owned(),
         }],
-        idempotency_key: "message-1".to_owned(),
+        operation_key: "message-1".to_owned(),
     };
     assert!(message.validate().is_ok());
     assert!(
@@ -94,7 +94,7 @@ fn task_message_and_followup_share_bounded_content_without_wake_flag() {
     );
     assert!(
         TaskMessageInput {
-            idempotency_key: "bad\nkey".to_owned(),
+            operation_key: "bad\nkey".to_owned(),
             ..message
         }
         .validate()

@@ -132,7 +132,7 @@ test("loopback fixture 推进 Agent Shell continuation 并过滤原始输出", a
     ].join("\n");
     const second = await (
       await post([
-        { type: "function_call", call_id: shellEnvironmentFixtureMarkers.agentShellCallId, name: "shell", arguments: "{}" },
+        { type: "function_call", call_id: shellEnvironmentFixtureMarkers.agentShellCallId, name: "exec_command", arguments: "{}" },
         {
           type: "function_call_output",
           call_id: shellEnvironmentFixtureMarkers.agentShellCallId,
@@ -161,7 +161,7 @@ test("loopback fixture 优先处理带旧 Shell 历史的 cancel 请求", async 
           {
             type: "function_call",
             call_id: shellEnvironmentFixtureMarkers.agentShellCallId,
-            name: "shell",
+            name: "exec_command",
             arguments: "{}",
           },
           {

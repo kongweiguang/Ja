@@ -8,7 +8,7 @@ use super::native::{NativeReviewAdapter, map_mutation_error};
 use super::transaction::{
     GitIndexTransaction, WorktreeRecovery, action_mutates_index, action_mutates_worktree,
     apply_patch_file, check_patch_file, map_worktree_patch_failure, required_index,
-    selected_path_args,
+    run_review_command, selected_path_args,
 };
 use crate::review::application::ReviewError;
 use crate::review::domain::{
@@ -124,7 +124,8 @@ impl NativeReviewAdapter {
         })
     }
 
-    /// 使用固定 Git argv 应用 selected mutation；native remove 仅用于已校验 untracked file。
+    /// 只按已验证的来源与动作路由固定 Git 参数；单独未暂存撤销沿用工作树入口，
+    /// 聚合来源由外层事务传递临时 index，原生删除仅用于已校验的未跟踪文件。
     pub(super) fn apply_selected(
         &self,
         source: &ReviewSource,
@@ -147,7 +148,7 @@ impl NativeReviewAdapter {
                 self.unstage(selected, required_index(index)?, cancellation)
             }
             (ReviewSource::Unstaged, ReviewAction::Revert) => {
-                self.revert_unstaged(selected, cancellation)
+                self.revert_unstaged(selected, None, cancellation)
             }
             (ReviewSource::Staged, ReviewAction::Revert) => {
                 self.revert_staged(selected, required_index(index)?, cancellation)
@@ -156,7 +157,8 @@ impl NativeReviewAdapter {
         }
     }
 
-    /// 聚合来源按 file layer 路由既有事务原语；All 只作用于支持该 action 的层。
+    /// 聚合来源按文件层路由既有事务原语；涉及 index 的 Git 调用共用外层临时 index，
+    /// 防止工作树恢复刷新真实 index 后触发事务自身的 CAS 冲突。
     fn apply_uncommitted(
         &self,
         action: ReviewAction,
@@ -190,7 +192,7 @@ impl NativeReviewAdapter {
                 // 先消除 worktree 层，随后 staged revert 的 overlap 检查才不会把同路径的
                 // 已选未暂存变更当成外部竞态；任一步失败仍由外层 recovery/temporary index 回滚。
                 if !unstaged.is_empty() {
-                    self.revert_unstaged(&unstaged, cancellation)?;
+                    self.revert_unstaged(&unstaged, Some(required_index(index)?), cancellation)?;
                 }
                 if !staged.is_empty() {
                     self.revert_staged(&staged, required_index(index)?, cancellation)?;
@@ -252,10 +254,12 @@ impl NativeReviewAdapter {
         Ok(())
     }
 
-    /// tracked patch check 全部成功后才 revert worktree，并仅删除 selected untracked regular file。
+    /// 文件恢复沿用调用方的 index 绑定，使聚合事务隔离 Git 的元数据刷新；
+    /// 区块恢复与已校验未跟踪文件的删除保持各自原有的工作树语义。
     pub(super) fn revert_unstaged(
         &self,
         selected: &[SelectedMutation],
+        index: Option<&Path>,
         cancellation: &CancellationToken,
     ) -> Result<(), ReviewError> {
         let files = selected
@@ -266,7 +270,7 @@ impl NativeReviewAdapter {
             .collect::<Vec<_>>();
         if !files.is_empty() {
             for selection in files {
-                self.restore_worktree_selection(selection, cancellation)?;
+                self.restore_worktree_selection(selection, index, cancellation)?;
             }
         }
         let hunk_selections = selected
@@ -304,10 +308,12 @@ impl NativeReviewAdapter {
         Ok(())
     }
 
-    /// 通过固定 Git command surface restore file selection，rename 时覆盖两侧路径。
+    /// 文件恢复使用事务提供的临时 index 读取基线并承接 Git 的刷新，真实 index 仍由
+    /// 外层 CAS 提交；未提供绑定时沿用单独工作树入口，重命名仍覆盖已验证的两侧路径。
     pub(super) fn restore_worktree_selection(
         &self,
         selection: &SelectedMutation,
+        index: Option<&Path>,
         cancellation: &CancellationToken,
     ) -> Result<(), ReviewError> {
         let mut args = vec![
@@ -316,7 +322,7 @@ impl NativeReviewAdapter {
             OsString::from("--"),
         ];
         args.extend(selected_path_args(&[selection]));
-        self.git.run_review_command(&args, cancellation)?;
+        run_review_command(&self.git, &args, index, cancellation)?;
         Ok(())
     }
 

@@ -11,17 +11,48 @@ import {
 } from "react";
 import { toast } from "sonner";
 import type { FilesWorkspaceCloseLease, FilesWorkspaceLifecycle } from "@/features/workbench/files";
+import type { FilesUnsavedDocumentSummary } from "@/features/workbench/files/application/types";
 import type { PreviewWorkspaceLifecycle } from "../useJaWorkbench";
 import { createThreadWorkbenchAdapters } from "../application/threadWorkbenchAdapters";
 import type { TerminalWorkspaceLifecycle } from "../application/workbenchLifecyclePorts";
 import { WorkbenchHost, type WorkbenchHostProps } from "./WorkbenchHost";
 
-export interface ThreadWorkbenchSessionsProps extends WorkbenchHostProps {
+/** 单次 Files close 的焦点证据只在 flush 调用栈内存活，并与来源请求和 Thread scope 配对。 */
+export interface FilesCapabilityCloseFocusCapture {
+  readonly workspaceId: string;
+  readonly scopeIdentity: string;
+  readonly requestId: number;
+  readonly expectedFocus: HTMLElement | null;
+  readonly allowedRestoreFocus: HTMLElement | null;
+}
+
+type ThreadSessionWorkbenchHostProps = Omit<WorkbenchHostProps, "onCloseFilesCapability"> & {
+  readonly onCloseFilesCapability: (workspaceId: string) => FilesCapabilityCloseFocusCapture | null;
+};
+
+export interface ThreadWorkbenchSessionsProps
+  extends Omit<WorkbenchHostProps, "onCloseFilesCapability"> {
   readonly scopeKey: string;
+  readonly onRegisterRebindLifecycle?: (
+    lifecycle: RetainedWorkspaceRebindLifecycle | undefined,
+  ) => void;
+  readonly onCloseFilesCapability: ThreadSessionWorkbenchHostProps["onCloseFilesCapability"];
   /** 只向当前缓存会话暴露侧聊 slash launcher；隐藏会话不得覆盖当前入口。 */
   readonly onRegisterSideChatLauncher?: WorkbenchHostProps["onRegisterSideChatLauncher"];
-  /** Files 已由当前会话完成 flush 后，只通知壳层恢复焦点，不得再次触发 workspace 级关闭。 */
-  readonly onFilesCapabilityClosed?: (workspaceId: string) => void;
+  /** lease release 后回送同一次 close capture；不再次触发 workspace 级关闭。 */
+  readonly onFilesCapabilityClosed?: (
+    workspaceId: string,
+    focusCapture: FilesCapabilityCloseFocusCapture | null,
+  ) => void;
+}
+
+/** 重绑只汇总指定项目的草稿摘要与资源租约，不提升正文的所有权。 */
+export interface RetainedWorkspaceRebindLifecycle {
+  listUnsavedDocuments(workspaceId: string): readonly FilesUnsavedDocumentSummary[];
+  prepareWorkspaceRebind(
+    workspaceId: string,
+    disposition: "save" | "discard",
+  ): Promise<{ commit(): void; release(): void }>;
 }
 
 interface ThreadLifecycleRegistry {
@@ -29,6 +60,7 @@ interface ThreadLifecycleRegistry {
   readonly filesLifecycle: FilesWorkspaceLifecycle;
   readonly terminalLifecycle: TerminalWorkspaceLifecycle;
   readonly previewLifecycle: PreviewWorkspaceLifecycle;
+  readonly rebindLifecycle: RetainedWorkspaceRebindLifecycle;
   readonly registerFiles: (
     scopeKey: string,
     lifecycle: FilesWorkspaceLifecycle | undefined,
@@ -59,8 +91,8 @@ interface ThreadSessionHostProps {
 }
 
 interface ThreadSessionInput {
-  readonly hostProps: WorkbenchHostProps;
-  readonly onFilesCapabilityClosed?: (workspaceId: string) => void;
+  readonly hostProps: ThreadSessionWorkbenchHostProps;
+  readonly onFilesCapabilityClosed?: ThreadWorkbenchSessionsProps["onFilesCapabilityClosed"];
   readonly onRegisterSideChatLauncher?: WorkbenchHostProps["onRegisterSideChatLauncher"];
 }
 
@@ -185,6 +217,65 @@ function createThreadLifecycleRegistry(initialWorkspaceId: string): ThreadLifecy
   const preview = new Map<string, PreviewWorkspaceLifecycle>();
   let mountRevision = 0;
 
+  /** 目录重绑只取得目标项目的租约；成功提交前保留各会话草稿，任何准备失败都解除冻结。 */
+  const rebindLifecycle: RetainedWorkspaceRebindLifecycle = {
+    listUnsavedDocuments: (workspaceId) =>
+      [...files.values()]
+        .filter((lifecycle) => lifecycle.workspaceId === workspaceId)
+        .flatMap((lifecycle) => lifecycle.listUnsavedDocuments()),
+    prepareWorkspaceRebind: async (workspaceId, disposition) => {
+      const targets = [...files.values()].filter(
+        (lifecycle) => lifecycle.workspaceId === workspaceId,
+      );
+      const terminalTargets = new Map(
+        [...terminal].filter(([, lifecycle]) => lifecycle.workspaceId === workspaceId),
+      );
+      const previewTargets = new Map(
+        [...preview].filter(([, lifecycle]) => lifecycle.workspaceId === workspaceId),
+      );
+      const results = await Promise.allSettled(
+        targets.map((lifecycle) => lifecycle.prepareForWorkspaceRebind(disposition)),
+      );
+      const leases = results.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : [],
+      );
+      const failure = results.find((result) => result.status === "rejected");
+      try {
+        if (failure?.status === "rejected") throw failure.reason;
+        await closeAllTerminals(workspaceId, terminalTargets);
+        await closeAllPreviews(workspaceId, previewTargets);
+      } catch (error: unknown) {
+        try {
+          releaseFilesLeases(leases);
+        } finally {
+          for (const lifecycle of terminalTargets.values()) lifecycle.resumeAfterWorkspaceChange();
+        }
+        throw error;
+      }
+      let committed = false;
+      let released = false;
+      return {
+        /** Java 已保存新目录才清空旧文件状态，资源绑定失败也不能继续使用旧目录。 */
+        commit: (): void => {
+          if (committed || released) return;
+          committed = true;
+          for (const lease of leases) lease.commit();
+        },
+        /** 释放是幂等的；失败路径保留草稿，成功路径允许新目录重新准备工作面。 */
+        release: (): void => {
+          if (released) return;
+          released = true;
+          try {
+            releaseFilesLeases(leases);
+          } finally {
+            for (const lifecycle of terminalTargets.values())
+              lifecycle.resumeAfterWorkspaceChange();
+          }
+        },
+      };
+    },
+  };
+
   /** undefined 是对应 Host 的卸载信号，只删除该 scope。 */
   const registerFiles = (
     scopeKey: string,
@@ -245,6 +336,9 @@ function createThreadLifecycleRegistry(initialWorkspaceId: string): ThreadLifecy
         return activeWorkspaceId;
       },
       flushForWorkspaceChange: () => flushAllFiles(activeWorkspaceId, files),
+      listUnsavedDocuments: () => rebindLifecycle.listUnsavedDocuments(activeWorkspaceId),
+      prepareForWorkspaceRebind: (disposition) =>
+        rebindLifecycle.prepareWorkspaceRebind(activeWorkspaceId, disposition),
     },
     terminalLifecycle: {
       get workspaceId() {
@@ -261,6 +355,7 @@ function createThreadLifecycleRegistry(initialWorkspaceId: string): ThreadLifecy
       },
       closeForWorkspaceChange: () => closeAllPreviews(activeWorkspaceId, preview),
     },
+    rebindLifecycle,
     registerFiles,
     registerTerminal,
     registerPreview,
@@ -297,6 +392,7 @@ function ThreadSessionHost({
   }
   const effectiveInput = input ?? retained.cached;
   const { hostProps, onFilesCapabilityClosed, onRegisterSideChatLauncher } = effectiveInput;
+  const captureFilesCloseFocus = hostProps.onCloseFilesCapability;
   const [adapters] = useState(() => createThreadWorkbenchAdapters(hostProps.adapters));
   const closeFilesTaskRef = useRef<Promise<void> | undefined>(undefined);
 
@@ -325,8 +421,8 @@ function ThreadSessionHost({
   );
 
   /**
-   * Files Tab 关闭只 flush 本 Host，并在 ACK 后立即释放短 lease；不调用父级 workspace close，
-   * 否则同项目下其它会话会被错误冻结和刷盘。
+   * Files Tab 先同步捕获焦点 owner，再 flush 本 Host；只在 lease release 后回送该次 capture，
+   * flush 失败时不发 ACK、不消费标签或焦点，且不冻结同项目下其它会话。
    */
   const closeFilesCapability = useCallback(
     (workspaceId: string): Promise<void> => {
@@ -335,16 +431,17 @@ function ThreadSessionHost({
       const lifecycle = registry.currentFiles(scopeKey);
       if (lifecycle?.workspaceId !== workspaceId) return Promise.resolve();
       const task = (async (): Promise<void> => {
+        const focusCapture = captureFilesCloseFocus(workspaceId);
         const lease = await lifecycle.flushForWorkspaceChange();
         lease.release();
-        onFilesCapabilityClosed?.(workspaceId);
+        onFilesCapabilityClosed?.(workspaceId, focusCapture);
       })().finally(() => {
         if (closeFilesTaskRef.current === task) closeFilesTaskRef.current = undefined;
       });
       closeFilesTaskRef.current = task;
       return task;
     },
-    [onFilesCapabilityClosed, registry, scopeKey],
+    [captureFilesCloseFocus, onFilesCapabilityClosed, registry, scopeKey],
   );
 
   return (
@@ -378,6 +475,7 @@ function ThreadSessionHost({
  */
 export function ThreadWorkbenchSessions({
   scopeKey,
+  onRegisterRebindLifecycle,
   onRegisterSideChatLauncher,
   onFilesCapabilityClosed,
   onRegisterFilesLifecycle,
@@ -399,13 +497,21 @@ export function ThreadWorkbenchSessions({
     onRegisterFilesLifecycle(registry.filesLifecycle);
     onRegisterTerminalLifecycle(registry.terminalLifecycle);
     onRegisterPreviewLifecycle(registry.previewLifecycle);
+    onRegisterRebindLifecycle?.(registry.rebindLifecycle);
     return () => {
       deactivate();
       onRegisterFilesLifecycle(undefined);
       onRegisterTerminalLifecycle(undefined);
       onRegisterPreviewLifecycle(undefined);
+      onRegisterRebindLifecycle?.(undefined);
     };
-  }, [onRegisterFilesLifecycle, onRegisterPreviewLifecycle, onRegisterTerminalLifecycle, registry]);
+  }, [
+    onRegisterFilesLifecycle,
+    onRegisterPreviewLifecycle,
+    onRegisterTerminalLifecycle,
+    onRegisterRebindLifecycle,
+    registry,
+  ]);
 
   return (
     <>

@@ -113,7 +113,6 @@ unit_scope!(
     crate::app_runtime::domain,
     "/tests/unit/app_runtime/domain/model_tests.rs"
 );
-
 unit_scope!(
     app_runtime_configuration_scope,
     crate::app_runtime::interface::configuration,
@@ -140,9 +139,9 @@ unit_scope!(
     "/tests/unit/app_runtime/interface/history_tests.rs"
 );
 unit_scope!(
-    app_runtime_goal_interface_scope,
-    crate::app_runtime::interface::goal,
-    "/tests/unit/app_runtime/interface/goal_tests.rs"
+    app_runtime_plan_interface_scope,
+    crate::app_runtime::interface::plans,
+    "/tests/unit/app_runtime/interface/plan_tests.rs"
 );
 unit_scope!(
     app_runtime_settings_model_scope,

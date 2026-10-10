@@ -125,6 +125,11 @@ integration_scope!(
     "/tests/integration/internal/app_runtime/application/host_tests.rs"
 );
 integration_scope!(
+    app_runtime_application_host_identity_scope,
+    crate::app_runtime::application::host,
+    "/tests/integration/internal/app_runtime/application/host_identity_tests.rs"
+);
+integration_scope!(
     app_runtime_application_host_lock_order_scope,
     crate::app_runtime::application::host,
     "/tests/integration/internal/app_runtime/application/host_lock_order_tests.rs"

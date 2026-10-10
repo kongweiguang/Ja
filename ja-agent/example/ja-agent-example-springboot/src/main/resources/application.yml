@@ -1,0 +1,26 @@
+# @author kongweiguang
+server:
+  address: 127.0.0.1
+  port: ${JA_EXAMPLE_PORT:8087}
+  error:
+    include-message: never
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50000000B
+      max-request-size: 51000000B
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: "${JA_EXAMPLE_JDBC_URL:jdbc:postgresql://127.0.0.1:5432/ja_agent_demo?sslmode=disable&reWriteBatchedInserts=true}"
+    username: ${JA_EXAMPLE_DB_USER:postgres}
+    password: "${JA_EXAMPLE_DB_PASSWORD:}"
+    hikari:
+      maximum-pool-size: 10
+  mvc:
+    async:
+      request-timeout: 0
+ja:
+  example:
+    attachments:
+      draft-retention-ms: ${JA_EXAMPLE_ATTACHMENT_DRAFT_RETENTION_MS:86400000}
+      cleanup-interval-ms: ${JA_EXAMPLE_ATTACHMENT_CLEANUP_INTERVAL_MS:3600000}

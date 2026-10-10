@@ -24,7 +24,7 @@ function event(type, sequenceNumber, payload) {
   })}\n\n`;
 }
 
-/** 构造 provider 终态 envelope，补齐 Native/JVM adapter 需要的 usage 与 output 字段。 */
+/** 构造带缓存命中的 provider 终态 envelope，覆盖缓存子项计入上下文但不重复进入 total 的口径。 */
 function responseEnvelope(responseId, status, output, includeUsage = true) {
   const response = {
     id: responseId,
@@ -40,7 +40,7 @@ function responseEnvelope(responseId, status, output, includeUsage = true) {
   if (includeUsage) {
     response.usage = {
       input_tokens: 20,
-      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      input_tokens_details: { cached_tokens: 10, cache_write_tokens: 0 },
       output_tokens: 12,
       output_tokens_details: { reasoning_tokens: 0 },
       total_tokens: 32,
@@ -379,13 +379,13 @@ export async function startConversationProgressFixture() {
             "resp_progress_shell",
             "item_progress_shell",
             SHELL_CALL_ID,
-            "shell",
-            { command: `Write-Output ${SHELL_MARKER}`, timeout_ms: 5_000 },
+            "exec_command",
+            { cmd: `Write-Output ${SHELL_MARKER}`, timeout_ms: 5_000 },
             `读取成功，我再执行一次低影响 Shell 回显 ${READ_MARKER}。${COMMENTARY_2}`,
             "读取结果已收到，继续做 Shell 校验。",
           ),
           stages,
-          "shell",
+          "exec_command",
           undefined,
           secondNarrativeGate,
         );

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-// RPC operations 只发送固定 JA-RPC v1 方法并校验完整结果。
+// RPC operations 只发送固定 JA-RPC v2 方法并校验完整结果。
 
 use super::*;
+use std::collections::HashSet;
 
 const THREAD_CREATE_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -20,6 +21,7 @@ struct AttachmentWireResult {
     created_at: String,
     expires_at: String,
     bound_message_id: Option<String>,
+    bound_thread_id: Option<String>,
 }
 
 /// 使用当前 actor session 发送一个固定附件方法；该 helper 不接受 WebView method 字符串。
@@ -108,7 +110,15 @@ pub(crate) fn parse_attachment_result(
             .bound_message_id
             .as_deref()
             .is_some_and(|value| !value.starts_with("item_") || !valid_id(value, 101))
-        || (wire.state == "bound") != wire.bound_message_id.is_some()
+        || wire
+            .bound_thread_id
+            .as_deref()
+            .is_some_and(|value| !value.starts_with("thr_") || !valid_id(value, 100))
+        || if wire.state == "bound" {
+            wire.bound_message_id.is_some() == wire.bound_thread_id.is_some()
+        } else {
+            wire.bound_message_id.is_some() || wire.bound_thread_id.is_some()
+        }
         || expected_attachment_id.is_some_and(|value| value != wire.attachment_id)
         || expected_workspace_id.is_some_and(|value| value != wire.workspace_id)
         || expected_name.is_some_and(|value| value != wire.display_name)
@@ -277,7 +287,7 @@ pub(super) fn attachment_preview_close_runtime(
         .map_err(|_| RuntimeCommandError::unavailable())
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// `thread/create` 会同步准备 Workspace 并提交首条 Thread；首次使用的磁盘初始化可能超过
 /// 4 秒 Turn deadline。仅为该写入提供 10 秒冷启动预算，仍低于 15 秒 bridge 命令上限，
 /// 且退出 deadline 可以进一步收紧；其他 History 请求沿用既有短预算。
@@ -486,7 +496,7 @@ pub(crate) fn parse_workspace_path_search_result(
     })
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 通过普通 client request lane 发送 allowlist 内的 Skills/MCP 请求；已解析私有 snapshot
 /// 始终由 Java 持有。
 pub(super) fn settings_query_runtime(
@@ -519,19 +529,16 @@ pub(super) fn settings_query_runtime(
         .ok_or_else(RuntimeCommandError::unavailable)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
-/// 打开已 canonicalize 的 native cwd，并协调显式 native trust 目标；Java 持有 durable identity，
-/// 可能返回 trust 已比注册默认值更新的既有 Workspace，因此重复打开必须比较而不能假定 untrusted。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
+/// 打开已 canonicalize 的 native cwd 只登记 Java-owned identity，权限变化必须通过独立授信操作。
 pub(super) fn workspace_open_runtime(
     config: &LaunchConfig,
     runtime: &mut Option<RunningRuntime>,
     root: PathBuf,
     display_name: String,
-    trust: String,
     exit_control: &ExitControl,
 ) -> Result<WorkspaceDto, RuntimeCommandError> {
-    if !matches!(trust.as_str(), "trusted" | "untrusted")
-        || display_name.is_empty()
+    if display_name.is_empty()
         || display_name.len() > 512
         || display_name.chars().any(char::is_control)
     {
@@ -564,14 +571,45 @@ pub(super) fn workspace_open_runtime(
     let result = value
         .get("result")
         .ok_or_else(RuntimeCommandError::unavailable)?;
-    let mut projection = validate_workspace_open_result(result, std::path::Path::new(root))?;
-    if projection.trust != trust {
+    validate_workspace_open_result(result, std::path::Path::new(root))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceListWirePage {
+    items: Vec<Value>,
+    next_cursor: Option<String>,
+}
+
+/// 设计原因：授信响应只有 accepted，不含 revision；必须在同一 actor 操作中分页回读 Java 投影，
+/// 让 Host 只缓存持久化 owner 实际签发的 trust 与 revision。
+pub(super) fn workspace_set_trust_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    workspace_id: String,
+    trust: String,
+    exit_control: &ExitControl,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    if !workspace_id.starts_with("ws_")
+        || !valid_id(&workspace_id, 99)
+        || !matches!(trust.as_str(), "trusted" | "untrusted")
+    {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    let accepted = {
+        let current = runtime
+            .as_mut()
+            .ok_or_else(RuntimeCommandError::unavailable)?;
+        if let Some(session) = current.client.session_for_cancellation() {
+            exit_control.attach_session(session);
+        }
+        let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
         let timeout = operation_timeout(config.request_timeout, exit_control)?;
         let response = current
             .client
             .request(
                 "workspace/set-trust",
-                json!({"workspaceId": projection.workspace_id.clone(), "trust": trust}),
+                json!({"workspaceId": workspace_id.clone(), "trust": trust.clone()}),
                 timeout,
             )
             .map_err(|error| RuntimeCommandError::from_process(&error))?;
@@ -579,23 +617,65 @@ pub(super) fn workspace_open_runtime(
         if let Some(error) = value.get("error") {
             return Err(command_error_from_rpc(error));
         }
-        let accepted = value
+        value
             .get("result")
             .and_then(Value::as_object)
             .filter(|result| result.len() == 1)
             .and_then(|result| result.get("accepted"))
-            .and_then(Value::as_bool);
-        if accepted != Some(true) {
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    if !accepted {
+        return Err(RuntimeCommandError::unavailable());
+    }
+
+    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let params = match cursor.as_deref() {
+            Some(cursor) => json!({"cursor": cursor, "limit": 200}),
+            None => json!({"limit": 200}),
+        };
+        let page_value = history_request_runtime(
+            config,
+            runtime,
+            HistoryMethod::WorkspaceList,
+            params,
+            exit_control,
+        )?;
+        let page_fields = page_value
+            .as_object()
+            .filter(|page| {
+                page.len() == 2 && page.contains_key("items") && page.contains_key("nextCursor")
+            })
+            .ok_or_else(RuntimeCommandError::unavailable)?;
+        let page: WorkspaceListWirePage =
+            serde_json::from_value(Value::Object(page_fields.clone()))
+                .map_err(|_| RuntimeCommandError::unavailable())?;
+        if page.items.len() > 200 {
             return Err(RuntimeCommandError::unavailable());
         }
-        projection.trust = trust;
-        projection.revision = projection
-            .revision
-            .checked_add(1)
-            .filter(|revision| *revision <= 9_007_199_254_740_991)
-            .ok_or_else(RuntimeCommandError::unavailable)?;
+        for item in page.items {
+            let projection = super::parse_workspace_projection(item)?;
+            if projection.workspace_id == workspace_id {
+                if projection.kind != WorkspaceKind::Project || projection.trust != trust {
+                    return Err(RuntimeCommandError::unavailable());
+                }
+                return Ok(projection);
+            }
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return Err(RuntimeCommandError::unavailable());
+        };
+        if next_cursor.is_empty()
+            || next_cursor.len() > 256
+            || next_cursor.chars().any(char::is_control)
+            || !seen_cursors.insert(next_cursor.clone())
+        {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        cursor = Some(next_cursor);
     }
-    Ok(projection)
 }
 
 /// 通过 App Server 持久化 ID 重开目录；Rust 不接受 Renderer 传来的 root 或 workspace kind。
@@ -634,27 +714,112 @@ pub(super) fn workspace_open_by_id_runtime(
     validate_workspace_open_by_id_result(result, &workspace_id)
 }
 
-/// 验证 ID-only 重开只能返回同一 Java identity 下的会话或旧共享目录。
+/// 验证 ID-only 重开返回同一 Java identity 下的项目或会话投影；目录能力仍须由 registry 校验。
 pub(crate) fn validate_workspace_open_by_id_result(
     result: &Value,
     expected_workspace_id: &str,
 ) -> Result<WorkspaceDto, RuntimeCommandError> {
     let projection = super::parse_workspace_projection(result.clone())?;
-    if projection.workspace_id != expected_workspace_id
-        || !matches!(
-            projection.kind,
-            WorkspaceKind::Session | WorkspaceKind::LegacyShared
-        )
-    {
+    if projection.workspace_id != expected_workspace_id {
         return Err(RuntimeCommandError::unavailable());
     }
-    // Do not compare Java's toRealPath spelling with Rust PathBuf spelling: Windows may represent
-    // one physical root with an extended prefix, case variation, or 8.3 alias. WorkspaceRegistry
-    // performs canonicalization plus reparse/physical-identity checks before any capability use.
+    // 不要比较 Java 的 toRealPath 拼写和 Rust PathBuf 拼写：Windows 可能用扩展前缀、大小写差异或 8.3 别名表示同一个物理根目录。
+    // WorkspaceRegistry 会先执行规范化和 reparse/物理身份检查，然后才能使用任何 capability。
     Ok(projection)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// Read 与 Update 共用固定投影校验，但保留各自 method 与 params 闭集，避免重新引入通用 RPC passthrough。
+fn workspace_projection_request_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    method: &'static str,
+    params: Value,
+    expected_workspace_id: &str,
+    exit_control: &ExitControl,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    if !matches!(method, "workspace/read" | "workspace/update") {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    let current = runtime
+        .as_mut()
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    if let Some(session) = current.client.session_for_cancellation() {
+        exit_control.attach_session(session);
+    }
+    let _session_cancellation_guard = SessionCancellationGuard::new(exit_control);
+    let timeout = operation_timeout(config.request_timeout, exit_control)?;
+    let response = current
+        .client
+        .request(method, params, timeout)
+        .map_err(|error| RuntimeCommandError::from_process(&error))?;
+    let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
+    if let Some(error) = value.get("error") {
+        return Err(command_error_from_rpc(error));
+    }
+    let result = value
+        .get("result")
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    let projection = super::parse_workspace_projection(result.clone())?;
+    if projection.workspace_id != expected_workspace_id {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    Ok(projection)
+}
+
+/// 只从 Java SQLite 读取登记投影；root 不存在不是 projection 错误，历史仍能按稳定 identity 读取。
+pub(super) fn workspace_read_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    workspace_id: String,
+    exit_control: &ExitControl,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    if !workspace_id.starts_with("ws_") || !valid_id(&workspace_id, 99) {
+        return Err(RuntimeCommandError::invalid_params());
+    }
+    workspace_projection_request_runtime(
+        config,
+        runtime,
+        "workspace/read",
+        json!({"workspaceId": workspace_id}),
+        &workspace_id,
+        exit_control,
+    )
+}
+
+/// 通过 revision CAS 更新原 Workspace 身份；可选字段保持缺席语义，不把 null 误当作清空命令。
+pub(super) fn workspace_update_runtime(
+    config: &LaunchConfig,
+    runtime: &mut Option<RunningRuntime>,
+    input: WorkspaceUpdateInput,
+    exit_control: &ExitControl,
+) -> Result<WorkspaceDto, RuntimeCommandError> {
+    input
+        .validate()
+        .map_err(|_| RuntimeCommandError::invalid_params())?;
+    let workspace_id = input.workspace_id.clone();
+    let mut params = serde_json::Map::new();
+    params.insert("workspaceId".to_owned(), json!(workspace_id));
+    params.insert(
+        "expectedRevision".to_owned(),
+        json!(input.expected_revision),
+    );
+    if let Some(display_name) = input.display_name {
+        params.insert("displayName".to_owned(), json!(display_name));
+    }
+    if let Some(cwd) = input.cwd {
+        params.insert("cwd".to_owned(), json!(cwd));
+    }
+    workspace_projection_request_runtime(
+        config,
+        runtime,
+        "workspace/update",
+        Value::Object(params),
+        &workspace_id,
+        exit_control,
+    )
+}
+
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 验证 Java 权威 Workspace 投影，但不要求重复打开回显 caller 的 display-name 建议；Java 会保留
 /// 首次注册名称，而 root identity 是必须匹配的 native capability 边界。
 pub(crate) fn validate_workspace_open_result(
@@ -674,14 +839,15 @@ pub(crate) fn validate_workspace_open_result(
     Ok(projection)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// Host 返回 startup/configuration 成功前，要求完整有界 health 结果与 Ready runtime；
 /// component 名称和状态仅限 native，诊断 payload 不进入 WebView state。
 pub(super) fn health_read_runtime(
     config: &LaunchConfig,
     runtime: &mut Option<RunningRuntime>,
     exit_control: &ExitControl,
-) -> Result<(), RuntimeCommandError> {
+    retry: bool,
+) -> Result<Option<crate::app_runtime::StorageRecovery>, RuntimeCommandError> {
     let current = runtime
         .as_mut()
         .ok_or_else(RuntimeCommandError::unavailable)?;
@@ -692,7 +858,15 @@ pub(super) fn health_read_runtime(
     let timeout = operation_timeout(config.request_timeout, exit_control)?;
     let response = current
         .client
-        .request("runtime/health", json!({}), timeout)
+        .request(
+            if retry {
+                "runtime/storage/retry"
+            } else {
+                "runtime/health"
+            },
+            json!({}),
+            timeout,
+        )
         .map_err(|error| RuntimeCommandError::from_process(&error))?;
     let value = frame_to_value(&response).map_err(|_| RuntimeCommandError::unavailable())?;
     if let Some(error) = value.get("error") {
@@ -701,17 +875,26 @@ pub(super) fn health_read_runtime(
     let result = value
         .get("result")
         .ok_or_else(RuntimeCommandError::unavailable)?;
-    validate_health_result(result)
+    validate_health_result(result)?;
+    result
+        .get("storageRecovery")
+        .map(parse_storage_recovery)
+        .transpose()
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 将完整 health 结果验证与 transport 分离，使 malformed 或含 secret fixture 无需启动 Java
 /// 进程也能覆盖。
 pub(crate) fn validate_health_result(result: &Value) -> Result<(), RuntimeCommandError> {
     let result = result
         .as_object()
         .filter(|result| {
-            result.len() == 2 && result.contains_key("status") && result.contains_key("components")
+            matches!(result.len(), 2 | 3)
+                && result.contains_key("status")
+                && result.contains_key("components")
+                && result
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "status" | "components" | "storageRecovery"))
         })
         .ok_or_else(RuntimeCommandError::unavailable)?;
     let components = result
@@ -719,51 +902,127 @@ pub(crate) fn validate_health_result(result: &Value) -> Result<(), RuntimeComman
         .and_then(Value::as_array)
         .filter(|components| components.len() == 4)
         .ok_or_else(RuntimeCommandError::unavailable)?;
-    if result.get("status").and_then(Value::as_str) != Some("ready")
-        || components.iter().any(|component| {
-            let Some(component) = component.as_object() else {
-                return true;
-            };
-            let Some(name) = component.get("name").and_then(Value::as_str) else {
-                return true;
-            };
-            let Some(status) = component.get("status").and_then(Value::as_str) else {
-                return true;
-            };
-            let known_name = matches!(name, "sidecar" | "sqlite" | "kernel" | "configuration");
-            let valid_status = matches!(status, "healthy" | "degraded" | "unavailable" | "stopped");
-            let valid_shape = if name == "configuration" {
-                matches!(component.len(), 2 | 3)
-                    && component
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "name" | "status" | "diagnostics"))
-                    && component
-                        .get("diagnostics")
-                        .is_none_or(valid_health_diagnostics)
-            } else {
-                component.len() == 2
-                    && component
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "name" | "status"))
-            };
-            !(known_name && valid_id(name, 256) && valid_status && valid_shape)
+    if !matches!(
+        result.get("status").and_then(Value::as_str),
+        Some("ready" | "blocked")
+    ) || components.iter().any(|component| {
+        let Some(component) = component.as_object() else {
+            return true;
+        };
+        let Some(name) = component.get("name").and_then(Value::as_str) else {
+            return true;
+        };
+        let Some(status) = component.get("status").and_then(Value::as_str) else {
+            return true;
+        };
+        let known_name = matches!(name, "sidecar" | "sqlite" | "kernel" | "configuration");
+        let valid_status = matches!(status, "healthy" | "degraded" | "unavailable" | "stopped");
+        let valid_shape = if name == "configuration" {
+            matches!(component.len(), 2 | 3)
+                && component
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "name" | "status" | "diagnostics"))
+                && component
+                    .get("diagnostics")
+                    .is_none_or(valid_health_diagnostics)
+        } else {
+            component.len() == 2
+                && component
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "name" | "status"))
+        };
+        !(known_name && valid_id(name, 256) && valid_status && valid_shape)
+    }) || {
+        let mut names = std::collections::HashSet::new();
+        components.iter().any(|component| {
+            component
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !names.insert(name))
         })
-        || {
-            let mut names = std::collections::HashSet::new();
-            components.iter().any(|component| {
-                component
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| !names.insert(name))
-            })
-        }
-    {
+    } {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let recovery = result
+        .get("storageRecovery")
+        .map(parse_storage_recovery)
+        .transpose()?;
+    let blocked = result.get("status").and_then(Value::as_str) == Some("blocked");
+    let recovery_blocked = recovery
+        .as_ref()
+        .is_some_and(|recovery| matches!(recovery.phase.as_str(), "rebuilding" | "blocked"));
+    if blocked != recovery_blocked {
         return Err(RuntimeCommandError::unavailable());
     }
     Ok(())
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 封闭字段集阻止异常文本、路径及未知恢复决策进入界面。
+fn parse_storage_recovery(
+    value: &Value,
+) -> Result<crate::app_runtime::StorageRecovery, RuntimeCommandError> {
+    let object = value
+        .as_object()
+        .filter(|object| {
+            object.len() == 6
+                && object.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "id" | "phase"
+                            | "reason"
+                            | "historyAvailable"
+                            | "backupAvailable"
+                            | "rebuilt"
+                    )
+                })
+        })
+        .ok_or_else(RuntimeCommandError::unavailable)?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(RuntimeCommandError::unavailable)
+    };
+    let boolean = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(RuntimeCommandError::unavailable)
+    };
+    let id = text("id")?;
+    let phase = text("phase")?;
+    if uuid::Uuid::parse_str(id).is_err() || !matches!(phase, "rebuilding" | "ready" | "blocked") {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    let reason = match object.get("reason") {
+        Some(Value::Null) if phase == "ready" => None,
+        Some(Value::String(reason))
+            if matches!(
+                reason.as_str(),
+                "SCHEMA_VALIDATION_FAILED"
+                    | "INITIALIZATION_FAILED"
+                    | "CORRUPT_DATABASE"
+                    | "DISK_FULL"
+                    | "PERMISSION_DENIED"
+                    | "INSTANCE_LOCKED"
+                    | "IO_ERROR"
+            ) =>
+        {
+            Some(reason.clone())
+        }
+        _ => return Err(RuntimeCommandError::unavailable()),
+    };
+    Ok(crate::app_runtime::StorageRecovery {
+        id: id.to_owned(),
+        phase: phase.to_owned(),
+        reason,
+        history_available: boolean("historyAvailable")?,
+        backup_available: boolean("backupAvailable")?,
+        rebuilt: boolean("rebuilt")?,
+    })
+}
+
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 验证 Java 唯一可选 health payload：configuration component 上有界的大写 diagnostic code
 /// 列表；独立 grammar 可阻止任意异常文本或含 secret 诊断跨越 native 边界。
 pub(super) fn valid_health_diagnostics(value: &Value) -> bool {
@@ -785,7 +1044,7 @@ pub(super) fn valid_health_diagnostics(value: &Value) -> bool {
         })
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 发送一个 allowlist 内 Java-owned configuration/credential 操作；含 secret 参数只向 Java
 /// 转发一次，绝不保留在 Host config、status、event 或诊断投影中。
 pub(super) fn config_request_runtime(
@@ -821,7 +1080,7 @@ pub(super) fn config_request_runtime(
         .ok_or_else(RuntimeCommandError::unavailable)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// Java 返回 accepted 后即越过不可回滚的提交点，因此这里只允许执行不会失败的 admission
 /// 记录并直接返回；生命周期与 timeline 投影由各自 owner 异步发布，不能把后置投影失败伪装成
 /// 可重试的 `turn/start` 失败，否则 caller 重试会创建重复 Turn。
@@ -834,7 +1093,7 @@ pub(super) fn turn_runtime(
     let Some(current) = runtime.as_mut() else {
         return Err(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
-            message: "runtime is not ready",
+            message: "runtime is not ready".into(),
             retryable: true,
         });
     };
@@ -873,7 +1132,7 @@ fn turn_admission_runtime(
     let Some(current) = runtime.as_mut() else {
         return Err(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
-            message: "runtime is not ready",
+            message: "runtime is not ready".into(),
             retryable: true,
         });
     };
@@ -965,7 +1224,7 @@ pub(super) fn turn_resume_runtime(
     let Some(current) = runtime.as_mut() else {
         return Err(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
-            message: "runtime is not ready",
+            message: "runtime is not ready".into(),
             retryable: true,
         });
     };
@@ -1221,7 +1480,7 @@ fn fixed_artifact_request(
         .ok_or_else(RuntimeCommandError::unavailable)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 发送 typed cancel 请求，但不修改 lifecycle generation 或停止 sidecar；最终 terminal event
 /// 仍是权威事实。
 pub(super) fn turn_cancel_runtime(
@@ -1233,7 +1492,7 @@ pub(super) fn turn_cancel_runtime(
     let Some(current) = runtime.as_mut() else {
         return Err(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
-            message: "runtime is not ready",
+            message: "runtime is not ready".into(),
             retryable: true,
         });
     };
@@ -1259,7 +1518,7 @@ pub(super) fn turn_cancel_runtime(
     parse_turn_cancel_result(&requested_turn_id, &value)
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 将 cancellation acknowledgement 解析为完整 value object；字段缺失、identity drift 或未接受
 /// 取消都不能向 UI 投影为成功 command。
 pub(super) fn parse_turn_cancel_result(
@@ -1291,6 +1550,7 @@ pub(super) fn parse_turn_cancel_result(
                 "queued"
                     | "running"
                     | "waiting_approval"
+                    | "waiting_input"
                     | "suspended"
                     | "completed"
                     | "failed"
@@ -1322,7 +1582,7 @@ pub(super) fn turn_input_runtime(
     let Some(current) = runtime.as_mut() else {
         return Err(RuntimeCommandError {
             code: "RUNTIME_NOT_READY",
-            message: "runtime is not ready",
+            message: "runtime is not ready".into(),
             retryable: true,
         });
     };
@@ -1333,7 +1593,7 @@ pub(super) fn turn_input_runtime(
         .to_owned();
     let operation_id = if method == "turn/input/enqueue" {
         params
-            .get("clientOperationId")
+            .get("operationKey")
             .and_then(Value::as_str)
             .map(str::to_owned)
     } else {
@@ -1366,14 +1626,15 @@ fn recover_enqueued_input(
 ) -> Result<TurnInputResult, RuntimeCommandError> {
     let unknown = || RuntimeCommandError {
         code: "OPERATION_UNCONFIRMED",
-        message: "input outcome is unknown; refresh the conversation before submitting again",
+        message: "input outcome is unknown; refresh the conversation before submitting again"
+            .into(),
         retryable: false,
     };
     let response = current
         .client
         .request(
             "operation/read",
-            json!({"clientOperationId":operation_id}),
+            json!({"operationKey":operation_id}),
             timeout,
         )
         .map_err(|_| unknown())?;
@@ -1791,7 +2052,7 @@ fn parse_queued_input_issue(
     }))
 }
 
-/// 将已验证 RPC errorCode 映射为稳定命令错误，展示 message 不参与分类。
+/// 按 errorCode 映射稳定命令错误；只有已校验且带固定重绑前缀的 WORKSPACE_BUSY message 可作为有界摘要展示。
 pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
     match value
         .get("data")
@@ -1800,257 +2061,248 @@ pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
     {
         Some("WORKSPACE_NOT_FOUND") => RuntimeCommandError {
             code: "WORKSPACE_NOT_FOUND",
-            message: "workspace was not found",
+            message: "workspace was not found".into(),
             retryable: false,
         },
+        Some("WORKSPACE_BUSY") => workspace_busy_rpc_error(value),
         Some("THREAD_NOT_FOUND") => RuntimeCommandError {
             code: "THREAD_NOT_FOUND",
-            message: "thread was not found",
+            message: "thread was not found".into(),
             retryable: false,
         },
         Some("TURN_NOT_FOUND") => RuntimeCommandError {
             code: "TURN_NOT_FOUND",
-            message: "turn was not found",
+            message: "turn was not found".into(),
             retryable: false,
         },
         Some("TURN_NOT_REASKABLE") => RuntimeCommandError {
             code: "TURN_NOT_REASKABLE",
-            message: "turn cannot be edited",
+            message: "turn cannot be edited".into(),
             retryable: false,
         },
         Some("THREAD_READ_ONLY") => RuntimeCommandError {
             code: "THREAD_READ_ONLY",
-            message: "thread is read-only",
+            message: "thread is read-only".into(),
             retryable: false,
         },
         Some("TASK_NOT_FOUND") => RuntimeCommandError {
             code: "TASK_NOT_FOUND",
-            message: "task was not found",
+            message: "task was not found".into(),
             retryable: false,
         },
         Some("TASK_RELATION_INVALID") => RuntimeCommandError {
             code: "TASK_RELATION_INVALID",
-            message: "task relationship is invalid",
+            message: "task relationship is invalid".into(),
             retryable: false,
         },
         Some("TASK_CONTEXT_REVISION_CONFLICT") => RuntimeCommandError {
             code: "TASK_CONTEXT_REVISION_CONFLICT",
-            message: "task context revision changed",
+            message: "task context revision changed".into(),
             retryable: true,
         },
         Some("TASK_PERMISSION_DENIED") => RuntimeCommandError {
             code: "TASK_PERMISSION_DENIED",
-            message: "task operation is not permitted",
+            message: "task operation is not permitted".into(),
             retryable: false,
         },
         Some("TASK_DEPTH_LIMIT") => RuntimeCommandError {
             code: "TASK_DEPTH_LIMIT",
-            message: "task depth limit was reached",
+            message: "task depth limit was reached".into(),
             retryable: false,
         },
         Some("TASK_TREE_LIMIT") => RuntimeCommandError {
             code: "TASK_TREE_LIMIT",
-            message: "task tree limit was reached",
+            message: "task tree limit was reached".into(),
             retryable: false,
         },
         Some("TASK_MAILBOX_FULL") => RuntimeCommandError {
             code: "TASK_MAILBOX_FULL",
-            message: "task mailbox is full",
+            message: "task mailbox is full".into(),
             retryable: true,
         },
         Some("TASK_TREE_DELETE_REQUIRED") => RuntimeCommandError {
             code: "TASK_TREE_DELETE_REQUIRED",
-            message: "task tree delete confirmation is required",
+            message: "task tree delete confirmation is required".into(),
             retryable: false,
         },
         Some("TASK_OBSERVATION_INVALID") => RuntimeCommandError {
             code: "TASK_OBSERVATION_INVALID",
-            message: "task observation is invalid",
+            message: "task observation is invalid".into(),
             retryable: false,
         },
         Some("WORKSPACE_WRITE_LEASE_TIMEOUT") => RuntimeCommandError {
             code: "WORKSPACE_WRITE_LEASE_TIMEOUT",
-            message: "workspace write lease timed out",
+            message: "workspace write lease timed out".into(),
             retryable: true,
         },
-        Some("GOAL_NOT_FOUND") => RuntimeCommandError {
-            code: "GOAL_NOT_FOUND",
-            message: "goal was not found",
-            retryable: false,
-        },
-        Some("GOAL_REVISION_CONFLICT") => RuntimeCommandError {
-            code: "GOAL_REVISION_CONFLICT",
-            message: "goal revision changed",
-            retryable: true,
-        },
-        Some("GOAL_INVALID_STATE") => RuntimeCommandError {
-            code: "GOAL_INVALID_STATE",
-            message: "goal state does not allow this operation",
-            retryable: false,
-        },
-        Some("PLAN_INVALID") => RuntimeCommandError {
-            code: "PLAN_INVALID",
-            message: "plan is invalid",
-            retryable: false,
-        },
-        Some("PLAN_APPROVAL_STALE") => RuntimeCommandError {
-            code: "PLAN_APPROVAL_STALE",
-            message: "plan approval is stale",
-            retryable: false,
-        },
-        Some("GOAL_EVIDENCE_INCOMPLETE") => RuntimeCommandError {
-            code: "GOAL_EVIDENCE_INCOMPLETE",
-            message: "goal acceptance evidence is incomplete",
-            retryable: false,
-        },
-        Some("GOAL_RECOVERY_REQUIRED") => RuntimeCommandError {
-            code: "GOAL_RECOVERY_REQUIRED",
-            message: "goal recovery requires user action",
-            retryable: false,
-        },
-        Some("INTERACTION_NOT_FOUND") => RuntimeCommandError {
-            code: "INTERACTION_NOT_FOUND",
-            message: "interaction was not found",
-            retryable: false,
-        },
-        Some("INTERACTION_REVISION_CONFLICT") => RuntimeCommandError {
-            code: "INTERACTION_REVISION_CONFLICT",
-            message: "interaction revision changed",
-            retryable: true,
-        },
-        Some("INTERACTION_INVALID_STATE") => RuntimeCommandError {
-            code: "INTERACTION_INVALID_STATE",
-            message: "interaction state does not allow this operation",
-            retryable: false,
-        },
-        Some("INTERACTION_INVALID") => RuntimeCommandError {
-            code: "INTERACTION_INVALID",
-            message: "interaction is invalid",
+        Some("PLAN_NOT_FOUND") => RuntimeCommandError {
+            code: "PLAN_NOT_FOUND",
+            message: "plan was not found".into(),
             retryable: false,
         },
         Some("PLAN_REVISION_CONFLICT") => RuntimeCommandError {
             code: "PLAN_REVISION_CONFLICT",
-            message: "plan revision changed",
+            message: "plan revision changed".into(),
             retryable: true,
         },
         Some("PLAN_INVALID_STATE") => RuntimeCommandError {
             code: "PLAN_INVALID_STATE",
-            message: "plan state does not allow this operation",
+            message: "plan state does not allow this operation".into(),
+            retryable: false,
+        },
+        Some("PLAN_INVALID") => RuntimeCommandError {
+            code: "PLAN_INVALID",
+            message: "plan is invalid".into(),
+            retryable: false,
+        },
+        Some("PLAN_APPROVAL_STALE") => RuntimeCommandError {
+            code: "PLAN_APPROVAL_STALE",
+            message: "plan approval is stale".into(),
+            retryable: false,
+        },
+        Some("PLAN_EVIDENCE_INCOMPLETE") => RuntimeCommandError {
+            code: "PLAN_EVIDENCE_INCOMPLETE",
+            message: "plan acceptance evidence is incomplete".into(),
+            retryable: false,
+        },
+        Some("PLAN_RECOVERY_REQUIRED") => RuntimeCommandError {
+            code: "PLAN_RECOVERY_REQUIRED",
+            message: "计划运行身份记录不完整，无法确认控制结果。请核查当前执行状态和已发生的修改；确认原因前不要重新执行。".into(),
+            retryable: false,
+        },
+        Some("INTERACTION_NOT_FOUND") => RuntimeCommandError {
+            code: "INTERACTION_NOT_FOUND",
+            message: "interaction was not found".into(),
+            retryable: false,
+        },
+        Some("INTERACTION_REVISION_CONFLICT") => RuntimeCommandError {
+            code: "INTERACTION_REVISION_CONFLICT",
+            message: "interaction revision changed".into(),
+            retryable: true,
+        },
+        Some("INTERACTION_INVALID_STATE") => RuntimeCommandError {
+            code: "INTERACTION_INVALID_STATE",
+            message: "interaction state does not allow this operation".into(),
+            retryable: false,
+        },
+        Some("INTERACTION_INVALID") => RuntimeCommandError {
+            code: "INTERACTION_INVALID",
+            message: "interaction is invalid".into(),
             retryable: false,
         },
         Some("CONFLICT") => RuntimeCommandError {
             code: "CONFLICT",
-            message: "runtime state conflict",
+            message: "runtime state conflict".into(),
             retryable: true,
         },
         Some("THREAD_BUSY") => RuntimeCommandError {
             code: "THREAD_BUSY",
-            message: "thread is busy",
+            message: "thread is busy".into(),
             retryable: true,
         },
         Some("SUMMARY_FAILURE") => RuntimeCommandError {
             code: "SUMMARY_FAILURE",
-            message: "context summary failed",
+            message: "context summary failed".into(),
             retryable: true,
         },
         Some("CONTEXT_LIMIT") => RuntimeCommandError {
             code: "CONTEXT_LIMIT",
-            message: "context limit was exceeded",
+            message: "context limit was exceeded".into(),
             retryable: false,
         },
         Some("CANCELLED") => RuntimeCommandError {
             code: "CANCELLED",
-            message: "request was cancelled",
+            message: "request was cancelled".into(),
             retryable: false,
         },
         Some("INVALID_STATE") => RuntimeCommandError {
             code: "INVALID_STATE",
-            message: "runtime state is invalid",
+            message: "runtime state is invalid".into(),
             retryable: false,
         },
         Some("RECOVERY_REQUIRED") => RuntimeCommandError {
             code: "RECOVERY_REQUIRED",
-            message: "runtime recovery is required",
+            message: "runtime recovery is required".into(),
             retryable: false,
         },
         Some("TURN_NOT_RESUMABLE") => RuntimeCommandError {
             code: "TURN_NOT_RESUMABLE",
-            message: "turn cannot be resumed",
+            message: "turn cannot be resumed".into(),
             retryable: false,
         },
         Some("TURN_RESUME_ORDER_CONFLICT") => RuntimeCommandError {
             code: "TURN_RESUME_ORDER_CONFLICT",
-            message: "an earlier turn must be resolved first",
+            message: "an earlier turn must be resolved first".into(),
             retryable: true,
         },
         Some("TURN_INPUT_QUEUE_FULL") => RuntimeCommandError {
             code: "TURN_INPUT_QUEUE_FULL",
-            message: "turn input queue is full",
+            message: "turn input queue is full".into(),
             retryable: true,
         },
         Some("QUEUED_INPUT_NOT_FOUND") => RuntimeCommandError {
             code: "QUEUED_INPUT_NOT_FOUND",
-            message: "queued input was not found",
+            message: "queued input was not found".into(),
             retryable: false,
         },
         Some("WORKSPACE_REFERENCE_INVALID") => RuntimeCommandError {
             code: "WORKSPACE_REFERENCE_INVALID",
-            message: "workspace reference is no longer valid",
+            message: "workspace reference is no longer valid".into(),
             retryable: false,
         },
         Some("SKILL_UNAVAILABLE") => RuntimeCommandError {
             code: "SKILL_UNAVAILABLE",
-            message: "skill is unavailable",
+            message: "skill is unavailable".into(),
             retryable: true,
         },
         Some("SKILL_LOAD_FAILED") => RuntimeCommandError {
             code: "SKILL_LOAD_FAILED",
-            message: "skill could not be loaded",
+            message: "skill could not be loaded".into(),
             retryable: true,
         },
         Some("CONTENT_TOO_LARGE") => RuntimeCommandError {
             code: "CONTENT_TOO_LARGE",
-            message: "message content is too large",
+            message: "message content is too large".into(),
             retryable: false,
         },
         Some("CONFIG_INVALID") => RuntimeCommandError {
             code: "CONFIG_INVALID",
-            message: "configuration input is invalid",
+            message: "configuration input is invalid".into(),
             retryable: false,
         },
         Some("CONFIG_CONFLICT") => RuntimeCommandError {
             code: "CONFIG_CONFLICT",
-            message: "configuration version conflict",
+            message: "configuration version conflict".into(),
             retryable: true,
         },
         Some("STORAGE_UNAVAILABLE") => RuntimeCommandError {
             code: "STORAGE_UNAVAILABLE",
-            message: "configuration storage is unavailable",
+            message: "configuration storage is unavailable".into(),
             retryable: true,
         },
         Some("ATTACHMENT_NOT_FOUND") => RuntimeCommandError {
             code: "ATTACHMENT_NOT_FOUND",
-            message: "attachment is unavailable in this scope",
+            message: "attachment is unavailable in this scope".into(),
             retryable: false,
         },
         Some("ATTACHMENT_LIMIT_EXCEEDED") => RuntimeCommandError {
             code: "ATTACHMENT_LIMIT_EXCEEDED",
-            message: "attachment exceeds the supported limit",
+            message: "attachment exceeds the supported limit".into(),
             retryable: false,
         },
         Some("ATTACHMENT_CONFLICT") => RuntimeCommandError {
             code: "ATTACHMENT_CONFLICT",
-            message: "attachment state conflicts with this request",
+            message: "attachment state conflicts with this request".into(),
             retryable: false,
         },
         Some("ATTACHMENT_UNAVAILABLE") => RuntimeCommandError {
             code: "ATTACHMENT_UNAVAILABLE",
-            message: "attachment content is unavailable",
+            message: "attachment content is unavailable".into(),
             retryable: true,
         },
         Some("CONFIG_CORRUPTED") => RuntimeCommandError {
             code: "CONFIG_CORRUPTED",
-            message: "configuration storage is corrupted",
+            message: "configuration storage is corrupted".into(),
             retryable: false,
         },
         Some("REQUEST_DEADLINE_EXCEEDED") => RuntimeCommandError::deadline(),
@@ -2059,7 +2311,30 @@ pub(crate) fn command_error_from_rpc(value: &Value) -> RuntimeCommandError {
     }
 }
 
-/// 设计原因：该函数只发送固定 JA-RPC v1 方法并校验完整结果，不开放 generic passthrough。
+/// 原生重绑摘要是公开 Thread 标题的唯一例外；即使调用方绕过 JA-RPC decoder，仍须匹配冻结元组、前缀和 UTF-8 字节边界。
+fn workspace_busy_rpc_error(value: &Value) -> RuntimeCommandError {
+    const SUMMARY_PREFIX: &str = "暂时无法更改项目目录：";
+    let exact_busy_tuple = value.get("code").and_then(Value::as_i64) == Some(-32_100)
+        && value.pointer("/data/errorCode").and_then(Value::as_str) == Some("WORKSPACE_BUSY")
+        && value.pointer("/data/category").and_then(Value::as_str) == Some("conflict")
+        && value.pointer("/data/retryable").and_then(Value::as_bool) == Some(true);
+    let summary = value
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| {
+            exact_busy_tuple
+                && message.starts_with(SUMMARY_PREFIX)
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+        })
+        .map(str::to_owned);
+    summary.map_or_else(
+        RuntimeCommandError::workspace_busy,
+        RuntimeCommandError::workspace_busy_with_summary,
+    )
+}
+
+/// 设计原因：该函数只发送固定 JA-RPC v2 方法并校验完整结果，不开放 generic passthrough。
 /// 将返回 identifier 限制为与输入 ID 相同的有界字符集，防止不可信 sidecar 字符串成为 UI
 /// 控制数据。
 pub(super) fn valid_id(value: &str, max: usize) -> bool {

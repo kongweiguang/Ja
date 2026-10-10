@@ -26,8 +26,8 @@ describe("ExecutionScopeDetails", () => {
     expect(note.textContent).toContain(
       "新会话采用默认值；已有会话保留选择，执行时以更严格的权限为准",
     );
-    expect(note.textContent).toContain("当前项目：需要确认（项目限制）");
-    expect(note.textContent).toContain("当前会话：需要确认（会话选择）");
+    expect(note.textContent).toContain("当前项目：需要审批（项目限制）");
+    expect(note.textContent).toContain("当前会话：需要审批（会话选择）");
     expect(note.querySelectorAll("input,button,select")).toHaveLength(0);
   });
 

@@ -18,9 +18,16 @@ const PENDING_CANCEL_TTL: Duration = Duration::from_secs(30);
 const COMPLETED_TTL: Duration = Duration::from_secs(300);
 
 enum OperationEntry {
-    PendingCancelled { expires_at: Instant },
-    Active(CancellationToken),
-    Completed { expires_at: Instant },
+    PendingCancelled {
+        expires_at: Instant,
+    },
+    Active {
+        cancellation: CancellationToken,
+        commit_started: bool,
+    },
+    Completed {
+        expires_at: Instant,
+    },
 }
 
 #[derive(Default)]
@@ -32,7 +39,7 @@ impl OperationRegistry {
     /// 清除已经失去竞态保护价值的 tombstone；active owner 永不被容量回收。
     fn prune_expired(&mut self, now: Instant) {
         self.entries.retain(|_, entry| match entry {
-            OperationEntry::Active(_) => true,
+            OperationEntry::Active { .. } => true,
             OperationEntry::PendingCancelled { expires_at }
             | OperationEntry::Completed { expires_at } => *expires_at > now,
         });
@@ -54,7 +61,7 @@ impl ReviewOperation {
             registry.prune_expired(Instant::now());
             match registry.entries.get(id.as_str()) {
                 Some(OperationEntry::PendingCancelled { .. }) => cancellation.cancel(),
-                Some(OperationEntry::Active(_) | OperationEntry::Completed { .. }) => {
+                Some(OperationEntry::Active { .. } | OperationEntry::Completed { .. }) => {
                     return Err(ReviewError::InvalidInput);
                 }
                 None if registry.entries.len() >= MAX_TRACKED_OPERATIONS => {
@@ -64,7 +71,10 @@ impl ReviewOperation {
             }
             registry.entries.insert(
                 id.as_str().to_owned(),
-                OperationEntry::Active(cancellation.clone()),
+                OperationEntry::Active {
+                    cancellation: cancellation.clone(),
+                    commit_started: false,
+                },
             );
         }
         Ok(Self {
@@ -78,15 +88,43 @@ impl ReviewOperation {
         self.cancellation.clone()
     }
 
+    /// 以注册表锁线性化取消与附件导入提交，避免两者同时成功而产生归属不明的副作用。
+    pub(crate) fn begin_commit(&self) -> Result<bool, ReviewError> {
+        if self.cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let Some(id) = self.id.as_ref() else {
+            return Ok(true);
+        };
+        let mut registry = operation_registry().lock().map_err(|_| ReviewError::Io)?;
+        match registry.entries.get_mut(id.as_str()) {
+            Some(OperationEntry::Active {
+                cancellation,
+                commit_started,
+            }) if !*commit_started && !cancellation.is_cancelled() => {
+                *commit_started = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// 幂等记录取消意图；worker 尚未注册时保留短期 tombstone 关闭 spawn 竞态。
     pub(crate) fn cancel(operation_id: &ReviewOperationId) -> Result<bool, ReviewError> {
         let mut registry = operation_registry().lock().map_err(|_| ReviewError::Io)?;
         let now = Instant::now();
         registry.prune_expired(now);
         match registry.entries.get(operation_id.as_str()) {
-            Some(OperationEntry::Active(cancellation)) => {
-                cancellation.cancel();
-                Ok(true)
+            Some(OperationEntry::Active {
+                cancellation,
+                commit_started,
+            }) => {
+                if *commit_started {
+                    Ok(false)
+                } else {
+                    cancellation.cancel();
+                    Ok(true)
+                }
             }
             Some(OperationEntry::PendingCancelled { .. }) => Ok(true),
             Some(OperationEntry::Completed { .. }) => Ok(false),
@@ -115,7 +153,7 @@ impl Drop for ReviewOperation {
         if let Ok(mut registry) = operation_registry().lock()
             && matches!(
                 registry.entries.get(id.as_str()),
-                Some(OperationEntry::Active(_))
+                Some(OperationEntry::Active { .. })
             )
         {
             registry.entries.insert(

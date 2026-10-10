@@ -1,15 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-export type WorkspaceKind = "project" | "session" | "legacy_shared";
+export type WorkspaceKind = "project" | "session";
 
 interface WorkspaceProjectionInput {
   workspaceId: string;
   kind: WorkspaceKind;
-  legacySharedWorkspaceId: string | null;
   root: string;
   displayName: string;
   trust: "trusted" | "untrusted";
+  revision?: number;
 }
 
 /**
@@ -19,10 +19,11 @@ interface WorkspaceProjectionInput {
 export interface WorkspaceProjection {
   kind: WorkspaceKind;
   workspaceId: string;
-  legacySharedWorkspaceId: string | null;
   rootPath: string;
   displayName: string;
   trust: "trusted" | "untrusted";
+  /** 项目元数据使用 CAS revision；旧 native Session activation 不携带此字段。 */
+  revision?: number;
 }
 
 /** 将持久 workspace projection 映射到值对象，同时完整保留服务端发出的 kind 与关联字段。 */
@@ -30,10 +31,10 @@ export function workspaceFromHistory(workspace: WorkspaceProjectionInput): Works
   return {
     kind: workspace.kind,
     workspaceId: workspace.workspaceId,
-    legacySharedWorkspaceId: workspace.legacySharedWorkspaceId,
     rootPath: workspace.root,
     displayName: workspace.displayName,
     trust: workspace.trust,
+    revision: workspace.revision,
   };
 }
 
@@ -44,9 +45,9 @@ export function workspaceFromActivation(
   return {
     kind: workspace.kind,
     workspaceId: workspace.workspaceId,
-    legacySharedWorkspaceId: workspace.legacySharedWorkspaceId,
     rootPath: workspace.rootPath,
     displayName: workspace.displayName,
     trust: workspace.trust,
+    revision: workspace.revision,
   };
 }

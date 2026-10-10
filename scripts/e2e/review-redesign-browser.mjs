@@ -209,8 +209,12 @@ async function verifyInteractions(page, fixtureUrl, evidenceDirectory) {
   for (const width of [1000, 520, 360]) {
     await page.setViewportSize({ width, height: 760 });
     for (const mode of ["split", "unified"]) {
-      await shell
-        .getByRole("button", { name: mode === "split" ? "双栏 Diff" : "统一 Diff", exact: true })
+      await shell.getByRole("button", { name: "审查更多操作", exact: true }).click();
+      await page
+        .getByRole("menuitemradio", {
+          name: mode === "split" ? "双栏 Diff" : "统一 Diff",
+          exact: true,
+        })
         .click();
       const viewer = shell.locator(`[data-review-diff-mode="${mode}"]`);
       await viewer.waitFor({ state: "visible" });

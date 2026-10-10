@@ -6,9 +6,10 @@
 use super::{valid_frozen_turn_id, valid_protocol_id, valid_text_id};
 
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_SKILL_REFERENCE_NAME_LENGTH: usize = 256;
 
 /// 设计原因：跨连接持久回执只接受固定随机身份，避免任意文本占用幂等索引或被日志误用。
-fn valid_client_operation_id(value: &str) -> bool {
+fn valid_operation_key(value: &str) -> bool {
     value.len() == 35
         && value.starts_with("op_")
         && value.as_bytes()[3..]
@@ -16,26 +17,65 @@ fn valid_client_operation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// 在原生 IPC 边界统一公开身份语法，避免各端解析分歧；目录存在性与授权由 App Server 判定。
+fn valid_skill_reference_id(value: &str) -> bool {
+    let Some((source, name)) = value.split_once(':') else {
+        return false;
+    };
+    matches!(source, "user" | "ja" | "project")
+        && name.len() <= MAX_SKILL_REFERENCE_NAME_LENGTH
+        && name.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
 /// 领域校验只表达“意图不满足不变量”，稳定 IPC code 与可重试语义由外层映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DomainValidationError;
 
-/// 选择 workspace 的强类型命令输入；客户端只提供 `cwd`，权威 workspace identity 由 Java 返回。
+/// 选择 workspace 的强类型命令输入；打开只登记原生目录，identity 与 trust 均由 Java 返回。
 #[derive(Debug, Clone)]
 pub struct WorkspaceOpenInput {
     pub cwd: String,
     pub display_name: Option<String>,
-    pub trust: String,
 }
 
-/// workspace 选择成功后只返回 Java-owned identity 与脱敏投影，config revision 和配置文档均不得跨越 IPC。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeConfigurationStatus {
-    pub accepted: bool,
-    pub workspace_id: Option<String>,
-    pub cwd: String,
-    pub display_name: String,
-    pub trust: String,
+/// 更新既有持久 Workspace 的原子补丁；Java revision 是并发写入的唯一权威，不以本地缓存替代 CAS。
+#[derive(Debug, Clone)]
+pub struct WorkspaceUpdateInput {
+    pub workspace_id: String,
+    pub expected_revision: u64,
+    pub display_name: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl WorkspaceUpdateInput {
+    /// 在提交前拒绝含糊补丁与不受界的输入；目录真实性、占用和运行门禁仍由 Java owner 判定。
+    pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
+        let valid_name = self.display_name.as_ref().is_none_or(|name| {
+            !name.trim().is_empty()
+                && name.encode_utf16().count() <= 1_024
+                && !name.chars().any(char::is_control)
+        });
+        let valid_cwd = self.cwd.as_ref().is_none_or(|cwd| {
+            !cwd.is_empty()
+                && cwd.encode_utf16().count() <= 4_096
+                && !cwd.contains('\0')
+                && std::path::Path::new(cwd).is_absolute()
+        });
+        if !valid_protocol_id(&self.workspace_id, "ws_", 99)
+            || self.expected_revision > MAX_SAFE_JSON_INTEGER
+            || (self.display_name.is_none() && self.cwd.is_none())
+            || !valid_name
+            || !valid_cwd
+        {
+            return Err(DomainValidationError);
+        }
+        Ok(())
+    }
 }
 
 /// Rust 安全 ingress 完成后提交给 Java 受管存储的固定命令；源路径与 staging 路径不属于该类型。
@@ -86,7 +126,7 @@ impl AttachmentDiscardInput {
 /// 将 WebView 的审批响应限制为业务审批 identity；私有 JSON-RPC request ID 始终留在原生 bridge 内部。
 #[derive(Debug, Clone)]
 pub struct ApprovalResponseInput {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub approval_id: String,
     pub turn_id: String,
     pub decision: String,
@@ -97,7 +137,7 @@ impl ApprovalResponseInput {
     /// 在普通客户端请求进入有界 sidecar session 前校验业务审批 identity 与 revision，避免陈旧响应跨会话生效。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
         if !self.approval_id.starts_with("appr_")
-            || !valid_client_operation_id(&self.client_operation_id)
+            || !valid_operation_key(&self.operation_key)
             || !valid_text_id(&self.approval_id, 128)
             || !valid_protocol_id(&self.turn_id, "turn_", 101)
             || !matches!(self.decision.as_str(), "approve" | "deny")
@@ -111,7 +151,7 @@ impl ApprovalResponseInput {
 /// Turn 启动的强类型输入；拒绝未知字段可防止 WebView 夹带可执行文件、环境或 shell 设置。
 #[derive(Debug, Clone)]
 pub struct TurnStartInput {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub content: Vec<TurnContentPart>,
 }
@@ -139,7 +179,7 @@ impl TurnStartInput {
     /// 在进入进程请求队列前校验身份与输入上限；JSON 映射由 infrastructure 固定完成。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
         if !valid_protocol_id(&self.thread_id, "thr_", 100)
-            || !valid_client_operation_id(&self.client_operation_id)
+            || !valid_operation_key(&self.operation_key)
             || self.content.is_empty()
             || self.content.len() > 64
         {
@@ -152,7 +192,7 @@ impl TurnStartInput {
 /// Continue 是挂到最后一个未答问题的新准入；隐藏 Turn 不携带用户内容，历史与模型上下文继续保留原提问。
 #[derive(Debug, Clone)]
 pub struct TurnContinueInput {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub expected_thread_revision: u64,
 }
@@ -161,7 +201,7 @@ impl TurnContinueInput {
     /// 在进入 actor 队列前拒绝非法 identity 与 revision；当前路径资格和 revision CAS 由 Java 原子裁决。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
         if !valid_protocol_id(&self.thread_id, "thr_", 100)
-            || !valid_client_operation_id(&self.client_operation_id)
+            || !valid_operation_key(&self.operation_key)
             || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
         {
             return Err(DomainValidationError);
@@ -173,7 +213,7 @@ impl TurnContinueInput {
 /// Reask 只替换当前路径最后一个未答问题；旧尝试保留为审计事实，路径选择与历史 CAS 由 Java 持有。
 #[derive(Debug, Clone)]
 pub struct TurnReaskInput {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub expected_thread_revision: u64,
     pub source_message_id: String,
@@ -184,7 +224,7 @@ impl TurnReaskInput {
     /// 复用普通内容联合类型与预算，防止编辑绕过附件/引用上限；源问题资格和当前路径由 Java 判定。
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
         if !valid_protocol_id(&self.thread_id, "thr_", 100)
-            || !valid_client_operation_id(&self.client_operation_id)
+            || !valid_operation_key(&self.operation_key)
             || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
             || !valid_protocol_id(&self.source_message_id, "item_", 101)
         {
@@ -194,7 +234,7 @@ impl TurnReaskInput {
     }
 }
 
-/// 三个消息入口共用同一内容不变量，保证首轮、队列与恢复不会因 Rust 路径不同而分叉。
+/// 三个消息入口共用同一内容不变量；Skill ID 镜像当前 wire schema，目录查找与授权仍由 Java 完成。
 pub(super) fn validate_turn_content(
     content: &[TurnContentPart],
     max_payload_bytes: usize,
@@ -263,9 +303,7 @@ pub(super) fn validate_turn_content(
                     .ok_or(DomainValidationError)?;
             }
             TurnContentPart::SkillReference { skill_id } => {
-                if phase != 0
-                    || !valid_protocol_id(skill_id, "skill_", 101)
-                    || !skill_ids.insert(skill_id)
+                if phase != 0 || !valid_skill_reference_id(skill_id) || !skill_ids.insert(skill_id)
                 {
                     return Err(DomainValidationError);
                 }
@@ -326,7 +364,7 @@ pub struct ToolRecoveryResponseInput {
     pub expected_thread_revision: u64,
     pub expected_recovery_revision: u64,
     pub decision: String,
-    pub idempotency_key: String,
+    pub operation_key: String,
 }
 
 impl ToolRecoveryResponseInput {
@@ -337,7 +375,7 @@ impl ToolRecoveryResponseInput {
             || self.expected_thread_revision > MAX_SAFE_JSON_INTEGER
             || !(1..=MAX_SAFE_JSON_INTEGER).contains(&self.expected_recovery_revision)
             || !matches!(self.decision.as_str(), "retry" | "skip")
-            || !valid_text_id(&self.idempotency_key, 128)
+            || !valid_text_id(&self.operation_key, 128)
         {
             return Err(DomainValidationError);
         }

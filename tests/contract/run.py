@@ -1,6 +1,6 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""运行唯一的 JA-RPC v1 跨语言语料门禁。"""
+"""运行唯一的 JA-RPC v2 跨语言语料门禁。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from typing import Sequence
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,12 +83,13 @@ def run_stage(name: str, command: Sequence[str], environment: dict[str, str]) ->
 
 
 def main() -> int:
-    """按固定顺序验证 schema 及三端生产 consumer，禁止局部成功冒充合同通过。"""
+    """三端共用语料但 Java 每轮新建目标目录，防止已删除类或资源残留后仍报告通过。"""
     if not GOLDEN.is_dir():
         print("CONTRACT_GATE_FAIL stage=setup reason=missing_corpus", file=sys.stderr)
         return 1
     environment = os.environ.copy()
     environment["JA_GOLDEN_PATH"] = str(GOLDEN)
+    java_build_directory = f"target-rpc-v2-contract-{uuid.uuid4().hex}"
     schema_stage = (
         executable("uv"),
         "run",
@@ -116,8 +118,10 @@ def main() -> int:
                         "-B",
                         "-ntp",
                         "-f",
-                        str(ROOT / "app-server" / "pom.xml"),
-                        "-Dja.build.directory=target-rpc-v1-contract",
+                        str(ROOT / "ja-agent" / "pom.xml"),
+                        "-pl", "ja-app-server", "-am",
+                        f"-Dja.build.directory={java_build_directory}",
+                        f"-Dja.app-server.build.directory={java_build_directory}",
                         "-Dtest=GoldenCorpusTest",
                         "test",
                     ),
@@ -131,6 +135,7 @@ def main() -> int:
                         "ja-runtime",
                         "--test",
                         "int_golden_corpus",
+                        "--locked",
                     ),
                 ),
                 (

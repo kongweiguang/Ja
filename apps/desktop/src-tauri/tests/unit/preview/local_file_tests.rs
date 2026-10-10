@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::preview::local_file::{
-    browser_document_extension, parse_absolute_or_file_target, validate_target,
+    browser_document_extension, html_document_extension, normalize_workspace_relative_target,
+    is_local_media_preview_url, parse_absolute_or_file_target, validate_target,
 };
-use crate::preview::{PreviewErrorCode, PreviewResolveFileInput};
+use crate::preview::{PreviewErrorCode, PreviewMode, PreviewResolveFileInput};
 use std::path::PathBuf;
 
 /// 验证带空格和 Unicode 的绝对路径经 file URL 编解码后保持一致；路径无需落盘。
@@ -23,9 +24,11 @@ fn absolute_and_file_targets_preserve_windows_unicode_paths() {
         .expect("file target");
     assert_eq!(parsed, target);
     let absolute = target.to_string_lossy();
-    assert!(parse_absolute_or_file_target(&absolute)
-        .expect("parse absolute")
-        .is_some());
+    assert!(
+        parse_absolute_or_file_target(&absolute)
+            .expect("parse absolute")
+            .is_some()
+    );
     assert_eq!(
         parse_absolute_or_file_target("src/说明.rs").expect("relative target"),
         None
@@ -53,12 +56,62 @@ fn invalid_file_targets_have_static_preview_errors() {
     );
 }
 
-/// 已知浏览器文档扩展名只影响路由，不构成拒绝未知格式的白名单。
+/// 相对 Markdown 路径采用协议 slash 并去除目录尾分隔符，空化根别名不能绕过 Workspace guard。
+#[test]
+fn workspace_relative_target_normalization_preserves_guarded_paths() {
+    assert_eq!(
+        normalize_workspace_relative_target("web/图形 示例/").expect("slash path"),
+        "web/图形 示例"
+    );
+    assert_eq!(
+        normalize_workspace_relative_target("web\\图形 示例\\").expect("Windows relative path"),
+        "web/图形 示例"
+    );
+    for root_alias in ["/", "\\", "///", "\\\\"] {
+        assert_eq!(
+            normalize_workspace_relative_target(root_alias)
+                .expect_err("separator-only path must not become the workspace root")
+                .code(),
+            PreviewErrorCode::FileTargetInvalid
+        );
+    }
+    assert_eq!(
+        normalize_workspace_relative_target(".").expect("leave dot for workspace validation"),
+        "."
+    );
+}
+
+/// 只有媒体扩展名自动进入预览；HTML 必须由用户明确选择浏览器预览。
 #[test]
 fn common_browser_document_extensions_are_recognized() {
     assert!(browser_document_extension("svg"));
     assert!(browser_document_extension("pdf"));
+    assert!(html_document_extension("html"));
+    assert!(html_document_extension("xhtml"));
     assert!(!browser_document_extension("unknown"));
+    assert!(!html_document_extension("unknown"));
+}
+
+/// 媒体 abort 豁免只接受 file URI 中已有 MIME 映射的本地音视频，覆盖中文、空格与大小写扩展名。
+/// @author kongweiguang
+#[test]
+fn local_media_probe_target_is_narrow_and_accepts_windows_file_uris() {
+    let wav = PathBuf::from(r"C:\临时 目录\录音.WAV");
+    let wav_url = url::Url::from_file_path(&wav)
+        .expect("Windows media path must serialize as file URL")
+        .to_string();
+    assert!(wav_url.contains("%20"));
+    assert!(is_local_media_preview_url(&wav_url));
+
+    let mp4 = url::Url::from_file_path(PathBuf::from(r"C:\临时 目录\影片.mp4"))
+        .expect("video path must serialize as file URL")
+        .to_string();
+    assert!(is_local_media_preview_url(&mp4));
+    assert!(!is_local_media_preview_url("https://example.test/recording.wav"));
+    assert!(!is_local_media_preview_url("file:///C:/临时%20目录/image.png"));
+    assert!(!is_local_media_preview_url("file:///C:/临时%20目录/report.pdf"));
+    assert!(!is_local_media_preview_url("file:///C:/临时%20目录/page.html"));
+    assert!(!is_local_media_preview_url("file:///C:/临时%20目录/recording.wav?download=1"));
 }
 
 /// DTO serde 字段名与 renderer 的 camelCase 解析契约保持一致。
@@ -71,6 +124,13 @@ fn resolver_input_rejects_renderer_supplied_workspace_roots() {
     }))
     .expect("camelCase input");
     assert_eq!(decoded.workspace_id.as_deref(), Some("ws_abc"));
+    assert_eq!(decoded.preview_mode, PreviewMode::Editor);
+    let browser = serde_json::from_value::<PreviewResolveFileInput>(serde_json::json!({
+        "target": "C:/work/page.html",
+        "previewMode": "browser"
+    }))
+    .expect("explicit browser preview input");
+    assert_eq!(browser.preview_mode, PreviewMode::Browser);
     assert!(
         serde_json::from_value::<PreviewResolveFileInput>(serde_json::json!({
             "target": "src/main.rs",

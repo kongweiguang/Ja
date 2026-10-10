@@ -7,7 +7,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/**"
-      - "app-server/**"
+      - "ja-agent/**"
       - "contracts/**"
       - "tests/**"
       - "scripts/**"
@@ -32,7 +32,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/**"
-      - "app-server/**"
+      - "ja-agent/**"
       - "contracts/**"
       - "tests/**"
       - "scripts/**"
@@ -78,12 +78,11 @@ permissions:
   actions: read
 
 env:
-  # Reusable release callers build an explicitly verified SHA; direct CI remains bound to its event SHA.
+  # 复用此流程的发布任务构建已明确验证的 SHA，直接触发的 CI 使用对应事件的 SHA。
   JA_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
 
 concurrency:
-  # Ordinary pushes should cancel stale verification, but a release candidate must keep its
-  # signing matrix alive even when another candidate is dispatched while it is running.
+  # 普通推送取消过期验证；候选版本发布期间，即使触发另一个候选版本，也须保留当前签名矩阵任务。
   group: ${{ inputs.release && format('ja-native-release-{0}', inputs.source_commit) || format('ja-native-app-server-{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: ${{ !inputs.release }}
 
@@ -184,9 +183,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           node --test `
+            packages/ja-npm/tests/*.test.mjs `
             scripts/check-initial-baseline.test.mjs `
             scripts/e2e/provider-smoke.test.mjs `
             scripts/e2e/file-search-acceptance.test.mjs `
+            scripts/e2e/windows-desktop-smoke.test.mjs `
+            scripts/e2e/process-session-webview2.test.mjs `
             scripts/verification/powershell-fail-fast.test.mjs `
             scripts/release/create-updater-manifest.test.mjs `
             scripts/release/workflow-contract.test.mjs
@@ -208,7 +210,7 @@ jobs:
     needs: fast-checks
     if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout exact event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -233,13 +235,21 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
 
+      - name: Install the pinned Playwright Chromium runtime
+        shell: pwsh
+        run: pnpm exec playwright install chromium
+
       - name: Run frontend tests and Vite build
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           # typecheck 已在 fast-checks 完成；直接调用 Vite，避免 pnpm build 再执行一次 tsc。
+          pnpm typecheck:example:spring
+          pnpm test:example:spring
           pnpm exec vitest run --maxWorkers=1 --minWorkers=1
+          node scripts/e2e/turn-changes-card-browser.mjs --evidence-directory (Join-Path $env:RUNNER_TEMP 'ja-turn-changes-card-browser')
+          if ($LASTEXITCODE -ne 0) { throw "Turn Change browser acceptance failed with exit code $LASTEXITCODE" }
           pnpm exec vite build --config apps/desktop/vite.config.ts
 
   fast-verification:
@@ -247,7 +257,7 @@ jobs:
     needs: fast-checks
     if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout exact event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -299,6 +309,10 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
 
+      - name: Install the pinned Playwright Chromium runtime
+        shell: pwsh
+        run: pnpm exec playwright install chromium
+
       - name: Cache Rust verification dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -340,7 +354,29 @@ jobs:
       # 两个 fuzz 方法由紧随其后的独立 Maven/JVM 步骤执行，仍是必需门禁。
       - name: Run JVM verification and build the Rust test fixture
         shell: pwsh
-        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=!ProviderInputFuzzTest" verify
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml "-Dtest=!ProviderInputFuzzTest" -Dja.example.browser=true verify
+
+      - name: Verify the Turn Change artifact protocol against the fresh JVM JAR
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:JA_REAL_PROVIDER_JAVA = (Get-Command java).Source
+          node scripts/e2e/turn-change-artifact-rpc.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Turn Change artifact RPC acceptance failed with exit code $LASTEXITCODE" }
+
+      - name: Run isolated process-session WebView2 acceptance
+        shell: pwsh
+        env:
+          JA_E2E_REAL_PROVIDER: "0"
+          JA_E2E_REAL_PROVIDER_API_KEY: ""
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:JA_E2E_APP_SERVER_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
+          $evidence = ".tmp/process-session-webview2-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          node scripts/e2e/process-session-webview2.mjs --java-home $env:JAVA_HOME --jar $env:JA_E2E_APP_SERVER_JAR --evidence-directory $evidence
+          if ($LASTEXITCODE -ne 0) { throw "process-session WebView2 acceptance failed with exit code $LASTEXITCODE" }
 
       - name: Run file-search acceptance against JVM App Server
         shell: pwsh
@@ -349,7 +385,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-file-search-jvm-evidence'
           New-Item -ItemType Directory -Force -Path $evidence | Out-Null
-          $jar = (Resolve-Path 'app-server/target/ja-app-server.jar').Path
+          $jar = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
           $java = (Get-Command java).Source
           node scripts/e2e/file-search-acceptance.mjs --jar $jar --java $java --evidence-directory $evidence --silent
           if ($LASTEXITCODE -ne 0) { throw "JVM file-search acceptance failed with exit code $LASTEXITCODE" }
@@ -361,13 +397,13 @@ jobs:
         shell: pwsh
         env:
           JAZZER_FUZZ: "1"
-        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
 
-      - name: Fuzz strict Provider SSE parsing
+      - name: Fuzz Provider event JSON parsing
         shell: pwsh
         env:
           JAZZER_FUZZ: "1"
-        run: mvn.cmd -B -ntp -f app-server/pom.xml "-Dtest=ProviderInputFuzzTest#strictSseReaderFailsClosedForArbitraryBytes" test
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#providerJsonFailsClosedForArbitraryBytes" test
 
       - name: Run the Rust workspace gates
         shell: pwsh
@@ -375,7 +411,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $env:JA_TEST_JAVA = (Get-Command java).Source
-          $env:JA_TEST_JAR = (Resolve-Path 'app-server/target/ja-app-server.jar').Path
+          $env:JA_TEST_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
           cargo install cargo-machete --version 0.9.2 --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           # int_internal 含真实 JVM/Git/Shell 进程测试；foundation 自身的 JVM 锁无法隔离其它模块的
@@ -383,6 +419,12 @@ jobs:
           # 也不改变测试内部显式并发场景或产品 15s timeout。
           cargo test --workspace --all-targets --locked -- --test-threads=1
           cargo machete --with-metadata --skip-target-dir
+          cargo build --locked -p ja-cli
+          if ($LASTEXITCODE -ne 0) { throw "Ja CLI fixture build failed with exit code $LASTEXITCODE" }
+          $cli = (Resolve-Path 'target/debug/ja.exe').Path
+          $evidence = ".tmp/cli-review-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          node scripts/e2e/cli-review-loopback.mjs --cli $cli --jar $env:JA_TEST_JAR --java $env:JA_TEST_JAVA --evidence-directory $evidence
+          if ($LASTEXITCODE -ne 0) { throw "CLI Review loopback acceptance failed with exit code $LASTEXITCODE" }
 
   native-app-server:
     name: App Server (${{ matrix.platform }} / ${{ matrix.arch }})
@@ -400,7 +442,7 @@ jobs:
         )
       }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -430,7 +472,7 @@ jobs:
             nikSuffix: macos-aarch64
             nikSha256: 8C74D049FA2B83A6A23F6981293EC956E7195C5FF546B8EB0DD20DF0BD92A99B
     env:
-      # Reusable workflows retain the caller's event name, so release behavior must depend on its explicit input.
+      # 复用工作流会保留调用方的事件名，因此发布行为须由显式输入决定。
       JA_RELEASE: ${{ inputs.release == true }}
       NIK_VERSION: 25.0.3+2
       NIK_JAVA_VERSION: 25.0.3+12
@@ -468,7 +510,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ((git rev-parse HEAD).Trim() -ne $env:JA_SOURCE_COMMIT) { throw 'checkout commit differs from selected source commit' }
-          if (-not (Select-String -LiteralPath 'app-server/pom.xml' -Pattern '<buildArg>--no-fallback</buildArg>' -Quiet)) { throw 'Native Image fallback is not explicitly disabled' }
+          if (-not (Select-String -LiteralPath 'ja-agent/ja-app-server/pom.xml' -Pattern '<buildArg>--no-fallback</buildArg>' -Quiet)) { throw 'Native Image fallback is not explicitly disabled' }
           $evidence = Join-Path $env:RUNNER_TEMP 'ja-native-evidence'
           New-Item -ItemType Directory -Force -Path $evidence | Out-Null
           "JA_NATIVE_EVIDENCE=$evidence" | Add-Content -Path $env:GITHUB_ENV
@@ -480,7 +522,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$JA_SOURCE_COMMIT"
-          grep -Fq '<buildArg>--no-fallback</buildArg>' app-server/pom.xml
+          grep -Fq '<buildArg>--no-fallback</buildArg>' ja-agent/ja-app-server/pom.xml
           evidence="$RUNNER_TEMP/ja-native-evidence"
           mkdir -p "$evidence"
           printf 'JA_NATIVE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
@@ -616,7 +658,7 @@ jobs:
           $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
           python -B scripts/release/restore-verified-native.py `
             --input $inputRoot `
-            --artifact 'app-server/target/ja-app-server.exe' `
+            --artifact 'ja-agent/ja-app-server/target/ja-app-server.exe' `
             --evidence-dir $env:JA_NATIVE_EVIDENCE `
             --source-commit $env:JA_SOURCE_COMMIT `
             --platform windows `
@@ -636,7 +678,7 @@ jobs:
           $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
           python3 -B scripts/release/restore-verified-native.py `
             --input $inputRoot `
-            --artifact 'app-server/target/ja-app-server' `
+            --artifact 'ja-agent/ja-app-server/target/ja-app-server' `
             --evidence-dir $env:JA_NATIVE_EVIDENCE `
             --source-commit $env:JA_SOURCE_COMMIT `
             --platform macos `
@@ -647,17 +689,17 @@ jobs:
             --verified-run-id '${{ inputs.verified_run_id }}'
           if ($LASTEXITCODE -ne 0) { throw "verified macOS native restore failed with exit code $LASTEXITCODE" }
 
-      # fast-verification owns JVM tests and verify-bound quality gates once on Windows.
-      # Matrix jobs only build each platform artifact and prove it through the native smoke below.
+      # fast-verification 在 Windows 上统一执行一次 JVM 测试及 verify 阶段质量门禁。
+      # 矩阵任务构建各平台产物，并通过下方原生冒烟验证检查产物。
       - name: Generate CycloneDX SBOM (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
-        run: mvn.cmd -B -ntp -f app-server/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server -DoutputDirectory="$env:JA_NATIVE_EVIDENCE"
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom -DoutputDirectory="$env:JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
 
       - name: Generate CycloneDX SBOM (macOS)
         if: matrix.platform == 'macos'
         shell: bash
-        run: mvn -B -ntp -f app-server/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server -DoutputDirectory="$JA_NATIVE_EVIDENCE"
+        run: mvn -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom -DoutputDirectory="$JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
 
       - name: Build App Server Native Image (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
@@ -667,20 +709,20 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
           if not defined VSINSTALL exit /b 1
           call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64
-          call mvn.cmd -B -ntp -f app-server/pom.xml -Pnative -DskipTests clean package
-          if not exist app-server\target\ja-app-server.exe exit /b 1
-          dumpbin /headers app-server\target\ja-app-server.exe | findstr /I /C:"machine (x64)"
+          call mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-app-server -am -Pnative -DskipTests clean package
+          if not exist ja-agent/ja-app-server\target\ja-app-server.exe exit /b 1
+          dumpbin /headers ja-agent/ja-app-server\target\ja-app-server.exe | findstr /I /C:"machine (x64)"
 
       - name: Build App Server Native Image (macOS)
         if: matrix.platform == 'macos' && env.JA_RELEASE != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          mvn -B -ntp -f app-server/pom.xml -Pnative -DskipTests clean package
-          test -x app-server/target/ja-app-server
-          file app-server/target/ja-app-server | tee "$JA_NATIVE_EVIDENCE/file.txt"
+          mvn -B -ntp -f ja-agent/pom.xml -pl :ja-app-server -am -Pnative -DskipTests clean package
+          test -x ja-agent/ja-app-server/target/ja-app-server
+          file ja-agent/ja-app-server/target/ja-app-server | tee "$JA_NATIVE_EVIDENCE/file.txt"
           grep -Fq '${{ matrix.arch }}' "$JA_NATIVE_EVIDENCE/file.txt"
-          otool -L app-server/target/ja-app-server | tee "$JA_NATIVE_EVIDENCE/otool.txt"
+          otool -L ja-agent/ja-app-server/target/ja-app-server | tee "$JA_NATIVE_EVIDENCE/otool.txt"
           if grep -Eiq 'java|jre|jdk' "$JA_NATIVE_EVIDENCE/otool.txt"; then
             echo 'Native Image executable links to a JVM runtime' >&2
             exit 1
@@ -692,10 +734,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $data = Join-Path $env:RUNNER_TEMP 'Ja App Server\unicode 空格 data'
-          $artifactPath = Join-Path $PWD 'app-server/target/ja-app-server.exe'
+          $artifactPath = Join-Path $PWD 'ja-agent/ja-app-server/target/ja-app-server.exe'
           $artifact = Get-Item -LiteralPath $artifactPath -ErrorAction Stop
-          # The current release matrix peaks at 106,893,312 bytes; retain a bounded
-          # copied-artifact guard while allowing the verified Native Image headroom.
+          # 当前发布矩阵的最大产物为 106,893,312 字节；复制产物仍须受大小限制，
+          # 同时为已验证的 Native Image 产物预留增长空间。
           $maxBytes = [int64](120 * 1024 * 1024)
           if ($artifact.Length -le 0 -or $artifact.Length -gt $maxBytes) { throw 'fresh native executable is missing, empty, or over the approved size limit' }
           $sha256 = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -716,7 +758,7 @@ jobs:
         run: |
           set -euo pipefail
           data="$RUNNER_TEMP/Ja App Server/unicode 空格 data"
-          artifact='app-server/target/ja-app-server'
+          artifact='ja-agent/ja-app-server/target/ja-app-server'
           identity="$(python3 - "$artifact" <<'PY'
           import hashlib
           from pathlib import Path
@@ -731,7 +773,7 @@ jobs:
           PY
           )"
           IFS=$'\t' read -r sha256 size_bytes mtime_ns <<< "$identity"
-          # Keep this bound identical to the Windows smoke gate and local verifier.
+          # 此上限须与 Windows 冒烟门禁和本地验证器保持一致。
           if [ -z "$sha256" ] || [ -z "$size_bytes" ] || [ -z "$mtime_ns" ] || [ "$size_bytes" -le 0 ] || [ "$size_bytes" -gt $((120 * 1024 * 1024)) ]; then
             echo 'fresh native executable is missing, empty, over the approved size limit, or has incomplete identity' >&2
             exit 1
@@ -753,14 +795,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner '${{ matrix.runner }}' --source-commit $env:JA_SOURCE_COMMIT --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
+          python -B scripts/native/make-build-report.py --artifact ja-agent/ja-app-server/target/ja-app-server.exe --sbom (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') --smoke (Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json') --output (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --checksum-output (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.exe.sha256') --platform windows --arch x86_64 --runner '${{ matrix.runner }}' --source-commit $env:JA_SOURCE_COMMIT --nik-version $env:NIK_VERSION --nik-java-version $env:NIK_JAVA_VERSION --nik-sha256 $env:NIK_SHA256 --no-fallback
 
       - name: Write checksum and build report (macOS)
         if: matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B scripts/native/make-build-report.py --artifact app-server/target/ja-app-server --sbom "$JA_NATIVE_EVIDENCE/ja-app-server.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja-app-server.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$JA_SOURCE_COMMIT" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
+          python3 -B scripts/native/make-build-report.py --artifact ja-agent/ja-app-server/target/ja-app-server --sbom "$JA_NATIVE_EVIDENCE/ja-app-server.json" --smoke "$JA_NATIVE_EVIDENCE/smoke.json" --output "$JA_NATIVE_EVIDENCE/build-report.json" --checksum-output "$JA_NATIVE_EVIDENCE/ja-app-server.sha256" --platform macos --arch '${{ matrix.arch }}' --runner '${{ matrix.runner }}' --source-commit "$JA_SOURCE_COMMIT" --nik-version "$NIK_VERSION" --nik-java-version "$NIK_JAVA_VERSION" --nik-sha256 "$NIK_SHA256" --no-fallback
 
       - name: Validate sidecar staging contract (Windows dry-run)
         if: matrix.platform == 'windows'
@@ -769,7 +811,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage-dry-run'
           $dryRun = Join-Path $env:JA_NATIVE_EVIDENCE 'sidecar-dry-run.json'
-          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --dry-run | Tee-Object -FilePath $dryRun
+          python -B scripts/native/stage-sidecar.py --artifact ja-agent/ja-app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') --dry-run | Tee-Object -FilePath $dryRun
           if ($LASTEXITCODE -ne 0) { throw "sidecar dry-run failed with exit code $LASTEXITCODE" }
 
       - name: Stage Tauri sidecar resource (Windows)
@@ -778,7 +820,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
-          python -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
+          python -B scripts/native/stage-sidecar.py --artifact ja-agent/ja-app-server/target/ja-app-server.exe --output-dir $stage --target-triple '${{ matrix.targetTriple }}' --platform windows --arch '${{ matrix.arch }}' --source-commit $env:JA_SOURCE_COMMIT --build-report (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json')
 
       - name: Stage pinned search tools (Windows)
         if: matrix.platform == 'windows'
@@ -790,6 +832,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "search-tool staging failed with exit code $LASTEXITCODE" }
           & (Join-Path $stage 'sidecars/tools/fd.exe') --version
           & (Join-Path $stage 'sidecars/tools/rg.exe') --version
+
+      - name: Run isolated Windows desktop WebView2 smoke
+        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
+        shell: pwsh
+        env:
+          JA_E2E_REAL_PROVIDER: "0"
+          JA_E2E_REAL_PROVIDER_API_KEY: ""
+          JA_E2E_KEEP_TEMP: "0"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:JA_E2E_APP_SERVER_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
+          $env:JA_E2E_SCREENSHOT_DIR = Join-Path $env:RUNNER_TEMP 'ja-windows-desktop-smoke'
+          node scripts/e2e/windows-desktop-smoke.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Windows desktop WebView2 smoke failed with exit code $LASTEXITCODE" }
 
       - name: Run file-search acceptance against Native App Server (Windows)
         if: matrix.platform == 'windows'
@@ -816,7 +873,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage-dry-run"
-          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json" --dry-run | tee "$JA_NATIVE_EVIDENCE/sidecar-dry-run.json"
+          python3 -B scripts/native/stage-sidecar.py --artifact ja-agent/ja-app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json" --dry-run | tee "$JA_NATIVE_EVIDENCE/sidecar-dry-run.json"
 
       - name: Stage Tauri sidecar resource (macOS)
         if: matrix.platform == 'macos'
@@ -824,7 +881,7 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/ja-native-stage"
-          python3 -B scripts/native/stage-sidecar.py --artifact app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
+          python3 -B scripts/native/stage-sidecar.py --artifact ja-agent/ja-app-server/target/ja-app-server --output-dir "$stage" --target-triple '${{ matrix.targetTriple }}' --platform macos --arch '${{ matrix.arch }}' --source-commit "$JA_SOURCE_COMMIT" --build-report "$JA_NATIVE_EVIDENCE/build-report.json"
 
       - name: Stage pinned search tools (macOS)
         if: matrix.platform == 'macos'
@@ -943,8 +1000,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Release and non-release bundles share the installer lifecycle check; the
-          # operating-system signature is intentionally absent while updater signing stays separate.
+          # 发布包和非发布包共用安装生命周期检查；按分发策略不要求操作系统签名，
+          # 更新器签名仍单独验证。
           $installers = @(Get-ChildItem -LiteralPath 'target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
           if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
           $output = Join-Path $env:JA_NATIVE_EVIDENCE 'installer-smoke.json'
@@ -1157,12 +1214,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
-          $target = Join-Path $root 'app-server/target'
+          $target = Join-Path $root 'ja-agent/ja-app-server/target'
           $evidence = Join-Path $root 'native-evidence'
-          New-Item -ItemType Directory -Force -Path $target,$evidence | Out-Null
-          Copy-Item -LiteralPath 'app-server/target/ja-app-server.exe' -Destination (Join-Path $target 'ja-app-server.exe')
+          $tools = Join-Path $root 'tools'
+          New-Item -ItemType Directory -Force -Path $target,$evidence,$tools | Out-Null
+          Copy-Item -LiteralPath 'ja-agent/ja-app-server/target/ja-app-server.exe' -Destination (Join-Path $target 'ja-app-server.exe')
           Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') -Destination (Join-Path $evidence 'build-report.json')
           Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') -Destination (Join-Path $evidence 'ja-app-server.json')
+          # npm 与桌面复用同一组已通过文件搜索验收的原生依赖。
+          Copy-Item -Path 'apps/desktop/src-tauri/sidecars/tools/*' -Destination $tools
 
       - name: Prepare native reuse artifact (macOS)
         if: success() && inputs.release != true && matrix.platform == 'macos'
@@ -1170,10 +1230,10 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/ja-native-reuse"
-          target="$root/app-server/target"
+          target="$root/ja-agent/ja-app-server/target"
           evidence="$root/native-evidence"
           mkdir -p "$target" "$evidence"
-          cp -- 'app-server/target/ja-app-server' "$target/ja-app-server"
+          cp -- 'ja-agent/ja-app-server/target/ja-app-server' "$target/ja-app-server"
           cp -- "$JA_NATIVE_EVIDENCE/build-report.json" "$evidence/build-report.json"
           cp -- "$JA_NATIVE_EVIDENCE/ja-app-server.json" "$evidence/ja-app-server.json"
 
@@ -1193,8 +1253,8 @@ jobs:
         with:
           name: ja-native-app-server-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
-            app-server/target/ja-app-server
-            app-server/target/ja-app-server.exe
+            ja-agent/ja-app-server/target/ja-app-server
+            ja-agent/ja-app-server/target/ja-app-server.exe
             ${{ runner.temp }}/ja-native-evidence
             ${{ runner.temp }}/ja-native-stage
             target/release/bundle/${{ matrix.tauriBundle }}
@@ -1203,6 +1263,87 @@ jobs:
           if-no-files-found: warn
           compression-level: 0
           retention-days: 7
+
+  npm-package-verification:
+    name: npm package install and runtime smoke
+    needs: native-app-server
+    if: ${{ !cancelled() && inputs.release != true && !inputs.skip_verification && needs.native-app-server.result == 'success' }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 1
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+
+      - name: Cache pinned Rust build outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: ". -> target"
+          shared-key: ja-npm-package-smoke
+
+      - name: Download the current run's verified Windows native artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ja-native-reuse-windows-x86_64
+          path: ${{ runner.temp }}/ja-native-reuse
+
+      - name: Build the matching Rust CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked --release -p ja-cli
+
+      - name: Pack, install offline, and exercise the installed npm runtime
+        shell: pwsh
+        env:
+          JA_SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $reuse = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-npm-ci-stage'
+          node packages/ja-npm/scripts/stage.mjs `
+            --cli 'target/release/ja.exe' `
+            --app-server (Join-Path $reuse 'ja-agent/ja-app-server/target/ja-app-server.exe') `
+            --native-report (Join-Path $reuse 'native-evidence/build-report.json') `
+            --search-tools (Join-Path $reuse 'tools') `
+            --source-commit $env:JA_SOURCE_COMMIT `
+            --out $stage
+          if ($LASTEXITCODE -ne 0) { throw 'npm package staging failed' }
+          Push-Location $stage
+          try {
+            node bin/verify.cjs
+            if ($LASTEXITCODE -ne 0) { throw 'staged npm package verification failed' }
+            npm pack --dry-run
+            if ($LASTEXITCODE -ne 0) { throw 'npm pack dry run failed' }
+            $packed = npm pack --json | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $packed.Count -ne 1) { throw 'npm pack did not create exactly one archive' }
+            $archive = Join-Path $stage $packed[0].filename
+          } finally {
+            Pop-Location
+          }
+          $install = Join-Path $env:RUNNER_TEMP "ja-npm-install-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $install) { throw 'npm install target already exists' }
+          New-Item -ItemType Directory -Path $install | Out-Null
+          npm install --offline --ignore-scripts --no-audit --no-fund --prefix $install $archive
+          if ($LASTEXITCODE -ne 0) { throw 'offline npm tarball installation failed' }
+          $launcher = Join-Path $install 'node_modules/.bin/ja.cmd'
+          & $launcher --help
+          if ($LASTEXITCODE -ne 0) { throw 'installed Ja npm launcher --help failed' }
+          & $launcher --version
+          if ($LASTEXITCODE -ne 0) { throw 'installed Ja npm launcher --version failed' }
+          node packages/ja-npm/scripts/verify-runtime.mjs `
+            --package-root (Join-Path $install 'node_modules/@kongweiguang/ja') `
+            --evidence-directory (Join-Path $env:RUNNER_TEMP "ja-npm-runtime-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")
+          if ($LASTEXITCODE -ne 0) { throw 'installed npm runtime smoke failed' }
 
   updater-draft-release:
     name: Assemble updater draft

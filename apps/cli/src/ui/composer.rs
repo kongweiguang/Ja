@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::model::{UiReference, UiReferenceKind};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const MAX_DRAFT_BYTES: usize = 32 * 1024;
 const PASTE_BURST_GAP: Duration = Duration::from_millis(12);
@@ -185,9 +186,9 @@ impl Composer {
         self.paste_burst.clear();
     }
 
-    /// 垂直移动使用终端显示列，并在短行往返时记住原列，不把中文宽字符拆开。
+    /// 垂直移动沿用渲染器相同的内边距折行几何，短行往返时仍保留原显示列。
     pub fn move_vertical(&mut self, width: usize, down: bool) {
-        let positions = self.visual_positions(width.max(4));
+        let positions = self.visual_positions(width);
         let (row, column) = positions[self.cursor];
         let desired = *self.preferred_column.get_or_insert(column);
         let target = if down {
@@ -274,6 +275,16 @@ impl Composer {
         }
     }
 
+    /// 发送失败恢复完整引用和光标；等待期间新写的输入留在撤销栈，不能被恢复操作悄悄丢弃。
+    pub(super) fn restore_submission(&mut self, submitted: Self) {
+        let next_input = (!self.is_empty()).then(|| self.snapshot());
+        *self = submitted;
+        if let Some(next_input) = next_input {
+            bounded_push(&mut self.undo, next_input);
+            self.redo.clear();
+        }
+    }
+
     /// 重做仅重放当前草稿的编辑快照，不跨越一次成功提交。
     pub fn redo(&mut self) {
         if let Some(snapshot) = self.redo.pop_back() {
@@ -350,20 +361,25 @@ impl Composer {
         }
     }
 
-    /// 统一计算逻辑换行和软折行后的光标位置，供垂直移动沿用渲染列宽。
+    /// 与历史问题共用两列正文前缀和字素折行，保证上下移动与左缘对齐后的绘制一致。
     fn visual_positions(&self, width: usize) -> Vec<(usize, usize)> {
+        let width = composer_content_width(width);
+        let continuation_indent = width.min(2);
         let mut positions = Vec::new();
-        let (mut row, mut column) = (0usize, 2usize);
+        let (mut row, mut column) = (0usize, continuation_indent);
         positions.push((row, column));
         for part in self.value.graphemes(true) {
             if part == "\n" {
                 row += 1;
-                column = 2;
+                column = continuation_indent;
             } else {
                 let cells = unicode_width::UnicodeWidthStr::width(part).max(1);
                 if column + cells > width {
                     row += 1;
-                    column = 2;
+                    column = continuation_indent;
+                    if column + cells > width {
+                        column = 0;
+                    }
                 }
                 column += cells;
             }
@@ -387,53 +403,33 @@ impl Composer {
         self.paste_burst.clear();
     }
 
-    /// 按终端列宽预先换行，保证窄窗口中光标和输入文本使用相同几何规则。
+    /// 草稿与已发送问题共用同一提示符和折行结果，发送前后不会改变正文起始列。
     pub(crate) fn visual_lines(&self, width: usize) -> Vec<String> {
-        let width = width.max(4);
-        let mut lines = Vec::new();
-        for (line_index, logical) in self.value.split('\n').enumerate() {
-            let mut current = if line_index == 0 { "› " } else { "  " }.to_owned();
-            let mut cells = 2usize;
-            if logical.is_empty() {
-                lines.push(current);
-                continue;
-            }
-            for grapheme in logical.graphemes(true) {
-                let cell_width = unicode_width::UnicodeWidthStr::width(grapheme).max(1);
-                if cells + cell_width > width {
-                    lines.push(current);
-                    current = "  ".to_owned();
-                    cells = 2;
-                }
-                current.push_str(grapheme);
-                cells += cell_width;
-            }
-            lines.push(current);
-        }
-        if lines.is_empty() {
-            lines.push("› ".to_owned());
-        }
-        lines
+        input_visual_lines(&self.value, width)
     }
 
-    /// 以同一宽字符规则计算光标位置，避免中文文本和窄屏换行错位。
+    /// 光标按同一提示符后的可用列定位，且与多行绘制共享宽字符和折行规则。
     pub(crate) fn visual_cursor(&self, width: usize) -> (usize, usize) {
-        let width = width.max(4);
+        let width = composer_content_width(width);
+        let continuation_indent = width.min(2);
         let mut row = 0usize;
-        let mut column = 2usize;
+        let mut column = continuation_indent;
         for (index, grapheme) in self.value.graphemes(true).enumerate() {
             if index >= self.cursor {
                 break;
             }
             if grapheme == "\n" {
                 row += 1;
-                column = 2;
+                column = continuation_indent;
                 continue;
             }
             let cell_width = unicode_width::UnicodeWidthStr::width(grapheme).max(1);
             if column + cell_width > width {
                 row += 1;
-                column = 2;
+                column = continuation_indent;
+                if column + cell_width > width {
+                    column = 0;
+                }
             }
             column += cell_width;
         }
@@ -453,6 +449,43 @@ impl Composer {
             .map_or(graphemes.len(), |at| self.cursor + at);
         (start, end)
     }
+}
+
+/// 提示符与历史消息左缘对齐，不另加外侧缩进；两列正文前缀由共同折行函数承担。
+pub(crate) fn composer_content_width(terminal_width: usize) -> usize {
+    terminal_width.max(1)
+}
+
+/// 已发送问题与草稿复用字素折行和续行缩进，避免灰底消息与编辑光标使用两套宽度。
+pub(crate) fn input_visual_lines(value: &str, width: usize) -> Vec<String> {
+    let width = composer_content_width(width);
+    let continuation_indent = width.min(2);
+    let prompt = if width >= 2 { "› " } else { "›" };
+    let mut lines = Vec::new();
+    for (line_index, logical) in value.split('\n').enumerate() {
+        let mut current = if line_index == 0 {
+            prompt.to_owned()
+        } else {
+            " ".repeat(continuation_indent)
+        };
+        let mut cells = continuation_indent;
+        for grapheme in logical.graphemes(true) {
+            let cell_width = UnicodeWidthStr::width(grapheme).max(1);
+            if cells + cell_width > width {
+                lines.push(current);
+                current = " ".repeat(continuation_indent);
+                cells = continuation_indent;
+                if cells + cell_width > width {
+                    current.clear();
+                    cells = 0;
+                }
+            }
+            current.push_str(grapheme);
+            cells += cell_width;
+        }
+        lines.push(current);
+    }
+    lines
 }
 
 impl PasteBurst {

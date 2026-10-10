@@ -5,7 +5,7 @@ import type {
   AttachmentPreviewAuthorization,
   AttachmentPreviewSession,
 } from "../domain/attachmentPreviewModel";
-import type { PreviewFileResolution, PreviewTarget } from "../domain/previewModel";
+import type { PreviewFileResolution, PreviewMode, PreviewTarget } from "../domain/previewModel";
 export type {
   AttachmentPreviewAuthorization,
   AttachmentPreviewTarget,
@@ -77,12 +77,14 @@ export interface NativePreviewPort {
     workspaceId?: string,
     line?: number,
     column?: number,
+    previewMode?: PreviewMode,
   ): Promise<PreviewFileResolution>;
   revealFile(target: string, workspaceId?: string): Promise<void>;
   openFile(
     target: string,
     workspaceId: string | undefined,
     viewport: PreviewViewport,
+    previewMode?: PreviewMode,
   ): Promise<PreviewOpenResult>;
   navigate(
     sessionId: string,
@@ -95,6 +97,7 @@ export interface NativePreviewPort {
     generation: number,
     target: string,
     workspaceId?: string,
+    previewMode?: PreviewMode,
   ): Promise<PreviewSessionSnapshot>;
   goBack(sessionId: string, generation: number): Promise<PreviewSessionSnapshot>;
   goForward(sessionId: string, generation: number): Promise<PreviewSessionSnapshot>;

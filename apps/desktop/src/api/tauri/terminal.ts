@@ -161,7 +161,7 @@ export interface TerminalNativeBridge {
 }
 
 /**
- * 将可选测试 bridge 收窄为共享拖放路由所需的监听能力；保持 invoke-only 测试桩无需伪造事件系统。
+ * 将可选测试桥接对象收窄为共享拖放路由所需的监听能力；仅实现 invoke 的测试桩无需伪造事件系统。
  */
 function supportsNativeDrop(
   bridge: TerminalNativeBridge,
@@ -258,7 +258,7 @@ export class TauriTerminalAdapter {
     return parseResult(TerminalProfilesSchema, result);
   }
 
-  /** 使用 allow-list Profile 与 workspace-relative cwd 打开 PTY。 */
+  /** 使用白名单 Profile 与相对于工作区的 cwd 打开 PTY。 */
   async open(
     value: Partial<z.input<typeof TerminalOpenInputSchema>> = {},
   ): Promise<TerminalSessionInfo> {

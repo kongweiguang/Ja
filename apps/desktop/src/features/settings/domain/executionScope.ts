@@ -17,7 +17,7 @@ export interface ExecutionScope {
 
 /** 使用设置页已有的两档公开名称，保持与权限选择控件一致。 */
 export function accessModeLabel(mode: AccessMode): string {
-  return mode === "full_access" ? "全部执行" : "需要确认";
+  return mode === "full_access" ? "完全访问" : "需要审批";
 }
 
 /**

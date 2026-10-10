@@ -86,18 +86,34 @@ describe("TauriTaskAdapter", () => {
     expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.cancel, expect.anything());
   });
 
-  /** 关闭必须走独立 command 并返回服务端 closed ACK，避免前端把 unobserve 当作销毁。 */
-  it("task/close 使用专用 command、固定 input envelope 并校验 closed ACK", async () => {
-    const native = bridgeWithResult({ closed: true });
+  /** 关闭必须走独立 command 并返回服务端完整 purge 集合，避免本地猜测清理范围。 */
+  it("task/close 使用专用 command 并返回服务端完整关闭集合", async () => {
+    const closedThreadIds = [task.taskThreadId, "thr_descendant"];
+    const native = bridgeWithResult({ closedThreadIds });
     const adapter = new TauriTaskAdapter(native.bridge);
 
     await expect(adapter.close({ taskThreadId: task.taskThreadId })).resolves.toEqual({
-      closed: true,
+      closedThreadIds,
     });
     expect(native.invoke).toHaveBeenCalledWith(JA_TASK_COMMANDS.close, {
       input: { taskThreadId: task.taskThreadId },
     });
     expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.unobserve, expect.anything());
     expect(native.invoke).not.toHaveBeenCalledWith(JA_TASK_COMMANDS.cancel, expect.anything());
+  });
+
+  it("task/close rejects incomplete, duplicate, invalid, or legacy success receipts", async () => {
+    for (const result of [
+      { closedThreadIds: [] },
+      { closedThreadIds: [task.taskThreadId, task.taskThreadId] },
+      { closedThreadIds: [task.taskThreadId, "not_a_thread"] },
+      { closedThreadIds: ["thr_other"] },
+      { closed: true },
+    ]) {
+      const adapter = new TauriTaskAdapter(bridgeWithResult(result).bridge);
+      await expect(adapter.close({ taskThreadId: task.taskThreadId })).rejects.toMatchObject({
+        code: "RUNTIME_UNAVAILABLE",
+      });
+    }
   });
 });

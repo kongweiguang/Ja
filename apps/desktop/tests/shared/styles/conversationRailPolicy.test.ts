@@ -30,4 +30,19 @@ describe("conversation content rail policy", () => {
   it("reserves symmetric scrollbar gutters around the timeline rail", () => {
     expect(timelineStyles()).toMatch(/scrollbar-gutter:\s*stable both-edges;/u);
   });
+
+  /** 图标必须锚定标题行而非整个详情高度；真实展开/收起的像素位置另由浏览器验证。 */
+  it("anchors tool icons to the header instead of centering them across expanded details", () => {
+    const styles = timelineStyles();
+    const iconRule = styles.match(/\.ja-work-step__icon\s*\{([^}]+)\}/u)?.[1];
+    const toolIconRule = styles.match(
+      /\.ja-work-step:has\(\.ja-tool-details\)\s*>\s*\.ja-work-step__icon\s*\{([^}]+)\}/u,
+    )?.[1];
+    const triggerRule = styles.match(/\.ja-tool-details__trigger\s*\{([^}]+)\}/u)?.[1];
+
+    expect(iconRule).toMatch(/align-self:\s*start;/u);
+    expect(iconRule).toMatch(/place-items:\s*center;/u);
+    expect(toolIconRule).toMatch(/height:\s*2rem;/u);
+    expect(triggerRule).toMatch(/min-height:\s*2rem;/u);
+  });
 });

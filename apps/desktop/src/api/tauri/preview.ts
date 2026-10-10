@@ -5,6 +5,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { z } from "zod";
 import { normalizePreviewUrl, normalizePreviewWebUrl } from "@/shared/validation/previewUrl";
+import type { PreviewMode } from "@/features/workbench/preview/domain/previewModel";
 import { invokeNativeCommand } from "./nativeInvoke";
 
 /** 封闭 command/event surface，防止 Preview 页面选择任意 Tauri capability。 */
@@ -148,9 +149,9 @@ const PreviewFileResolutionSchema = z
     workspaceId: z.string().min(1).max(128).nullable(),
     workspaceRelativePath: z.string().min(1).max(4_096).nullable(),
     withinWorkspace: z.boolean(),
-    kind: z.enum(["text", "browser", "unsupported"]),
+    kind: z.enum(["text", "browser", "directory", "unsupported"]),
     mimeType: z.string().min(1).max(256).nullable(),
-    fileUrl: PreviewPageUrlSchema,
+    fileUrl: PreviewPageUrlSchema.nullable(),
     content: z.string().max(1_048_576).nullable(),
     truncated: z.boolean(),
     line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).nullable(),
@@ -337,6 +338,7 @@ export class TauriPreviewAdapter {
     workspaceId?: string,
     line?: number,
     column?: number,
+    previewMode: PreviewMode = "editor",
   ): Promise<PreviewFileResolution> {
     const input = parseInput(
       z
@@ -345,9 +347,10 @@ export class TauriPreviewAdapter {
           workspaceId: z.string().min(1).max(128).optional(),
           line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
           column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+          previewMode: z.enum(["editor", "browser"]).default("editor"),
         })
         .strict(),
-      { target, workspaceId, line, column },
+      { target, workspaceId, line, column, previewMode },
     );
     const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.resolveFile, { input });
     return parseResult(PreviewFileResolutionSchema, result);
@@ -372,6 +375,7 @@ export class TauriPreviewAdapter {
     target: string,
     workspaceId: string | undefined,
     viewport: PreviewViewport,
+    previewMode: PreviewMode = "browser",
   ): Promise<PreviewOpenResult> {
     const input = parseInput(
       z
@@ -379,9 +383,10 @@ export class TauriPreviewAdapter {
           target: z.string().trim().min(1).max(4_096),
           workspaceId: z.string().min(1).max(128).optional(),
           viewport: PreviewViewportSchema,
+          previewMode: z.enum(["editor", "browser"]).default("browser"),
         })
         .strict(),
-      { target, workspaceId, viewport },
+      { target, workspaceId, viewport, previewMode },
     );
     if (input.viewport.width < 1 || input.viewport.height < 1)
       throw new PreviewAdapterError("invalid_input");
@@ -410,6 +415,7 @@ export class TauriPreviewAdapter {
     generation: number,
     target: string,
     workspaceId?: string,
+    previewMode: PreviewMode = "browser",
   ): Promise<PreviewSessionSnapshot> {
     const input = parseInput(
       z
@@ -418,9 +424,10 @@ export class TauriPreviewAdapter {
           generation: GenerationSchema,
           target: z.string().trim().min(1).max(4_096),
           workspaceId: z.string().min(1).max(128).optional(),
+          previewMode: z.enum(["editor", "browser"]).default("browser"),
         })
         .strict(),
-      { sessionId, generation, target, workspaceId },
+      { sessionId, generation, target, workspaceId, previewMode },
     );
     const result = await invokePreview(this.bridge, JA_PREVIEW_COMMANDS.navigateFile, { input });
     return parseResult(PreviewSessionSnapshotSchema, result);

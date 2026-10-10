@@ -275,10 +275,15 @@ export function useTimelineScroll({
       };
     }
     if (!followingRef.current) return undefined;
+    /** RAF 可能已进入浏览器派发队列，执行时仍需确认用户意图和 Thread identity 未变化。 */
+    const scrollIfStillFollowing = (): void => {
+      if (!followingRef.current || activeThreadRef.current !== threadId) return;
+      scrollToLatest();
+    };
     const frame =
       typeof window.requestAnimationFrame === "function"
-        ? window.requestAnimationFrame(scrollToLatest)
-        : window.setTimeout(scrollToLatest, 0);
+        ? window.requestAnimationFrame(scrollIfStillFollowing)
+        : window.setTimeout(scrollIfStillFollowing, 0);
     return () => {
       if (typeof window.cancelAnimationFrame === "function" && typeof frame === "number") {
         window.cancelAnimationFrame(frame);
@@ -286,7 +291,7 @@ export function useTimelineScroll({
         window.clearTimeout(frame);
       }
     };
-  }, [revision, restorePosition, rowCount, scrollToLatest]);
+  }, [revision, restorePosition, rowCount, scrollToLatest, threadId]);
 
   /** 清理仅属于本次挂载的 viewport 快照；不会写入或修改用户持久化数据。 */
   useEffect(() => {

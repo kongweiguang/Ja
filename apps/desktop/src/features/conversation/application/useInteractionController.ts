@@ -10,6 +10,7 @@ import {
   type InteractionRequest,
   type InteractionSnapshot,
 } from "./interactionPort";
+import { createOperationKey } from "@/shared/operationKey";
 
 export interface InteractionControllerOptions {
   threadId: string | undefined;
@@ -153,12 +154,12 @@ function answersFromSnapshot(
 
 type PendingDraft = {
   threadId: string;
-  requestId: string;
+  interactionId: string;
   expectedDraftRevision: number;
   answers: readonly InteractionAnswer[];
   page: number;
   collapsed: boolean;
-  idempotencyKey: string;
+  operationKey: string;
   scopeEpoch: number;
   editRevision: number;
 };
@@ -166,8 +167,8 @@ type PendingDraft = {
 const unconfirmedDrafts = new Map<string, PendingDraft>();
 
 /** 用 Thread 与请求稳定定位未确认草稿，避免切回同一会话时串到其它问题。 */
-function pendingDraftKey(threadId: string, requestId: string): string {
-  return `${threadId}\u0000${requestId}`;
+function pendingDraftKey(threadId: string, interactionId: string): string {
+  return `${threadId}\u0000${interactionId}`;
 }
 
 /** 复制未确认草稿的可变数组，缓存只保存用户本地事实，不共享 React 快照引用。 */
@@ -184,14 +185,14 @@ function clonePendingDraft(payload: PendingDraft): PendingDraft {
 /** 记录尚未得到服务端确认的编辑，供同 Thread 切回后明确重试。 */
 function rememberPendingDraft(payload: PendingDraft): void {
   unconfirmedDrafts.set(
-    pendingDraftKey(payload.threadId, payload.requestId),
+    pendingDraftKey(payload.threadId, payload.interactionId),
     clonePendingDraft(payload),
   );
 }
 
 /** 仅在同一编辑代次已收到成功 ACK 时移除本地缓存，避免误删更新后的输入。 */
 function forgetPendingDraft(payload: PendingDraft): void {
-  const key = pendingDraftKey(payload.threadId, payload.requestId);
+  const key = pendingDraftKey(payload.threadId, payload.interactionId);
   if (unconfirmedDrafts.get(key)?.editRevision === payload.editRevision)
     unconfirmedDrafts.delete(key);
 }
@@ -214,12 +215,12 @@ function toDraftSaveInput(
 ): Omit<PendingDraft, "scopeEpoch" | "editRevision"> {
   return {
     threadId: payload.threadId,
-    requestId: payload.requestId,
+    interactionId: payload.interactionId,
     expectedDraftRevision: payload.expectedDraftRevision,
     answers: payload.answers,
     page: payload.page,
     collapsed: payload.collapsed,
-    idempotencyKey: payload.idempotencyKey,
+    operationKey: payload.operationKey,
   };
 }
 
@@ -286,19 +287,19 @@ export function useInteractionController({
   const applySnapshot = useCallback(
     (next: InteractionSnapshot): void => {
       if (next.threadId !== threadId || next.eventSequence < readSequenceRef.current) return;
-      const previousRequestId = snapshotRef.current?.request?.requestId;
-      const nextRequestId = next.request?.requestId;
-      if (previousRequestId !== undefined && previousRequestId !== nextRequestId) {
-        unconfirmedDrafts.delete(pendingDraftKey(threadId, previousRequestId));
+      const previousInteractionId = snapshotRef.current?.request?.interactionId;
+      const nextInteractionId = next.request?.interactionId;
+      if (previousInteractionId !== undefined && previousInteractionId !== nextInteractionId) {
+        unconfirmedDrafts.delete(pendingDraftKey(threadId, previousInteractionId));
       }
       if (next.request !== null && next.request?.status !== "pending") {
-        unconfirmedDrafts.delete(pendingDraftKey(threadId, next.request.requestId));
+        unconfirmedDrafts.delete(pendingDraftKey(threadId, next.request.interactionId));
       }
       const pendingLocalDraft =
         next.request?.status === "pending"
-          ? unconfirmedDrafts.get(pendingDraftKey(threadId, next.request.requestId))
+          ? unconfirmedDrafts.get(pendingDraftKey(threadId, next.request.interactionId))
           : undefined;
-      if (previousRequestId !== nextRequestId) {
+      if (previousInteractionId !== nextInteractionId) {
         dirtyRef.current = false;
         submitKeyRef.current = undefined;
         submitFingerprintRef.current = undefined;
@@ -445,7 +446,7 @@ export function useInteractionController({
             (next) =>
               port.saveDraft({
                 ...input,
-                expectedDraftRevision: next.draft?.revision ?? input.expectedDraftRevision,
+                expectedDraftRevision: next.draft?.draftRevision ?? input.expectedDraftRevision,
               }),
             (reason: unknown) => {
               remember();
@@ -474,17 +475,17 @@ export function useInteractionController({
     if (currentRequest === null || currentRequest === undefined) return;
     const payload: PendingDraft = {
       threadId,
-      requestId: currentRequest.requestId,
-      expectedDraftRevision: current?.draft?.revision ?? 0,
+      interactionId: currentRequest.interactionId,
+      expectedDraftRevision: current?.draft?.draftRevision ?? 0,
       answers: answerList(answersRef.current),
       page: pageRef.current,
       collapsed: collapsedRef.current,
-      idempotencyKey: `interaction-draft-${crypto.randomUUID()}`,
+      operationKey: createOperationKey(),
       scopeEpoch: scopeEpochRef.current,
       editRevision: editRevisionRef.current,
     };
     pendingDraftRef.current = payload;
-    if (unconfirmedDrafts.has(pendingDraftKey(payload.threadId, payload.requestId))) {
+    if (unconfirmedDrafts.has(pendingDraftKey(payload.threadId, payload.interactionId))) {
       rememberPendingDraft(payload);
     }
     draftTimerRef.current = window.setTimeout(() => {
@@ -494,7 +495,7 @@ export function useInteractionController({
       if (
         pending === undefined ||
         pending.scopeEpoch !== scopeEpochRef.current ||
-        snapshotRef.current?.request?.requestId !== pending.requestId
+        snapshotRef.current?.request?.interactionId !== pending.interactionId
       )
         return;
       if (draftSaveInFlightRef.current) {
@@ -510,7 +511,7 @@ export function useInteractionController({
         .then((next) => {
           if (
             pending.scopeEpoch !== scopeEpochRef.current ||
-            snapshotRef.current?.request?.requestId !== pending.requestId
+            snapshotRef.current?.request?.interactionId !== pending.interactionId
           )
             return;
           forgetPendingDraft(pending);
@@ -601,24 +602,24 @@ export function useInteractionController({
       return;
     }
     const submissionAnswers = answersForSubmission(request, answersRef.current);
-    const fingerprint = `${request.requestId}:${request.revision}:${JSON.stringify(submissionAnswers)}`;
-    const idempotencyKey =
+    const fingerprint = `${request.interactionId}:${request.interactionRevision}:${JSON.stringify(submissionAnswers)}`;
+    const operationKey =
       submitKeyRef.current !== undefined && submitFingerprintRef.current === fingerprint
         ? submitKeyRef.current
-        : `interaction-submit-${crypto.randomUUID()}`;
+        : createOperationKey();
     const operationEpoch = scopeEpochRef.current;
     const submissionEditRevision = editRevisionRef.current;
-    submitKeyRef.current = idempotencyKey;
+    submitKeyRef.current = operationKey;
     submitFingerprintRef.current = fingerprint;
     setSubmitting(true);
     setError(undefined);
     const promise = port
       .submit({
         threadId,
-        requestId: request.requestId,
-        expectedRevision: request.revision,
+        interactionId: request.interactionId,
+        expectedInteractionRevision: request.interactionRevision,
         answers: submissionAnswers,
-        idempotencyKey,
+        operationKey,
       })
       .then((next) => {
         if (operationEpoch !== scopeEpochRef.current) return;
@@ -669,9 +670,9 @@ export function useInteractionController({
     try {
       const next = await port.cancel({
         threadId,
-        requestId: request.requestId,
-        expectedRevision: request.revision,
-        idempotencyKey: `interaction-cancel-${crypto.randomUUID()}`,
+        interactionId: request.interactionId,
+        expectedInteractionRevision: request.interactionRevision,
+        operationKey: createOperationKey(),
       });
       if (operationEpoch !== scopeEpochRef.current) return;
       dirtyRef.current = false;

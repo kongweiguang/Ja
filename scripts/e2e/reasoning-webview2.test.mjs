@@ -54,7 +54,7 @@ function continuationRequest(protocol, contract, responseIndex) {
         encrypted_content: contract.privateMarkers.encrypted[index],
       });
       if (index < 2) {
-        const name = index === 0 ? "read" : "shell";
+        const name = index === 0 ? "read" : "exec_command";
         input.push(
           { type: "function_call", call_id: contract.toolCalls[name], name, arguments: "{}" },
           { type: "function_call_output", call_id: contract.toolCalls[name], output: "ok" },
@@ -72,7 +72,7 @@ function continuationRequest(protocol, contract, responseIndex) {
     const messages = [{ role: "user", content: "reasoning" }];
     for (let index = 0; index < responseIndex; index += 1) {
       if (index < 2) {
-        const name = index === 0 ? "read" : "shell";
+        const name = index === 0 ? "read" : "exec_command";
         messages.push(
           {
             role: "assistant",
@@ -112,7 +112,7 @@ function continuationRequest(protocol, contract, responseIndex) {
       { type: "redacted_thinking", data: contract.privateMarkers.redacted[index] },
     ];
     if (index < 2) {
-      const name = index === 0 ? "read" : "shell";
+      const name = index === 0 ? "read" : "exec_command";
       content.push({ type: "tool_use", id: contract.toolCalls[name], name, input: {} });
       messages.push(
         { role: "assistant", content },
@@ -171,7 +171,7 @@ async function postStatus(fixture, protocol, body) {
   return response.status;
 }
 
-/** CLI defaults pin JDK25 and a reasoning-specific Cargo target while protocol remains opt-in. */
+/** CLI 默认固定使用 JDK25 和 reasoning 专用 Cargo target，协议仍需显式启用。 */
 test("reasoning runner defaults are isolated and explicit", () => {
   const parsed = parseArguments([
     "--evidence-directory",
@@ -196,7 +196,7 @@ test("reasoning runner defaults are isolated and explicit", () => {
   );
 });
 
-/** temp-path guard rejects OS temp root itself and allows only a concrete child directory. */
+/** 临时路径检查拒绝操作系统临时目录本身，只允许具体的子目录。 */
 test("reasoning runner temp path guard is fail-closed", () => {
   assert.throws(
     () => assertOwnedTemporaryPath(process.env.TEMP ?? "C:\\Windows\\Temp", "root"),
@@ -340,7 +340,7 @@ test("loopback fixtures reject incomplete native continuation", async () => {
   }
 });
 
-/** report contract rejects a missing native continuation or a sequence that omits reasoning rows. */
+/** 报告合同会拒绝缺少原生续传或遗漏 reasoning 记录的序列。 */
 test("reasoning report contract requires native continuation and interleaving", () => {
   const report = {
     schemaVersion: 1,

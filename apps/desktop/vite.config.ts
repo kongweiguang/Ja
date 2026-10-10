@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -12,6 +13,7 @@ const devPort =
     ? requestedDevPort
     : 1420;
 const e2eDevServer = process.env.JA_E2E_DEV_PORT !== undefined;
+const e2eRuntimeRoot = process.env.JA_E2E_RUNTIME_ROOT?.trim();
 const productionTauriAdapterRoot = fileURLToPath(new URL("./src/api/tauri", import.meta.url));
 const e2eEntryPath = "/tests/app/e2e/main.tsx";
 const e2eNativeInvokePath = fileURLToPath(
@@ -62,6 +64,9 @@ export default defineConfig(async () => ({
   // 桌面应用以自身目录作为构建根，但产物统一输出到 Tauri `frontendDist`
   // 指向的仓库级 dist，避免开发预览与原生打包读取不同资源。
   root: fileURLToPath(new URL(".", import.meta.url)),
+  // 各轮真窗的优化缓存随隔离目录清理；同一轮预热与重启共用缓存，避免其它 runner 使依赖 URL 失效。
+  cacheDir:
+    e2eDevServer && e2eRuntimeRoot ? resolve(e2eRuntimeRoot, "..", "vite-cache") : undefined,
   plugins: [react(), ...(e2eDevServer ? [createE2eCompositionPlugin()] : [])],
 
   resolve: {

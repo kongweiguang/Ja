@@ -80,22 +80,46 @@ const SCHEMA_FIELD_DIFFERENCES = Object.freeze([
   "nullable",
 ]);
 const SCHEMA_TYPES = Object.freeze({
-  grep: Object.freeze({ query: "string", filePattern: "string", path: "string", maxResults: "integer" }),
-  find: Object.freeze({ pattern: "string", path: "string", maxResults: "integer" }),
+  grep: Object.freeze({
+    pattern: "string",
+    glob: "string",
+    path: "string",
+    literal: "boolean",
+    ignoreCase: "boolean",
+    context: "integer",
+    limit: "integer",
+  }),
+  find: Object.freeze({ pattern: "string", path: "string", limit: "integer" }),
   ls: Object.freeze({ path: "string", maxEntries: "integer" }),
 });
 const TOOL_SCHEMA_CONTRACT = Object.freeze({
   grep: Object.freeze({
-    properties: Object.freeze(["filePattern", "maxResults", "path", "query"]),
-    required: Object.freeze(["filePattern", "maxResults", "path", "query"]),
-    nonNullable: Object.freeze(["query"]),
-    nullable: Object.freeze(["filePattern", "maxResults", "path"]),
+    properties: Object.freeze([
+      "context",
+      "glob",
+      "ignoreCase",
+      "limit",
+      "literal",
+      "path",
+      "pattern",
+    ]),
+    required: Object.freeze([
+      "context",
+      "glob",
+      "ignoreCase",
+      "limit",
+      "literal",
+      "path",
+      "pattern",
+    ]),
+    nonNullable: Object.freeze(["pattern"]),
+    nullable: Object.freeze(["context", "glob", "ignoreCase", "limit", "literal", "path"]),
   }),
   find: Object.freeze({
-    properties: Object.freeze(["maxResults", "path", "pattern"]),
-    required: Object.freeze(["maxResults", "path", "pattern"]),
+    properties: Object.freeze(["limit", "path", "pattern"]),
+    required: Object.freeze(["limit", "path", "pattern"]),
     nonNullable: Object.freeze(["pattern"]),
-    nullable: Object.freeze(["maxResults", "path"]),
+    nullable: Object.freeze(["limit", "path"]),
   }),
   ls: Object.freeze({
     properties: Object.freeze(["maxEntries", "path"]),
@@ -154,8 +178,7 @@ function assertToolSchema(payload, name) {
   }
   for (const field of expected.nullable) {
     if (
-      JSON.stringify(schema?.properties?.[field]?.type) !==
-      JSON.stringify([types[field], "null"])
+      JSON.stringify(schema?.properties?.[field]?.type) !== JSON.stringify([types[field], "null"])
     ) {
       throw schemaContractFailure(name, "nullable");
     }
@@ -177,19 +200,22 @@ function safeFixtureFailure(error) {
   return { errorCategory: "fixture", toolName: "unknown", fieldDifference: "tool" };
 }
 
-/** 使用本轮确定的 grep/find/ls 字段生成唯一参数，不保留旧字段别名或兼容回退。 */
+/** 使用当前原生 grep/find/ls 契约，显式填齐 strict wire 字段以检出生产目录漂移。 */
 function toolArguments(payload, name, validGrep) {
   assertToolSchema(payload, name);
   switch (name) {
     case "grep":
       return {
-        query: validGrep ? GREP_MARKER : "",
-        filePattern: "*.txt",
+        pattern: validGrep ? GREP_MARKER : "",
+        glob: "*.txt",
         path: ".",
-        maxResults: 50,
+        literal: true,
+        ignoreCase: false,
+        context: 0,
+        limit: 50,
       };
     case "find":
-      return { pattern: "*.txt", path: ".", maxResults: 200 };
+      return { pattern: "*.txt", path: ".", limit: 200 };
     case "ls":
       return { path: ".", maxEntries: 200 };
     default:
@@ -208,19 +234,20 @@ function continuationOutput(payload, callId) {
   return output.output;
 }
 
-/** 校验 schema 失败回传的字段和纠正建议；错误码由 ToolResult 独立字段承载，不绑定正文格式。 */
+/** 对齐原生 pattern 字段的失败反馈，确保下一轮根据真实 ToolResult 纠错而非夹具假定。 */
 function assertInvalidGrepCorrection(payload) {
   const items = Array.isArray(payload?.input) ? payload.input : [];
   const call = items.find(
-    (candidate) => candidate?.type === "function_call" && candidate?.call_id === INVALID_GREP_CALL_ID,
+    (candidate) =>
+      candidate?.type === "function_call" && candidate?.call_id === INVALID_GREP_CALL_ID,
   );
   assert.ok(call !== undefined, `${INVALID_GREP_CALL_ID} must have a function_call continuation`);
   assert.equal(call.name, "grep");
   const argumentsValue = JSON.parse(call.arguments);
-  assert.equal(argumentsValue.query, "");
-  assert.equal(argumentsValue.filePattern, "*.txt");
+  assert.equal(argumentsValue.pattern, "");
+  assert.equal(argumentsValue.glob, "*.txt");
   const output = continuationOutput(payload, INVALID_GREP_CALL_ID);
-  assert.match(output, /query/iu);
+  assert.match(output, /pattern/iu);
   assert.match(output, /(minLength|non-empty)/iu);
   assert.match(output, /(correct.*argument|retry)/iu);
 }

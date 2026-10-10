@@ -26,6 +26,7 @@ import {
   type SettingsAdapter,
   type SettingsAppearancePort,
   type SettingsPorts,
+  type SettingsUserConfigurationPorts,
   type SettingsRuntimePort,
   type SettingsRuntimeState,
   type SkillListResult,
@@ -47,7 +48,9 @@ interface BootProjection {
 interface SettingsControllerOptions {
   adapter: SettingsAdapter;
   appearancePort: SettingsAppearancePort;
-  workspaceScope: { workspaceId: string; kind: "general" | "project" } | undefined;
+  workspaceScope:
+    | { workspaceId: string; kind: "general" | "project"; bindingKey?: string }
+    | undefined;
   runtimeState: SettingsRuntimeState | undefined;
   boot: BootProjection;
   configurationChange: SettingsConfigurationChange | undefined;
@@ -57,13 +60,15 @@ interface SettingsControllerOptions {
   catalogSection?: "skills" | "mcp" | "all" | "none";
 }
 
-/** Settings controller 只暴露 v1 Provider 聚合，模型选择始终归属已保存 Provider。 */
+/** Settings controller 汇总服务端配置与运行时投影；模型选择始终归属具体已保存的 Provider。 */
 export interface SettingsController {
   loaded: LoadedSettings | undefined;
   /** 当前 Workspace 的 effective 配置，只供对话、Composer 与 Turn 准入消费。 */
   snapshot: SettingsSnapshot;
   /** 设置页唯一可编辑投影，始终来自用户级配置文档。 */
   globalSnapshot: SettingsSnapshot;
+  /** 全局写入固定用户文档，不受此 controller 正在服务的 Workspace scope 影响。 */
+  userConfigurationPorts: SettingsUserConfigurationPorts;
   /** Skills 单独提供全局与当前项目投影，避免其它设置页误把项目 effective 值当成用户写入基线。 */
   skillSettings: {
     global: SkillProjection[];
@@ -83,8 +88,8 @@ export interface SettingsController {
   scopeWorkspaceId: string | undefined;
   error: string | undefined;
   ports: SettingsPorts;
-  /** 由 App Server 备份当前原文并恢复最近完整用户配置后再触发权威重读。 */
-  restoreLastKnownGood(): Promise<void>;
+  /** 显式备份当前原文，再以能确认的配置投影修复指定层。 */
+  repairConfiguration(scope: "user" | "project"): Promise<void>;
   reload(): Promise<void>;
 }
 
@@ -381,12 +386,13 @@ function rebaseSettingsDocument(
 
 /**
  * Settings snapshot 按 workspace、App Server 实例和 runtime generation 分代；workspace 切换
- * 让无法取消的旧 native 结果只能写回旧 key，编辑层切换不重新读取 effective 配置。
+ * 让无法取消的旧 native 结果只能写回旧 key；项目目录改变也换 key，名称不参与绑定身份。
  */
 function settingsSnapshotQueryKey(
   workspaceId: string | undefined,
   serverInstanceId: string | null | undefined,
   runtimeGeneration: number | undefined,
+  bindingKey?: string,
 ) {
   return [
     "settings",
@@ -394,6 +400,7 @@ function settingsSnapshotQueryKey(
     workspaceId ?? "general",
     serverInstanceId ?? "unavailable",
     runtimeGeneration ?? 0,
+    ...(bindingKey === undefined ? [] : [bindingKey]),
   ] as const;
 }
 
@@ -425,6 +432,7 @@ function settingsErrorCode(error: unknown): string | undefined {
  * snapshot 与 Turn admission；全局写 userDocument，项目 MCP/Skill 分字段 CAS patch，
  * 由 App Server 在可信 Workspace 的 .ja/config.toml 上合并。
  * controller 不保存或切换 workspace，也不拥有会话状态。
+ * 已鉴权的 Runtime 仍可能等待存储恢复；只在应用与存储均就绪后读取，避免缓存过早失败。
  */
 export function useSettingsController({
   adapter,
@@ -443,6 +451,9 @@ export function useSettingsController({
   const projectWorkspaceId =
     workspaceScope?.kind === "project" ? workspaceScope.workspaceId : undefined;
   const queryWorkspaceId = projectWorkspaceId;
+  // 同一项目换目录必须丢弃旧目录配置查询；显示名称变更不会产生配置 IO。
+  const workspaceBindingKey =
+    workspaceScope?.kind === "project" ? workspaceScope.bindingKey : undefined;
   const {
     themeMode,
     palette,
@@ -456,7 +467,11 @@ export function useSettingsController({
     setReducedTransparency,
   } = appearancePort;
   const runtimeReady =
-    active && runtimeState !== undefined && ["ready", "busy"].includes(runtimeState.status);
+    active &&
+    runtimeState !== undefined &&
+    ["ready", "busy"].includes(runtimeState.status) &&
+    ["ready", "busy"].includes(boot.status) &&
+    (runtimeState.storageRecovery === undefined || runtimeState.storageRecovery.phase === "ready");
   // Query 与失效 effect 只依赖投影中的分代标量；调用方重建等值对象时不能形成 fetch 循环。
   const runtimeServerInstanceId = runtimeState?.serverInstanceId;
   const runtimeGeneration = runtimeState?.generation;
@@ -474,33 +489,43 @@ export function useSettingsController({
     configurationScope === "user" ||
     (configurationScope === "project" && configurationWorkspaceId === queryWorkspaceId);
   const snapshotKey = useMemo(
-    () => settingsSnapshotQueryKey(queryWorkspaceId, runtimeServerInstanceId, runtimeGeneration),
-    [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId],
+    () =>
+      settingsSnapshotQueryKey(
+        queryWorkspaceId,
+        runtimeServerInstanceId,
+        runtimeGeneration,
+        workspaceBindingKey,
+      ),
+    [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId, workspaceBindingKey],
   );
   const skillWorkspaceId = workspaceScope?.kind === "project" ? queryWorkspaceId : undefined;
   const skillsKey = useMemo(
-    () =>
-      runtimeProjectionKey(
+    () => [
+      ...runtimeProjectionKey(
         "skills",
         runtimeServerInstanceId,
         runtimeGeneration,
         skillWorkspaceId ?? "global",
       ),
-    [runtimeGeneration, runtimeServerInstanceId, skillWorkspaceId],
+      ...(workspaceBindingKey === undefined ? [] : [workspaceBindingKey]),
+    ],
+    [runtimeGeneration, runtimeServerInstanceId, skillWorkspaceId, workspaceBindingKey],
   );
   const globalSkillsKey = useMemo(
     () => runtimeProjectionKey("skills", runtimeServerInstanceId, runtimeGeneration, "global"),
     [runtimeGeneration, runtimeServerInstanceId],
   );
   const mcpKey = useMemo(
-    () =>
-      runtimeProjectionKey(
+    () => [
+      ...runtimeProjectionKey(
         "mcp",
         runtimeServerInstanceId,
         runtimeGeneration,
         queryWorkspaceId ?? "global",
       ),
-    [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId],
+      ...(workspaceBindingKey === undefined ? [] : [workspaceBindingKey]),
+    ],
+    [queryWorkspaceId, runtimeGeneration, runtimeServerInstanceId, workspaceBindingKey],
   );
   const globalMcpKey = useMemo(
     () => runtimeProjectionKey("mcp", runtimeServerInstanceId, runtimeGeneration, "global"),
@@ -702,22 +727,51 @@ export function useSettingsController({
     [adapter, currentLoaded, reload, updateLoadedQuery],
   );
 
-  /**
-   * 恢复仅在用户明确选择时发生，成功后丢弃页面旧投影并重新读取，避免把恢复前的草稿或 CAS
-   * 版本重新写回。冲突仍保留当前界面，用户可以看到外部修改后的最新状态再决定下一步。
-   */
-  const restoreLastKnownGood = useCallback(async (): Promise<void> => {
-    const current = currentLoaded();
-    if (current === undefined) throw new Error("settings unavailable");
-    try {
-      await adapter.restoreLastKnownGood(current.cas.userVersion);
-    } catch (error) {
-      if (settingsErrorCode(error) === "revision_conflict") await reload();
-      throw error;
-    }
-    await reload();
-    await refreshRuntimeSettings();
-  }, [adapter, currentLoaded, refreshRuntimeSettings, reload]);
+  /** Project 普通字段只 patch 当前可信工作区，并以最新项目 CAS 写入后权威回读。 */
+  const saveProjectPatch = useCallback(
+    async (patch: Record<string, unknown>): Promise<void> => {
+      const current = currentLoaded();
+      const workspaceId =
+        workspaceScope?.kind === "project" ? workspaceScope.workspaceId : undefined;
+      if (current === undefined || workspaceId === undefined) {
+        throw new Error("project settings unavailable");
+      }
+      await adapter.patch({
+        scope: "project",
+        workspaceId,
+        expectedVersion: current.cas.projectVersion,
+        patch,
+      });
+      await reload();
+      await refreshRuntimeSettings();
+    },
+    [adapter, currentLoaded, refreshRuntimeSettings, reload, workspaceScope],
+  );
+
+  /** 只提交用户明确确认的安全投影；App Server 负责版本校验、原文备份和原子替换。 */
+  const repairConfiguration = useCallback(
+    async (scope: "user" | "project"): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      const workspaceId =
+        workspaceScope?.kind === "project" ? workspaceScope.workspaceId : undefined;
+      if (scope === "project" && workspaceId === undefined)
+        throw new Error("project settings unavailable");
+      try {
+        await adapter.repairConfiguration(
+          scope === "user"
+            ? { scope, expectedVersion: current.cas.userVersion }
+            : { scope, workspaceId: workspaceId!, expectedVersion: current.cas.projectVersion },
+        );
+      } catch (error) {
+        if (settingsErrorCode(error) === "revision_conflict") await reload();
+        throw error;
+      }
+      await reload();
+      await refreshRuntimeSettings();
+    },
+    [adapter, currentLoaded, refreshRuntimeSettings, reload, workspaceScope],
+  );
 
   /**
    * 整组模型与连接共用 user CAS；能力编辑同步收敛根思考档位，删除默认模型仍须走显式替代流程。
@@ -996,9 +1050,27 @@ export function useSettingsController({
     [currentLoaded, saveDocument],
   );
 
+  /** 共享配置动作先固定 owner，避免全局编辑随活动 Workspace 意外落入项目 patch。 */
+  const saveScopedConfiguration = useCallback(
+    async (
+      current: LoadedSettings,
+      scope: "user" | "project",
+      updateUserDocument: (document: SettingsDocument) => SettingsDocument,
+      projectPatch: Record<string, unknown>,
+    ): Promise<void> => {
+      if (scope === "project") {
+        if (workspaceScope?.kind !== "project") throw new Error("project settings unavailable");
+        await saveProjectPatch(projectPatch);
+        return;
+      }
+      await saveDocument(updateUserDocument(current.userDocument));
+    },
+    [saveDocument, saveProjectPatch, workspaceScope],
+  );
+
   /** 默认选择必须命中真实模型，思考档位由模型能力闭集裁决。 */
-  const saveDefaultSelection = useCallback(
-    async (selection: DefaultModelSelection): Promise<void> => {
+  const saveDefaultSelectionForScope = useCallback(
+    async (selection: DefaultModelSelection, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       const model = current.userDocument.providers
@@ -1011,18 +1083,42 @@ export function useSettingsController({
       ) {
         throw new Error("default selection unavailable");
       }
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        defaultSelection: selection,
-      });
+      await saveScopedConfiguration(
+        current,
+        scope,
+        (document) => ({
+          ...document,
+          revision: document.revision + 1,
+          defaultSelection: selection,
+        }),
+        {
+          default_provider_id: selection.providerId,
+          default_model_id: selection.modelId,
+          default_reasoning_level: selection.reasoningLevel,
+        },
+      );
     },
-    [currentLoaded, saveDocument],
+    [currentLoaded, saveScopedConfiguration],
+  );
+  /** 运行时设置动作保留 controller 当前 Workspace 的配置 owner。 */
+  const saveDefaultSelection = useCallback(
+    (selection: DefaultModelSelection): Promise<void> =>
+      saveDefaultSelectionForScope(
+        selection,
+        workspaceScope?.kind === "project" ? "project" : "user",
+      ),
+    [saveDefaultSelectionForScope, workspaceScope],
+  );
+  /** 设置页全局范围固定写用户文档，即使当前应用正服务项目 Workspace。 */
+  const saveUserDefaultSelection = useCallback(
+    (selection: DefaultModelSelection): Promise<void> =>
+      saveDefaultSelectionForScope(selection, "user"),
+    [saveDefaultSelectionForScope],
   );
 
   /** 子智能体引用必须同时命中已保存目录，防止删除模型后静默改派到其它上游。 */
-  const saveSubagentSettings = useCallback(
-    async (settings: SubagentSettings): Promise<void> => {
+  const saveSubagentSettingsForScope = useCallback(
+    async (settings: SubagentSettings, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
       if ((settings.providerId === null) !== (settings.modelId === null))
@@ -1040,43 +1136,362 @@ export function useSettingsController({
         )
           throw new Error("subagent reasoning level unavailable");
       }
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        subagents: { ...settings },
-      });
+      await saveScopedConfiguration(
+        current,
+        scope,
+        (document) => ({
+          ...document,
+          revision: document.revision + 1,
+          subagents: { ...settings },
+        }),
+        {
+          subagents: {
+            enabled: settings.enabled,
+            provider_id: settings.providerId,
+            model_id: settings.modelId,
+            reasoning_level: settings.reasoningLevel,
+          },
+        },
+      );
     },
-    [currentLoaded, saveDocument],
+    [currentLoaded, saveScopedConfiguration],
+  );
+  /** 运行时设置动作保留 controller 当前 Workspace 的配置 owner。 */
+  const saveSubagentSettings = useCallback(
+    (settings: SubagentSettings): Promise<void> =>
+      saveSubagentSettingsForScope(
+        settings,
+        workspaceScope?.kind === "project" ? "project" : "user",
+      ),
+    [saveSubagentSettingsForScope, workspaceScope],
+  );
+  /** 设置页全局范围固定写用户文档，即使当前应用正服务项目 Workspace。 */
+  const saveUserSubagentSettings = useCallback(
+    (settings: SubagentSettings): Promise<void> => saveSubagentSettingsForScope(settings, "user"),
+    [saveSubagentSettingsForScope],
   );
 
-  /** 持久化根默认访问模式；Thread 的请求级实际值仍由 App Server 在安全点解析。 */
+  /** 根默认访问模式始终与 Thread 请求级实际权限分开持久化。 */
+  const saveAccessModeForScope = useCallback(
+    async (mode: AccessMode, scope: "user" | "project"): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveScopedConfiguration(
+        current,
+        scope,
+        (document) => ({
+          ...document,
+          revision: document.revision + 1,
+          defaultAccessMode: mode,
+        }),
+        { default_access_mode: mode },
+      );
+    },
+    [currentLoaded, saveScopedConfiguration],
+  );
+  /** 运行时设置动作保留 controller 当前 Workspace 的配置 owner。 */
   const saveAccessMode = useCallback(
-    async (mode: AccessMode): Promise<void> => {
-      const current = currentLoaded();
-      if (current === undefined) throw new Error("settings unavailable");
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        defaultAccessMode: mode,
-      });
-    },
-    [currentLoaded, saveDocument],
+    (mode: AccessMode): Promise<void> =>
+      saveAccessModeForScope(mode, workspaceScope?.kind === "project" ? "project" : "user"),
+    [saveAccessModeForScope, workspaceScope],
+  );
+  /** 设置页全局范围固定写用户文档，即使当前应用正服务项目 Workspace。 */
+  const saveUserAccessMode = useCallback(
+    (mode: AccessMode): Promise<void> => saveAccessModeForScope(mode, "user"),
+    [saveAccessModeForScope],
   );
 
-  /**
-   * 仅更新用户层澄清开关并复用完整文档 CAS；项目 effective 快照不能成为写入基线。
-   */
-  const saveClarificationEnabled = useCallback(
-    async (enabled: boolean): Promise<void> => {
+  /** 澄清开关按所选配置层保存，不把 Thread/Plan 的交互状态写入根设置。 */
+  const saveClarificationEnabledForScope = useCallback(
+    async (enabled: boolean, scope: "user" | "project"): Promise<void> => {
       const current = currentLoaded();
       if (current === undefined) throw new Error("settings unavailable");
-      await saveDocument({
-        ...current.userDocument,
-        revision: current.userDocument.revision + 1,
-        clarificationEnabled: enabled,
+      await saveScopedConfiguration(
+        current,
+        scope,
+        (document) => ({
+          ...document,
+          revision: document.revision + 1,
+          clarificationEnabled: enabled,
+        }),
+        { interaction: { clarification_enabled: enabled } },
+      );
+    },
+    [currentLoaded, saveScopedConfiguration],
+  );
+  /** 运行时设置动作保留 controller 当前 Workspace 的配置 owner。 */
+  const saveClarificationEnabled = useCallback(
+    (enabled: boolean): Promise<void> =>
+      saveClarificationEnabledForScope(
+        enabled,
+        workspaceScope?.kind === "project" ? "project" : "user",
+      ),
+    [saveClarificationEnabledForScope, workspaceScope],
+  );
+  /** 设置页全局范围固定写用户文档，即使当前应用正服务项目 Workspace。 */
+  const saveUserClarificationEnabled = useCallback(
+    (enabled: boolean): Promise<void> => saveClarificationEnabledForScope(enabled, "user"),
+    [saveClarificationEnabledForScope],
+  );
+  /** 全局编辑动作复用 controller 的 CAS 写入逻辑，并固定绑定用户层 owner。 */
+  const userConfigurationPorts = useMemo<SettingsUserConfigurationPorts>(
+    () => ({
+      onDefaultSelectionChange: saveUserDefaultSelection,
+      onSubagentSettingsChange: saveUserSubagentSettings,
+      onAccessModeChange: saveUserAccessMode,
+      onClarificationEnabledChange: saveUserClarificationEnabled,
+    }),
+    [
+      saveUserAccessMode,
+      saveUserClarificationEnabled,
+      saveUserDefaultSelection,
+      saveUserSubagentSettings,
+    ],
+  );
+
+  /** 删除单个项目覆盖时只发 RFC 7396 null，保留当前项目的其它设置、Skill 与 MCP。 */
+  const inheritProjectOverride = useCallback(
+    async (field: "defaultSelection" | "accessMode" | "subagents" | "clarification") => {
+      const patch =
+        field === "defaultSelection"
+          ? {
+              default_provider_id: null,
+              default_model_id: null,
+              default_reasoning_level: null,
+            }
+          : field === "accessMode"
+            ? { default_access_mode: null }
+            : field === "subagents"
+              ? { subagents: null }
+              : { interaction: null };
+      await saveProjectPatch(patch);
+    },
+    [saveProjectPatch],
+  );
+
+  /** Project Provider 更新按稳定 ID 和叶字段提交，避免覆盖未知原文或无关项目参数。 */
+  const saveProjectProviderRuntime = useCallback(
+    async (
+      providerId: string,
+      value: { connectTimeoutMs: number; requestTimeoutMs: number; autoCompact: boolean },
+    ): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            network_timeouts: {
+              connect_timeout_ms: value.connectTimeoutMs,
+              request_timeout_ms: value.requestTimeoutMs,
+            },
+            agent_defaults: { context: { auto_compact: value.autoCompact } },
+          },
+        },
       });
     },
-    [currentLoaded, saveDocument],
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 删除一个 Provider 的项目运行参数，保留路由覆盖和同项目其它 Provider 设置。 */
+  const inheritProjectProvider = useCallback(
+    async (providerId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            network_timeouts: {
+              connect_timeout_ms: null,
+              request_timeout_ms: null,
+            },
+            agent_defaults: { context: { auto_compact: null } },
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 项目连接必须一次保存协议、地址和显式凭据引用，避免继承全局密钥到新目标。 */
+  const saveProjectProviderConnection = useCallback(
+    async (
+      providerId: string,
+      connection: {
+        api: "openai_responses" | "anthropic_messages" | "openai_chat_completions";
+        baseUrl: string;
+        credentialId: string;
+      },
+    ): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            api: connection.api,
+            base_url: connection.baseUrl,
+            credential_id: connection.credentialId,
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 清除连接三元组并保留 timeout/context，项目随后完整继承全局连接。 */
+  const inheritProjectProviderConnection = useCallback(
+    async (providerId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            api: null,
+            base_url: null,
+            credential_id: null,
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 按 Provider/Model 稳定 ID 仅提交真正改动的项目模型，未触及模型与源文件字段保持原样。 */
+  const saveProjectProviderModels = useCallback(
+    async (provider: ProviderSave): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      const baselineProvider = current.userDocument.providers.find(
+        (item) => item.providerId === provider.providerId,
+      );
+      if (baselineProvider === undefined) throw new Error("provider unavailable");
+      const existingOverrides =
+        current.projectOverrides.providerRuntime?.find(
+          (item) => item.providerId === provider.providerId,
+        )?.models ?? [];
+      const baseModels = new Map(baselineProvider.models.map((model) => [model.modelId, model]));
+      const desiredModels = new Map(provider.models.map((model) => [model.modelId, model]));
+      const existingIds = new Set(existingOverrides.map((model) => model.modelId));
+      const operations: Record<string, unknown> = {};
+      const sameModel = (left: ProviderModelSave, right: ProviderModelSave): boolean =>
+        JSON.stringify(left) === JSON.stringify(right);
+      const nativeModel = (model: ProviderModelSave): Record<string, unknown> => ({
+        name: model.name.trim() || model.model.trim(),
+        model: model.model.trim(),
+        capabilities: {
+          context_window_tokens: model.capabilities.contextWindowTokens,
+          max_output_tokens: model.capabilities.maxOutputTokens,
+          supports_output_schema: model.capabilities.supportsOutputSchema,
+        },
+        reasoning_level_map: { ...model.reasoningLevelMap },
+        default_reasoning_level:
+          model.defaultReasoningLevel === null ? { __ja_null: true } : model.defaultReasoningLevel,
+      });
+
+      for (const override of existingOverrides) {
+        const desired = desiredModels.get(override.modelId);
+        const base = baseModels.get(override.modelId);
+        if (desired === undefined || (base !== undefined && sameModel(desired, base))) {
+          operations[override.modelId] = null;
+        } else if (!sameModel(desired, override)) {
+          operations[override.modelId] = nativeModel(desired);
+        }
+      }
+      for (const desired of provider.models) {
+        if (existingIds.has(desired.modelId)) continue;
+        const base = baseModels.get(desired.modelId);
+        if (base === undefined || !sameModel(desired, base)) {
+          operations[desired.modelId] = nativeModel(desired);
+        }
+      }
+      if (Object.keys(operations).length === 0) return;
+      await saveProjectPatch({
+        providers: { [provider.providerId]: { models: operations } },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 单模型继承删除项目 overlay 项，重新使用相同 model_id 的全局模型。 */
+  const inheritProjectModelOverride = useCallback(
+    async (providerId: string, modelId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      await saveProjectPatch({ providers: { [providerId]: { models: { [modelId]: null } } } });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 隐藏全局模型时同时清除同 ID 项目改写，避免改写模型绕过项目排除标记。 */
+  const hideProjectModel = useCallback(
+    async (providerId: string, modelId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      const existing =
+        current.projectOverrides.providerRuntime?.find((item) => item.providerId === providerId)
+          ?.removedModelIds ?? [];
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            models: { [modelId]: null },
+            removed_model_ids: Array.from(new Set([...existing, modelId])),
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 只从项目排除清单移除目标 ID，最后一项清空时删除字段以恢复全局集合语义。 */
+  const restoreProjectModel = useCallback(
+    async (providerId: string, modelId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      const removed = current.projectOverrides.providerRuntime?.find(
+        (item) => item.providerId === providerId,
+      )?.removedModelIds;
+      if (removed === undefined || !removed.includes(modelId)) return;
+      const remaining = removed.filter((id) => id !== modelId);
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            removed_model_ids: remaining.length === 0 ? null : remaining,
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
+  );
+
+  /** 一次清除当前 Provider 的模型覆盖与删除标记，恢复完整全局模型目录。 */
+  const inheritProjectProviderModels = useCallback(
+    async (providerId: string): Promise<void> => {
+      const current = currentLoaded();
+      if (current === undefined) throw new Error("settings unavailable");
+      const override = current.projectOverrides.providerRuntime?.find(
+        (item) => item.providerId === providerId,
+      );
+      if (
+        override === undefined ||
+        (override.models === undefined && override.removedModelIds === undefined)
+      )
+        return;
+      await saveProjectPatch({
+        providers: {
+          [providerId]: {
+            ...(override.models === undefined
+              ? {}
+              : {
+                  models:
+                    override.models.length === 0
+                      ? null
+                      : Object.fromEntries(override.models.map((model) => [model.modelId, null])),
+                }),
+            ...(override.removedModelIds === undefined ? {} : { removed_model_ids: null }),
+          },
+        },
+      });
+    },
+    [currentLoaded, saveProjectPatch],
   );
 
   /**
@@ -1305,7 +1720,7 @@ export function useSettingsController({
   );
 
   /**
-   * Skill 开关只提交来源限定停用引用；全局与项目各自写入所属来源名单。
+   * Skill 开关只提交来源限定停用引用；项目显式列表可以覆盖任一来源的全局停用事实。
    * 保存失败或 CAS 冲突会保留当前画面并权威重读，禁止乐观状态漂移到其它 workspace。
    */
   const toggleSkill = useCallback(
@@ -1330,13 +1745,17 @@ export function useSettingsController({
         if (workspaceId === undefined || project === undefined) {
           throw new Error("project settings unavailable");
         }
-        if (!skillReference.startsWith("project:")) throw new Error("project skill unavailable");
+        if (!/^(?:user|ja|project):/.test(skillReference))
+          throw new Error("project skill unavailable");
+        const currentDisabled = current.projectOverrides.disabledSkillList
+          ? project.disabledSkills
+          : current.userDocument.disabledSkills;
         const next = {
           ...project,
           revision: project.revision + 1,
           disabledSkills: enabled
-            ? project.disabledSkills.filter((skill) => skill !== skillReference)
-            : Array.from(new Set([...project.disabledSkills, skillReference])),
+            ? currentDisabled.filter((skill) => skill !== skillReference)
+            : Array.from(new Set([...currentDisabled, skillReference])),
         };
         try {
           await adapter.saveProjectSkills(next, workspaceId, current.cas.projectVersion);
@@ -1352,8 +1771,9 @@ export function useSettingsController({
   );
 
   /**
-   * Credential CAS 冲突只允许权威重读后重试一次；成功也必须重读脱敏投影，
-   * 避免将 command 回执或本地推测冒充 credentialConfigured 事实。
+   * Credential CAS 冲突只回读权威投影并把原冲突交还调用方；Secret 重试必须由用户再次确认，
+   * 避免未知回执后的重试覆盖其它客户端的凭据。成功也重读脱敏投影，不以 command 回执推测 configured。
+   * @author kongweiguang
    */
   const mutateCredential = useCallback(
     async (mutation: (expectedVersion: string) => Promise<string>): Promise<void> => {
@@ -1365,9 +1785,7 @@ export function useSettingsController({
         } catch (error) {
           if (settingsErrorCode(error) !== "revision_conflict") throw error;
           await reload();
-          const refreshed = currentLoaded();
-          if (refreshed === undefined) throw error;
-          await mutation(refreshed.cas.credentialVersion);
+          throw error;
         }
         await reload();
       });
@@ -1503,8 +1921,8 @@ export function useSettingsController({
       return { global, projectAvailable: false };
     const project = skillSettingsProjection(
       runtimeSkills,
-      projectDocument.disabledSkills,
-      (skill) => skill.source === "project",
+      loaded.projectOverrides.disabledSkillList ? projectDocument.disabledSkills : globalDisabled,
+      () => true,
     );
     return { global, project, projectAvailable: true };
   }, [
@@ -1562,6 +1980,16 @@ export function useSettingsController({
       onTestMcp: testMcp,
       onToggleSkill: toggleSkill,
       onAccessModeChange: saveAccessMode,
+      onInheritProjectOverride: inheritProjectOverride,
+      onProjectProviderRuntimeChange: saveProjectProviderRuntime,
+      onInheritProjectProvider: inheritProjectProvider,
+      onProjectProviderConnectionChange: saveProjectProviderConnection,
+      onInheritProjectProviderConnection: inheritProjectProviderConnection,
+      onSaveProjectProviderModels: saveProjectProviderModels,
+      onInheritProjectProviderModels: inheritProjectProviderModels,
+      onInheritProjectModelOverride: inheritProjectModelOverride,
+      onHideProjectModel: hideProjectModel,
+      onRestoreProjectModel: restoreProjectModel,
       onClarificationEnabledChange: saveClarificationEnabled,
       onAppearanceChange: saveAppearance,
     }),
@@ -1577,6 +2005,16 @@ export function useSettingsController({
       moveProvider,
       saveAppearance,
       saveAccessMode,
+      inheritProjectOverride,
+      hideProjectModel,
+      restoreProjectModel,
+      inheritProjectProvider,
+      inheritProjectProviderConnection,
+      inheritProjectProviderModels,
+      inheritProjectModelOverride,
+      saveProjectProviderConnection,
+      saveProjectProviderModels,
+      saveProjectProviderRuntime,
       saveClarificationEnabled,
       saveDefaultSelection,
       saveSubagentSettings,
@@ -1610,6 +2048,7 @@ export function useSettingsController({
     loaded,
     snapshot,
     globalSnapshot,
+    userConfigurationPorts,
     skillSettings,
     mcpSettings,
     loading,
@@ -1618,7 +2057,7 @@ export function useSettingsController({
     scopeWorkspaceId: queryWorkspaceId,
     error,
     ports,
-    restoreLastKnownGood,
+    repairConfiguration,
     reload,
   };
 }

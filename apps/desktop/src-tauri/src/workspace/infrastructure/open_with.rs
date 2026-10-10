@@ -50,8 +50,8 @@ pub(crate) struct LaunchPlan {
 struct NativeProcessLauncher;
 
 impl ProcessLauncher for NativeProcessLauncher {
-    /// Explorer 的 /select, 语法要求只给路径加引号；普通 arg 会把整个含空格参数加引号，
-    /// 导致 Explorer 打开默认目录。其余闭集目标仍使用结构化参数，并立即释放 child handle。
+    /// Explorer 文件选择必须保留 `/select,"path"` 的原始拼接，目录则走结构化普通参数；
+    /// 避免普通参数破坏文件选择语法，同时不经 shell 启动闭集目标并立即释放 child handle。
     fn launch(&self, plan: &LaunchPlan) -> Result<(), ()> {
         let mut command = Command::new(&plan.program);
         #[cfg(windows)]
@@ -294,34 +294,49 @@ pub(crate) fn open_with<R: ExecutableResolver, L: ProcessLauncher>(
     })
 }
 
-/// 点击已由 Preview 核验的本机文件时沿用闭集 Explorer resolver 和结构化 launcher；
-/// 不把工作区外路径塞进仅接受相对路径的 Workspace open 用例。
-pub(crate) fn reveal_absolute_file_with<R: ExecutableResolver, L: ProcessLauncher>(
+/// 显式 Explorer 操作沿用闭集 resolver 与结构化 launcher；文件选中，目录直接打开。
+/// 路径须先由 Preview native resolver canonicalize，且此处不接受 renderer executable 或 shell 文本。
+pub(crate) fn reveal_absolute_target_with<R: ExecutableResolver, L: ProcessLauncher>(
     resolver: &R,
     launcher: &L,
     path: &Path,
+    entry_kind: EntryKind,
 ) -> Result<(), OpenError> {
-    if !path.is_absolute() {
+    if !path.is_absolute() || !matches!(entry_kind, EntryKind::File | EntryKind::Directory) {
         return Err(OpenError::InvalidInput);
     }
     let program = resolver
         .resolve(OpenWithTarget::FileExplorer)
         .map_err(|_| OpenError::TargetUnavailable)?;
-    let parent = path.parent().ok_or(OpenError::InvalidInput)?;
+    let args = if entry_kind == EntryKind::File {
+        vec![explorer_file_argument(path)]
+    } else {
+        vec![path.as_os_str().to_os_string()]
+    };
+    let cwd = if entry_kind == EntryKind::Directory {
+        path.to_path_buf()
+    } else {
+        path.parent().ok_or(OpenError::InvalidInput)?.to_path_buf()
+    };
     let plan = LaunchPlan {
         target: OpenWithTarget::FileExplorer,
         program,
-        args: vec![explorer_file_argument(path)],
-        cwd: parent.to_path_buf(),
+        args,
+        cwd,
         relative_path: String::new(),
-        entry_kind: EntryKind::File,
+        entry_kind,
     };
     launcher.launch(&plan).map_err(|_| OpenError::LaunchFailed)
 }
 
-/// 原生入口固定 Explorer 程序和文件选择参数，拒绝 renderer 提供 executable 或 shell 文本。
-pub(crate) fn reveal_absolute_file(path: &Path) -> Result<(), OpenError> {
-    reveal_absolute_file_with(&NativeExecutableResolver, &NativeProcessLauncher, path)
+/// 原生入口固定 Explorer 程序和路径参数，拒绝 renderer 提供 executable 或 shell 文本。
+pub(crate) fn reveal_absolute_target(path: &Path, entry_kind: EntryKind) -> Result<(), OpenError> {
+    reveal_absolute_target_with(
+        &NativeExecutableResolver,
+        &NativeProcessLauncher,
+        path,
+        entry_kind,
+    )
 }
 
 /// 原生 Open port 固定绑定一个 Workspace handle，不暴露 resolver 或 process launcher。

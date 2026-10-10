@@ -406,14 +406,14 @@ pub(crate) fn sidecar_resource_name() -> &'static str {
     "sidecars/ja-app-server-unsupported-target"
 }
 impl RuntimeStatusKind {
-    /// 将冻结的生命周期事实映射为 UI-safe 有限状态，不扩展协议状态空间。
+    /// 将冻结的生命周期事实映射为 UI-safe 有限状态；closed owner 仍是 Crashed，只有无 owner 才是 Stopped。
     pub(crate) fn from_lifecycle(state: LifecycleState) -> Self {
         match state {
             LifecycleState::Starting => Self::Starting,
             LifecycleState::Ready => Self::Ready,
             LifecycleState::Busy => Self::Busy,
             LifecycleState::Stopping => Self::Stopping,
-            LifecycleState::Exited | LifecycleState::Backoff => Self::Stopped,
+            LifecycleState::Exited | LifecycleState::Backoff => Self::Crashed,
             LifecycleState::Incompatible => Self::Incompatible,
             LifecycleState::Faulted => Self::Faulted,
         }

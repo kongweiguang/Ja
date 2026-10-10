@@ -31,4 +31,33 @@ describe("Runtime Task event routing", () => {
       },
     });
   });
+
+  /** Close 广播按存活顶层 root 投递，保留与 ACK 同一组完整删除身份。 */
+  it("把 task/closed 作为 Task host event 分流并保留关闭集合", () => {
+    const event = parseRuntimeHostEvent({
+      jsonrpc: "2.0",
+      method: "task/closed",
+      params: {
+        serverInstanceId: "srv_12345678",
+        eventId: "evt_12345678",
+        sequence: 9,
+        occurredAt: "2026-09-03T08:00:01Z",
+        generation: 2,
+        rootThreadId: "thr_root",
+        taskThreadId: "thr_side_root",
+        closedThreadIds: ["thr_side_root", "thr_subagent"],
+      },
+    });
+    expect(event).toMatchObject({
+      kind: "task",
+      event: {
+        method: "task/closed",
+        params: {
+          rootThreadId: "thr_root",
+          taskThreadId: "thr_side_root",
+          closedThreadIds: ["thr_side_root", "thr_subagent"],
+        },
+      },
+    });
+  });
 });

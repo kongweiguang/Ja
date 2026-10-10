@@ -42,6 +42,7 @@ function sidebarProps(overrides: Partial<NavigationSidebarProps> = {}): Navigati
     currentThreadId: thread.threadId,
     threads: [thread],
     historyBusy: false,
+    historyHasError: false,
     newConversationDisabled: false,
     projectBusy: false,
     compact: false,
@@ -49,8 +50,11 @@ function sidebarProps(overrides: Partial<NavigationSidebarProps> = {}): Navigati
     activeAction: "workspace",
     conversationSearchOpen: false,
     onNewConversation: vi.fn(),
+    onNewConversationForProject: vi.fn(),
     onSelectConversation: vi.fn(),
+    onEditProject: vi.fn(),
     onOpenProjectFolder: vi.fn(async () => undefined),
+    onCopyProjectPath: vi.fn(async () => undefined),
     onOpenConversationSearch: vi.fn(),
     onRenameConversation: vi.fn(async () => undefined),
     onPinConversation: vi.fn(async () => undefined),
@@ -65,7 +69,6 @@ function sidebarProps(overrides: Partial<NavigationSidebarProps> = {}): Navigati
     onOpenSettings: vi.fn(),
     onRequestClose: vi.fn(),
     onOpenWorkspaceFolder: vi.fn(async () => undefined),
-    onOpenLegacySharedFolder: vi.fn(async () => undefined),
     ...overrides,
   };
 }
@@ -159,6 +162,55 @@ afterEach(() => {
 });
 
 describe("NavigationSidebar", () => {
+  /** 空项目目录的后台刷新不得插入临时行；失败重试仍须遵守进行中的请求门禁。 */
+  it("keeps project catalog loading silent and retains error recovery", () => {
+    const props = sidebarProps({ projects: [], noProjectSelected: true });
+    const { rerender } = render(<NavigationSidebar {...props} />);
+    const heading = screen.getByRole("heading", { name: "最近对话" });
+    const scope = screen.getByRole("button", { name: "当前范围：无项目对话" });
+
+    for (const projectCatalogLoading of [true, false, true]) {
+      rerender(<NavigationSidebar {...props} projectCatalogLoading={projectCatalogLoading} />);
+      expect(screen.queryByText("正在读取项目…")).not.toBeInTheDocument();
+      expect(document.querySelector(".ja-navigation-catalog-status")).toBeNull();
+      expect(screen.getByRole("heading", { name: "最近对话" })).toBe(heading);
+      expect(screen.getByRole("button", { name: "当前范围：无项目对话" })).toBe(scope);
+    }
+
+    rerender(
+      <NavigationSidebar
+        {...props}
+        projectCatalogLoading
+        projectCatalogError="项目列表暂时不可用，请重试。"
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("项目列表暂时不可用，请重试。");
+    expect(screen.getByRole("button", { name: "重试" })).toBeDisabled();
+
+    rerender(<NavigationSidebar {...props} projectCatalogError="项目列表暂时不可用，请重试。" />);
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(props.onRetryProjects).toHaveBeenCalledOnce();
+  });
+
+  /** 切换只改变新建入口的准入属性，保留原按钮节点并拦截忙碌期间的重复点击。 */
+  it("retains the new conversation button across navigation admission changes", () => {
+    const props = sidebarProps();
+    const { rerender } = render(<NavigationSidebar {...props} />);
+    const button = screen.getByRole("button", { name: "新会话" });
+
+    rerender(<NavigationSidebar {...props} newConversationDisabled projectBusy historyBusy />);
+    expect(screen.getByRole("button", { name: "新会话" })).toBe(button);
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(props.onNewConversation).not.toHaveBeenCalled();
+
+    rerender(<NavigationSidebar {...props} />);
+    expect(screen.getByRole("button", { name: "新会话" })).toBe(button);
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(props.onNewConversation).toHaveBeenCalledOnce();
+  });
+
   /** Runtime 展示已移出导航，底部只保留设置入口。 */
   it("omits the runtime status block while keeping Settings available", () => {
     render(<NavigationSidebar {...sidebarProps({ runtimeTone: "danger" })} />);
@@ -247,19 +299,37 @@ describe("NavigationSidebar", () => {
     expect(within(footer).getByRole("button")).toHaveAccessibleName("设置");
   });
 
-  /** 项目右键以行内 Workspace ID 打开 Explorer，不经过会改变当前项目的选择动作。 */
-  it("opens a project directory from the project row context menu", async () => {
+  /** 四项项目菜单均绑定稳定 Workspace ID，目录动作不改变当前选择。 */
+  it("offers the four project actions from its context menu", async () => {
     const props = sidebarProps();
     render(<NavigationSidebar {...props} />);
 
     const project = screen.getByRole("button", { name: "切换到项目：agent-studio" });
     fireEvent.contextMenu(project, { clientX: 48, clientY: 64 });
-    const openFolder = await screen.findByRole("menuitem", {
-      name: "在资源管理器中打开项目目录",
-    });
-    fireEvent.click(openFolder);
+    const menu = await screen.findByRole("menu", { name: "项目操作：agent-studio" });
+    expect(within(menu).getAllByRole("menuitem")).toHaveLength(4);
+    for (const label of ["新建对话", "编辑项目…", "在资源管理器中打开", "复制项目路径"])
+      expect(within(menu).getByRole("menuitem", { name: label })).toBeVisible();
 
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "新建对话" }));
+    expect(props.onNewConversationForProject).toHaveBeenCalledExactlyOnceWith("workspace-2");
+    fireEvent.contextMenu(project, { clientX: 48, clientY: 64 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "编辑项目…" }));
+    expect(props.onEditProject).toHaveBeenCalledExactlyOnceWith(
+      "workspace-2",
+      expect.any(Function),
+    );
+    const restoreProjectFocus = vi.mocked(props.onEditProject).mock.calls[0]?.[1];
+    expect(restoreProjectFocus).toBeTypeOf("function");
+    restoreProjectFocus?.();
+    expect(project).toHaveFocus();
+    fireEvent.contextMenu(project, { clientX: 48, clientY: 64 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "在资源管理器中打开" }));
     expect(props.onOpenProjectFolder).toHaveBeenCalledExactlyOnceWith("workspace-2");
+    fireEvent.contextMenu(project, { clientX: 48, clientY: 64 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "复制项目路径" }));
+    expect(props.onCopyProjectPath).toHaveBeenCalledExactlyOnceWith("workspace-2");
+
     expect(props.onSelectProject).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "当前项目：ja" })).toBeVisible();
   });
@@ -272,7 +342,7 @@ describe("NavigationSidebar", () => {
     fireEvent.keyDown(project, { key: "F10", shiftKey: true });
 
     const openFolder = await screen.findByRole("menuitem", {
-      name: "在资源管理器中打开项目目录",
+      name: "在资源管理器中打开",
     });
     fireEvent.keyDown(openFolder, { key: "Escape" });
     await waitFor(() => expect(project).toHaveFocus());
@@ -373,7 +443,8 @@ describe("NavigationSidebar", () => {
     expect(onRequestClose).toHaveBeenCalledOnce();
   });
 
-  it("retains busy, error, and empty history states without coupling them to projects", () => {
+  /** 历史读错时只通过派生门控隐藏空态，不在导航复制通知文案。@author kongweiguang */
+  it("retains busy and empty history states without duplicating history errors", () => {
     const { rerender } = render(
       <NavigationSidebar {...sidebarProps({ projects: [], threads: [], historyBusy: true })} />,
     );
@@ -387,14 +458,22 @@ describe("NavigationSidebar", () => {
           projects: [],
           threads: [],
           historyBusy: false,
-          historyError: "历史读取失败",
+          historyHasError: true,
         })}
       />,
     );
-    expect(screen.getByRole("alert")).toHaveTextContent("历史读取失败");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("还没有历史对话。")).not.toBeInTheDocument();
 
     rerender(
-      <NavigationSidebar {...sidebarProps({ projects: [], threads: [], historyBusy: false })} />,
+      <NavigationSidebar
+        {...sidebarProps({
+          projects: [],
+          threads: [],
+          historyBusy: false,
+          historyHasError: false,
+        })}
+      />,
     );
     expect(screen.getByText("还没有历史对话。")).toBeVisible();
   });
@@ -562,16 +641,13 @@ describe("NavigationSidebar", () => {
   });
 
   /** 文件夹菜单只按 Thread 身份发起打开，不得把菜单操作变成会话切换。 */
-  it("opens a thread folder and exposes the legacy folder only for migrated sessions", async () => {
+  it("opens a thread folder without selecting the conversation", async () => {
     const onOpenWorkspaceFolder = vi.fn(async () => undefined);
-    const onOpenLegacySharedFolder = vi.fn(async () => undefined);
     const onSelectConversation = vi.fn();
     render(
       <NavigationSidebar
         {...sidebarProps({
-          threads: [{ ...thread, legacySharedWorkspaceId: "ws_legacy_shared" }],
           onOpenWorkspaceFolder,
-          onOpenLegacySharedFolder,
           onSelectConversation,
         })}
       />,
@@ -583,25 +659,9 @@ describe("NavigationSidebar", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "打开工作文件夹" }));
     expect(onOpenWorkspaceFolder).toHaveBeenCalledExactlyOnceWith(thread.threadId);
     expect(onSelectConversation).not.toHaveBeenCalled();
-
-    fireEvent.keyDown(screen.getByRole("button", { name: "对话菜单：修复导航" }), {
-      key: "Enter",
-    });
-    await screen.findByRole("menuitem", { name: "打开旧共享文件夹" });
-    fireEvent.click(screen.getByRole("menuitem", { name: "打开旧共享文件夹" }));
-    expect(onOpenLegacySharedFolder).toHaveBeenCalledExactlyOnceWith(thread.threadId);
-    expect(onSelectConversation).not.toHaveBeenCalled();
-
-    cleanup();
-    render(<NavigationSidebar {...sidebarProps({ threads: [thread] })} />);
-    fireEvent.keyDown(screen.getByRole("button", { name: "对话菜单：修复导航" }), {
-      key: "Enter",
-    });
-    await screen.findByRole("menuitem", { name: "打开工作文件夹" });
-    expect(screen.queryByRole("menuitem", { name: "打开旧共享文件夹" })).not.toBeInTheDocument();
   });
 
-  /** 右键菜单绑定指针下 Thread，复用更多菜单项并保留旧共享目录的条件显示。 */
+  /** 右键菜单绑定指针下 Thread，并复用更多菜单项而不切换当前会话。 */
   it("uses the same thread actions from the row context menu without selecting the row", async () => {
     const onOpenWorkspaceFolder = vi.fn(async () => undefined);
     const onSelectConversation = vi.fn();
@@ -615,7 +675,6 @@ describe("NavigationSidebar", () => {
               threadId: "target-thread",
               title: "目标会话",
               pinned: true,
-              legacySharedWorkspaceId: "ws_legacy_shared",
             },
           ],
           onOpenWorkspaceFolder,
@@ -632,7 +691,6 @@ describe("NavigationSidebar", () => {
     expect(screen.getByRole("menuitem", { name: "取消置顶" })).toBeVisible();
     expect(screen.getByRole("menuitem", { name: "重命名" })).toBeVisible();
     expect(screen.getByRole("menuitem", { name: "打开工作文件夹" })).toBeVisible();
-    expect(screen.getByRole("menuitem", { name: "打开旧共享文件夹" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("menuitem", { name: "打开工作文件夹" }));
     expect(onOpenWorkspaceFolder).toHaveBeenCalledExactlyOnceWith("target-thread");
@@ -671,7 +729,8 @@ describe("NavigationSidebar", () => {
     expect(onSelectConversation).toHaveBeenCalledWith(thread.threadId);
   });
 
-  it("shows independent project catalog progress and routes a visible retry", async () => {
+  /** 后台项目读取不展示临时提示，但失败后仍能显式重试，不牵连既有项目行。 */
+  it("keeps independent project catalog progress silent and routes a visible retry", async () => {
     const user = userEvent.setup();
     const onRetryProjects = vi.fn();
     const { rerender } = render(
@@ -679,7 +738,7 @@ describe("NavigationSidebar", () => {
         {...sidebarProps({ projects: [], projectCatalogLoading: true, onRetryProjects })}
       />,
     );
-    expect(screen.getByRole("status", { name: "" })).toHaveTextContent("正在读取项目");
+    expect(screen.queryByText("正在读取项目…")).not.toBeInTheDocument();
 
     rerender(
       <NavigationSidebar

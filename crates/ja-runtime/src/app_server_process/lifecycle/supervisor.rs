@@ -10,11 +10,12 @@ use super::{LifecycleMachine, LifecycleState};
 use crate::app_server_process::client::{EventPump, Session, SessionEvent, TerminalReason};
 use crate::app_server_process::error::AppServerProcessError;
 use crate::app_server_process::protocol::{
-    AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewReadParams, Limits,
-    MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, RpcFrame, TurnChangeSetReadParams, V1_CLIENT_METHODS,
-    checked_deadline, error_is_incompatible, generate_ready_token, is_ready_notification,
-    is_runtime_ready_notification, valid_schema_id, validate_attachment_preview_request,
-    validate_capabilities, validate_remote_limits, validate_turn_change_set_request,
+    AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewReadParams,
+    CLIENT_METHODS, Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, RpcFrame,
+    TurnChangeSetReadParams, checked_deadline, error_is_incompatible, generate_ready_token,
+    is_ready_notification, is_runtime_ready_notification, valid_schema_id,
+    validate_attachment_preview_request, validate_capabilities, validate_remote_limits,
+    validate_turn_change_set_request,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -355,14 +356,14 @@ impl SidecarSupervisor {
         }
     }
 
-    /// 用同一 v1 client 闭集提供短生命周期 supervisor request。
+    /// 用同一 v2 client 闭集提供短生命周期 supervisor request。
     pub fn request(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        if !V1_CLIENT_METHODS.contains(&method) {
+        if !CLIENT_METHODS.contains(&method) {
             return Err(AppServerProcessError::ProtocolFault);
         }
         validate_turn_identity(method, &params)?;
@@ -717,7 +718,7 @@ pub(crate) fn validate_turn_identity(
     };
     let valid_operation_id = || {
         object
-            .get("clientOperationId")
+            .get("operationKey")
             .and_then(Value::as_str)
             .is_some_and(|value| {
                 value.len() == 35
@@ -727,21 +728,111 @@ pub(crate) fn validate_turn_identity(
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
             })
     };
+    let valid_process_generation = || {
+        object
+            .get("generation")
+            .and_then(Value::as_u64)
+            .is_some_and(|generation| generation > 0 && generation <= 9_007_199_254_740_991)
+    };
+    let valid_process_session_id = || {
+        object
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 37
+                    && value.starts_with("proc_")
+                    && value.as_bytes()[5..]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            })
+    };
+    let valid_process_cursor_value = |value: &Value| {
+        value.as_str().is_some_and(|cursor| {
+            !cursor.is_empty()
+                && cursor.len() <= 256
+                && cursor.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-')
+                })
+        })
+    };
+    let valid_call_id = |value: &Value| {
+        value.as_str().is_some_and(|call_id| {
+            !call_id.is_empty()
+                && call_id.len() <= 128
+                && call_id.as_bytes()[0].is_ascii_alphanumeric()
+                && call_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+                })
+        })
+    };
+    // Per-turn overrides are a closed patch and never carry collaboration-mode authority.
+    let valid_runtime_overrides = || match object.get("runtimeOverrides") {
+        None => true,
+        Some(Value::Object(overrides)) => {
+            overrides
+                .keys()
+                .all(|key| matches!(key.as_str(), "modelId" | "accessMode" | "outputSchema"))
+                && overrides.get("modelId").is_none_or(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| valid_schema_id(value, "model_", 128))
+                })
+                && overrides.get("accessMode").is_none_or(|value| {
+                    matches!(value.as_str(), Some("approval_required" | "full_access"))
+                })
+                && overrides.get("outputSchema").is_none_or(Value::is_object)
+        }
+        Some(_) => false,
+    };
     let valid = match method {
         // 只有规范操作身份可查询持久回执；不能由客户端选择 Thread 或数据库行。
-        "operation/read" => exact_keys(&["clientOperationId"]) && valid_operation_id(),
+        "operation/read" => {
+            exact_keys(&["operationKey", "sourceThreadId"])
+                && valid_operation_id()
+                && object
+                    .get("sourceThreadId")
+                    .is_none_or(|_| valid_id("sourceThreadId", "thr_", 100))
+        }
+        "thread/fork" => {
+            exact_keys(&[
+                "sourceThreadId",
+                "sourceItemId",
+                "expectedThreadRevision",
+                "operationKey",
+            ]) && valid_id("sourceThreadId", "thr_", 100)
+                && valid_id("sourceItemId", "item_", 101)
+                && valid_revision("expectedThreadRevision")
+                && valid_operation_id()
+        }
+        "review/start" => {
+            exact_keys(&[
+                "threadId",
+                "expectedThreadRevision",
+                "operationKey",
+                "snapshotAttachmentId",
+            ]) && valid_id("threadId", "thr_", 100)
+                && valid_revision("expectedThreadRevision")
+                && valid_operation_id()
+                && valid_id("snapshotAttachmentId", "att_", 128)
+        }
+        "review/read" => {
+            exact_keys(&["threadId", "turnId"])
+                && valid_id("threadId", "thr_", 100)
+                && valid_id("turnId", "turn_", 101)
+        }
         "attachment/preview/open" | "attachment/preview/read" | "attachment/preview/close" => {
             validate_attachment_preview_request(method, params)
         }
         "turn/change-set/read" => validate_turn_change_set_request(method, params),
         "turn/start" => {
-            exact_keys(&["threadId", "content", "clientOperationId"])
+            exact_keys(&["threadId", "content", "operationKey", "runtimeOverrides"])
                 && valid_id("threadId", "thr_", 100)
                 && valid_operation_id()
                 && valid_turn_content(object.get("content"))
+                && valid_runtime_overrides()
         }
         "turn/continue" => {
-            exact_keys(&["threadId", "expectedThreadRevision", "clientOperationId"])
+            exact_keys(&["threadId", "expectedThreadRevision", "operationKey"])
                 && valid_id("threadId", "thr_", 100)
                 && valid_operation_id()
                 && valid_revision("expectedThreadRevision")
@@ -752,7 +843,7 @@ pub(crate) fn validate_turn_identity(
                 "expectedThreadRevision",
                 "sourceMessageId",
                 "content",
-                "clientOperationId",
+                "operationKey",
             ]) && valid_id("threadId", "thr_", 100)
                 && valid_revision("expectedThreadRevision")
                 && valid_operation_id()
@@ -761,7 +852,7 @@ pub(crate) fn validate_turn_identity(
         }
         "turn/cancel" => exact_keys(&["turnId"]) && valid_id("turnId", "turn_", 101),
         "turn/input/enqueue" => {
-            exact_keys(&["turnId", "content", "kind", "clientOperationId"])
+            exact_keys(&["turnId", "content", "kind", "operationKey"])
                 && valid_id("turnId", "turn_", 101)
                 && valid_operation_id()
                 && matches!(
@@ -792,12 +883,12 @@ pub(crate) fn validate_turn_identity(
                 "senderThreadId",
                 "targetThreadId",
                 "content",
-                "idempotencyKey",
+                "operationKey",
             ]) && valid_id("senderThreadId", "thr_", 100)
                 && valid_id("targetThreadId", "thr_", 100)
                 && valid_turn_content(object.get("content"))
                 && object
-                    .get("idempotencyKey")
+                    .get("operationKey")
                     .and_then(Value::as_str)
                     .is_some_and(|key| {
                         !key.is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
@@ -810,7 +901,7 @@ pub(crate) fn validate_turn_identity(
                 "turnId",
                 "decision",
                 "expectedThreadRevision",
-                "clientOperationId",
+                "operationKey",
             ]) && valid_id("approvalId", "appr_", 101)
                 && valid_id("turnId", "turn_", 101)
                 && valid_operation_id()
@@ -820,7 +911,72 @@ pub(crate) fn validate_turn_identity(
                 )
                 && valid_revision("expectedThreadRevision")
         }
-        // Java 只允许按 ID 重开已登记的会话/旧共享目录；项目仍由 native 校验过的 cwd 注册。
+        "process/list" => {
+            exact_keys(&[
+                "workspaceId",
+                "threadId",
+                "limit",
+                "cursor",
+                "startedCallId",
+            ]) && valid_id("workspaceId", "ws_", 99)
+                && valid_id("threadId", "thr_", 100)
+                && object
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|limit| (1..=200).contains(&limit))
+                && object
+                    .get("cursor")
+                    .is_some_and(|cursor| cursor.is_null() || valid_process_cursor_value(cursor))
+                && object.get("startedCallId").is_none_or(valid_call_id)
+        }
+        "process/read" => {
+            exact_keys(&[
+                "workspaceId",
+                "threadId",
+                "generation",
+                "sessionId",
+                "afterSequence",
+                "maxBytes",
+            ]) && valid_id("workspaceId", "ws_", 99)
+                && valid_id("threadId", "thr_", 100)
+                && valid_process_generation()
+                && valid_process_session_id()
+                && valid_revision("afterSequence")
+                && object
+                    .get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|max_bytes| (1..=65_536).contains(&max_bytes))
+        }
+        "process/write" => {
+            exact_keys(&[
+                "workspaceId",
+                "threadId",
+                "generation",
+                "sessionId",
+                "afterSequence",
+                "input",
+                "closeInput",
+                "operationKey",
+            ]) && valid_id("workspaceId", "ws_", 99)
+                && valid_id("threadId", "thr_", 100)
+                && valid_process_generation()
+                && valid_process_session_id()
+                && valid_revision("afterSequence")
+                && object
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .is_some_and(|input| input.len() <= 1_048_576)
+                && object.get("closeInput").is_some_and(Value::is_boolean)
+                && valid_operation_id()
+        }
+        "process/stop" => {
+            exact_keys(&["workspaceId", "threadId", "generation", "sessionId"])
+                && valid_id("workspaceId", "ws_", 99)
+                && valid_id("threadId", "thr_", 100)
+                && valid_process_generation()
+                && valid_process_session_id()
+        }
+        // Java 按 ID 重开持久项目或会话；新目录仍由 native 校验后才可首次注册。
         // 互斥的精确字段集防止调用方混用绝对路径、kind 或伪造 workspace identity。
         "workspace/open" => {
             (exact_keys(&["workspaceId"]) && valid_id("workspaceId", "ws_", 100))
@@ -841,6 +997,28 @@ pub(crate) fn validate_turn_identity(
                                 && !name.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r'))
                         })
                     }))
+        }
+        "workspace/read" => exact_keys(&["workspaceId"]) && valid_id("workspaceId", "ws_", 99),
+        "workspace/update" => {
+            exact_keys(&["workspaceId", "expectedRevision", "displayName", "cwd"])
+                && valid_id("workspaceId", "ws_", 99)
+                && valid_revision("expectedRevision")
+                && (object.contains_key("displayName") || object.contains_key("cwd"))
+                && object.get("displayName").is_none_or(|value| {
+                    value.as_str().is_some_and(|name| {
+                        !name.trim().is_empty()
+                            && name.encode_utf16().count() <= 512
+                            && !name.chars().any(char::is_control)
+                    })
+                })
+                && object.get("cwd").is_none_or(|value| {
+                    value.as_str().is_some_and(|cwd| {
+                        !cwd.is_empty()
+                            && cwd.encode_utf16().count() <= 4_096
+                            && !cwd.contains('\0')
+                            && std::path::Path::new(cwd).is_absolute()
+                    })
+                })
         }
         "workspace/path/search" => {
             exact_keys(&["threadId", "workspaceId", "query", "limit"])
@@ -958,15 +1136,21 @@ fn valid_turn_content(value: Option<&Value>) -> bool {
     sendable
 }
 
-/// Skill 身份带来源域，必须与 Java 和 JA-RPC 的 `user|ja|project:name` 合同一致。
+/// 只接受公开来源及 ASCII kebab 名称，名称上限 256 使来源前缀后的 wire 长度稳定有界。
 fn valid_skill_reference(value: &str) -> bool {
     let Some((scope, name)) = value.split_once(':') else {
         return false;
     };
     matches!(scope, "user" | "ja" | "project")
-        && (1..=512).contains(&name.chars().count())
-        && value.chars().count() <= 520
-        && !name.chars().any(|ch| ch == ':' || ch <= '\u{001f}')
+        && !name.is_empty()
+        && name.len() <= 256
+        && value.len() <= 264
+        && name.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 /// 队列预算按实际紧凑 JSON bytes 校验，避免多字节路径或结构开销绕过 512 KiB 上限。
@@ -989,7 +1173,7 @@ fn valid_relative_reference_path(path: &str) -> bool {
         && !path.split('/').any(|segment| segment == "..")
 }
 
-/// 校验 v1 initialize 的唯一六字段结果，并返回已绑定的 server instance。
+/// 校验 v2 initialize 的唯一六字段结果，并返回已绑定的 server instance。
 ///
 /// `serverVersion` 不是冻结合同字段；拒绝任何额外字段可避免桌面端把实现诊断误当成
 /// 可依赖能力，同时保留 runtime 的两字段 Kernel 身份约束。
@@ -1024,7 +1208,7 @@ pub(crate) fn validate_initialize_result(
         .and_then(Value::as_i64)
         .filter(|minor| (0..=i64::from(i32::MAX)).contains(minor))
         .ok_or(AppServerProcessError::ProtocolFault)?;
-    if major != 1 || minor != 0 {
+    if major != 2 || minor != 0 {
         return Err(AppServerProcessError::Incompatible);
     }
     let instance = object

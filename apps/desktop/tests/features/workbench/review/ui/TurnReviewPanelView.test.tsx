@@ -225,4 +225,122 @@ describe("TurnReviewPanelView", () => {
     expect(screen.getByRole("button", { name: "重试" })).toBeVisible();
     expect(screen.getByRole("tree", { name: "审查文件" })).toBeVisible();
   });
+
+  /** 重试按钮成功后会卸载；只在相同读取仍拥有空焦点时定位到可编程文件标题。 */
+  it("键盘重试成功后把焦点交回当前文件标题", async () => {
+    const retryRead = deferred<TurnReviewFileContent>();
+    let attempts = 0;
+    const readFrozen: TurnReviewPort["readFrozen"] = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary read failure");
+      return retryRead.promise;
+    });
+    render(
+      <TurnReviewPanelView
+        target={target}
+        port={port(readFrozen)}
+        active
+        onShowWorkspaceReview={vi.fn()}
+      />,
+    );
+
+    const user = userEvent.setup();
+    const retry = await screen.findByRole("button", { name: "重试" });
+    retry.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(readFrozen).toHaveBeenCalledTimes(2));
+    await act(async () => retryRead.resolve(result("src/a.ts", "recovered")));
+
+    expect(await screen.findByText("recovered")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "src/a.ts", level: 2 })).toHaveFocus();
+  });
+
+  /** 异步完成不能把焦点从用户后来选择的控件抢回到 Diff。 */
+  it("重试等待期间焦点移到别处时不抢回焦点", async () => {
+    const retryRead = deferred<TurnReviewFileContent>();
+    let attempts = 0;
+    const readFrozen: TurnReviewPort["readFrozen"] = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary read failure");
+      return retryRead.promise;
+    });
+    render(
+      <>
+        <button type="button">其他控件</button>
+        <TurnReviewPanelView
+          target={target}
+          port={port(readFrozen)}
+          active
+          onShowWorkspaceReview={vi.fn()}
+        />
+      </>,
+    );
+
+    const user = userEvent.setup();
+    const retry = await screen.findByRole("button", { name: "重试" });
+    retry.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(readFrozen).toHaveBeenCalledTimes(2));
+    const otherControl = screen.getByRole("button", { name: "其他控件" });
+    otherControl.focus();
+    await act(async () => retryRead.resolve(result("src/a.ts", "recovered")));
+
+    expect(await screen.findByText("recovered")).toBeVisible();
+    expect(otherControl).toHaveFocus();
+  });
+
+  /** target 切换后迟到的重试结果不得改变新目标或夺取当前页面焦点。 */
+  it("目标切换后忽略迟到的重试结果和焦点恢复", async () => {
+    const retryRead = deferred<TurnReviewFileContent>();
+    const nextTarget: TurnReviewTarget = {
+      ...target,
+      turnId: "turn_next",
+      artifactId: "artifact_next",
+    };
+    let attempts = 0;
+    const readFrozen: TurnReviewPort["readFrozen"] = vi.fn(async (requestedTarget, file) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary read failure");
+      if (attempts === 2) return retryRead.promise;
+      return {
+        ...result(file.path, "new target"),
+        artifactId: requestedTarget.artifactId,
+      };
+    });
+    const view = render(
+      <TurnReviewPanelView
+        target={target}
+        port={port(readFrozen)}
+        active
+        onShowWorkspaceReview={vi.fn()}
+      />,
+    );
+
+    const user = userEvent.setup();
+    const retry = await screen.findByRole("button", { name: "重试" });
+    retry.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(readFrozen).toHaveBeenCalledTimes(2));
+    view.rerender(
+      <TurnReviewPanelView
+        target={nextTarget}
+        port={port(readFrozen)}
+        active
+        onShowWorkspaceReview={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("new target")).toBeVisible();
+    expect(document.activeElement).toBe(document.body);
+    await act(async () =>
+      retryRead.resolve({
+        ...result("src/a.ts", "stale target"),
+        artifactId: target.artifactId,
+      }),
+    );
+
+    expect(screen.getByLabelText("统一 Diff src/a.ts")).toHaveTextContent("new target");
+    expect(screen.queryByText("stale target")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(document.body);
+  });
 });

@@ -271,6 +271,72 @@
   font-size: var(--ja-text-control-size);
   font-weight: var(--ja-weight-semibold);
 }
+.ja-settings-scope-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-settings-secondary);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-settings-scope-source {
+  min-width: 0;
+  color: var(--text-settings-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--ja-text-caption-size);
+}
+.ja-settings-scope-note {
+  margin: 0 0 12px;
+  color: var(--text-settings-secondary);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-settings-project-provider-list {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.ja-settings-project-provider {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-settings-subtle);
+  border-radius: var(--ja-radius-lg);
+  background: var(--surface-settings-elevated);
+}
+.ja-settings-project-provider > header,
+.ja-settings-project-provider-fields {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ja-settings-project-provider-fields {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+.ja-settings-project-provider-fields > label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-settings-secondary);
+  font-size: var(--ja-text-caption-size);
+}
+.ja-settings-project-provider-fields input[type="number"] {
+  width: 148px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border-settings-subtle);
+  border-radius: var(--ja-radius-md);
+  color: var(--text-settings-primary);
+  background: var(--surface-settings-content);
+}
+.ja-settings-project-provider-fields > .ja-settings-project-provider-toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-end;
+  min-height: 32px;
+  gap: 7px;
+}
 .ja-settings-toolbar-actions {
   display: flex;
   align-items: center;
@@ -1276,6 +1342,17 @@
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
 }
+.ja-settings-trust-dialog .ja-settings-dialog-header {
+  flex-direction: column;
+  gap: 6px;
+}
+.ja-settings-trust-path {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
 .ja-settings-dialog > .ja-settings-form,
 .ja-settings-dialog > .ja-settings-mcp-form {
   min-height: 0;
@@ -1312,7 +1389,31 @@
   border-radius: 10px;
 }
 
+.ja-settings-repair-confirm-dialog .ja-settings-sheet-body {
+  min-height: 0;
+  overflow: visible;
+  gap: 12px;
+  padding: 16px 0 0;
+}
+
 @media (max-width: 800px) {
+  .ja-settings-project-provider-connection-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: end;
+    width: 100%;
+  }
+  .ja-settings-project-provider-connection-fields > label {
+    min-width: 0;
+  }
+  .ja-settings-project-provider-connection-fields > label:nth-child(2) {
+    grid-column: 1 / -1;
+  }
+  .ja-settings-project-provider-connection-fields select,
+  .ja-settings-project-provider-connection-fields input {
+    width: 100%;
+    min-width: 0;
+  }
   .ja-settings {
     gap: 0;
     padding: 0;
@@ -1361,6 +1462,18 @@
   .ja-settings-toolbar-actions {
     gap: 2px;
   }
+  .ja-settings-scope-picker {
+    flex: 0 0 auto;
+    gap: 4px;
+    font-size: 11px;
+  }
+  .ja-settings-scope-picker .ja-button {
+    min-height: 28px;
+    padding-inline: 7px;
+  }
+  .ja-settings-scope-source {
+    display: none;
+  }
   .ja-settings-issues {
     padding: 10px 16px 12px;
   }
@@ -1378,6 +1491,9 @@
 }
 
 @media (max-width: 620px) {
+  .ja-settings-project-provider-connection-fields {
+    grid-template-columns: 1fr;
+  }
   .ja-settings-form-grid,
   .ja-settings-facts {
     grid-template-columns: 1fr;
@@ -1973,4 +2089,29 @@
   .ja-capability-project-trigger {
     max-width: 100%;
   }
+}
+.ja-storage-details {
+  padding: 16px 0;
+}
+
+.ja-storage-details dl {
+  display: grid;
+  grid-template-columns: minmax(76px, auto) minmax(0, 1fr);
+  gap: 14px 24px;
+  margin: 0 0 20px;
+}
+
+.ja-storage-details dt {
+  color: var(--text-muted);
+}
+
+.ja-storage-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ja-storage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }

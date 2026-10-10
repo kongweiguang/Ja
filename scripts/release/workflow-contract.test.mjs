@@ -9,6 +9,7 @@ import test from "node:test";
 
 const NATIVE_WORKFLOW_PATH = resolve(".github/workflows/native-app-server.yml");
 const RELEASE_WORKFLOW_PATH = resolve(".github/workflows/release.yml");
+const NPM_WORKFLOW_PATH = resolve(".github/workflows/npm-cli-publish.yml");
 
 /** 统一 CRLF/LF 输入，避免 Windows checkout 与 Ubuntu runner 对同一结构产生不同断言结果。 */
 function normalizeWorkflow(source) {
@@ -57,23 +58,27 @@ function releaseBashRun(source, name) {
   return script.replace(/\$\{\{[\s\S]*?\}\}/gu, "GITHUB_EXPRESSION");
 }
 
-/** 让 Git Bash 只做 -n 语法检查，不执行预检中的 API、版本或发布命令。 */
-function assertReleasePreflightBashSyntax() {
+/** 对预检和最终发布的真实 Bash 块只做语法检查，避免校验时产生外部发布。 */
+function assertReleaseBashSyntax() {
   const source = readWorkflow(RELEASE_WORKFLOW_PATH);
-  const script = releaseBashRun(source, "Require current main, verified CI artifacts, and release metadata");
   const bash = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
   if (process.platform === "win32") assert.ok(existsSync(bash), `Git Bash is missing: ${bash}`);
-  const result = spawnSync(bash, ["--noprofile", "--norc", "-n"], {
-    input: script,
-    encoding: "utf8",
-    timeout: 10_000,
-    windowsHide: true,
-  });
-  assert.equal(result.error, undefined, result.error?.message);
-  assert.equal(result.status, 0, `${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+  for (const name of [
+    "Require current main, verified CI artifacts, and release metadata",
+    "Verify and publish the matching GitHub draft",
+  ]) {
+    const result = spawnSync(bash, ["--noprofile", "--norc", "-n"], {
+      input: releaseBashRun(source, name),
+      encoding: "utf8",
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.equal(result.status, 0, `${name}\n${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+  }
 }
 
-test("release preflight Bash is syntactically valid", assertReleasePreflightBashSyntax);
+test("release preflight and publication Bash are syntactically valid", assertReleaseBashSyntax);
 
 /** 回归验证同一 workflow 在 Windows CRLF 与仓库 LF checkout 下都能被正确定位。 */
 function assertWorkflowLineEndingNormalization() {
@@ -85,7 +90,7 @@ function assertWorkflowLineEndingNormalization() {
 
 test("workflow contract parser normalizes LF and CRLF", assertWorkflowLineEndingNormalization);
 
-/** 固定快速门禁与两个并行重门禁的依赖图，防止拆分后 native 提前启动。 */
+/** 固定快速门禁和桌面 reader 回归接线，防止测试遗漏或拆分后 native 提前启动。 */
 function assertNativeVerificationGraph() {
   const source = readWorkflow(NATIVE_WORKFLOW_PATH);
   const fastChecks = jobBody(source, "fast-checks");
@@ -94,20 +99,37 @@ function assertNativeVerificationGraph() {
   const native = jobBody(source, "native-app-server");
   assert.match(fastChecks, /Run Python script tests[\s\S]*test_restore_verified_native/u);
   assert.match(fastChecks, /Run Node script tests[\s\S]*create-updater-manifest\.test\.mjs[\s\S]*workflow-contract\.test\.mjs/u);
+  const nodeScripts = stepBody(fastChecks, "Run Node script tests");
+  assert.match(nodeScripts, /node --test[\s\S]*scripts\/e2e\/windows-desktop-smoke\.test\.mjs[\s\S]*process-session-webview2\.test\.mjs/u);
   assert.match(fastChecks, /pnpm typecheck[\s\S]*pnpm lint[\s\S]*pnpm check:architecture[\s\S]*pnpm check:unused/u);
   assert.match(fastChecks, /cargo fmt --all -- --check/u);
   assert.match(frontend, /needs: fast-checks/u);
+  assert.match(frontend, /playwright install chromium/u);
+  assert.match(frontend, /pnpm typecheck:example:spring/u);
+  assert.match(frontend, /pnpm test:example:spring/u);
   assert.match(frontend, /vitest run --maxWorkers=1 --minWorkers=1/u);
+  assert.match(frontend, /turn-changes-card-browser\.mjs/u);
   assert.match(frontend, /vite build --config apps\/desktop\/vite\.config\.ts/u);
   assert.doesNotMatch(frontend, /^\s+pnpm build\s*$/mu);
   assert.match(verification, /needs: fast-checks/u);
   assert.match(verification, /tests\/contract\/run\.ps1/u);
+  assert.match(verification, /playwright install chromium/u);
   assert.match(verification, /Run JVM verification and build the Rust test fixture/u);
+  assert.match(verification, /-Dja\.example\.browser=true/u);
+  assert.match(verification, /turn-change-artifact-rpc\.mjs/u);
+  assert.match(verification, /process-session-webview2\.mjs/u);
+  assert.match(verification, /cli-review-loopback\.mjs/u);
   assert.match(verification, /Run the Rust workspace gates/u);
   assert.match(native, /needs: \[fast-checks, frontend-verification, fast-verification\]/u);
   assert.match(native, /needs\.frontend-verification\.result == 'success'/u);
   assert.match(native, /needs\.fast-verification\.result == 'success'/u);
+  assert.match(native, /windows-desktop-smoke\.mjs/u);
+  assert.match(native, /run-windows-installer-smoke\.ps1/u);
   assert.match(native, /!cancelled\(\)/u);
+  const npmSmoke = jobBody(source, "npm-package-verification");
+  assert.match(npmSmoke, /needs: native-app-server/u);
+  assert.match(npmSmoke, /npm install --offline --ignore-scripts/u);
+  assert.match(npmSmoke, /verify-runtime\.mjs/u);
 }
 
 test("native matrix waits for both verification jobs", assertNativeVerificationGraph);
@@ -117,7 +139,7 @@ function assertNativeReuseContract() {
   const source = readWorkflow(NATIVE_WORKFLOW_PATH);
   assert.match(source, /verified_run_id:[\s\S]*required: true[\s\S]*type: string/u);
   assert.match(source, /name: ja-native-reuse-\$\{\{ matrix\.platform \}\}-\$\{\{ matrix\.arch \}\}/u);
-  assert.match(source, /app-server\/target\/ja-app-server\.exe/u);
+  assert.match(source, /ja-agent\/ja-app-server\/target\/ja-app-server\.exe/u);
   const windowsReuse = stepBody(source, "Prepare native reuse artifact (Windows)");
   const macReuse = stepBody(source, "Prepare native reuse artifact (macOS)");
   for (const reuseStep of [windowsReuse, macReuse]) {
@@ -157,3 +179,52 @@ function assertReleasePreflightContract() {
 }
 
 test("release preflight publishes an exact verified run id", assertReleasePreflightContract);
+
+/** 两端公开必须串联同一候选身份；npm 失败时 GitHub 仍保留可恢复的已验证草稿。 */
+function assertCoordinatedPublication() {
+  const source = readWorkflow(RELEASE_WORKFLOW_PATH);
+  const npm = jobBody(source, "publish-npm-cli");
+  assert.match(npm, /needs: \[verify-release-candidate, signed-native-matrix\]/u);
+  assert.match(npm, /uses: \.\/\.github\/workflows\/npm-cli-publish\.yml/u);
+  assert.match(npm, /source_commit: \$\{\{ needs\.verify-release-candidate\.outputs\.source_commit \}\}/u);
+  assert.match(npm, /native_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u);
+  assert.match(npm, /id-token: write/u);
+  assert.match(npm, /NPM_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/u);
+  const publication = jobBody(source, "publish-github-release");
+  assert.match(publication, /needs: \[verify-release-candidate, signed-native-matrix, publish-npm-cli\]/u);
+  assert.doesNotMatch(publication, /if:.*always\(\)|continue-on-error/u);
+  assert.match(publication, /sourceCommit == \$sha/u);
+  assert.match(publication, /sha256sum --check --strict SHA256SUMS/u);
+  assert.match(publication, /gh release edit[\s\S]*--draft=false --latest/u);
+  assert.match(publication, /\.draft == false and \.target_commitish == \$sha/u);
+  const preflight = stepBody(source, "Require current main, verified CI artifacts, and release metadata");
+  assert.match(preflight, /First npm publication requires the NPM_TOKEN repository secret/u);
+}
+
+test("release publishes npm before the verified GitHub draft", assertCoordinatedPublication);
+
+/** npm 必须复用已验证产物，携带搜索依赖，并回读 registry 中的真实包才算完成。 */
+function assertNpmPublicationContract() {
+  const source = readWorkflow(NPM_WORKFLOW_PATH);
+  assert.match(source, /workflow_call:[\s\S]*NPM_TOKEN:[\s\S]*required: false/u);
+  assert.match(source, /workflow_dispatch:/u);
+  assert.match(source, /id-token: write/u);
+  assert.match(source, /cancel-in-progress: false/u);
+  assert.match(source, /\$run\.event -cne 'push'/u);
+  assert.match(source, /run-id: \$\{\{ inputs\.native_run_id \}\}/u);
+  assert.match(source, /--search-tools \(Join-Path \$reuse 'tools'\)/u);
+  assert.match(source, /name: ja-npm-windows-x64/u);
+  const candidate = stepBody(source, "Stage, inspect, and install the npm tarball");
+  assert.match(candidate, /verify-runtime\.mjs[\s\S]*ja-npm-candidate-smoke/u);
+  const publication = stepBody(source, "Publish and read back the verified public npm package");
+  assert.match(publication, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/u);
+  assert.match(publication, /\$failure\.error\.code -cne 'E404'/u);
+  assert.match(publication, /npm publish --access public --registry=https:\/\/registry\.npmjs\.org/u);
+  assert.match(publication, /npm install --ignore-scripts[\s\S]*\$spec --registry=/u);
+  assert.match(publication, /verify-published\.mjs \$package \$stage/u);
+  assert.match(publication, /verify-runtime\.mjs[\s\S]*ja-npm-published-smoke/u);
+  const native = stepBody(readWorkflow(NATIVE_WORKFLOW_PATH), "Prepare native reuse artifact (Windows)");
+  assert.match(native, /Copy-Item -Path 'apps\/desktop\/src-tauri\/sidecars\/tools\/\*'/u);
+}
+
+test("npm publishes and verifies the installed registry package", assertNpmPublicationContract);

@@ -16,7 +16,7 @@ permissions:
   actions: read
 
 concurrency:
-  # Different release candidates must never cancel each other after Draft creation has started.
+  # 发布草稿开始创建后，不同候选版本的发布任务不得互相取消。
   group: ja-release-${{ inputs.source_commit }}
   cancel-in-progress: false
 
@@ -56,6 +56,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          JA_NPM_BOOTSTRAP_AVAILABLE: ${{ secrets.NPM_TOKEN != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -83,6 +84,17 @@ jobs:
           if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
             echo 'TAURI_SIGNING_PRIVATE_KEY is missing' >&2
             exit 1
+          fi
+          npm_metadata="$RUNNER_TEMP/ja-npm-preflight.json"
+          if ! npm view '@kongweiguang/ja' name --json --registry=https://registry.npmjs.org > "$npm_metadata"; then
+            if ! jq -e '.error.code == "E404"' "$npm_metadata" >/dev/null; then
+              echo 'npm registry lookup failed; publication state is unknown' >&2
+              exit 1
+            fi
+            if [[ "$JA_NPM_BOOTSTRAP_AVAILABLE" != 'true' ]]; then
+              echo 'First npm publication requires the NPM_TOKEN repository secret (granular write token with bypass 2FA).' >&2
+              exit 1
+            fi
           fi
           releases="$(gh api --paginate --slurp \
             "/repos/$GITHUB_REPOSITORY/releases?per_page=100")"
@@ -141,3 +153,51 @@ jobs:
     permissions:
       contents: write
       actions: read
+
+  publish-npm-cli:
+    name: Publish the matching npm CLI
+    needs: [verify-release-candidate, signed-native-matrix]
+    uses: ./.github/workflows/npm-cli-publish.yml
+    with:
+      source_commit: ${{ needs.verify-release-candidate.outputs.source_commit }}
+      native_run_id: ${{ needs.verify-release-candidate.outputs.verified_run_id }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+
+  publish-github-release:
+    name: Publish GitHub Release after npm verification
+    needs: [verify-release-candidate, signed-native-matrix, publish-npm-cli]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Verify and publish the matching GitHub draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JA_SOURCE_COMMIT: ${{ needs.verify-release-candidate.outputs.source_commit }}
+          JA_RELEASE_TAG: ${{ needs.verify-release-candidate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          release="$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$JA_RELEASE_TAG")"
+          jq -e --arg sha "$JA_SOURCE_COMMIT" --arg tag "$JA_RELEASE_TAG" \
+            '.tag_name == $tag and .target_commitish == $sha and .prerelease == false' \
+            <<< "$release" >/dev/null
+          assets="$RUNNER_TEMP/ja-release-publication"
+          mkdir -p "$assets"
+          gh release download "$JA_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$assets"
+          jq -e --arg sha "$JA_SOURCE_COMMIT" --arg tag "$JA_RELEASE_TAG" \
+            '.product == "Ja" and .sourceCommit == $sha and .tag == $tag and .release.updaterSigning == "verified"' \
+            "$assets/artifact-manifest.json" >/dev/null
+          jq -e --arg version "${JA_RELEASE_TAG#v}" '.version == $version' "$assets/latest.json" >/dev/null
+          (cd "$assets" && sha256sum --check --strict SHA256SUMS)
+          if jq -e '.draft == true' <<< "$release" >/dev/null; then
+            gh release edit "$JA_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$JA_RELEASE_TAG" \
+            | jq -e --arg sha "$JA_SOURCE_COMMIT" '.draft == false and .target_commitish == $sha' >/dev/null
+          echo "Ja $JA_RELEASE_TAG is public on GitHub and npm (@kongweiguang/ja@${JA_RELEASE_TAG#v})." >> "$GITHUB_STEP_SUMMARY"

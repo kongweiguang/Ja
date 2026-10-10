@@ -22,7 +22,11 @@ const provider: ProviderProjection = {
     modelId: model,
     name: model,
     model,
-    capabilities: { contextWindowTokens: 256000, maxOutputTokens: 8192 },
+    capabilities: {
+      contextWindowTokens: 256000,
+      maxOutputTokens: 8192,
+      supportsOutputSchema: false,
+    },
     reasoningLevelMap: {},
     defaultReasoningLevel: null,
   })),

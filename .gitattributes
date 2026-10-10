@@ -1,10 +1,10 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SQLite migrations are hashed from exact UTF-8 bytes; keep checkout bytes stable on Windows.
+# SQLite 迁移按实际 UTF-8 字节计算摘要，须保持 Windows 检出后的字节内容稳定。
 *.sql text eol=lf
 
-# Prettier owns frontend line endings; keep Windows checkouts compatible with endOfLine=lf.
+# 前端换行符由 Prettier 管理，Windows 检出时须保持与 endOfLine=lf 配置一致。
 apps/desktop/**/*.ts text eol=lf
 apps/desktop/**/*.tsx text eol=lf
 apps/desktop/**/*.css text eol=lf

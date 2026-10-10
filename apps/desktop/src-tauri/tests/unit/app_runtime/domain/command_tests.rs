@@ -50,7 +50,7 @@ fn resume_input_is_strict_and_bounded() {
 fn continue_and_reask_inputs_are_identity_and_budget_bounded() {
     assert!(
         TurnContinueInput {
-            client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
             thread_id: "thr_fixture".to_owned(),
             expected_thread_revision: 7,
         }
@@ -59,12 +59,12 @@ fn continue_and_reask_inputs_are_identity_and_budget_bounded() {
     );
     for input in [
         TurnContinueInput {
-            client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
             thread_id: "turn_fixture".to_owned(),
             expected_thread_revision: 7,
         },
         TurnContinueInput {
-            client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
             thread_id: "thr_fixture".to_owned(),
             expected_thread_revision: 9_007_199_254_740_992,
         },
@@ -73,7 +73,7 @@ fn continue_and_reask_inputs_are_identity_and_budget_bounded() {
     }
 
     let valid_reask = TurnReaskInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
         thread_id: "thr_fixture".to_owned(),
         expected_thread_revision: 7,
         source_message_id: "item_user_fixture".to_owned(),
@@ -174,7 +174,7 @@ fn approval_decisions_are_exact() {
     for decision in ["approve", "deny"] {
         assert!(
             ApprovalResponseInput {
-                client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+                operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
                 approval_id: "appr_demo".to_owned(),
                 turn_id: "turn_demo".to_owned(),
                 decision: decision.to_owned(),
@@ -187,7 +187,7 @@ fn approval_decisions_are_exact() {
     for decision in ["allow_once", "allow_session"] {
         assert!(
             ApprovalResponseInput {
-                client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+                operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
                 approval_id: "appr_demo".to_owned(),
                 turn_id: "turn_demo".to_owned(),
                 decision: decision.to_owned(),
@@ -199,11 +199,11 @@ fn approval_decisions_are_exact() {
     }
 }
 
-/// Turn content 接受 text/attachment union，同时拒绝重复 identity、超过十个附件与旧的自由 kind 形状。
+/// Turn content 使用当前真实的来源限定 Skill ID，同时拒绝重复 identity 和超额附件。
 #[test]
 fn turn_content_is_strict_bounded_and_path_free() {
     let valid = TurnStartInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
         thread_id: "thr_fixture".to_owned(),
         content: vec![
             TurnContentPart::WorkspaceReference {
@@ -212,7 +212,7 @@ fn turn_content_is_strict_bounded_and_path_free() {
                 kind: "file".to_owned(),
             },
             TurnContentPart::SkillReference {
-                skill_id: "skill_fixture".to_owned(),
+                skill_id: "user:runtime-refresh".to_owned(),
             },
             TurnContentPart::Attachment {
                 attachment_id: "att_fixture".to_owned(),
@@ -225,7 +225,7 @@ fn turn_content_is_strict_bounded_and_path_free() {
     assert!(valid.validate().is_ok());
     assert!(
         TurnStartInput {
-            client_operation_id: "op_NOT_RANDOM".to_owned(),
+            operation_key: "op_NOT_RANDOM".to_owned(),
             ..valid.clone()
         }
         .validate()
@@ -233,7 +233,7 @@ fn turn_content_is_strict_bounded_and_path_free() {
     );
     assert!(
         TurnStartInput {
-            client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
             thread_id: "thr_fixture".to_owned(),
             content: vec![
                 TurnContentPart::Attachment {
@@ -249,7 +249,7 @@ fn turn_content_is_strict_bounded_and_path_free() {
     );
     assert!(
         TurnStartInput {
-            client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
             thread_id: "thr_fixture".to_owned(),
             content: (0..11)
                 .map(|index| TurnContentPart::Attachment {
@@ -260,6 +260,60 @@ fn turn_content_is_strict_bounded_and_path_free() {
         .validate()
         .is_err()
     );
+}
+
+/// Skill 引用遵循 JA-RPC 的公开来源、ASCII kebab 名称和 256 字符边界。
+#[test]
+fn skill_reference_matches_current_wire_schema() {
+    let validate = |skill_id: &str| {
+        TurnStartInput {
+            operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
+            thread_id: "thr_fixture".to_owned(),
+            content: vec![
+                TurnContentPart::SkillReference {
+                    skill_id: skill_id.to_owned(),
+                },
+                TurnContentPart::Text {
+                    text: "hello".to_owned(),
+                },
+            ],
+        }
+        .validate()
+    };
+    for skill_id in [
+        "user:runtime-refresh",
+        "ja:runtime-refresh",
+        "project:runtime-refresh",
+    ] {
+        assert!(validate(skill_id).is_ok(), "rejected {skill_id:?}");
+    }
+
+    let max_length_skill_id = format!("project:{}", "a".repeat(256));
+    assert_eq!(max_length_skill_id.len(), 264);
+    assert!(validate(&max_length_skill_id).is_ok());
+
+    let too_long_skill_id = format!("project:{}", "a".repeat(257));
+    for skill_id in [
+        "",
+        "user:",
+        "extension.catalog:runtime-refresh",
+        "user:runtime:refresh",
+        "user:runtime\nrefresh",
+        "user:runtime\u{007f}refresh",
+        "user:Runtime-refresh",
+        "user:runtime_refresh",
+        "user:-runtime",
+        "user:runtime-",
+        "user:runtime--refresh",
+        "user:café",
+        "other:runtime-refresh",
+        too_long_skill_id.as_str(),
+    ] {
+        assert!(
+            validate(skill_id).is_err(),
+            "unexpectedly accepted {skill_id:?}"
+        );
+    }
 }
 
 /// Frozen review 只允许 artifact 内的协议相对路径，防止单文件读取成为宿主路径探针。

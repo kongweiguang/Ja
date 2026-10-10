@@ -45,6 +45,7 @@ const PREFERENCES: ConversationThreadPreferences = {
 /** README 截图使用可审阅的微型真实投影，保持 ChatTimeline/WorkProcess 的生产分组逻辑。 */
 const ITEMS: readonly TimelineItemAdapter[] = [
   {
+    origin: "native" as const,
     itemId: "item_user",
     threadId: THREAD_ID,
     turnId: TURN_ID,
@@ -54,6 +55,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
     createdAt: "2026-09-09T10:00:00.000Z",
   },
   {
+    origin: "native" as const,
     itemId: "item_commentary",
     threadId: THREAD_ID,
     turnId: TURN_ID,
@@ -63,6 +65,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
     createdAt: "2026-09-09T10:00:01.000Z",
   },
   {
+    origin: "native" as const,
     itemId: "item_read",
     threadId: THREAD_ID,
     turnId: TURN_ID,
@@ -84,6 +87,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
     createdAt: "2026-09-09T10:00:02.000Z",
   },
   {
+    origin: "native" as const,
     itemId: "item_command",
     threadId: THREAD_ID,
     turnId: TURN_ID,
@@ -107,6 +111,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
     createdAt: "2026-09-09T10:00:03.000Z",
   },
   {
+    origin: "native" as const,
     itemId: "item_final",
     threadId: THREAD_ID,
     turnId: TURN_ID,
@@ -119,6 +124,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
 ];
 
 const TURN: TimelineTurn = {
+  origin: "native" as const,
   turnId: TURN_ID,
   threadId: THREAD_ID,
   status: "completed",
@@ -167,6 +173,7 @@ export function ReadmeBrowserFixture() {
             currentThreadId={THREAD_ID}
             threads={[thread]}
             historyBusy={false}
+            historyHasError={false}
             newConversationDisabled={false}
             projectBusy={false}
             compact={false}
@@ -174,8 +181,11 @@ export function ReadmeBrowserFixture() {
             activeAction="workspace"
             conversationSearchOpen={false}
             onNewConversation={() => undefined}
+            onNewConversationForProject={() => undefined}
             onSelectConversation={() => undefined}
+            onEditProject={() => undefined}
             onOpenProjectFolder={openProjectFolderFixture}
+            onCopyProjectPath={async () => undefined}
             onOpenConversationSearch={() => undefined}
             onRenameConversation={async () => undefined}
             onPinConversation={async () => undefined}
@@ -190,7 +200,6 @@ export function ReadmeBrowserFixture() {
             onOpenSettings={() => undefined}
             onRequestClose={() => undefined}
             onOpenWorkspaceFolder={async () => undefined}
-            onOpenLegacySharedFolder={async () => undefined}
           />
         </div>
         <div className="ja-workspace-stage">

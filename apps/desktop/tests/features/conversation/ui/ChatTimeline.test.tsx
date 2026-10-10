@@ -4,7 +4,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   TimelineApproval as ApprovalSummary,
   TimelineItemAdapter,
@@ -18,6 +18,7 @@ import { TimelineDisclosureCache } from "@/features/conversation/ui/timeline/tim
 const turnId = "turn_one";
 /** 构建一个 Renderer Item，同时让每个 UI 断言只关注自己持有的字段。 */
 const baseItem = (item: Partial<TimelineItemAdapter>): TimelineItemAdapter => ({
+  origin: "native" as const,
   itemId: "item_one",
   threadId: "thr_one",
   turnId,
@@ -28,13 +29,6 @@ const baseItem = (item: Partial<TimelineItemAdapter>): TimelineItemAdapter => ({
 
 describe("ChatTimeline", () => {
   afterEach(() => cleanup());
-
-  /** Drain TanStack Virtual's fallback scroll-end timeout before Vitest removes this file's JSDOM window. */
-  async function drainVirtualizerScrollEndTimeout() {
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  afterAll(drainVirtualizerScrollEndTimeout);
 
   it("只在旧页可用时提供单次按需加载入口", async () => {
     let release!: () => void;
@@ -88,12 +82,13 @@ describe("ChatTimeline", () => {
   it("按需展开并复制超过事件帧的完整回复", async () => {
     const preview = "答".repeat(65_536);
     const complete = `${preview}末尾保留`;
-    const read = vi.fn(async (messageId: string) => {
-      expect(messageId).toBe("item_long_final");
+    const read = vi.fn(async (threadId: string, itemId: string) => {
+      expect(threadId).toBe("thr_one");
+      expect(itemId).toBe("item_long_final");
       return complete;
     });
     const copy = vi.fn(async () => {});
-    render(
+    const { rerender } = render(
       <ChatTimeline
         items={[baseItem({ itemId: "item_long_final", final: true, text: preview })]}
         onReadMessageContent={read}
@@ -102,6 +97,26 @@ describe("ChatTimeline", () => {
     );
     expect(screen.getByRole("button", { name: "查看完整回复" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "查看完整回复" }));
+    expect(read).toHaveBeenCalledWith("thr_one", "item_long_final");
+    rerender(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_long_final",
+            final: true,
+            text: preview,
+            answerHydration: {
+              status: "complete",
+              text: complete,
+              offsetCharacters: 0,
+              totalCharacters: Array.from(complete).length,
+            },
+          }),
+        ]}
+        onReadMessageContent={read}
+        onCopyText={copy}
+      />,
+    );
     await waitFor(() => expect(screen.getByText(/末尾保留/)).toBeVisible());
     fireEvent.click(screen.getByRole("button", { name: "复制回复" }));
     expect(read).toHaveBeenCalledTimes(1);
@@ -112,12 +127,13 @@ describe("ChatTimeline", () => {
   it("按需读取完整公开思考摘要", async () => {
     const preview = "思".repeat(65_536);
     const complete = `${preview}摘要末尾`;
-    const read = vi.fn(async (messageId: string) => {
-      expect(messageId).toBe("item_reasoning");
+    const read = vi.fn(async (threadId: string, itemId: string) => {
+      expect(threadId).toBe("thr_one");
+      expect(itemId).toBe("item_reasoning");
       return complete;
     });
     const copy = vi.fn(async () => {});
-    render(
+    const { rerender } = render(
       <ChatTimeline
         items={[
           baseItem({
@@ -132,6 +148,27 @@ describe("ChatTimeline", () => {
       />,
     );
     await userEvent.click(screen.getByRole("button", { name: "查看完整思考摘要" }));
+    expect(read).toHaveBeenCalledWith("thr_one", "item_reasoning");
+    rerender(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_reasoning",
+            kind: "reasoning",
+            status: "completed",
+            text: preview,
+            bodyHydration: {
+              status: "complete",
+              text: complete,
+              offsetCharacters: 0,
+              totalCharacters: Array.from(complete).length,
+            },
+          }),
+        ]}
+        onReadMessageContent={read}
+        onCopyText={copy}
+      />,
+    );
     await waitFor(() => expect(screen.getByText(/摘要末尾/)).toBeVisible());
     fireEvent.click(screen.getByRole("button", { name: "复制全文" }));
     await waitFor(() => expect(copy).toHaveBeenCalledWith(complete));
@@ -201,6 +238,59 @@ describe("ChatTimeline", () => {
     expect(rows[1]).toHaveTextContent("第二轮结论");
   });
 
+  /** 普通 Turn 也持有首条 USER 来源；恢复时必须保留按输入消费划分的正文和真实复制边界。 */
+  it("保留带来源消息 ID 的同 Turn 排队追问及各自回复", async () => {
+    const firstAnswer = "首轮已经完成";
+    const queuedAnswer = "排队追问已经完成";
+    const onCopyText = vi.fn(async () => {});
+    render(
+      <ChatTimeline
+        turns={[
+          {
+            origin: "native" as const,
+            turnId,
+            threadId: "thr_one",
+            sourceMessageId: "item_user_first",
+            status: "completed",
+          },
+        ]}
+        items={[
+          baseItem({ itemId: "item_user_first", kind: "user_message", text: "先完成首个问题" }),
+          baseItem({
+            itemId: "item_progress_first",
+            kind: "commentary",
+            text: firstAnswer,
+            metadata: { phase: "assistant_progress" },
+          }),
+          baseItem({ itemId: "item_user_queued", kind: "user_message", text: "再完成排队追问" }),
+          baseItem({ itemId: "item_final_queued", final: true, text: queuedAnswer }),
+        ]}
+        onCopyText={onCopyText}
+      />,
+    );
+
+    const rows = document.querySelectorAll(".ja-chat-timeline__row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveAttribute("data-source-message-id", "item_user_first");
+    expect(rows[1]).toHaveAttribute("data-source-message-id", "item_user_queued");
+    expect(
+      screen.getAllByRole("article", { name: "用户问题" }).map((item) => item.textContent),
+    ).toEqual([
+      expect.stringContaining("先完成首个问题"),
+      expect.stringContaining("再完成排队追问"),
+    ]);
+    expect(screen.getByText(firstAnswer)).toBeVisible();
+    expect(rows[0]).toHaveTextContent(firstAnswer);
+    expect(rows[0]).not.toHaveTextContent(queuedAnswer);
+    expect(rows[1]).toHaveTextContent(queuedAnswer);
+    expect(rows[1]).not.toHaveTextContent(firstAnswer);
+    const final = screen.getByRole("article", { name: "最终答复" });
+    expect(final).toBeVisible();
+    expect(rows[1]).toContainElement(final);
+    fireEvent.click(within(final).getByRole("button", { name: "复制回复" }));
+    await waitFor(() => expect(onCopyText.mock.calls).toEqual([[queuedAnswer]]));
+  });
+
   /** Turn 的活动或终态只属于最后一条 USER input，旧 exchange 不得重新出现响应壳。 */
   it("assigns the turn lifecycle only to the latest exchange", () => {
     render(
@@ -209,7 +299,7 @@ describe("ChatTimeline", () => {
           baseItem({ itemId: "item_user_first", kind: "user_message", text: "第一条" }),
           baseItem({ itemId: "item_user_second", kind: "user_message", text: "第二条" }),
         ]}
-        turns={[{ turnId, threadId: "thr_one", status: "running" }]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "running" }]}
       />,
     );
 
@@ -257,6 +347,14 @@ describe("ChatTimeline", () => {
           }),
         ]}
         approvals={[firstApproval, secondApproval]}
+        turns={[
+          {
+            origin: "native" as const,
+            turnId,
+            threadId: "thr_one",
+            status: "waiting_approval",
+          },
+        ]}
       />,
     );
 
@@ -506,7 +604,7 @@ describe("ChatTimeline", () => {
 
   /** 流式正文必须留在工作过程；只有 terminal 才能把权威结果放入最终答复阅读位置。 */
   it("流式正文留在工作过程，并在 terminal 后显示最终答复", () => {
-    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(<ChatTimeline items={[]} turns={[runningTurn]} />);
 
     const response = screen.getByRole("article", { name: "回复状态" });
@@ -530,7 +628,7 @@ describe("ChatTimeline", () => {
               presentation: {
                 kind: "read",
                 title: "读取结果",
-                status: "running",
+            status: "waiting_approval",
                 relativePaths: ["result.json"],
                 truncated: false,
               },
@@ -646,7 +744,7 @@ describe("ChatTimeline", () => {
 
   /** thread/read 会用持久 user item 替换 turn/start 的临时 item；同一 Turn 的 response 不能因此重建。 */
   it("保留 thread/read 替换用户条目后的 authoritative response 节点", () => {
-    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(
       <ChatTimeline
         items={[
@@ -715,7 +813,7 @@ describe("ChatTimeline", () => {
   /** 自动上下文压缩和普通 Tool 一样留在阅读顺序中，只有成功答复到位后才一并归档。 */
   it("keeps automatic context compaction in the reply reading flow before archiving", async () => {
     const user = userEvent.setup();
-    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
     const contextStep = baseItem({
       itemId: "item_compaction",
       kind: "tool_call",
@@ -823,8 +921,8 @@ describe("ChatTimeline", () => {
     expect(screen.getByText("上下文已从 12,000 Token 压缩至 4,000 Token。")).toBeVisible();
   });
 
-  /** 终态失败保留工作过程入口，但 Tool 详情默认收起，用户可主动查看压缩诊断。 */
-  it("keeps failed context compaction visible while detail opens on demand", () => {
+  /** 终态失败保留过程与自动展开的压缩诊断，不让用户猜测停止原因。 */
+  it("keeps failed context compaction and its diagnostic visible", () => {
     render(
       <ChatTimeline
         items={[
@@ -848,6 +946,7 @@ describe("ChatTimeline", () => {
         ]}
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -862,8 +961,7 @@ describe("ChatTimeline", () => {
     const contextDetails = screen.getByRole("button", {
       name: /上下文自动压缩，context_compaction，失败/,
     });
-    expect(contextDetails).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(contextDetails);
+    expect(contextDetails).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("自动压缩未完成：SUMMARY_FAILURE。")).toBeVisible();
   });
 
@@ -881,7 +979,7 @@ describe("ChatTimeline", () => {
       reason: "运行测试",
       expiresAt: "2099-08-17T12:00:00+08:00",
     };
-    const waitingTurn = { turnId, threadId: "thr_one", status: "waiting_approval" as const };
+    const waitingTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "waiting_approval" as const };
     const { rerender } = render(
       <ChatTimeline
         items={[]}
@@ -918,10 +1016,109 @@ describe("ChatTimeline", () => {
     expect(waitingResponse).toHaveTextContent("正在工作");
   });
 
+  /**
+   * 暂停只约束其所属 Turn row；同 Thread 的另一条运行中 Turn 仍可显示工作反馈。
+   * @author kongweiguang
+   */
+  it("同一 Thread 内暂停态按 Turn 隔离，不压掉另一 Turn 的工作提示", () => {
+    const pausedTurn = {
+      origin: "native" as const,
+      turnId: "turn_paused_plan",
+      threadId: "thr_one",
+      status: "suspended" as const,
+    };
+    const runningTurn = {
+      origin: "native" as const,
+      turnId: "turn_other_running",
+      threadId: "thr_one",
+      status: "running" as const,
+    };
+    render(
+      <ChatTimeline
+        items={[
+          baseItem({
+            itemId: "item_paused_public_stream",
+            turnId: pausedTurn.turnId,
+            kind: "commentary",
+            status: "in_progress",
+            text: "暂停前已公开的进展",
+            metadata: { phase: "assistant_progress" },
+          }),
+          baseItem({
+            itemId: "item_other_turn_public_stream",
+            turnId: runningTurn.turnId,
+            kind: "commentary",
+            status: "in_progress",
+            text: "另一轮仍在推进",
+            metadata: { phase: "assistant_progress" },
+          }),
+        ]}
+        turns={[pausedTurn, runningTurn]}
+      />,
+    );
+
+    const pausedRow = document.querySelector<HTMLElement>(
+      `.ja-chat-timeline__row[data-turn-id="${pausedTurn.turnId}"]`,
+    );
+    expect(pausedRow).toBeVisible();
+    expect(pausedRow).toHaveAttribute("data-response-turn-id", pausedTurn.turnId);
+    const pausedResponse = within(pausedRow!).getByRole("article", { name: "回复状态" });
+    expect(pausedResponse).toHaveAttribute("data-response-state", "suspended");
+    expect(pausedResponse).toHaveTextContent("已暂停");
+    expect(pausedResponse).not.toHaveTextContent("正在工作");
+    expect(pausedResponse.querySelector(".ja-chat-activity-dots")).toBeNull();
+    expect(within(pausedRow!).getByRole("region", { name: "工作过程" })).toHaveAttribute(
+      "data-state",
+      "suspended",
+    );
+
+    const runningRow = document.querySelector<HTMLElement>(
+      `.ja-chat-timeline__row[data-turn-id="${runningTurn.turnId}"]`,
+    );
+    expect(runningRow).toBeVisible();
+    expect(runningRow).toHaveAttribute("data-response-turn-id", runningTurn.turnId);
+    const runningResponse = within(runningRow!).getByRole("article", { name: "回复状态" });
+    expect(runningResponse).toHaveAttribute("data-response-state", "working");
+    expect(runningResponse).toHaveTextContent("正在工作");
+  });
+
+  /** 普通澄清用独立等待文案；失败无最终助手时展示服务端真实错误说明。 */
+  it("shows waiting-input state and the actual failure message without inventing a reply", () => {
+    const { rerender } = render(
+      <ChatTimeline
+        items={[]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "waiting_input" }]}
+      />,
+    );
+    expect(screen.getByRole("article", { name: "回复状态" })).toHaveTextContent("等待你的输入");
+
+    rerender(
+      <ChatTimeline
+        items={[]}
+        turns={[
+          {
+            origin: "native" as const,
+            turnId,
+            threadId: "thr_one",
+            status: "failed",
+            error: {
+              code: "MODEL_UPSTREAM_REJECTED",
+              message: "模型服务拒绝了请求",
+              retryable: false,
+            },
+          },
+        ]}
+      />,
+    );
+    const failure = screen.getByRole("article", { name: "失败说明" });
+    expect(failure).toHaveTextContent("模型服务拒绝了请求");
+    expect(screen.queryByRole("article", { name: "最终答复" })).not.toBeInTheDocument();
+  });
+
   /** Terminal 状态只保留静态结论，失败绝不能继续伪装成最终答复。 */
   it("失败、取消和历史完成回复都不会保留活动动画标识", () => {
     const { rerender } = render(
-      <ChatTimeline items={[]} turns={[{ turnId, threadId: "thr_one", status: "failed" }]} />,
+      <ChatTimeline items={[]} turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "failed" }]} />,
     );
     const response = screen.getByRole("article", { name: "失败说明" });
     expect(response).toHaveAttribute("data-response-state", "failed");
@@ -942,15 +1139,18 @@ describe("ChatTimeline", () => {
             metadata: { phase: "assistant_progress" },
           }),
         ]}
-        turns={[{ turnId, threadId: "thr_one", status: "cancelled" }]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "cancelled" }]}
       />,
     );
     expect(response).toHaveAttribute("data-response-state", "cancelled");
     expect(response).not.toHaveTextContent("取消前已经生成的正文");
     expect(response).toHaveTextContent("已取消");
     expect(response.querySelector(".ja-chat-activity-dots")).toBeNull();
-    expect(screen.getByRole("region", { name: "工作过程" })).toHaveTextContent(
-      "取消前已经生成的正文",
+    const cancelledProcess = screen.getByRole("region", { name: "工作过程" });
+    expect(cancelledProcess).toHaveTextContent("取消前已经生成的正文");
+    expect(screen.getByRole("button", { name: /收起工作过程/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
     );
 
     rerender(<ChatTimeline items={[baseItem({ itemId: "item_history", text: "历史答复" })]} />);
@@ -983,6 +1183,133 @@ describe("ChatTimeline", () => {
 
     rerender(<WorkProcess steps={[{ ...completed, status: "failed" as const }]} />);
     expect(screen.getByRole("button", { name: /失败/ })).toHaveAttribute("data-state", "open");
+  });
+
+  /** Plan 摘要留在持续可见的触发器，展开区不重复它且仍保留安全参数与失败诊断。 */
+  it("用中文动作与目标折叠展示 Plan 工具且展开不重复摘要", async () => {
+    const user = userEvent.setup();
+    const planProposal = baseItem({
+      itemId: "item_plan_proposal",
+      kind: "tool_call",
+      status: "in_progress",
+      metadata: {
+        callId: "call_plan_proposal",
+        toolName: "plan_propose",
+        presentation: {
+          kind: "mcp",
+          title: "提交方案修订",
+          status: "pending",
+          inputPreview: 'planId: "plan_private", operationKey: "op_private"',
+          summary: "目标：整理发布验证",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    const planDraft = baseItem({
+      itemId: "item_plan_draft",
+      kind: "tool_call",
+      status: "in_progress",
+      metadata: {
+        callId: "call_plan_draft",
+        toolName: "plan_draft_update",
+        presentation: {
+          kind: "mcp",
+          title: "更新方案草稿",
+          status: "pending",
+          inputPreview:
+            'planId: "plan_private", expectedDraftRevision: 2, operationKey: "op_private"',
+          summary: "目标：整理发布验证",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    const planStep = baseItem({
+      itemId: "item_plan_step",
+      kind: "tool_call",
+      status: "in_progress",
+      metadata: {
+        callId: "call_plan_step",
+        toolName: "plan_step_update",
+        presentation: {
+          kind: "mcp",
+          title: "更新执行步骤",
+          status: "pending",
+          inputPreview:
+            'planId: "plan_private", expectedPlanRevision: 3, runId: "run_private", operationKey: "op_private"',
+          summary: "请求步骤状态：待执行 → 执行中",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    const failedPlanStep = baseItem({
+      itemId: "item_failed_plan_step",
+      kind: "tool_call",
+      status: "failed",
+      metadata: {
+        callId: "call_failed_plan_step",
+        toolName: "plan_step_update",
+        presentation: {
+          kind: "mcp",
+          title: "更新执行步骤",
+          status: "error",
+          inputPreview:
+            'planId: "plan_failed_private", stepId: "step_failed_private", operationKey: "op_failed_private"',
+          outputPreview: "步骤状态更新失败：方案修订已变化",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    const unknownMcp = baseItem({
+      itemId: "item_unknown_mcp",
+      kind: "tool_call",
+      status: "completed",
+      metadata: {
+        callId: "call_unknown_mcp",
+        toolName: "custom_mcp",
+        presentation: {
+          kind: "mcp",
+          title: "custom_mcp",
+          status: "success",
+          summary: "自定义工具摘要保持可查看",
+          relativePaths: [],
+          truncated: false,
+        },
+      },
+    });
+    render(<WorkProcess steps={[planProposal, planDraft, planStep, failedPlanStep, unknownMcp]} />);
+
+    const proposalAction = screen.getByRole("button", {
+      name: "提交方案修订，目标：整理发布验证，等待执行",
+    });
+    const draftAction = screen.getByRole("button", {
+      name: "更新方案草稿，目标：整理发布验证，等待执行",
+    });
+    const planAction = screen.getByRole("button", {
+      name: "更新执行步骤，请求步骤状态：待执行 → 执行中，等待执行",
+    });
+    for (const action of [proposalAction, draftAction, planAction]) {
+      expect(action).not.toHaveAccessibleName(
+        /plan_(propose|draft_update|step_update)|plan_private|run_private|op_private/u,
+      );
+      expect(action).not.toHaveTextContent(
+        /planId|expectedPlanRevision|expectedDraftRevision|runId|operationKey|plan_private|run_private|op_private/u,
+      );
+    }
+    expect(planAction).toHaveTextContent("更新执行步骤");
+    expect(planAction).toHaveTextContent("请求步骤状态：待执行 → 执行中");
+    expect(screen.getByRole("button", { name: /调用工具，custom_mcp/u })).toBeVisible();
+
+    await user.click(planAction);
+    expect(screen.getByText(/planId: "plan_private"/u)).toBeVisible();
+    expect(screen.getAllByText("请求步骤状态：待执行 → 执行中")).toHaveLength(1);
+    expect(screen.getByText("步骤状态更新失败：方案修订已变化")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /调用工具，custom_mcp/u }));
+    expect(screen.getByText("自定义工具摘要保持可查看")).toBeVisible();
   });
 
   /** 已完成的公开 reasoning 遵循工作过程默认折叠规则，但用户仍可手动展开查看。 */
@@ -1019,7 +1346,7 @@ describe("ChatTimeline", () => {
       status: "in_progress",
       metadata: { phase: "reasoning_summary" },
     });
-    const runningTurn = { turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
     const { rerender } = render(<WorkProcess steps={[step]} turn={runningTurn} />);
     const trigger = screen.getByRole("button", { name: /工作过程/u });
     expect(trigger).toHaveAttribute("data-state", "open");
@@ -1146,7 +1473,7 @@ describe("ChatTimeline", () => {
     const { rerender } = render(
       <WorkProcess
         steps={[step]}
-        turn={{ turnId, threadId: "thr_one", status: cases[0].status }}
+        turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: cases[0].status }}
       />,
     );
 
@@ -1155,7 +1482,7 @@ describe("ChatTimeline", () => {
         rerender(
           <WorkProcess
             steps={[step]}
-            turn={{ turnId, threadId: "thr_one", status: entry.status }}
+            turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: entry.status }}
           />,
         );
       }
@@ -1181,7 +1508,7 @@ describe("ChatTimeline", () => {
     rerender(
       <WorkProcess
         steps={[{ ...step, status: "failed" }]}
-        turn={{ turnId, threadId: "thr_one", status: "running" }}
+        turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "running" }}
       />,
     );
     const runningWithLocalFailure = screen.getByRole("button", { name: /进行中/u });
@@ -1194,7 +1521,7 @@ describe("ChatTimeline", () => {
 
   /** 无明细状态行不伪造可操作性，避免用户打开一个没有内容的 Disclosure。 */
   it("无明细时只显示状态，不提供空折叠操作或零步占位", () => {
-    render(<WorkProcess steps={[]} turn={{ turnId, threadId: "thr_one", status: "queued" }} />);
+    render(<WorkProcess steps={[]} turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "queued" }} />);
 
     const region = screen.getByRole("region", { name: "工作过程" });
     expect(region.querySelector("button")).toBeNull();
@@ -1218,6 +1545,7 @@ describe("ChatTimeline", () => {
       <WorkProcess
         steps={[failedStep]}
         turn={{
+          origin: "native" as const,
           turnId,
           threadId: "thr_one",
           status: "completed",
@@ -1252,6 +1580,7 @@ describe("ChatTimeline", () => {
       <WorkProcess
         steps={[{ ...failedStep, status: "completed" }]}
         turn={{
+          origin: "native" as const,
           turnId,
           threadId: "thr_one",
           status: "completed",
@@ -1288,6 +1617,7 @@ describe("ChatTimeline", () => {
       },
     });
     const completedTurn = {
+      origin: "native" as const,
       turnId,
       threadId: "thr_one",
       status: "completed" as const,
@@ -1300,7 +1630,7 @@ describe("ChatTimeline", () => {
     expect(screen.queryByText("7.3秒")).not.toBeInTheDocument();
 
     rerender(
-      <WorkProcess steps={[step]} turn={{ turnId, threadId: "thr_one", status: "completed" }} />,
+      <WorkProcess steps={[step]} turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "completed" }} />,
     );
     expect(document.querySelector(".ja-work-process__duration")).toBeNull();
 
@@ -1450,7 +1780,9 @@ describe("ChatTimeline", () => {
     expect(region).not.toHaveTextContent("状态：等待执行");
   });
 
+  /** Call ID 只在 Thread+Turn 内唯一；替换审批必须重置动作并展示其对应的脱敏目标。 */
   it("gives a replacement approval a fresh identity and explicit action context", async () => {
+    const user = userEvent.setup();
     const approvalA: ApprovalSummary = {
       approvalId: "appr_one",
       threadId: "thr_one",
@@ -1465,26 +1797,80 @@ describe("ChatTimeline", () => {
       ...approvalA,
       approvalId: "appr_two",
       callId: "call_two",
-      toolName: "read",
+      toolName: "exec_command",
       reason: "读取工作区文件",
     };
-    const step = baseItem({
+    const firstStep = baseItem({
       itemId: "item_command",
       kind: "command",
       title: "运行命令",
       status: "in_progress",
-      metadata: { callId: "call_one", toolName: "shell" },
+      metadata: {
+        callId: "call_one",
+        toolName: "exec_command",
+        presentation: {
+          kind: "shell",
+          title: "执行命令",
+          status: "waiting_approval",
+          relativePaths: [],
+          command: "pnpm test --filter unit",
+          truncated: false,
+        },
+      },
+    });
+    const replacementStep = baseItem({
+      itemId: "item_command_two",
+      kind: "command",
+      title: "运行命令",
+      status: "in_progress",
+      metadata: {
+        callId: "call_two",
+        toolName: "exec_command",
+        presentation: {
+          kind: "shell",
+          title: "执行命令",
+          status: "waiting_approval",
+          relativePaths: [],
+          command: "pnpm release:check",
+          truncated: false,
+        },
+      },
+    });
+    const sameCallInAnotherTurn = baseItem({
+      itemId: "item_decoy",
+      turnId: "turn_previous",
+      kind: "tool_call",
+      title: "读取旧文件",
+      status: "completed",
+      metadata: {
+        callId: "call_two",
+        toolName: "read",
+        presentation: {
+          kind: "read",
+          title: "读取工作区文件",
+          status: "success",
+          relativePaths: ["private/previous-turn.txt"],
+          truncated: false,
+        },
+      },
     });
     const { rerender } = render(
       <WorkProcess
-        steps={[step]}
+        steps={[firstStep]}
         approvals={[approvalA]}
         approvalDecisions={{ [approvalA.approvalId]: "approve" }}
       />,
     );
 
     expect(screen.getByRole("status")).toHaveTextContent("已批准");
-    rerender(<WorkProcess steps={[step]} approvals={[approvalB]} onApprovalDecision={vi.fn()} />);
+    const onApprovalDecision = vi.fn();
+    rerender(
+      <WorkProcess
+        steps={[replacementStep, sameCallInAnotherTurn]}
+        approvals={[approvalB]}
+        onApprovalDecision={onApprovalDecision}
+      />,
+    );
 
     await waitFor(() => {
       expect(screen.queryByRole("status")).not.toBeInTheDocument();
@@ -1494,8 +1880,15 @@ describe("ChatTimeline", () => {
       screen.getByRole("button", { name: /工作过程/ }).querySelector(".ja-work-process__summary"),
     ).toHaveTextContent("等待确认");
     expect(screen.getByText("读取工作区文件")).toBeVisible();
-    expect(screen.getByText("read")).toBeVisible();
-    expect(screen.getByText("call_two")).toBeVisible();
+    const replacementCard = document.querySelector<HTMLElement>(".ja-approval-card");
+    expect(replacementCard).not.toBeNull();
+    expect(replacementCard).not.toHaveTextContent(/appr_two|call_two/u);
+    expect(replacementCard).not.toHaveTextContent("private/previous-turn.txt");
+    expect(
+      screen.getByText("pnpm release:check", { selector: ".ja-approval-card__target" }),
+    ).toBeVisible();
+    await user.click(within(replacementCard!).getByRole("button", { name: "批准" }));
+    await waitFor(() => expect(onApprovalDecision).toHaveBeenCalledWith(approvalB, "approve"));
   });
 
   it("coalesces adjacent tool items into one work process", () => {
@@ -1624,6 +2017,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1666,6 +2060,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1701,7 +2096,7 @@ describe("ChatTimeline", () => {
     render(
       <ChatTimeline
         turns={[
-          { turnId, threadId: "thr_one", status: "failed", error: { code, retryable: true } },
+          { origin: "native" as const, turnId, threadId: "thr_one", status: "failed", error: { code, retryable: true } },
         ]}
         items={[
           baseItem({ itemId: "item_terminal_failure", kind: "user_message", text: "原始问题" }),
@@ -1718,7 +2113,7 @@ describe("ChatTimeline", () => {
   it("重试期间只展示一处轻状态并保持正在工作", () => {
     render(
       <ChatTimeline
-        turns={[{ turnId, threadId: "thr_one", status: "running" }]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "running" }]}
         items={[
           baseItem({ itemId: "item_retry_question", kind: "user_message", text: "原始问题" }),
           baseItem({
@@ -1742,8 +2137,8 @@ describe("ChatTimeline", () => {
     expect(screen.queryByText(/失败请求的半截正文/u)).not.toBeInTheDocument();
   });
 
-  /** 成功 continuation 归回原问题后必须采用最新 Turn 状态，阻止旧失败再次显示编辑入口。 */
-  it("把隐藏 continuation 的成功回答归回原问题并移除旧编辑入口", () => {
+  /** 连续隐藏 continuation 沿用原 exchange 和已提交过程，最新成功状态不能再次暴露旧失败编辑入口。 */
+  it("把连续隐藏 continuation 的成功回答归回原问题并移除旧编辑入口", () => {
     const onEditQuestion = vi.fn();
     render(
       <ChatTimeline
@@ -1751,6 +2146,7 @@ describe("ChatTimeline", () => {
         onEditQuestion={onEditQuestion}
         turns={[
           {
+            origin: "native" as const,
             turnId: "turn_original",
             threadId: "thr_one",
             status: "failed",
@@ -1758,11 +2154,21 @@ describe("ChatTimeline", () => {
             error: { code: "MODEL_UNAVAILABLE", retryable: true },
           },
           {
+            origin: "native" as const,
+            turnId: "turn_continue_failed",
+            threadId: "thr_one",
+            sourceMessageId: "item_original_question",
+            status: "failed",
+            threadRevision: 5,
+            error: { code: "MODEL_UNAVAILABLE", retryable: true },
+          },
+          {
+            origin: "native" as const,
             turnId: "turn_continue",
             threadId: "thr_one",
             sourceMessageId: "item_original_question",
             status: "completed",
-            threadRevision: 5,
+            threadRevision: 6,
           },
         ]}
         items={[
@@ -1773,11 +2179,33 @@ describe("ChatTimeline", () => {
             text: "原始问题",
           }),
           baseItem({
+            itemId: "item_original_progress",
+            turnId: "turn_original",
+            kind: "commentary",
+            text: "原尝试已提交的过程",
+            metadata: { phase: "assistant_progress" },
+          }),
+          baseItem({
             itemId: "item_old_failure",
             turnId: "turn_original",
             kind: "agent_message",
             final: true,
             text: "旧失败收口",
+            status: "failed",
+            metadata: { failureReply: true },
+          }),
+          baseItem({
+            itemId: "item_continue_failed_progress",
+            turnId: "turn_continue_failed",
+            kind: "commentary",
+            text: "首次继续已提交的过程",
+            metadata: { phase: "assistant_progress" },
+          }),
+          baseItem({
+            itemId: "item_continue_old_failure",
+            turnId: "turn_continue_failed",
+            final: true,
+            text: "首次继续失败收口",
             status: "failed",
             metadata: { failureReply: true },
           }),
@@ -1795,9 +2223,14 @@ describe("ChatTimeline", () => {
     const rows = document.querySelectorAll(".ja-chat-timeline__row");
     expect(rows).toHaveLength(1);
     expect(rows[0]).toHaveAttribute("data-source-message-id", "item_original_question");
+    expect(screen.getAllByRole("article", { name: "用户问题" })).toHaveLength(1);
     expect(screen.getByRole("article", { name: "最终答复" })).toHaveTextContent("继续后完成");
     expect(screen.queryByText("旧失败收口")).not.toBeInTheDocument();
+    expect(screen.queryByText("首次继续失败收口")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "编辑问题" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /工作过程/ }));
+    expect(screen.getByText("原尝试已提交的过程")).toBeVisible();
+    expect(screen.getByText("首次继续已提交的过程")).toBeVisible();
     expect(onEditQuestion).not.toHaveBeenCalled();
   });
 
@@ -1807,7 +2240,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         editableSourceMessageId="item_cancelled_question"
         onEditQuestion={vi.fn()}
-        turns={[{ turnId, threadId: "thr_one", status: "cancelled" }]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "cancelled" }]}
         items={[
           baseItem({
             itemId: "item_cancelled_question",
@@ -1827,6 +2260,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1856,6 +2290,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1876,6 +2311,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1894,6 +2330,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1923,6 +2360,7 @@ describe("ChatTimeline", () => {
       <ChatTimeline
         turns={[
           {
+            origin: "native" as const,
             turnId,
             threadId: "thr_one",
             status: "failed",
@@ -1971,6 +2409,7 @@ describe("ChatTimeline", () => {
       },
     });
     const availableTurn = {
+      origin: "native" as const,
       turnId,
       threadId: "thr_one",
       status: "completed" as const,
@@ -2095,8 +2534,8 @@ describe("ChatTimeline", () => {
     ).toBeVisible();
   });
 
-  /** 成功命令默认只保留可扫描摘要，用户展开后再读取命令事实与十行输出预览。 */
-  it("用单行命令折叠入口按需展示分流输出和退出事实", async () => {
+  /** 非零 shell 退出自动保留诊断，手动折叠与展开工作面不丢命令输出事实。 */
+  it("用单行命令折叠入口保留非零退出诊断和完整输出", async () => {
     const user = userEvent.setup();
     const stdout = Array.from({ length: 12 }, (_, index) => `输出 ${index + 1}`).join("\n");
     render(
@@ -2129,34 +2568,42 @@ describe("ChatTimeline", () => {
       />,
     );
 
-    expect(screen.queryByText("工作目录：workspace")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /工作过程/ }));
+    expect(screen.getByRole("button", { name: /工作过程/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
 
     const detailsTrigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，完成/ });
     expect(detailsTrigger).toBeVisible();
-    expect(detailsTrigger).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText("工作目录：workspace")).not.toBeInTheDocument();
-
-    await user.click(detailsTrigger);
-    const output = document.querySelector(".ja-tool-details__output");
     expect(detailsTrigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getAllByText("pnpm test")).toHaveLength(1);
     expect(screen.queryByText("命令与结果")).not.toBeInTheDocument();
     expect(screen.getByText("工作目录：workspace")).toBeVisible();
-    expect(output).toHaveTextContent("stdout");
-    expect(output).toHaveTextContent("输出 9");
-    expect(output).not.toHaveTextContent("输出 10");
+    const initialOutput = document.querySelector(".ja-tool-details__output");
+    expect(initialOutput).toHaveTextContent("stdout");
+    expect(initialOutput).toHaveTextContent("输出 9");
+    expect(initialOutput).not.toHaveTextContent("输出 10");
     expect(screen.getByText("退出码 1")).toBeVisible();
-    expect(screen.getByText("状态：完成")).toBeVisible();
-    expect(document.querySelector(".ja-tool-details__facts")).toHaveTextContent("1.3 s");
+    expect(screen.queryByText("状态：完成")).not.toBeInTheDocument();
+    expect(screen.queryByText("1.3 s")).not.toBeInTheDocument();
+
+    await user.click(detailsTrigger);
+    expect(detailsTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("工作目录：workspace")).not.toBeInTheDocument();
+    await user.click(detailsTrigger);
+    expect(detailsTrigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("工作目录：workspace")).toBeVisible();
+    expect(screen.getByText("退出码 1")).toBeVisible();
+
     await user.click(screen.getByRole("button", { name: /展开全部/ }));
-    expect(output).toHaveTextContent("输出 12");
-    expect(output).toHaveTextContent("stderr");
-    expect(output).toHaveTextContent("测试告警");
+    const completeOutput = document.querySelector(".ja-tool-details__output");
+    expect(completeOutput).toHaveTextContent("输出 12");
+    expect(completeOutput).toHaveTextContent("stderr");
+    expect(completeOutput).toHaveTextContent("测试告警");
   });
 
-  /** 失败命令沿用普通命令的收起入口，用户展开后仍能读取唯一诊断和退出事实。 */
-  it("命令失败时默认收起并可按需展开结果", async () => {
+  /** 失败命令自动展示唯一诊断，手动收起后仍可从原入口重新打开。 */
+  it("命令失败时自动展开并可手动收起结果", async () => {
     const user = userEvent.setup();
     render(
       <WorkProcess
@@ -2186,9 +2633,11 @@ describe("ChatTimeline", () => {
     );
 
     const trigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/ });
-    expect(trigger).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText(/测试失败/)).not.toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/测试失败/)).toBeVisible();
 
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
     await user.click(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/测试失败/)).toBeVisible();
@@ -2243,7 +2692,13 @@ describe("ChatTimeline", () => {
 
   it("展示冻结修改事实，并把查看动作交给 Workbench 页面", async () => {
     const user = userEvent.setup();
-    const turn = { turnId, threadId: "thr_one", status: "completed" as const };
+    const turn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "completed" as const,
+      threadRevision: 7,
+    };
     const available = {
       state: "complete" as const,
       incompleteReasons: [],
@@ -2289,22 +2744,44 @@ describe("ChatTimeline", () => {
       <TurnChangesCard turn={turn} changeSet={available} onReview={review} />,
     );
     expect(screen.getByText("已编辑 4 个文件")).toBeVisible();
-    expect(screen.getByText("src/new.ts")).toBeVisible();
+    expect(screen.getByRole("button", { name: "查看 src/new.ts 的修改，修改" })).toBeVisible();
     expect(screen.getByText("二进制")).toBeVisible();
-    expect(screen.queryByText("src/fourth.ts")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "查看 src/new.ts 的修改" }));
+    expect(
+      screen.queryByRole("button", { name: "查看 src/fourth.ts 的修改，删除" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "查看 src/new.ts 的修改，修改" }));
     expect(review).toHaveBeenLastCalledWith("src/new.ts");
-    await user.click(screen.getByRole("button", { name: "再显示 1 个文件" }));
-    expect(screen.getByText("src/fourth.ts")).toBeVisible();
+    const expand = screen.getByRole("button", { name: "再显示 1 个文件" });
+    await user.click(expand);
+    expect(expand).toHaveFocus();
+    expect(screen.getByRole("button", { name: "查看 src/fourth.ts 的修改，删除" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "查看修改" }));
     expect(review).toHaveBeenCalledTimes(2);
     expect(review).toHaveBeenLastCalledWith();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
-    rerender(<TurnChangesCard turn={turn} changeSet={{ ...available, artifactId: undefined }} />);
+    rerender(
+      <TurnChangesCard
+        turn={{ ...turn, threadRevision: undefined }}
+        changeSet={available}
+        onReview={review}
+      />,
+    );
     expect(screen.queryByRole("button", { name: "查看修改" })).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "查看 src/new.ts 的修改" }),
+      screen.queryByRole("button", { name: /查看 src\/new\.ts 的修改/u }),
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <TurnChangesCard
+        turn={turn}
+        changeSet={{ ...available, artifactId: undefined }}
+        onReview={review}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "查看修改" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /查看 src\/new\.ts 的修改/u }),
     ).not.toBeInTheDocument();
     rerender(
       <TurnChangesCard
@@ -2319,6 +2796,238 @@ describe("ChatTimeline", () => {
     );
     expect(screen.queryByRole("region", { name: "修改记录" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "查看修改" })).not.toBeInTheDocument();
+  });
+
+  /** 用户主动展开的修改列表在虚拟卸载后恢复；折叠操作仍将焦点留在原入口。 */
+  it("跨虚拟卸载恢复修改列表展开状态并保留焦点", async () => {
+    const user = userEvent.setup();
+    const cache = new TimelineDisclosureCache();
+    const turn = {
+      origin: "native" as const,
+      turnId: "turn_cached_changes",
+      threadId: "thread_cached_changes",
+      status: "completed" as const,
+      threadRevision: 4,
+    };
+    const review = vi.fn();
+    const changeSet = {
+      state: "complete" as const,
+      incompleteReasons: [],
+      files: ["one.ts", "two.ts", "three.ts", "four.ts"].map((name) => ({
+        path: `src/${name}`,
+        status: "modified" as const,
+        additions: 1,
+        deletions: 0,
+        binary: false,
+        truncated: false,
+      })),
+      stats: { files: 4, additions: 4, deletions: 0, binaryFiles: 0, truncated: false },
+      artifactId: "artifact_cached_changes",
+    };
+    const first = render(
+      <TurnChangesCard
+        turn={turn}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+
+    const expand = screen.getByRole("button", { name: "再显示 1 个文件" });
+    await user.click(expand);
+    expect(expand).toHaveFocus();
+    expect(expand).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "查看 src/four.ts 的修改，修改" })).toBeVisible();
+    expect(review).not.toHaveBeenCalled();
+    first.unmount();
+
+    const second = render(
+      <TurnChangesCard
+        turn={turn}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+    const collapse = screen.getByRole("button", { name: "收起文件" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "查看 src/four.ts 的修改，修改" })).toBeVisible();
+
+    await user.click(collapse);
+    expect(collapse).toHaveFocus();
+    expect(collapse).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("button", { name: "查看 src/four.ts 的修改，修改" }),
+    ).not.toBeInTheDocument();
+    expect(review).not.toHaveBeenCalled();
+    second.unmount();
+  });
+
+  /** 相同 Turn ID 跨 Thread、相同 Thread 跨 Turn 都必须拥有独立的展开选择。 */
+  it("在同组件重渲染时按 Thread 与 Turn 隔离修改列表展开状态", async () => {
+    const user = userEvent.setup();
+    const cache = new TimelineDisclosureCache();
+    const review = vi.fn();
+    const changeSet = {
+      state: "complete" as const,
+      incompleteReasons: [],
+      files: ["one.ts", "two.ts", "three.ts", "four.ts"].map((name) => ({
+        path: `src/${name}`,
+        status: "modified" as const,
+        additions: 1,
+        deletions: 0,
+        binary: false,
+        truncated: false,
+      })),
+      stats: { files: 4, additions: 4, deletions: 0, binaryFiles: 0, truncated: false },
+      artifactId: "artifact_isolated_changes",
+    };
+    const sameTurnOtherThread = {
+      origin: "native" as const,
+      turnId: "turn_shared",
+      threadId: "thread_two",
+      status: "completed" as const,
+      threadRevision: 2,
+    };
+    const anotherTurnSameThread = {
+      origin: "native" as const,
+      turnId: "turn_other",
+      threadId: "thread_one",
+      status: "completed" as const,
+      threadRevision: 3,
+    };
+    const firstTurn = {
+      origin: "native" as const,
+      turnId: "turn_shared",
+      threadId: "thread_one",
+      status: "completed" as const,
+      threadRevision: 1,
+    };
+    const { rerender } = render(
+      <TurnChangesCard
+        turn={firstTurn}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "再显示 1 个文件" }));
+    expect(screen.getByRole("button", { name: "收起文件" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+
+    rerender(
+      <TurnChangesCard
+        turn={sameTurnOtherThread}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "再显示 1 个文件" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    await user.click(screen.getByRole("button", { name: "再显示 1 个文件" }));
+
+    rerender(
+      <TurnChangesCard
+        turn={anotherTurnSameThread}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "再显示 1 个文件" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    rerender(
+      <TurnChangesCard
+        turn={firstTurn}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "收起文件" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    rerender(
+      <TurnChangesCard
+        turn={sameTurnOtherThread}
+        changeSet={changeSet}
+        disclosureCache={cache}
+        onReview={review}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "收起文件" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  /** 父 Timeline 将 Workspace 缓存传入虚拟化修改卡，重建 Timeline 后仍须还原展开选择。 */
+  it("经 ChatTimeline 虚拟挂载后恢复修改卡展开状态", async () => {
+    const user = userEvent.setup();
+    const cache = new TimelineDisclosureCache();
+    const changeSet = {
+      state: "complete" as const,
+      incompleteReasons: [],
+      files: ["one.ts", "two.ts", "three.ts", "four.ts"].map((name) => ({
+        path: `src/${name}`,
+        status: "modified" as const,
+        additions: 1,
+        deletions: 0,
+        binary: false,
+        truncated: false,
+      })),
+      stats: { files: 4, additions: 4, deletions: 0, binaryFiles: 0, truncated: false },
+      artifactId: "artifact_timeline_changes",
+    };
+    const timelineProps = {
+      items: [
+        baseItem({
+          itemId: "item_timeline_changes",
+          turnId: "turn_timeline_changes",
+          final: true,
+          text: "修改已经完成",
+        }),
+      ],
+      turns: [
+        {
+          origin: "native" as const,
+          turnId: "turn_timeline_changes",
+          threadId: "thr_one",
+          status: "completed" as const,
+          threadRevision: 21,
+          changeSet,
+        },
+      ],
+      disclosureCache: cache,
+    };
+    const first = render(<ChatTimeline {...timelineProps} />);
+    const card = screen.getByRole("region", { name: "修改记录" });
+
+    await user.click(within(card).getByRole("button", { name: "再显示 1 个文件" }));
+    expect(within(card).getByRole("button", { name: "收起文件" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(within(card).getByTitle("修改：src/four.ts")).toBeVisible();
+    first.unmount();
+
+    render(<ChatTimeline {...timelineProps} />);
+    const restoredCard = screen.getByRole("region", { name: "修改记录" });
+    expect(within(restoredCard).getByRole("button", { name: "收起文件" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(within(restoredCard).getByTitle("修改：src/four.ts")).toBeVisible();
   });
 
   it("为每个终态 Turn 保留修改卡并按各自身份触发查看", async () => {
@@ -2340,6 +3049,10 @@ describe("ChatTimeline", () => {
       stats: { files: 1, additions: 1, deletions: 0, binaryFiles: 0, truncated: false },
       artifactId: "artifact_latest",
     };
+    const oldChangeSet = {
+      ...changeSet,
+      files: [{ ...changeSet.files[0]!, path: "src/old.ts" }],
+    };
     render(
       <ChatTimeline
         items={[
@@ -2348,38 +3061,50 @@ describe("ChatTimeline", () => {
         ]}
         turns={[
           {
+            origin: "native" as const,
             turnId: "turn_old",
             threadId: "thr_one",
             status: "completed",
-            changeSet: {
-              ...changeSet,
-              files: [{ ...changeSet.files[0]!, path: "src/old.ts" }],
-            },
+            threadRevision: 11,
+            changeSet: oldChangeSet,
           },
-          { turnId: "turn_latest", threadId: "thr_one", status: "completed", changeSet },
+          {
+            origin: "native" as const,
+            turnId: "turn_latest",
+            threadId: "thr_one",
+            status: "completed",
+            threadRevision: 12,
+            changeSet,
+          },
         ]}
         onReviewTurn={review}
       />,
     );
 
     expect(screen.getAllByRole("region", { name: "修改记录" })).toHaveLength(2);
-    expect(screen.getByText("src/old.ts")).toBeVisible();
-    const latestPath = screen.getByText("src/latest.ts");
-    expect(latestPath).toBeVisible();
-    const latestReview = latestPath
-      .closest(".ja-turn-changes")
-      ?.querySelector<HTMLButtonElement>("button");
-    expect(latestReview).not.toBeNull();
-    await user.click(latestReview!);
-    expect(review).toHaveBeenCalledWith(
-      expect.objectContaining({ turnId: "turn_latest" }),
+    const oldFile = screen.getByRole("button", { name: "查看 src/old.ts 的修改，修改" });
+    const latestFile = screen.getByRole("button", { name: "查看 src/latest.ts 的修改，修改" });
+    expect(oldFile).toBeVisible();
+    expect(latestFile).toBeVisible();
+    await user.click(oldFile);
+    await user.click(latestFile);
+    expect(review).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ turnId: "turn_old", threadRevision: 11 }),
+      oldChangeSet,
+      "src/old.ts",
+    );
+    expect(review).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ turnId: "turn_latest", threadRevision: 12 }),
       changeSet,
-      undefined,
+      "src/latest.ts",
     );
   });
 
   it("固定流式工作过程、终态答复与可靠非零变更的顺序", async () => {
     const runningTurn = {
+      origin: "native" as const,
       turnId,
       threadId: "thr_one",
       status: "running" as const,
@@ -2887,7 +3612,7 @@ describe("ChatTimeline", () => {
         editableSourceMessageId={question.itemId}
         onEditQuestion={onEditQuestion}
         onCopyText={onCopyText}
-        turns={[{ turnId, threadId: "thr_one", status: "failed" }]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "failed" }]}
         items={[question]}
       />,
     );

@@ -5,19 +5,19 @@
 param(
     [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path,
     [string]$OutputDirectory = 'release\sbom\license-candidate',
-    [string]$MavenBomPath = 'app-server\target\ja-app-server-bom.json',
-    [string]$CargoToolchain = '1.88.0',
+    [string]$MavenBomPath = 'ja-agent\target\ja-app-server-bom.json',
+    [string]$CargoToolchain = '1.98.0',
     [switch]$ReplaceExisting
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\lib\diagnostics.ps1')
 
 function Resolve-RepositoryPath {
     <#
-    Resolves a repository-relative path while keeping generated evidence inside the checkout.
-    This prevents a local package cache or user-selected output path from being copied by
-    accident into the candidate archive.
+    解析仓库相对路径，并确保生成的证据留在当前检出目录中。
+    这样可避免本机软件包缓存或用户选择的输出路径意外被复制到候选归档。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -38,8 +38,7 @@ function Resolve-RepositoryPath {
 
 function Get-RelativeRepositoryPath {
     <#
-    Converts repository-owned paths to stable slash-separated names; absolute cache paths never
-    enter the manifest because package records use ecosystem coordinates instead.
+    将仓库管理的路径转换为稳定的斜杠分隔名称；清单使用生态系统坐标记录软件包，因此绝对缓存路径不会写入清单。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -51,9 +50,9 @@ function Get-RelativeRepositoryPath {
 
 function Get-EvidenceHash {
     <#
-    Hashes raw manifests and lockfiles byte-for-byte, while hashing CycloneDX from normalized JSON.
-    The Maven plugin emits a new timestamp for an unchanged graph, so run identity must not make a
-    reviewed dependency set stale; component and dependency ordering are normalized as well.
+    对原始 manifest 和 lockfile 逐字节计算哈希，对 CycloneDX 则基于规范化 JSON 计算哈希。
+    依赖关系图未变化时，Maven 插件仍会生成新的时间戳，因此不能让运行身份导致已审查的依赖集合过期；
+    组件和依赖的顺序也会被规范化。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -95,9 +94,8 @@ function Get-EvidenceHash {
 
 function Clear-GeneratedCandidateOutput {
     <#
-    Replaces only a directory that has the exact generated candidate shape. This permits a final
-    lockfile rebuild without broad recursive deletion and refuses unknown files, nested folders,
-    or non-hash-addressed text that may belong to a user.
+    只替换结构与生成的候选目录完全一致的目录。这样可以在最终重建 lockfile 时避免宽泛的递归删除，
+    并拒绝处理可能属于用户的未知文件、嵌套目录或未按哈希寻址的文本。
     #>
     param([Parameter(Mandatory = $true)][string]$OutputRoot)
 
@@ -129,8 +127,8 @@ function Clear-GeneratedCandidateOutput {
 
 function Get-FileEvidence {
     <#
-    Hashes one fixed candidate input so later promotion can prove the lockfile/BOM graph has not
-    changed since collection; paths remain repository-relative and contain no workstation details.
+    对一项固定候选输入计算哈希，以便后续晋级时证明收集后 lockfile/BOM 依赖图没有变化；
+    路径保持为仓库相对形式，不含工作站信息。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Role,
@@ -150,8 +148,8 @@ function Get-FileEvidence {
 
 function Invoke-JsonCommand {
     <#
-    Runs an offline dependency command and extracts its one JSON document.  Tool warnings are
-    tolerated only before the outer object; malformed or empty output remains a hard failure.
+    离线运行依赖命令并提取唯一的 JSON 文档。只容忍外围对象之前的工具警告；输出格式错误或为空仍会导致硬失败。
+    stderr 独立保留并在失败时复用共享脱敏规则，只写错误通道以保持 stdout JSON；缺失环境用 NullString 删除，不能恢复成新的空值。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -165,13 +163,24 @@ function Invoke-JsonCommand {
         [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
     }
     try {
-        $lines = @(& $FilePath @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        $standardError = [Collections.Generic.List[string]]::new()
+        $lines = @(& $FilePath @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) { $standardError.Add([string]$_) } else { [string]$_ }
+        })
         if ($LASTEXITCODE -ne 0) {
-            throw "$FilePath failed with exit code $LASTEXITCODE"
+            $exitCode = $LASTEXITCODE
+            if ($standardError.Count -gt 0) {
+                [Console]::Error.WriteLine((ConvertTo-SafeDiagnosticText -Value ($standardError -join [Environment]::NewLine) -RepositoryRoot $root))
+            }
+            throw "$FilePath failed with exit code $exitCode"
         }
     } finally {
         foreach ($name in $Environment.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process')
+            if ($null -eq $oldEnvironment[$name]) {
+                [Environment]::SetEnvironmentVariable($name, [System.Management.Automation.Language.NullString]::Value, 'Process')
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process')
+            }
         }
     }
 
@@ -186,8 +195,8 @@ function Invoke-JsonCommand {
 
 function Get-OptionalPropertyString {
     <#
-    Reads optional metadata without letting StrictMode turn a missing homepage/repository field
-    into a failed archive run; absent fields remain explicit empty strings in the manifest.
+    读取可选元数据，不让 StrictMode 因缺少 homepage/repository 字段而使归档运行失败；
+    清单中会将缺失字段明确记录为空字符串。
     #>
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -202,8 +211,7 @@ function Get-OptionalPropertyString {
 
 function Get-LicenseFiles {
     <#
-    Finds license/notice files supplied by one dependency without descending into nested package
-    installations.  The bytes are copied unchanged; no SPDX expression is inferred here.
+    查找单项依赖提供的许可证或声明文件，但不进入嵌套的软件包安装目录。复制时保持字节不变；此处不推断 SPDX 表达式。
     #>
     param([Parameter(Mandatory = $true)][string]$PackageRoot)
 
@@ -222,8 +230,7 @@ function Get-LicenseFiles {
 
 function New-LicenseCollector {
     <#
-    Creates the collector state.  Hash-addressed text deduplicates identical MIT/Apache/etc.
-    files while the manifest retains every package-to-text mapping needed for legal review.
+    创建收集器状态。按哈希寻址的文本会对相同的 MIT/Apache 等文件去重，清单则保留法务审查所需的每项软件包到文本映射。
     #>
     param([Parameter(Mandatory = $true)][string]$OutputRoot)
 
@@ -240,8 +247,7 @@ function New-LicenseCollector {
 
 function Add-LicenseBytes {
     <#
-    Persists one exact byte sequence under its SHA-256 and appends a package mapping.  Existing
-    hashes are reused, so the candidate remains compact without altering upstream license text.
+    按 SHA-256 保存一段精确字节序列，并追加软件包映射。已有哈希会复用，因此候选内容保持精简，且不修改上游许可证文本。
     #>
     param(
         [Parameter(Mandatory = $true)]$Collector,
@@ -278,8 +284,8 @@ function Add-LicenseBytes {
 
 function Add-LicenseFile {
     <#
-    Reads a local license/notice file as bytes and delegates to the hash-addressed collector.
-    Reading bytes instead of normalized text preserves upstream line endings and notices.
+    以字节形式读取本地许可证或声明文件，并交由哈希寻址收集器处理。
+    直接读取字节而不规范化文本，可保留上游换行和声明内容。
     #>
     param(
         [Parameter(Mandatory = $true)]$Collector,
@@ -300,8 +306,8 @@ function Add-LicenseFile {
 
 function Add-MissingRecord {
     <#
-    Records a package whose local cache has no license/notice bytes.  Missing records keep the
-    candidate honest and provide the exact follow-up list for a controlled source/legal review.
+    记录本地缓存中没有许可证或声明字节的软件包。保留缺失记录可确保候选信息真实，
+    并为受控的源码或法务审查提供明确的后续清单。
     #>
     param(
         [Parameter(Mandatory = $true)]$Collector,
@@ -327,8 +333,7 @@ function Add-MissingRecord {
 
 function Get-DeclaredLicenses {
     <#
-    Converts a CycloneDX license array to one stable expression for the candidate manifest; the
-    original BOM remains the authority for the detailed component record.
+    将 CycloneDX 许可证数组转换为候选清单中的一个稳定表达式；组件详细记录仍以原始 BOM 为准。
     #>
     param([Parameter(Mandatory = $true)]$Licenses)
 
@@ -341,9 +346,8 @@ function Get-DeclaredLicenses {
 
 function Add-MavenArchiveEntries {
     <#
-    Reads license/notice entries directly from the cached Maven JAR.  A missing JAR entry is
-    reported rather than replaced with a guessed SPDX text, because POM metadata alone is not
-    enough to prove the exact notice obligations of a component.
+    直接从 Maven 缓存 JAR 中读取许可证或声明条目。若 JAR 中缺少条目则报告缺失，不猜测 SPDX 文本来替代，
+    因为仅靠 POM 元数据不足以证明组件的确切声明义务。
     #>
     param(
         [Parameter(Mandatory = $true)]$Collector,
@@ -396,8 +400,7 @@ function Add-MavenArchiveEntries {
 
 function Write-CandidateManifest {
     <#
-    Writes a deterministic candidate manifest and review README.  The explicit pending status is
-    intentional: this output is evidence for a release owner, not an automatic legal approval.
+    写入确定性的候选清单和审查 README。状态明确标为待处理是有意设计：这些输出是供发布负责人审查的证据，并非自动法务批准。
     #>
     param(
         [Parameter(Mandatory = $true)]$Collector,
@@ -407,7 +410,7 @@ function Write-CandidateManifest {
     )
 
     $manifest = [PSCustomObject][ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         status = 'candidate-review-pending'
         networkPolicy = 'offline'
         generatedBy = 'scripts/release/sbom/collect-license-candidates.ps1'
@@ -417,7 +420,15 @@ function Write-CandidateManifest {
             Get-FileEvidence -Role 'cargo-workspace-manifest' -Path 'Cargo.toml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'cargo-package-manifest' -Path 'apps/desktop/src-tauri/Cargo.toml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'cargo-lock' -Path 'Cargo.lock' -RepositoryRoot $RepositoryRoot
-            Get-FileEvidence -Role 'maven-manifest' -Path 'app-server/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-parent-manifest' -Path 'ja-agent/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-core-manifest' -Path 'ja-agent/ja-agent-core/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-store-local-manifest' -Path 'ja-agent/extensions/ja-agent-store-local/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-store-pg-manifest' -Path 'ja-agent/extensions/ja-agent-store-pg/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-skills-local-manifest' -Path 'ja-agent/extensions/ja-agent-skills-local/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-skills-pg-manifest' -Path 'ja-agent/extensions/ja-agent-skills-pg/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-example-manifest' -Path 'ja-agent/example/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-example-spring-boot-manifest' -Path 'ja-agent/example/ja-agent-example-springboot/pom.xml' -RepositoryRoot $RepositoryRoot
+            Get-FileEvidence -Role 'maven-app-server-manifest' -Path 'ja-agent/ja-app-server/pom.xml' -RepositoryRoot $RepositoryRoot
             Get-FileEvidence -Role 'maven-bom' -Path $MavenBomPath -RepositoryRoot $RepositoryRoot
         )
         cargoToolchain = $CargoToolchain

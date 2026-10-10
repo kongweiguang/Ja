@@ -165,7 +165,7 @@ export class AttachmentError extends Error {
   readonly code: string;
   readonly retryable: boolean;
 
-  /** 错误实例只保存 allow-list code 与固定本地文案，不保留 native rejection payload。 */
+  /** 错误实例只保存白名单错误码与固定本地文案，不保留原生拒绝载荷。 */
   constructor(code: string, message: string, retryable: boolean) {
     super(message);
     this.name = "AttachmentError";
@@ -192,7 +192,7 @@ function normalizeAttachmentError(error: unknown): AttachmentError {
   );
 }
 
-/** failed event 只信任 native code；用户文案始终由 renderer allow-list 决定。 */
+/** 只信任 failed 事件中的原生错误码；用户文案始终由渲染层白名单决定。 */
 function sanitizeImportEvent(
   event: z.infer<typeof AttachmentImportEventSchema>,
 ): AttachmentImportEvent {

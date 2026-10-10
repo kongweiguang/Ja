@@ -71,10 +71,25 @@ export interface FilesWorkspaceCloseLease {
   release: () => void;
 }
 
+/** 重绑确认只暴露未保存文件身份与状态，不把草稿正文提升到 App 会话聚合层。 */
+export interface FilesUnsavedDocumentSummary {
+  path: string;
+  status: "dirty" | "saving" | "saveError" | "conflict";
+}
+
+/** 新 root 已权威保存后提交旧工作面清理；未提交即 release 时保留原文件与草稿。 */
+export interface FilesWorkspaceRebindLease extends FilesWorkspaceCloseLease {
+  commit: () => void;
+}
+
 /** 只暴露切换所需的 flush fence，不把编辑 buffer 或保存内部状态提升到 App。 */
 export interface FilesWorkspaceLifecycle {
   workspaceId: string;
+  listUnsavedDocuments: () => readonly FilesUnsavedDocumentSummary[];
   flushForWorkspaceChange: () => Promise<FilesWorkspaceCloseLease>;
+  prepareForWorkspaceRebind: (
+    disposition: "save" | "discard",
+  ) => Promise<FilesWorkspaceRebindLease>;
 }
 
 /** Public feature composition 只接收 typed operations，绝不在 Files 内创建 Tauri adapter。 */
@@ -124,6 +139,7 @@ export interface FilesSearchSummary {
 export interface FilesViewModel {
   nodes: readonly WorkspaceFileNode[];
   selectedPath?: string;
+  directoryReveal?: { path: string; sequence: number };
   treeLoading: boolean;
   treeError?: string;
   searchQuery: string;
@@ -154,6 +170,7 @@ export interface FilesActions {
   selectNode: (node: WorkspaceFileNode) => void;
   toggleDirectory: (node: WorkspaceFileNode) => void;
   retryTree: () => void;
+  revealDirectory: (path: string) => Promise<boolean>;
   createFile?: (parent: string, name: string) => void;
   createDirectory?: (parent: string, name: string) => void;
   rename?: (node: WorkspaceFileNode, name: string) => void;

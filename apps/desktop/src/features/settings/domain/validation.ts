@@ -35,11 +35,12 @@ const optionalUrl = z.preprocess(
   z.string().max(2048).optional(),
 );
 
-/** Renderer 只编辑模型预算；输入能力由 App Server 目录与 Codec 共同裁决。 */
+/** Renderer 显式编辑终答 Schema 能力；模型声明与 Codec 能力仍由 App Server 共同裁决。 */
 const modelCapabilitiesSchema = z
   .object({
     contextWindowTokens: z.number().int().min(4_096).max(4_000_000),
     maxOutputTokens: z.number().int().min(1).max(1_000_000),
+    supportsOutputSchema: z.boolean(),
   })
   .strict();
 
@@ -64,7 +65,7 @@ const providerContextSchema = z
   })
   .strict();
 
-/** 网络超时保持在 JA-RPC v1 可接受范围内，避免无界等待或立即超时。 */
+/** 网络超时与 JA-RPC v2 的配置约束保持一致，在提交前给出可修正的字段错误。 */
 const providerNetworkTimeoutsSchema = z
   .object({
     connectTimeoutMs: z.number().int().min(100).max(120_000),
@@ -136,8 +137,6 @@ export const providerSchema = z
       });
     }
   });
-
-/** v1 只提供 Provider 聚合入口，Provider 连接与模型能力必须分别校验。 */
 
 /** MCP 表单规则同时约束安全 URL 与 stdio Secret 边界，不执行任何 native IO。 */
 export const mcpSchema = z

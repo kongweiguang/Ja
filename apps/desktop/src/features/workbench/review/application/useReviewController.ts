@@ -122,7 +122,7 @@ interface DiffRequestLane {
 
 class SupersededDiffRequest extends Error {}
 
-/** metadata-only 条目没有可读取正文，所有选择入口必须共用该判定以免留下永久 loading。 */
+/** 仅含元数据的条目没有可读取正文，所有选择入口必须共用该判定以免留下永久加载状态。 */
 function requiresFileDiff(file: ReviewFile | undefined): boolean {
   return file !== undefined && !file.binary && !file.truncated;
 }
@@ -452,16 +452,17 @@ export function useReviewController({
     );
   }, [scopeKey]);
 
-  /** 只有普通 Review 激活时才接受刷新，隐藏失效通知不得排队触发后续 Git 读取。 */
+  /** 显式刷新复用各自可见性准入：冻结历史只重读轻量目录，隐藏工作面不排队触发 Git 正文。 */
   const refresh = useCallback(() => {
-    if (workspaceId === undefined || !snapshotEnabled) return;
+    if (workspaceId === undefined || (!catalogEnabled && !snapshotEnabled)) return;
     refreshCatalogScope();
+    if (!snapshotEnabled) return;
     if (activeSnapshotRequestRef.current !== undefined) {
       pendingSnapshotRefreshRef.current = true;
       return;
     }
     refreshSnapshotScope();
-  }, [refreshCatalogScope, refreshSnapshotScope, snapshotEnabled, workspaceId]);
+  }, [catalogEnabled, refreshCatalogScope, refreshSnapshotScope, snapshotEnabled, workspaceId]);
 
   useEffect(() => {
     if (snapshotEnabled) return;
@@ -908,7 +909,7 @@ export function useReviewController({
     [scopeKey],
   );
 
-  /** 以 revision 与 scope 栅栏执行一次 native all/file/hunk 操作，并用 single-flight 防止重复提交。 */
+  /** 以 revision 与 scope 栅栏执行一次原生 all/file/hunk 操作，并通过单飞机制防止重复提交。 */
   const applyAction = useCallback(
     async (action: ReviewAction, target: ReviewTarget): Promise<void> => {
       if (

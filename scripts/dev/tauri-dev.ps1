@@ -89,6 +89,38 @@ function Assert-DevelopmentToolchain {
     Write-Host "工具链已确认：JDK 25 / $nodeVersion / pnpm $pnpmVersion" -ForegroundColor Green
 }
 
+# 运行副本不放进 Maven target，避免 clean/repackage 与仍在退出的 JVM 争用同一文件。
+function New-DevelopmentRuntimeJar {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BuildJar,
+        [Parameter(Mandatory)]
+        [string]$RepositoryRoot
+    )
+
+    $directory = Join-Path $RepositoryRoot ".tmp\tauri-dev\$([Guid]::NewGuid().ToString('N'))"
+    $null = New-Item -ItemType Directory -Path $directory
+    $runtimeJar = Join-Path $directory 'ja-app-server.jar'
+    Copy-Item -LiteralPath $BuildJar -Destination $runtimeJar
+    return $runtimeJar
+}
+
+# 只回收本次创建的文件与空目录；残留 JVM 的锁不能使成功退出变失败，更不能触发强停。
+function Remove-DevelopmentRuntimeJar {
+    param(
+        [Parameter(Mandatory)]
+        [string]$RuntimeJar
+    )
+
+    try {
+        Remove-Item -LiteralPath $RuntimeJar -ErrorAction Stop
+        [IO.Directory]::Delete((Split-Path -Parent $RuntimeJar))
+    }
+    catch {
+        Write-Warning "本次开发 JAR 暂未清理（可能仍被使用），不影响下次启动：$RuntimeJar"
+    }
+}
+
 $repositoryRoot = Resolve-RepositoryRoot
 $javaExecutable = Join-Path $JavaHome 'bin\java.exe'
 if (-not (Test-Path -LiteralPath $javaExecutable -PathType Leaf)) {
@@ -99,10 +131,13 @@ $env:JAVA_HOME = (Resolve-Path -LiteralPath $JavaHome).Path
 $env:PATH = "$(Join-Path $env:JAVA_HOME 'bin');$env:PATH"
 
 Push-Location $repositoryRoot
+$runtimeJar = $null
 try {
     Assert-DevelopmentToolchain -JavaExecutable $javaExecutable
 
-    $mavenArguments = @('-B', '-ntp', '-f', 'app-server/pom.xml', 'clean', 'package')
+    $buildDirectory = 'target-tauri-dev'
+    $mavenArguments = @('-B', '-ntp', '-f', 'ja-agent/pom.xml', '-pl', ':ja-app-server', '-am',
+        "-Dja.build.directory=$buildDirectory", 'clean', 'package')
     if (-not $RunJavaTests) {
         $mavenArguments += '-DskipTests'
     }
@@ -110,11 +145,12 @@ try {
     Write-Host '正在构建 Ja App Server JAR…' -ForegroundColor Cyan
     Invoke-CheckedCommand -Command 'mvn.cmd' -Arguments $mavenArguments
 
-    $jarPath = (Resolve-Path -LiteralPath 'app-server/target/ja-app-server.jar').Path
+    $buildJar = (Resolve-Path -LiteralPath "ja-agent/ja-app-server/$buildDirectory/ja-app-server.jar").Path
+    $runtimeJar = New-DevelopmentRuntimeJar -BuildJar $buildJar -RepositoryRoot $repositoryRoot
     $env:JA_DEBUG_JAVA = (Resolve-Path -LiteralPath $javaExecutable).Path
-    $env:JA_DEBUG_JAR = $jarPath
+    $env:JA_DEBUG_JAR = $runtimeJar
 
-    Write-Host "已启用 JVM 开发 sidecar：$jarPath" -ForegroundColor Green
+    Write-Host "已启用 JVM 开发 sidecar：$runtimeJar" -ForegroundColor Green
     if ($SkipLaunch) {
         Write-Host '已按要求只完成 JAR 准备，未启动 Tauri。' -ForegroundColor Yellow
         return
@@ -124,5 +160,8 @@ try {
     Invoke-CheckedCommand -Command 'pnpm.cmd' -Arguments @('tauri', 'dev')
 }
 finally {
+    if ($runtimeJar -and -not $SkipLaunch) {
+        Remove-DevelopmentRuntimeJar -RuntimeJar $runtimeJar
+    }
     Pop-Location
 }

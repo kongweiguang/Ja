@@ -1,0 +1,700 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskMapper">
+    <sql id="taskSummaryColumns">
+        l.child_thread_id AS taskThreadId,l.parent_thread_id AS parentThreadId,l.root_thread_id AS rootThreadId,
+        l.origin_turn_id AS originTurnId,t.title AS taskName,l.depth,l.task_kind AS taskKind,l.lifecycle,
+        l.context_seed_id AS contextSeedId,l.created_at_ms AS createdAt,p.revision,p.state,
+        p.latest_activity_sequence AS latestActivitySequence,p.last_seen_activity_sequence AS lastSeenActivitySequence,
+        p.unread_count AS unreadCount,p.descendant_count AS descendantCount,
+        p.running_descendant_count AS runningDescendantCount,p.needs_attention_count AS needsAttentionCount,
+        p.latest_safe_summary AS latestSafeSummary,p.started_at_ms AS startedAt,p.completed_at_ms AS completedAt,
+        p.updated_at_ms AS updatedAt
+    </sql>
+
+    <select id="selectParent"
+            resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ParentRow">
+        SELECT t.thread_id AS threadId,t.owner_user_id AS ownerUserId,t.workspace_id AS workspaceId,
+        t.access_mode AS accessMode,t.revision,
+        l.root_thread_id AS rootThreadId,l.depth
+        FROM ja_conversation_thread t LEFT JOIN ja_conversation_lineage l ON l.child_thread_id=t.thread_id
+        WHERE t.thread_id=#{threadId} AND t.deleted_at_ms IS NULL
+    </select>
+    <select id="selectTurnCausality"
+            resultMap="selectTurnCausalityTemporalRow">
+        SELECT thread_id AS threadId,parent_turn_id AS parentTurnId,root_turn_id AS rootTurnId,state,
+        cancel_requested_at_ms AS cancelRequestedAt,requested_at_ms AS requestedAt
+        FROM ja_conversation_turn WHERE turn_id=#{turnId}
+    </select>
+    <select id="selectTaskRoute"
+            resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskRouteRow">
+        SELECT t.thread_id AS threadId,l.root_thread_id AS rootThreadId,l.depth,t.title,
+        COALESCE(t.temporary_lifecycle_state='CLOSING',0) AS closing
+        FROM ja_conversation_thread t LEFT JOIN ja_conversation_lineage l ON l.child_thread_id=t.thread_id
+        WHERE t.thread_id=#{threadId} AND t.deleted_at_ms IS NULL
+    </select>
+    <select id="countRootDescendants" resultType="int">
+        SELECT COUNT(*) FROM ja_conversation_lineage WHERE root_thread_id=#{rootThreadId}
+    </select>
+    <insert id="insertContextSeed">
+        INSERT INTO ja_task_context_seed(context_seed_id,parent_thread_id,parent_turn_id,parent_revision,inheritance_mode,
+        task_brief_json,effective_context_json,references_json,permission_ceiling_json,fingerprint,created_at_ms)
+        VALUES(#{contextSeedId},#{parentThreadId},#{parentTurnId},#{parentRevision},#{inheritanceMode},
+        #{taskBriefJson},#{effectiveContextJson},#{referencesJson},#{permissionCeilingJson},#{fingerprint},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <insert id="insertLineage">
+        INSERT INTO ja_conversation_lineage(child_thread_id,parent_thread_id,root_thread_id,origin_turn_id,task_name,depth,
+        task_kind,lifecycle,context_seed_id,created_at_ms)
+        VALUES(#{childThreadId},#{parentThreadId},#{rootThreadId},#{originTurnId},#{taskName},#{depth},
+        #{taskKind},#{lifecycle},#{contextSeedId},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <select id="insertActivity" resultType="long" affectData="true">
+        INSERT INTO ja_task_activity(activity_id,root_thread_id,task_thread_id,actor_thread_id,causal_turn_id,kind,
+        summary_json,created_at_ms)
+        VALUES(#{activityId},#{rootThreadId},#{taskThreadId},#{actorThreadId},#{causalTurnId},#{kind},
+        #{summaryJson},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}) RETURNING activity_sequence
+    </select>
+    <insert id="insertProjection">
+        INSERT INTO ja_task_projection(task_thread_id,root_thread_id,state,latest_activity_sequence,unread_count,
+        latest_safe_summary,started_at_ms,updated_at_ms)
+        VALUES(#{taskThreadId},#{rootThreadId},#{state},#{latestActivitySequence},1,
+        #{latestSafeSummary},#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <update id="incrementAncestorDescendants">
+        WITH RECURSIVE ancestors(thread_id) AS (
+        SELECT #{parentThreadId}
+        UNION ALL
+        SELECT l.parent_thread_id FROM ja_conversation_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        )
+        UPDATE ja_task_projection SET descendant_count=descendant_count+1,revision=revision+1
+        WHERE task_thread_id IN (SELECT thread_id FROM ancestors) AND descendant_count&lt;64
+    </update>
+    <update id="recomputeAncestorCounts">
+        WITH RECURSIVE ancestors(thread_id) AS (
+        SELECT parent_thread_id FROM ja_conversation_lineage WHERE child_thread_id=#{taskThreadId} AND lifecycle='ATTACHED'
+        UNION ALL
+        SELECT l.parent_thread_id FROM ja_conversation_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        )
+        UPDATE ja_task_projection AS p SET
+        descendant_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM descendants),
+        running_descendant_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM ja_task_projection WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state='RUNNING'),
+        needs_attention_count=(WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM ja_task_projection WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state IN ('WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')),
+        revision=revision+1,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE p.task_thread_id IN (SELECT thread_id FROM ancestors)
+    </update>
+    <update id="advanceTitleProjection">
+        UPDATE ja_task_projection SET revision=revision+1,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId}
+    </update>
+
+    <select id="selectTaskSummary"
+            resultMap="selectTaskSummaryTemporalRow">
+        SELECT
+        <include refid="taskSummaryColumns"/>
+        FROM ja_conversation_lineage l JOIN ja_task_projection p ON p.task_thread_id=l.child_thread_id
+        JOIN ja_conversation_thread t ON t.thread_id=l.child_thread_id
+        WHERE l.child_thread_id=#{taskThreadId} AND t.deleted_at_ms IS NULL
+    </select>
+    <select id="selectTaskTree"
+            resultMap="selectTaskTreeTemporalRow">
+        SELECT
+        <include refid="taskSummaryColumns"/>
+        FROM ja_conversation_lineage l JOIN ja_task_projection p ON p.task_thread_id=l.child_thread_id
+        JOIN ja_conversation_thread t ON t.thread_id=l.child_thread_id
+        WHERE l.root_thread_id=#{rootThreadId} AND t.deleted_at_ms IS NULL
+        ORDER BY l.depth,l.created_at_ms,l.child_thread_id
+    </select>
+    <select id="selectRootActivityProjections"
+            resultMap="selectRootActivityProjectionsTemporalRow">
+        SELECT a.activity_sequence AS activitySequence,a.activity_id AS activityId,
+        a.root_thread_id AS activityRootThreadId,a.task_thread_id AS activityTaskThreadId,
+        a.actor_thread_id AS actorThreadId,a.causal_turn_id AS causalTurnId,
+        a.kind AS activityKind,a.summary_json AS activitySummaryJson,a.created_at_ms AS activityCreatedAt,
+        l.child_thread_id AS lineageTaskThreadId,l.parent_thread_id AS parentThreadId,
+        l.root_thread_id AS lineageRootThreadId,l.origin_turn_id AS originTurnId,t.title AS taskName,
+        l.depth,l.task_kind AS taskKind,l.lifecycle,l.context_seed_id AS contextSeedId,
+        l.created_at_ms AS lineageCreatedAt,p.task_thread_id AS projectionTaskThreadId,
+        p.root_thread_id AS projectionRootThreadId,p.revision AS projectionRevision,
+        p.state AS projectionState,p.latest_activity_sequence AS latestActivitySequence,
+        p.last_seen_activity_sequence AS lastSeenActivitySequence,p.unread_count AS unreadCount,
+        p.descendant_count AS descendantCount,p.running_descendant_count AS runningDescendantCount,
+        p.needs_attention_count AS needsAttentionCount,p.latest_safe_summary AS latestSafeSummary,
+        p.started_at_ms AS startedAt,p.completed_at_ms AS completedAt,p.updated_at_ms AS projectionUpdatedAt,
+        t.thread_id AS persistedThreadId,t.deleted_at_ms AS threadDeletedAt
+        FROM (
+        SELECT activity_sequence,activity_id,root_thread_id,task_thread_id,actor_thread_id,
+        causal_turn_id,kind,summary_json,created_at_ms
+        FROM ja_task_activity
+        WHERE task_thread_id IN (
+        SELECT child_thread_id FROM ja_conversation_lineage
+        WHERE parent_thread_id=#{rootThreadId} AND task_kind='SUBAGENT' AND lifecycle='ATTACHED'
+        )
+        ORDER BY activity_sequence DESC LIMIT #{limit}
+        ) a
+        LEFT JOIN ja_conversation_lineage l ON l.child_thread_id=a.task_thread_id
+        LEFT JOIN ja_task_projection p ON p.task_thread_id=a.task_thread_id
+        LEFT JOIN ja_conversation_thread t ON t.thread_id=a.task_thread_id
+        ORDER BY a.activity_sequence
+    </select>
+    <select id="selectContextSeed"
+            resultMap="selectContextSeedTemporalRow">
+        SELECT s.context_seed_id AS contextSeedId,s.parent_thread_id AS parentThreadId,
+        s.parent_turn_id AS parentTurnId,s.parent_revision AS parentRevision,
+        s.inheritance_mode AS inheritanceMode,s.task_brief_json AS taskBriefJson,
+        s.effective_context_json AS effectiveContextJson,s.references_json AS referencesJson,
+        s.permission_ceiling_json AS permissionCeilingJson,s.fingerprint,s.created_at_ms AS createdAt
+        FROM ja_task_context_seed s JOIN ja_conversation_lineage l ON l.context_seed_id=s.context_seed_id
+        WHERE l.child_thread_id=#{taskThreadId}
+    </select>
+    <select id="selectActivities"
+            resultMap="selectActivitiesTemporalRow">
+        SELECT activity_sequence AS activitySequence,activity_id AS activityId,root_thread_id AS rootThreadId,
+        task_thread_id AS taskThreadId,actor_thread_id AS actorThreadId,causal_turn_id AS causalTurnId,
+        kind,summary_json AS summaryJson,created_at_ms AS createdAt
+        FROM ja_task_activity WHERE task_thread_id=#{taskThreadId} AND activity_sequence&gt;#{afterSequence}
+        ORDER BY activity_sequence LIMIT #{limit}
+    </select>
+    <select id="selectMailbox"
+            resultMap="selectMailboxTemporalRow">
+        SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+        from_thread_id AS senderThreadId,sender_title AS senderTitle,
+        to_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+        kind,content_json AS contentJson,operation_key AS operationKey,state,bound_turn_id AS boundTurnId,
+        created_at_ms AS createdAt,updated_at_ms AS updatedAt,consumed_at_ms AS consumedAt
+        FROM ja_task_mailbox_message WHERE (from_thread_id=#{taskThreadId} OR to_thread_id=#{taskThreadId})
+        AND mailbox_sequence&gt;#{afterSequence}
+        ORDER BY mailbox_sequence LIMIT #{limit}
+    </select>
+    <select id="selectMailboxByIdempotency"
+            resultMap="selectMailboxByIdempotencyTemporalRow">
+        SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+        from_thread_id AS senderThreadId,sender_title AS senderTitle,
+        to_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+        kind,content_json AS contentJson,operation_key AS operationKey,state,bound_turn_id AS boundTurnId,
+        created_at_ms AS createdAt,updated_at_ms AS updatedAt,consumed_at_ms AS consumedAt
+        FROM ja_task_mailbox_message WHERE from_thread_id=#{senderThreadId} AND operation_key=#{operationKey}
+    </select>
+    <select id="selectPendingMessages"
+            resultMap="selectPendingMessagesTemporalRow">
+        SELECT mailbox_sequence AS mailboxSequence,message_id AS messageId,root_thread_id AS rootThreadId,
+        from_thread_id AS senderThreadId,sender_title AS senderTitle,
+        to_thread_id AS targetThreadId,causal_turn_id AS causalTurnId,
+        kind,content_json AS contentJson,operation_key AS operationKey,state,bound_turn_id AS boundTurnId,
+        created_at_ms AS createdAt,updated_at_ms AS updatedAt,consumed_at_ms AS consumedAt
+        FROM ja_task_mailbox_message WHERE to_thread_id=#{targetThreadId} AND state='PENDING'
+        AND kind IN ('MESSAGE','FINAL_ANSWER')
+        ORDER BY mailbox_sequence LIMIT #{limit}
+    </select>
+    <select id="selectMailboxStats"
+            resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxStats">
+        SELECT COUNT(*) AS pendingCount,COALESCE(SUM(length(CAST(content_json AS BLOB))),0) AS pendingBytes
+        FROM ja_task_mailbox_message WHERE to_thread_id=#{targetThreadId} AND state IN ('PENDING','BOUND')
+    </select>
+    <select id="insertMailbox" resultType="long" affectData="true" flushCache="true">
+        INSERT INTO
+        ja_task_mailbox_message(message_id,root_thread_id,from_thread_id,sender_title,to_thread_id,causal_turn_id,kind,
+        content_json,operation_key,state,bound_turn_id,created_at_ms,updated_at_ms)
+        SELECT #{messageId},#{rootThreadId},#{senderThreadId},t.title,#{targetThreadId},#{causalTurnId},#{kind},
+        #{contentJson},#{operationKey},#{state},#{boundTurnId},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        FROM ja_conversation_thread t WHERE t.thread_id=#{senderThreadId} AND t.deleted_at_ms IS NULL
+        ON CONFLICT(from_thread_id,operation_key) DO NOTHING RETURNING mailbox_sequence
+    </select>
+    <update id="bindMailbox">
+        UPDATE ja_task_mailbox_message SET state='BOUND',bound_turn_id=#{boundTurnId},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE message_id=#{messageId} AND to_thread_id=#{targetThreadId} AND kind='FOLLOW_UP' AND state='PENDING'
+    </update>
+    <update id="consumeFollowUpMailbox">
+        UPDATE ja_task_mailbox_message SET state='CONSUMED',consumed_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE message_id=#{messageId} AND to_thread_id=#{targetThreadId} AND kind='FOLLOW_UP'
+        AND state='BOUND' AND bound_turn_id=#{boundTurnId} AND consumed_at_ms IS NULL
+    </update>
+    <update id="releaseBoundMailboxForTurn">
+        UPDATE ja_task_mailbox_message SET state='PENDING',bound_turn_id=NULL,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE bound_turn_id=#{turnId} AND state='BOUND'
+    </update>
+    <update id="compareAndSetProjection">
+        UPDATE ja_task_projection SET
+        revision=revision+1,state=#{state},latest_activity_sequence=#{latestActivitySequence},
+        unread_count=unread_count+CASE WHEN #{incrementUnread} THEN 1 ELSE 0 END,
+        latest_safe_summary=#{latestSafeSummary},
+        started_at_ms=COALESCE(started_at_ms,#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}),completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+        AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+    </update>
+    <update id="compareAndSetInternalProjection">
+        UPDATE ja_task_projection SET
+        revision=revision+1,state=#{state},latest_activity_sequence=#{latestActivitySequence},
+        unread_count=unread_count+CASE WHEN #{incrementUnread} THEN 1 ELSE 0 END,
+        latest_safe_summary=#{latestSafeSummary},
+        started_at_ms=COALESCE(started_at_ms,#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}),completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+    </update>
+    <update id="compareAndSetProjectionActivity">
+        UPDATE ja_task_projection SET revision=revision+1,latest_activity_sequence=#{latestActivitySequence},
+        unread_count=unread_count+1,latest_safe_summary=#{latestSafeSummary},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+    </update>
+    <update id="compareAndSetFollowUpProjection">
+        UPDATE ja_task_projection SET revision=revision+1,
+        state=CASE WHEN state IN ('RUNNING','WAITING_APPROVAL','WAITING_INPUT') THEN state ELSE 'QUEUED' END,
+        latest_activity_sequence=#{latestActivitySequence},unread_count=unread_count+1,
+        latest_safe_summary=#{latestSafeSummary},
+        completed_at_ms=CASE WHEN state IN ('RUNNING','WAITING_APPROVAL','WAITING_INPUT') THEN completed_at_ms ELSE NULL END,
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+    </update>
+    <update id="compareAndSetUserAdmissionProjection">
+        UPDATE ja_task_projection SET revision=revision+1,
+        state=CASE WHEN state IN ('QUEUED','RUNNING') THEN state ELSE 'QUEUED' END,
+        latest_activity_sequence=#{latestActivitySequence},latest_safe_summary=#{latestSafeSummary},
+        started_at_ms=COALESCE(started_at_ms,#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}),completed_at_ms=NULL,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+        AND state NOT IN ('WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')
+    </update>
+    <update id="compareAndSetSeen">
+        UPDATE ja_task_projection SET revision=revision+1,last_seen_activity_sequence=#{throughActivitySequence},
+        unread_count=(SELECT COUNT(*) FROM ja_task_activity a
+        WHERE a.task_thread_id=#{taskThreadId} AND a.activity_sequence&gt;#{throughActivitySequence}),
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+        AND #{throughActivitySequence}&lt;=latest_activity_sequence
+        AND #{throughActivitySequence}&gt;=COALESCE(last_seen_activity_sequence,0)
+    </update>
+    <select id="selectAttachedDescendants"
+            resultMap="selectAttachedDescendantsTemporalRow">
+        WITH RECURSIVE attached(child_thread_id,depth) AS (
+        SELECT child_thread_id,depth FROM ja_conversation_lineage
+        WHERE parent_thread_id=#{parentThreadId} AND lifecycle='ATTACHED'
+        UNION ALL
+        SELECT l.child_thread_id,l.depth FROM ja_conversation_lineage l JOIN attached a ON l.parent_thread_id=a.child_thread_id
+        WHERE l.lifecycle='ATTACHED'
+        )
+        SELECT
+        <include refid="taskSummaryColumns"/>
+        FROM attached x JOIN ja_conversation_lineage l ON l.child_thread_id=x.child_thread_id
+        JOIN ja_task_projection p ON p.task_thread_id=l.child_thread_id
+        JOIN ja_conversation_thread t ON t.thread_id=l.child_thread_id
+        WHERE t.deleted_at_ms IS NULL ORDER BY x.depth,l.created_at_ms,l.child_thread_id
+    </select>
+    <select id="selectPendingCancellationPropagations"
+            resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$CancellationPropagationRow">
+        SELECT DISTINCT parent.thread_id AS parentThreadId,parent.turn_id AS parentTurnId
+        FROM ja_conversation_turn parent
+        JOIN ja_conversation_lineage child_lineage
+        ON child_lineage.parent_thread_id=parent.thread_id
+        AND child_lineage.origin_turn_id=parent.turn_id
+        AND child_lineage.lifecycle='ATTACHED'
+        JOIN ja_conversation_turn child_turn ON child_turn.thread_id=child_lineage.child_thread_id
+        WHERE parent.cancel_requested_at_ms IS NOT NULL
+        AND child_turn.state NOT IN ('COMPLETED','FAILED','CANCELLED')
+        ORDER BY parent.requested_at_ms,parent.turn_id
+    </select>
+    <select id="selectTaskByTurn"
+            resultType="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TerminalTaskRow">
+        SELECT l.child_thread_id AS taskThreadId,l.parent_thread_id AS parentThreadId,
+        l.root_thread_id AS rootThreadId,l.task_kind AS taskKind,
+        p.revision AS taskRevision,p.state AS taskState
+        FROM ja_conversation_turn x JOIN ja_conversation_lineage l ON l.child_thread_id=x.thread_id
+        JOIN ja_task_projection p ON p.task_thread_id=l.child_thread_id
+        WHERE x.turn_id=#{turnId}
+    </select>
+    <select id="selectNextNonTerminalTaskTurnState" resultType="string">
+        SELECT state FROM ja_conversation_turn
+        WHERE thread_id=#{taskThreadId} AND turn_id&lt;&gt;#{settledTurnId}
+        AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+        ORDER BY requested_at_ms,turn_id LIMIT 1
+    </select>
+
+    <select id="countDeleteTarget" resultType="int">
+        SELECT COUNT(*) FROM ja_task_projection WHERE task_thread_id=#{taskThreadId} AND revision=#{expectedRevision}
+    </select>
+    <select id="countNonTerminalTurnsInTree" resultType="int">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        SELECT COUNT(*) FROM ja_conversation_turn WHERE thread_id IN (SELECT thread_id FROM tree)
+        AND state NOT IN ('COMPLETED','FAILED','CANCELLED')
+    </select>
+    <select id="countTaskSubtree" resultType="int">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) SELECT COUNT(*) FROM tree
+    </select>
+    <update id="softDeleteTaskThreads">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        UPDATE ja_conversation_thread SET deleted_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},revision=revision+1
+        WHERE thread_id IN (SELECT thread_id FROM tree) AND deleted_at_ms IS NULL
+    </update>
+    <delete id="deleteTreeWriteClaims">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) DELETE FROM ja_workspace_write_claim WHERE thread_id IN (SELECT thread_id FROM tree)
+    </delete>
+    <delete id="deleteTreeMailbox">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) DELETE FROM ja_task_mailbox_message WHERE from_thread_id IN (SELECT thread_id FROM tree)
+        OR to_thread_id IN (SELECT thread_id FROM tree)
+    </delete>
+    <delete id="deleteTreeActivities">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) DELETE FROM ja_task_activity WHERE task_thread_id IN (SELECT thread_id FROM tree)
+    </delete>
+    <delete id="deleteTreeProjections">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) DELETE FROM ja_task_projection WHERE task_thread_id IN (SELECT thread_id FROM tree)
+    </delete>
+    <select id="selectTreeSeedIds" resultType="string">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) SELECT context_seed_id FROM ja_conversation_lineage WHERE child_thread_id IN (SELECT thread_id FROM tree)
+    </select>
+    <delete id="deleteTreeLineage">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT #{taskThreadId} UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        ) DELETE FROM ja_conversation_lineage WHERE child_thread_id IN (SELECT thread_id FROM tree)
+    </delete>
+    <delete id="deleteContextSeeds">
+        DELETE FROM ja_task_context_seed WHERE context_seed_id IN
+        <foreach item="seedId" collection="seedIds" open="(" separator="," close=")">#{seedId}</foreach>
+    </delete>
+    <update id="recomputeDescendantCounts">
+        UPDATE ja_task_projection AS p SET descendant_count=(
+        WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id WHERE
+        l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM descendants
+        ),running_descendant_count=(
+        WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM ja_task_projection WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state='RUNNING'
+        ),needs_attention_count=(
+        WITH RECURSIVE descendants(thread_id) AS (
+        SELECT child_thread_id FROM ja_conversation_lineage WHERE parent_thread_id=p.task_thread_id AND lifecycle='ATTACHED'
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN descendants d ON l.parent_thread_id=d.thread_id
+        WHERE l.lifecycle='ATTACHED'
+        ) SELECT COUNT(*) FROM ja_task_projection WHERE task_thread_id IN (SELECT thread_id FROM descendants)
+        AND state IN ('WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')
+        ),revision=revision+1,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE p.root_thread_id=#{rootThreadId}
+    </update>
+
+    <select id="selectNextFencingToken" resultType="long">
+        SELECT COALESCE(MAX(fencing_token),0)+1 FROM ja_workspace_write_claim WHERE workspace_id=#{workspaceId}
+    </select>
+    <select id="allocateProcessGeneration" resultType="long" affectData="true">
+        UPDATE ja_task_process_generation SET last_generation=last_generation+1 WHERE singleton_id=1
+        RETURNING last_generation
+    </select>
+    <select id="insertWriteClaim" resultType="long" affectData="true">
+        INSERT INTO ja_workspace_write_claim(claim_id,workspace_id,thread_id,turn_id,process_generation,fencing_token,
+        state,requested_at_ms)
+        VALUES(#{claimId},#{workspaceId},#{threadId},#{turnId},#{processGeneration},#{fencingToken},'WAITING',#{requestedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+        RETURNING claim_sequence
+    </select>
+    <select id="selectWriteClaim"
+            resultMap="selectWriteClaimTemporalRow">
+        SELECT claim_sequence AS claimSequence,claim_id AS claimId,workspace_id AS workspaceId,thread_id AS threadId,
+        turn_id AS turnId,process_generation AS processGeneration,fencing_token AS fencingToken,state,
+        requested_at_ms AS requestedAt,acquired_at_ms AS acquiredAt,heartbeat_at_ms AS heartbeatAt,released_at_ms AS releasedAt
+        FROM ja_workspace_write_claim WHERE claim_id=#{claimId}
+    </select>
+    <update id="acquireWriteClaim">
+        UPDATE ja_workspace_write_claim SET state='HELD',acquired_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},heartbeat_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='WAITING'
+        AND NOT EXISTS(SELECT 1 FROM ja_workspace_write_claim held
+        WHERE held.workspace_id=ja_workspace_write_claim.workspace_id AND held.state='HELD')
+        AND claim_sequence=(SELECT MIN(waiting.claim_sequence) FROM ja_workspace_write_claim waiting
+        WHERE waiting.workspace_id=ja_workspace_write_claim.workspace_id AND waiting.state='WAITING')
+    </update>
+    <update id="heartbeatWriteClaim">
+        UPDATE ja_workspace_write_claim SET heartbeat_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='HELD'
+    </update>
+    <update id="releaseWriteClaim">
+        UPDATE ja_workspace_write_claim SET state='RELEASED',released_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state='HELD'
+    </update>
+    <update id="abandonWriteClaim">
+        UPDATE ja_workspace_write_claim SET state='ABANDONED',released_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE claim_id=#{claimId} AND fencing_token=#{fencingToken} AND state IN ('WAITING','HELD')
+    </update>
+    <update id="abandonActiveWriteClaims">
+        UPDATE ja_workspace_write_claim SET state='ABANDONED',released_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE state IN ('WAITING','HELD')
+    </update>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectTurnCausalityTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TurnCausalityRow">
+        <constructor>
+            <arg column="threadId" javaType="string"/>
+            <arg column="parentTurnId" javaType="string"/>
+            <arg column="rootTurnId" javaType="string"/>
+            <arg column="state" javaType="string"/>
+            <arg column="cancelRequestedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="requestedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectTaskSummaryTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+        <constructor>
+            <arg column="taskThreadId" javaType="string"/>
+            <arg column="parentThreadId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="originTurnId" javaType="string"/>
+            <arg column="taskName" javaType="string"/>
+            <arg column="depth" javaType="_int"/>
+            <arg column="taskKind" javaType="string"/>
+            <arg column="lifecycle" javaType="string"/>
+            <arg column="contextSeedId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="state" javaType="string"/>
+            <arg column="latestActivitySequence" javaType="_long"/>
+            <arg column="lastSeenActivitySequence" javaType="java.lang.Long"/>
+            <arg column="unreadCount" javaType="_int"/>
+            <arg column="descendantCount" javaType="_int"/>
+            <arg column="runningDescendantCount" javaType="_int"/>
+            <arg column="needsAttentionCount" javaType="_int"/>
+            <arg column="latestSafeSummary" javaType="string"/>
+            <arg column="startedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectTaskTreeTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+        <constructor>
+            <arg column="taskThreadId" javaType="string"/>
+            <arg column="parentThreadId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="originTurnId" javaType="string"/>
+            <arg column="taskName" javaType="string"/>
+            <arg column="depth" javaType="_int"/>
+            <arg column="taskKind" javaType="string"/>
+            <arg column="lifecycle" javaType="string"/>
+            <arg column="contextSeedId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="state" javaType="string"/>
+            <arg column="latestActivitySequence" javaType="_long"/>
+            <arg column="lastSeenActivitySequence" javaType="java.lang.Long"/>
+            <arg column="unreadCount" javaType="_int"/>
+            <arg column="descendantCount" javaType="_int"/>
+            <arg column="runningDescendantCount" javaType="_int"/>
+            <arg column="needsAttentionCount" javaType="_int"/>
+            <arg column="latestSafeSummary" javaType="string"/>
+            <arg column="startedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectRootActivityProjectionsTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$RootActivityProjectionRow">
+        <constructor>
+            <arg column="activitySequence" javaType="_long"/>
+            <arg column="activityId" javaType="string"/>
+            <arg column="activityRootThreadId" javaType="string"/>
+            <arg column="activityTaskThreadId" javaType="string"/>
+            <arg column="actorThreadId" javaType="string"/>
+            <arg column="causalTurnId" javaType="string"/>
+            <arg column="activityKind" javaType="string"/>
+            <arg column="activitySummaryJson" javaType="string"/>
+            <arg column="activityCreatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="lineageTaskThreadId" javaType="string"/>
+            <arg column="parentThreadId" javaType="string"/>
+            <arg column="lineageRootThreadId" javaType="string"/>
+            <arg column="originTurnId" javaType="string"/>
+            <arg column="taskName" javaType="string"/>
+            <arg column="depth" javaType="java.lang.Integer"/>
+            <arg column="taskKind" javaType="string"/>
+            <arg column="lifecycle" javaType="string"/>
+            <arg column="contextSeedId" javaType="string"/>
+            <arg column="lineageCreatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="projectionTaskThreadId" javaType="string"/>
+            <arg column="projectionRootThreadId" javaType="string"/>
+            <arg column="projectionRevision" javaType="java.lang.Long"/>
+            <arg column="projectionState" javaType="string"/>
+            <arg column="latestActivitySequence" javaType="java.lang.Long"/>
+            <arg column="lastSeenActivitySequence" javaType="java.lang.Long"/>
+            <arg column="unreadCount" javaType="java.lang.Integer"/>
+            <arg column="descendantCount" javaType="java.lang.Integer"/>
+            <arg column="runningDescendantCount" javaType="java.lang.Integer"/>
+            <arg column="needsAttentionCount" javaType="java.lang.Integer"/>
+            <arg column="latestSafeSummary" javaType="string"/>
+            <arg column="startedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="projectionUpdatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="persistedThreadId" javaType="string"/>
+            <arg column="threadDeletedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectContextSeedTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ContextSeedRow">
+        <constructor>
+            <arg column="contextSeedId" javaType="string"/>
+            <arg column="parentThreadId" javaType="string"/>
+            <arg column="parentTurnId" javaType="string"/>
+            <arg column="parentRevision" javaType="_long"/>
+            <arg column="inheritanceMode" javaType="string"/>
+            <arg column="taskBriefJson" javaType="string"/>
+            <arg column="effectiveContextJson" javaType="string"/>
+            <arg column="referencesJson" javaType="string"/>
+            <arg column="permissionCeilingJson" javaType="string"/>
+            <arg column="fingerprint" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectActivitiesTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$ActivityRow">
+        <constructor>
+            <arg column="activitySequence" javaType="_long"/>
+            <arg column="activityId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="taskThreadId" javaType="string"/>
+            <arg column="actorThreadId" javaType="string"/>
+            <arg column="causalTurnId" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="summaryJson" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Constructor columns follow query labels; timestamp adapters keep INTEGER storage at the boundary. -->
+    <resultMap id="selectMailboxTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+        <constructor>
+            <arg column="mailboxSequence" javaType="_long"/>
+            <arg column="messageId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="senderThreadId" javaType="string"/>
+            <arg column="senderTitle" javaType="string"/>
+            <arg column="targetThreadId" javaType="string"/>
+            <arg column="causalTurnId" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="contentJson" javaType="string"/>
+            <arg column="operationKey" javaType="string"/>
+            <arg column="state" javaType="string"/>
+            <arg column="boundTurnId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="consumedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Constructor columns follow query labels; timestamp adapters keep INTEGER storage at the boundary. -->
+    <resultMap id="selectMailboxByIdempotencyTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+        <constructor>
+            <arg column="mailboxSequence" javaType="_long"/>
+            <arg column="messageId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="senderThreadId" javaType="string"/>
+            <arg column="senderTitle" javaType="string"/>
+            <arg column="targetThreadId" javaType="string"/>
+            <arg column="causalTurnId" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="contentJson" javaType="string"/>
+            <arg column="operationKey" javaType="string"/>
+            <arg column="state" javaType="string"/>
+            <arg column="boundTurnId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="consumedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Constructor columns follow query labels; timestamp adapters keep INTEGER storage at the boundary. -->
+    <resultMap id="selectPendingMessagesTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$MailboxRow">
+        <constructor>
+            <arg column="mailboxSequence" javaType="_long"/>
+            <arg column="messageId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="senderThreadId" javaType="string"/>
+            <arg column="senderTitle" javaType="string"/>
+            <arg column="targetThreadId" javaType="string"/>
+            <arg column="causalTurnId" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="contentJson" javaType="string"/>
+            <arg column="operationKey" javaType="string"/>
+            <arg column="state" javaType="string"/>
+            <arg column="boundTurnId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="consumedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectAttachedDescendantsTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$TaskSummaryRow">
+        <constructor>
+            <arg column="taskThreadId" javaType="string"/>
+            <arg column="parentThreadId" javaType="string"/>
+            <arg column="rootThreadId" javaType="string"/>
+            <arg column="originTurnId" javaType="string"/>
+            <arg column="taskName" javaType="string"/>
+            <arg column="depth" javaType="_int"/>
+            <arg column="taskKind" javaType="string"/>
+            <arg column="lifecycle" javaType="string"/>
+            <arg column="contextSeedId" javaType="string"/>
+            <arg column="createdAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="state" javaType="string"/>
+            <arg column="latestActivitySequence" javaType="_long"/>
+            <arg column="lastSeenActivitySequence" javaType="java.lang.Long"/>
+            <arg column="unreadCount" javaType="_int"/>
+            <arg column="descendantCount" javaType="_int"/>
+            <arg column="runningDescendantCount" javaType="_int"/>
+            <arg column="needsAttentionCount" javaType="_int"/>
+            <arg column="latestSafeSummary" javaType="string"/>
+            <arg column="startedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectWriteClaimTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$WriteClaimRow">
+        <constructor>
+            <arg column="claimSequence" javaType="_long"/>
+            <arg column="claimId" javaType="string"/>
+            <arg column="workspaceId" javaType="string"/>
+            <arg column="threadId" javaType="string"/>
+            <arg column="turnId" javaType="string"/>
+            <arg column="processGeneration" javaType="_long"/>
+            <arg column="fencingToken" javaType="_long"/>
+            <arg column="state" javaType="string"/>
+            <arg column="requestedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="acquiredAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="heartbeatAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="releasedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+</mapper>

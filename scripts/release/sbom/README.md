@@ -10,13 +10,17 @@
 - Java 依赖图和许可证/哈希/来源引用来自 CycloneDX Maven plugin 生成的 BOM；脚本只
   在离线阶段校验和规范化该 BOM，不重新解析 Maven 依赖。
 
+两个脚本的 `CargoToolchain` 默认值与当前 `rust-toolchain.toml` 基线一致，均为 `1.98.0`；
+调用方仍可显式传入 `-CargoToolchain`。原生命令失败时，脱敏后的 stderr 保留到错误通道，
+机器 JSON 与真实退出码保持独立；临时环境结束后恢复原有缺失、空值或具体值。
+
 ## 离线报告
 
 在仓库根目录执行：
 
 ```powershell
 pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
-  -MavenBomPath app-server/target/ja-app-server-bom.json
+  -MavenBomPath ja-agent/ja-app-server/target/ja-app-server-bom.json
 ```
 
 脚本只读取固定的 manifest/lockfile、许可证入口和显式传入的 Maven BOM/产物路径，输出
@@ -34,7 +38,7 @@ pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
 
 ```powershell
 pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
-  -MavenBomPath app-server/target/ja-app-server-bom.json `
+  -MavenBomPath ja-agent/ja-app-server/target/ja-app-server-bom.json `
   -CorrespondingSourcePath <对应源码归档或源码目录> `
   -ArtifactPath <实际安装包或 bundle 目录> `
   -FailOnBlocker
@@ -62,7 +66,7 @@ pwsh -NoProfile -File scripts/release/sbom/generate.ps1 `
 
 ```powershell
 pwsh -NoProfile -File scripts/release/sbom/collect-license-candidates.ps1 `
-  -MavenBomPath app-server/target/ja-app-server-bom.json `
+  -MavenBomPath ja-agent/ja-app-server/target/ja-app-server-bom.json `
   -OutputDirectory release/sbom/license-candidate-<run-id>
 ```
 
@@ -77,7 +81,7 @@ pwsh -NoProfile -File scripts/release/sbom/collect-license-candidates.ps1 `
 官方来源补齐并保留版权/NOTICE，不能根据 SPDX 名称自行重写文本。
 
 候选 schema 3 会按角色记录 `package.json`、`pnpm-lock.yaml`、根/桌面 Cargo manifest、
-根 `Cargo.lock`、`app-server/pom.xml` 与 Maven BOM 的内容身份。manifest/lockfile 使用原始
+根 `Cargo.lock`、Ja Agent 父 POM、全部七个 Java 模块 POM 与 Maven 聚合 BOM 的内容身份。manifest/lockfile 使用原始
 bytes SHA-256；BOM 使用 `cyclonedx-dependency-graph-v1`，去除生成 timestamp/UUID 并排序
 component/dependency 集合后再计算 SHA-256，因此相同依赖图的重新生成不会制造假漂移。
 promotion 会在复制任何归档前重新计算全部哈希，真实输入变化要求从最终 lockfile 重新生成
@@ -90,7 +94,7 @@ pwsh -NoProfile -File scripts/release/sbom/promote-license-candidates.ps1 `
   -CandidateDirectory release/sbom/license-candidate-<run-id> -ValidateOnly
 ```
 
-它会校验 7 类输入哈希、所有 mapping/text bytes、hash-addressed 文件名和候选 summary，
+它会校验 14 类输入哈希、所有 mapping/text bytes、hash-addressed 文件名和候选 summary，
 不会创建 `LICENSES/approved`，也不等于 source review。
 
 候选经过逐项来源复核后，可用固定 SPDX 数据提交生成 hash-addressed archive：
@@ -110,13 +114,14 @@ SHA-256 写入 `LICENSES/approved/manifest.json`，已有非空归档不会被�
 
 ## Java BOM 的边界
 
-当前 `cyclonedx-maven-plugin:2.9.1:makeBom` 会声明 Maven 在线执行要求，即使
+当前 `cyclonedx-maven-plugin:2.9.1:makeAggregateBom` 会声明 Maven 在线执行要求，即使
 本地缓存已经存在插件，因此不能把它伪装成离线生成。由受控网络准备阶段执行：
 
 ```powershell
-mvn -f app-server/pom.xml `
+mvn -f ja-agent/pom.xml `
   org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom `
-  -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom
+  -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom `
+  -DoutputReactorProjects=false -DexcludeTestProject
 ```
 
 随后把生成的 BOM 作为受控输入，在干净/离线环境运行本报告脚本。发布 owner 仍需固定

@@ -15,7 +15,6 @@ const projects: WorkspaceProjection[] = [
     displayName: "同名项目",
     rootPath: "C:\\work\\alpha",
     trust: "trusted",
-    legacySharedWorkspaceId: null,
   },
   {
     kind: "project",
@@ -23,7 +22,6 @@ const projects: WorkspaceProjection[] = [
     displayName: "同名项目",
     rootPath: "C:\\work\\beta",
     trust: "trusted",
-    legacySharedWorkspaceId: null,
   },
 ];
 

@@ -40,30 +40,11 @@
 .ja-review-notice.is-error {
   color: var(--ja-danger);
 }
-
-.ja-review-view-toggle {
+.ja-review-notice .ja-review-notice-action {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
-  gap: 0.1rem;
-  margin-left: auto;
-  padding: 0.12rem;
-  border: 1px solid var(--ja-border);
-  border-radius: var(--ja-radius-sm);
-  background: var(--ja-window-surface-muted);
-}
-.ja-review-view-toggle button {
-  width: 1.65rem;
-  height: 1.65rem;
-  border-radius: 4px;
-}
-.ja-review-view-toggle button[aria-pressed="true"] {
-  color: var(--ja-foreground);
-  background: var(--ja-control-active);
-  box-shadow: var(--ja-shadow-sm);
-}
-.ja-review-view-toggle svg {
-  width: 0.82rem;
-  height: 0.82rem;
+  gap: 0.25rem;
 }
 
 .ja-review-diff {
@@ -196,6 +177,84 @@
   font-size: var(--ja-text-heading-size);
   line-height: var(--ja-line-heading);
 }
+
+.ja-review-frozen-evidence-dialog {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(10rem, min(48vh, 32rem));
+  width: min(54rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  padding: 1rem;
+  gap: 0.55rem;
+  overflow: hidden;
+}
+.ja-review-frozen-evidence-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 0.75rem;
+}
+.ja-review-frozen-evidence-heading > h2,
+.ja-review-frozen-evidence-dialog > p {
+  margin: 0;
+}
+.ja-review-frozen-evidence-heading > h2 {
+  min-width: 0;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-heading-size);
+  line-height: var(--ja-line-heading);
+}
+.ja-review-frozen-evidence-close {
+  flex-shrink: 0;
+  width: var(--ja-control-height-compact);
+  padding: 0;
+}
+.ja-review-frozen-evidence-close > svg {
+  width: 1rem;
+  height: 1rem;
+}
+.ja-review-frozen-evidence-dialog > p {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-review-frozen-evidence-meta {
+  display: grid;
+  min-width: 0;
+  gap: 0.18rem;
+  padding: 0.45rem 0.55rem;
+  border-block: 1px solid var(--ja-border);
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+  line-height: var(--ja-line-caption);
+}
+.ja-review-frozen-evidence-meta strong,
+.ja-review-frozen-evidence-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ja-review-frozen-evidence-meta strong {
+  color: var(--ja-foreground);
+  font-family: var(--ja-font-mono);
+  font-weight: 500;
+}
+.ja-review-frozen-evidence-dialog > .ja-editor-viewer {
+  min-height: 10rem;
+  height: min(48vh, 32rem);
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+}
+
+@media (max-width: 40rem) {
+  .ja-review-frozen-evidence-dialog {
+    grid-template-rows: auto auto auto minmax(8rem, 40vh);
+    padding: 0.85rem;
+  }
+  .ja-review-frozen-evidence-dialog > .ja-editor-viewer {
+    min-height: 8rem;
+    height: 40vh;
+  }
+}
 .ja-review-confirm-dialog p {
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-body-size);
@@ -211,10 +270,5 @@
 @media (prefers-reduced-motion: reduce) {
   .ja-review-spin {
     animation: none;
-  }
-}
-@media (forced-colors: active) {
-  .ja-review-view-toggle button[aria-pressed="true"] {
-    outline: 1px solid Highlight;
   }
 }

@@ -62,7 +62,7 @@ impl Drop for ResponsesProvider {
     }
 }
 
-/// 读取当前 Adapter 的 Content-Length 请求；大小和超时均受限，不实现通用 HTTP 服务。
+/// 读取当前 Adapter 的有界请求，并用现行进程工具触发审批，避免旧工具名让恢复用例等待不存在的事件。
 fn serve(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -105,8 +105,8 @@ fn serve(stream: &mut TcpStream) -> std::io::Result<()> {
     let needs_approval =
         input.contains("__JA_FAKE_REVIEW_FIXTURE__") && !input.contains("function_call_output");
     let item = if needs_approval {
-        json!({"id":"item_host","type":"function_call","call_id":"call_host_approval","name":"shell",
-            "arguments":json!({"command":"Write-Output JA_HOST_APPROVAL"}).to_string()})
+        json!({"id":"item_host","type":"function_call","call_id":"call_host_approval","name":"exec_command",
+            "arguments":json!({"cmd":"Write-Output JA_HOST_APPROVAL"}).to_string()})
     } else {
         json!({"id":"item_host","type":"message","role":"assistant","status":"completed",
             "content":[{"type":"output_text","text":"已完成。","annotations":[]}]})

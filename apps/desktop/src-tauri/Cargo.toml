@@ -32,6 +32,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 # Ja App Server sidecar 生命周期与协议保持独立于 Tauri，使合同测试和未来非桌面宿主可复用同一 runtime crate。
 ja-runtime = { path = "../../../crates/ja-runtime" }
+ja-review = { path = "../../../crates/ja-review" }
 
 # 桌面宿主固定在 Tauri 2，平台能力只通过显式 plugin 与 capability 暴露。
 # 生产环境保留 Wry 运行时，但不引入 v6 common-controls 链接；Windows 测试宿主

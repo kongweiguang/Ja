@@ -939,7 +939,7 @@ function assertReasoningSequence(items, label) {
   );
   assert.deepEqual(
     actionableItems.filter((item) => item.kind === "tool").map((item) => item.toolKind),
-    ["read", "shell"],
+    ["read", "exec_command"],
     `${label} Tool sequence mismatch`,
   );
 }

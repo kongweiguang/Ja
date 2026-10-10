@@ -17,12 +17,11 @@ const readyStatus: RuntimeStatus = {
   status: "ready",
   generation: 1,
   serverInstanceId: "srv_fixture",
-  features: ["task_threads_v1", "plan_goal_v1"],
+  features: ["task_threads", "plan"],
 };
 const sessionWorkspace = {
   workspaceId: "ws_runtime_a" as const,
   kind: "session" as const,
-  legacySharedWorkspaceId: null,
   displayName: "会话 A" as const,
   trust: "trusted" as const,
   rootPath: "C:\\data\\ja\\workspaces\\thr_runtime_a",
@@ -43,8 +42,8 @@ const requestProfile = {
   maxOutputTokens: 32_000,
 };
 const knownUsage = {
-  requestId: "request_fixture",
-  requestOrdinal: 1,
+  modelRequestId: "modelreq_fixture",
+  modelRequestOrdinal: 1,
   modelRound: 1,
   purpose: "assistant" as const,
   measuredAt: "2026-09-07T00:00:01Z",
@@ -56,7 +55,7 @@ const knownUsage = {
 };
 const unknownUsage = {
   ...knownUsage,
-  requestId: "request_unknown",
+  modelRequestId: "modelreq_unknown",
   certainty: "unknown" as const,
   inputTokens: null,
   outputTokens: null,
@@ -129,10 +128,505 @@ function createBridge(overrides: Partial<RuntimeNativeBridge> = {}): RuntimeNati
   };
 }
 
+/** Fixture exposes the target Thread revision only under thread.revision, matching the fork receipt contract. */
+function forkReceipt(
+  sourceThreadId = "thr_source",
+  sourceItemId = "item_answer",
+  sourceRevision = 7,
+) {
+  return {
+    thread: {
+      threadId: "thr_forked",
+      workspaceId: "ws_demo",
+      workspaceKind: "project" as const,
+      preferences: null,
+      title: "Demo（分叉）",
+      status: "active" as const,
+      pinned: false,
+      latestTurnStatus: null,
+      latestTurnSeen: true,
+      revision: 2,
+      createdAt: "2026-10-01T00:00:00Z",
+      updatedAt: "2026-10-01T00:00:00Z",
+    },
+    source: {
+      threadId: sourceThreadId,
+      itemId: sourceItemId,
+      threadRevision: sourceRevision,
+    },
+  };
+}
+
 describe("RuntimeHost v1 typed adapter", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     localStorage.clear();
+  });
+
+  /** 先持久化来源身份，确认回执后留到成功打开才清理，避免打开失败时重复创建。 */
+  it("freezes a fork tuple and retains the created receipt until the target is opened", async () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_0123456789abcdef0123456789abcdef",
+    };
+    const result = forkReceipt();
+    const invoke = vi.fn(async (command: string, args: unknown): Promise<unknown> => {
+      expect(command).toBe(JA_RUNTIME_COMMANDS.threadFork);
+      expect(args).toEqual({ input });
+      expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+        {
+          method: "thread/fork",
+          threadId: input.sourceThreadId,
+          sourceItemId: input.sourceItemId,
+          expectedThreadRevision: input.expectedThreadRevision,
+          operationKey: input.operationKey,
+        },
+      ]);
+      return result;
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+
+    await expect(adapter.threadFork(input)).resolves.toEqual(result);
+    const journal = JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]");
+    expect(journal).toMatchObject([
+      { method: "thread/fork", sourceItemId: input.sourceItemId, createdResult: result },
+    ]);
+    expect(JSON.stringify(journal)).not.toContain("transcript");
+    await expect(adapter.recoverThreadForks()).resolves.toEqual([
+      { state: "created", input, result },
+    ]);
+    await expect(
+      adapter.threadFork({ ...input, sourceItemId: "item_other" }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await adapter.acknowledgeThreadForkOpened(input.operationKey);
+    expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
+  });
+
+  /** Fork 原子回执已证明创建；恢复只持久化目标身份，避免为未打开会话读取历史。 */
+  it("recovers an unknown fork receipt without reading the child thread", async () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_1123456789abcdef0123456789abcdef",
+    };
+    const result = forkReceipt();
+    let operationReadCount = 0;
+    const invoke = vi.fn(async (command: string, args: unknown): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.threadFork) throw new Error("connection lost");
+      if (command === JA_RUNTIME_COMMANDS.operationRead) {
+        expect(args).toEqual({
+          input: { operationKey: input.operationKey, sourceThreadId: input.sourceThreadId },
+        });
+        operationReadCount += 1;
+        return operationReadCount === 1
+          ? { status: "unknown" }
+          : {
+              status: "committed",
+              method: "thread/fork",
+              threadId: input.sourceThreadId,
+              result,
+            };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const makeAdapter = () =>
+      new TauriRuntimeHostAdapter(
+        createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+      );
+
+    await expect(makeAdapter().threadFork(input)).rejects.toMatchObject({
+      code: "OPERATION_UNCONFIRMED",
+    });
+    expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+      { operationKey: input.operationKey, method: "thread/fork", sourceItemId: input.sourceItemId },
+    ]);
+    await expect(makeAdapter().recoverThreadForks()).resolves.toEqual([
+      { state: "created", input, result },
+    ]);
+    expect(operationReadCount).toBe(2);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_RUNTIME_COMMANDS.threadFork,
+      JA_RUNTIME_COMMANDS.operationRead,
+      JA_RUNTIME_COMMANDS.operationRead,
+    ]);
+    expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+      {
+        operationKey: input.operationKey,
+        method: "thread/fork",
+        threadId: input.sourceThreadId,
+        sourceItemId: input.sourceItemId,
+        expectedThreadRevision: input.expectedThreadRevision,
+        createdResult: result,
+      },
+    ]);
+
+    await expect(makeAdapter().recoverThreadForks()).resolves.toEqual([
+      { state: "created", input, result },
+    ]);
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  /** Receipt envelope 必须仍属于发起 fork 的来源 Thread，即使嵌套结果和 Item 三元组合法。 */
+  it("keeps a fork pending when the committed receipt has a different outer owner", async () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_4123456789abcdef0123456789abcdef",
+    };
+    const result = forkReceipt();
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.threadFork) throw new Error("connection lost");
+      if (command === JA_RUNTIME_COMMANDS.operationRead) {
+        return {
+          status: "committed",
+          method: "thread/fork",
+          threadId: "thr_other_source",
+          result,
+        };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+
+    await expect(adapter.threadFork(input)).rejects.toMatchObject({
+      code: "OPERATION_UNCONFIRMED",
+    });
+    await expect(adapter.recoverThreadForks()).resolves.toEqual([{ state: "pending", input }]);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_RUNTIME_COMMANDS.threadFork,
+      JA_RUNTIME_COMMANDS.operationRead,
+      JA_RUNTIME_COMMANDS.operationRead,
+    ]);
+    const pending = JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]") as Array<
+      Record<string, unknown>
+    >;
+    expect(pending).toMatchObject([
+      { operationKey: input.operationKey, method: "thread/fork", threadId: input.sourceThreadId },
+    ]);
+    expect(pending[0]).not.toHaveProperty("createdResult");
+  });
+
+  /** 回执查询失败代表状态未知而非提交失败；保留原键，待下一次 owner 查证后打开既有子会话。 */
+  it("does not resubmit a pending fork when receipt lookup fails", async () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_2123456789abcdef0123456789abcdef",
+    };
+    const result = forkReceipt();
+    let forkCount = 0;
+    let operationReadCount = 0;
+    const invoke = vi.fn(async (command: string, args: unknown): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.threadFork) {
+        forkCount += 1;
+        expect(args).toEqual({ input });
+        throw new Error("connection lost after submit");
+      }
+      if (command === JA_RUNTIME_COMMANDS.operationRead) {
+        expect(args).toEqual({
+          input: { operationKey: input.operationKey, sourceThreadId: input.sourceThreadId },
+        });
+        operationReadCount += 1;
+        if (operationReadCount === 1) throw new Error("receipt store unavailable");
+        return {
+          status: "committed",
+          method: "thread/fork",
+          threadId: input.sourceThreadId,
+          result,
+        };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+
+    await expect(adapter.threadFork(input)).rejects.toMatchObject({
+      code: "OPERATION_UNCONFIRMED",
+    });
+    expect(forkCount).toBe(1);
+    expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+      {
+        operationKey: input.operationKey,
+        method: "thread/fork",
+        threadId: input.sourceThreadId,
+        sourceItemId: input.sourceItemId,
+        expectedThreadRevision: input.expectedThreadRevision,
+      },
+    ]);
+
+    await expect(adapter.threadFork(input)).resolves.toEqual(result);
+    expect(forkCount).toBe(1);
+    expect(operationReadCount).toBe(2);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      JA_RUNTIME_COMMANDS.threadFork,
+      JA_RUNTIME_COMMANDS.operationRead,
+      JA_RUNTIME_COMMANDS.operationRead,
+    ]);
+    expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+      { operationKey: input.operationKey, method: "thread/fork", createdResult: result },
+    ]);
+  });
+
+  /** 只有 owner 查询明确返回 unknown 才能重提，并且重提参数必须与持久 tuple 完全相同。 */
+  it("resubmits a pending fork only after an explicit unknown receipt", async () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_3123456789abcdef0123456789abcdef",
+    };
+    const result = forkReceipt();
+    let forkCount = 0;
+    let operationReadCount = 0;
+    const invoke = vi.fn(async (command: string, args: unknown): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.threadFork) {
+        forkCount += 1;
+        expect(args).toEqual({ input });
+        if (forkCount === 1) throw new Error("connection lost after submit");
+        return result;
+      }
+      if (command === JA_RUNTIME_COMMANDS.operationRead) {
+        expect(args).toEqual({
+          input: { operationKey: input.operationKey, sourceThreadId: input.sourceThreadId },
+        });
+        operationReadCount += 1;
+        return { status: "unknown" };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+
+    await expect(adapter.threadFork(input)).rejects.toMatchObject({
+      code: "OPERATION_UNCONFIRMED",
+    });
+    await expect(adapter.threadFork(input)).resolves.toEqual(result);
+    expect(forkCount).toBe(2);
+    expect(operationReadCount).toBe(2);
+    expect(JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]")).toMatchObject([
+      {
+        operationKey: input.operationKey,
+        method: "thread/fork",
+        sourceItemId: input.sourceItemId,
+        expectedThreadRevision: input.expectedThreadRevision,
+        createdResult: result,
+      },
+    ]);
+  });
+
+  /** 持久提交日志先于 RPC，但仍在等待 ACK 的请求不能成为结果未知警告或被人工解除。 */
+  it.each(["turn/start", "turn/continue", "turn/reask", "approval/respond"] as const)(
+    "%s 等待正常回执时保留日志但不发布待核实提示",
+    async (method) => {
+      let resolveAck!: (value: unknown) => void;
+      const ack = new Promise<unknown>((resolve) => {
+        resolveAck = resolve;
+      });
+      const command = {
+        "turn/start": JA_RUNTIME_COMMANDS.turnStart,
+        "turn/continue": JA_RUNTIME_COMMANDS.turnContinue,
+        "turn/reask": JA_RUNTIME_COMMANDS.turnReask,
+        "approval/respond": JA_RUNTIME_COMMANDS.approvalRespond,
+      }[method];
+      const invoke = vi.fn(async (nextCommand: string): Promise<unknown> => {
+        if (nextCommand === command) return ack;
+        if (nextCommand === JA_RUNTIME_COMMANDS.operationRead) return { status: "unknown" };
+        throw new Error("unexpected diagnostic read");
+      });
+      const adapter = new TauriRuntimeHostAdapter(
+        createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+      );
+      const listener = vi.fn();
+      const unsubscribe = adapter.subscribePendingOperations(listener);
+      const input = {
+        threadId: "thr_fixture",
+        content: [{ type: "text" as const, text: "hello" }],
+      };
+      const submission =
+        method === "turn/start"
+          ? adapter.turnStart(input)
+          : method === "turn/continue"
+            ? adapter.turnContinue({ threadId: input.threadId, expectedThreadRevision: 1 })
+            : method === "turn/reask"
+              ? adapter.turnReask({
+                  ...input,
+                  expectedThreadRevision: 1,
+                  sourceMessageId: "item_fixture",
+                })
+              : adapter.approvalRespond({
+                  approvalId: "appr_fixture",
+                  turnId: "turn_fixture",
+                  decision: "approve",
+                  expectedThreadRevision: 1,
+                });
+      try {
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(command, expect.anything()));
+        const journal = JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]");
+        expect(journal).toHaveLength(1);
+        expect(journal[0]).toMatchObject({ method });
+        expect(JSON.stringify(journal)).not.toContain("hello");
+        expect(listener.mock.calls.every(([records]) => records.length === 0)).toBe(true);
+        await expect(adapter.pendingOperations()).resolves.toEqual([]);
+        await expect(adapter.recheckPendingOperations()).resolves.toEqual([]);
+        expect(invoke).toHaveBeenCalledTimes(1);
+        await expect(
+          adapter.acknowledgePendingOperation(journal[0].operationKey),
+        ).rejects.toMatchObject({ code: "OPERATION_UNCONFIRMED" });
+        expect(localStorage.getItem("ja.acknowledged-unknown-operations.v1")).toBeNull();
+      } finally {
+        resolveAck(
+          method === "approval/respond"
+            ? null
+            : { accepted: true, turnId: "turn_fixture", queued: false, threadRevision: 1 },
+        );
+        await submission;
+        unsubscribe();
+      }
+      expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
+      expect(listener.mock.calls.every(([records]) => records.length === 0)).toBe(true);
+    },
+  );
+
+  /** 关闭未知提示不等于放宽在途提交门禁；不同 adapter 也必须共享同一 Thread 的保护。 */
+  it("在途请求不显示警告，但仍阻止同一会话重复提交", async () => {
+    let resolveAck!: (value: unknown) => void;
+    const ack = new Promise<unknown>((resolve) => {
+      resolveAck = resolve;
+    });
+    const invoke = vi.fn(async (): Promise<unknown> => ack);
+    const bridge = createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] });
+    const adapter = new TauriRuntimeHostAdapter(bridge);
+    const otherAdapter = new TauriRuntimeHostAdapter(bridge);
+    const input = {
+      threadId: "thr_fixture",
+      content: [{ type: "text" as const, text: "hello" }],
+    };
+    const submission = adapter.turnStart(input);
+    try {
+      await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+      await expect(otherAdapter.pendingOperations()).resolves.toEqual([]);
+      await expect(otherAdapter.turnStart(input)).rejects.toMatchObject({
+        code: "OPERATION_UNCONFIRMED",
+      });
+      expect(invoke).toHaveBeenCalledTimes(1);
+    } finally {
+      resolveAck({ accepted: true, turnId: "turn_fixture", queued: false, threadRevision: 1 });
+      await submission;
+    }
+  });
+
+  /** 独立 Thread 可并发；一个 ACK 清理日志时不能把另一个在途请求提升为未知结果。 */
+  it("不同会话的并发提交保留各自日志且不产生核查警告", async () => {
+    const resolvers = new Map<string, (value: unknown) => void>();
+    const invoke = vi.fn(
+      async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (command !== JA_RUNTIME_COMMANDS.turnStart) throw new Error("unexpected read");
+        const input = args?.["input"] as { threadId: string };
+        return new Promise((resolve) => resolvers.set(input.threadId, resolve));
+      },
+    );
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    const listener = vi.fn();
+    const unsubscribe = adapter.subscribePendingOperations(listener);
+    const first = adapter.turnStart({
+      threadId: "thr_first",
+      content: [{ type: "text", text: "first" }],
+    });
+    const second = adapter.turnStart({
+      threadId: "thr_second",
+      content: [{ type: "text", text: "second" }],
+    });
+    try {
+      await vi.waitFor(() => expect(resolvers.size).toBe(2));
+      const readJournal = (): { threadId: string }[] =>
+        JSON.parse(localStorage.getItem("ja.pending-operations.v1") ?? "[]");
+      expect(readJournal()).toHaveLength(2);
+      resolvers.get("thr_first")?.({
+        accepted: true,
+        turnId: "turn_first",
+        queued: false,
+        threadRevision: 1,
+      });
+      await first;
+      expect(readJournal()).toMatchObject([{ threadId: "thr_second" }]);
+      await expect(adapter.pendingOperations()).resolves.toEqual([]);
+      expect(listener.mock.calls.every(([records]) => records.length === 0)).toBe(true);
+    } finally {
+      for (const [threadId, resolve] of resolvers)
+        resolve({
+          accepted: true,
+          turnId: threadId === "thr_first" ? "turn_first" : "turn_second",
+          queued: false,
+          threadRevision: 1,
+        });
+      await Promise.all([first, second]);
+      unsubscribe();
+    }
+    expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
+  });
+
+  /** 自动查询持久回执仍属于原请求结算；短暂丢 ACK 后成功收敛不能先闪未知警告。 */
+  it("自动回查确认已提交的请求保持静默并清除日志", async () => {
+    let resolveReceipt!: (value: unknown) => void;
+    const receipt = new Promise<unknown>((resolve) => {
+      resolveReceipt = resolve;
+    });
+    const invoke = vi.fn(async (command: string): Promise<unknown> => {
+      if (command === JA_RUNTIME_COMMANDS.turnStart) throw new Error("ACK lost");
+      if (command === JA_RUNTIME_COMMANDS.operationRead) return receipt;
+      if (command === JA_RUNTIME_COMMANDS.threadReadForOperation)
+        return {
+          threadId: "thr_fixture",
+          revision: 1,
+          turns: [],
+          items: [],
+          taskActivities: [],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          nextCursor: null,
+        };
+      throw new Error("unexpected invoke");
+    });
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    const listener = vi.fn();
+    const unsubscribe = adapter.subscribePendingOperations(listener);
+    const submission = adapter.turnStart({
+      threadId: "thr_fixture",
+      content: [{ type: "text", text: "hello" }],
+    });
+    try {
+      await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+      await expect(adapter.pendingOperations()).resolves.toEqual([]);
+      expect(listener.mock.calls.every(([records]) => records.length === 0)).toBe(true);
+    } finally {
+      resolveReceipt({
+        status: "committed",
+        method: "turn/start",
+        threadId: "thr_fixture",
+        result: { accepted: true, turnId: "turn_fixture", queued: false, threadRevision: 1 },
+      });
+      await submission;
+      unsubscribe();
+    }
+    expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
+    expect(listener.mock.calls.every(([records]) => records.length === 0)).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(3);
   });
 
   it("丢失提交响应后持久保留同一操作 ID，重载只查回执不自动重发", async () => {
@@ -144,12 +638,16 @@ describe("RuntimeHost v1 typed adapter", () => {
     const adapter = new TauriRuntimeHostAdapter(
       createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
     );
+    const listener = vi.fn();
+    const unsubscribe = adapter.subscribePendingOperations(listener);
     const input = { threadId: "thr_fixture", content: [{ type: "text" as const, text: "hello" }] };
     await expect(adapter.turnStart(input)).rejects.toMatchObject({ code: "OPERATION_UNCONFIRMED" });
     const pending = await adapter.pendingOperations();
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({ method: "turn/start", threadId: "thr_fixture" });
     expect(JSON.stringify(pending)).not.toContain("hello");
+    expect(listener).toHaveBeenLastCalledWith(pending);
+    unsubscribe();
 
     const reloaded = new TauriRuntimeHostAdapter(
       createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
@@ -168,7 +666,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       "ja.pending-operations.v1",
       JSON.stringify([
         {
-          clientOperationId: operationId,
+          operationKey: operationId,
           method: "turn/start",
           threadId: "thr_fixture",
           createdAt: "2026-09-24T00:00:00.000Z",
@@ -195,7 +693,6 @@ describe("RuntimeHost v1 typed adapter", () => {
           turns: [],
           items: [],
           taskActivities: [],
-          goalActivities: [],
           inputQueue: null,
           contextUsage: null,
           liveStream: null,
@@ -220,7 +717,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       "ja.pending-operations.v1",
       JSON.stringify([
         {
-          clientOperationId: operationId,
+          operationKey: operationId,
           method: "turn/start",
           threadId: "thr_fixture",
           createdAt: "2026-09-24T00:00:00.000Z",
@@ -242,7 +739,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       JSON.parse(localStorage.getItem("ja.acknowledged-unknown-operations.v1") ?? "[]"),
     ).toMatchObject([
       {
-        clientOperationId: operationId,
+        operationKey: operationId,
         method: "turn/start",
         threadId: "thr_fixture",
       },
@@ -355,14 +852,14 @@ describe("RuntimeHost v1 typed adapter", () => {
       input: {
         threadId: "thr_fixture",
         content: [{ type: "text", text: "hello" }],
-        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
+        operationKey: expect.stringMatching(/^op_[0-9a-f]{32}$/),
       },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnContinue, {
       input: {
         threadId: "thr_fixture",
         expectedThreadRevision: 2,
-        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
+        operationKey: expect.stringMatching(/^op_[0-9a-f]{32}$/),
       },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnReask, {
@@ -371,7 +868,7 @@ describe("RuntimeHost v1 typed adapter", () => {
         expectedThreadRevision: 2,
         sourceMessageId: "item_question",
         content: [{ type: "text", text: "edited" }],
-        clientOperationId: expect.stringMatching(/^op_[0-9a-f]{32}$/),
+        operationKey: expect.stringMatching(/^op_[0-9a-f]{32}$/),
       },
     });
     expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnInputEnqueue, {
@@ -447,6 +944,7 @@ describe("RuntimeHost v1 typed adapter", () => {
     }
   });
 
+  /** Runtime feature 合同使用无后缀标识；旧 key 必须拒绝，避免静默关闭新能力。 */
   it("redacts invalid native frames and accepts the public host lifecycle projection", async () => {
     let handler: ((payload: unknown) => void) | undefined;
     const listener = vi.fn();
@@ -478,7 +976,7 @@ describe("RuntimeHost v1 typed adapter", () => {
         occurredAt: "2026-08-18T00:00:00Z",
         status: "ready",
         generation: 1,
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads", "plan"],
         reason: "turn_started",
       },
     });
@@ -488,10 +986,27 @@ describe("RuntimeHost v1 typed adapter", () => {
         status: "ready",
         generation: 1,
         serverInstanceId: "srv_fixture",
-        features: ["task_threads_v1", "plan_goal_v1"],
+        features: ["task_threads", "plan"],
       },
       reason: "turn_started",
     });
+    for (const legacyFeature of ["task_threads_v1", "plan_v1", "interaction_v1"] as const) {
+      expect(() =>
+        parseRuntimeHostEvent({
+          jsonrpc: "2.0",
+          method: "runtime/status-changed",
+          params: {
+            serverInstanceId: "srv_fixture",
+            eventId: "evt_legacy_feature",
+            occurredAt: "2026-08-18T00:00:00Z",
+            status: "ready",
+            generation: 1,
+            features: [legacyFeature],
+            reason: "turn_started",
+          },
+        }),
+      ).toThrow();
+    }
     expect(() =>
       parseRuntimeHostEvent({
         jsonrpc: "2.0",
@@ -502,9 +1017,50 @@ describe("RuntimeHost v1 typed adapter", () => {
           occurredAt: "2026-08-18T00:00:00Z",
           status: "ready",
           generation: 1,
-          features: ["task_threads_v1", "plan_goal_v1"],
+          features: ["task_threads", "plan"],
           readyToken: "0123456789abcdef0123456789abcdef",
         },
+      }),
+    ).toThrow();
+  });
+
+  /** 恢复信号保留连接排序序号，并拒绝把它或额外 Thread revision 当成快照游标。 */
+  it("routes projection recovery notifications to authoritative thread resync", () => {
+    const notification = {
+      jsonrpc: "2.0",
+      method: "turn/resync-required",
+      params: {
+        serverInstanceId: "srv_fixture",
+        eventId: "evt_resync_fixture",
+        sequence: 66,
+        occurredAt: "2026-09-27T00:00:00Z",
+        generation: 2,
+        workspaceId: "ws_fixture",
+        threadId: "thr_fixture",
+        turnId: "turn_fixture",
+        reasonCode: "projection_failed",
+      },
+    };
+    expect(parseRuntimeHostEvent(notification)).toEqual({
+      kind: "resync_required",
+      event: notification.params,
+    });
+    expect(() =>
+      parseRuntimeHostEvent({
+        ...notification,
+        params: { ...notification.params, sequence: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseRuntimeHostEvent({
+        ...notification,
+        params: { ...notification.params, threadRevision: 7 },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseRuntimeHostEvent({
+        ...notification,
+        params: { ...notification.params, reasonCode: "terminal_missing" },
       }),
     ).toThrow();
   });
@@ -525,6 +1081,8 @@ describe("RuntimeHost v1 typed adapter", () => {
         occurredAt: "2026-08-18T00:00:01Z",
         messageId: "item_fixture",
         text: "",
+        totalCharacters: 0,
+        truncated: false,
         modelRound: 1,
         toolCalls: [
           {
@@ -603,6 +1161,8 @@ describe("RuntimeHost v1 typed adapter", () => {
         occurredAt: "2026-09-07T00:00:01Z",
         messageId: "item_known_usage",
         text: "",
+        totalCharacters: 0,
+        truncated: false,
         modelRound: 1,
         usage: knownUsage,
         toolCalls: [
@@ -638,7 +1198,14 @@ describe("RuntimeHost v1 typed adapter", () => {
         occurredAt: "2026-09-07T00:00:02Z",
         state: "completed",
         summary: "done",
-        finalMessage: { messageId: "item_unknown_usage", text: "done" },
+        summaryTotalCharacters: 4,
+        summaryTruncated: false,
+        finalMessage: {
+          messageId: "item_unknown_usage",
+          text: "done",
+          totalCharacters: 4,
+          truncated: false,
+        },
         usage: unknownUsage,
         changeSet: completeChangeSet,
       },
@@ -703,6 +1270,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       turns: [
         {
           turnId: "turn_fixture",
+          origin: "native" as const,
           sourceMessageId: null,
           status: "completed" as const,
           requestedAt: "2026-09-07T00:00:00Z",
@@ -714,9 +1282,8 @@ describe("RuntimeHost v1 typed adapter", () => {
       ],
       items: [],
       taskActivities: [],
-      goalActivities: [],
       inputQueue: null,
-      contextUsage: { ...knownUsage, turnId: "turn_fixture" },
+      contextUsage: { ...knownUsage, turnId: "turn_fixture", contextEstimate: null },
       liveStream: null,
       nextCursor: null,
     };
@@ -725,7 +1292,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       .mockResolvedValueOnce(snapshot)
       .mockResolvedValueOnce({
         ...snapshot,
-        contextUsage: { ...unknownUsage, turnId: "turn_fixture" },
+        contextUsage: { ...unknownUsage, turnId: "turn_fixture", contextEstimate: null },
       });
     const adapter = new TauriHistoryAdapter({
       invoke: invoke as unknown as HistoryNativeBridge["invoke"],
@@ -774,6 +1341,8 @@ describe("RuntimeHost v1 typed adapter", () => {
         occurredAt: "2026-09-07T00:00:03Z",
         messageId: "item_sensitive_usage",
         text: "",
+        totalCharacters: 0,
+        truncated: false,
         modelRound: 1,
         usage: {
           ...knownUsage,
@@ -829,6 +1398,8 @@ describe("RuntimeHost v1 typed adapter", () => {
           occurredAt: `2026-08-18T00:00:0${modelRound}Z`,
           messageId: `item_fixture_${modelRound}`,
           text: "",
+          totalCharacters: 0,
+          truncated: false,
           modelRound,
           toolCalls: ordinals.map((ordinal, index) => ({
             callId: `call_fixture_${modelRound}_${index}`,
@@ -876,14 +1447,14 @@ describe("RuntimeHost v1 typed adapter", () => {
         turnId: "turn_fixture",
         threadRevision: 7,
         occurredAt: "2026-08-30T10:00:01Z",
-        callId: "call_fixture",
+        callId: "toolu_01HABC123",
         ordinal: 3,
       },
     };
 
     expect(parseRuntimeHostEvent(started)).toMatchObject({
       kind: "timeline",
-      event: { method: "tool/started", params: { callId: "call_fixture", ordinal: 3 } },
+      event: { method: "tool/started", params: { callId: "toolu_01HABC123", ordinal: 3 } },
     });
     expect(() =>
       parseRuntimeHostEvent({
@@ -894,6 +1465,40 @@ describe("RuntimeHost v1 typed adapter", () => {
     expect(() =>
       parseRuntimeHostEvent({ ...started, params: { ...started.params, ordinal: -1 } }),
     ).toThrow();
+  });
+
+  /** Tool 恢复 RPC 保留 Provider 原始 callId，并在调用 native bridge 前拒绝路径字符。 */
+  it("preserves opaque provider ids when responding to Tool recovery", async () => {
+    const invoke = vi.fn(async () => ({
+      accepted: true,
+      turnId: "turn_fixture",
+      threadRevision: 8,
+      decision: "retry",
+      resumed: true,
+    }));
+    const adapter = new TauriRuntimeHostAdapter(
+      createBridge({ invoke: invoke as RuntimeNativeBridge["invoke"] }),
+    );
+    const input = {
+      turnId: "turn_fixture",
+      callId: "toolu_01HABC123",
+      expectedThreadRevision: 7,
+      expectedRecoveryRevision: 1,
+      decision: "retry" as const,
+      operationKey: "recovery_fixture_1",
+    };
+
+    await expect(adapter.turnRecoveryRespond(input)).resolves.toMatchObject({
+      accepted: true,
+      turnId: input.turnId,
+      decision: input.decision,
+      resumed: true,
+    });
+    expect(invoke).toHaveBeenCalledWith(JA_RUNTIME_COMMANDS.turnRecoveryRespond, { input });
+    await expect(
+      adapter.turnRecoveryRespond({ ...input, callId: "toolu/unsafe" }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it("accepts workspace-scoped config invalidations and rejects cwd leakage", () => {
@@ -1004,6 +1609,83 @@ describe("RuntimeHost v1 typed adapter", () => {
     ).toThrow();
   });
 
+  /** 局部上下文估算是公开用量，但仅放行合同定义的非负/正整数，避免被 Secret 扫描误杀。 */
+  it("accepts validated context-estimate token metrics and rejects malformed values", () => {
+    const contextEstimate = {
+      certainty: "estimated" as const,
+      source: "local" as const,
+      usedTokens: 12_345,
+      limitTokens: requestProfile.contextWindowTokens,
+      measuredAt: unknownUsage.measuredAt,
+    };
+    const usage = { ...unknownUsage, contextEstimate };
+    const event = {
+      jsonrpc: "2.0",
+      method: "assistant/context-estimated",
+      params: {
+        serverInstanceId: "srv_fixture",
+        eventId: "evt_context_estimated",
+        sequence: 6,
+        occurredAt: unknownUsage.measuredAt,
+        generation: 1,
+        workspaceId: "ws_fixture",
+        threadId: "thr_fixture",
+        turnId: "turn_fixture",
+        threadRevision: 4,
+        usage,
+      },
+    };
+
+    expect(parseRuntimeHostEvent(event)).toMatchObject({
+      kind: "timeline",
+      event: { method: "assistant/context-estimated", params: { usage } },
+    });
+    for (const invalidEstimate of [
+      { ...contextEstimate, usedTokens: -1 },
+      { ...contextEstimate, usedTokens: "token=secret" },
+      { ...contextEstimate, limitTokens: 0 },
+    ]) {
+      expect(() =>
+        parseRuntimeHostEvent({
+          ...event,
+          params: {
+            ...event.params,
+            usage: { ...usage, contextEstimate: invalidEstimate },
+          },
+        }),
+      ).toThrow();
+    }
+  });
+
+  /** 项目繁忙摘要需要穿过重复的 adapter 规范化；不符合公开业务边界的文本不能靠错误码透传。 */
+  it("retains bounded workspace blocker summaries through repeated normalization", () => {
+    const message =
+      "暂时无法更改项目目录：集成验证（等待补充信息）；修复代码（Plan 已暂停）。请先处理或取消这些任务。";
+    const normalized = normalizeRuntimeError({ code: "WORKSPACE_BUSY", message });
+    expect(normalized).toMatchObject({ code: "WORKSPACE_BUSY", message, retryable: true });
+    expect(normalizeRuntimeError(normalized)).toMatchObject({ message });
+
+    const publicTitle =
+      "暂时无法更改项目目录：会话“token /src/README.md 0123456789abcdef0123456789abcdef”正在运行，请结束或取消后重试。";
+    expect(normalizeRuntimeError({ code: "WORKSPACE_BUSY", message: publicTitle }).message).toBe(
+      publicTitle,
+    );
+
+    for (const diagnostic of [
+      "C:\\private\\token=secret",
+      "暂时无法更改项目目录：诊断\nsecret",
+      `暂时无法更改项目目录：${"x".repeat(512)}`,
+      `暂时无法更改项目目录：${"目".repeat(170)}`,
+    ]) {
+      expect(
+        normalizeRuntimeError({ code: "WORKSPACE_BUSY", message: diagnostic }).message,
+      ).not.toBe(diagnostic);
+    }
+    expect(normalizeRuntimeError({ code: "RUNTIME_UNAVAILABLE", message }).message).toBe(
+      "运行时暂不可用",
+    );
+  });
+
   it("normalizes native diagnostics and rejects malformed projections", async () => {
     expect(
       normalizeRuntimeError({ code: "RUNTIME_UNAVAILABLE", message: "C:\\private\\token=secret" }),
@@ -1016,6 +1698,21 @@ describe("RuntimeHost v1 typed adapter", () => {
     expect(normalizeRuntimeError({ code: "TURN_NOT_FOUND" })).toMatchObject({
       code: "TURN_NOT_FOUND",
       message: "运行不存在或已结束",
+      retryable: false,
+    });
+    expect(normalizeRuntimeError({ code: "WORKSPACE_BUSY" })).toMatchObject({
+      code: "WORKSPACE_BUSY",
+      message: expect.stringContaining("项目"),
+      retryable: true,
+    });
+    expect(normalizeRuntimeError({ code: "WORKSPACE_NOT_FOUND" })).toMatchObject({
+      code: "WORKSPACE_NOT_FOUND",
+      message: "项目不存在或已被移除",
+      retryable: false,
+    });
+    expect(normalizeRuntimeError({ code: "WORKSPACE_CONFINEMENT" })).toMatchObject({
+      code: "WORKSPACE_CONFINEMENT",
+      message: expect.stringContaining("目录"),
       retryable: false,
     });
     const malformed = new TauriRuntimeHostAdapter(

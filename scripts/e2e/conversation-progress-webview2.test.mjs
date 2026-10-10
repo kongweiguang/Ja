@@ -12,10 +12,14 @@ import {
   installConversationProgressInvokeProbe,
   parseArguments,
   readResponseAnimationReplayCount,
+  readSourceFileIdentities,
   validateConversationProgressReport,
 } from "./conversation-progress-webview2.mjs";
 
-/** 以完整顺序基线驱动报告合同测试，防止真窗断言退化成单一布尔状态。 */
+/**
+ * 顺序与现行源码路径共同构成报告基线；账本输入按总计 96 减输出 36 展示为含缓存的 60，缓存明细不得重复加总。
+ * @author kongweiguang
+ */
 function validReport() {
   return {
     schemaVersion: 1,
@@ -55,7 +59,7 @@ function validReport() {
           sha256: "a".repeat(64),
         },
         activeStreamRegistry: {
-          path: "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java",
+          path: "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java",
           size: 1,
           sha256: "a".repeat(64),
         },
@@ -65,22 +69,22 @@ function validReport() {
         threadReadContract: { path: "threadReadContract", size: 1, sha256: "a".repeat(64) },
         rustHistoryModel: { path: "rustHistoryModel", size: 1, sha256: "a".repeat(64) },
         mybatisHistoryService: {
-          path: "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
+          path: "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
           size: 1,
           sha256: "a".repeat(64),
         },
         agentLoopPersistence: {
-          path: "app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/loop/AgentLoopPersistence.java",
+          path: "ja-agent/ja-agent-core/src/main/java/io/github/kongweiguang/ja/agent/application/loop/AgentLoopPersistence.java",
           size: 1,
           sha256: "a".repeat(64),
         },
         turnEventSink: {
-          path: "app-server/src/main/java/io/github/kongweiguang/ja/conversation/port/in/TurnEventSink.java",
+          path: "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/model/TurnEventSink.java",
           size: 1,
           sha256: "a".repeat(64),
         },
         threadSnapshot: {
-          path: "app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/ThreadSnapshot.java",
+          path: "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/model/ThreadSnapshot.java",
           size: 1,
           sha256: "a".repeat(64),
         },
@@ -153,18 +157,25 @@ function validReport() {
       screenshots: ["conversation-progress-failure.png", "conversation-progress-continued.png"],
       readCountBeforeContinue: 3,
     },
+    dispatchContext: {
+      contextLabel: "当前上下文约 3.0%，3.8k / 128k tokens，本地估算",
+      sectionHeadings: ["当前上下文 · 本地估算", "Token · 本会话"],
+      screenshot: "context-usage-dispatch.png",
+    },
     contextUsage: {
       // 固定 279px 覆盖 WebView2 非整数 DPI 的真实回报，防止报告合同重新退化为精确像素比较。
       width: 279,
       userSelect: "text",
+      contextLabel: "当前上下文 <0.1%，32 / 128k tokens，Provider 完整用量",
       metrics: {
-        newInput: "60",
+        input: "60",
         output: "36",
-        cacheRead: "0",
+        cacheRead: "30",
+        cacheWrite: null,
         total: "96",
-        cacheRate: "0.0%",
-        context: "0.0%",
-        used: "20 / 128k",
+        cacheRate: "50.0%",
+        context: "<0.1%",
+        used: "32 / 128k",
       },
       narrow: { documentOverflows: false },
     },
@@ -274,17 +285,26 @@ test("animation replay count requires an installed probe", async () => {
   delete globalValue.__JA_CONVERSATION_FLICKER_EVIDENCE__;
 });
 
+/** 所有映射入口都必须存在，避免只抽样两个 Java 类而让真窗身份验收遗漏迁移漂移。 */
+test("source identity resolves moved Java boundaries", async () => {
+  const sources = await readSourceFileIdentities();
+  for (const [name, source] of Object.entries(sources)) {
+    assert.match(source.sha256, /^[0-9a-f]{64}$/u, name);
+    assert.equal(source.status, undefined, name);
+  }
+});
+
 test("报告必须证明流式正文留在工作过程、terminal 收口与 reload 后的公开顺序", () => {
   const report = validReport();
   assert.equal(validateConversationProgressReport(report), report);
   report.contextUsage.metrics.cacheRate = "—";
   assert.throws(() => validateConversationProgressReport(report), /deep-equal|equal/u);
-  report.contextUsage.metrics.cacheRate = "0.0%";
+  report.contextUsage.metrics.cacheRate = "50.0%";
   report.identity.sources.activeStreamRegistry.path =
-    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/stream/ActiveStreamRegistry.java";
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/stream/ActiveStreamRegistry.java";
   assert.throws(() => validateConversationProgressReport(report), /equal/u);
   report.identity.sources.activeStreamRegistry.path =
-    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java";
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java";
   report.live.processNodeStable = false;
   assert.throws(() => validateConversationProgressReport(report), /equal/u);
   report.live.processNodeStable = true;
@@ -311,8 +331,8 @@ test("报告必须证明流式正文留在工作过程、terminal 收口与 relo
   assert.throws(() => validateConversationProgressReport(report), /equal/u);
 });
 
-/** 当前 Agent 提示的公开进展约束必须被 loopback fixture 识别，防止真窗只因验收关键字过时而失败。 */
-test("loopback fixture 按 function_call_output 推进 read、shell、final 三轮", async () => {
+/** Fixture stage 按 Provider 中的真实 Tool 名命名，防止 UI 别名掩盖执行契约漂移。 */
+test("loopback fixture 按 function_call_output 推进 read、exec_command、final 三轮", async () => {
   const fixture = await startConversationProgressFixture();
   try {
     const instructions =
@@ -337,12 +357,17 @@ test("loopback fixture 按 function_call_output 推进 read、shell、final 三�
       { type: "function_call", call_id: "call_progress_read", name: "read", arguments: "{}" },
       { type: "function_call_output", call_id: "call_progress_read", output: "no head" },
     ]);
-    await waitForFixtureStage(fixture, "summary_shell");
+    await waitForFixtureStage(fixture, "summary_exec_command");
     fixture.releaseSecondNarrative();
     const second = await (await secondResponse).text();
     assert.match(second, /call_progress_shell/u);
     const thirdResponse = post([
-      { type: "function_call", call_id: "call_progress_shell", name: "shell", arguments: "{}" },
+      {
+        type: "function_call",
+        call_id: "call_progress_shell",
+        name: "exec_command",
+        arguments: "{}",
+      },
       {
         type: "function_call_output",
         call_id: "call_progress_shell",
@@ -395,11 +420,16 @@ test("loopback fixture 支持失败终态后独立继续 Turn", async () => {
       { type: "function_call", call_id: "call_progress_read", name: "read", arguments: "{}" },
       { type: "function_call_output", call_id: "call_progress_read", output: "no head" },
     ]);
-    await waitForFixtureStage(fixture, "summary_shell");
+    await waitForFixtureStage(fixture, "summary_exec_command");
     fixture.releaseSecondNarrative();
     await (await second).text();
     const third = post([
-      { type: "function_call", call_id: "call_progress_shell", name: "shell", arguments: "{}" },
+      {
+        type: "function_call",
+        call_id: "call_progress_shell",
+        name: "exec_command",
+        arguments: "{}",
+      },
       {
         type: "function_call_output",
         call_id: "call_progress_shell",

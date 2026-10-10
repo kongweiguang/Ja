@@ -376,6 +376,102 @@ fn cached_diff_rejects_changed_unselected_manifest_entry() {
     assert!(matches!(result, Err(ReviewError::ReviewStale)));
 }
 
+/// Unmerged combined diff 不受当前 parser 支持；保持快照时返回 Parse，磁盘变化时仍优先报告 stale。
+#[test]
+fn conflict_diff_reports_parser_limit_without_masking_external_change() {
+    let Some(repo) = committed_repo() else {
+        return;
+    };
+    git(repo.path(), &["checkout", "-qb", "review-conflict"]).expect("create conflict side branch");
+    fs::write(repo.path().join("tracked.txt"), b"feature\ntwo\n")
+        .expect("write feature conflict side");
+    git(repo.path(), &["add", "--all"]).expect("stage feature conflict side");
+    git(repo.path(), &["commit", "-q", "-m", "feature side"])
+        .expect("commit feature conflict side");
+    git(repo.path(), &["checkout", "-q", "HEAD~1"]).expect("return to common ancestor");
+    fs::write(repo.path().join("tracked.txt"), b"main\ntwo\n").expect("write main conflict side");
+    git(repo.path(), &["add", "--all"]).expect("stage main conflict side");
+    git(repo.path(), &["commit", "-q", "-m", "main side"]).expect("commit main conflict side");
+    let merge = Command::new("git")
+        .current_dir(repo.path())
+        .args(["merge", "--no-edit", "review-conflict"])
+        .output()
+        .expect("run expected conflicting merge");
+    assert!(
+        !merge.status.success(),
+        "fixture merge must leave an unmerged path"
+    );
+
+    let registry = WorkspaceRegistry::default();
+    let info = registry.register(repo.path()).expect("register workspace");
+    let service = git_only_service(registry.get(info.id).expect("workspace"));
+    let snapshot = service
+        .snapshot(ReviewSource::Uncommitted, &CancellationToken::new())
+        .expect("snapshot unmerged worktree");
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "tracked.txt")
+        .expect("conflicted file");
+    assert_eq!(file.status, ReviewFileStatus::Conflict);
+    assert!(matches!(
+        service.file_diff(
+            ReviewSource::Uncommitted,
+            &snapshot.revision,
+            &file.file_id,
+            &CancellationToken::new(),
+        ),
+        Err(ReviewError::Parse)
+    ));
+
+    fs::write(repo.path().join("tracked.txt"), b"external conflict edit\n")
+        .expect("change conflicted file externally");
+    assert!(matches!(
+        service.file_diff(
+            ReviewSource::Uncommitted,
+            &snapshot.revision,
+            &file.file_id,
+            &CancellationToken::new(),
+        ),
+        Err(ReviewError::ReviewStale)
+    ));
+}
+
+/// Lazy staged rename diff must query both validated pathspecs so Git can retain the old/new identity.
+#[test]
+fn staged_rename_lazy_diff_preserves_both_paths() {
+    let Some(repo) = committed_repo() else {
+        return;
+    };
+    git(repo.path(), &["mv", "tracked.txt", "renamed.txt"]).expect("stage rename");
+    let registry = WorkspaceRegistry::default();
+    let info = registry.register(repo.path()).expect("register workspace");
+    let service = git_only_service(registry.get(info.id).expect("workspace"));
+    let snapshot = service
+        .snapshot(ReviewSource::Staged, &CancellationToken::new())
+        .expect("staged rename snapshot");
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "renamed.txt")
+        .expect("renamed file");
+    assert_eq!(file.old_path.as_deref(), Some("tracked.txt"));
+    assert_eq!(file.status, ReviewFileStatus::Renamed);
+
+    let diff = service
+        .file_diff(
+            ReviewSource::Staged,
+            &snapshot.revision,
+            &file.file_id,
+            &CancellationToken::new(),
+        )
+        .expect("load staged rename diff");
+    assert_eq!(diff.file.path, "renamed.txt");
+    assert_eq!(diff.file.old_path.as_deref(), Some("tracked.txt"));
+    assert!(diff.file.diff_loaded);
+    assert!(String::from_utf8_lossy(&diff.file.patch).contains("rename from tracked.txt"));
+}
+
 /// 验证 hunk 坐标、additions 与 CRLF/no-final-newline 在解析后保持，不依赖 locale/display format。
 #[test]
 fn parses_hunk_and_synthetic_untracked_patch() {
@@ -663,6 +759,149 @@ fn uncommitted_snapshot_preserves_partial_staging_layers_and_routes_file_actions
             .files
             .iter()
             .any(|file| file.layer == ReviewFileLayer::Unstaged)
+    );
+}
+
+/// 文件级撤销复现桌面先暂存、取消暂存并补读 Diff 的真实链路；所有外部查询都在最后
+/// 快照之前结束，使事务不能把自己的 index 刷新误判为外部写入，失败也不能遗留临时 index。
+#[test]
+fn uncommitted_file_stage_unstage_then_revert_keeps_index_transactional() {
+    let repo =
+        committed_repo().expect("real Git fixture must be available for file revert regression");
+    git(repo.path(), &["config", "core.autocrlf", "false"])
+        .expect("keep worktree byte assertions independent of global line ending settings");
+    let original = b"one\ntwo\n";
+    let modified = b"ONE\ntwo\nnew line\n";
+    let path = repo.path().join("tracked.txt");
+    fs::write(&path, modified).expect("modify tracked fixture");
+    let registry = WorkspaceRegistry::default();
+    let info = registry
+        .register(repo.path())
+        .expect("register isolated workspace");
+    let service = git_only_service(registry.get(info.id).expect("workspace handle"));
+    let source = ReviewSource::Uncommitted;
+    let cancellation = CancellationToken::new();
+    let initial = service
+        .snapshot(source.clone(), &cancellation)
+        .expect("initial aggregate snapshot");
+    let unstaged_id = initial
+        .files
+        .iter()
+        .find(|file| file.path == "tracked.txt" && file.layer == ReviewFileLayer::Unstaged)
+        .expect("modified worktree layer")
+        .file_id
+        .clone();
+    let staged = service
+        .apply(
+            source.clone(),
+            &initial.revision,
+            ReviewAction::Stage,
+            ReviewTarget::File {
+                file_id: unstaged_id,
+            },
+            &cancellation,
+        )
+        .expect("stage aggregate file")
+        .snapshot;
+    assert_eq!(
+        git(repo.path(), &["show", ":tracked.txt"]).expect("read staged content"),
+        modified
+    );
+    let staged_id = staged
+        .files
+        .iter()
+        .find(|file| file.path == "tracked.txt" && file.layer == ReviewFileLayer::Staged)
+        .expect("staged file layer")
+        .file_id
+        .clone();
+    service
+        .apply(
+            source.clone(),
+            &staged.revision,
+            ReviewAction::Unstage,
+            ReviewTarget::File { file_id: staged_id },
+            &cancellation,
+        )
+        .expect("unstage aggregate file");
+    assert_eq!(
+        fs::read(&path).expect("read unchanged worktree edit"),
+        modified
+    );
+    assert_eq!(
+        git(repo.path(), &["show", ":tracked.txt"]).expect("read unstaged index content"),
+        original
+    );
+    assert!(
+        git(repo.path(), &["diff", "--cached", "--name-only"])
+            .expect("read real index diff before final snapshot")
+            .is_empty()
+    );
+    assert_eq!(
+        git(repo.path(), &["diff", "--name-only"])
+            .expect("read real worktree diff before final snapshot"),
+        b"tracked.txt\n"
+    );
+
+    let fresh = service
+        .snapshot(source.clone(), &cancellation)
+        .expect("fresh aggregate snapshot after external Git queries");
+    let file = fresh
+        .files
+        .iter()
+        .find(|file| file.path == "tracked.txt" && file.layer == ReviewFileLayer::Unstaged)
+        .expect("fresh unstaged file");
+    let diff = service
+        .file_diff(
+            source.clone(),
+            &fresh.revision,
+            &file.file_id,
+            &cancellation,
+        )
+        .expect("read current file diff before confirmation");
+    assert_eq!(diff.file.file_id, file.file_id);
+    assert_eq!(diff.file.layer, ReviewFileLayer::Unstaged);
+    assert!(diff.file.diff_loaded);
+    assert!(!diff.file.hunks.is_empty());
+    let reverted = service.apply(
+        source,
+        &fresh.revision,
+        ReviewAction::Revert,
+        ReviewTarget::File {
+            file_id: file.file_id.clone(),
+        },
+        &cancellation,
+    );
+    let leftovers = fs::read_dir(repo.path().join(".git"))
+        .expect("read transaction metadata after revert result")
+        .map(|entry| entry.expect("read Git metadata entry"))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ja-review-index-")
+        })
+        .count();
+    assert_eq!(
+        leftovers, 0,
+        "revert result must release its temporary index"
+    );
+    let reverted =
+        reverted.expect("fresh aggregate file revert must not conflict with its own index update");
+    assert!(reverted.snapshot.files.is_empty());
+    assert_eq!(fs::read(&path).expect("read reverted worktree"), original);
+    assert_eq!(
+        git(repo.path(), &["show", ":tracked.txt"]).expect("read committed index content"),
+        original
+    );
+    assert!(
+        git(repo.path(), &["diff", "--cached", "--name-only"])
+            .expect("read final index diff")
+            .is_empty()
+    );
+    assert!(
+        git(repo.path(), &["diff", "--name-only"])
+            .expect("read final worktree diff")
+            .is_empty()
     );
 }
 

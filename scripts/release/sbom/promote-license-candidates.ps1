@@ -17,9 +17,8 @@ $ErrorActionPreference = 'Stop'
 
 function Resolve-RepositoryPath {
     <#
-    Resolves a repository-relative path and rejects missing inputs before any archive mutation.
-    Keeping this boundary local prevents a candidate from copying arbitrary cache files into the
-    checked-in license directory.
+    解析仓库相对路径，并在修改任何归档内容前拒绝缺失输入。
+    在此处本地约束路径，可防止候选项将任意缓存文件复制到纳入版本管理的许可证目录。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -40,8 +39,7 @@ function Resolve-RepositoryPath {
 
 function Get-RelativePath {
     <#
-    Serializes archive paths with forward slashes so the provenance remains stable across Windows
-    and macOS release runners.
+    使用正斜杠序列化归档路径，确保来源信息在 Windows 和 macOS 发布 runner 间保持一致。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -53,8 +51,7 @@ function Get-RelativePath {
 
 function Get-Sha256 {
     <#
-    Hashes an exact byte file; the hash is the archive identity and prevents silent text changes
-    while a candidate is promoted.
+    对文件的精确字节内容计算哈希；哈希是归档身份，可防止候选项晋级时文本被静默修改。
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -63,8 +60,7 @@ function Get-Sha256 {
 
 function Get-EvidenceHash {
     <#
-    Recomputes candidate input identities with the declared mode. CycloneDX run metadata is removed
-    because a fresh Maven invocation must not invalidate an otherwise identical dependency graph.
+    按声明的模式重新计算候选输入身份。会移除 CycloneDX 运行元数据，因为重新运行 Maven 不应使内容相同的依赖关系图失效。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -106,7 +102,7 @@ function Get-EvidenceHash {
 
 function Write-JsonFile {
     <#
-    Writes deterministic UTF-8 JSON for machine review and later release evidence regeneration.
+    写入确定性的 UTF-8 JSON，供机器审查及后续重新生成发布证据使用。
     #>
     param(
         [Parameter(Mandatory = $true)]$Value,
@@ -119,9 +115,8 @@ function Write-JsonFile {
 
 function Resolve-SpdxIds {
     <#
-    Converts only the small set of explicit SPDX expressions present in the candidate manifest to
-    IDs. This is not a license classifier: an unknown expression fails closed instead of being
-    guessed from package names.
+    只将候选清单中明确列出的一小组 SPDX 表达式转换为 ID。这不是许可证分类器：遇到未知表达式时失败关闭，
+    不根据软件包名称猜测许可证。
     #>
     param([Parameter(Mandatory = $true)][string]$Expression)
 
@@ -154,8 +149,7 @@ function Resolve-SpdxIds {
 
 function Get-SpdxText {
     <#
-    Retrieves the SPDX canonical text at a pinned commit only when the caller explicitly enables
-    network access; the commit and response hash are recorded in the resulting provenance.
+    只有调用方明确启用网络访问时，才从固定提交获取 SPDX 标准文本；结果来源信息会记录该提交和响应哈希。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Id,
@@ -183,8 +177,7 @@ function Get-SpdxText {
 
 function Copy-HashAddressedText {
     <#
-    Copies one candidate or canonical text blob into the hash-addressed archive, refusing a hash
-    collision whose bytes differ.
+    将一份候选文本或标准文本复制到按哈希寻址的归档；若哈希相同而字节不同，则拒绝处理。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$SourcePath,
@@ -209,8 +202,7 @@ function Copy-HashAddressedText {
 
 function Copy-CanonicalText {
     <#
-    Writes a downloaded SPDX byte sequence through the same hash-addressed path used for cached
-    candidate files, preserving one canonical copy for all packages that share a license.
+    使用缓存候选文件相同的哈希寻址路径保存下载的 SPDX 字节序列，使共享同一许可证的软件包复用一份标准文本。
     #>
     param(
         [Parameter(Mandatory = $true)][byte[]]$Bytes,
@@ -236,21 +228,24 @@ function Copy-CanonicalText {
 
 function Confirm-CandidateInputs {
     <#
-    Re-hashes every role-bound candidate input before promotion.  This prevents a reviewed text
-    set from being attached to lockfiles or a Maven BOM that changed after collection.
+    晋级前重新计算每项绑定角色的候选输入哈希，防止将已审查的文本集合关联到收集后发生变化的 lockfile 或 Maven BOM。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)]$Candidate
     )
 
-    if ([int]$Candidate.schemaVersion -ne 3) {
-        throw 'candidate schemaVersion must be 3'
+    if ([int]$Candidate.schemaVersion -ne 4) {
+        throw 'candidate schemaVersion must be 4'
     }
     $inputs = @($Candidate.inputs)
     $requiredRoles = @(
         'node-manifest', 'node-lock', 'cargo-workspace-manifest', 'cargo-package-manifest',
-        'cargo-lock', 'maven-manifest', 'maven-bom'
+        'cargo-lock', 'maven-parent-manifest', 'maven-core-manifest',
+        'maven-store-local-manifest', 'maven-store-pg-manifest',
+        'maven-skills-local-manifest', 'maven-skills-pg-manifest',
+        'maven-example-manifest',
+        'maven-example-spring-boot-manifest', 'maven-app-server-manifest', 'maven-bom'
     )
     if ($inputs.Count -ne $requiredRoles.Count -or
         @($inputs | ForEach-Object { [string]$_.role } | Sort-Object -Unique).Count -ne $requiredRoles.Count) {
@@ -283,8 +278,7 @@ function Confirm-CandidateInputs {
 
 function Confirm-CandidateArchive {
     <#
-    Verifies the candidate text closure and all mapping hashes without promoting or changing review
-    state.  Validation is deliberately separate from source/legal approval.
+    验证候选文本闭包及所有映射哈希，但不执行晋级或修改审查状态。校验有意与源码及法务批准分开处理。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$CandidateRoot,

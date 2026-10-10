@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:review-read","method":"review/read","params":{"threadId":"thr_review","turnId":"turn_review"}}
+{"jsonrpc":"2.0","id":"c:review-read","result":{"threadId":"thr_review","turnId":"turn_review","status":"completed","report":null}}

@@ -18,9 +18,6 @@ export const MAX_TERMINAL_LAYOUT_DEPTH = 8;
 export const MAX_TERMINAL_LAYOUT_INSPECTION_STEPS =
   1 + MAX_TERMINAL_LAYOUT_TABS + MAX_TERMINAL_LAYOUT_NODES;
 export const MAX_TERMINAL_RELATIVE_CWD_LENGTH = 4_096;
-export const MIN_SPLIT_RATIO = 0.2;
-export const MAX_SPLIT_RATIO = 0.8;
-
 const TERMINAL_LAYOUT_KEYS = ["version", "workspaceId", "tabs", "activeTabId"] as const;
 const TERMINAL_TAB_KEYS = ["tabId", "title", "profile", "root", "activePaneId"] as const;
 const TERMINAL_TAB_WITH_CWD_KEYS = [...TERMINAL_TAB_KEYS, "relativeCwd"] as const;
@@ -149,10 +146,10 @@ function collectLayoutIds(layout: TerminalLayoutV1): Set<string> {
   return usedIds;
 }
 
-/** 将分屏比例限定在合同范围，避免手工编辑或指针噪声破坏布局可用性。 */
+/** 将持久比例限定为有限偏好值；当前窗口的可行范围由 UI 几何实时计算。 */
 export function clampSplitRatio(ratio: number): number {
   if (!Number.isFinite(ratio)) return 0.5;
-  return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
+  return Math.min(1, Math.max(0, ratio));
 }
 
 /**
@@ -694,7 +691,7 @@ export function removeTerminalPane(
   });
 }
 
-/** 使用与拖拽手柄一致的 0.2 至 0.8 边界更新分屏比例。 */
+/** 保存有限的分屏比例偏好，不把临时窗口尺寸约束写回布局。 */
 export function setTerminalSplitRatio(
   layout: TerminalLayoutV1,
   tabId: string,
@@ -707,7 +704,7 @@ export function setTerminalSplitRatio(
   }));
 }
 
-/** 遍历单标签树，只更新目标 splitId 的有界比例。 */
+/** 遍历单标签树，只更新目标 splitId 的有限比例偏好。 */
 function updateSplitRatio(
   node: TerminalLayoutNode,
   splitId: string,

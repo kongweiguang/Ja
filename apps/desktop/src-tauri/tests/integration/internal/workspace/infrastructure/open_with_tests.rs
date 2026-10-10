@@ -158,7 +158,7 @@ fn fake_launcher_receives_safe_file_reveal_and_repeat_clicks() {
     assert_eq!(plans[0].cwd, plans[1].cwd);
 }
 
-/// 工作区外文件使用同一闭集 Explorer launcher，保留空格与中文且不经过 shell。
+/// 工作区外文件使用闭集 Explorer launcher，保留空格与中文并以 `/select` 定位。
 #[test]
 fn external_file_reveal_uses_fixed_explorer_plan() {
     let root = tempfile_like::TempDir::create();
@@ -169,9 +169,14 @@ fn external_file_reveal_uses_fixed_explorer_plan() {
     };
     let launcher = RecordingLauncher::default();
 
-    reveal_absolute_file_with(&resolver, &launcher, &path).expect("reveal plan");
+    reveal_absolute_target_with(&resolver, &launcher, &path, EntryKind::File).expect("reveal plan");
     assert!(matches!(
-        reveal_absolute_file_with(&resolver, &launcher, Path::new("relative.txt")),
+        reveal_absolute_target_with(
+            &resolver,
+            &launcher,
+            Path::new("relative.txt"),
+            EntryKind::File
+        ),
         Err(OpenError::InvalidInput)
     ));
     let plans = launcher.plans.lock().expect("recording launcher lock");
@@ -182,6 +187,28 @@ fn external_file_reveal_uses_fixed_explorer_plan() {
         plans[0].args,
         vec![OsString::from(format!("/select,\"{}\"", path.display()))]
     );
+}
+
+/// 显式打开外部目录时直接向 Explorer 传结构化绝对路径，不伪装成文件选择参数。
+#[test]
+fn external_directory_reveal_opens_folder_without_select_argument() {
+    let root = tempfile_like::TempDir::create();
+    let path = root.path.join("中文 项目");
+    fs::create_dir(&path).expect("external directory fixture");
+    let resolver = FakeResolver {
+        program: PathBuf::from("C:\\Windows\\explorer.exe"),
+    };
+    let launcher = RecordingLauncher::default();
+
+    reveal_absolute_target_with(&resolver, &launcher, &path, EntryKind::Directory)
+        .expect("directory reveal plan");
+    let plans = launcher.plans.lock().expect("recording launcher lock");
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].target, OpenWithTarget::FileExplorer);
+    assert_eq!(plans[0].entry_kind, EntryKind::Directory);
+    assert_eq!(plans[0].cwd, path);
+    assert_eq!(plans[0].args, vec![path.as_os_str().to_os_string()]);
+    assert!(!plans[0].args[0].to_string_lossy().contains("/select"));
 }
 
 /// Visual Studio 目录打开保持确定性：仅准入唯一直接 solution/project，歧义目录失败关闭。

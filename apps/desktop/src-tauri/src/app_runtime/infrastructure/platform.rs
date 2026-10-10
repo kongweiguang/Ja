@@ -69,9 +69,9 @@ impl RuntimePlatformPort for NativeRuntimePlatform {
         Err(RuntimeCommandError::unavailable())
     }
 
-    /// 只投影用户可见目录事实；executable、参数、环境和完整原生路径诊断不离开基础设施层。
+    /// 从启动所有者提供的内容展示存储角色；宿主从 Java 获取恢复决策并补充显示。
     fn storage_info(&self) -> RuntimeStorageInfo {
-        let run_dir = &self.config.sidecar.run_dir;
+        let data_dir = &self.config.sidecar.data_dir;
         let native_image = !self
             .config
             .sidecar
@@ -80,14 +80,46 @@ impl RuntimePlatformPort for NativeRuntimePlatform {
             .any(|argument| argument == std::ffi::OsStr::new("-jar"));
         RuntimeStorageInfo {
             native_image,
-            data_path: display_run_directory(run_dir),
-            log_path: None,
+            data_path: display_run_directory(data_dir),
+            log_path: Some(display_run_directory(&self.config.sidecar.log_dir)),
             cache_path: None,
-            last_backup: run_dir
-                .join("ja.sqlite.bak")
-                .is_file()
-                .then(|| "已生成本地备份".to_owned()),
+            last_backup: None,
+            storage_recovery: None,
         }
+    }
+
+    /// 仅解析通过校验的恢复目录；调用操作系统打开器前拒绝任何被重定向的祖先目录。
+    fn open_storage_backup(&self, recovery_id: &str) -> Result<(), RuntimeCommandError> {
+        if recovery_id.len() != 36
+            || !recovery_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            return Err(RuntimeCommandError::invalid_params());
+        }
+        let root = self.config.sidecar.data_dir.join("db-backups");
+        let backup = root.join(recovery_id);
+        for path in [&self.config.sidecar.data_dir, &root, &backup] {
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|_| RuntimeCommandError::unavailable())?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || super::path_policy::is_reparse_point(&metadata)
+            {
+                return Err(RuntimeCommandError::unavailable());
+            }
+        }
+        let root = root
+            .canonicalize()
+            .map_err(|_| RuntimeCommandError::unavailable())?;
+        let backup = backup
+            .canonicalize()
+            .map_err(|_| RuntimeCommandError::unavailable())?;
+        if !backup.starts_with(&root) || !backup.join("original.db").is_file() {
+            return Err(RuntimeCommandError::unavailable());
+        }
+        tauri_plugin_opener::open_path(backup, None::<&str>)
+            .map_err(|_| RuntimeCommandError::unavailable())
     }
 
     /// WebView 字符串先经过 canonical containment 与 trust 校验，再形成 application source。
@@ -95,17 +127,14 @@ impl RuntimePlatformPort for NativeRuntimePlatform {
         &self,
         cwd: &str,
         display_name: Option<&str>,
-        trust: &str,
     ) -> Result<WorkspaceRuntimeSource, RuntimeCommandError> {
         let source = RuntimeConfigSource::from_input(WorkspaceOpenInput {
             cwd: cwd.to_owned(),
             display_name: display_name.map(ToOwned::to_owned),
-            trust: trust.to_owned(),
         })?;
         Ok(WorkspaceRuntimeSource {
             root: source.root_path,
             display_name: source.display_name.unwrap_or_default(),
-            trust: source.trust,
         })
     }
 }

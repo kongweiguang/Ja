@@ -19,6 +19,7 @@ vi.mock("@/shared/hooks/useInterfacePreferencesValue", () => ({
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   uiFontSizeState.value = 16;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -396,9 +397,10 @@ describe("ReviewUnifiedDiff", () => {
       newLine: index % 2 === 0 ? null : (index + 1) / 2,
       text: `line-${index}`,
     }));
-    const { container } = render(
+    const rendered = render(
       <ReviewUnifiedDiff file={{ path: "large.txt", lines }} revision="rev-large" />,
     );
+    const { container } = rendered;
     const viewer = container.querySelector("[data-review-unified-diff]");
     expect(Number(viewer?.getAttribute("data-review-row-count"))).toBeGreaterThan(9_000);
     expect(
@@ -407,8 +409,11 @@ describe("ReviewUnifiedDiff", () => {
 
     const viewport = container.querySelector<HTMLElement>(".ja-review-unified-diff-viewport");
     expect(viewport).not.toBeNull();
+    vi.useFakeTimers();
     fireEvent.scroll(viewport!, { target: { scrollTop: 4_000 } });
     expect(container.querySelectorAll(".ja-review-unified-diff-row").length).toBeLessThan(150);
+    rendered.unmount();
+    act(() => vi.advanceTimersByTime(150));
   });
 
   it("界面字号变化时同步虚拟 Diff 行高，避免 CSS 行盒与滚动偏移不一致", async () => {

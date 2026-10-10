@@ -540,7 +540,7 @@ async function createMcpHeaderThreads(page) {
   return { threadIds: [firstThreadId, secondThreadId] };
 }
 
-/** 借用隔离项目目录新建可信项目会话，让项目 MCP 通过真实工作区身份进入设置与概览。 */
+/** 项目 MCP fixture 独立授信并权威回读，不能把 open 的旧投影手写成可信状态。 */
 async function createProjectMcpHeaderThread(page, sourceThreadId, workspaceRoot) {
   if (!workspaceRoot || !isAbsolute(workspaceRoot)) throw new Error("isolated project path is missing");
   const project = await page.evaluate(async ({ cwd, threadId }) => {
@@ -551,12 +551,16 @@ async function createProjectMcpHeaderThread(page, sourceThreadId, workspaceRoot)
     const preferences = threads.items.find((item) => item.threadId === threadId)?.preferences;
     if (source.threadId !== threadId || !preferences) throw new Error("source preferences unavailable");
     const workspace = await history.workspaceOpen({ cwd });
+    await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
+    const projects = await history.workspaceList({ kind: "project", limit: 200 });
+    const trustedWorkspace = projects.items.find((item) => item.workspaceId === workspace.workspaceId);
+    if (trustedWorkspace?.trust !== "trusted") throw new Error("isolated project trust was not persisted");
     const thread = await history.threadCreate({
       cwd: workspace.root, title: "项目 MCP 概览验收", providerId: preferences.providerId,
       modelId: preferences.modelId, reasoningLevel: preferences.reasoningLevel,
       accessMode: preferences.accessMode, collaborationMode: preferences.collaborationMode,
     });
-    return { workspace, thread };
+    return { workspace: trustedWorkspace, thread };
   }, { cwd: workspaceRoot, threadId: sourceThreadId });
   if (project.workspace.kind !== "project" || project.workspace.trust !== "trusted") {
     throw new Error("isolated project workspace is not trusted");
@@ -569,12 +573,18 @@ async function createProjectMcpHeaderThread(page, sourceThreadId, workspaceRoot)
   return project;
 }
 
-/** 只登记第二个可信项目；重载后显式回到 A Thread，保证设置筛选不借会话切换实现。 */
+/** 第二项目的信任由独立 setter 和 catalog 回读证明，重载后回到 A Thread 保持筛选验收边界。 */
 async function registerAlternateProjectForSettings(page, workspaceRoot, activeProject) {
   if (!workspaceRoot || !isAbsolute(workspaceRoot)) throw new Error("alternate project path is missing");
   const alternate = await page.evaluate(async (cwd) => {
     const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
-    return createHistoryAdapter().workspaceOpen({ cwd });
+    const history = createHistoryAdapter();
+    const workspace = await history.workspaceOpen({ cwd });
+    await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
+    const projects = await history.workspaceList({ kind: "project", limit: 200 });
+    const trustedWorkspace = projects.items.find((item) => item.workspaceId === workspace.workspaceId);
+    if (trustedWorkspace?.trust !== "trusted") throw new Error("alternate project trust was not persisted");
+    return trustedWorkspace;
   }, workspaceRoot);
   if (alternate.kind !== "project" || alternate.trust !== "trusted") {
     throw new Error("alternate project is not trusted");

@@ -5,7 +5,10 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { createElement, StrictMode, useEffect, useRef, type ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ThreadWorkbenchSessions } from "@/app/composition/ThreadWorkbenchSessions";
+import {
+  ThreadWorkbenchSessions,
+  type FilesCapabilityCloseFocusCapture,
+} from "@/app/composition/ThreadWorkbenchSessions";
 import type { WorkbenchHost } from "@/app/composition/WorkbenchHost";
 import type { TerminalWorkspaceLifecycle } from "@/app/application/workbenchLifecyclePorts";
 import type { FilesWorkspaceLifecycle } from "@/features/workbench/files";
@@ -109,7 +112,8 @@ function makeProps(
     onRegisterFilesLifecycle: vi.fn(),
     onRegisterTerminalLifecycle: vi.fn(),
     onRegisterPreviewLifecycle: vi.fn(),
-    onCloseFilesCapability: vi.fn(async () => undefined),
+    onCloseFilesCapability: vi.fn(() => null),
+    onFilesCapabilityClosed: vi.fn(),
     onAddWorkspaceReference: vi.fn(),
     onWorkspaceReferencePreviewSettled: vi.fn(),
     onGitBranchChange: vi.fn(),
@@ -118,6 +122,20 @@ function makeProps(
     onShowRetainedTurnReview: vi.fn(),
     onShowLatestTurnReview: vi.fn(),
     onDismissTurnReview: vi.fn(),
+    ...overrides,
+  };
+}
+
+/** lifecycle fake 始终满足新契约；各测试只覆盖实际关心的 flush 或重绑租约行为。 */
+function filesLifecycle(
+  workspaceId: string,
+  overrides: Partial<FilesWorkspaceLifecycle> = {},
+): FilesWorkspaceLifecycle {
+  return {
+    workspaceId,
+    listUnsavedDocuments: () => [],
+    flushForWorkspaceChange: async () => ({ release: () => undefined }),
+    prepareForWorkspaceRebind: async () => ({ commit: () => undefined, release: () => undefined }),
     ...overrides,
   };
 }
@@ -243,20 +261,23 @@ describe("ThreadWorkbenchSessions", () => {
     ).not.toHaveAttribute("hidden");
   });
 
+  /** 先固定当前焦点 owner；只有保存 lease 完成并释放后才允许应用消费同一份 capture。 */
   it("关闭 Files capability 只 flush 当前会话并在成功后发送焦点通知", async () => {
     const releaseA = vi.fn();
     const releaseB = vi.fn();
     const flushA = vi.fn(async () => ({ release: releaseA }));
-    const flushB = vi.fn(async () => ({ release: releaseB }));
-    mocks.filesByThread.set("thread-a", {
+    const pendingFlush = deferred<{ release: () => void }>();
+    const flushB = vi.fn(() => pendingFlush.promise);
+    const focusCapture: FilesCapabilityCloseFocusCapture = {
       workspaceId: "workspace-1",
-      flushForWorkspaceChange: flushA,
-    });
-    mocks.filesByThread.set("thread-b", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: flushB,
-    });
-    const parentClose = vi.fn(async () => undefined);
+      scopeIdentity: "thread-b",
+      requestId: 7,
+      expectedFocus: null,
+      allowedRestoreFocus: null,
+    };
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushA }));
+    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushB }));
+    const parentClose = vi.fn(() => focusCapture);
     const notified = vi.fn();
     const view = render(
       <ThreadWorkbenchSessions
@@ -276,26 +297,30 @@ describe("ThreadWorkbenchSessions", () => {
     );
     await waitFor(() => expect(view.getByTestId("host-thread-b")).toBeInTheDocument());
 
-    await latestHostProps("thread-b").onCloseFilesCapability("workspace-1");
+    const close = latestHostProps("thread-b").onCloseFilesCapability("workspace-1");
+    expect(parentClose).toHaveBeenCalledExactlyOnceWith("workspace-1");
     expect(flushB).toHaveBeenCalledOnce();
-    expect(releaseB).toHaveBeenCalledOnce();
+    expect(parentClose.mock.invocationCallOrder[0]!).toBeLessThan(
+      flushB.mock.invocationCallOrder[0]!,
+    );
+    expect(releaseB).not.toHaveBeenCalled();
+    expect(notified).not.toHaveBeenCalled();
     expect(flushA).not.toHaveBeenCalled();
     expect(releaseA).not.toHaveBeenCalled();
-    expect(parentClose).not.toHaveBeenCalled();
-    expect(notified).toHaveBeenCalledWith("workspace-1");
+    pendingFlush.resolve({ release: releaseB });
+    await close;
+    expect(releaseB).toHaveBeenCalledOnce();
+    expect(notified).toHaveBeenCalledExactlyOnceWith("workspace-1", focusCapture);
+    expect(releaseB.mock.invocationCallOrder[0]).toBeLessThan(
+      notified.mock.invocationCallOrder[0]!,
+    );
   });
 
   it("聚合 Files flush 失败时释放其它会话已取得的 lease", async () => {
     const releaseA = vi.fn();
     const flushFailure = new Error("thread-b save failed");
-    mocks.filesByThread.set("thread-a", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })),
-    });
-    mocks.filesByThread.set("thread-b", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: vi.fn(async () => Promise.reject(flushFailure)),
-    });
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })) }));
+    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => Promise.reject(flushFailure)) }));
     const registerFiles = vi.fn();
     const view = render(
       <ThreadWorkbenchSessions
@@ -354,10 +379,7 @@ describe("ThreadWorkbenchSessions", () => {
 
   it("后台 A 的迟到 Files flush 只调用 A 缓存的完成通知", async () => {
     const pending = deferred<{ release: () => void }>();
-    mocks.filesByThread.set("thread-a", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: vi.fn(() => pending.promise),
-    });
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(() => pending.promise) }));
     const notifyA = vi.fn();
     const notifyB = vi.fn();
     const view = render(
@@ -448,6 +470,133 @@ describe("ThreadWorkbenchSessions", () => {
     expect(closeB).toHaveBeenCalledOnce();
   });
 
+  /** Rebind 按已登记的 workspace 身份筛选所有保留 Thread，并把失败资源准备作为可回滚事务处理。 */
+  it("workspace rebind 只取得目标 Thread 租约，失败释放且重试只提交目标项目", async () => {
+    const fileLeaseA1 = { commit: vi.fn(), release: vi.fn() };
+    const fileLeaseB1 = { commit: vi.fn(), release: vi.fn() };
+    const fileLeaseA2 = { commit: vi.fn(), release: vi.fn() };
+    const fileLeaseB2 = { commit: vi.fn(), release: vi.fn() };
+    const prepareFilesA = vi
+      .fn<FilesWorkspaceLifecycle["prepareForWorkspaceRebind"]>()
+      .mockResolvedValueOnce(fileLeaseA1)
+      .mockResolvedValueOnce(fileLeaseA2);
+    const prepareFilesB = vi
+      .fn<FilesWorkspaceLifecycle["prepareForWorkspaceRebind"]>()
+      .mockResolvedValueOnce(fileLeaseB1)
+      .mockResolvedValueOnce(fileLeaseB2);
+    const prepareFilesC = vi.fn<FilesWorkspaceLifecycle["prepareForWorkspaceRebind"]>();
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", { prepareForWorkspaceRebind: prepareFilesA }),
+    );
+    mocks.filesByThread.set(
+      "thread-b",
+      filesLifecycle("workspace-1", { prepareForWorkspaceRebind: prepareFilesB }),
+    );
+    mocks.filesByThread.set(
+      "thread-c",
+      filesLifecycle("workspace-2", { prepareForWorkspaceRebind: prepareFilesC }),
+    );
+
+    const closeTerminalA = vi.fn(async () => undefined);
+    const closeTerminalB = vi.fn(async () => undefined);
+    const closeTerminalC = vi.fn(async () => undefined);
+    const resumeTerminalA = vi.fn();
+    const resumeTerminalB = vi.fn();
+    const resumeTerminalC = vi.fn();
+    mocks.terminalByThread.set("thread-a", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closeTerminalA,
+      resumeAfterWorkspaceChange: resumeTerminalA,
+    });
+    mocks.terminalByThread.set("thread-b", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closeTerminalB,
+      resumeAfterWorkspaceChange: resumeTerminalB,
+    });
+    mocks.terminalByThread.set("thread-c", {
+      workspaceId: "workspace-2",
+      closeForWorkspaceChange: closeTerminalC,
+      resumeAfterWorkspaceChange: resumeTerminalC,
+    });
+
+    const closePreviewA = vi.fn(async () => undefined);
+    const closePreviewB = vi
+      .fn<PreviewWorkspaceLifecycle["closeForWorkspaceChange"]>()
+      .mockRejectedValueOnce(new Error("thread-b preview close failed"))
+      .mockResolvedValueOnce(undefined);
+    const closePreviewC = vi.fn(async () => undefined);
+    mocks.previewByThread.set("thread-a", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closePreviewA,
+    });
+    mocks.previewByThread.set("thread-b", {
+      workspaceId: "workspace-1",
+      closeForWorkspaceChange: closePreviewB,
+    });
+    mocks.previewByThread.set("thread-c", {
+      workspaceId: "workspace-2",
+      closeForWorkspaceChange: closePreviewC,
+    });
+
+    const registerRebind = vi.fn();
+    const propsFor = (threadId: string, workspaceId: string) =>
+      makeProps(threadId, {
+        workspace: { workspaceId } as ComponentProps<
+          typeof ThreadWorkbenchSessions
+        >["workspace"],
+        onRegisterRebindLifecycle: registerRebind,
+      });
+    const view = render(<ThreadWorkbenchSessions {...propsFor("thread-a", "workspace-1")} />);
+    view.rerender(<ThreadWorkbenchSessions {...propsFor("thread-b", "workspace-1")} />);
+    view.rerender(<ThreadWorkbenchSessions {...propsFor("thread-c", "workspace-2")} />);
+    await waitFor(() => expect(view.getByTestId("host-thread-c")).toBeInTheDocument());
+    const rebind = [...registerRebind.mock.calls]
+      .reverse()
+      .find(([lifecycle]) => lifecycle !== undefined)?.[0];
+    if (rebind === undefined) throw new Error("missing retained workspace rebind lifecycle");
+
+    await expect(rebind.prepareWorkspaceRebind("workspace-1", "save")).rejects.toThrow(
+      "thread-b preview close failed",
+    );
+    expect(prepareFilesA).toHaveBeenCalledExactlyOnceWith("save");
+    expect(prepareFilesB).toHaveBeenCalledExactlyOnceWith("save");
+    expect(prepareFilesC).not.toHaveBeenCalled();
+    expect(fileLeaseA1.commit).not.toHaveBeenCalled();
+    expect(fileLeaseB1.commit).not.toHaveBeenCalled();
+    expect(fileLeaseA1.release).toHaveBeenCalledOnce();
+    expect(fileLeaseB1.release).toHaveBeenCalledOnce();
+    expect(closeTerminalA).toHaveBeenCalledOnce();
+    expect(closeTerminalB).toHaveBeenCalledOnce();
+    expect(resumeTerminalA).toHaveBeenCalledOnce();
+    expect(resumeTerminalB).toHaveBeenCalledOnce();
+    expect(closePreviewA).toHaveBeenCalledOnce();
+    expect(closePreviewB).toHaveBeenCalledOnce();
+    expect(closeTerminalC).not.toHaveBeenCalled();
+    expect(resumeTerminalC).not.toHaveBeenCalled();
+    expect(closePreviewC).not.toHaveBeenCalled();
+
+    const successfulLease = await rebind.prepareWorkspaceRebind("workspace-1", "discard");
+    successfulLease.commit();
+    successfulLease.release();
+    expect(prepareFilesA).toHaveBeenCalledTimes(2);
+    expect(prepareFilesB).toHaveBeenCalledTimes(2);
+    expect(prepareFilesC).not.toHaveBeenCalled();
+    expect(fileLeaseA2.commit).toHaveBeenCalledOnce();
+    expect(fileLeaseB2.commit).toHaveBeenCalledOnce();
+    expect(fileLeaseA2.release).toHaveBeenCalledOnce();
+    expect(fileLeaseB2.release).toHaveBeenCalledOnce();
+    expect(closeTerminalA).toHaveBeenCalledTimes(2);
+    expect(closeTerminalB).toHaveBeenCalledTimes(2);
+    expect(resumeTerminalA).toHaveBeenCalledTimes(2);
+    expect(resumeTerminalB).toHaveBeenCalledTimes(2);
+    expect(closePreviewA).toHaveBeenCalledTimes(2);
+    expect(closePreviewB).toHaveBeenCalledTimes(2);
+    expect(closeTerminalC).not.toHaveBeenCalled();
+    expect(resumeTerminalC).not.toHaveBeenCalled();
+    expect(closePreviewC).not.toHaveBeenCalled();
+  });
+
   it("真实卸载先 flush Files，再等待 Terminal close fence，最后关闭 Preview 并释放 lease", async () => {
     const order: string[] = [];
     const terminalGate = deferred<void>();
@@ -463,10 +612,7 @@ describe("ThreadWorkbenchSessions", () => {
     const closePreview = vi.fn(async () => {
       order.push("preview-close");
     });
-    mocks.filesByThread.set("thread-a", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: flushFiles,
-    });
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }));
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,
@@ -526,10 +672,7 @@ describe("ThreadWorkbenchSessions", () => {
     const flushFiles = vi.fn(async () => ({ release: vi.fn() }));
     const closeTerminal = vi.fn(async () => undefined);
     const closePreview = vi.fn(async () => undefined);
-    mocks.filesByThread.set("thread-a", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: flushFiles,
-    });
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }));
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,
@@ -560,14 +703,8 @@ describe("ThreadWorkbenchSessions", () => {
     const releaseA = vi.fn();
     const closeTerminal = vi.fn(async () => undefined);
     const closePreview = vi.fn(async () => undefined);
-    mocks.filesByThread.set("thread-a", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })),
-    });
-    mocks.filesByThread.set("thread-b", {
-      workspaceId: "workspace-1",
-      flushForWorkspaceChange: vi.fn(async () => Promise.reject(new Error("save failed"))),
-    });
+    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })) }));
+    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => Promise.reject(new Error("save failed"))) }));
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,

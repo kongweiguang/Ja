@@ -21,8 +21,8 @@ export const interactionPlanProviderScenario = Object.freeze({
   ]),
   readonlyToolCalls: Object.freeze([
     Object.freeze({
-      name: "shell",
-      arguments: Object.freeze({ command: "Write-Output JA_PLAN_READONLY_SHELL" }),
+      name: "exec_command",
+      arguments: Object.freeze({ cmd: "Write-Output JA_PLAN_READONLY_SHELL" }),
     }),
     Object.freeze({
       name: "write",
@@ -63,21 +63,21 @@ export const interactionPlanProviderScenario = Object.freeze({
     }),
     Object.freeze({
       questionId: "question_targets",
-      prompt: "需要覆盖哪些目标？",
+      prompt: "本次任务需要覆盖哪些部分？",
       type: "multiple",
       required: false,
       allowFreeText: false,
       options: Object.freeze([
         Object.freeze({
           optionId: "option_plan",
-          label: "Plan",
-          description: "覆盖计划版本与执行。",
+          label: "Plan 执行",
+          description: "覆盖计划版本、执行与恢复。",
           recommended: true,
         }),
         Object.freeze({
-          optionId: "option_goal",
-          label: "Goal",
-          description: "验证 Goal 保持独立。",
+          optionId: "option_conversation",
+          label: "普通对话",
+          description: "验证多步骤工具执行与最终交付。",
           recommended: false,
         }),
       ]),

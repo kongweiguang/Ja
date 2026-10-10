@@ -184,6 +184,38 @@ describe("useReviewController", () => {
     expect(port.fileDiff).toHaveBeenCalledTimes(1);
   });
 
+  /** 冻结历史允许显式重读轻量来源目录，但隐藏工作面与 Git 正文继续受各自准入约束。 */
+  it("冻结历史重试 catalog 不物化 Git 正文，隐藏后刷新不发起读取", async () => {
+    const port = createPort({
+      catalog: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("catalog unavailable"))
+        .mockResolvedValue(catalog),
+    });
+    const { result, rerender } = renderHook(
+      ({ catalogEnabled }: { catalogEnabled: boolean }) =>
+        useReviewController({
+          workspaceId: "ws_demo",
+          snapshotEnabled: false,
+          catalogEnabled,
+          adapter: port,
+        }),
+      { initialProps: { catalogEnabled: true } },
+    );
+    await waitFor(() => expect(result.current.viewModel.state.error).toBeDefined());
+    act(() => result.current.actions.refresh());
+    await waitFor(() => expect(result.current.viewModel.state.catalog).toEqual(catalog));
+    expect(port.catalog).toHaveBeenCalledTimes(2);
+    expect(port.snapshot).not.toHaveBeenCalled();
+    expect(port.fileDiff).not.toHaveBeenCalled();
+
+    rerender({ catalogEnabled: false });
+    act(() => result.current.actions.refresh());
+    expect(port.catalog).toHaveBeenCalledTimes(2);
+    expect(port.snapshot).not.toHaveBeenCalled();
+    expect(port.fileDiff).not.toHaveBeenCalled();
+  });
+
   /** 隐藏态不得触发任何 Git 物化，重新激活后才按当前来源完整加载。 */
   it("隐藏时保持 catalog、snapshot 和 file diff 读取全零", async () => {
     const port = createPort();
@@ -642,7 +674,7 @@ describe("useReviewController", () => {
     expect(port.fileDiff).not.toHaveBeenCalled();
   });
 
-  /** 本地筛选切到 metadata-only 条目时不能遗留 loading，也不能补发无意义正文请求。 */
+  /** 本地筛选切换到仅含元数据的条目时不能遗留加载状态，也不能额外发起无意义的正文请求。 */
   it("筛选切到二进制文件后立即结束 Diff loading", async () => {
     const binaryFile = { ...secondaryFile, binary: true };
     const port = createPort({
@@ -664,7 +696,7 @@ describe("useReviewController", () => {
     expect(port.fileDiff).toHaveBeenCalledTimes(1);
   });
 
-  /** metadata-first 快照不携带 hunk；写入授权必须来自当前 revision 已验证的单文件 Diff。 */
+  /** 元数据优先的快照不携带 hunk；写入授权必须来自当前 revision 已验证的单文件差异。 */
   it("使用当前文件 Diff 的权威 hunk 身份执行操作", async () => {
     const metadataFile = { ...file, hunks: [] };
     const port = createPort({

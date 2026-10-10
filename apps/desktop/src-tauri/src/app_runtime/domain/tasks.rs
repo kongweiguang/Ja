@@ -183,7 +183,7 @@ pub struct TaskMessageInput {
     pub sender_thread_id: String,
     pub target_thread_id: String,
     pub content: Vec<TurnContentPart>,
-    pub idempotency_key: String,
+    pub operation_key: String,
 }
 
 impl TaskMessageInput {
@@ -191,9 +191,9 @@ impl TaskMessageInput {
     pub(crate) fn validate(&self) -> Result<(), DomainValidationError> {
         if !valid_protocol_id(&self.sender_thread_id, "thr_", 100)
             || !valid_protocol_id(&self.target_thread_id, "thr_", 100)
-            || self.idempotency_key.is_empty()
-            || self.idempotency_key.len() > 128
-            || self.idempotency_key.chars().any(char::is_control)
+            || self.operation_key.is_empty()
+            || self.operation_key.len() > 128
+            || self.operation_key.chars().any(char::is_control)
         {
             return Err(DomainValidationError);
         }
@@ -352,8 +352,6 @@ pub struct TaskThreadSummary {
     pub thread_id: String,
     pub workspace_id: String,
     pub workspace_kind: WorkspaceKind,
-    pub legacy_shared_workspace_id: Option<String>,
-    pub active_goal_id: Option<String>,
     pub preferences: Option<TaskThreadPreferences>,
     pub title: String,
     pub status: String,
@@ -423,5 +421,5 @@ pub struct TaskTreeDeleteResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCloseResult {
-    pub closed: bool,
+    pub closed_thread_ids: Vec<String>,
 }

@@ -11,15 +11,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $root = [System.IO.Path]::GetFullPath($RepositoryRoot)
-$pom = Join-Path $root 'app-server\pom.xml'
+$pom = Join-Path $root 'ja-agent/pom.xml'
 $target = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    Join-Path $root 'app-server\target'
+    Join-Path $root 'ja-agent/ja-app-server\target'
 } else {
     [System.IO.Path]::GetFullPath($OutputDirectory)
 }
 $jar = Join-Path $target 'ja-app-server.jar'
+$moduleBuildDirectory = 'target-ja-app-package-' + [Guid]::NewGuid().ToString('N')
 
-# Proves the target can be atomically replaced before Maven creates a thin intermediate JAR.
+# 在 Maven 生成薄 JAR 中间产物前，确认目标文件可以原子替换。
 function Test-ArtifactReplaceAdmission {
     if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) { return $true }
     try {
@@ -32,7 +33,7 @@ function Test-ArtifactReplaceAdmission {
     }
 }
 
-# Checks the Solon executable layout instead of accepting Maven's thin pre-repackage output.
+# 检查 Solon 可执行 JAR 的结构，不接受 Maven 重打包前的普通薄 JAR。
 function Test-FatJarLayout {
     if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) { return $false }
     try {
@@ -61,7 +62,7 @@ if (-not (Test-ArtifactReplaceAdmission)) {
     exit 2
 }
 
-& mvn.cmd -B -ntp -f $pom -DskipTests "-Dja.build.directory=$target" package
+& mvn.cmd -B -ntp -f $pom -pl :ja-app-server -am -DskipTests "-Dja.build.directory=$moduleBuildDirectory" "-Dja.app-server.build.directory=$target" package
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if (-not (Test-FatJarLayout)) {

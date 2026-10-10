@@ -9,7 +9,7 @@ import {
   summaryDocument,
 } from "./conversation-recovery-fixture.mjs";
 
-/** 分类始终只看最新用户项，让历史里的 marker/答案不会改写当前恢复操作。 */
+/** 分类优先沿用最近已知的 user 场景 marker，再识别没有来源 marker 的通用继续。 */
 test("request classifier uses the last user marker and recognizes summary/title", () => {
   assert.equal(RECOVERY_MAX_ATTEMPTS, 6);
   assert.equal(
@@ -30,10 +30,11 @@ test("request classifier uses the last user marker and recognizes summary/title"
       input: [
         { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_CONTINUE" }] },
         { role: "assistant", content: "failed attempt" },
+        { role: "user", content: [{ type: "input_text", text: "继续" }] },
       ],
     }),
     "JA_RECOVERY_CONTINUE",
-    "continue must reuse the source prompt without a visible continuation user item",
+    "a later generic continue item must retain the latest known source scenario",
   );
   assert.equal(
     requestStep({
@@ -145,6 +146,7 @@ test("loopback gates a manual continuation after a deterministic rejection", asy
         input: [
           { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_CONTINUE" }] },
           { role: "assistant", content: "failed attempt" },
+          { role: "user", content: [{ type: "input_text", text: "继续" }] },
         ],
       }),
     }).then((response) => {
@@ -157,7 +159,16 @@ test("loopback gates a manual continuation after a deterministic rejection", asy
     const recovered = await gated;
     assert.equal(recovered.status, 200);
     assert.match(await recovered.text(), /JA_RECOVERY_CONTINUE_SUCCESS/u);
-    assert.equal(fixture.attempts.at(-1)?.continuationContext?.continueMessageCount, 0);
+    assert.equal(fixture.attempts.at(-1)?.continuationContext?.continueMessageCount, 1);
+    assert.equal(fixture.attempts.at(-1)?.continuationContext?.step, "JA_RECOVERY_CONTINUE");
+    assert.deepEqual(fixture.attempts.at(-1)?.inputRoutingFacts, {
+      inputShape: "messages",
+      userMessageCount: 2,
+      latestUserHasRecoveryMarker: false,
+      latestUserHasContinueMarker: false,
+      anyUserHasContinueMarker: true,
+    });
+    assert.equal("input" in fixture.attempts.at(-1), false);
   } finally {
     await fixture.close();
   }
@@ -230,7 +241,7 @@ test("loopback tool call receives one output across a failed continuation retry"
     const continuation = {
       input: [
         { role: "user", content: [{ type: "input_text", text: "JA_RECOVERY_TOOL_ONCE" }] },
-        { type: "function_call", call_id: "call_recovery_once", name: "shell", arguments: "{}" },
+        { type: "function_call", call_id: "call_recovery_once", name: "exec_command", arguments: "{}" },
         { type: "function_call_output", call_id: "call_recovery_once", output: "JA_RECOVERY_TOOL_ONCE_EXECUTED" },
       ],
     };

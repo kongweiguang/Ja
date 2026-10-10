@@ -130,7 +130,7 @@ const initialPreferences: UiPreferences = {
 
 /**
  * 校验 preference store 持久化的小型 enum；原生 Settings 文档有自己的 Schema，
- * 因此非法 UI-only 值必须在本地修复，不能泄漏到文档级 theme。
+ * 因此非法的界面专用值必须在本地修复，不能泄漏到文档级主题。
  */
 function normalizeThemeMode(value: unknown): ThemeMode {
   return value === "light" || value === "dark" || value === "system" ? value : "system";

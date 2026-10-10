@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   ConfigCredentialRefSchema,
   ConfigDocumentSchema,
+  ConfigEffectiveDocumentSchema,
   ConfigMcpServerSchema,
   ConfigModelIdSchema,
   ConfigModelSchema,
@@ -22,7 +23,6 @@ export const JA_SETTINGS_COMMANDS = {
   patch: "ja_configuration_patch",
   replace: "ja_configuration_replace",
   reset: "ja_configuration_reset",
-  restore: "ja_configuration_restore",
   setCredential: "ja_credential_set",
   deleteCredential: "ja_credential_delete",
   revealProviderCredential: "ja_credential_reveal_provider",
@@ -48,7 +48,7 @@ const ConfigLayerSchema = z
   .object({
     present: z.boolean(),
     trusted: z.boolean(),
-    status: z.enum(["missing", "valid", "untrusted", "corrupt", "io_error"]),
+    status: z.enum(["missing", "valid", "partial", "untrusted", "corrupt", "io_error"]),
     document: ConfigValuesSchema.nullable(),
   })
   .strict();
@@ -69,7 +69,7 @@ const ConfigIssueSchema = z
     column: z.number().int().min(1).nullable(),
     reason: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/),
     impact: z.string().regex(/^[a-z_]{1,64}$/),
-    actions: z.array(z.enum(["edit", "retry", "restore"])).max(3),
+    actions: z.array(z.enum(["edit", "retry", "repair"])).max(3),
   })
   .strict();
 const ConfigReadResultSchema = z
@@ -79,6 +79,7 @@ const ConfigReadResultSchema = z
     effective: ConfigValuesSchema,
     user: ConfigLayerSchema,
     project: ConfigLayerSchema,
+    sources: z.record(z.string().min(1).max(256), z.enum(["default", "user", "project"])),
     credentials: z.record(CredentialRefSchema, z.object({ configured: z.boolean() }).strict()),
     cas: ConfigCasSchema,
     diagnostics: z.array(z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/)).max(32),
@@ -110,7 +111,6 @@ const ConfigResetInputSchema = z.discriminatedUnion("scope", [
   z.object(userConfigTarget).strict(),
   z.object(projectConfigTarget).strict(),
 ]);
-const ConfigRestoreInputSchema = z.object({ expectedVersion: ConfigVersionSchema }).strict();
 
 const UiReasoningLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const UiReasoningLevelMapSchema = z
@@ -133,6 +133,7 @@ const UiProviderModelSchema = z
       .object({
         contextWindowTokens: z.number().int().min(4_096).max(4_000_000),
         maxOutputTokens: z.number().int().min(1).max(1_000_000),
+        supportsOutputSchema: z.boolean(),
       })
       .strict(),
     reasoningLevelMap: UiReasoningLevelMapSchema,
@@ -264,9 +265,26 @@ export interface LoadedSettings {
   projectOverrides: {
     defaultSelection: boolean;
     accessMode: boolean;
+    clarification?: boolean;
+    subagents?: boolean;
+    providerIds?: string[];
+    providerRuntime?: Array<{
+      providerId: string;
+      connection?: {
+        api: "openai_responses" | "anthropic_messages" | "openai_chat_completions";
+        baseUrl: string;
+        credentialId: string;
+      };
+      models?: SettingsDocument["providers"][number]["models"];
+      removedModelIds?: string[];
+      networkTimeouts?: { connectTimeoutMs?: number; requestTimeoutMs?: number };
+      autoCompact?: boolean;
+    }>;
+    disabledSkillList?: boolean;
     disabledSkillReferences: string[];
   };
   cas: ConfigReadResult["cas"];
+  sources?: ConfigReadResult["sources"];
   /** App Server 返回的脱敏问题只用于就地引导，不能作为任何写入配置的基线。 */
   issues: ConfigReadResult["issues"];
 }
@@ -276,7 +294,10 @@ export interface LoadedSettings {
  */
 function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["projectOverrides"] {
   const document =
-    layer.present && layer.trusted && layer.status === "valid" && layer.document !== null
+    layer.present &&
+    layer.trusted &&
+    (layer.status === "valid" || layer.status === "partial") &&
+    layer.document !== null
       ? layer.document
       : {};
   const disabledSkills = Array.isArray(document["disabled_skills"])
@@ -288,6 +309,87 @@ function projectOverrides(layer: ConfigReadResult["project"]): LoadedSettings["p
       Object.hasOwn(document, "default_model_id") ||
       Object.hasOwn(document, "default_reasoning_level"),
     accessMode: Object.hasOwn(document, "default_access_mode"),
+    clarification:
+      typeof document["interaction"] === "object" &&
+      document["interaction"] !== null &&
+      Object.hasOwn(document["interaction"], "clarification_enabled"),
+    subagents: Object.hasOwn(document, "subagents"),
+    providerIds: Array.isArray(document["providers"])
+      ? document["providers"].flatMap((value) => {
+          if (typeof value !== "object" || value === null) return [];
+          const providerId = (value as Record<string, unknown>)["provider_id"];
+          return typeof providerId === "string" ? [providerId] : [];
+        })
+      : [],
+    providerRuntime: Array.isArray(document["providers"])
+      ? document["providers"].flatMap((value) => {
+          if (typeof value !== "object" || value === null) return [];
+          const item = value as Record<string, unknown>;
+          const providerId = item["provider_id"];
+          if (typeof providerId !== "string") return [];
+          const timeouts = item["network_timeouts"];
+          const api = item["api"];
+          const baseUrl = item["base_url"];
+          const credentialId = item["credential_id"];
+          const models = Array.isArray(item["models"])
+            ? item["models"].flatMap((value) => {
+                const parsed = ConfigModelSchema.safeParse(value);
+                return parsed.success ? [toUiModel(parsed.data)] : [];
+              })
+            : undefined;
+          const removedModelIds = Array.isArray(item["removed_model_ids"])
+            ? item["removed_model_ids"].filter(
+                (value): value is string => typeof value === "string",
+              )
+            : undefined;
+          const context =
+            typeof item["agent_defaults"] === "object" && item["agent_defaults"] !== null
+              ? (item["agent_defaults"] as Record<string, unknown>)["context"]
+              : undefined;
+          return [
+            {
+              providerId,
+              ...(models === undefined ? {} : { models }),
+              ...(removedModelIds === undefined ? {} : { removedModelIds }),
+              ...((api === "openai_responses" ||
+                api === "anthropic_messages" ||
+                api === "openai_chat_completions") &&
+              typeof baseUrl === "string" &&
+              typeof credentialId === "string"
+                ? { connection: { api, baseUrl, credentialId } }
+                : {}),
+              ...(typeof timeouts === "object" && timeouts !== null
+                ? {
+                    networkTimeouts: {
+                      ...(typeof (timeouts as Record<string, unknown>)["connect_timeout_ms"] ===
+                      "number"
+                        ? {
+                            connectTimeoutMs: (timeouts as Record<string, number>)[
+                              "connect_timeout_ms"
+                            ],
+                          }
+                        : {}),
+                      ...(typeof (timeouts as Record<string, unknown>)["request_timeout_ms"] ===
+                      "number"
+                        ? {
+                            requestTimeoutMs: (timeouts as Record<string, number>)[
+                              "request_timeout_ms"
+                            ],
+                          }
+                        : {}),
+                    },
+                  }
+                : {}),
+              ...(typeof context === "object" &&
+              context !== null &&
+              typeof (context as Record<string, unknown>)["auto_compact"] === "boolean"
+                ? { autoCompact: (context as Record<string, boolean>)["auto_compact"] }
+                : {}),
+            },
+          ];
+        })
+      : [],
+    disabledSkillList: Object.hasOwn(document, "disabled_skills"),
     disabledSkillReferences: disabledSkills,
   };
 }
@@ -301,13 +403,18 @@ function projectSkillDocumentFrom(
   if (!layer.present && layer.trusted) {
     return { schemaVersion: 2, revision: 0, disabledSkills: [] };
   }
-  if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
+  if (
+    !layer.trusted ||
+    (layer.status !== "valid" && layer.status !== "partial") ||
+    layer.document === null
+  )
+    return undefined;
   const parsed = ConfigProjectDocumentSchema.safeParse(layer.document);
   if (!parsed.success) return undefined;
   return {
     schemaVersion: 2,
     revision: parsed.data.config_revision,
-    disabledSkills: [...parsed.data.disabled_skills],
+    disabledSkills: [...(parsed.data.disabled_skills ?? [])],
   };
 }
 
@@ -316,14 +423,18 @@ function projectMcpServersFrom(
   layer: ConfigReadResult["project"],
 ): SettingsMcpServer[] | undefined {
   if (!layer.present && layer.trusted) return [];
-  if (!layer.trusted || layer.status !== "valid" || layer.document === null) return undefined;
+  if (
+    !layer.trusted ||
+    (layer.status !== "valid" && layer.status !== "partial") ||
+    layer.document === null
+  )
+    return undefined;
   const parsed = ConfigProjectDocumentSchema.safeParse(layer.document);
-  return parsed.success ? parsed.data.mcp_servers.map(toUiMcp) : undefined;
+  return parsed.success ? (parsed.data.mcp_servers ?? []).map(toUiMcp) : undefined;
 }
 export type ConfigPatchInput = z.infer<typeof ConfigPatchInputSchema>;
 export type ConfigReplaceInput = z.infer<typeof ConfigReplaceInputSchema>;
 export type ConfigResetInput = z.infer<typeof ConfigResetInputSchema>;
-export type ConfigRestoreInput = z.infer<typeof ConfigRestoreInputSchema>;
 export type ConfigWriteResult = z.infer<typeof ConfigWriteResultSchema>;
 
 export interface SettingsConfigurationChangeProjection {
@@ -391,7 +502,7 @@ export class SettingsAdapterError extends Error {
       code === "invalid_input"
         ? "设置请求参数无效"
         : code === "invalid_response"
-          ? "设置配置无效，需要先恢复；当前已禁止保存覆盖"
+          ? "配置需要显式修复；当前原文已保留"
           : code === "revision_conflict"
             ? "设置已被其他窗口修改，请重新加载后再保存"
             : code === "storage_unavailable"
@@ -505,19 +616,27 @@ function toUiProvider(
     agentDefaults: {
       context: { autoCompact: provider.agent_defaults.context.auto_compact },
     },
-    models: provider.models.map((model) => ({
-      modelId: model.model_id,
-      name: model.name,
-      model: model.model,
-      capabilities: {
-        contextWindowTokens: model.capabilities.context_window_tokens,
-        maxOutputTokens: model.capabilities.max_output_tokens,
-      },
-      reasoningLevelMap: { ...model.reasoning_level_map },
-      defaultReasoningLevel:
-        model.default_reasoning_level ??
-        (model.reasoning_level_map.medium === undefined ? null : "medium"),
-    })),
+    models: provider.models.map(toUiModel),
+  };
+}
+
+/** Provider 和项目模型覆盖共享同一脱敏型号映射，保持模型身份与能力值一致。 */
+function toUiModel(
+  model: z.infer<typeof ConfigModelSchema>,
+): SettingsDocument["providers"][number]["models"][number] {
+  return {
+    modelId: model.model_id,
+    name: model.name,
+    model: model.model,
+    capabilities: {
+      contextWindowTokens: model.capabilities.context_window_tokens,
+      maxOutputTokens: model.capabilities.max_output_tokens,
+      supportsOutputSchema: model.capabilities.supports_output_schema ?? false,
+    },
+    reasoningLevelMap: { ...model.reasoning_level_map },
+    defaultReasoningLevel:
+      model.default_reasoning_level ??
+      (model.reasoning_level_map.medium === undefined ? null : "medium"),
   };
 }
 /** 完整 v2 native 文档只映射受信任字段，theme/window 留在 UI preference owner。 */
@@ -569,8 +688,13 @@ function emptySettingsDocument(): SettingsDocument {
 }
 
 /** 配置读取必须完整命中严格 v2；非法 effective 文档仍然失败关闭。 */
-function parseConfigResponse(value: unknown): z.infer<typeof ConfigDocumentSchema> {
-  const parsed = ConfigDocumentSchema.safeParse(value);
+function parseConfigResponse(
+  value: unknown,
+  effective = false,
+): z.infer<typeof ConfigDocumentSchema> {
+  const parsed = (effective ? ConfigEffectiveDocumentSchema : ConfigDocumentSchema).safeParse(
+    value,
+  );
   if (!parsed.success) throw new SettingsAdapterError("invalid_response");
   return parsed.data;
 }
@@ -597,6 +721,7 @@ function toNativeProvider(provider: SettingsProvider): z.infer<typeof ConfigProv
         capabilities: {
           context_window_tokens: model.capabilities.contextWindowTokens,
           max_output_tokens: model.capabilities.maxOutputTokens,
+          supports_output_schema: model.capabilities.supportsOutputSchema,
         },
         reasoning_level_map: { ...model.reasoningLevelMap },
         default_reasoning_level: model.defaultReasoningLevel,
@@ -656,14 +781,177 @@ const USER_PATCH_FIELDS = [
   "default_model_id",
   "default_reasoning_level",
   "subagents",
-  "providers",
   "mcp_servers",
   "disabled_skills",
 ] as const;
 
 /**
- * 由两份严格 UI 文档生成最小用户层 patch。`config_revision` 是 Java 侧发布序号，不能被 renderer
- * 当作写入意图；只发送真正改变的配置根字段，才能让后端保留原始 TOML 中未知或暂不可用的条目。
+ * 只把普通对象作为可递归 Merge Patch 节点；数组仍按整体值处理，避免错误拆分有序字段。
+ * @author kongweiguang
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 把 Merge Patch 中真实 null 编码为 Java 侧的显式 null 标记；直接发送 null 会删除配置字段。
+ * @author kongweiguang
+ */
+function mergePatchValue(value: unknown): unknown {
+  if (value === null) return { __ja_null: true };
+  if (Array.isArray(value)) return value.map(mergePatchValue);
+  if (isPlainObject(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, mergePatchValue(child)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * 仅提交对象中变化的字段；省略字段保留 raw 文档内容，实际 null 使用协议标记而不触发删除。
+ * @author kongweiguang
+ */
+function objectMergePatch(
+  baseline: Record<string, unknown>,
+  intended: Record<string, unknown>,
+): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(baseline), ...Object.keys(intended)])) {
+    const hadBaseline = Object.hasOwn(baseline, key);
+    const hasIntended = Object.hasOwn(intended, key);
+    if (!hasIntended) {
+      patch[key] = null;
+      continue;
+    }
+    const before = baseline[key];
+    const after = intended[key];
+    if (hadBaseline && JSON.stringify(before) === JSON.stringify(after)) continue;
+    if (hadBaseline && isPlainObject(before) && isPlainObject(after)) {
+      const nested = objectMergePatch(before, after);
+      if (Object.keys(nested).length > 0) patch[key] = nested;
+      continue;
+    }
+    patch[key] = mergePatchValue(after);
+  }
+  return patch;
+}
+
+/**
+ * Provider/Model 的 map key 是稳定身份，实体正文不重复保存 identity 字段。
+ * @author kongweiguang
+ */
+function identifiedFields(
+  value: Record<string, unknown>,
+  identity: string,
+): Record<string, unknown> {
+  const fields = { ...value };
+  delete fields[identity];
+  return fields;
+}
+
+/**
+ * 将模型实体转成按 Model ID 操作的差量；顺序控制字段与 models 同级，避免被当成模型实体。
+ * @author kongweiguang
+ */
+function modelOperations(
+  baseline: Array<Record<string, unknown>>,
+  intended: Array<Record<string, unknown>>,
+): { operations: Record<string, unknown>; order?: string[] } {
+  const before = new Map(baseline.map((model) => [String(model["model_id"]), model]));
+  const after = new Map(intended.map((model) => [String(model["model_id"]), model]));
+  const operations: Record<string, unknown> = {};
+  for (const [id, model] of before) {
+    if (!after.has(id)) operations[id] = null;
+    else {
+      const delta = objectMergePatch(
+        identifiedFields(model, "model_id"),
+        identifiedFields(after.get(id)!, "model_id"),
+      );
+      if (Object.keys(delta).length > 0) operations[id] = delta;
+    }
+  }
+  for (const [id, model] of after) {
+    if (!before.has(id)) operations[id] = mergePatchValue(identifiedFields(model, "model_id"));
+  }
+
+  const postOperationsOrder = [
+    ...baseline.map((model) => String(model["model_id"])).filter((id) => after.has(id)),
+    ...intended.map((model) => String(model["model_id"])).filter((id) => !before.has(id)),
+  ];
+  const intendedOrder = intended.map((model) => String(model["model_id"]));
+  return {
+    operations,
+    ...(JSON.stringify(postOperationsOrder) !== JSON.stringify(intendedOrder)
+      ? { order: intendedOrder }
+      : {}),
+  };
+}
+
+/**
+ * Provider 差量按稳定 ID 合并；仅提交可见实体，避免过滤后的投影替换未解析的原始条目。
+ * @author kongweiguang
+ */
+function providerOperations(
+  baseline: Array<Record<string, unknown>>,
+  intended: Array<Record<string, unknown>>,
+): { operations: Record<string, unknown>; order?: string[] } {
+  const before = new Map(baseline.map((provider) => [String(provider["provider_id"]), provider]));
+  const after = new Map(intended.map((provider) => [String(provider["provider_id"]), provider]));
+  const operations: Record<string, unknown> = {};
+  for (const [id, provider] of before) {
+    const next = after.get(id);
+    if (next === undefined) {
+      operations[id] = null;
+      continue;
+    }
+    const previousFields = identifiedFields(provider, "provider_id");
+    const intendedFields = identifiedFields(next, "provider_id");
+    delete previousFields["models"];
+    delete intendedFields["models"];
+    const providerFields = objectMergePatch(previousFields, intendedFields);
+    const modelDelta = modelOperations(
+      Array.isArray(provider["models"])
+        ? (provider["models"] as Array<Record<string, unknown>>)
+        : [],
+      Array.isArray(next["models"]) ? (next["models"] as Array<Record<string, unknown>>) : [],
+    );
+    if (Object.keys(modelDelta.operations).length > 0)
+      providerFields["models"] = modelDelta.operations;
+    if (modelDelta.order !== undefined) providerFields["model_order"] = modelDelta.order;
+    if (Object.keys(providerFields).length > 0) operations[id] = providerFields;
+  }
+  for (const [id, provider] of after) {
+    if (before.has(id)) continue;
+    const fields = identifiedFields(provider, "provider_id");
+    const models = Array.isArray(provider["models"])
+      ? (provider["models"] as Array<Record<string, unknown>>)
+      : [];
+    fields["models"] = Object.fromEntries(
+      models.map((model) => [
+        String(model["model_id"]),
+        mergePatchValue(identifiedFields(model, "model_id")),
+      ]),
+    );
+    operations[id] = mergePatchValue(fields);
+  }
+
+  const postOperationsOrder = [
+    ...baseline.map((provider) => String(provider["provider_id"])).filter((id) => after.has(id)),
+    ...intended.map((provider) => String(provider["provider_id"])).filter((id) => !before.has(id)),
+  ];
+  const intendedOrder = intended.map((provider) => String(provider["provider_id"]));
+  return {
+    operations,
+    ...(JSON.stringify(postOperationsOrder) !== JSON.stringify(intendedOrder)
+      ? { order: intendedOrder }
+      : {}),
+  };
+}
+
+/**
+ * 由两份严格 UI 文档生成最小用户层 patch。版本由 CAS 持有，Provider/Model 数组改为 ID 差量。
+ * @author kongweiguang
  */
 export function settingsDocumentPatch(
   baseline: SettingsDocument,
@@ -673,9 +961,19 @@ export function settingsDocumentPatch(
   const after = settingsDocumentValue(parseInput(SettingsDocumentSchema, intended));
   const patch: Record<string, unknown> = {};
   for (const field of USER_PATCH_FIELDS) {
-    if (JSON.stringify(before[field]) !== JSON.stringify(after[field])) {
-      patch[field] = after[field];
-    }
+    if (JSON.stringify(before[field]) === JSON.stringify(after[field])) continue;
+    const previous = before[field];
+    const next = after[field];
+    patch[field] =
+      isPlainObject(previous) && isPlainObject(next)
+        ? objectMergePatch(previous, next)
+        : mergePatchValue(next);
+  }
+  if (JSON.stringify(before.providers) !== JSON.stringify(after.providers)) {
+    const providerPatch = providerOperations(before.providers, after.providers);
+    if (Object.keys(providerPatch.operations).length > 0)
+      patch["providers"] = providerPatch.operations;
+    if (providerPatch.order !== undefined) patch["provider_order"] = providerPatch.order;
   }
   return patch;
 }
@@ -685,7 +983,11 @@ interface SettingsWireAdapter {
   patch(input: ConfigPatchInput): Promise<ConfigWriteResult>;
   replace(input: ConfigReplaceInput): Promise<ConfigWriteResult>;
   reset(input: ConfigResetInput): Promise<ConfigWriteResult>;
-  restore(input: ConfigRestoreInput): Promise<ConfigWriteResult>;
+  repairConfiguration(
+    input:
+      | { scope: "user"; expectedVersion: string }
+      | { scope: "project"; workspaceId: string; expectedVersion: string },
+  ): Promise<ConfigWriteResult>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
   revealProviderCredential(providerId: string): Promise<string | null>;
@@ -742,21 +1044,49 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.reset, { input: parsed }),
     );
   }
-  /** 用户层恢复只发送当前 CAS；快照、备份和原子写入都由 Java 配置 owner 完成。 */
-  async restore(input: ConfigRestoreInput): Promise<ConfigWriteResult> {
-    const parsed = parseInput(ConfigRestoreInputSchema, input);
-    return parseResult(
-      ConfigWriteResultSchema,
-      await invokeSettings(this.bridge, JA_SETTINGS_COMMANDS.restore, { input: parsed }),
+  /** CAS 回读后显式 replace；App Server 在替换损坏源前先创建同目录备份。 */
+  async repairConfiguration(
+    input:
+      | { scope: "user"; expectedVersion: string }
+      | { scope: "project"; workspaceId: string; expectedVersion: string },
+  ): Promise<ConfigWriteResult> {
+    const read = await this.read(
+      input.scope === "project" ? { workspaceId: input.workspaceId } : {},
     );
+    const currentVersion = input.scope === "user" ? read.cas.userVersion : read.cas.projectVersion;
+    if (currentVersion !== input.expectedVersion)
+      throw new SettingsAdapterError("revision_conflict");
+    if (input.scope === "user") {
+      const document =
+        read.user.document === null
+          ? settingsDocumentValue(emptySettingsDocument())
+          : parseConfigResponse(read.user.document);
+      return this.replace({ scope: "user", expectedVersion: input.expectedVersion, document });
+    }
+    if (!read.project.trusted) throw new SettingsAdapterError("storage_unavailable");
+    let document: z.infer<typeof ConfigProjectDocumentSchema>;
+    try {
+      document =
+        read.project.document === null
+          ? { schema_version: 2, config_revision: 0 }
+          : ConfigProjectDocumentSchema.parse(read.project.document);
+    } catch {
+      document = { schema_version: 2, config_revision: 0 };
+    }
+    return this.replace({
+      scope: "project",
+      workspaceId: input.workspaceId,
+      expectedVersion: input.expectedVersion,
+      document,
+    });
   }
   /**
    * effective 与 user layer 都是 App Server 的可用投影。读取绝不写回原文件；语义问题在
-   * `issues` 中就地解释，文件级故障则由后端选择最近有效快照或安全默认值。
+   * `issues` 中就地解释；语法损坏只使用能确认的前缀并由后端提供安全默认值。
    */
   async snapshot(input?: ConfigReadInput): Promise<LoadedSettings> {
     const read = await this.read(input);
-    const effective = parseConfigResponse(read.effective);
+    const effective = parseConfigResponse(read.effective, true);
     const userMissing =
       !read.user.present && read.user.status === "missing" && read.user.document === null;
     if (!userMissing && (!read.user.present || !read.user.trusted)) {
@@ -776,35 +1106,45 @@ export class TauriSettingsAdapter implements SettingsWireAdapter {
       ...(projectMcpServers === undefined ? {} : { projectMcpServers }),
       projectOverrides: projectOverrides(read.project),
       cas: read.cas,
+      sources: read.sources,
       issues: read.issues,
     };
   }
   /**
-   * application 提交已验证的用户编辑结果，但写入改为 Java 侧以原始文档为底的 patch，避免
+   * 应用层提交已验证的用户编辑结果；缺少读取基线时先 CAS 回读，再只提交可见实体差量，避免
    * renderer 的有效投影覆盖未知字段或尚未修复的局部条目。
+   * @author kongweiguang
    */
   async save(
     document: SettingsDocument,
     expectedVersion: string,
     baseline?: SettingsDocument,
   ): Promise<string> {
-    let patch: Record<string, unknown>;
+    let intended: SettingsDocument;
     try {
-      const intended = parseInput(SettingsDocumentSchema, document);
-      patch =
-        baseline === undefined
-          ? settingsDocumentValue(intended)
-          : settingsDocumentPatch(parseInput(SettingsDocumentSchema, baseline), intended);
+      intended = parseInput(SettingsDocumentSchema, document);
+      settingsDocumentValue(intended);
     } catch {
       throw new SettingsAdapterError("invalid_input");
     }
+    let currentBaseline = baseline;
+    if (currentBaseline === undefined) {
+      const loaded = await this.snapshot();
+      if (loaded.cas.userVersion !== expectedVersion) {
+        throw new SettingsAdapterError("revision_conflict");
+      }
+      currentBaseline = loaded.userDocument;
+    }
+    let patch: Record<string, unknown>;
+    try {
+      patch = settingsDocumentPatch(parseInput(SettingsDocumentSchema, currentBaseline), intended);
+    } catch {
+      throw new SettingsAdapterError("invalid_input");
+    }
+    if (Object.keys(patch).length === 0) return expectedVersion;
     return (await this.patch({ scope: "user", expectedVersion, patch })).version;
   }
 
-  /** 只用当前用户层 CAS 触发恢复，成功后由调用方权威重读而不是复用旧页面快照。 */
-  async restoreLastKnownGood(expectedVersion: string): Promise<string> {
-    return (await this.restore({ expectedVersion })).version;
-  }
   /**
    * 项目 Skill 仅 patch 自身字段；并发 MCP 编辑由相同 CAS 保护而不会被整文替换清除。
    */

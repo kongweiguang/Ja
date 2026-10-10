@@ -20,12 +20,15 @@ import {
   itemDurationMs,
   turnDurationMs,
   workStepLabel,
+  type ToolPresentation,
   type WorkStepAdapter,
   type TimelineTurn,
 } from "../../domain/timelineTypes";
 import { MarkdownMessage, type MarkdownFileTarget } from "./MarkdownMessage";
 import { ToolStepDetails } from "./ToolStepDetails";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
+import type { ConversationProcessBinding } from "../../application/processSessionTypes";
+import { countCommittedConversationActivity } from "../../domain/conversationActivity";
 import { useFullPublicText } from "./useFullPublicText";
 import { exportPublicText } from "./exportPublicText";
 import "./timeline.css";
@@ -33,6 +36,8 @@ import "./timeline.css";
 export interface WorkProcessProps {
   steps: readonly WorkStepAdapter[];
   turn?: TimelineTurn;
+  /** 续答共享同一过程；仅合计各次尝试的权威耗时，排除用户等待继续的间隔。 */
+  relatedTurns?: readonly TimelineTurn[];
   /**
    * Timeline 根据权威 Turn 和最终答复决定何时把过程归档；inline 保持正文直出，避免流式阶段
    * 先出现一层无操作价值的总折叠栏。未传入时保留独立复用场景的既有折叠语义。
@@ -56,16 +61,26 @@ export interface WorkProcessProps {
   onOpenFile?: (
     target: MarkdownFileTarget,
     source: HTMLElement,
-    mode?: "explorer",
+    mode?: "explorer" | "browser",
   ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
-  onReadMessageContent?: (messageId: string) => Promise<string>;
+  onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   onReadToolArtifact?: (input: {
     threadId: string;
     turnId: string;
     callId: string;
     artifactId: string;
   }) => Promise<string>;
+  onOpenAttachmentPreview?: (
+    attachment: {
+      attachmentId: string;
+      displayName: string;
+      mediaKind: "image" | "text";
+      threadId: string;
+      authorization: { kind: "thread"; threadId: string };
+    },
+    source: HTMLButtonElement,
+  ) => void;
   onResolveToolRecovery?: (input: {
     threadId: string;
     turnId: string;
@@ -73,8 +88,9 @@ export interface WorkProcessProps {
     expectedThreadRevision: number;
     expectedRecoveryRevision: number;
     decision: "retry" | "skip";
-    idempotencyKey: string;
+    operationKey: string;
   }) => Promise<unknown>;
+  processSession?: ConversationProcessBinding;
   className?: string;
 }
 
@@ -174,6 +190,33 @@ function StepIcon({ step }: { step: WorkStepAdapter }): ReactElement {
 }
 
 /**
+ * 冻结历史可能来自一个仍在来源 Thread 中运行的 Turn；展示时把遗留活动态收口为历史完成态，
+ * 同时保留其公开输入、结果和附件，但不携带可操作的来源进程授权。
+ * @author kongweiguang
+ */
+function projectWorkStepForDisplay(step: WorkStepAdapter): WorkStepAdapter {
+  if (step.origin !== "inherited") return step;
+  const status = step.status === "started" || step.status === "in_progress" ? "completed" : step.status;
+  const presentation = step.metadata?.presentation;
+  const presentationStatus =
+    presentation?.status === "pending" ||
+    presentation?.status === "running" ||
+    presentation?.status === "waiting_approval"
+      ? "success"
+      : presentation?.status;
+  const hasActivePresentation =
+    presentation !== undefined && presentationStatus !== presentation.status;
+  return {
+    ...step,
+    status,
+    metadata:
+      !hasActivePresentation || presentation === undefined || presentationStatus === undefined
+        ? step.metadata
+        : { ...step.metadata, presentation: { ...presentation, status: presentationStatus } },
+  };
+}
+
+/**
  * 将 Host 提供的 elapsed milliseconds 压缩为中文阅读单位；秒级保留一位小数，
  * 分钟以上逐级省略低价值精度，避免过程摘要被英文单位或过长数字抢占。
  */
@@ -260,7 +303,7 @@ function PublicTextStep({
 }: {
   step: WorkStepAdapter;
   detail: string;
-  onReadMessageContent?: (messageId: string) => Promise<string>;
+  onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   onCopyText?: (text: string) => Promise<void>;
   onOpenLink?: WorkProcessProps["onOpenLink"];
   onOpenFile?: WorkProcessProps["onOpenFile"];
@@ -277,8 +320,8 @@ function PublicTextStep({
     step.status === "completed" &&
     onReadMessageContent !== undefined;
   const { text, loading, error, load } = useFullPublicText(
-    step.itemId,
-    canRead ? () => onReadMessageContent(step.itemId) : undefined,
+    step,
+    canRead ? () => onReadMessageContent(step.threadId, step.itemId) : undefined,
   );
   const [exportFeedback, setExportFeedback] = useState<{
     itemId: string;
@@ -411,11 +454,14 @@ function processReadingIsActive(element: HTMLElement | null): boolean {
 /**
  * 流式、失败、取消与未决审批保持可操作内容展开，只有权威最终答复到达后才归档；
  * 自动归档尊重已聚焦或选中的过程内容，独立复用且未传 displayMode 时沿用原折叠策略。
- * 归档入口只保留处理概览，重试只替换轻状态，避免重复标题和失败正文干扰统一工作状态。
+ * 归档入口以次要文字保留工作时长和真实调用次数；缺失时间不猜测，统计不进入持久化。
+ * 一个过程可合并续答 Turn，步骤展示必须按 Thread/Turn 复合身份读取状态，不能用当前行状态覆盖旧步骤。
+ * @author kongweiguang
  */
 export function WorkProcess({
   steps,
   turn,
+  relatedTurns,
   displayMode,
   autoCollapse = true,
   disclosureCache,
@@ -431,13 +477,23 @@ export function WorkProcess({
   onReadMessageContent,
   onReadToolArtifact,
   onResolveToolRecovery,
+  onOpenAttachmentPreview,
+  processSession,
   className,
 }: WorkProcessProps): ReactElement | null {
   // 安全 Commentary 与公开 Reasoning 保留为正文；空摘要不创建占位行，Tool 继续承担可操作步骤身份。
-  const visibleSteps = steps.filter(
-    (step) =>
-      (step.kind !== "commentary" && !isReasoningItem(step)) || stepDetail(step) !== undefined,
-  );
+  const visibleApprovalIds = new Set(approvals.map((approval) => approval.approvalId));
+  const visibleSteps = steps.filter((step) => {
+    // 有权威 ApprovalCard 时，approval Item 只重复标题和状态，动作与身份由卡片承载。
+    if (
+      step.kind === "approval" &&
+      step.metadata?.approvalId !== undefined &&
+      visibleApprovalIds.has(step.metadata.approvalId)
+    ) {
+      return false;
+    }
+    return (step.kind !== "commentary" && !isReasoningItem(step)) || stepDetail(step) !== undefined;
+  });
   const actionableSteps = visibleSteps.filter(
     (step) => step.kind !== "commentary" && !isReasoningItem(step),
   );
@@ -454,6 +510,16 @@ export function WorkProcess({
   const [archivedDefaultOpen, setArchivedDefaultOpen] = useState<boolean>();
   const inline = displayMode === "inline";
   const archived = displayMode === "archived";
+  // stop_process 成功执行的动作和取消中的退出码不代表命令失败；普通命令非零退出仍保留诊断。
+  const failedStepCount = actionableSteps.filter((step) => {
+    const presentation = step.metadata?.presentation;
+    const nonZeroProcessExit =
+      presentation?.exitCode !== undefined &&
+      presentation.exitCode !== 0 &&
+      presentation.status !== "cancelled" &&
+      step.metadata?.toolName !== "stop_process";
+    return step.status === "failed" || nonZeroProcessExit;
+  }).length;
 
   useLayoutEffect(() => {
     if (!archived) {
@@ -464,9 +530,12 @@ export function WorkProcess({
     setArchivedDefaultOpen(
       (previous) =>
         previous ??
-        (state !== "completed" || !autoCollapse || processReadingIsActive(rootRef.current)),
+        (state !== "completed" ||
+          !autoCollapse ||
+          failedStepCount > 0 ||
+          processReadingIsActive(rootRef.current)),
     );
-  }, [archived, autoCollapse, state]);
+  }, [archived, autoCollapse, failedStepCount, state]);
 
   if (
     visibleSteps.length === 0 &&
@@ -476,16 +545,32 @@ export function WorkProcess({
     return null;
   }
 
-  // Call 关联把卡片排在对应 Prepared Tool 旁，即使 Approval Event 明确不携带展示 Item Identity。
+  // Call 只在 Turn 内唯一；continuation 会合并多个 Turn 的步骤，因此审批位置必须使用复合身份。
   const stepIndexByCallId = new Map(
     visibleSteps.flatMap((step, index) =>
-      step.metadata?.callId === undefined ? [] : [[step.metadata.callId, index] as const],
+      step.metadata?.callId === undefined
+        ? []
+        : [[JSON.stringify([step.threadId, step.turnId, step.metadata.callId]), index] as const],
+    ),
+  );
+  const presentationByCall = new Map<string, ToolPresentation>(
+    visibleSteps.flatMap((step) =>
+      step.metadata?.callId === undefined || step.metadata.presentation === undefined
+        ? []
+        : [
+            [
+              JSON.stringify([step.threadId, step.turnId, step.metadata.callId]),
+              step.metadata.presentation,
+            ] as const,
+          ],
     ),
   );
   const orderedApprovals = [...approvals].sort(
     (left, right) =>
-      (stepIndexByCallId.get(left.callId) ?? Number.MAX_SAFE_INTEGER) -
-      (stepIndexByCallId.get(right.callId) ?? Number.MAX_SAFE_INTEGER),
+      (stepIndexByCallId.get(JSON.stringify([left.threadId, left.turnId, left.callId])) ??
+        Number.MAX_SAFE_INTEGER) -
+      (stepIndexByCallId.get(JSON.stringify([right.threadId, right.turnId, right.callId])) ??
+        Number.MAX_SAFE_INTEGER),
   );
   // 未决审批只有恢复到 WAITING_APPROVAL 后才重新开放；Suspended 的唯一动作是继续或取消。
   const visibleApprovals = orderedApprovals.filter(
@@ -496,11 +581,18 @@ export function WorkProcess({
       turn.status === "waiting_approval",
   );
 
-  // Turn 存在时只信任它的权威起止时间；仅无 Turn 的降级投影允许汇总步骤耗时。
+  // 任一次续答缺少起止时间就省略总时长，避免把部分测量冒充整个过程；工具耗时可能并行，不能代替 Turn。
+  const turnDurations = (relatedTurns ?? [turn]).map(turnDurationMs);
   const durationMs =
-    turn === undefined ? sumOptional(visibleSteps.map(itemDurationMs)) : turnDurationMs(turn);
+    turn === undefined
+      ? sumOptional(visibleSteps.map(itemDurationMs))
+      : turnDurations.some((value) => value === undefined)
+        ? undefined
+        : sumOptional(turnDurations);
   const duration = formatDuration(durationMs);
-  const failedStepCount = actionableSteps.filter((step) => step.status === "failed").length;
+  const toolCallCount = countCommittedConversationActivity(
+    visibleSteps.filter((step) => step.metadata?.presentation?.kind !== "context"),
+  ).toolCalls;
   const cachedOpen =
     disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
       ? disclosureCache.get(disclosureThreadId, "process", disclosureKey)
@@ -524,8 +616,12 @@ export function WorkProcess({
     : completedCollapsed
       ? "查看工作过程"
       : "工作过程";
-  // 成功收口不重复步骤数量或状态；只有已恢复的 Tool 失败需要在折叠态保留可见提醒。
-  const archiveSummary = recoveredFailureCount > 0 ? [`${recoveredFailureCount} 步失败`] : [];
+  // 只显示有依据的统计；公开进展、推理和审批不算工具调用，展开与折叠保留同一摘要。
+  const archiveSummary = [
+    duration === undefined ? undefined : `工作 ${duration}`,
+    toolCallCount > 0 ? `调用工具 ${toolCallCount} 次` : undefined,
+    recoveredFailureCount > 0 ? `${recoveredFailureCount} 步失败` : undefined,
+  ].filter((label): label is string => label !== undefined);
   const accessibleSummary = archived
     ? [headingLabel, ...archiveSummary].join("，")
     : [
@@ -565,8 +661,10 @@ export function WorkProcess({
 
   const headerContent = archived ? (
     <span className="ja-work-process__heading ja-work-process__heading--archive">
-      <strong>{headingLabel}</strong>
-      <ChevronDown aria-hidden="true" className="ja-work-process__chevron" />
+      <span className="ja-work-process__archive-label">
+        <strong>{headingLabel}</strong>
+        <ChevronDown aria-hidden="true" className="ja-work-process__chevron" />
+      </span>
       {archiveSummary.map((summary) => (
         <span className="ja-work-process__archive-summary" key={summary}>
           <span aria-hidden="true">·</span>
@@ -616,6 +714,12 @@ export function WorkProcess({
     </>
   );
 
+  const turnStatusByIdentity = new Map(
+    [...(relatedTurns ?? []), ...(turn === undefined ? [] : [turn])].map(
+      (candidate) =>
+        [JSON.stringify([candidate.threadId, candidate.turnId]), candidate.status] as const,
+    ),
+  );
   /**
    * 公开正文从 Draft 结算为持久 Item 时服务端 identity 会变化；语义位置才是同一可见段落的稳定身份。
    * Tool 与审批仍使用服务端 ID，避免同一批次的可操作条目因位置变化错误复用 DOM。
@@ -630,17 +734,18 @@ export function WorkProcess({
       {visibleSteps.length > 0 ? (
         <ol className="ja-work-process__steps">
           {visibleSteps.map((step, index) => {
-            const detail = stepDetail(step);
-            if (isReasoningItem(step) && detail !== undefined) {
+            const displayStep = projectWorkStepForDisplay(step);
+            const detail = stepDetail(displayStep);
+            if (isReasoningItem(displayStep) && detail !== undefined) {
               return (
                 <li
-                  key={visibleStepKey(step, index)}
+                  key={visibleStepKey(displayStep, index)}
                   className="ja-work-step--reasoning"
                   data-role="reasoning"
                   aria-label="模型思考"
                 >
                   <PublicTextStep
-                    step={step}
+                    step={displayStep}
                     detail={detail}
                     onReadMessageContent={onReadMessageContent}
                     onOpenLink={onOpenLink}
@@ -650,10 +755,10 @@ export function WorkProcess({
                 </li>
               );
             }
-            if (step.kind === "commentary" && detail !== undefined) {
+            if (displayStep.kind === "commentary" && detail !== undefined) {
               return (
                 <li
-                  key={visibleStepKey(step, index)}
+                  key={visibleStepKey(displayStep, index)}
                   className="ja-work-step--commentary"
                   data-role="commentary"
                   data-retry-status={
@@ -662,7 +767,7 @@ export function WorkProcess({
                   aria-label="助手进展"
                 >
                   <PublicTextStep
-                    step={step}
+                    step={displayStep}
                     detail={detail}
                     onReadMessageContent={onReadMessageContent}
                     onOpenLink={onOpenLink}
@@ -674,25 +779,25 @@ export function WorkProcess({
             }
             // ToolPresentation 已在详情中显示自身耗时；通用步骤耗时只服务 commentary 等非 Tool 项，避免重复事实。
             const stepDuration =
-              step.metadata?.presentation === undefined
-                ? formatDuration(itemDurationMs(step))
+              displayStep.metadata?.presentation === undefined
+                ? formatDuration(itemDurationMs(displayStep))
                 : undefined;
-            const hasPresentation = step.metadata?.presentation !== undefined;
+            const hasPresentation = displayStep.metadata?.presentation !== undefined;
             return (
-              <li key={step.itemId} className={cn("ja-work-step", `ja-work-step-${step.status}`)}>
+              <li key={displayStep.itemId} className={cn("ja-work-step", `ja-work-step-${displayStep.status}`)}>
                 <span className="ja-work-step__icon" aria-hidden="true">
-                  <StepIcon step={step} />
+                  <StepIcon step={displayStep} />
                 </span>
                 <div className="ja-work-step__body">
                   {hasPresentation ? null : (
                     <div className="ja-work-step__header">
-                      <strong>{workStepLabel(step)}</strong>
-                      <span>{presentedStepStatusLabel(step)}</span>
+                      <strong>{workStepLabel(displayStep)}</strong>
+                      <span>{presentedStepStatusLabel(displayStep)}</span>
                     </div>
                   )}
-                  {!hasPresentation && stepDetail(step) ? (
+                  {!hasPresentation && stepDetail(displayStep) ? (
                     <MarkdownMessage
-                      content={stepDetail(step) ?? ""}
+                      content={stepDetail(displayStep) ?? ""}
                       className="ja-work-step__detail"
                       onOpenLink={onOpenLink}
                       onOpenFile={onOpenFile}
@@ -701,13 +806,20 @@ export function WorkProcess({
                   ) : null}
                   {step.metadata?.presentation === undefined ? null : (
                     <ToolStepDetails
-                      step={step}
+                      step={displayStep}
+                      owningTurnAwaitingInput={
+                        step.origin === "native" &&
+                        turnStatusByIdentity.get(JSON.stringify([step.threadId, step.turnId])) ===
+                        "waiting_input"
+                      }
                       disclosureCache={disclosureCache}
                       disclosureKey={`${disclosureKey ?? step.turnId}:${step.itemId}`}
                       disclosureThreadId={disclosureThreadId ?? step.threadId}
                       onReadArtifact={onReadToolArtifact}
-                      recoveryThreadRevision={turn?.threadRevision}
-                      onResolveRecovery={onResolveToolRecovery}
+                      onOpenAttachmentPreview={onOpenAttachmentPreview}
+                      recoveryThreadRevision={step.origin === "native" ? turn?.threadRevision : undefined}
+                      onResolveRecovery={step.origin === "native" ? onResolveToolRecovery : undefined}
+                      processSession={step.origin === "native" ? processSession : undefined}
                     />
                   )}
                   {stepDuration ? (
@@ -726,6 +838,9 @@ export function WorkProcess({
         <ApprovalCard
           key={approval.approvalId}
           approval={approval}
+          presentation={presentationByCall.get(
+            JSON.stringify([approval.threadId, approval.turnId, approval.callId]),
+          )}
           resolvedDecision={approvalDecisions[approval.approvalId]}
           closedAt={approvalClosedAt[approval.approvalId]}
           onResolve={

@@ -35,19 +35,19 @@ export interface TaskPort {
     expectedTaskRevision: number;
     throughActivitySequence: number;
   }): Promise<{ accepted: true; task: TaskSummary }>;
-  /** 侧聊关闭由服务端统一取消执行、释放资源并清除临时数据，ACK 前不得移除 Tab。 */
-  close(input: { taskThreadId: string }): Promise<{ closed: true }>;
+  /** ACK 返回服务端实际清理的完整 Thread 集合，前端不从有界 Task 投影推导子树。 */
+  close(input: { taskThreadId: string }): Promise<{ closedThreadIds: string[] }>;
   messageSend(input: {
     senderThreadId: string;
     targetThreadId: string;
     content: TaskContentBlock[];
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<{ accepted: true; messageId: string; mailboxSequence: number }>;
   followup(input: {
     senderThreadId: string;
     targetThreadId: string;
     content: TaskContentBlock[];
-    idempotencyKey: string;
+    operationKey: string;
     expectedTaskRevision: number;
   }): Promise<{ accepted: true; messageId: string; turnId: string; task: TaskSummary }>;
   cancel(input: {

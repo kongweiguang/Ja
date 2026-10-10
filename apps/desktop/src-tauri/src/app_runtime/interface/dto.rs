@@ -7,28 +7,82 @@ use crate::app_runtime::domain;
 use crate::app_runtime::interface::history_model::{ThreadDto, ThreadPreferencesDto};
 use serde::{Deserialize, Serialize};
 
+/// Workspace 打开请求是按路径新开或按稳定 ID 重开的互斥意图；保持 wire shape 闭集，
+/// 避免 renderer 同时提供 ID 和路径时由字段优先级意外改变 Java 的身份选择。
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum WorkspaceOpenInputDto {
+    ByPath(WorkspaceOpenPathInputDto),
+    ById(WorkspaceOpenIdInputDto),
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkspaceOpenInputDto {
+pub struct WorkspaceOpenPathInputDto {
     pub cwd: String,
     pub display_name: Option<String>,
-    pub trust: String,
 }
-impl From<WorkspaceOpenInputDto> for domain::WorkspaceOpenInput {
-    /// interface 只复制已反序列化字段，路径与 trust 不变量仍由原生 platform 校验。
-    fn from(value: WorkspaceOpenInputDto) -> Self {
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceOpenIdInputDto {
+    pub workspace_id: String,
+}
+
+impl From<WorkspaceOpenPathInputDto> for domain::WorkspaceOpenInput {
+    /// interface 只复制已反序列化字段，原生 platform 再校验目录边界。
+    fn from(value: WorkspaceOpenPathInputDto) -> Self {
         Self {
             cwd: value.cwd,
             display_name: value.display_name,
-            trust: value.trust,
         }
     }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceReadInputDto {
+    pub workspace_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceUpdateInputDto {
+    pub workspace_id: String,
+    pub expected_revision: u64,
+    pub display_name: Option<String>,
+    pub cwd: Option<String>,
+}
+
+impl From<WorkspaceUpdateInputDto> for domain::WorkspaceUpdateInput {
+    /// DTO 仅映射编辑草稿；命令边界校验后由 Java owner 执行原子 CAS。
+    fn from(value: WorkspaceUpdateInputDto) -> Self {
+        Self {
+            workspace_id: value.workspace_id,
+            expected_revision: value.expected_revision,
+            display_name: value.display_name,
+            cwd: value.cwd,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceTrustInputDto {
+    pub workspace_id: String,
+    pub trust: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustAcceptedDto {
+    pub accepted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalResponseInputDto {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub approval_id: String,
     pub turn_id: String,
     pub decision: String,
@@ -38,7 +92,7 @@ impl From<ApprovalResponseInputDto> for domain::ApprovalResponseInput {
     /// 审批 DTO 不解释 decision；domain 与 infrastructure 共同执行闭集和 pending identity 校验。
     fn from(value: ApprovalResponseInputDto) -> Self {
         Self {
-            client_operation_id: value.client_operation_id,
+            operation_key: value.operation_key,
             approval_id: value.approval_id,
             turn_id: value.turn_id,
             decision: value.decision,
@@ -50,7 +104,7 @@ impl From<ApprovalResponseInputDto> for domain::ApprovalResponseInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TurnStartInputDto {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub content: Vec<TurnContentPartDto>,
 }
@@ -80,7 +134,7 @@ impl From<TurnStartInputDto> for domain::TurnStartInput {
     /// Turn parts 显式逐项映射，未知字段已由 serde 拒绝，内容上限由 domain 校验。
     fn from(value: TurnStartInputDto) -> Self {
         Self {
-            client_operation_id: value.client_operation_id,
+            operation_key: value.operation_key,
             thread_id: value.thread_id,
             content: map_turn_content(value.content),
         }
@@ -91,7 +145,7 @@ impl From<TurnStartInputDto> for domain::TurnStartInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TurnContinueInputDto {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub expected_thread_revision: u64,
 }
@@ -100,7 +154,7 @@ impl From<TurnContinueInputDto> for domain::TurnContinueInput {
     /// 保持 command 映射为字段搬运；当前路径资格仍由 Java CAS 判定。
     fn from(value: TurnContinueInputDto) -> Self {
         Self {
-            client_operation_id: value.client_operation_id,
+            operation_key: value.operation_key,
             thread_id: value.thread_id,
             expected_thread_revision: value.expected_thread_revision,
         }
@@ -111,7 +165,7 @@ impl From<TurnContinueInputDto> for domain::TurnContinueInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TurnReaskInputDto {
-    pub client_operation_id: String,
+    pub operation_key: String,
     pub thread_id: String,
     pub expected_thread_revision: u64,
     pub source_message_id: String,
@@ -122,7 +176,7 @@ impl From<TurnReaskInputDto> for domain::TurnReaskInput {
     /// 内容复用冻结的 Turn 联合类型；源 item 是否仍为最后一个未答问题只由 Java 判定。
     fn from(value: TurnReaskInputDto) -> Self {
         Self {
-            client_operation_id: value.client_operation_id,
+            operation_key: value.operation_key,
             thread_id: value.thread_id,
             expected_thread_revision: value.expected_thread_revision,
             source_message_id: value.source_message_id,
@@ -221,7 +275,7 @@ pub struct ToolRecoveryResponseInputDto {
     pub expected_thread_revision: u64,
     pub expected_recovery_revision: u64,
     pub decision: String,
-    pub idempotency_key: String,
+    pub operation_key: String,
 }
 
 impl From<ToolRecoveryResponseInputDto> for domain::ToolRecoveryResponseInput {
@@ -233,7 +287,7 @@ impl From<ToolRecoveryResponseInputDto> for domain::ToolRecoveryResponseInput {
             expected_thread_revision: value.expected_thread_revision,
             expected_recovery_revision: value.expected_recovery_revision,
             decision: value.decision,
-            idempotency_key: value.idempotency_key,
+            operation_key: value.operation_key,
         }
     }
 }
@@ -432,6 +486,8 @@ pub struct RuntimeStatusDto {
     pub generation: u64,
     pub server_instance_id: Option<String>,
     pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_recovery: Option<StorageRecoveryDto>,
 }
 impl From<domain::RuntimeStatus> for RuntimeStatusDto {
     /// 生命周期枚举映射为稳定 renderer 拼写，Busy 保持独立 UI 状态。
@@ -452,10 +508,11 @@ impl From<domain::RuntimeStatus> for RuntimeStatusDto {
             },
             generation: value.generation,
             server_instance_id: value.server_instance_id,
+            storage_recovery: None,
             features: vec![
-                "task_threads_v1".to_owned(),
-                "plan_goal_v1".to_owned(),
-                "interaction_v1".to_owned(),
+                "task_threads".to_owned(),
+                "plan".to_owned(),
+                "interaction".to_owned(),
             ],
         }
     }
@@ -470,6 +527,34 @@ pub struct RuntimeStorageInfoDto {
     pub log_path: Option<String>,
     pub cache_path: Option<String>,
     pub last_backup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_recovery: Option<StorageRecoveryDto>,
+}
+
+/// 恢复字段刻意与文件系统路径及运行时进程身份解耦。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageRecoveryDto {
+    pub id: String,
+    pub phase: String,
+    pub reason: Option<String>,
+    pub history_available: bool,
+    pub backup_available: bool,
+    pub rebuilt: bool,
+}
+
+impl From<domain::StorageRecovery> for StorageRecoveryDto {
+    /// 使用显式投影，确保未来的内部诊断信息不会泄漏到 WebView。
+    fn from(value: domain::StorageRecovery) -> Self {
+        Self {
+            id: value.id,
+            phase: value.phase,
+            reason: value.reason,
+            history_available: value.history_available,
+            backup_available: value.backup_available,
+            rebuilt: value.rebuilt,
+        }
+    }
 }
 
 impl From<domain::RuntimeStorageInfo> for RuntimeStorageInfoDto {
@@ -481,38 +566,37 @@ impl From<domain::RuntimeStorageInfo> for RuntimeStorageInfoDto {
             log_path: value.log_path,
             cache_path: value.cache_path,
             last_backup: value.last_backup,
+            storage_recovery: value.storage_recovery.map(Into::into),
         }
     }
 }
 
-/// Renderer may request activation by Java ID only; physical roots never cross into native input.
+/// Renderer 只能按 Java ID 请求激活；物理根目录不会传入原生输入。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceActivationInputDto {
     pub workspace_id: String,
 }
 
-/// Closed workspace classification shared with the Java workspace projection.
+/// 与 Java 工作区投影共用封闭的工作区分类。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceKindDto {
     Project,
     Session,
-    LegacyShared,
 }
 
 impl From<domain::WorkspaceKind> for WorkspaceKindDto {
-    /// Preserve Java's closed kind wire spelling instead of leaking Rust enum naming conventions.
+    /// 保留 Java 封闭类型在 wire 上的拼写，避免泄漏 Rust 枚举的命名方式。
     fn from(value: domain::WorkspaceKind) -> Self {
         match value {
             domain::WorkspaceKind::Project => Self::Project,
             domain::WorkspaceKind::Session => Self::Session,
-            domain::WorkspaceKind::LegacyShared => Self::LegacyShared,
         }
     }
 }
 
-/// Renderer receives the canonical Java-issued directory solely to label the active workbench.
+/// Renderer 接收 Java 签发的规范目录，仅用于标记当前工作台。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceActivationDto {
@@ -521,11 +605,10 @@ pub struct WorkspaceActivationDto {
     pub display_name: String,
     pub trust: String,
     pub kind: WorkspaceKindDto,
-    pub legacy_shared_workspace_id: Option<String>,
 }
 
 impl From<domain::WorkspaceActivation> for WorkspaceActivationDto {
-    /// Expose only the already-registered canonical root and Java identity needed by the workbench.
+    /// 仅公开已登记的规范根目录及工作台所需的 Java 身份。
     fn from(value: domain::WorkspaceActivation) -> Self {
         Self {
             workspace_id: value.workspace_id,
@@ -533,7 +616,6 @@ impl From<domain::WorkspaceActivation> for WorkspaceActivationDto {
             display_name: value.display_name,
             trust: value.trust,
             kind: value.kind.into(),
-            legacy_shared_workspace_id: value.legacy_shared_workspace_id,
         }
     }
 }
@@ -1068,7 +1150,7 @@ pub struct TaskMessageInputDto {
     pub sender_thread_id: String,
     pub target_thread_id: String,
     pub content: Vec<TurnContentPartDto>,
-    pub idempotency_key: String,
+    pub operation_key: String,
 }
 
 impl From<TaskMessageInputDto> for domain::TaskMessageInput {
@@ -1078,7 +1160,7 @@ impl From<TaskMessageInputDto> for domain::TaskMessageInput {
             sender_thread_id: value.sender_thread_id,
             target_thread_id: value.target_thread_id,
             content: value.content.into_iter().map(task_content_part).collect(),
-            idempotency_key: value.idempotency_key,
+            operation_key: value.operation_key,
         }
     }
 }
@@ -1089,7 +1171,7 @@ pub struct TaskFollowupInputDto {
     pub sender_thread_id: String,
     pub target_thread_id: String,
     pub content: Vec<TurnContentPartDto>,
-    pub idempotency_key: String,
+    pub operation_key: String,
     pub expected_task_revision: u64,
 }
 
@@ -1101,7 +1183,7 @@ impl From<TaskFollowupInputDto> for domain::TaskFollowupInput {
                 sender_thread_id: value.sender_thread_id,
                 target_thread_id: value.target_thread_id,
                 content: value.content.into_iter().map(task_content_part).collect(),
-                idempotency_key: value.idempotency_key,
+                operation_key: value.operation_key,
             },
             expected_task_revision: value.expected_task_revision,
         }
@@ -1417,14 +1499,12 @@ impl From<domain::TaskThreadSummary> for ThreadDto {
             thread_id: value.thread_id,
             workspace_id: value.workspace_id,
             workspace_kind: value.workspace_kind.into(),
-            legacy_shared_workspace_id: value.legacy_shared_workspace_id,
             preferences: value.preferences.map(Into::into),
             title: value.title,
             status: value.status,
             pinned: value.pinned,
             latest_turn_status: value.latest_turn_status,
             latest_turn_seen: value.latest_turn_seen,
-            active_goal_id: value.active_goal_id,
             revision: value.revision,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -1566,14 +1646,14 @@ impl From<domain::TaskTreeDeleteResult> for TaskTreeDeleteResultDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCloseResultDto {
-    pub closed: bool,
+    pub closed_thread_ids: Vec<String>,
 }
 
 impl From<domain::TaskCloseResult> for TaskCloseResultDto {
-    /// 关闭回执只映射 Java 幂等终态，不把 `accepted` 等旧 mutation 语义带入侧聊。
+    /// 关闭回执保留 Java purge 后的精确身份集合，不从 Rust Task 投影推导范围。
     fn from(value: domain::TaskCloseResult) -> Self {
         Self {
-            closed: value.closed,
+            closed_thread_ids: value.closed_thread_ids,
         }
     }
 }

@@ -39,7 +39,7 @@ export function useWorkspaceChangeController(
     [],
   );
 
-  /** Preview controller 只注册 ACK-first close port，不向壳层泄漏 child window label。 */
+  /** Preview 控制器只注册收到 ACK 后再关闭的端口，不向壳层泄漏子窗口标签。 */
   const registerPreview = useCallback((lifecycle: PreviewWorkspaceLifecycle | undefined): void => {
     previewRef.current = lifecycle;
   }, []);

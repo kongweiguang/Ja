@@ -8,21 +8,19 @@ pub(crate) mod domain;
 pub(crate) mod infrastructure;
 pub(crate) mod interface;
 
-pub use application::RuntimeHost;
 pub(crate) use application::WorkspaceLookup;
 pub(crate) use application::{
     ConfigurationPatchParams, ConfigurationPatchResult, ConfigurationReadParams,
     ConfigurationReadResult, ConfigurationReplaceParams, ConfigurationReplaceResult,
     ConfigurationRequest, ConfigurationResetParams, ConfigurationResetResult,
-    ConfigurationResponse, ConfigurationRestoreParams, ConfigurationRestoreResult,
-    CredentialDeleteParams, CredentialDeleteResult, CredentialRevealProviderParams,
-    CredentialRevealProviderResult, CredentialSetParams, CredentialSetResult, HistoryRequest,
-    HistoryResponse, McpListParams, McpListResultData, McpTestParams, McpTestResultData,
-    McpToolsReadParams, McpToolsReadResultData, MessageContentReadParams,
-    MessageContentReadResultData, ModelDiscoverParams, ModelDiscoverResultData, ModelTestParams,
-    ModelTestResultData, OperationReadParams, OperationReadResultData, RuntimeBridgePort,
-    RuntimePlatformPort, SettingsRequest, SettingsResponse, SkillListParams, SkillListResultData,
-    ThreadArchiveParams, ThreadArchiveResultData, ThreadCompactCancelParams,
+    ConfigurationResponse, CredentialDeleteParams, CredentialDeleteResult,
+    CredentialRevealProviderParams, CredentialRevealProviderResult, CredentialSetParams,
+    CredentialSetResult, HistoryRequest, HistoryResponse, ItemContentReadParams,
+    ItemContentReadResultData, McpListParams, McpListResultData, McpTestParams, McpTestResultData,
+    McpToolsReadParams, McpToolsReadResultData, ModelDiscoverParams, ModelDiscoverResultData,
+    ModelTestParams, ModelTestResultData, OperationReadParams, OperationReadResultData,
+    RuntimeBridgePort, RuntimePlatformPort, SettingsRequest, SettingsResponse, SkillListParams,
+    SkillListResultData, ThreadArchiveParams, ThreadArchiveResultData, ThreadCompactCancelParams,
     ThreadCompactCancelResultData, ThreadCompactParams, ThreadCompactResultData,
     ThreadCreateParams, ThreadCreateResultData, ThreadDeleteParams, ThreadDeleteResultData,
     ThreadDiscoverParams, ThreadDiscoverResultData, ThreadListParams, ThreadListResultData,
@@ -35,25 +33,27 @@ pub(crate) use application::{
     WorkspaceListParams, WorkspaceListResultData, WorkspaceRuntimeSource,
 };
 pub use application::{EventEmitError, RuntimeCommandError};
+pub use application::{RuntimeHost, WorkspaceMetadataEventRouter};
 pub use domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     AttachmentSummary, InputQueue, ManualRecoveryConfirmation, ManualRecoveryReason, QueuedInput,
-    QueuedInputIssue, RuntimeConfigurationStatus, RuntimeRecoveryState, RuntimeStatus,
-    RuntimeStatusKind, RuntimeStorageInfo, TaskActivity, TaskCloseInput, TaskCloseResult,
-    TaskContextPreviewItem, TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput,
-    TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput,
-    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
-    TaskReadResult, TaskSeenInput, TaskSummary, TaskThreadPreferences, TaskThreadSummary,
-    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput,
-    ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted,
-    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
-    TurnContentPart, TurnContinueInput, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize,
-    TurnInputResult, TurnInputUpdate, TurnReaskInput, TurnResumeInput, TurnStartInput,
-    WorkspaceActivation, WorkspaceDto, WorkspaceKind, WorkspaceOpenInput, WorkspacePathSearchInput,
-    WorkspacePathSearchItem, WorkspacePathSearchResult,
+    QueuedInputIssue, RuntimeRecoveryState, RuntimeStatus, RuntimeStatusKind, RuntimeStorageInfo,
+    StorageRecovery, TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextPreviewItem,
+    TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput, TaskFollowupResult,
+    TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput, TaskMessageResult,
+    TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult,
+    TaskSeenInput, TaskSummary, TaskThreadPreferences, TaskThreadSummary, TaskTreeDeleteInput,
+    TaskTreeDeleteResult, TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult,
+    ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput,
+    TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContentPart,
+    TurnContinueInput, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
+    TurnInputUpdate, TurnReaskInput, TurnResumeInput, TurnStartInput, WorkspaceActivation,
+    WorkspaceDto, WorkspaceKind, WorkspaceOpenInput, WorkspacePathSearchInput,
+    WorkspacePathSearchItem, WorkspacePathSearchResult, WorkspaceUpdateInput,
 };
 pub(crate) use domain::{
-    GoalMethod, GoalPayload, GoalPayloadError, GoalRequest, GoalResponse, valid_frozen_turn_id,
+    WorkflowMethod, WorkflowPayload, WorkflowPayloadError, WorkflowRequest, WorkflowResponse,
+    valid_frozen_turn_id,
 };
 pub use infrastructure::EventSink;
 pub(crate) use infrastructure::HomeLayout;
@@ -71,5 +71,17 @@ impl RuntimeHost {
         Self::compose(std::sync::Arc::new(NativeRuntimePlatform::new(
             config, sink,
         )))
+    }
+
+    /// App Server event sink 与 Host 共用 metadata router，使新 root 通知在对前端发布前撤销旧 capability。
+    pub(crate) fn new_with_workspace_event_router(
+        config: LaunchConfig,
+        sink: EventSink,
+        router: &WorkspaceMetadataEventRouter,
+    ) -> Self {
+        Self::compose_with_event_router(
+            std::sync::Arc::new(NativeRuntimePlatform::new(config, sink)),
+            router,
+        )
     }
 }

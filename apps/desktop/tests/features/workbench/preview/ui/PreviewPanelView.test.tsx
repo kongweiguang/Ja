@@ -48,6 +48,7 @@ function makeController(overrides: Partial<PreviewViewModel> = {}): PreviewContr
       attachment: {
         dismiss: vi.fn(),
         retry: vi.fn(),
+        closeForThreads: vi.fn(async () => undefined),
         zoomIn: vi.fn(),
         zoomOut: vi.fn(),
         fit: vi.fn(),
@@ -383,6 +384,21 @@ describe("PreviewPanelView", () => {
     rendered.rerender(<PreviewPanelView viewModel={failed.viewModel} actions={failed.actions} />);
     await user.click(screen.getByRole("button", { name: "重试" }));
     expect(failed.actions.retryRecovery).toHaveBeenCalledOnce();
+  });
+
+  /** 导航错误必须收为内容高度，不能因共享 ErrorState 的满高规则挤掉 native browser viewport。 @author kongweiguang */
+  it("keeps the browser viewport sized when a navigation error is visible", () => {
+    const failed = makeController({ error: "preview navigation failed" });
+    render(<PreviewPanelView viewModel={failed.viewModel} actions={failed.actions} />);
+
+    const errorRow = screen.getByRole("alert");
+    const viewport = screen.getByRole("tabpanel");
+    const errorStyle = getComputedStyle(errorRow);
+    const viewportStyle = getComputedStyle(viewport);
+    expect(errorRow).toHaveClass("ja-preview-recovery-row");
+    expect(errorStyle.minHeight).toBe("0");
+    expect(errorStyle.flexGrow).toBe("0");
+    expect(viewportStyle.flexGrow).toBe("1");
   });
 
   it("上报 CSS pixel 边界，并在 inactive 与卸载时隐藏 native 子视图", () => {

@@ -32,7 +32,7 @@ describe("createInteractionPort", () => {
     const port = createInteractionPort(adapter, events);
     const input = {
       threadId: "thr_one",
-      requestId: "req_one",
+      interactionId: "interaction_one",
       expectedDraftRevision: 4,
       answers: [
         {
@@ -45,7 +45,7 @@ describe("createInteractionPort", () => {
       ],
       page: 1,
       collapsed: false,
-      idempotencyKey: "draft_one",
+      operationKey: "draft_one",
       scopeEpoch: 3,
       editRevision: 9,
     } as unknown as Parameters<typeof port.saveDraft>[0];
@@ -53,7 +53,7 @@ describe("createInteractionPort", () => {
 
     expect(adapter.draftSave).toHaveBeenCalledWith({
       threadId: "thr_one",
-      requestId: "req_one",
+      interactionId: "interaction_one",
       expectedDraftRevision: 4,
       answers: [
         {
@@ -65,7 +65,7 @@ describe("createInteractionPort", () => {
       ],
       page: 1,
       collapsed: false,
-      idempotencyKey: "draft_one",
+      operationKey: "draft_one",
     });
   });
 });

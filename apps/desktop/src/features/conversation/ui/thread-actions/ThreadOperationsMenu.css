@@ -5,11 +5,6 @@
   display: contents;
 }
 
-/* 反馈占用 header 自身的第二行，避免浮层盖住顶部的用户消息。 */
-.ja-conversation-header:has(.ja-thread-compaction-feedback) {
-  padding-bottom: 2.65rem;
-}
-
 .ja-thread-operations-menu {
   z-index: 92;
   min-width: 11.5rem;
@@ -46,77 +41,18 @@
   height: 0.95rem;
 }
 
-.ja-thread-compaction-feedback {
-  position: absolute;
-  z-index: 4;
-  bottom: 0.35rem;
-  right: 0.75rem;
-  display: flex;
-  max-width: min(30rem, calc(100vw - 2rem));
-  align-items: center;
-  gap: 0.42rem;
-  padding: 0.42rem 0.48rem 0.42rem 0.68rem;
-  border: 1px solid var(--ja-border-strong);
-  border-radius: var(--ja-radius-lg);
-  color: var(--ja-foreground);
-  background: var(--ja-window-surface-muted);
-  box-shadow: var(--ja-shadow-floating);
-  font-size: var(--ja-text-caption-size);
+.ja-thread-operations-spin {
+  animation: ja-thread-operations-spin 0.8s linear infinite;
 }
 
-.ja-thread-compaction-feedback.is-error {
-  border-color: color-mix(in srgb, var(--ja-danger) 48%, var(--ja-border-strong));
+@keyframes ja-thread-operations-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-.ja-thread-compaction-feedback > span {
-  min-width: 0;
-}
-
-.ja-thread-compaction-feedback > button:not(.ja-icon-button) {
-  flex: 0 0 auto;
-  border: 0;
-  color: var(--ja-accent);
-  background: transparent;
-  font: inherit;
-  font-weight: var(--ja-weight-semibold);
-  cursor: pointer;
-}
-
-.ja-thread-compaction-feedback > button:not(.ja-icon-button):focus-visible {
-  border-radius: var(--ja-radius-sm);
-  outline: 2px solid var(--ja-focus);
-  outline-offset: 2px;
-}
-
-.ja-thread-compaction-feedback .ja-icon-button {
-  /* IconButton 只提供语义，不提供视觉；局部重置原生按钮，避免 WebView2 显示白色方块。 */
-  appearance: none;
-  display: inline-grid;
-  width: 1.55rem;
-  height: 1.55rem;
-  flex: 0 0 auto;
-  place-items: center;
-  padding: 0;
-  border: 0;
-  border-radius: var(--ja-radius-sm);
-  color: var(--ja-foreground-muted);
-  background: transparent;
-  line-height: 0;
-  cursor: pointer;
-}
-
-.ja-thread-compaction-feedback .ja-icon-button:hover {
-  color: var(--ja-foreground);
-  background: var(--ja-control-hover);
-}
-
-.ja-thread-compaction-feedback .ja-icon-button:focus-visible {
-  outline: 2px solid var(--ja-focus);
-  outline-offset: 1px;
-}
-
-.ja-thread-compaction-feedback .ja-icon-button svg {
-  display: block;
-  width: 0.9rem;
-  height: 0.9rem;
+@media (prefers-reduced-motion: reduce) {
+  .ja-thread-operations-spin {
+    animation: none;
+  }
 }

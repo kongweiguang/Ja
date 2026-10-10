@@ -5,6 +5,8 @@
 
 use super::*;
 use crate::preview::NavigationSource;
+#[cfg(windows)]
+use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED;
 
 /// 构造一组合法的检查器视口，集中表达后续校验用例共同依赖的边界。
 fn visible_viewport() -> PreviewViewportInput {
@@ -81,20 +83,84 @@ fn preview_viewport_accepts_hidden_open_with_nonzero_bounds() {
     .is_ok());
 }
 
-/// 旧页面 completion 不能领取新导航的 generation；初始导航只保留一次无 Starting 的受控路径。
+/// 旧页面 completion 不能领取新导航的 ticket，同代际新导航也必须使旧媒体探测失效。
+/// @author kongweiguang
 #[cfg(windows)]
 #[test]
 fn preview_navigation_completion_matches_native_navigation_identity() {
     let mut initial = PreviewNavigationCompletionTracker::new();
-    assert_eq!(initial.completed(7, 3), Some(3));
+    let initial_identity = initial.completed(7, 3).expect("initial completion identity");
+    assert_eq!(initial_identity.generation, 3);
+    assert!(initial.is_current(initial_identity));
     assert_eq!(initial.completed(7, 4), None);
 
     let mut tracker = PreviewNavigationCompletionTracker::new();
     tracker.started(11, 4);
     tracker.started(12, 5);
     assert_eq!(tracker.completed(11, 5), None);
-    assert_eq!(tracker.completed(12, 99), Some(5));
+    let current = tracker.completed(12, 99).expect("matched native navigation");
+    assert_eq!(current.generation, 5);
+    assert!(tracker.is_current(current));
     assert_eq!(tracker.completed(12, 99), None);
+
+    tracker.started(13, 5);
+    assert!(!tracker.is_current(current));
+}
+
+/// 只有 status 9 的失败导航可进入媒体验证，成功完成或状态不可读仍沿用普通 completion。
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn media_probe_is_restricted_to_connection_aborted() {
+    assert!(should_probe_media_after_navigation_abort(
+        false,
+        Some(COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED)
+    ));
+    assert!(!should_probe_media_after_navigation_abort(
+        true,
+        Some(COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED)
+    ));
+    assert!(!should_probe_media_after_navigation_abort(false, None));
+}
+
+/// ExecuteScript 只把返回的真实数值 1 当作 loaded metadata，Promise 或任意文本不会误报成功。
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn media_probe_requires_a_synchronous_numeric_metadata_result() {
+    assert_eq!(
+        parse_media_metadata_probe_result(true, "1"),
+        MediaMetadataProbeState::Ready
+    );
+    assert_eq!(
+        parse_media_metadata_probe_result(true, "2"),
+        MediaMetadataProbeState::Pending
+    );
+    for invalid in ["true", "{}", "[object Promise]", "3", "private payload"] {
+        assert_eq!(
+            parse_media_metadata_probe_result(true, invalid),
+            MediaMetadataProbeState::Failed
+        );
+    }
+    assert_eq!(
+        parse_media_metadata_probe_result(false, "1"),
+        MediaMetadataProbeState::Failed
+    );
+}
+
+/// 媒体探测脚本拒绝无穷 duration，并以 JSON 字符串承载 URL，避免路径文本逃逸为脚本。
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn media_probe_script_requires_finite_duration_and_escapes_url() {
+    let target = "file:///C:/媒体 目录/clip.wav\";globalThis.injected=true;//";
+    let script = build_local_media_metadata_probe_script(target).expect("probe script");
+    let encoded_url = serde_json::to_string(target).expect("JSON URL encoding");
+
+    assert!(script.contains(&format!("location.href!=={encoded_url}")));
+    assert!(script.contains("Number.isFinite(duration)"));
+    assert!(script.contains("duration>=0"));
+    assert_eq!(script.matches("globalThis.injected=true").count(), 1);
 }
 
 /// 确认只有 URL 策略拒绝可映射为页面加载失败，陈旧回调与宿主故障不得冒充远端错误。

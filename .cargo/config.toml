@@ -1,6 +1,6 @@
 # @author kongweiguang
 
-# Desktop and CLI share the workspace target tree; neither application owns
-# the other's build output. Explicit isolated target directories remain supported.
+# 桌面端与 CLI 共用工作区的 target 目录，各自都不独占另一端的构建产物。
+# 仍支持显式指定独立的构建目标目录。
 [build]
 target-dir = "target"

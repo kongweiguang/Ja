@@ -1,7 +1,7 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Provider-free contract tests for the Native Image smoke client."""
+"""针对 Native Image smoke 客户端的无 Provider 合同测试。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import http.client
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,9 +22,9 @@ import jsonschema
 
 
 SCRIPT = Path(__file__).with_name("run-sidecar-smoke.py")
-FIXTURE = Path(__file__).parents[1] / "e2e" / "fixtures" / "v1-smoke-mock-sidecar.mjs"
-SCHEMA = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
-GOLDEN = Path(__file__).parents[2] / "contracts" / "golden" / "v1" / "valid" / "core.jsonl"
+FIXTURE = Path(__file__).parents[1] / "e2e" / "fixtures" / "v2-smoke-mock-sidecar.mjs"
+SCHEMA = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
+GOLDEN = Path(__file__).parents[2] / "contracts" / "golden" / "v2" / "valid" / "core.jsonl"
 SPEC = importlib.util.spec_from_file_location("run_sidecar_smoke", SCRIPT)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import machinery failure is environmental
     raise RuntimeError("native smoke module is unavailable")
@@ -32,8 +33,8 @@ sys.modules[SPEC.name] = SMOKE
 SPEC.loader.exec_module(SMOKE)
 
 
-class NativeSmokeV1Test(unittest.TestCase):
-    """Verifies exact v1 frames and the complete mock-sidecar lifecycle."""
+class NativeSmokeV2Test(unittest.TestCase):
+    """验证精确的 v2 帧和完整的 mock-sidecar 生命周期。"""
 
     def test_capability_names_follow_golden_order_and_schema_set(self) -> None:
         """沿用 Java 共用的 golden 顺序，同时由 schema 封闭校验成员集合。"""
@@ -51,9 +52,11 @@ class NativeSmokeV1Test(unittest.TestCase):
             set(events),
         )
         self.assertIn("runtime/context/register", methods)
+        self.assertIn("runtime/client/close", methods)
         self.assertIn("operation/read", methods)
         self.assertIn("thread/observe", methods)
         self.assertIn("thread/unobserve", methods)
+        self.assertIn("thread/item-content/read", methods)
 
     def test_capability_loader_tracks_schema_additions(self) -> None:
         """golden 新成员决定 offer 顺序，schema 同时必须声明完全相同的闭集。"""
@@ -101,8 +104,8 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIsNotNone(SMOKE.LEAK_PATTERN.search("Bearer " + "abcdefgh12345678"))
         self.assertIn(SMOKE.SMOKE_SECRET, f"payload={SMOKE.SMOKE_SECRET}")
 
-    def test_initialize_is_exact_v1_and_configuration_free(self) -> None:
-        """方法与事件顺序来自合同 schema，golden 继续锚定其它能力、模式和限制。"""
+    def test_initialize_is_exact_v2_and_configuration_free(self) -> None:
+        """方法与事件沿用合同顺序；Native scoped close 与 Task/Plan 必须共同进入生产闭集。"""
 
         params = SMOKE.initialize_frame()["params"]
         golden_params = json.loads(GOLDEN.read_text(encoding="utf-8").splitlines()[0])["params"]
@@ -115,7 +118,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             for name in schema_definitions["eventName"]["enum"]
             if name != "runtime/initialized"
         )
-        self.assertEqual(1, params["protocolMajor"])
+        self.assertEqual(2, params["protocolMajor"])
         self.assertEqual(0, params["protocolMinor"])
         self.assertEqual(
             {"protocolMajor", "protocolMinor", "clientVersion", "capabilities", "limits"},
@@ -129,6 +132,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual(schema_methods, set(methods))
         self.assertEqual(schema_events, set(events))
         self.assertIn("runtime/context/register", methods)
+        self.assertIn("runtime/client/close", methods)
         self.assertIn("operation/read", methods)
         self.assertIn("thread/observe", methods)
         self.assertIn("thread/unobserve", methods)
@@ -140,10 +144,29 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("workspace/path/search", methods)
         self.assertIn("task/create", methods)
         self.assertIn("task/tree/delete", methods)
-        self.assertIn("goal/read", methods)
-        self.assertIn("goal/create", methods)
-        self.assertIn("goal/plan/attach", methods)
-        self.assertIn("goal/plan/detach", methods)
+        self.assertIn("task/closed", events)
+        self.assertEqual(
+            {
+                "plan/read",
+                "plan/revisions/list",
+                "plan/current/read",
+                "plan/events/read",
+                "plan/evidence/list",
+                "plan/observe",
+                "plan/unobserve",
+                "plan/pause",
+                "plan/resume",
+                "plan/stop",
+                "plan/create",
+                "plan/draft/save",
+                "plan/draft/discard",
+                "plan/propose",
+                "plan/execute",
+                "plan/reject",
+            },
+            {method for method in methods if method.startswith("plan/")},
+        )
+        self.assertFalse(any(method.startswith("goal/") for method in methods))
         self.assertIn("plan/create", methods)
         self.assertIn("plan/draft/save", methods)
         self.assertNotIn("plan/approve", methods)
@@ -164,15 +187,13 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIn("context/compaction-failed", events)
         self.assertIn("thread/metadata-changed", events)
         self.assertIn("task/activity", events)
-        self.assertIn("goal/changed", events)
-        self.assertIn("goal/activity", events)
-        self.assertNotIn("goal/input-requested", events)
+        self.assertFalse(any(event.startswith("goal/") for event in events))
         self.assertIn("interaction/changed", events)
         self.assertIn("plan/changed", events)
         self.assertNotIn("turn/change-preview-updated", events)
         self.assertEqual(["default", "plan"], params["capabilities"]["collaborationModes"])
         self.assertEqual(
-            ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+            ["task_threads", "plan", "interaction"],
             params["capabilities"]["features"],
         )
         self.assertEqual(["approval_required", "full_access"], params["capabilities"]["accessModes"])
@@ -194,7 +215,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             )
 
     def test_workspace_and_thread_use_cwd_without_client_identity(self) -> None:
-        """Requires Java to assign workspaceId instead of accepting a client-computed identity."""
+        """要求 workspaceId 由 Java 分配，不接受客户端计算的身份。"""
 
         workspace = Path(tempfile.gettempdir()) / "ja-合同-workspace"
         opened = SMOKE.workspace_open_frame(workspace)["params"]
@@ -229,7 +250,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual(str(workspace.resolve()), frame["params"]["cwd"])
 
     def test_sidecar_command_is_the_exact_current_cli(self) -> None:
-        """Locks the four directory arguments accepted by the single App Server composition graph."""
+        """锁定唯一 App Server 组合图所接受的四个目录参数。"""
 
         root = Path(tempfile.gettempdir()) / "ja-合同-root"
         command = SMOKE.sidecar_command(
@@ -248,8 +269,8 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual(7, len(command))
         self.assertEqual("--ja-runtime-generation=1", command[-1])
 
-    def test_emitted_requests_validate_against_the_current_v1_schema(self) -> None:
-        """Checks the authoritative schema directly so handler-aligned builders cannot drift silently."""
+    def test_emitted_requests_validate_against_the_current_v2_schema(self) -> None:
+        """直接检查权威 schema，避免与处理器一致的构造器悄然偏离契约。"""
 
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         frames = [
@@ -257,6 +278,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             SMOKE.workspace_open_frame(Path(tempfile.gettempdir()) / "ja-合同-workspace"),
             SMOKE.workspace_trust_frame("ws_demo"),
             SMOKE.thread_create_frame(Path(tempfile.gettempdir()) / "ja-合同-workspace"),
+            SMOKE.thread_item_content_read_frame("thr_demo", "item_demo"),
             SMOKE.thread_rename_frame("thr_demo", 1),
             SMOKE.configuration_replace_frame("cfg_missing"),
             SMOKE.approval_response_frame("appr_demo", "turn_demo", 1),
@@ -269,37 +291,52 @@ class NativeSmokeV1Test(unittest.TestCase):
         for frame in frames:
             jsonschema.Draft202012Validator(schema).validate(frame)
 
-    def test_turn_cancellation_frame_uses_only_the_current_v1_identity(self) -> None:
+    def test_item_content_read_frame_uses_the_v2_unicode_page_contract(self) -> None:
+        """正文 smoke 使用 code point 游标和当前 Thread/item 双重身份。"""
+
+        frame = SMOKE.thread_item_content_read_frame("thr_demo", "item_demo")
+        self.assertEqual("thread/item-content/read", frame["method"])
+        self.assertEqual(
+            {
+                "threadId": "thr_demo",
+                "itemId": "item_demo",
+                "offsetCharacters": 0,
+                "limitCharacters": SMOKE.ITEM_CONTENT_PAGE_LIMIT,
+            },
+            frame["params"],
+        )
+
+    def test_turn_cancellation_frame_uses_only_the_current_v2_identity(self) -> None:
         """防止已移除的 CAS 字段重新进入生产取消请求并只在 Native CI 暴露。"""
 
         frame = SMOKE.turn_cancel_frame("turn_demo")
         self.assertEqual({"turnId": "turn_demo"}, frame["params"])
 
-    def test_turn_start_frame_has_a_fresh_client_operation_id(self) -> None:
+    def test_turn_start_frame_has_a_fresh_operation_key(self) -> None:
         """每次 smoke admission 使用独立回执键，满足当前 JA-RPC 幂等边界。"""
 
         first = SMOKE.turn_start_frame("thr_demo", "first")["params"]
         second = SMOKE.turn_start_frame("thr_demo", "second")["params"]
-        self.assertRegex(first["clientOperationId"], r"^op_[0-9a-f]{32}$")
-        self.assertRegex(second["clientOperationId"], r"^op_[0-9a-f]{32}$")
-        self.assertNotEqual(first["clientOperationId"], second["clientOperationId"])
+        self.assertRegex(first["operationKey"], r"^op_[0-9a-f]{32}$")
+        self.assertRegex(second["operationKey"], r"^op_[0-9a-f]{32}$")
+        self.assertNotEqual(first["operationKey"], second["operationKey"])
 
     def test_turn_start_frame_uses_only_schema_owned_request_fields(self) -> None:
-        """Deadline 由 smoke harness 限制，不能扩展服务端 admission 的严格 v1 字段集。"""
+        """Deadline 由 smoke harness 限制，不能扩展服务端 admission 的严格 v2 字段集。"""
 
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         frame = SMOKE.turn_start_frame("thr_demo", "schema-owned request")
-        self.assertEqual({"threadId", "content", "clientOperationId"}, set(frame["params"]))
+        self.assertEqual({"threadId", "content", "operationKey"}, set(frame["params"]))
         jsonschema.Draft202012Validator(schema).validate(frame)
 
-    def test_approval_response_frame_has_a_fresh_client_operation_id(self) -> None:
+    def test_approval_response_frame_has_a_fresh_operation_key(self) -> None:
         """每次审批裁决都用独立回执键，避免重复提交串扰另一条 smoke 任务。"""
 
         first = SMOKE.approval_response_frame("appr_demo", "turn_demo", 1)["params"]
         second = SMOKE.approval_response_frame("appr_demo", "turn_demo", 2)["params"]
-        self.assertRegex(first["clientOperationId"], r"^op_[0-9a-f]{32}$")
-        self.assertRegex(second["clientOperationId"], r"^op_[0-9a-f]{32}$")
-        self.assertNotEqual(first["clientOperationId"], second["clientOperationId"])
+        self.assertRegex(first["operationKey"], r"^op_[0-9a-f]{32}$")
+        self.assertRegex(second["operationKey"], r"^op_[0-9a-f]{32}$")
+        self.assertNotEqual(first["operationKey"], second["operationKey"])
 
     def test_loopback_configuration_document_is_exact_v2(self) -> None:
         """锁定当前 v2 用户配置字段，禁用列表与 workspace 中发现的 Skill 分开表达。"""
@@ -337,7 +374,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             self.assertNotIn(removed_field, encoded)
 
     def test_workspace_skill_fixture_matches_configured_identity(self) -> None:
-        """Keeps Native Skill coverage on a real workspace package after bundled Skills were removed."""
+        """移除内置 Skills 后，仍通过真实工作区包覆盖 Native Skill 行为。"""
 
         with tempfile.TemporaryDirectory(prefix="ja-native-skill-test-") as parent:
             workspace = Path(parent) / "workspace"
@@ -349,7 +386,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             self.assertIn(f"description: {SMOKE.SKILL_DESCRIPTION}.\n", content)
 
     def test_loopback_provider_rejects_retired_responses_token_count(self) -> None:
-        """Keeps the retired count route absent so a production preflight call breaks the smoke."""
+        """确保已废弃的计数路由不存在，使生产预检调用能够令 smoke 失败。"""
 
         provider = SMOKE.LoopbackProvider()
         try:
@@ -370,7 +407,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             provider.close()
 
     def test_known_context_usage_requires_exact_durable_provider_accounting(self) -> None:
-        """Reject unknown or mis-correlated Usage before Native smoke can report persistence success."""
+        """拒绝未知或关联错误的 Usage，避免 Native smoke 将其报告为持久化成功。"""
 
         usage = {
             "turnId": "turn_expected",
@@ -396,7 +433,7 @@ class NativeSmokeV1Test(unittest.TestCase):
 
     @unittest.skipIf(shutil.which("node") is None, "Node.js is required for the mock sidecar")
     def test_mock_sidecar_exercises_four_unicode_roots_and_cleans_temp_home(self) -> None:
-        """复制当前 v1 mock 到临时目录，验证四个 Unicode 根目录与受控清理。"""
+        """复制当前 v2 mock 到临时目录，验证四个 Unicode 根目录与受控清理。"""
 
         node = Path(shutil.which("node") or "")
         with tempfile.TemporaryDirectory(prefix="ja-native-fixture-") as fixture_parent, \
@@ -418,9 +455,8 @@ class NativeSmokeV1Test(unittest.TestCase):
                 identity["sizeBytes"],
                 identity["mtimeNs"],
             )
-            # The fixture intentionally lacks Windows ACL, MCP, shell-cancel, recovery and
-            # networknt evidence.  The process lifecycle still runs and cleans up, but the
-            # release-facing report must fail closed instead of presenting a false green.
+            # 此夹具有意不提供 Windows ACL、MCP、shell 取消、恢复及 networknt 证据。进程生命周期仍会运行并清理，
+            # 但面向发布的报告必须失败关闭，不能误报通过。
             self.assertEqual("failed", report["status"])
             self.assertFalse(report["passed"])
             self.assertTrue(report["executable"]["expectedIdentityMatched"])
@@ -440,7 +476,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             self.assertEqual([], list(Path(parent).iterdir()))
 
     def test_expected_identity_is_all_or_none_and_fail_closed(self) -> None:
-        """Prevents freshness callers from silently comparing only one mutable artifact attribute."""
+        """避免新鲜度检查调用方只比较一个可变产物属性而不报错。"""
 
         actual = {"sha256": "0" * 64, "sizeBytes": 1, "mtimeNs": 1}
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
@@ -449,7 +485,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             SMOKE.require_expected_identity(actual, "1" * 64, 1, 1)
 
     def test_each_artifact_identity_field_is_immutable_for_smoke(self) -> None:
-        """Rejects a hash, size or timestamp mutation even when the other identity fields match."""
+        """即使其他身份字段匹配，摘要、大小或时间戳发生变化时也必须拒绝。"""
 
         expected = {"sha256": "0" * 64, "sizeBytes": 1, "mtimeNs": 1}
         for field, value in (("sha256", "1" * 64), ("sizeBytes", 2), ("mtimeNs", 2)):
@@ -459,7 +495,7 @@ class NativeSmokeV1Test(unittest.TestCase):
                 SMOKE.require_expected_identity(mutated, expected["sha256"], expected["sizeBytes"], expected["mtimeNs"])
 
     def test_required_subgates_reject_blocked_and_missing_entries(self) -> None:
-        """Keeps an omitted or blocked capability from being interpreted as an optional check."""
+        """缺失或受阻的能力不能被解释为可选检查。"""
 
         complete = {name: {"status": "passed"} for name in SMOKE.REQUIRED_SUBGATES}
         blocked = dict(complete)
@@ -477,7 +513,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual(["networknt"], missing_result["missing"])
 
     def test_required_subgates_reject_failed_or_mutated_status(self) -> None:
-        """Treats an unknown status and a contradictory passed flag as hard failures."""
+        """将未知状态和相互矛盾的通过标记视为硬失败。"""
 
         unknown = {name: {"status": "passed"} for name in SMOKE.REQUIRED_SUBGATES}
         unknown["networknt"] = {"status": "changed"}
@@ -494,7 +530,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual(["configAuth"], mutated_result["failed"])
 
     def test_required_subgates_pass_only_when_the_closed_set_passes(self) -> None:
-        """Provides one positive pure-rule case so the fail-closed helper is not tautological."""
+        """补充一条纯规则的正向用例，避免失败关闭辅助逻辑只验证自身。"""
 
         complete = {name: {"status": "passed", "passed": True} for name in SMOKE.REQUIRED_SUBGATES}
         result = SMOKE.evaluate_required_subgates(complete)
@@ -505,7 +541,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertEqual([], result["failed"])
 
     def test_turn_wait_fails_fast_when_terminal_precedes_approval(self) -> None:
-        """Keeps a failed Tool Turn from consuming the smoke-wide deadline and hiding its real phase."""
+        """避免失败的 Tool Turn 耗尽 smoke 全局时限并掩盖实际阶段。"""
 
         lines: Queue[bytes | None] = Queue()
         lines.put(json.dumps({
@@ -528,6 +564,21 @@ class NativeSmokeV1Test(unittest.TestCase):
 
         self.assertEqual("Start-Sleep -Seconds 30", SMOKE.SHELL_COMMAND)
         self.assertNotEqual(SMOKE.SHELL_CANCEL_CALL_ID, SMOKE.SHELL_STDIN_EOF_CALL_ID)
+
+    @unittest.skipUnless(SMOKE.os.name == "nt" and shutil.which("pwsh"), "requires Windows PowerShell 7")
+    def test_stdin_eof_probe_decodes_utf8_independently_of_console_code_page(self) -> None:
+        """用真实重定向管道验证中文与 EOF，避免 GB2312 宿主误判 UTF-8 传输失败。"""
+
+        process = subprocess.run(
+            [shutil.which("pwsh"), "-Command", SMOKE.SHELL_STDIN_EOF_COMMAND],
+            input="Ja-input-中文".encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(0, process.returncode)
+        self.assertIn(b"JA_NATIVE_STDIN_EOF", process.stdout)
 
     def test_loopback_provider_requires_advertised_shell_capability(self) -> None:
         """自动标题可包含相同用户文本，但没有 Tool 能力时不得被夹具误路由为 Shell。"""
@@ -553,7 +604,7 @@ class NativeSmokeV1Test(unittest.TestCase):
 
             tool_request = json.dumps({
                 "input": [{"role": "user", "content": "stdin EOF"}],
-                "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+                "tools": [{"type": "function", "name": "exec_command", "parameters": {}}],
             }).encode("utf-8")
             connection.request(
                 "POST",
@@ -571,7 +622,7 @@ class NativeSmokeV1Test(unittest.TestCase):
             server.close()
 
     def test_terminal_failure_label_excludes_message(self) -> None:
-        """Allows stable diagnosis without copying provider or Tool failure text into smoke evidence."""
+        """在不复制 Provider 或 Tool 错误文本到 smoke 证据的前提下保留稳定诊断信息。"""
 
         event = {"params": {"state": "failed", "errorCode": "PROFILE_NOT_FOUND", "errorMessage": "secret"}}
         label = SMOKE.terminal_failure_label(event)
@@ -599,7 +650,7 @@ class NativeSmokeV1Test(unittest.TestCase):
         self.assertIsNone(SMOKE.latest_tool_error_code(documents, "turn_fixture"))
 
     def test_mcp_notification_response_is_self_delimiting(self) -> None:
-        """Locks HTTP/1.1 framing because the MCP client waits for notification transport completion."""
+        """锁定 HTTP/1.1 分帧行为，因为 MCP 客户端会等待通知传输完成。"""
 
         server = SMOKE.LoopbackMcp()
         connection = http.client.HTTPConnection("127.0.0.1", server.server.server_port, timeout=1.0)
@@ -641,6 +692,113 @@ class NativeSmokeV1Test(unittest.TestCase):
         finally:
             connection.close()
             server.close()
+
+    def test_failure_stage_identifies_last_rpc_without_response_body(self) -> None:
+        """失败现场只区分请求与等待阶段，不把正文、参数或结果文本写入诊断。"""
+
+        sent = [{"method": "turn/continue", "id": "c:continue"}]
+        documents = [{
+            "id": "c:continue",
+            "result": {"state": "accepted", "privateText": "do-not-copy"},
+        }]
+        stage = SMOKE.failure_stage_summary(sent, documents)
+        trace = SMOKE.failure_protocol_trace(sent, documents)
+        self.assertEqual("awaiting_followup_frame", stage["kind"])
+        self.assertEqual("turn/continue", stage["requestMethod"])
+        self.assertTrue(stage["rpcResponseReceived"])
+        self.assertNotIn("do-not-copy", json.dumps(trace))
+        self.assertEqual("c:continue", trace["server"][0]["id"])
+
+    def test_failure_diagnostics_redact_stderr_and_list_only_profile_files(self) -> None:
+        """用明确 mock 值验证失败证据过滤凭据及绝对路径，不依赖真实令牌形状。"""
+
+        with tempfile.TemporaryDirectory(prefix="ja-native-diagnostics-") as directory:
+            profile = Path(directory) / "profile"
+            profile.mkdir()
+            (profile / "logs").mkdir()
+            (profile / "data.sqlite").write_bytes(b"isolated database")
+            (profile / "logs" / "app-server.log").write_text(
+                "native log line\n", encoding="utf-8"
+            )
+            secret_path = profile / "private" / "logs"
+            stderr = (
+                f"{SMOKE.SMOKE_SECRET}\n{secret_path}\\app-server.log\n"
+                "Authorization: Bearer mock-bearer\napi_key='mock-api-key'\n"
+            ).encode("utf-8")
+            diagnostic_ref = SMOKE.write_failure_diagnostics(
+                profile,
+                [{"method": "turn/continue", "id": "c:continue"}],
+                [{"id": "c:continue", "result": {"text": "private body"}}],
+                stderr,
+                [profile],
+            )
+            diagnostic = json.loads((profile / "failure-diagnostics.json").read_text(encoding="utf-8"))
+            encoded = json.dumps(diagnostic, ensure_ascii=False)
+            self.assertEqual("profile", diagnostic_ref["profileDirectory"])
+            self.assertEqual("awaiting_followup_frame", diagnostic["stage"]["kind"])
+            self.assertEqual(["data.sqlite"], [item["path"] for item in diagnostic["databaseFiles"]])
+            self.assertIn("[redacted-secret]", diagnostic["stderrRedacted"])
+            self.assertNotIn(SMOKE.SMOKE_SECRET, encoded)
+            self.assertNotIn("mock-bearer", encoded)
+            self.assertNotIn("mock-api-key", encoded)
+            self.assertNotIn("private body", encoded)
+            self.assertNotIn(str(profile), encoded)
+
+    def test_run_failure_returns_profile_pointer_through_report_sink(self) -> None:
+        """异常清理会保留有限失败目录，并通过报告通道回传相对定位信息。"""
+
+        executable = Path(sys.executable)
+        identity = SMOKE.executable_identity(executable)
+        evidence: dict[str, object] = {}
+        with tempfile.TemporaryDirectory(prefix="ja-native-failure-sink-") as directory:
+            with self.assertRaisesRegex(RuntimeError, "non-JSON stdout"):
+                SMOKE.run_smoke(
+                    executable,
+                    Path(directory),
+                    10.0,
+                    ["-c", "import time; print('not-json', flush=True); time.sleep(5)"],
+                    identity["sha256"],
+                    identity["sizeBytes"],
+                    identity["mtimeNs"],
+                    keep_failed_profile=True,
+                    failure_evidence_sink=evidence,
+                )
+            profile = Path(directory) / str(evidence["profileDirectory"])
+            self.assertTrue((profile / "failure-diagnostics.json").is_file())
+            self.assertEqual("awaiting_rpc_response", evidence["stage"]["kind"])
+
+    def test_cli_report_contains_failure_evidence_pointer(self) -> None:
+        """命令行异常路径把失败 profile 的相对指针写进报告，不要求读者猜临时目录。"""
+
+        executable = Path(sys.executable)
+        identity = SMOKE.executable_identity(executable)
+        with tempfile.TemporaryDirectory(prefix="ja-native-report-sink-") as directory:
+            root = Path(directory)
+            output = root / "report.json"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT.resolve()),
+                    "--executable", str(executable),
+                    "--data-dir", str(root / "data"),
+                    "--timeout-seconds", "10",
+                    "--expected-sha256", identity["sha256"],
+                    "--expected-size", str(identity["sizeBytes"]),
+                    "--expected-mtime-ns", str(identity["mtimeNs"]),
+                    "--keep-failed-profile",
+                    "--output", str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(1, completed.returncode)
+            self.assertEqual("failed", report["status"])
+            self.assertIn("failureEvidence", report)
+            profile = root / "data" / report["failureEvidence"]["profileDirectory"]
+            self.assertTrue((profile / report["failureEvidence"]["diagnosticsFile"]).is_file())
 
 
 if __name__ == "__main__":

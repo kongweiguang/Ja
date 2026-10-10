@@ -21,8 +21,8 @@ const PROFILE = {
 } as const;
 
 const USAGE: TimelineContextUsage = {
-  requestId: "request_1",
-  requestOrdinal: 1,
+  modelRequestId: "modelreq_1",
+  modelRequestOrdinal: 1,
   modelRound: 1,
   purpose: "assistant",
   profile: PROFILE,
@@ -43,13 +43,13 @@ function resolve(overrides: Partial<Parameters<typeof resolveContextUsage>[0]> =
 
 describe("context usage presentation", () => {
   /** 上下文窗口只取自该请求画像，当前偏好变化不能改写历史百分比。 */
-  it("只按请求画像投影 Provider 的真实输入 Token", () => {
+  it("按最近普通请求的完整总量投影上下文，包含缓存与输出", () => {
     expect(resolve()).toEqual({
       certainty: "known",
-      usedTokens: 42_000,
+      usedTokens: 44_000,
       limitTokens: 128_000,
-      percentage: 32.8,
-      ringPercentage: 32.8125,
+      percentage: 34.4,
+      ringPercentage: 34.375,
       tone: "neutral",
       source: "provider",
       measuredAt: USAGE.measuredAt,
@@ -76,8 +76,62 @@ describe("context usage presentation", () => {
     });
   });
 
-  /** 摘要成功开始新投影阶段，旧输入计量必须失效，失败摘要则继续保留原阶段的可信读数。 */
-  it("压缩后等待新的可信 Usage，并接受阶段后的计量", () => {
+  /** thread/read 在压缩后重建仅由持久检查点估算提供的上下文，不恢复过期的实测输入。 */
+  it("从恢复快照投影压缩检查点的本地估算", () => {
+    expect(
+      resolve({
+        usage: {
+          ...USAGE,
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: {
+            certainty: "estimated",
+            source: "local",
+            usedTokens: 12_000,
+            limitTokens: PROFILE.contextWindowTokens,
+            measuredAt: "2026-08-31T00:00:02Z",
+          },
+        },
+      }),
+    ).toMatchObject({
+      certainty: "estimated",
+      usedTokens: 12_000,
+      source: "local",
+      measuredAt: "2026-08-31T00:00:02Z",
+    });
+  });
+
+  /** Provider 请求尚未结算时显示 Java 按完整当前请求 envelope 计算的 dispatch 估算。 */
+  it("在 Provider 实测到来前显示当前请求本地估算", () => {
+    expect(
+      resolve({
+        usage: {
+          ...USAGE,
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: {
+            certainty: "estimated",
+            source: "local",
+            usedTokens: 18_500,
+            limitTokens: PROFILE.contextWindowTokens,
+            measuredAt: "2026-08-31T00:00:02Z",
+          },
+        },
+      }),
+    ).toMatchObject({
+      certainty: "estimated",
+      usedTokens: 18_500,
+      percentage: 14.5,
+      source: "local",
+    });
+  });
+
+  /** 摘要成功开始新投影阶段，旧上游计量失效并显示压缩后 envelope 的本地预算。 */
+  it("压缩后使用明确标记的压缩后估算，并接受阶段后的计量", () => {
     expect(
       resolve({
         compaction: {
@@ -86,9 +140,11 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:02Z",
         },
       }),
-    ).toEqual({
-      certainty: "unknown",
-      source: "provider",
+    ).toMatchObject({
+      certainty: "estimated",
+      usedTokens: 12_000,
+      limitTokens: 128_000,
+      source: "local",
       measuredAt: "2026-08-31T00:00:02Z",
     });
     expect(
@@ -108,7 +164,7 @@ describe("context usage presentation", () => {
       }),
     ).toMatchObject({
       certainty: "known",
-      usedTokens: 18_000,
+      usedTokens: 20_000,
       source: "provider",
       measuredAt: "2026-08-31T00:00:03Z",
     });
@@ -120,7 +176,7 @@ describe("context usage presentation", () => {
           occurredAt: "2026-08-31T00:00:03Z",
         },
       }),
-    ).toMatchObject({ certainty: "known", usedTokens: 42_000, source: "provider" });
+    ).toMatchObject({ certainty: "known", usedTokens: 44_000, source: "provider" });
   });
 
   /** 生命周期投影可在 snapshot 后收敛，但成功摘要的阶段边界必须继续阻断旧 Provider 读数。 */
@@ -135,7 +191,7 @@ describe("context usage presentation", () => {
         invalidatedAt: "2026-08-31T00:00:02Z",
         usage: { ...USAGE, measuredAt: "2026-08-31T00:00:03Z" },
       }),
-    ).toMatchObject({ certainty: "known", usedTokens: 42_000, source: "provider" });
+    ).toMatchObject({ certainty: "known", usedTokens: 44_000, source: "provider" });
   });
 
   /** 80% 与 95% 是完整窗口上的稳定阈值，环形进度在超限时仍约束在可绘制范围。 */
@@ -146,7 +202,8 @@ describe("context usage presentation", () => {
           ...USAGE,
           profile: { ...PROFILE, contextWindowTokens: 100_000 },
           inputTokens: 79_000,
-          totalTokens: 81_000,
+          outputTokens: 0,
+          totalTokens: 79_000,
         },
       }),
     ).toMatchObject({
@@ -159,7 +216,8 @@ describe("context usage presentation", () => {
           ...USAGE,
           profile: { ...PROFILE, contextWindowTokens: 100_000 },
           inputTokens: 80_000,
-          totalTokens: 82_000,
+          outputTokens: 0,
+          totalTokens: 80_000,
         },
       }),
     ).toMatchObject({ percentage: 80, ringPercentage: 80, tone: "warning" });
@@ -169,7 +227,8 @@ describe("context usage presentation", () => {
           ...USAGE,
           profile: { ...PROFILE, contextWindowTokens: 100_000 },
           inputTokens: 95_000,
-          totalTokens: 97_000,
+          outputTokens: 0,
+          totalTokens: 95_000,
         },
       }),
     ).toMatchObject({ percentage: 95, ringPercentage: 95, tone: "danger" });
@@ -179,9 +238,34 @@ describe("context usage presentation", () => {
           ...USAGE,
           profile: { ...PROFILE, contextWindowTokens: 100_000 },
           inputTokens: 120_000,
-          totalTokens: 122_000,
+          outputTokens: 0,
+          totalTokens: 120_000,
         },
       }),
     ).toMatchObject({ percentage: 120, ringPercentage: 100, tone: "danger" });
+  });
+
+  /** 原截图规模：小的未缓存输入不能代替完整的缓存输入与输出上下文。 */
+  it("使用最近请求完整用量避免高缓存会话显示接近零", () => {
+    expect(
+      resolve({
+        usage: {
+          ...USAGE,
+          profile: { ...PROFILE, contextWindowTokens: 1_000_000 },
+          inputTokens: 35_000,
+          outputTokens: 47_000,
+          totalTokens: 689_000,
+        },
+      }),
+    ).toMatchObject({
+      certainty: "known",
+      usedTokens: 689_000,
+      percentage: 68.9,
+    });
+  });
+
+  /** 摘要模型的 Token 预算与用户会话当前上下文无关，不能成为圆环的基准。 */
+  it("不把摘要请求用量显示为对话上下文", () => {
+    expect(resolve({ usage: { ...USAGE, purpose: "summary" } })).toBeUndefined();
   });
 });

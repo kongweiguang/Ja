@@ -6,31 +6,53 @@ use serde_json::json;
 
 /// 大回复只按 Unicode 页前进；拒绝错位、空进度和混入未知字段，避免界面重复或漏字。
 #[test]
-fn message_content_pages_keep_exact_identity_and_progress() {
-    let input = MessageContentReadInput {
+fn item_content_pages_keep_exact_identity_and_progress() {
+    let input = ItemContentReadInput {
         thread_id: "thr_demo".to_owned(),
-        message_id: "item_answer".to_owned(),
+        item_id: "item_answer".to_owned(),
         offset_characters: 0,
         limit_characters: 2,
     };
-    assert!(validate_message_content_read(&input).is_ok());
-    let first = parse_message_content_read(json!({
-        "messageId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":2,
-        "totalCharacters":3, "truncated":true, "content":"甲😀"
-    }), &input).expect("first Unicode page");
+    assert!(validate_item_content_read(&input).is_ok());
+    let first = parse_item_content_read(
+        json!({
+            "itemId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":2,
+            "totalCharacters":3, "truncated":true, "content":"甲😀"
+        }),
+        &input,
+    )
+    .expect("first Unicode page");
     assert_eq!(first.next_offset_characters, Some(2));
-    assert!(parse_message_content_read(json!({
-        "messageId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":0,
-        "totalCharacters":3, "truncated":true, "content":""
-    }), &input).is_err());
-    assert!(parse_message_content_read(json!({
-        "messageId":"item_other", "offsetCharacters":0, "nextOffsetCharacters":null,
-        "totalCharacters":1, "truncated":false, "content":"甲"
-    }), &input).is_err());
-    assert!(parse_message_content_read(json!({
-        "messageId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":null,
-        "totalCharacters":1, "truncated":false, "content":"甲", "extra":true
-    }), &input).is_err());
+    assert!(
+        parse_item_content_read(
+            json!({
+                "itemId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":0,
+                "totalCharacters":3, "truncated":true, "content":""
+            }),
+            &input
+        )
+        .is_err()
+    );
+    assert!(
+        parse_item_content_read(
+            json!({
+                "itemId":"item_other", "offsetCharacters":0, "nextOffsetCharacters":null,
+                "totalCharacters":1, "truncated":false, "content":"甲"
+            }),
+            &input
+        )
+        .is_err()
+    );
+    assert!(
+        parse_item_content_read(
+            json!({
+                "itemId":"item_answer", "offsetCharacters":0, "nextOffsetCharacters":null,
+                "totalCharacters":1, "truncated":false, "content":"甲", "extra":true
+            }),
+            &input
+        )
+        .is_err()
+    );
 }
 
 /// 订阅 ACK 和持久操作回执都必须精确回显身份；unknown 不会伪造可重试成功。
@@ -50,24 +72,44 @@ fn observation_and_operation_read_results_are_strict() {
     );
 
     let query = OperationReadInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        source_thread_id: None,
     };
     assert!(validate_operation_read(&query).is_ok());
     assert!(matches!(
-        parse_operation_read(json!({"status":"unknown"})),
+        parse_operation_read(json!({"status":"unknown"}), None),
         Ok(OperationReadResult::Unknown)
     ));
     assert!(
-        parse_operation_read(json!({
-            "status":"committed", "method":"turn/start", "threadId":"thr_demo",
-            "result":{"accepted":true,"queued":false,"turnId":"turn_demo","threadRevision":1}
-        }))
+        parse_operation_read(
+            json!({
+                "status":"committed", "method":"turn/start", "threadId":"thr_demo",
+                "result":{"accepted":true,"queued":false,"turnId":"turn_demo","threadRevision":1}
+            }),
+            None
+        )
         .is_ok()
     );
     assert!(parse_operation_read(json!({
         "status":"committed", "method":"turn/start", "threadId":"thr_demo",
         "result":{"accepted":true,"queued":false,"turnId":"turn_demo","threadRevision":1,"secret":"bad"}
-    })).is_err());
+    }), None).is_err());
+
+    let fork_receipt = json!({
+        "status":"committed", "method":"thread/fork", "threadId":"thr_source",
+        "result":{
+            "thread":{
+                "threadId":"thr_forked", "workspaceId":"ws_demo", "workspaceKind":"project",
+                "preferences":null, "title":"来源标题（分叉）", "status":"active", "pinned":false,
+                "latestTurnStatus":null, "latestTurnSeen":true, "revision":0,
+                "createdAt":"2026-10-06T08:00:00Z", "updatedAt":"2026-10-06T08:00:00Z"
+            },
+            "source":{"threadId":"thr_source", "itemId":"item_answer", "threadRevision":7}
+        }
+    });
+    assert!(parse_operation_read(fork_receipt.clone(), Some("thr_source")).is_ok());
+    assert!(parse_operation_read(fork_receipt.clone(), Some("thr_other")).is_err());
+    assert!(parse_operation_read(fork_receipt, None).is_err());
 }
 
 /// Workspace page 保持共享 cursor/limit shape，不引入 Thread-specific scope。
@@ -81,7 +123,7 @@ fn page_input_contains_only_cursor_and_limit() {
     assert_eq!(value, json!({"cursor": "cursor_1", "limit": 200}));
 }
 
-/// Workspace kind filtering is closed and optional; omitting it retains complete discovery behavior.
+/// 工作区类型筛选采用封闭的可选集合；省略筛选时保留完整的发现行为。
 #[test]
 fn workspace_list_input_accepts_only_known_kind_filters() {
     let input: WorkspaceListInput =
@@ -206,7 +248,6 @@ fn thread_create_result_is_direct() {
         "threadId": "thr_demo",
         "workspaceId": "ws_demo",
         "workspaceKind": "project",
-        "legacySharedWorkspaceId": null,
         "preferences": {
             "providerId": "provider_demo",
             "modelId": "model_demo",
@@ -220,7 +261,6 @@ fn thread_create_result_is_direct() {
         "pinned": false,
         "latestTurnStatus": null,
         "latestTurnSeen": true,
-        "activeGoalId": null,
         "revision": 1,
         "createdAt": "2026-08-25T00:00:00Z",
         "updatedAt": "2026-08-25T00:00:00Z"
@@ -237,7 +277,7 @@ fn thread_create_result_is_direct() {
     );
 }
 
-/// 锁定 Java 所有的 Workspace 投影和统一 items 键，避免 Rust 旧字段误拒绝成功列表。
+/// 锁定 Java 所有的 Workspace 投影与 `project/session` 闭集，拒绝旧关联字段和列表键。
 #[test]
 fn workspace_page_uses_root_projection() {
     let page = json!({
@@ -247,8 +287,7 @@ fn workspace_page_uses_root_projection() {
             "displayName": "Demo",
             "trust": "trusted",
             "revision": 1,
-            "kind": "project",
-            "legacySharedWorkspaceId": null
+            "kind": "project"
         }],
         "nextCursor": null
     });
@@ -266,7 +305,7 @@ fn workspace_page_uses_root_projection() {
     let mut session_with_legacy = page.clone();
     session_with_legacy["items"][0]["kind"] = json!("session");
     session_with_legacy["items"][0]["legacySharedWorkspaceId"] = json!("ws_legacy");
-    assert!(parse_workspace_page(session_with_legacy).is_ok());
+    assert!(parse_workspace_page(session_with_legacy).is_err());
 
     assert!(
         parse_workspace_page(json!({"workspaces": page["items"], "nextCursor": null})).is_err()
@@ -278,21 +317,48 @@ fn workspace_page_uses_root_projection() {
 fn thread_page_rejects_old_list_key() {
     let items = json!([{
         "threadId": "thr_demo", "workspaceId": "ws_demo",
-        "workspaceKind": "project", "legacySharedWorkspaceId": null,
+        "workspaceKind": "project",
         "preferences": {
             "providerId": "provider_demo", "modelId": "model_demo",
             "reasoningLevel": null, "accessMode": "approval_required",
             "collaborationMode": "default", "titleSource": "auto"
         },
         "title": "Demo", "status": "active", "pinned": false,
-        "latestTurnStatus": null, "latestTurnSeen": true, "activeGoalId": null, "revision": 1,
+        "latestTurnStatus": null, "latestTurnSeen": true, "revision": 1,
         "createdAt": "2026-08-25T00:00:00Z", "updatedAt": "2026-08-25T00:00:00Z"
     }]);
     assert!(parse_thread_page(json!({"items": items.clone(), "nextCursor": null})).is_ok());
     assert!(parse_thread_page(json!({"threads": items, "nextCursor": null})).is_err());
 }
 
-/// Project pages use their workspace ID while the no-project sidebar uses Java's session-kind filter.
+/// Java 持久化的澄清等待态在重启后仍可见，不能使整个会话列表或发现页失败。
+#[test]
+fn waiting_input_thread_remains_visible_after_restart() {
+    let mut thread = json!({
+        "threadId": "thr_waiting", "workspaceId": "ws_demo",
+        "workspaceKind": "project",
+        "preferences": null, "title": "Clarification", "status": "active",
+        "pinned": false, "latestTurnStatus": "waiting_input",
+        "latestTurnSeen": false, "revision": 2,
+        "createdAt": "2026-09-03T00:00:00Z", "updatedAt": "2026-09-03T00:00:01Z"
+    });
+    assert!(parse_thread_page(json!({"items": [thread.clone()], "nextCursor": null})).is_ok());
+    thread["latestTurnStatus"] = json!("unknown_wait");
+    assert!(parse_thread_page(json!({"items": [thread], "nextCursor": null})).is_err());
+
+    assert!(
+        parse_thread_discovery(json!({
+            "items": [{
+                "threadId": "thr_waiting", "workspaceId": "ws_demo",
+                "title": "Clarification", "kind": "main", "status": "waiting_input"
+            }],
+            "nextCursor": null
+        }))
+        .is_ok()
+    );
+}
+
+/// 项目页面按 workspace ID 筛选；无项目的侧栏使用 Java 的 session 类型筛选。
 #[test]
 fn thread_list_filters_are_project_or_session_only() {
     let project: ThreadListInput =
@@ -338,10 +404,10 @@ fn thread_search_filters_are_project_or_session_only() {
 fn thread_seen_projection_is_required_and_consistent() {
     let valid = json!({
         "threadId": "thr_demo", "workspaceId": "ws_demo", "workspaceKind": "project",
-        "legacySharedWorkspaceId": null, "preferences": null,
+        "preferences": null,
         "title": "Demo", "status": "active", "pinned": false,
         "latestTurnStatus": "completed", "latestTurnSeen": true,
-        "activeGoalId": "goal_demo", "revision": 2,
+        "revision": 2,
         "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:01:00Z"
     });
     assert!(parse_thread(valid.clone()).is_ok());
@@ -352,24 +418,6 @@ fn thread_seen_projection_is_required_and_consistent() {
         .expect("thread object")
         .remove("latestTurnSeen");
     assert!(parse_thread(missing).is_err());
-
-    let mut missing_goal = valid.clone();
-    missing_goal
-        .as_object_mut()
-        .expect("thread object")
-        .remove("activeGoalId");
-    assert!(parse_thread(missing_goal).is_err());
-
-    let mut missing_legacy_association = valid.clone();
-    missing_legacy_association
-        .as_object_mut()
-        .expect("thread object")
-        .remove("legacySharedWorkspaceId");
-    assert!(parse_thread(missing_legacy_association).is_err());
-
-    let mut project_with_legacy_association = valid.clone();
-    project_with_legacy_association["legacySharedWorkspaceId"] = json!("ws_legacy");
-    assert!(parse_thread(project_with_legacy_association).is_err());
 
     let mut project_with_legacy_association = valid.clone();
     project_with_legacy_association["legacySharedWorkspaceId"] = json!("ws_legacy");
@@ -424,16 +472,18 @@ fn thread_read_accepts_strict_thread_message_items() {
         "revision": 3,
         "turns": [],
         "items": [{
-            "itemId": "item_message_1",
-            "createdAt": "2026-09-05T00:00:00Z",
-            "turnId": "turn_target",
-            "kind": "thread_message",
+        "itemId": "item_message_1",
+        "createdAt": "2026-09-05T00:00:00Z",
+        "turnId": "turn_target",
+        "origin": "native",
+        "kind": "thread_message",
             "sourceThreadId": "thr_source",
             "sourceTitle": "临时侧聊",
-            "content": "请检查这个旁支结果"
+            "content": "请检查这个旁支结果",
+            "totalCharacters": 9,
+            "truncated": false
         }],
         "taskActivities": [],
-        "goalActivities": [],
         "contextUsage": null,
         "inputQueue": null,
         "liveStream": null,
@@ -452,14 +502,14 @@ fn thread_read_accepts_strict_thread_message_items() {
     assert!(parse_thread_read(result).is_err());
 }
 
-/// 该 fixture 镜像当前 Java snapshot：Turn 的 changeSet/completedAt/errorCode 均显式存在，
-/// Tool 只携带安全 presentation，Provider 请求画像归属 Usage 而不再伪装成 Turn 单一 runtime。
-fn v1_thread_read_fixture() -> serde_json::Value {
+/// 该 fixture 镜像当前 JA-RPC snapshot：必需 nullable 字段和正文计量完整，Tool 只携带安全 presentation。
+fn thread_read_snapshot_fixture() -> serde_json::Value {
     json!({
         "threadId": "thr_demo",
         "revision": 11,
         "turns": [{
             "turnId": "turn_demo",
+            "origin": "native",
             "sourceMessageId": null,
             "status": "completed",
             "requestedAt": "2026-08-30T10:00:00Z",
@@ -484,27 +534,29 @@ fn v1_thread_read_fixture() -> serde_json::Value {
         "items": [
             {
                 "itemId": "item_user_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "user_input",
+                "turnId": "turn_demo", "origin": "native", "kind": "user_input",
                 "content": [
                     {"type":"workspace_reference","workspaceId":"ws_demo","relativePath":"src/main.rs","kind":"file"},
-                    {"type":"skill_reference","skillId":"skill_demo"},
+                    {"type":"skill_reference","skillId":"user:demo"},
                     {"type":"text","text":"检查合同"}
                 ],
-                "attachments": []
+                "attachments": [], "totalCharacters": 4, "truncated": false
             },
             {
                 "itemId": "item_progress_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "assistant_progress",
-                "text": "正在检查合同。", "modelRound": 1
+                "turnId": "turn_demo", "origin": "native", "kind": "assistant_progress",
+                "text": "正在检查合同。", "modelRound": 1,
+                "totalCharacters": 7, "truncated": false
             },
             {
                 "itemId": "item_reasoning_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "reasoning_summary",
-                "text": "需要先验证当前协议。", "modelRound": 1
+                "turnId": "turn_demo", "origin": "native", "kind": "reasoning_summary",
+                "text": "需要先验证当前协议。", "modelRound": 1,
+                "totalCharacters": 10, "truncated": false
             },
             {
                 "itemId": "item_call_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "tool_call", "callId": "call_shell_demo",
+                "turnId": "turn_demo", "origin": "native", "kind": "tool_call", "callId": "toolu_01HABC123",
                 "toolName": "shell", "ordinal": 0,
                 "presentation": {
                     "kind": "shell", "title": "运行命令", "status": "success",
@@ -516,22 +568,22 @@ fn v1_thread_read_fixture() -> serde_json::Value {
             },
             {
                 "itemId": "item_approval_demo", "createdAt": "2026-08-30T10:00:00Z",
-                "turnId": "turn_demo", "kind": "approval", "approvalId": "appr_demo",
-                "callId": "call_shell_demo", "toolName": "shell", "reason": "Tool requires approval",
+                "turnId": "turn_demo", "origin": "native", "kind": "approval", "approvalId": "appr_demo",
+                "callId": "toolu_01HABC123", "toolName": "shell", "reason": "Tool requires approval",
                 "expiresAt": "2026-08-30T10:05:00Z", "decision": null
             },
             {
                 "itemId": "item_final_demo", "createdAt": "2026-08-30T10:00:02Z",
-                "turnId": "turn_demo", "kind": "final_answer", "text": "合同检查完成。"
+                "turnId": "turn_demo", "origin": "native", "kind": "final_answer", "text": "合同检查完成。",
+                "totalCharacters": 7, "truncated": false
             }
         ],
         "inputQueue": null,
         "taskActivities": [],
-        "goalActivities": [],
         "contextUsage": {
             "turnId": "turn_demo",
-            "requestId": "request_demo",
-            "requestOrdinal": 1,
+            "modelRequestId": "modelreq_demo",
+            "modelRequestOrdinal": 1,
             "modelRound": 1,
             "purpose": "assistant",
             "certainty": "known",
@@ -553,19 +605,20 @@ fn v1_thread_read_fixture() -> serde_json::Value {
             "inputTokens": 100,
             "outputTokens": 20,
             "totalTokens": 120,
-            "measuredAt": "2026-08-30T10:00:00Z"
+            "measuredAt": "2026-08-30T10:00:00Z",
+            "contextEstimate": null
         },
         "liveStream": null,
         "nextCursor": null
     })
 }
 
-/// 冷启动恢复必须接受包含 `changeSet` 与精确 Usage 的真实快照；缺失必需 nullable 字段与
+/// 冷启动恢复必须接受包含 `changeSet` 与精确 Usage 的当前快照；缺失必需 nullable 字段与
 /// 绝对文件路径仍应关闭失败，旧 Turn runtime 快照不再作为恢复事实。
 #[test]
-fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
-    let fixture = v1_thread_read_fixture();
-    let parsed = parse_thread_read(fixture.clone()).expect("v1 history fixture");
+fn thread_read_accepts_snapshot_and_preserves_required_nulls() {
+    let fixture = thread_read_snapshot_fixture();
+    let parsed = parse_thread_read(fixture.clone()).expect("current history fixture");
     assert_eq!(
         parsed.turns[0]
             .change_set
@@ -625,11 +678,51 @@ fn thread_read_accepts_v1_snapshot_and_preserves_required_nulls() {
     assert!(parse_thread_read(absolute_path).is_err());
 }
 
+/// Snapshot 与 Timeline 使用全局 item 身份和 Thread/Turn/call 复合关联，保留 Provider 原生 callId。
+#[test]
+fn snapshot_tool_call_identity_is_scoped_to_turn() {
+    let mut fixture = thread_read_snapshot_fixture();
+    assert_eq!(fixture["items"][3]["callId"], "toolu_01HABC123");
+
+    let mut next_turn = fixture["turns"][0].clone();
+    next_turn["turnId"] = json!("turn_next");
+    fixture["turns"]
+        .as_array_mut()
+        .expect("turns")
+        .push(next_turn);
+    let mut next_turn_call = fixture["items"][3].clone();
+    next_turn_call["itemId"] = json!("item_call_next_turn");
+    next_turn_call["turnId"] = json!("turn_next");
+    fixture["items"]
+        .as_array_mut()
+        .expect("items")
+        .push(next_turn_call.clone());
+    assert!(parse_thread_read(fixture.clone()).is_ok());
+
+    let mut duplicate_call = fixture.clone();
+    let mut same_turn_call = next_turn_call.clone();
+    same_turn_call["itemId"] = json!("item_call_duplicate");
+    same_turn_call["turnId"] = json!("turn_demo");
+    duplicate_call["items"]
+        .as_array_mut()
+        .expect("items")
+        .push(same_turn_call);
+    assert!(parse_thread_read(duplicate_call).is_err());
+
+    let mut duplicate_item = fixture;
+    next_turn_call["itemId"] = json!("item_call_demo");
+    duplicate_item["items"]
+        .as_array_mut()
+        .expect("items")
+        .push(next_turn_call);
+    assert!(parse_thread_read(duplicate_item).is_err());
+}
+
 /// 活动流必须绑定活动 Turn，非空片段连续覆盖到 baseline；空片段仅用于保留已提交后的游标，
 /// 同时用 Unicode 字节预算固定 native parser 与 Java/TypeScript 的恢复边界。
 #[test]
 fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
-    let mut fixture = v1_thread_read_fixture();
+    let mut fixture = thread_read_snapshot_fixture();
     fixture["turns"][0]["status"] = json!("running");
     fixture["turns"][0]["completedAt"] = Value::Null;
     fixture["turns"][0]["changeSet"] = Value::Null;
@@ -675,7 +768,7 @@ fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
     unicode_budget["liveStream"]["segments"][0]["text"] = json!("界".repeat(21_846));
     assert!(parse_thread_read(unicode_budget).is_err());
 
-    let mut invalid_timestamp = v1_thread_read_fixture();
+    let mut invalid_timestamp = thread_read_snapshot_fixture();
     invalid_timestamp["turns"][0]["status"] = json!("running");
     invalid_timestamp["turns"][0]["completedAt"] = Value::Null;
     invalid_timestamp["turns"][0]["changeSet"] = Value::Null;
@@ -692,7 +785,7 @@ fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
     });
     assert!(parse_thread_read(invalid_timestamp).is_err());
 
-    let mut missing_live_stream = v1_thread_read_fixture();
+    let mut missing_live_stream = thread_read_snapshot_fixture();
     missing_live_stream
         .as_object_mut()
         .expect("thread read object")
@@ -710,7 +803,6 @@ fn thread_read_accepts_a_new_empty_thread_snapshot() {
         "turns": [],
         "items": [],
         "taskActivities": [],
-        "goalActivities": [],
         "contextUsage": null,
         "inputQueue": null,
         "liveStream": null,
@@ -723,28 +815,10 @@ fn thread_read_accepts_a_new_empty_thread_snapshot() {
     assert!(parsed.items.is_empty());
 }
 
-/// Goal 终态必须是有界、唯一且按事件序号升序的不可逆事实，运行中状态不得混入历史时间线。
-#[test]
-fn thread_read_validates_terminal_goal_activities() {
-    let mut fixture = v1_thread_read_fixture();
-    fixture["goalActivities"] = json!([{
-        "goalId": "goal_done",
-        "objective": "完成生产验收",
-        "status": "achieved",
-        "goalRevision": 8,
-        "eventSequence": 21,
-        "occurredAt": "2026-09-05T00:00:00Z"
-    }]);
-    assert!(parse_thread_read(fixture.clone()).is_ok());
-
-    fixture["goalActivities"][0]["status"] = json!("active");
-    assert!(parse_thread_read(fixture).is_err());
-}
-
 /// 冷启动快照接受 Java 持久化的 suspended，且非终态必须保留显式 null completedAt/errorCode。
 #[test]
 fn thread_read_accepts_suspended_turn_snapshot() {
-    let mut fixture = v1_thread_read_fixture();
+    let mut fixture = thread_read_snapshot_fixture();
     fixture["turns"][0]["status"] = json!("suspended");
     fixture["turns"][0]["completedAt"] = Value::Null;
     fixture["turns"][0]["changeSet"] = Value::Null;
@@ -763,25 +837,63 @@ fn thread_read_accepts_suspended_turn_snapshot() {
     assert!(parsed.turns[0].completed_at.is_none());
 }
 
+/// 等待澄清仍是可管理的活动 Turn；队列和已提交流归属必须在冷启动快照中保持有效。
+#[test]
+fn thread_read_accepts_waiting_input_snapshot() {
+    let mut fixture = thread_read_snapshot_fixture();
+    fixture["turns"][0]["status"] = json!("waiting_input");
+    fixture["turns"][0]["completedAt"] = Value::Null;
+    fixture["turns"][0]["changeSet"] = Value::Null;
+    fixture["items"] = json!([]);
+    fixture["contextUsage"] = Value::Null;
+    fixture["inputQueue"] = json!({
+        "turnId": "turn_demo", "revision": 0, "accepting": true, "items": []
+    });
+    fixture["liveStream"] = json!({
+        "turnId": "turn_demo", "streamSeq": 1,
+        "segments": [{
+            "kind": "assistant", "segmentStartSeq": 1, "streamSeq": 1,
+            "text": "Clarifying", "occurredAt": "2026-08-30T10:00:01Z"
+        }]
+    });
+
+    let parsed = parse_thread_read(fixture).expect("waiting input history fixture");
+    assert_eq!(parsed.turns[0].status, "waiting_input");
+    assert_eq!(
+        parsed
+            .input_queue
+            .as_ref()
+            .map(|queue| queue.turn_id.as_str()),
+        Some("turn_demo")
+    );
+    assert_eq!(
+        parsed
+            .live_stream
+            .as_ref()
+            .map(|stream| stream.turn_id.as_str()),
+        Some("turn_demo")
+    );
+}
+
 /// Context Usage 必须同时归属快照内的 Turn 和请求 identity，且不能伪造较低的 total 占用。
 #[test]
 fn thread_read_rejects_orphaned_or_inconsistent_context_usage() {
-    let mut orphaned = v1_thread_read_fixture();
+    let mut orphaned = thread_read_snapshot_fixture();
     orphaned["contextUsage"]["turnId"] = json!("turn_other");
     assert!(parse_thread_read(orphaned).is_err());
 
-    let mut missing_turn = v1_thread_read_fixture();
+    let mut missing_turn = thread_read_snapshot_fixture();
     missing_turn["contextUsage"]
         .as_object_mut()
         .expect("context usage object")
         .remove("turnId");
     assert!(parse_thread_read(missing_turn).is_err());
 
-    let mut invalid_request = v1_thread_read_fixture();
-    invalid_request["contextUsage"]["requestId"] = json!("turn_other");
+    let mut invalid_request = thread_read_snapshot_fixture();
+    invalid_request["contextUsage"]["modelRequestId"] = json!("turn_other");
     assert!(parse_thread_read(invalid_request).is_err());
 
-    let mut inconsistent = v1_thread_read_fixture();
+    let mut inconsistent = thread_read_snapshot_fixture();
     inconsistent["contextUsage"]["totalTokens"] = json!(119);
     assert!(parse_thread_read(inconsistent).is_err());
 }
@@ -789,7 +901,7 @@ fn thread_read_rejects_orphaned_or_inconsistent_context_usage() {
 /// UNKNOWN Usage 必须完整保留为空计量；混入任意 Token 数会破坏崩溃窗口的事实语义并被拒绝。
 #[test]
 fn thread_read_accepts_strict_unknown_context_usage() {
-    let mut fixture = v1_thread_read_fixture();
+    let mut fixture = thread_read_snapshot_fixture();
     fixture["contextUsage"]["certainty"] = json!("unknown");
     fixture["contextUsage"]["inputTokens"] = Value::Null;
     fixture["contextUsage"]["outputTokens"] = Value::Null;
@@ -807,11 +919,86 @@ fn thread_read_accepts_strict_unknown_context_usage() {
     assert!(parse_thread_read(fixture).is_err());
 }
 
+/// 本地派发估算仅在使用量标记为 UNKNOWN 且窗口身份保持冻结时，才能通过 Thread 历史解码保留下来。
+#[test]
+fn thread_read_restores_local_context_estimate_without_fabricating_usage() {
+    let mut fixture = thread_read_snapshot_fixture();
+    fixture["contextUsage"]["certainty"] = json!("unknown");
+    fixture["contextUsage"]["inputTokens"] = Value::Null;
+    fixture["contextUsage"]["outputTokens"] = Value::Null;
+    fixture["contextUsage"]["totalTokens"] = Value::Null;
+    fixture["contextUsage"]["contextEstimate"] = json!({
+        "certainty": "estimated",
+        "source": "local",
+        "usedTokens": 18_500,
+        "limitTokens": 128_000,
+        "measuredAt": "2026-08-30T10:00:01Z"
+    });
+
+    let parsed = parse_thread_read(fixture.clone()).expect("local context estimate restores");
+    let usage = parsed.context_usage.expect("context usage");
+    assert_eq!(usage.certainty, "unknown");
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+        (None, None, None)
+    );
+    assert_eq!(
+        usage
+            .context_estimate
+            .as_ref()
+            .map(|estimate| estimate.used_tokens),
+        Some(18_500)
+    );
+
+    fixture["contextUsage"]["certainty"] = json!("known");
+    fixture["contextUsage"]["inputTokens"] = json!(100);
+    fixture["contextUsage"]["outputTokens"] = json!(20);
+    fixture["contextUsage"]["totalTokens"] = json!(120);
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["contextUsage"]["certainty"] = json!("unknown");
+    fixture["contextUsage"]["inputTokens"] = Value::Null;
+    fixture["contextUsage"]["outputTokens"] = Value::Null;
+    fixture["contextUsage"]["totalTokens"] = Value::Null;
+    fixture["contextUsage"]["contextEstimate"]["limitTokens"] = json!(1);
+    assert!(parse_thread_read(fixture).is_err());
+}
+
+/// Tauri usage command 复用 ja-runtime 摘要边界，并将错误压到原有脱敏 runtime error。
+#[test]
+fn thread_usage_summary_uses_shared_strict_parser() {
+    let summary = json!({
+        "threadId": "thr_usage_demo",
+        "snapshotRevision": 11,
+        "requestCount": 2,
+        "measuredRequestCount": 2,
+        "newInputRequestCount": 2,
+        "newInputTokens": 180,
+        "outputRequestCount": 2,
+        "outputTokens": 40,
+        "totalRequestCount": 2,
+        "totalTokens": 220,
+        "cacheReadRequestCount": 1,
+        "cacheReadTokens": 60,
+        "cacheWriteRequestCount": 1,
+        "cacheWriteTokens": 10,
+        "cacheCompleteRequestCount": 1,
+        "cacheCompleteInputTokens": 70,
+        "cacheCompleteReadTokens": 60
+    });
+    let parsed = parse_thread_usage_summary(summary.clone()).expect("shared summary parser");
+    assert_eq!(parsed.new_input_tokens, 180);
+
+    let mut malformed = summary;
+    malformed["cacheCompleteReadTokens"] = json!(71);
+    assert!(parse_thread_usage_summary(malformed).is_err());
+}
+
 /// Java 对可选 artifact 使用“缺失”而非 `null`；Rust 再投影给 WebView 时必须保留该语义，
 /// 同时拒绝 JA-RPC 2.0 的 unavailable/reason 和可选文本统计兼容形状。
 #[test]
 fn thread_read_serialization_omits_absent_change_set_fields() {
-    let mut fixture = v1_thread_read_fixture();
+    let mut fixture = thread_read_snapshot_fixture();
     fixture["turns"][0]["changeSet"] = json!({
         "state": "partial",
         "incompleteReasons": ["recovery_boundary"],
@@ -837,7 +1024,7 @@ fn thread_read_serialization_omits_absent_change_set_fields() {
     );
     assert!(!change_set.contains_key("artifactId"));
 
-    let mut complete = v1_thread_read_fixture();
+    let mut complete = thread_read_snapshot_fixture();
     let complete_change_set = complete["turns"][0]["changeSet"]
         .as_object_mut()
         .expect("complete change set");
@@ -851,18 +1038,18 @@ fn thread_read_serialization_omits_absent_change_set_fields() {
         .expect("available change set object");
     assert!(!change_set.contains_key("artifactId"));
 
-    let mut legacy = v1_thread_read_fixture();
+    let mut legacy = thread_read_snapshot_fixture();
     legacy["turns"][0]["changeSet"]["state"] = json!("available");
     assert!(parse_thread_read(legacy).is_err());
 
-    let mut missing_reasons = v1_thread_read_fixture();
+    let mut missing_reasons = thread_read_snapshot_fixture();
     missing_reasons["turns"][0]["changeSet"]
         .as_object_mut()
         .expect("change set")
         .remove("incompleteReasons");
     assert!(parse_thread_read(missing_reasons).is_err());
 
-    let mut renamed = v1_thread_read_fixture();
+    let mut renamed = thread_read_snapshot_fixture();
     renamed["turns"][0]["changeSet"]["files"][0]["status"] = json!("renamed");
     assert!(parse_thread_read(renamed).is_err());
 }
@@ -871,24 +1058,100 @@ fn thread_read_serialization_omits_absent_change_set_fields() {
 /// 应关闭失败并由调用方重新读取权威快照。
 #[test]
 fn thread_read_rejects_unknown_tool_presentation_status() {
-    let mut fixture = v1_thread_read_fixture();
+    let mut fixture = thread_read_snapshot_fixture();
     fixture["items"][3]["presentation"]["status"] = json!("unknown");
     assert!(parse_thread_read(fixture).is_err());
 }
 
-/// Snapshot item 页精确接受 200 条并拒绝第 201 条；字节预算继续受 4 MiB frame 边界约束，
-/// 不因首版 Tool/change-set 扩展而形成无界恢复路径。
+/// Java 已脱敏的问答展示与待裁决恢复版本分别按原样通过历史回读。
 #[test]
-fn thread_read_enforces_v1_item_page_limit() {
-    let mut fixture = v1_thread_read_fixture();
+fn thread_read_accepts_structured_interaction_answers_and_recovery() {
+    let mut fixture = thread_read_snapshot_fixture();
+    fixture["items"][3]["toolName"] = json!("request_user_input");
+    fixture["items"][3]["presentation"]["kind"] = json!("mcp");
+    fixture["items"][3]["presentation"]["title"] = json!("询问偏好");
+    fixture["items"][3]["presentation"]["summary"] = json!("已回答 2 个澄清问题");
+    fixture["items"][3]["presentation"]["relativePaths"] = json!([]);
+    let presentation = fixture["items"][3]["presentation"]
+        .as_object_mut()
+        .expect("tool presentation");
+    for field in ["command", "stdout", "exitCode", "artifactId"] {
+        presentation.remove(field);
+    }
+    fixture["items"][3]["presentation"]["interactionAnswers"] = json!([
+        {"question": "如何同步？", "answers": ["保留本地改动", "合并远程提交"], "skipped": false},
+        {"question": "是否推送？", "answers": [], "skipped": true}
+    ]);
+    let parsed = parse_thread_read(fixture.clone()).expect("safe interaction history");
+    assert_eq!(
+        parsed.items[3]["presentation"]["interactionAnswers"][0]["answers"][1],
+        "合并远程提交"
+    );
+
+    fixture["items"][3]["presentation"]
+        .as_object_mut()
+        .expect("tool presentation")
+        .remove("interactionAnswers");
+    fixture["items"][3]["presentation"]["status"] = json!("error");
+    fixture["items"][3]["presentation"]["recovery"] = json!({"revision": 1});
+    let recovery = parse_thread_read(fixture).expect("safe recovery history");
+    assert_eq!(recovery.items[3]["presentation"]["recovery"]["revision"], 1);
+}
+
+/// 历史快照不能把原始答案、越界文案或恢复命令夹带在安全 Tool 展示字段中。
+#[test]
+fn thread_read_rejects_invalid_interaction_answers_and_recovery() {
+    let mut fixture = thread_read_snapshot_fixture();
+    fixture["items"][3]["presentation"]["interactionAnswers"] = json!([
+        {"question": "是否推送？", "answers": ["推送"], "skipped": true}
+    ]);
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]["interactionAnswers"][0]["skipped"] = json!(false);
+    fixture["items"][3]["presentation"]["interactionAnswers"][0]["rawAnswer"] = json!("private");
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]["interactionAnswers"][0]
+        .as_object_mut()
+        .expect("interaction answer")
+        .remove("rawAnswer");
+    fixture["items"][3]["presentation"]["interactionAnswers"][0]["answers"][0] = json!(" ");
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]["interactionAnswers"][0]["answers"][0] =
+        json!("x".repeat(4_097));
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]["interactionAnswers"] = json!(null);
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]
+        .as_object_mut()
+        .expect("tool presentation")
+        .remove("interactionAnswers");
+    fixture["items"][3]["presentation"]["recovery"] = json!({"revision": 1, "command": "hidden"});
+    assert!(parse_thread_read(fixture.clone()).is_err());
+
+    fixture["items"][3]["presentation"]["recovery"] = json!({"revision": 0});
+    assert!(parse_thread_read(fixture).is_err());
+}
+
+/// Snapshot item 页精确接受 200 条并拒绝第 201 条；字节预算继续受 4 MiB frame 边界约束，
+/// 不因当前 Tool/change-set 投影而形成无界恢复路径。
+#[test]
+fn thread_read_enforces_item_page_limit() {
+    let mut fixture = thread_read_snapshot_fixture();
     let items = (0..200)
         .map(|index| {
             json!({
                 "itemId": format!("item_final_{index}"),
                 "createdAt": "2026-08-30T10:00:02Z",
                 "turnId": "turn_demo",
+                "origin": "native",
                 "kind": "final_answer",
-                "text": "ok"
+                "text": "ok",
+                "totalCharacters": 2,
+                "truncated": false
             })
         })
         .collect::<Vec<_>>();
@@ -901,8 +1164,11 @@ fn thread_read_enforces_v1_item_page_limit() {
             "itemId": "item_final_overflow",
             "createdAt": "2026-08-30T10:00:02Z",
             "turnId": "turn_demo",
+            "origin": "native",
             "kind": "final_answer",
-            "text": "overflow"
+            "text": "overflow",
+            "totalCharacters": 8,
+            "truncated": false
         }));
     assert!(parse_thread_read(fixture).is_err());
 }

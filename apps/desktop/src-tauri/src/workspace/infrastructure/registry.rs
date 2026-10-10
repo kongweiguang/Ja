@@ -9,9 +9,12 @@ use std::collections::HashMap;
 use std::fs::{self, Metadata};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// Workspace metadata read 使用固定四秒请求 deadline，额外一秒用于 native waiter 获取完成通知。
+const METADATA_REFRESH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(windows)]
 use std::ffi::c_void;
@@ -50,6 +53,40 @@ pub struct WorkspaceHandle {
     root_identity: FileIdentity,
     tree_snapshots: Arc<TreeSnapshotCache>,
     mutation_recovery_required: Arc<AtomicBool>,
+    io_gate: Arc<WorkspaceIoGate>,
+}
+
+/// 旧句柄可能被 watcher 或延迟任务克隆；gate 在根替换时阻止新 IO 并给已有有界读取一个排空边界。
+#[derive(Debug, Default)]
+struct WorkspaceIoGate {
+    state: Mutex<WorkspaceIoState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceIoState {
+    active: usize,
+    frozen: bool,
+    revoked: bool,
+    wait_for_refresh: bool,
+}
+
+/// 一次 resolved path 的生命周期覆盖后续受限 IO；clone 共享同一 lease，避免重复计数或提前释放。
+#[derive(Debug)]
+struct WorkspaceIoLease {
+    gate: Arc<WorkspaceIoGate>,
+}
+
+impl Drop for WorkspaceIoLease {
+    /// 读取退出后唤醒等待重绑的 owner；中毒时不伪造 idle，调用方的 drain 仍会超时失败关闭。
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            if state.active == 0 {
+                self.gate.changed.notify_all();
+            }
+        }
+    }
 }
 
 /// 物理身份防止有界读取仍使用 canonical 名称时，路径替换静默改变 Workspace 目标。
@@ -65,6 +102,7 @@ pub(crate) struct ResolvedPath {
     pub(crate) path: PathBuf,
     components: Vec<(PathBuf, FileIdentity)>,
     final_identity: FileIdentity,
+    _lease: Arc<WorkspaceIoLease>,
 }
 
 impl ResolvedPath {
@@ -83,6 +121,93 @@ impl WorkspaceHandle {
     /// 用准入时捕获的文件系统身份比较 Java Workspace，避免 Windows 大小写、扩展前缀或短名别名改变合法绑定判断。
     pub(crate) fn same_physical_root(&self, other: &Self) -> bool {
         self.root_identity == other.root_identity
+    }
+
+    /// 重绑只等待已经 admission 的有限 IO；超时保持冻结，由 Host 明确取消更新或失败关闭。
+    pub(crate) fn freeze_and_drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let Ok(mut state) = self.io_gate.state.lock() else {
+            return false;
+        };
+        state.frozen = true;
+        while state.active > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Ok((next, result)) = self.io_gate.changed.wait_timeout(state, remaining) else {
+                return false;
+            };
+            state = next;
+            if result.timed_out() && state.active > 0 {
+                return false;
+            }
+        }
+        !state.revoked
+    }
+
+    /// 服务端 CAS 未提交时恢复旧目录访问；已撤销的句柄永远不允许 thaw。
+    pub(crate) fn thaw_after_aborted_rebind(&self) {
+        if let Ok(mut state) = self.io_gate.state.lock()
+            && !state.revoked
+        {
+            state.frozen = false;
+            state.wait_for_refresh = false;
+            self.io_gate.changed.notify_all();
+        }
+    }
+
+    /// Metadata 通知暂时未知是否只改名；新 IO 等 authority read 完成，避免短暂拒绝后又恢复同一 root。
+    pub(crate) fn freeze_for_metadata_refresh(&self) {
+        if let Ok(mut state) = self.io_gate.state.lock()
+            && !state.revoked
+        {
+            state.frozen = true;
+            state.wait_for_refresh = true;
+        }
+    }
+
+    /// 根目录 metadata 已被替换时永久撤销所有克隆句柄，避免仅凭 workspaceId 继续读旧树。
+    pub(crate) fn revoke(&self) {
+        if let Ok(mut state) = self.io_gate.state.lock() {
+            state.frozen = true;
+            state.revoked = true;
+            state.wait_for_refresh = false;
+            self.io_gate.changed.notify_all();
+        }
+    }
+
+    /// resolved path 持有此 lease 直到文件读取/校验完成；metadata freeze 最多等待 RPC deadline 和唤醒余量。
+    fn acquire_io_lease(&self) -> Result<Arc<WorkspaceIoLease>, WorkspaceError> {
+        let mut state = self
+            .io_gate
+            .state
+            .lock()
+            .map_err(|_| WorkspaceError::WorkspaceNotFound)?;
+        let deadline = Instant::now() + METADATA_REFRESH_WAIT_TIMEOUT;
+        while state.frozen && state.wait_for_refresh && !state.revoked {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(WorkspaceError::WorkspaceNotFound);
+            }
+            let Ok((next, timeout)) = self.io_gate.changed.wait_timeout(state, remaining) else {
+                return Err(WorkspaceError::WorkspaceNotFound);
+            };
+            state = next;
+            if timeout.timed_out() && state.frozen && state.wait_for_refresh {
+                return Err(WorkspaceError::WorkspaceNotFound);
+            }
+        }
+        if state.frozen || state.revoked {
+            return Err(WorkspaceError::WorkspaceNotFound);
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or(WorkspaceError::WorkspaceNotFound)?;
+        Ok(Arc::new(WorkspaceIoLease {
+            gate: Arc::clone(&self.io_gate),
+        }))
     }
 
     /// 不跟随 symlink/reparse 解析常规文件并复核 canonical containment，别名路径失败关闭。
@@ -156,6 +281,7 @@ impl WorkspaceHandle {
         relative_path: &str,
         directory: Option<bool>,
     ) -> Result<ResolvedPath, WorkspaceError> {
+        let lease = self.acquire_io_lease()?;
         validate_relative_path(relative_path)?;
         self.verify_root_identity()?;
         let mut current = self.root.as_ref().clone();
@@ -198,6 +324,7 @@ impl WorkspaceHandle {
             path: canonical,
             components,
             final_identity,
+            _lease: lease,
         };
         self.verify_resolved(&resolved, directory)?;
         Ok(resolved)
@@ -304,6 +431,15 @@ impl WorkspaceHandle {
 
     /// 在子节点读取完成后仍复核 canonical 根对应最初准入的物理 Workspace，路径替换必须失败关闭。
     fn verify_root_identity(&self) -> Result<(), WorkspaceError> {
+        if self
+            .io_gate
+            .state
+            .lock()
+            .map_err(|_| WorkspaceError::WorkspaceNotFound)?
+            .revoked
+        {
+            return Err(WorkspaceError::WorkspaceNotFound);
+        }
         let metadata = fs::symlink_metadata(self.root_path())
             .map_err(|error| map_path_error(error, "root"))?;
         if is_reparse_point(&metadata) || metadata.file_type().is_symlink() {
@@ -346,6 +482,7 @@ impl WorkspaceRegistry {
             root_identity,
             tree_snapshots: Arc::new(TreeSnapshotCache::default()),
             mutation_recovery_required: Arc::new(AtomicBool::new(false)),
+            io_gate: Arc::new(WorkspaceIoGate::default()),
         };
         self.workspaces
             .write()

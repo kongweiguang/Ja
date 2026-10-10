@@ -21,7 +21,9 @@ pub use commands::{
     ja_preview_resolve_file, ja_preview_reveal_file, ja_preview_state,
 };
 pub use error::{PreviewError, PreviewErrorCode};
-pub use local_file::{PreviewFileKind, PreviewFileResolution, PreviewResolveFileInput};
+pub use local_file::{
+    PreviewFileKind, PreviewFileResolution, PreviewMode, PreviewResolveFileInput,
+};
 pub use model::{
     NavigationSource, PreviewEvent, PreviewEventKind, PreviewGeneration, PreviewId, PreviewLimits,
     PreviewLoadStatus, PreviewNavigationRequest, PreviewOpenResult, PreviewSessionSnapshot,

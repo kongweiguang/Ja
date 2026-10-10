@@ -1,0 +1,135 @@
+/* @author kongweiguang */
+/* 目录输入需要比普通确认框更宽；显式布局与留白避免依赖 Dialog 基础层不存在的表单样式。 */
+.ja-project-edit-dialog.ja-dialog-content {
+  display: grid;
+  width: min(40rem, calc(100vw - 2rem));
+  max-width: min(40rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  padding: 1.5rem;
+  gap: 1rem;
+}
+
+.ja-project-edit-dialog > h2 {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.ja-project-edit-dialog > p {
+  margin: -0.25rem 0 0;
+  color: var(--ja-foreground-muted);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.ja-project-edit-dialog form {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.ja-project-edit-dialog label {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.ja-project-edit-dialog label > span:first-child {
+  color: var(--ja-foreground);
+  font-size: 0.8125rem;
+  font-weight: 550;
+}
+
+.ja-project-edit-path-help {
+  color: var(--ja-foreground-muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.ja-project-edit-dialog input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 2.375rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-control);
+  color: var(--ja-foreground);
+  font: inherit;
+  outline: none;
+}
+
+.ja-project-edit-dialog input:focus-visible {
+  border-color: var(--ja-focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ja-focus) 18%, transparent);
+}
+
+.ja-project-edit-path-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.ja-project-edit-path-row input {
+  flex: 1 1 auto;
+}
+
+.ja-project-edit-path-row button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ja-project-edit-error {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  color: var(--ja-danger);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ja-project-edit-error > button {
+  justify-self: start;
+}
+
+.ja-project-edit-error-details {
+  display: grid;
+  gap: 0.125rem;
+  color: var(--ja-foreground-muted);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.ja-project-edit-recheck-notice {
+  margin: 0;
+  color: var(--ja-foreground-muted);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ja-project-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.625rem;
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 36rem) {
+  .ja-project-edit-dialog.ja-dialog-content {
+    padding: 1.25rem;
+  }
+
+  .ja-project-edit-path-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ja-project-edit-path-row button {
+    align-self: stretch;
+  }
+}

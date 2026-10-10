@@ -1,7 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { ArrowLeft, ChevronLeft, ChevronRight, LoaderCircle, RefreshCw } from "lucide-react";
+import {
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
+  LoaderCircle,
+  MoreHorizontal,
+  RefreshCw,
+} from "lucide-react";
 import {
   useEffect,
   useRef,
@@ -10,8 +17,16 @@ import {
   type PointerEvent,
   type ReactElement,
   type ReactNode,
+  type Ref,
 } from "react";
-import { IconButton } from "@/shared/ui/primitives";
+import {
+  IconButton,
+  Menu,
+  MenuContent,
+  MenuItem,
+  MenuSeparator,
+  MenuTrigger,
+} from "@/shared/ui/primitives";
 import "./ReviewShell.css";
 
 export interface ReviewShellStats {
@@ -24,12 +39,15 @@ export interface ReviewShellProps {
   readonly ariaLabel: string;
   readonly scopeLabel: string;
   readonly sourceNavigation?: ReactNode;
-  readonly stats: ReviewShellStats;
+  readonly stats?: ReviewShellStats;
   readonly refreshing: boolean;
   readonly onRefresh: () => void;
   readonly refreshLabel: string;
+  readonly refreshButtonRef?: Ref<HTMLButtonElement>;
   readonly notice?: ReactNode;
-  readonly toolbar?: ReactNode;
+  readonly primaryAction?: ReactNode;
+  readonly menuItems?: ReactNode;
+  readonly reviewPanel?: ReactNode;
   readonly tree: ReactNode;
   readonly diff: ReactNode;
   readonly detailOpen: boolean;
@@ -54,8 +72,8 @@ function clampTreeWidth(width: number, containerWidth: number): number {
 }
 
 /**
- * Git 与 Turn Review 共用同一个内容优先外壳：容器宽度决定窄/宽布局，
- * 玻璃只留给宿主提供的范围菜单，Diff 与文件树始终使用稳定实色表面。
+ * Git 与 Turn Review 共用同一个内容优先外壳：容器宽度决定窄/宽布局；
+ * 主动作、刷新和更多集中在一行，次要动作按需展开；未取得快照时不伪造零统计。
  */
 export function ReviewShell({
   ariaLabel,
@@ -65,8 +83,11 @@ export function ReviewShell({
   refreshing,
   onRefresh,
   refreshLabel,
+  refreshButtonRef,
   notice,
-  toolbar,
+  primaryAction,
+  menuItems,
+  reviewPanel,
   tree,
   diff,
   detailOpen,
@@ -154,50 +175,63 @@ export function ReviewShell({
         <div className="ja-review-shell-scope">
           {sourceNavigation ?? <strong>{scopeLabel}</strong>}
         </div>
-        <div className="ja-review-shell-summary" aria-label="变更统计">
-          <span>{stats.files} 文件</span>
-          <span className="is-added">+{stats.additions}</span>
-          <span className="is-removed">-{stats.deletions}</span>
-        </div>
+        {stats === undefined ? null : (
+          <div className="ja-review-shell-summary" aria-label="变更统计">
+            <span>{stats.files} 文件</span>
+            <span className="is-added">+{stats.additions}</span>
+            <span className="is-removed">-{stats.deletions}</span>
+          </div>
+        )}
         <div className="ja-review-shell-navigation">
-          <IconButton label={refreshLabel} tooltip="刷新" disabled={refreshing} onClick={onRefresh}>
+          {primaryAction}
+          <IconButton
+            ref={refreshButtonRef}
+            label={refreshLabel}
+            tooltip="刷新"
+            disabled={refreshing}
+            onClick={onRefresh}
+          >
             {refreshing ? (
               <LoaderCircle className="ja-review-spin" aria-hidden="true" />
             ) : (
               <RefreshCw aria-hidden="true" />
             )}
           </IconButton>
+          {menuItems === undefined &&
+          onPreviousFile === undefined &&
+          onNextFile === undefined ? null : (
+            <Menu>
+              <MenuTrigger asChild>
+                <IconButton label="审查更多操作" tooltip="更多">
+                  <MoreHorizontal aria-hidden="true" />
+                </IconButton>
+              </MenuTrigger>
+              <MenuContent className="ja-review-more-menu" align="end" aria-label="审查更多操作">
+                {menuItems}
+                {menuItems === undefined ||
+                (onPreviousFile === undefined && onNextFile === undefined) ? null : (
+                  <MenuSeparator />
+                )}
+                {onPreviousFile === undefined ? null : (
+                  <MenuItem disabled={previousDisabled} onSelect={onPreviousFile}>
+                    <ChevronLeft aria-hidden="true" />
+                    上一个文件
+                  </MenuItem>
+                )}
+                {onNextFile === undefined ? null : (
+                  <MenuItem disabled={nextDisabled} onSelect={onNextFile}>
+                    <ChevronRight aria-hidden="true" />
+                    下一个文件
+                  </MenuItem>
+                )}
+              </MenuContent>
+            </Menu>
+          )}
         </div>
       </header>
       {notice === undefined ? null : <div className="ja-review-shell-notice">{notice}</div>}
-      {toolbar === undefined && onPreviousFile === undefined && onNextFile === undefined ? null : (
-        <div className="ja-review-shell-toolbar">
-          {toolbar}
-          {onPreviousFile === undefined && onNextFile === undefined ? null : (
-            <div className="ja-review-shell-file-navigation" aria-label="文件导航">
-              {onPreviousFile === undefined ? null : (
-                <IconButton
-                  label="上一个文件"
-                  tooltip="上一个文件"
-                  disabled={previousDisabled}
-                  onClick={onPreviousFile}
-                >
-                  <ChevronLeft aria-hidden="true" />
-                </IconButton>
-              )}
-              {onNextFile === undefined ? null : (
-                <IconButton
-                  label="下一个文件"
-                  tooltip="下一个文件"
-                  disabled={nextDisabled}
-                  onClick={onNextFile}
-                >
-                  <ChevronRight aria-hidden="true" />
-                </IconButton>
-              )}
-            </div>
-          )}
-        </div>
+      {reviewPanel === undefined ? null : (
+        <div className="ja-review-shell-review-panel">{reviewPanel}</div>
       )}
       <div className="ja-review-shell-body">
         <main className="ja-review-shell-diff">

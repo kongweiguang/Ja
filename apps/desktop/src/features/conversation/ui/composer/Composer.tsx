@@ -18,6 +18,7 @@ import {
   Plus,
   Play,
   Square,
+  Settings2,
   Target,
   Trash2,
   X,
@@ -175,13 +176,15 @@ export interface ComposerProps {
   interactionPresentation?: ComposerInteractionPresentation;
   /** 由当前 Thread owner 单调递增；用于从计划动作恢复输入焦点，不查询全局 DOM。 */
   focusRequest?: number;
+  /** Retained Compose hosts stay mounted but must not issue visible-surface work while hidden. */
+  active?: boolean;
   /** 未由 composition 显式传入时读取全局界面偏好；测试和嵌入宿主可注入稳定快照。 */
   sendShortcut?: SendShortcut;
   preferences?: ConversationThreadPreferences;
-  /** 非默认 Plan/Goal 状态由 Goal feature 提供，默认态不占用工具栏空间。 */
+  /** 非默认 Plan 状态由 Plan feature 提供，默认态不占用工具栏空间。 */
   modeStatus?: ReactNode;
-  /** 活跃 Goal 的紧凑投影由 composition root 注入，终态由时间线负责。 */
-  goalStatus?: ReactNode;
+  /** 活跃 Plan 的紧凑投影由 composition root 注入。 */
+  planStatus?: ReactNode;
   placeholder?: string;
   /** 草稿由会话层唯一持有，Composer 只投影文本并上报编辑意图。 */
   text: string;
@@ -215,6 +218,8 @@ export interface ComposerProps {
   cancelling?: boolean;
   resuming?: boolean;
   error?: string;
+  modelSettingsRequired?: boolean;
+  onOpenModelSettings?: () => void;
   queuedInputs?: readonly ComposerQueuedInputView[];
   queueAccepting?: boolean;
   /** 圆环只投影已核验的最近请求；会话级计量仅留给开发诊断，不进入日常输入器。 */
@@ -290,6 +295,19 @@ interface ComposerInlineCommandState {
   scopeIdentity: string;
   command: ComposerSlashCommand;
 }
+
+type ComposerWorkspaceSuggestionsState = {
+  state: "idle" | "loading" | "ready" | "error";
+  items: ComposerWorkspaceSearchResult["items"];
+  truncated: boolean;
+  error?: string;
+};
+
+const IDLE_WORKSPACE_SUGGESTIONS: ComposerWorkspaceSuggestionsState = {
+  state: "idle",
+  items: [],
+  truncated: false,
+};
 
 /** 命令名称匹配使用 NFKC 与稳定别名，不让大小写或全角输入制造第二条执行路径。 */
 function slashCommandMatches(command: ComposerSlashCommand, name: string): boolean {
@@ -401,7 +419,7 @@ function AttachmentDraftCard({
     try {
       await onRemove(item.itemId);
     } catch {
-      // Visible remove control uses the same controller path; failures are reflected by its owner.
+      // 可见的移除控件沿用同一控制器路径；失败由所属组件反映。
     }
   };
 
@@ -626,6 +644,7 @@ function reasoningLabel(effort: ReasoningLevel): string {
 }
 
 interface QueuedInputRowProps {
+  active: boolean;
   item: ComposerQueuedInputView;
   position: number;
   skills: readonly ComposerSkillSuggestion[];
@@ -814,7 +833,7 @@ function QueuedAttachmentRow({
                 try {
                   onRemove(attachment.attachmentId);
                 } catch {
-                  // The visible remove action uses the same owner callback and error path.
+                  // 可见的移除操作沿用所属方回调和错误处理路径。
                 }
               }}
             >
@@ -861,6 +880,7 @@ function QueuedAttachmentList({
  * 最终排序、revision 和错误仍由 application 投影覆盖。
  */
 function QueuedInputRow({
+  active,
   item,
   position,
   skills,
@@ -898,13 +918,13 @@ function QueuedInputRow({
 
   /** 菜单关闭后再聚焦内联编辑器，避免 Portal 的焦点归还覆盖编辑起点。 */
   useEffect(() => {
-    if (!editing) return;
+    if (!active || !editing) return;
     const frame = window.requestAnimationFrame(() => {
       editorRef.current?.focus();
       editorRef.current?.select();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [editing]);
+  }, [active, editing]);
 
   /** 对单条对象串行化动作，补住 controller 投影返回前的双击窗口但不改变权威队列。 */
   const runAction = async (
@@ -1296,14 +1316,17 @@ function QueuedInputRow({
  * 签发的 attachmentId。项目上下文由组合层放在表单上方，避免输入器承担非表单信息。编辑历史问题时
  * 临时替换草稿并显式保留取消入口，避免修改中的附件或原草稿丢失。失败续答复用紧凑图标动作位，
  * 语义留给 aria-label 与 tooltip，避免在窄屏 Composer 中额外挤占输入空间。
+ * 模型与推理子菜单使用默认模态焦点管理，确保 WebView2 Portal 跨层键盘导航不会关闭父菜单。
+ * @author kongweiguang
  */
 export function Composer({
   sendShortcut: sendShortcutProp,
   interactionSlot,
   focusRequest,
+  active = true,
   preferences,
   modeStatus,
-  goalStatus,
+  planStatus,
   placeholder = "随心输入",
   text,
   onTextChange,
@@ -1333,6 +1356,8 @@ export function Composer({
   cancelling = false,
   resuming = false,
   error,
+  modelSettingsRequired = false,
+  onOpenModelSettings,
   queuedInputs = [],
   queueAccepting = true,
   contextUsage,
@@ -1367,10 +1392,22 @@ export function Composer({
   const sendShortcutHint = sendShortcut === "enter" ? "Enter" : "Ctrl/Cmd + Enter";
   const awaitingUserInput = interactionPresentation !== "none";
   const interactionPanelExpanded = interactionPresentation === "expanded";
+  const inputDisabled = disabled || cancelling || resuming;
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastSelectionRef = useRef({ start: text.length, end: text.length });
+  const pendingSelectionRecoveryRef = useRef<
+    | {
+        scopeIdentity: string;
+        expectedText: string;
+        intermediateText: string;
+        start: number;
+        end: number;
+      }
+    | undefined
+  >(undefined);
   const observedRecoveryRevisionRef = useRef(draftRecoveryRevision);
   const composingRef = useRef(false);
+  const activeRef = useRef(active);
   const suggestionRequestRef = useRef(0);
   const commandBusyRef = useRef(false);
   const composerScopeIdentity = `${threadId ?? ""}\u0000${workspaceId ?? ""}\u0000${runtimeGeneration ?? ""}`;
@@ -1385,12 +1422,8 @@ export function Composer({
   const [inputFocused, setInputFocused] = useState(false);
   const [composing, setComposing] = useState(false);
   const [suggestionRetry, setSuggestionRetry] = useState(0);
-  const [workspaceSuggestions, setWorkspaceSuggestions] = useState<{
-    state: "idle" | "loading" | "ready" | "error";
-    items: ComposerWorkspaceSearchResult["items"];
-    truncated: boolean;
-    error?: string;
-  }>({ state: "idle", items: [], truncated: false });
+  const [workspaceSuggestions, setWorkspaceSuggestions] =
+    useState<ComposerWorkspaceSuggestionsState>(IDLE_WORKSPACE_SUGGESTIONS);
   const [ownedSuggestionSession, setOwnedSuggestionSession] =
     useState<ComposerSuggestionSessionState>(() => ({ scopeIdentity: composerScopeIdentity }));
   const [ownedInlineCommand, setOwnedInlineCommand] = useState<ComposerInlineCommandState>();
@@ -1399,17 +1432,30 @@ export function Composer({
       ? ownedInlineCommand.command
       : undefined;
 
-  /** 仅响应 owner 的显式 focus token；不因问答卡出现而抢走用户正在编辑的焦点。 */
+  /**
+   * 隐藏或不可输入期间保留 owner 的焦点 token；ready 后依赖同一禁用条件重试，只有实际聚焦时才消费。
+   * @author kongweiguang
+   */
   const observedFocusRequestRef = useRef(focusRequest);
   useEffect(() => {
-    if (focusRequest === undefined || focusRequest === observedFocusRequestRef.current) return;
-    observedFocusRequestRef.current = focusRequest;
-    inputRef.current?.focus();
-  }, [focusRequest]);
+    if (!active || focusRequest === undefined || focusRequest === observedFocusRequestRef.current)
+      return;
+    const input = inputRef.current;
+    if (input === null || input.disabled) return;
+    input.focus();
+    if (document.activeElement === input) observedFocusRequestRef.current = focusRequest;
+  }, [active, focusRequest, inputDisabled]);
 
-  /** 在浏览器绘制前更新异步命令的 scope 栅栏，避免 render 期间写 ref，也不给旧会话结果留下可见窗口。 */
+  /** Deferred focus actions consult committed visibility so an old animation frame cannot steal hidden focus. */
+  useLayoutEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+
+  /** 在浏览器绘制前更新异步命令的 scope 栅栏，并丢弃旧会话未提交的选区恢复请求。 */
   useLayoutEffect(() => {
     composerContextRef.current = composerScopeIdentity;
+    if (pendingSelectionRecoveryRef.current?.scopeIdentity !== composerScopeIdentity)
+      pendingSelectionRecoveryRef.current = undefined;
   }, [composerScopeIdentity]);
 
   /** Scope 切换立即结束临时命令编辑，目标正文仍由外层 Thread 草稿 owner 决定是否恢复。 */
@@ -1477,9 +1523,13 @@ export function Composer({
       ),
     [slashCommands, visibleTrigger],
   );
+  const displayedWorkspaceSuggestions =
+    active && visibleTrigger?.kind === "workspace"
+      ? workspaceSuggestions
+      : IDLE_WORKSPACE_SUGGESTIONS;
   const suggestionItems = useMemo<ComposerSuggestionItem[]>(() => {
     if (visibleTrigger?.kind === "workspace")
-      return workspaceSuggestions.items.map((value, index) => ({
+      return displayedWorkspaceSuggestions.items.map((value, index) => ({
         kind: "workspace" as const,
         id: `${suggestionListId}-workspace-${index}`,
         value,
@@ -1502,7 +1552,7 @@ export function Composer({
     filteredSkills,
     suggestionListId,
     visibleTrigger?.kind,
-    workspaceSuggestions.items,
+    displayedWorkspaceSuggestions.items,
   ]);
   const defaultActiveSuggestionId =
     suggestionItems.find((item) => item.kind !== "command" || item.value.available)?.id ??
@@ -1536,8 +1586,15 @@ export function Composer({
     [defaultActiveSuggestionId, suggestionResetKey],
   );
 
-  /** Workspace 搜索延迟 120ms 并绑定四重身份，任何晚到结果都不能跨 Thread 或代际显示。 */
+  /** 隐藏时同步推进请求栅栏，展示态直接派生为空闲，避免用 effect 反写 React 状态。 */
+  useLayoutEffect(() => {
+    if (active) return;
+    suggestionRequestRef.current += 1;
+  }, [active]);
+
+  /** Workspace search is delayed 120ms and identity-bound; hidden Composers cancel before issuing IO. */
   useEffect(() => {
+    if (!active) return undefined;
     if (visibleTrigger?.kind !== "workspace") {
       suggestionRequestRef.current += 1;
       const frame = window.requestAnimationFrame(() =>
@@ -1565,10 +1622,13 @@ export function Composer({
     }
     const request = ++suggestionRequestRef.current;
     const query = visibleTrigger.query;
-    const loadingFrame = window.requestAnimationFrame(() =>
-      setWorkspaceSuggestions({ state: "loading", items: [], truncated: false }),
+    const loadingFrame = window.requestAnimationFrame(
+      () =>
+        request === suggestionRequestRef.current &&
+        setWorkspaceSuggestions({ state: "loading", items: [], truncated: false }),
     );
     const timer = window.setTimeout(() => {
+      if (request !== suggestionRequestRef.current) return;
       void onSearchWorkspacePaths(query).then(
         (result) => {
           if (
@@ -1601,6 +1661,7 @@ export function Composer({
       window.clearTimeout(timer);
     };
   }, [
+    active,
     onSearchWorkspacePaths,
     runtimeGeneration,
     suggestionRetry,
@@ -1625,13 +1686,13 @@ export function Composer({
 
   /** 键盘改变 active option 时只滚动面板内部，textarea 继续持有实际焦点。 */
   useEffect(() => {
-    if (activeSuggestionId === undefined) return;
+    if (!active || activeSuggestionId === undefined) return;
     document.getElementById(activeSuggestionId)?.scrollIntoView?.({ block: "nearest" });
-  }, [activeSuggestionId]);
+  }, [active, activeSuggestionId]);
 
   /** 根据 Composer 的实时顶部空间限制向上面板高度，缩放和矮窗下也不越出视口。 */
   useLayoutEffect(() => {
-    if (visibleTrigger === undefined) return undefined;
+    if (!active || visibleTrigger === undefined) return undefined;
     const composer = inputRef.current?.closest<HTMLElement>(".ja-composer");
     if (composer === undefined || composer === null) return undefined;
     const updateAvailableSpace = (): void => {
@@ -1648,7 +1709,7 @@ export function Composer({
       window.removeEventListener("resize", updateAvailableSpace);
       composer.style.removeProperty("--ja-composer-suggestion-space");
     };
-  }, [visibleTrigger]);
+  }, [active, visibleTrigger]);
   const selectedModel = models.find(
     (model) =>
       model.providerId === preferences?.providerId && model.modelId === preferences.modelId,
@@ -1691,6 +1752,7 @@ export function Composer({
     readyAttachments.length > 0;
   const canSend =
     hasSendableContent &&
+    selectedModel !== undefined &&
     !disabled &&
     !preferenceBusy &&
     !sending &&
@@ -1769,6 +1831,7 @@ export function Composer({
    * 丢失中间 render，导致用户重输完全相同的 token 后仍被旧 identity 抑制。
    */
   const handleTextChange = (event: ChangeEvent<HTMLTextAreaElement>): void => {
+    pendingSelectionRecoveryRef.current = undefined;
     const nextText = event.currentTarget.value;
     const nextCaret = event.currentTarget.selectionStart ?? nextText.length;
     const nextTrigger = findComposerTrigger(nextText, nextCaret);
@@ -1790,14 +1853,16 @@ export function Composer({
     onTextChange(nextText);
   };
 
-  /** 更新受控 textarea 后在下一帧恢复光标，面板点击始终把焦点留在原生输入控件。 */
+  /** 更新受控 textarea 后在下一帧恢复光标，并用 scope fence 阻止旧会话夺取新输入焦点。 */
   const focusTextareaAt = (position: number): void => {
     focusTextareaSelection(position, position);
   };
 
-  /** 命令失败需要恢复完整 selection；普通选择仍通过相同入口折叠到 token 起点。 */
+  /** 下一帧恢复普通选择的光标位置；提交期间若已切换会话，则放弃迟到的焦点动作。 */
   const focusTextareaSelection = (start: number, end: number): void => {
+    const scopeIdentity = composerContextRef.current;
     window.requestAnimationFrame(() => {
+      if (!activeRef.current || composerContextRef.current !== scopeIdentity) return;
       const input = inputRef.current;
       if (input === null) return;
       input.focus({ preventScroll: true });
@@ -1817,8 +1882,8 @@ export function Composer({
   };
 
   /**
-   * Slash action 在执行前先提交可见草稿变化；失败时仅在原 scope 恢复命令正文和 selection，
-   * 内联目标命令额外恢复编辑态，避免异步 ACK 覆盖用户已切换会话后的输入。
+   * Slash action 在执行前先提交可见草稿变化，并把同步与异步失败统一到 Promise 恢复链；
+   * 恢复 selection 绑定目标文本与 scope，待受控值 commit 后再恢复，避免 RAF 与 value 写入竞争。
    */
   const runSlashCommand = (
     command: ComposerSlashCommand,
@@ -1832,17 +1897,24 @@ export function Composer({
     updateSuggestionSession({ commandError: undefined, dismissedTrigger: undefined });
     setOwnedInlineCommand(undefined);
     onTextChange(visibleText);
-    void Promise.resolve(command.execute({ argument }))
+    void Promise.resolve()
+      .then(() => command.execute({ argument }))
       .then(() => {
         if (composerContextRef.current === commandContext) focusTextareaAt(visibleText.length);
       })
       .catch(() => {
         if (composerContextRef.current !== commandContext) return;
+        pendingSelectionRecoveryRef.current = {
+          scopeIdentity: commandContext,
+          expectedText: recovery.text,
+          intermediateText: visibleText,
+          start: recovery.start,
+          end: recovery.end,
+        };
         onTextChange(recovery.text);
         if (recovery.inline)
           setOwnedInlineCommand({ scopeIdentity: composerScopeIdentity, command });
         updateSuggestionSession({ commandError: "指令未完成，请重试。" });
-        focusTextareaSelection(recovery.start, recovery.end);
       })
       .finally(() => {
         commandBusyRef.current = false;
@@ -1924,15 +1996,39 @@ export function Composer({
    * 则落到文本末尾，避免旧 scope 的 caret 截断新 token，同时不干预 IME 和键盘选区。
    */
   useLayoutEffect(() => {
+    if (!active) return;
     const input = inputRef.current;
     if (input === null) return;
     resizeTextarea(input);
     if (document.activeElement === input) return;
     lastSelectionRef.current = { start: text.length, end: text.length };
-  }, [text]);
+  }, [active, text]);
+
+  /** 只在同一 scope 的目标草稿已进入 DOM 后恢复 selection，跳过中间清空态并丢弃其它文本。 */
+  useLayoutEffect(() => {
+    if (!active) return;
+    const pending = pendingSelectionRecoveryRef.current;
+    if (pending === undefined) return;
+    if (pending.scopeIdentity !== composerScopeIdentity) {
+      pendingSelectionRecoveryRef.current = undefined;
+      return;
+    }
+    if (text === pending.expectedText) {
+      const input = inputRef.current;
+      if (input === null || input.value !== pending.expectedText) return;
+      pendingSelectionRecoveryRef.current = undefined;
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(pending.start, pending.end);
+      lastSelectionRef.current = { start: pending.start, end: pending.end };
+      setCaretState({ text: pending.expectedText, position: pending.end });
+      return;
+    }
+    if (text !== pending.intermediateText) pendingSelectionRecoveryRef.current = undefined;
+  }, [active, composerScopeIdentity, text]);
 
   /** 准入失败恢复由显式 revision 驱动，鼠标提交后也恢复原选择区与 textarea 焦点。 */
   useLayoutEffect(() => {
+    if (!active) return;
     if (observedRecoveryRevisionRef.current === draftRecoveryRevision) return;
     observedRecoveryRevisionRef.current = draftRecoveryRevision;
     const input = inputRef.current;
@@ -1942,10 +2038,11 @@ export function Composer({
     input.focus({ preventScroll: true });
     input.setSelectionRange(start, end);
     setCaretState({ text: input.value, position: end });
-  }, [draftRecoveryRevision, text]);
+  }, [active, draftRecoveryRevision, text]);
 
   /** 宽度、缩放和字体加载会改变换行数量；ResizeObserver 让高度跟随真实排版。 */
   useEffect(() => {
+    if (!active) return undefined;
     const input = inputRef.current;
     const container = input?.closest<HTMLElement>(".ja-composer");
     if (input === undefined || input === null || container === undefined || container === null)
@@ -1971,14 +2068,14 @@ export function Composer({
       observer?.disconnect();
       window.removeEventListener("resize", scheduleResize);
     };
-  }, []);
+  }, [active]);
 
   /**
    * 原生 drop 已由应用级路由器完成坐标命中并唯一分发；Composer 只消费自己的事件和 token，
    * leave、取消和 drop 由派生视觉态立即清理，不注册第二个 Tauri listener。
    */
   useEffect(() => {
-    if (nativeDropEvent === undefined || onDropAttachments === undefined) return;
+    if (!active || nativeDropEvent === undefined || onDropAttachments === undefined) return;
     if (
       nativeDropEvent.phase === "drop" &&
       !disabled &&
@@ -1989,7 +2086,7 @@ export function Composer({
       consumedDropTokenRef.current = nativeDropEvent.dropToken;
       void onDropAttachments(nativeDropEvent.dropToken);
     }
-  }, [disabled, nativeDropEvent, onDropAttachments, sending]);
+  }, [active, disabled, nativeDropEvent, onDropAttachments, sending]);
 
   /** 表单提交优先收口内联 command；普通消息仍交给并发保护的 submit。 */
   const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {
@@ -2129,7 +2226,7 @@ export function Composer({
         data-drop-active={dropActive || undefined}
         aria-busy={activeTurn || sending || cancelling || resuming || undefined}
       >
-        {interactionPanelExpanded ? null : goalStatus}
+        {interactionPanelExpanded ? null : planStatus}
         {editingQuestion ? (
           <div className="ja-composer__inline-command ja-composer__editing-question" role="status">
             <Pencil aria-hidden="true" />
@@ -2156,6 +2253,7 @@ export function Composer({
             {queuedInputs.map((item, position) => (
               <QueuedInputRow
                 key={item.inputId}
+                active={active}
                 item={item}
                 position={position}
                 skills={skills}
@@ -2221,15 +2319,17 @@ export function Composer({
             kind={visibleTrigger.kind}
             state={
               visibleTrigger.kind === "workspace"
-                ? workspaceSuggestions.state === "idle"
+                ? displayedWorkspaceSuggestions.state === "idle"
                   ? "loading"
-                  : workspaceSuggestions.state
+                  : displayedWorkspaceSuggestions.state
                 : "ready"
             }
             items={suggestionItems}
             activeId={activeSuggestionId}
-            error={workspaceSuggestions.error}
-            truncated={visibleTrigger.kind === "workspace" && workspaceSuggestions.truncated}
+            error={displayedWorkspaceSuggestions.error}
+            truncated={
+              visibleTrigger.kind === "workspace" && displayedWorkspaceSuggestions.truncated
+            }
             onActiveChange={setActiveSuggestionId}
             onSelect={selectSuggestion}
             onRetry={
@@ -2258,7 +2358,7 @@ export function Composer({
           value={text}
           maxLength={1_048_576}
           rows={1}
-          disabled={disabled || cancelling || resuming}
+          disabled={inputDisabled}
           onChange={handleTextChange}
           onFocus={(event) => {
             const start = event.currentTarget.selectionStart ?? event.currentTarget.value.length;
@@ -2344,6 +2444,7 @@ export function Composer({
           <div className="ja-composer__trailing">
             {interactionPanelExpanded ? null : (
               <ContextUsageIndicator
+                active={active}
                 usage={contextUsage}
                 threadId={threadId}
                 runtimeGeneration={runtimeGeneration}
@@ -2351,8 +2452,20 @@ export function Composer({
                 refreshRevision={usageRefreshRevision}
               />
             )}
-            {interactionPanelExpanded ? null : (
-              <Menu modal={false}>
+            {interactionPanelExpanded ? null : models.length === 0 ? (
+              <button
+                type="button"
+                className="ja-composer__model-trigger ja-composer__model-trigger--unavailable"
+                aria-label="未配置模型，打开模型设置"
+                title="配置模型后即可发送"
+                disabled={disabled || preferenceBusy || onOpenModelSettings === undefined}
+                onClick={onOpenModelSettings}
+              >
+                <span>未配置模型 · 配置</span>
+                <Settings2 aria-hidden="true" />
+              </button>
+            ) : (
+              <Menu>
                 <MenuTrigger asChild>
                   <button
                     type="button"
@@ -2576,9 +2689,20 @@ export function Composer({
           </div>
         </div>
         {error || commandError ? (
-          <p id={feedbackId} className="ja-composer__error" role="alert">
-            {error ?? commandError}
-          </p>
+          <div className="ja-composer__error-row">
+            <p id={feedbackId} className="ja-composer__error" role="alert">
+              {error ?? commandError}
+            </p>
+            {modelSettingsRequired && onOpenModelSettings !== undefined ? (
+              <button
+                type="button"
+                className="ja-composer__error-action"
+                onClick={onOpenModelSettings}
+              >
+                打开模型设置
+              </button>
+            ) : null}
+          </div>
         ) : null}
       </form>
     </>

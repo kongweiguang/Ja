@@ -4,7 +4,7 @@
 [CmdletBinding()]
 param(
     [string]$EvidenceDirectory = '.tmp/verification/runtime-soak',
-    [string]$Executable = 'app-server/target/ja-app-server.exe',
+    [string]$Executable = 'ja-agent/ja-app-server/target/ja-app-server.exe',
     [string]$ExpectedSha256 = '',
     [long]$ExpectedSizeBytes = 0,
     [long]$ExpectedMtimeNs = 0,
@@ -28,8 +28,7 @@ $startedAt = [DateTimeOffset]::Now
 $evidencePreexisted = Test-Path -LiteralPath $evidenceRoot -PathType Container
 $evidenceWasNonEmpty = $evidencePreexisted -and @((Get-ChildItem -LiteralPath $evidenceRoot -Force -ErrorAction SilentlyContinue)).Count -gt 0
 
-# Converts the filesystem timestamp to the same Unix nanosecond identity emitted by the Python
-# smoke client. The soak must pass all three values through to every iteration of the smoke gate.
+# 将文件系统时间戳转换为与 Python smoke 客户端相同的 Unix 纳秒标识；soak 每轮调用 smoke 门禁都必须传入这三个值。
 function Get-FileMtimeNanoseconds {
     param([Parameter(Mandatory)][System.IO.FileInfo]$File)
 
@@ -37,8 +36,7 @@ function Get-FileMtimeNanoseconds {
     return [int64](($File.LastWriteTimeUtc.Ticks - $unixEpochTicks) * 100L)
 }
 
-# Maps paths to repository-relative values or an external placeholder so resource evidence never
-# discloses a user's profile path, temporary directory name or workspace layout.
+# 将路径映射为仓库相对路径或外部占位值，避免资源证据泄露用户配置目录、临时目录名或工作区结构。
 function Get-SafeRelativePath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -50,8 +48,7 @@ function Get-SafeRelativePath {
     return '<external>'
 }
 
-# Computes the byte size of one fresh data directory; failures remain explicit so a missing or
-# unreadable SQLite directory cannot be interpreted as zero growth.
+# 计算一份新数据目录的字节数；读取失败必须明确呈现，不能把缺失或不可读的 SQLite 目录当作零增长。
 function Get-DirectoryBytes {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -65,8 +62,7 @@ function Get-DirectoryBytes {
     }
 }
 
-# Takes a process snapshot by exact executable identity. Command lines and environment are
-# intentionally excluded; this lets the soak distinguish Ja-owned children from unrelated tools.
+# 按可执行文件精确身份采集进程快照。快照不含命令行和环境变量，以便区分 Ja 子进程与无关工具。
 function Get-OwnedProcessSnapshot {
     $snapshot = @{}
     foreach ($row in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
@@ -84,8 +80,7 @@ function Get-OwnedProcessSnapshot {
     return $snapshot
 }
 
-# Aggregates one exact-process snapshot into comparable counters; sums are used because a smoke
-# iteration can briefly have more than one Ja process during restart or child handoff.
+# 将同一进程身份的快照汇总为可比较计数；重启或子进程交接期间，一轮 smoke 可能短暂存在多个 Ja 进程，因此按资源值求和。
 function Get-ResourceCounters {
     param([Parameter(Mandatory)]$Snapshot)
 
@@ -100,8 +95,7 @@ function Get-ResourceCounters {
     return [ordered]@{ processCount = [int]$Snapshot.Count; threads = $threads; handles = $handles; workingSetBytes = $workingSet }
 }
 
-# Merges a sample into a peak counter set. Keeping peak and end values separate prevents a child
-# that exits before the final sample from hiding a transient thread/handle/working-set spike.
+# 将一次采样合并到峰值计数。分别保留峰值和结束值，避免子进程在最终采样前退出而掩盖线程、句柄或工作集的瞬时峰值。
 function Update-ResourcePeak {
     param([Parameter(Mandatory)]$Peak, [Parameter(Mandatory)]$Sample)
 
@@ -110,9 +104,8 @@ function Update-ResourcePeak {
     }
 }
 
-# Launches the existing Native smoke entrypoint with ProcessStartInfo.ArgumentList, samples the
-# exact sidecar while it is live, and returns only exit/resource facts. No stdout/stderr is written
-# because the native smoke already emits sanitized JSON and provider credentials are out of scope.
+# 使用 ProcessStartInfo.ArgumentList 启动现有 Native smoke 入口，在 sidecar 存活期间采样，并且只返回退出状态和资源数据。
+# 不写入 stdout/stderr，因为 Native smoke 已输出净化后的 JSON，Provider 凭据不属于本报告范围。
 function Invoke-TrackedNativeSmoke {
     param(
         [Parameter(Mandatory)][string]$DataDirectory,
@@ -146,8 +139,7 @@ function Invoke-TrackedNativeSmoke {
     $stderrDrain = $null
     try {
         if (-not $process.Start()) { return [ordered]@{ status = 'blocked'; blocker = 'native smoke process could not start'; exitCode = $null; timedOut = $false; start = $baseline; end = $baseline; peak = $peak; dataBytes = $null } }
-        # Begin draining immediately: waiting for exit before reading redirected pipes can deadlock
-        # once either child stream fills its OS pipe buffer during a long soak iteration.
+        # 立即开始排空重定向管道：长时间 soak 中，任一子进程输出流填满操作系统管道缓冲区后再等待退出会造成死锁。
         $stdoutDrain = $process.StandardOutput.ReadToEndAsync()
         $stderrDrain = $process.StandardError.ReadToEndAsync()
         while (-not $process.HasExited) {
@@ -194,16 +186,14 @@ function Invoke-TrackedNativeSmoke {
     }
 }
 
-# Appends one compact sanitized JSON record to the script-owned JSONL file. Records contain no
-# stdout/stderr, command line, PID or absolute path, which keeps the trend suitable for review.
+# 向脚本管理的 JSONL 文件追加一条精简净化记录。记录不含 stdout/stderr、命令行、PID 或绝对路径，便于审阅趋势。
 function Add-SoakRecord {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Record)
 
     [System.IO.File]::AppendAllText($Path, ($Record | ConvertTo-Json -Compress -Depth 10) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
 
-# Removes only the fresh data subtree created by this invocation; an identity and containment
-# check prevents KeepData cleanup from deleting a caller-selected workspace or prior evidence.
+# 只删除本次运行新建的数据子目录；身份与路径包含关系检查可避免 KeepData 清理调用方指定的工作区或既有证据。
 function Remove-OwnedDataDirectory {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -213,8 +203,7 @@ function Remove-OwnedDataDirectory {
     if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
 }
 
-# Writes the mode-specific summary even for missing executables, invalid parameters and failed
-# observations. Stable blocker text is used instead of raw exception details to preserve secrecy.
+# 即使可执行文件缺失、参数无效或采样失败，也要写入对应模式的摘要。为保护敏感信息，使用稳定的阻塞说明而不保留原始异常。
 function Write-SoakSummary {
     param([Parameter(Mandatory)]$Summary)
 
@@ -223,8 +212,7 @@ function Write-SoakSummary {
     [System.IO.File]::WriteAllText($path, ($Summary | ConvertTo-Json -Depth 14) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
 
-# Claims the evidence directory before validation or iteration output so concurrent standalone
-# soak runners cannot merge resource samples and accidentally satisfy freshness.
+# 在校验或写入迭代结果前先独占证据目录，避免并发运行的独立 soak 合并资源采样并误满足新鲜度要求。
 function New-SoakEvidenceClaim {
     [System.IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
     $claimPath = Join-Path $evidenceRoot '.runtime-soak-run.json'
@@ -244,8 +232,7 @@ function New-SoakEvidenceClaim {
     }
 }
 
-# Validates all numeric bounds before touching a child process. The validation result is itself
-# evidence so callers can distinguish a rejected configuration from a missing native executable.
+# 接触子进程前先校验所有数值边界。校验结果本身也作为证据，便于调用方区分配置被拒与 Native 可执行文件缺失。
 function Get-ParameterValidation {
     $errors = [System.Collections.Generic.List[string]]::new()
     if ($DurationMinutes -lt 1 -or $DurationMinutes -gt 1440) { $errors.Add('DurationMinutes must be between 1 and 1440') }
@@ -376,9 +363,8 @@ try {
         $iteration++
         $iterationRoot = Join-Path $evidenceRoot ('iteration-{0:D6}' -f $iteration)
         [System.IO.Directory]::CreateDirectory($iterationRoot) | Out-Null
-        # Each iteration receives a clean database because the smoke intentionally uses fixed
-        # protocol identities. Comparing equivalent fresh runs detects footprint drift without
-        # converting duplicate-key failures into a false long-soak regression.
+        # 每轮都使用干净数据库，因为 smoke 有意采用固定协议标识。比较条件相同的新运行可发现资源占用漂移，
+        # 同时避免把重复键错误误判为长时间 soak 回归。
         $iterationDataRoot = Join-Path $iterationRoot 'data'
         $smoke = Invoke-TrackedNativeSmoke -DataDirectory $iterationDataRoot -OutputPath (Join-Path $iterationRoot 'smoke.json') -ExpectedSha256 $ExpectedSha256.Trim().ToLowerInvariant() -ExpectedSizeBytes $ExpectedSizeBytes -ExpectedMtimeNs $ExpectedMtimeNs
         $peak = if ($null -ne $smoke.peak) { $smoke.peak } else { $baseline }
@@ -398,8 +384,7 @@ try {
         $databaseGrowth = if ($null -ne $firstDataBytes -and $null -ne $dataBytes) { [int64]$dataBytes - [int64]$firstDataBytes } else { $null }
         $afterSnapshot = Get-OwnedProcessSnapshot
         $newProcessCount = @($afterSnapshot.Keys | Where-Object { -not $baselineSnapshot.ContainsKey($_) }).Count
-        # Only the count of new exact-path identities is retained; PID values and command lines
-        # are deliberately omitted from the record.
+        # 只保留新增精确路径身份的数量；记录中有意省略 PID 和命令行。
         $violations = [System.Collections.Generic.List[string]]::new()
         if ($resourceGrowth.threads -gt $MaxThreadGrowth) { $violations.Add('thread-growth-limit') }
         if ($resourceGrowth.handles -gt $MaxHandleGrowth) { $violations.Add('handle-growth-limit') }

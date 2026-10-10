@@ -75,6 +75,7 @@
 }
 
 .ja-navigation-action:hover:not(:disabled),
+.ja-navigation-action.is-text:hover,
 .ja-navigation-action[data-active] {
   color: var(--text-primary);
   background: var(--surface-selected);
@@ -83,6 +84,11 @@
 .ja-navigation-action:disabled {
   cursor: wait;
   opacity: 0.46;
+}
+
+/* 切换期间仍拦截新建动作，但保持入口与悬停外观，避免短暂禁用造成整行闪烁。 */
+.ja-navigation-action.is-text:disabled {
+  opacity: 1;
 }
 
 .ja-navigation-action svg {
@@ -305,7 +311,6 @@
   flex: 0 0 auto;
 }
 
-.ja-navigation-catalog-status,
 .ja-navigation-catalog-error {
   margin: 0;
   padding: 0.34rem 0.58rem;

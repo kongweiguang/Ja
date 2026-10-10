@@ -205,15 +205,13 @@ function validReport() {
       },
       executionAuthorizationRecorded: true,
       singleRunCreated: true,
-      continuationKeptBudget: true,
+      continuationKeptLedger: true,
       pauseSettledBeforeVisible: true,
       resumeUsedSameRun: true,
       stopPreservedHistory: true,
       versionConflictDidNotExecuteLatest: true,
-      goalNotImplicitlyCreated: true,
       runCount: 1,
       continuationTurnCount: 2,
-      remainingBudgetNonNegative: true,
     },
     recovery: {
       restartRestoredSnapshot: true,
@@ -225,52 +223,12 @@ function validReport() {
       status: "needs_attention",
     },
     isolation: {
-      goalWithoutPlan: true,
-      planWithoutGoal: true,
+      planOwnedByThread: true,
       threadAQuestionNotVisibleInThreadB: true,
       threadBQuestionNotVisibleInThreadA: true,
       hiddenThreadDidNotMaterializePlan: true,
     },
     visualMatrix,
-    goalRegression: {
-      statuses: ["active", "paused", "active"],
-      planLinkUnchanged: true,
-      completionProof: {
-        achieved: true,
-        planLinkNull: true,
-        goalId: "goal_only_fixture",
-        goalDefinitionRevision: 1,
-        runId: "run_goal_only_fixture",
-        evidence: {
-          goalId: "goal_only_fixture",
-          goalDefinitionRevision: 1,
-          runId: "run_goal_only_fixture",
-          count: 1,
-          criterionIds: ["criterion_goal_only"],
-          sourceIds: ["call_goal_only_shell"],
-        },
-        evaluation: {
-          goalId: "goal_only_fixture",
-          goalDefinitionRevision: 1,
-          runId: "run_goal_only_fixture",
-          count: 1,
-          metCount: 1,
-          evaluationId: "evaluation_goal_only",
-          verdict: "MET",
-        },
-        completionEvent: {
-          goalId: "goal_only_fixture",
-          goalDefinitionRevision: 1,
-          runId: "run_goal_only_fixture",
-          count: 1,
-          eventId: "event_goal_only_achieved",
-          eventSequence: 9,
-        },
-        pendingToolCount: 0,
-        pendingInteractionCount: 0,
-        completionGateVerified: true,
-      },
-    },
     soak: { requestedMinutes: 0, elapsedMs: 0, healthChecks: 0, healthy: true },
   };
 }
@@ -340,7 +298,6 @@ test("driver 阶段按权威顺序采集，并拒绝缺失阶段", async () => {
     ["recoveryEvidence", "recovery"],
     ["isolationEvidence", "isolation"],
     ["visualEvidence", "visualMatrix"],
-    ["goalRegressionEvidence", "goalRegression"],
     ["soakEvidence", "soak"],
   ]) {
     driver[method] = async () => {
@@ -376,42 +333,42 @@ test("fixture 覆盖 single/multi/空白可选题、重启恢复与并发 CAS", 
   ];
   const request = fixture.ask({ threadId: "thread_a", questions });
   assert.equal(fixture.restart().length, 1);
-  const collapsed = fixture.collapse(request.requestId);
+  const collapsed = fixture.collapse(request.interactionId);
   assert.equal(collapsed.collapsed, true);
   let answer = fixture.answer({
-    requestId: request.requestId,
-    expectedRevision: request.revision,
+    interactionId: request.interactionId,
+    expectedInteractionRevision: request.interactionRevision,
     response: { kind: "option", optionId: "safe" },
     idempotencyKey: "answer-scope",
   });
   assert.equal(
     fixture.answer({
-      requestId: request.requestId,
-      expectedRevision: request.revision,
+      interactionId: request.interactionId,
+      expectedInteractionRevision: request.interactionRevision,
       response: { kind: "option", optionId: "safe" },
       idempotencyKey: "answer-scope",
-    }).revision,
-    answer.revision,
+    }).interactionRevision,
+    answer.interactionRevision,
   );
   answer = fixture.answer({
-    requestId: request.requestId,
-    expectedRevision: answer.revision,
+    interactionId: request.interactionId,
+    expectedInteractionRevision: answer.interactionRevision,
     response: { kind: "option", optionId: "ui" },
     idempotencyKey: "answer-targets",
   });
   expectCode(
     () =>
       fixture.answer({
-        requestId: request.requestId,
-        expectedRevision: request.revision,
+        interactionId: request.interactionId,
+        expectedInteractionRevision: request.interactionRevision,
         response: { kind: "skip" },
         idempotencyKey: "stale",
       }),
     "INTERACTION_REVISION_CONFLICT",
   );
   answer = fixture.answer({
-    requestId: request.requestId,
-    expectedRevision: answer.revision,
+    interactionId: request.interactionId,
+    expectedInteractionRevision: answer.interactionRevision,
     response: { kind: "custom", text: "自定义约束" },
     idempotencyKey: "answer-note",
   });
@@ -424,8 +381,8 @@ test("fixture 覆盖 single/multi/空白可选题、重启恢复与并发 CAS", 
     ],
   });
   const skipped = fixture.answer({
-    requestId: second.requestId,
-    expectedRevision: second.revision,
+    interactionId: second.interactionId,
+    expectedInteractionRevision: second.interactionRevision,
     response: { kind: "skip" },
     idempotencyKey: "skip-ok",
   });
@@ -757,41 +714,15 @@ test("恢复清理等待权威 suspended Turn 后再开放下一次 admission", 
   assert.match(source, /recovered Turn settlement/u);
   assert.match(source, /candidate\.turnId === turn\.turnId && candidate\.status === "cancelled"/u);
   assert.match(source, /await waitForComposerAdmission\(page, recoveryDeadline\)/u);
-  assert.doesNotMatch(source, /const recoveredThread = await readPlanGoalThreadAuthority/u);
+  assert.doesNotMatch(source, /const recoveredThread = await readThreadAuthority/u);
 });
 
-/** 完成 Goal 后的 Interaction 请求不能读取旧 Goal binding，避免共享 fixture context 串线成 500。 */
-test("完成 Goal 后 Interaction 请求跳过旧 Goal binding 解析", async () => {
+/** 确认桌面 E2E 只保留交互与独立 Plan 验收，普通任务继续走默认对话流程。 */
+test("desktop E2E 只暴露 Interaction 与独立 Plan 验收", async () => {
   const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /const currentGoalBindingRevision =\s*scenario\.id === scenarios\.planGoal\.id &&\s*!planGoalEvaluationRequest &&\s*planGoalContext\?\.kind === "goal"[\s\S]*?readGoalToolBindingRevision/u,
-  );
-  assert.match(
-    source,
-    /const planGoalAggregateRevision =\s*scenario\.id === scenarios\.planGoal\.id[\s\S]*?: undefined;\s*if \(\s*scenario\.id === scenarios\.planGoal\.id/u,
-  );
-});
-
-/** 隔离 Goal 的 pause/resume 与 Goal-only completion 必须从最新 projection 做 CAS，防止后台 Provider 伪造成功。 */
-test("隔离 Goal pause/resume 与 Goal-only 完成使用真实 fixture identity", async () => {
-  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
-  assert.match(
-    source,
-    /providerFixture\.resetPlanGoalContext\("normal"\);[\s\S]*?objective: providerFixture\.scenarios\.planGoal\.goalOnlyObjective/u,
-  );
-  assert.match(
-    source,
-    /const isolationCriterionId = providerFixture\.scenarios\.planGoal\.goalOnlyCriterionId/u,
-  );
-  assert.match(source, /runGoalOnlyCompletion\(/u);
-  assert.match(source, /completionProof: goalOnlyCompletion\.completionProof/u);
-  assert.match(source, /async \(command, goalId, expectedStatus, action\) =>/u);
-  assert.match(source, /invoke\("ja_runtime_goal_read", \{ goalId \}\)/u);
-  assert.match(source, /latestGoal\.status !== expectedStatus/u);
-  assert.match(source, /lastResult\.code !== "GOAL_REVISION_CONFLICT"/u);
-  assert.match(source, /kind: "goal"[\s\S]*?planRevisionId: null/u);
-  assert.match(source, /goalRevision: goalResumed\.value\.goal\.revision/u);
+  assert.match(source, /JA_E2E_INTERACTION_PLAN_ONLY/u);
+  assert.match(source, /runStandalonePlanCompletion/u);
+  assert.doesNotMatch(source, /JA_E2E_PLAN_GOAL|ja_runtime_goal_|goal-only|plan-goal/iu);
 });
 
 test("loopback Provider 场景只发结构化 Interaction Tool 且身份稳定", () => {
@@ -808,4 +739,10 @@ test("loopback Provider 场景只发结构化 Interaction Tool 且身份稳定",
   );
   assert.equal(interactionPlanProviderScenario.questions[0]?.required, true);
   assert.equal(interactionPlanProviderScenario.questions[1]?.required, false);
+  assert.equal(
+    interactionPlanProviderScenario.questions[1]?.options.some(
+      (option) => option.optionId === "option_conversation",
+    ),
+    true,
+  );
 });

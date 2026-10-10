@@ -19,6 +19,12 @@ export interface DiffViewerProps {
   modified: string;
   language?: string;
   revision?: string | number;
+  /** 由冻结审查发现触发行定位；side 对应 merge 左侧原文或右侧当前内容。 */
+  scrollLocation?: {
+    readonly side: "original" | "modified";
+    readonly line: number;
+    readonly token: string;
+  };
   onCopyText?: (text: string) => Promise<void>;
 }
 
@@ -32,10 +38,13 @@ export function DiffViewer({
   modified,
   language,
   revision,
+  scrollLocation,
   onCopyText,
 }: DiffViewerProps): ReactElement {
   const resolvedTheme = useResolvedTheme();
   const palette = useUiPalette();
+  const scrollSide = scrollLocation?.side;
+  const scrollLine = scrollLocation?.line;
   const hostRef = useRef<HTMLDivElement>(null);
   const mergeRef = useRef<MergeView | undefined>(undefined);
   const themeCompartment = useMemo(() => new Compartment(), []);
@@ -95,6 +104,15 @@ export function DiffViewer({
     replaceDocument(merge.a, original, `external.${String(revision ?? "original")}`);
     replaceDocument(merge.b, modified, `external.${String(revision ?? "modified")}`);
   }, [original, modified, revision]);
+  /** 在只读侧滚至已校验的发现行，revision replacement 先运行以免落到旧文档坐标。 */
+  useEffect(() => {
+    const merge = mergeRef.current;
+    if (merge === undefined || scrollSide === undefined || scrollLine === undefined) return;
+    const editor = scrollSide === "original" ? merge.a : merge.b;
+    const lineNumber = Math.min(Math.max(1, scrollLine), editor.state.doc.lines);
+    const position = editor.state.doc.line(lineNumber).from;
+    editor.dispatch({ effects: EditorView.scrollIntoView(position, { y: "center" }) });
+  }, [original, modified, revision, scrollLine, scrollSide, scrollLocation?.token]);
   return (
     <section
       className="ja-editor-diff"

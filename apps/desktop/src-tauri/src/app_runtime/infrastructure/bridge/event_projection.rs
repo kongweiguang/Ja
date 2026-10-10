@@ -47,7 +47,7 @@ pub(super) fn spawn_event_drain(spec: EventDrainSpec) -> Result<EventDrain, Runt
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 连续轮询通知，并在到达 UI 前拒绝 stale identity。
+/// 连续轮询通知，并在到达 UI 前拒绝 stale identity；投影失败只记录冻结方法与错误码，不输出正文。
 pub(super) fn event_drain_loop(mut context: EventDrainContext) {
     loop {
         if !event_is_current(
@@ -89,6 +89,12 @@ pub(super) fn event_drain_loop(mut context: EventDrainContext) {
                 }
                 if let Err(error) = emit_frame(&context.sink, &frame) {
                     if projection_failure_is_terminal(&error) {
+                        eprintln!(
+                            "Ja runtime event projection rejected: method={} code={} generation={}",
+                            frame.method().unwrap_or("missing"),
+                            error.code,
+                            context.generation
+                        );
                         context
                             .terminal_fault
                             .publish(context.generation, TERMINAL_SIDECAR_PROTOCOL_FRAME);
@@ -355,7 +361,7 @@ pub(crate) fn terminal_reason(reason: u8) -> &'static str {
 }
 
 /// 设计原因：该函数先验证 generation 与进程身份再投影事件，避免重启竞态串流。
-/// 关闭失败 generation，并且只发布一次 crash 投影。
+/// 关闭失败 generation，并且只发布一次 crash 投影；成功清理也保留本地 closed identity 供 reload 回读。
 pub(super) fn terminal_runtime(context: TerminalCleanupContext<'_>, reason: &str) {
     let TerminalCleanupContext {
         config,
@@ -380,10 +386,12 @@ pub(super) fn terminal_runtime(context: TerminalCleanupContext<'_>, reason: &str
         // Terminal notification 不能证明进程树已 reap；保留 runtime owner 并阻止新 generation，
         // 直到后续 stop attempt 确认同一 generation 已清理。
         cleanup_fault.mark(generation);
-        *runtime = Some(current);
     } else {
         cleanup_fault.clear(generation);
     }
+    // 即使 event worker 与连接已清理，也保留关闭的 client identity，让 reload 的 state snapshot
+    // 继续呈现 Crashed；只有用户显式 start 并再次确认 cleanup 后才释放此故障事实。
+    *runtime = Some(current);
     if emit_status(
         sink,
         RuntimeStatusKind::Crashed,

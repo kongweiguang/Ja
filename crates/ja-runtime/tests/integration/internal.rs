@@ -15,6 +15,21 @@ mod production;
 
 pub(crate) use production::app_server_process;
 
+mod websocket_scope {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/integration/internal/app_server_process/shared/websocket_tests.rs"
+    ));
+}
+
+#[cfg(windows)]
+mod shared_spawn_scope {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/integration/internal/app_server_process/shared/spawn_windows_tests.rs"
+    ));
+}
+
 mod unit_support_scope {
     pub(crate) use crate::app_server_process::*;
 

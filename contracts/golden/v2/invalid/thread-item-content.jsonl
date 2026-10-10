@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":"c:item-content-no-id","method":"thread/item-content/read","params":{"threadId":"thr_demo","offsetCharacters":0,"limitCharacters":2}}
+{"jsonrpc":"2.0","id":"c:item-content-zero-limit","method":"thread/item-content/read","params":{"threadId":"thr_demo","itemId":"item_answer","offsetCharacters":0,"limitCharacters":0}}
+{"jsonrpc":"2.0","id":"c:item-content-extra","method":"thread/item-content/read","params":{"threadId":"thr_demo","itemId":"item_answer","offsetCharacters":0,"limitCharacters":2,"path":"secret"}}
+{"jsonrpc":"2.0","id":"c:old-message-content-read","method":"thread/message-content/read","params":{"threadId":"thr_demo","messageId":"item_answer","offsetCharacters":0,"limitCharacters":2}}
+

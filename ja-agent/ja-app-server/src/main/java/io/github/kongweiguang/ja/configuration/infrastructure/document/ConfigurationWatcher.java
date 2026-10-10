@@ -1,0 +1,497 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.configuration.infrastructure.document;
+
+import io.github.kongweiguang.ja.configuration.application.service.ConfigurationMutationCoordinator;
+import io.github.kongweiguang.ja.configuration.infrastructure.generation.ConfigurationRuntimeState;
+
+import java.io.IOException;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/**
+ * ConfigurationWatcher 集中维护 secret 与 credential 的脱敏边界，并确保敏感缓冲区按所有权生命周期清理。
+ */
+public final class ConfigurationWatcher implements AutoCloseable {
+    private static final int MAX_WATCHED_WORKSPACES = 1024;
+    private static final long CHANGE_SETTLE_MILLIS = 100L;
+
+    private final Path homeDirectory;
+    private final Path userConfigPath;
+    private final Path trustPath;
+    private final Supplier<Map<String, Boolean>> trustedWorkspaceLoader;
+    private final Runnable invalidateAllGenerations;
+    private final Consumer<Path> invalidateGeneration;
+    private final Consumer<List<ConfigurationRuntimeState.ConfigChanged>> publishChanges;
+    private final ScheduledExecutorService changeExecutor = createChangeExecutor();
+    private final Map<WatchKey, WatchRegistration> watchRegistrations = new HashMap<>();
+    private final Map<Path, WatchKey> watchedDirectories = new HashMap<>();
+    private final Map<String, ConfigurationRuntimeState.ConfigChanged> pendingChanges = new LinkedHashMap<>();
+    private final Set<Path> pendingInvalidations = new HashSet<>();
+    private WatchService watchService;
+    private Thread watchThread;
+    private ScheduledFuture<?> pendingFlush;
+    private int watchedWorkspaces;
+    private long workspaceWatchRevision;
+    private boolean pendingInvalidateAll;
+    private boolean pendingTrustRegistryChanged;
+    private volatile boolean closed;
+
+    /**
+     * ConfigurationWatcher 集中维护 secret 与 credential 的脱敏边界，并确保敏感缓冲区按所有权生命周期清理。
+     */
+    public ConfigurationWatcher(Path homeDirectory, Path userConfigPath, Path trustPath,
+                                Supplier<Map<String, Boolean>> trustedWorkspaceLoader,
+                                Runnable invalidateAllGenerations,
+                                Consumer<Path> invalidateGeneration,
+                                Consumer<List<ConfigurationRuntimeState.ConfigChanged>> publishChanges) {
+        this.homeDirectory = Objects.requireNonNull(homeDirectory, "homeDirectory");
+        this.userConfigPath = Objects.requireNonNull(userConfigPath, "userConfigPath");
+        this.trustPath = Objects.requireNonNull(trustPath, "trustPath");
+        this.trustedWorkspaceLoader = Objects.requireNonNull(trustedWorkspaceLoader,
+                "trustedWorkspaceLoader");
+        this.invalidateAllGenerations = Objects.requireNonNull(invalidateAllGenerations,
+                "invalidateAllGenerations");
+        this.invalidateGeneration = Objects.requireNonNull(invalidateGeneration,
+                "invalidateGeneration");
+        this.publishChanges = Objects.requireNonNull(publishChanges, "publishChanges");
+    }
+
+    /**
+     * 创建只服务于配置事件收敛的 daemon 线程；它不拥有配置文件，也不阻止 app-server 关闭。
+     */
+    private static ScheduledExecutorService createChangeExecutor() {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "ja-config-settle");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    /**
+     * Native watcher 只是配置变更的即时提示；平台不支持或注册失败时，显式读取仍是权威路径。
+     */
+    public void start() {
+        synchronized (this) {
+            if (closed || watchService != null) {
+                return;
+            }
+            try {
+                Files.createDirectories(homeDirectory);
+                watchService = FileSystems.getDefault().newWatchService();
+                registerDirectory(homeDirectory, null, true, false);
+                watchThread = new Thread(this::watchLoop, "ja-config-watch");
+                watchThread.setDaemon(true);
+                watchThread.start();
+            } catch (IOException | RuntimeException failure) {
+                closeWatchServiceQuietly();
+                return;
+            }
+        }
+        registerExistingTrustedWorkspaceWatches();
+    }
+
+    /**
+     * 只为已信任工作区注册根目录与 .ja 目录，并以规范 cwd 关联后续代际失效。
+     */
+    public synchronized void registerWorkspaceWatches(Path canonical) {
+        if (watchService == null || closed) {
+            return;
+        }
+        workspaceWatchRevision++;
+        if (!watchedDirectories.containsKey(canonical) && watchedWorkspaces < MAX_WATCHED_WORKSPACES
+            && registerDirectory(canonical, canonical, false, true)) {
+            watchedWorkspaces++;
+        }
+        registerDirectory(canonical.resolve(".ja"), canonical, false, false);
+    }
+
+    /**
+     * unregisterWorkspaceWatches 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+     */
+    public synchronized void unregisterWorkspaceWatches(Path canonical) {
+        if (closed) {
+            return;
+        }
+        workspaceWatchRevision++;
+        List<WatchKey> removed = watchRegistrations.entrySet().stream()
+                .filter(entry -> Objects.equals(entry.getValue().canonicalCwd(), canonical))
+                .map(Map.Entry::getKey)
+                .toList();
+        for (WatchKey watchKey : removed) {
+            removeWatchRegistration(watchKey);
+        }
+    }
+
+    /**
+     * 在监视器外读取信任登记，避免持有 Watcher 锁等待 trust 条带并与关闭或目录注册形成反向锁序。
+     */
+    private void registerExistingTrustedWorkspaceWatches() {
+        long observedRevision;
+        synchronized (this) {
+            if (closed || watchService == null) {
+                return;
+            }
+            observedRevision = workspaceWatchRevision;
+        }
+        Set<Path> trustedPaths = new HashSet<>();
+        Set<Path> existingWorkspaces = new HashSet<>();
+        try {
+            for (String value : trustedWorkspaceLoader.get().keySet()) {
+                try {
+                    Path workspace = Path.of(value).toAbsolutePath().normalize();
+                    trustedPaths.add(workspace);
+                    if (Files.isDirectory(workspace)) {
+                        existingWorkspaces.add(workspace);
+                    }
+                } catch (RuntimeException ignored) {
+                    // 信任登记中单个无法解析的历史路径不应阻断其他工作区恢复监听。
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 信任登记加载失败时保留 home 监听，不根据不完整快照注册项目目录。
+            return;
+        }
+        synchronized (this) {
+            if (closed || watchService == null || observedRevision != workspaceWatchRevision) {
+                return;
+            }
+            for (Path workspace : existingWorkspaces) {
+                registerWorkspaceWatches(workspace);
+            }
+            List<WatchKey> stale = watchRegistrations.entrySet().stream()
+                    .filter(entry -> !entry.getValue().home()
+                                     && !trustedPaths.contains(entry.getValue().canonicalCwd()))
+                    .map(Map.Entry::getKey)
+                    .toList();
+            stale.forEach(this::removeWatchRegistration);
+        }
+    }
+
+    /**
+     * registerDirectory 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+     */
+    private boolean registerDirectory(Path directory, Path canonicalCwd,
+                                      boolean home, boolean workspaceRoot) {
+        if (watchService == null || closed || watchedDirectories.containsKey(directory)
+            || !Files.isDirectory(directory)) {
+                return false;
+            }
+        try {
+            WatchKey key = directory.register(watchService,
+                    StandardWatchEventKinds.ENTRY_CREATE,
+                    StandardWatchEventKinds.ENTRY_DELETE,
+                    StandardWatchEventKinds.ENTRY_MODIFY);
+            watchRegistrations.put(key, new WatchRegistration(directory, canonicalCwd, home,
+                    workspaceRoot));
+            watchedDirectories.put(directory, key);
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            return false;
+        }
+    }
+
+    /**
+     * WatchService 故障只停止后台提示线程；业务读取保持独立，不能依赖 watcher 保证配置正确性。
+     */
+    /**
+     * 单批事件异常可安全丢弃，显式配置读取仍是权威路径；此方法同时负责 WatchService 关闭与线程生命周期。
+     */
+    @SuppressWarnings({"PMD.CloseResource", "PMD.EmptyCatchBlock"})
+    private void watchLoop() {
+        while (true) {
+            WatchService service;
+            synchronized (this) {
+                if (closed || watchService == null) {
+                    return;
+                }
+                service = watchService;
+            }
+            final WatchKey key;
+            try {
+                key = service.take();
+            } catch (InterruptedException | RuntimeException stopped) {
+                closeWatchServiceQuietly();
+                return;
+            }
+            try {
+                processWatchKey(key);
+            } catch (RuntimeException failedBatch) {
+                // 丢弃这一批通知；显式读取仍是权威路径。
+            }
+        }
+    }
+
+    /**
+     * 把一批 WatchKey 转成有序失效意图和脱敏事件。
+     *
+     * <p>服务回调必须在释放 Watcher 监视器后执行，避免关闭或 generation 轮换形成
+     * Watcher 到服务的反向锁顺序；空 fileName 事件被忽略，不能因平台异常事件终止线程。</p>
+     */
+    private void processWatchKey(WatchKey key) {
+        List<ConfigurationRuntimeState.ConfigChanged> changes = new ArrayList<>();
+        List<Path> invalidations = new ArrayList<>();
+        boolean invalidateAll = false;
+        boolean trustRegistryChanged = false;
+        synchronized (this) {
+            WatchRegistration registration = watchRegistrations.get(key);
+            if (registration == null || closed) {
+                return;
+            }
+            for (WatchEvent<?> event : key.pollEvents()) {
+                if (event.kind() == StandardWatchEventKinds.OVERFLOW
+                    || !(event.context() instanceof Path relative)) {
+                    invalidateAll = true;
+                    changes.add(new ConfigurationRuntimeState.ConfigChanged("unknown", null,
+                            ConfigurationStore.MISSING_VERSION));
+                    continue;
+                }
+                Path fileName = relative.getFileName();
+                if (fileName == null) {
+                    continue;
+                }
+                String name = fileName.toString();
+                if (registration.home()) {
+                    if (name.equalsIgnoreCase("config.toml")) {
+                        invalidateAll = true;
+                        changes.add(new ConfigurationRuntimeState.ConfigChanged("user", null,
+                                ConfigurationStore.MISSING_VERSION));
+                    } else if (name.equalsIgnoreCase("auth.json")) {
+                        invalidateAll = true;
+                        changes.add(new ConfigurationRuntimeState.ConfigChanged("credential", null,
+                                ConfigurationStore.MISSING_VERSION));
+                    } else if (name.equalsIgnoreCase("trusted-workspaces.json")) {
+                        invalidateAll = true;
+                        trustRegistryChanged = true;
+                        changes.add(new ConfigurationRuntimeState.ConfigChanged("trust", null,
+                                ConfigurationStore.MISSING_VERSION));
+                    }
+                } else if (registration.workspaceRoot()) {
+                    if (name.equalsIgnoreCase(".ja")) {
+                        registerDirectory(registration.directory().resolve(".ja"),
+                                registration.canonicalCwd(), false, false);
+                        invalidations.add(Path.of(registration.directory().toString()));
+                        changes.add(new ConfigurationRuntimeState.ConfigChanged("project",
+                                registration.canonicalCwd(),
+                                ConfigurationStore.MISSING_VERSION));
+                    }
+                } else if (name.equalsIgnoreCase("config.toml")) {
+                    invalidations.add(registration.directory().getParent());
+                    changes.add(new ConfigurationRuntimeState.ConfigChanged("project",
+                            registration.canonicalCwd(),
+                            ConfigurationStore.MISSING_VERSION));
+                }
+            }
+            if (!key.reset()) {
+                removeWatchRegistration(key);
+            }
+        }
+        enqueueChanges(changes, invalidations, invalidateAll, trustRegistryChanged);
+    }
+
+    /**
+     * 合并一小段时间内的重复、乱序 Watch 事件。Windows 原子替换常将同一次保存拆成多条事件，
+     * 因此只在最后一条事件后失效一次 generation，并在锁外按最终文件状态发布一组变更。
+     */
+    private synchronized void enqueueChanges(List<ConfigurationRuntimeState.ConfigChanged> changes,
+                                             List<Path> invalidations, boolean invalidateAll,
+                                             boolean trustRegistryChanged) {
+        if (closed) {
+            return;
+        }
+        for (ConfigurationRuntimeState.ConfigChanged change : changes) {
+            String identity = change.scope() + "|"
+                              + (change.canonicalCwd() == null ? "general" : change.canonicalCwd());
+            pendingChanges.put(identity, change);
+        }
+        pendingInvalidations.addAll(invalidations);
+        pendingInvalidateAll |= invalidateAll;
+        pendingTrustRegistryChanged |= trustRegistryChanged;
+        if (pendingFlush != null) {
+            pendingFlush.cancel(false);
+        }
+        pendingFlush = changeExecutor.schedule(this::flushPendingChanges,
+                CHANGE_SETTLE_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 经过短暂静默窗口后才读取最终版本并失效缓存。文档运行时随后仍会执行自己的有界读取重试，
+     * 这两层分别处理事件抖动和文件句柄短暂占用，避免把瞬态状态发布给 renderer。
+     */
+    private void flushPendingChanges() {
+        List<ConfigurationRuntimeState.ConfigChanged> pending;
+        List<ConfigurationRuntimeState.ConfigChanged> changes;
+        List<Path> invalidations;
+        boolean invalidateAll;
+        boolean trustRegistryChanged;
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            pending = List.copyOf(pendingChanges.values());
+            pendingChanges.clear();
+            invalidations = List.copyOf(pendingInvalidations);
+            pendingInvalidations.clear();
+            invalidateAll = pendingInvalidateAll;
+            pendingInvalidateAll = false;
+            trustRegistryChanged = pendingTrustRegistryChanged;
+            pendingTrustRegistryChanged = false;
+            pendingFlush = null;
+        }
+        changes = pending.stream().map(this::stabilizeChange).toList();
+        if (closed) {
+            return;
+        }
+        if (invalidateAll) {
+            invalidateAllGenerations.run();
+        }
+        else {
+            invalidations.forEach(invalidateGeneration);
+        }
+        if (closed) {
+            return;
+        }
+        if (trustRegistryChanged) {
+            registerExistingTrustedWorkspaceWatches();
+        }
+        if (!closed && !changes.isEmpty()) {
+            publishChanges.accept(changes);
+        }
+    }
+
+    /**
+     * 事件携带的版本可能来自原子替换中间态，发布前重新取当前文件版本；读取失败只产出安全的
+     * unavailable 标识，真正配置解析仍由 App Server 的带重试读取路径负责。
+     */
+    private ConfigurationRuntimeState.ConfigChanged stabilizeChange(
+            ConfigurationRuntimeState.ConfigChanged change) {
+        String version = switch (change.scope()) {
+            case "user" -> configurationVersion(userConfigPath);
+            case "credential" -> secretVersion(homeDirectory.resolve("auth.json"));
+            case "trust" -> configurationVersion(trustPath);
+            case "project" -> change.canonicalCwd() == null ? ConfigurationStore.MISSING_VERSION
+                    : configurationVersion(change.canonicalCwd().resolve(".ja").resolve("config.toml"));
+            default -> ConfigurationStore.MISSING_VERSION;
+        };
+        return new ConfigurationRuntimeState.ConfigChanged(change.scope(), change.canonicalCwd(), version);
+    }
+
+    /**
+     * Watcher 只能发布与同路径 CAS 写入串行化后的最终版本，不能发布替换过程中的文件状态。
+     */
+    private String configurationVersion(Path path) {
+        return ConfigurationMutationCoordinator.execute(path, () -> closed
+                ? ConfigurationStore.MISSING_VERSION : ConfigurationStore.version(path));
+    }
+
+    /**
+     * Credential 版本读取与凭据轮换共用同一路径条带，保持 Watcher 元数据对应完整文件版本。
+     */
+    private String secretVersion(Path path) {
+        return ConfigurationMutationCoordinator.execute(path, () -> closed
+                ? ConfigurationStore.MISSING_VERSION : ConfigurationStore.secretVersion(path));
+    }
+
+    /**
+     * removeWatchRegistration 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+     */
+    private void removeWatchRegistration(WatchKey key) {
+        WatchRegistration registration = watchRegistrations.remove(key);
+        if (registration == null) {
+            return;
+        }
+        watchedDirectories.remove(registration.directory());
+        if (registration.workspaceRoot()) {
+            watchedWorkspaces = Math.max(0, watchedWorkspaces - 1);
+        }
+        key.cancel();
+    }
+
+    /**
+     * 从启动失败路径释放尚未进入服务所有权的 WatchService，同时清空注册计数。
+     */
+    @SuppressWarnings("PMD.CloseResource")
+    private void closeWatchServiceQuietly() {
+        WatchService service;
+        Thread thread;
+        synchronized (this) {
+            service = watchService;
+            watchService = null;
+            thread = watchThread;
+            watchThread = null;
+            for (WatchKey key : List.copyOf(watchRegistrations.keySet())) {
+                key.cancel();
+            }
+            watchRegistrations.clear();
+            watchedDirectories.clear();
+            watchedWorkspaces = 0;
+        }
+        if (thread != null) {
+            thread.interrupt();
+        }
+        if (service != null) {
+            try {
+                service.close();
+            } catch (IOException ignored) {
+                // WatchService 关闭属于最佳努力清理；状态已标记关闭，不能因二次 IO 失败重开生命周期。
+            }
+        }
+    }
+
+    /**
+     * close 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+     */
+    @Override
+    public void close() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+        }
+        closeWatchServiceQuietly();
+        changeExecutor.shutdownNow();
+    }
+
+    /**
+     * WatchRegistration 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+     *
+     * @param directory 目录
+     * @param canonicalCwd 已规范化的命令执行目录
+     * @param home 是否为用户主目录
+     * @param workspaceRoot 是否为工作区根目录
+     */
+    private record WatchRegistration(Path directory,
+                                     Path canonicalCwd,
+                                     boolean home,
+                                     boolean workspaceRoot) {
+        /**
+         * toString 隔离 Watcher 失效与回调顺序，避免关闭、轮换和通知之间形成锁反转。
+         */
+        @Override
+        public String toString() {
+            return "WatchRegistration[home=" + home + ", workspace="
+                   + (canonicalCwd == null ? "none" : "present") + "]";
+        }
+    }
+}

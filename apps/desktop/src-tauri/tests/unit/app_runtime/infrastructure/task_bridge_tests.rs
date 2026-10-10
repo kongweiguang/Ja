@@ -116,6 +116,23 @@ fn task_activity_parser_requires_nullable_causal_turn_id() {
     assert!(parse_task_activity_value(&missing).is_err());
 }
 
+/// 澄清等待由 Java 持久化；侧聊摘要和活动回读必须保留该状态供恢复操作定位。
+#[test]
+fn task_parser_accepts_waiting_input_state_and_activity() {
+    let mut summary = task_summary("thr_child", "thr_root");
+    summary["state"] = json!("waiting_input");
+    assert!(parse_task_summary_value(&summary).is_ok());
+
+    let activity = json!({
+        "activitySequence": 3, "activityId": "activity_waiting_input",
+        "rootThreadId": "thr_root", "taskThreadId": "thr_child",
+        "actorThreadId": "thr_child", "causalTurnId": "turn_child",
+        "kind": "waiting_input", "summary": {"text": "Waiting for an answer"},
+        "createdAt": "2026-09-03T08:00:02Z"
+    });
+    assert!(parse_task_activity_value(&activity).is_ok());
+}
+
 /// create/list parser 必须把 idle 创建结果绑定到本次父任务与根任务请求，且不携带 Turn。
 #[test]
 fn task_collection_results_reject_cross_tree_projection() {
@@ -178,7 +195,6 @@ fn task_read_result_rejects_cross_task_detail_rows() {
         "task": task_summary("thr_child", "thr_root"),
         "thread": {
             "threadId": "thr_child", "workspaceId": "ws_root", "workspaceKind": "session",
-            "legacySharedWorkspaceId": null, "activeGoalId": "goal_child",
             "preferences": {
                 "providerId": "provider_side", "modelId": "model_side", "reasoningLevel": "high",
                 "accessMode": "full_access", "collaborationMode": "plan", "titleSource": "manual"
@@ -217,8 +233,6 @@ fn task_read_result_rejects_cross_task_detail_rows() {
     assert_eq!(parsed.thread.thread_id, "thr_child");
     assert_eq!(parsed.thread.workspace_id, "ws_root");
     assert_eq!(parsed.thread.workspace_kind, WorkspaceKind::Session);
-    assert_eq!(parsed.thread.legacy_shared_workspace_id, None);
-    assert_eq!(parsed.thread.active_goal_id.as_deref(), Some("goal_child"));
     assert_eq!(parsed.thread.title, "检查测试");
     assert_eq!(parsed.thread.status, "active");
     assert!(!parsed.thread.pinned);
@@ -259,7 +273,6 @@ fn task_read_rejects_invalid_cursor_and_non_monotonic_sequences() {
         "task": task_summary("thr_child", "thr_root"),
         "thread": {
             "threadId": "thr_child", "workspaceId": "ws_root", "workspaceKind": "session",
-            "legacySharedWorkspaceId": null, "activeGoalId": null,
             "preferences": null, "title": "检查测试", "status": "active", "pinned": false,
             "latestTurnStatus": "running", "latestTurnSeen": true, "revision": 2,
             "createdAt": "2026-09-03T08:00:00Z", "updatedAt": "2026-09-03T08:00:01Z"
@@ -297,16 +310,36 @@ fn task_unobserve_requires_positive_exact_ack() {
     assert!(parse_accepted(json!({"accepted": true, "observationId": "observe_child"})).is_err());
 }
 
-/// 侧聊关闭回执只有精确的 `closed=true` 才能释放本地生命周期资源。
+/// 侧聊关闭回执必须是合法唯一集合，并包含本次请求的 root。
 #[test]
-fn task_close_result_requires_strict_positive_ack() {
+fn task_close_result_requires_complete_identity_set() {
     assert_eq!(
-        parse_task_close_result(json!({"closed": true})),
-        Ok(TaskCloseResult { closed: true })
+        parse_task_close_result(
+            json!({"closedThreadIds": ["thr_root", "thr_child"]}),
+            "thr_root"
+        ),
+        Ok(TaskCloseResult {
+            closed_thread_ids: vec!["thr_root".to_owned(), "thr_child".to_owned()]
+        })
     );
-    assert!(parse_task_close_result(json!({})).is_err());
-    assert!(parse_task_close_result(json!({"closed": false})).is_err());
-    assert!(parse_task_close_result(json!({"closed": true, "taskThreadId": "thr_side"})).is_err());
+    assert!(parse_task_close_result(json!({"closedThreadIds": []}), "thr_root").is_err());
+    assert!(parse_task_close_result(
+        json!({"closedThreadIds": ["thr_root", "thr_root"]}),
+        "thr_root"
+    )
+    .is_err());
+    assert!(parse_task_close_result(
+        json!({"closedThreadIds": ["thr_root", "not_a_thread"]}),
+        "thr_root"
+    )
+    .is_err());
+    assert!(parse_task_close_result(json!({"closedThreadIds": ["thr_other"]}), "thr_root").is_err());
+    assert!(parse_task_close_result(json!({"closed": true}), "thr_root").is_err());
+    assert!(parse_task_close_result(
+        json!({"closedThreadIds": ["thr_root"], "taskThreadId": "thr_root"}),
+        "thr_root"
+    )
+    .is_err());
 }
 
 /// Registry 同时绑定 owner 与 sidecar generation；reload drain 后迟到 progress 立即失效。

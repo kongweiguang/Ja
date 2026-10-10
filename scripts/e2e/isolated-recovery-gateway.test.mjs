@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/** Unit coverage for the request budget, baseline mutation, fixed pass-through, and redaction gates. */
+/** 覆盖请求额度、baseline 修改、fixed 透传和脱敏门禁。 */
 
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -35,7 +35,7 @@ import {
 const promptMarker = "JA_RECOVERY_GATEWAY_SEED_TEST";
 const callId = "call_recovery_fixture";
 
-/** Minimal profile fixture verifies the bridge preserves the selected real wire identity. */
+/** 最小 profile fixture 用于核实桥接保留了选定的真实协议标识。 */
 function providerDocument() {
   return {
     schema_version: 2,
@@ -66,7 +66,7 @@ function providerDocument() {
   };
 }
 
-/** A failed Tool history request represents Ja's exact continuation input shape without touching a provider. */
+/** 构造 Ja 实际续传所需的失败 Tool 历史结构，不访问 Provider。 */
 function continuationPayload(status) {
   const output = {
     type: "function_call_output",
@@ -87,7 +87,7 @@ function continuationPayload(status) {
   };
 }
 
-/** The go token is round-specific and cannot be inferred from a stage name. */
+/** go token 按回合区分，不能根据阶段名称推断。 */
 test("real requests require an explicit matching parent go", () => {
   assert.throws(() => requireRealRoundAuthorization("baseline", {}), /GO_BASELINE/u);
   assert.throws(
@@ -100,7 +100,7 @@ test("real requests require an explicit matching parent go", () => {
   );
 });
 
-/** HTTP private gateways remain selectable while credentials and URL query data are rejected. */
+/** 允许选择 HTTP 私有网关，同时拒绝凭据和 URL 查询参数。 */
 test("provider endpoint validation preserves HTTP and rejects secret-bearing URL shapes", () => {
   assert.equal(
     validateUpstreamBaseUrl("http://172.16.40.21:8082/custom/v1").href,
@@ -117,7 +117,7 @@ test("provider endpoint validation preserves HTTP and rejects secret-bearing URL
   );
 });
 
-/** Endpoint construction follows production for host-only, canonical, and reverse-proxy bases. */
+/** host-only、规范地址和反向代理基址的端点构造均遵循生产规则。 */
 test("Responses endpoint mirrors the production v1 suffix rule", () => {
   assert.equal(configuredResponsesEndpoint("http://gateway.invalid").pathname, "/v1/responses");
   assert.equal(configuredResponsesEndpoint("http://gateway.invalid/v1/").pathname, "/v1/responses");
@@ -131,7 +131,7 @@ test("Responses endpoint mirrors the production v1 suffix rule", () => {
   );
 });
 
-/** The harness keeps exactly the active Responses model and strips unrelated network surfaces. */
+/** 测试框架只保留当前 Responses 模型，并移除无关网络入口。 */
 test("profile selection and isolated settings retain one configured Responses model", () => {
   const source = providerDocument();
   const profile = selectConfiguredResponsesProfile(source);
@@ -154,7 +154,7 @@ test("profile selection and isolated settings retain one configured Responses mo
   );
 });
 
-/** Baseline changes only the intended property, while fixed forwards the source JSON bytes unchanged. */
+/** baseline 只修改目标属性；fixed 则原样转发源 JSON 字节。 */
 test("baseline inserts one incomplete status and fixed preserves exact Ja body", () => {
   const input = JSON.stringify(continuationPayload());
   const baseline = baselineBody(input, { callId, promptMarker });
@@ -174,7 +174,7 @@ test("baseline inserts one incomplete status and fixed preserves exact Ja body",
   );
 });
 
-/** A continuation without the failed Tool or with a visible Continue message never qualifies for egress. */
+/** 续传若缺少失败的 Tool，或出现可见的“继续”消息，都不能发起外部请求。 */
 test("continuation evidence requires the original question and excludes a Continue bubble", () => {
   assert.equal(
     continuationEvidence(continuationPayload(), { callId, promptMarker }).eligible,
@@ -191,7 +191,7 @@ test("continuation evidence requires the original question and excludes a Contin
   assert.equal(continuationEvidence(missingOutput, { callId, promptMarker }).eligible, false);
 });
 
-/** Error evidence admits only the closed status/code/param vocabulary and drops messages and URLs. */
+/** 错误证据只允许封闭集合中的 status/code/param，并丢弃消息正文和 URL。 */
 test("gateway failures return only allowlisted status, code, and parameter", () => {
   const safe = safeGatewayFailure(
     400,
@@ -215,7 +215,7 @@ test("gateway failures return only allowlisted status, code, and parameter", () 
   );
 });
 
-/** The test sidecar cannot inherit proxy routing or Java startup option injection. */
+/** 测试 sidecar 不得继承代理路由或 Java 启动参数注入。 */
 test("Java preflight environment strips proxy and JVM override variables", () => {
   const environment = sanitizedJavaEnvironment({
     PATH: "safe-path",
@@ -228,9 +228,9 @@ test("Java preflight environment strips proxy and JVM override variables", () =>
   assert.deepEqual(environment, { PATH: "safe-path" });
 });
 
-/** Preflight stack extraction must preserve only Ja-owned frame positions and exception types. */
+/** 用普通 mock 文本验证异常正文不会进入诊断，只保留 Ja 自有帧和异常类型。 */
 test("preflight diagnostics omit messages, paths, credentials, and non-Ja frames", () => {
-  const secret = "sk-secret-fixture";
+  const secret = "mock-private-message";
   const stderr = [
     "ERROR Unexpected JA-RPC failure errorId=err_123 type=java.lang.IllegalStateException causeType=org.sqlite.SQLiteException origin=io.github.kongweiguang.ja.runtime.turn.AgentLoop#startTurn:312",
     `java.lang.IllegalStateException: ${secret} https://gateway.invalid/private payload=hidden`,
@@ -243,10 +243,10 @@ test("preflight diagnostics omit messages, paths, credentials, and non-Ja frames
     diagnostic,
     "rpcType=java.lang.IllegalStateException;rpcCauseType=org.sqlite.SQLiteException;rpcOrigin=io.github.kongweiguang.ja.runtime.turn.AgentLoop#startTurn:312;exception=java.lang.IllegalStateException;jaFrames=io.github.kongweiguang.ja.runtime.turn.AgentLoop.startTurn:312",
   );
-  assert.doesNotMatch(diagnostic, /sk-secret-fixture|gateway\.invalid|payload|Thread|vendor/iu);
+  assert.doesNotMatch(diagnostic, /mock-private-message|gateway\.invalid|payload|Thread|vendor/iu);
 });
 
-/** JA-RPC error diagnosis keeps only fixed field names, value classes, and allowlisted categories. */
+/** JA-RPC 错误诊断只保留固定字段名、值类型和允许的类别。 */
 test("RPC error shape omits the message and unknown field values", () => {
   const detail = safeRpcErrorShape({
     code: -32080,
@@ -260,7 +260,7 @@ test("RPC error shape omits the message and unknown field values", () => {
   assert.doesNotMatch(detail, /private|payload|must-not-escape|turn_execution/u);
 });
 
-/** Seed terminal diagnostics admit only terminal vocabulary and approval presence, never event text. */
+/** Seed 终端诊断只接受终端状态词汇和审批是否存在，不保留事件正文。 */
 test("seed event evidence exposes a closed terminal projection", () => {
   const turnId = "turn_fixture";
   const diagnostic = safeSeedTurnEvidence(
@@ -300,7 +300,7 @@ test("seed event evidence exposes a closed terminal projection", () => {
   assert.equal(seedToolResultHistoryCount({ items: "private" }, turnId, callId), "unavailable");
 });
 
-/** An approval is accepted only for the one read call on its exact generated relative path. */
+/** 仅当审批对应唯一 read 调用及其准确生成的相对路径时才予以接受。 */
 test("seed approval match requires exact Thread, Tool, revision, and relative path", () => {
   const expected = {
     threadId: "thr_fixture",
@@ -354,7 +354,7 @@ test("seed approval match requires exact Thread, Tool, revision, and relative pa
   );
 });
 
-/** The host Secret only reaches the local callback; result evidence carries membership flags only. */
+/** 宿主 Secret 只传给本地回调；结果证据仅保留是否存在的标记。 */
 test("credential secret access is scoped to the callback and reports booleans", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ja-recovery-auth-membership-"));
   const authPath = join(directory, "auth.json");
@@ -392,7 +392,7 @@ test("credential secret access is scoped to the callback and reports booleans", 
   }
 });
 
-/** Strict Java initialization requires the current server order and schema-closed names. */
+/** Java 严格初始化要求使用当前服务端顺序及 schema 定义的封闭名称集合。 */
 test("recovery handshake uses the current JA-RPC server capability order", async () => {
   const { capabilities } = await recoveryInitializeParams();
   const methods = capabilities.methods;
@@ -415,7 +415,7 @@ test("recovery handshake uses the current JA-RPC server capability order", async
   ]);
 });
 
-/** The shared ledger permits baseline then fixed exactly once, with no reuse after either reservation. */
+/** 共享账本只允许依次执行一次 baseline 和 fixed；任一名额占用后都不能复用。 */
 test("two durable slots cap real HTTP exchanges across process stages", async () => {
   const root = await mkdtemp(join(await realpath(tmpdir()), "ja-recovery-budget-test-"));
   try {
@@ -442,7 +442,7 @@ test("two durable slots cap real HTTP exchanges across process stages", async ()
   }
 });
 
-/** A loopback upstream proves bridge counting, one-field baseline injection, and pre-egress refusal. */
+/** loopback 上游用于验证桥接计数、单字段 baseline 注入及发出请求前的拒绝行为。 */
 test("bridge forwards one baseline exchange and blocks every later attempt locally", async () => {
   let forwarded = 0;
   let upstreamPayload;
@@ -509,7 +509,7 @@ test("bridge forwards one baseline exchange and blocks every later attempt local
   }
 });
 
-/** Successful SSE content reaches the isolated runtime but stays out of gateway evidence. */
+/** 成功的 SSE 内容会到达隔离运行时，但不会进入网关证据。 */
 test("bridge records only status for a successful SSE response", async () => {
   const secretSse = 'data: {"type":"response.completed","text":"must-not-be-reported"}\n\n';
   const upstream = createServer((request, response) => {
@@ -549,7 +549,7 @@ test("bridge records only status for a successful SSE response", async () => {
   }
 });
 
-/** The seed fixture reports a fixed function call and exposes only its classification metadata. */
+/** Seed fixture 报告固定的函数调用，并且只公开分类元数据。 */
 test("seed fixture emits exactly one fixed Tool call over loopback", async () => {
   const bridge = await startRecoveryGatewayBridge({
     upstreamBaseUrl: "http://127.0.0.1:1/v1",

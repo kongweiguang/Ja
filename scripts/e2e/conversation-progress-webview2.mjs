@@ -30,7 +30,7 @@ const TITLE = "Conversation Progress E2E";
 const PROGRESS_TURN_WALL_TIMEOUT_MS = 120_000;
 const PROGRESS_INVOKE_LOG_KEY = "__JA_CONVERSATION_PROGRESS_INVOKES__";
 const ACTIVE_STREAM_REGISTRY_SOURCE_PATH =
-  "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java";
+  "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/ActiveStreamRegistry.java";
 const execFileAsync = promisify(execFile);
 const SOURCE_IDENTITY_FILES = Object.freeze({
   controller: "apps/desktop/src/features/conversation/application/useConversationController.ts",
@@ -44,22 +44,22 @@ const SOURCE_IDENTITY_FILES = Object.freeze({
   workProcess: "apps/desktop/src/features/conversation/ui/timeline/WorkProcess.tsx",
   activeStreamRegistry: ACTIVE_STREAM_REGISTRY_SOURCE_PATH,
   rpcSession:
-    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/RpcSession.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/runtime/RpcSession.java",
   threadHistoryHandler:
-    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/ThreadHistoryHandler.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/ThreadHistoryHandler.java",
   rpcResults:
-    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/RpcResults.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/RpcResults.java",
   threadReadContract:
-    "app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/ThreadReadContract.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/protocol/ThreadReadContract.java",
   rustHistoryModel: "apps/desktop/src-tauri/src/app_runtime/interface/history_model.rs",
   mybatisHistoryService:
-    "app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/infrastructure/persistence/repository/MybatisHistoryService.java",
   agentLoopPersistence:
-    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/application/loop/AgentLoopPersistence.java",
+    "ja-agent/ja-agent-core/src/main/java/io/github/kongweiguang/ja/agent/application/loop/AgentLoopPersistence.java",
   turnEventSink:
-    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/port/in/TurnEventSink.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/model/TurnEventSink.java",
   threadSnapshot:
-    "app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/ThreadSnapshot.java",
+    "ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/conversation/domain/model/ThreadSnapshot.java",
 });
 
 /** 将真窗阶段限制在统一 deadline 内，避免 selector 漂移隐藏真正失败阶段。 */
@@ -109,7 +109,7 @@ async function readGitIdentity() {
 }
 
 /** 对每个关键跨栈源文件只发布相对路径、大小和哈希，缺失时不伪造源码身份。 */
-async function readSourceFileIdentities() {
+export async function readSourceFileIdentities() {
   const entries = {};
   for (const [name, relativePath] of Object.entries(SOURCE_IDENTITY_FILES)) {
     const path = resolve(repoRoot, relativePath);
@@ -764,7 +764,7 @@ export function assertLiveStreamEvidence(readEvidence, threadId, invocationId) {
   return active.liveStream;
 }
 
-/** 校验启动时固定的隔离 Provider，再通过真实 typed adapter 建会话，不在验收中热改配置或密钥。 */
+/** 固定隔离 Provider，并在登记项目后独立授信；真实工具执行不依赖 open 的隐式授权。 */
 async function configureFixtureAndCreateThread(page, workspaceRoot, baseUrl) {
   return page.evaluate(
     async ({ cwd, endpoint, title }) => {
@@ -786,6 +786,7 @@ async function configureFixtureAndCreateThread(page, workspaceRoot, baseUrl) {
         cwd,
         displayName: "Conversation Progress E2E",
       });
+      await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
       const created = await history.threadCreate({
         cwd: workspace.root,
         title,
@@ -822,15 +823,11 @@ async function selectThread(page, threadId, deadline) {
   );
 }
 
-/** 等待真实应用 ready、运行时连接和消息 Composer；项目由后续 thread identity 恢复，避免隐藏窗口伪造目录选择。 */
+/** 等待真实 App Shell 与消息 Composer；运行时连接通过 typed adapter 单独验证，不依赖已移除的状态徽标。 */
 async function waitForApplication(page, deadline) {
   await page
     .locator('.ja-shell[data-app-ready="true"]')
     .waitFor({ state: "visible", timeout: timeout(deadline) });
-  await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
   await page.getByRole("textbox", { name: "消息", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -962,7 +959,7 @@ function assertProcessSequence(items, label) {
   );
   assert.deepEqual(
     items.filter((item) => item.kind === "tool").map((item) => item.toolKind),
-    ["read", "shell"],
+    ["read", "exec_command"],
     `${label} must contain exactly one read and one shell`,
   );
   assert.equal(
@@ -990,9 +987,9 @@ function assertFinalBodyOutsideProcess(items, label) {
 }
 
 /**
- * 在真实结算和重载后验收上下文浮层：账本数字必须来自 JVM 持久化回读，布局则以 WebView2
- * 的实际碰撞结果为准。这里同时覆盖 hover 阅读、点击固定、外部/Escape 关闭和焦点回归，避免
- * 组件测试中的 JSDOM Portal 行为替代桌面交互事实。
+ * 在真实结算和重载后验收上下文浮层：输入仅在总计、输出和实测请求覆盖一致时按总计减输出，缓存明细不再次累加；
+ * 账本数字必须来自 JVM 持久化回读，布局则以 WebView2 的实际碰撞结果为准。这里同时覆盖 hover 阅读、点击固定、外部/Escape 关闭和焦点回归。
+ * @author kongweiguang
  */
 async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
   const trigger = page.getByRole("button", { name: "上下文用量详情", exact: true });
@@ -1041,6 +1038,16 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
     state: "visible",
     timeout: timeout(deadline),
   });
+  // 标题是同步结构，账本行来自按需 RPC；等待 fixture 的累计总量以免把合法 loading 采成缺失值。
+  await popover.getByText("96", { exact: true }).waitFor({
+    state: "visible",
+    timeout: timeout(deadline),
+  });
+  assert.deepEqual(
+    await popover.locator("section h2").allTextContents(),
+    ["当前上下文 · Provider 实测", "Token · 本会话"],
+    "current context must be visible before the cumulative session ledger",
+  );
 
   const initialFacts = await popover.evaluate((element) => {
     const valueFor = (label) => {
@@ -1054,47 +1061,69 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
       classNames: element.className,
       userSelect: globalThis.getComputedStyle(element).userSelect,
       width: Math.round(bounds.width),
+      computedWidth: globalThis.getComputedStyle(element).width,
+      devicePixelRatio: globalThis.devicePixelRatio,
       left: Math.round(bounds.left),
       right: Math.round(bounds.right),
       viewportWidth: globalThis.innerWidth,
       documentOverflows: globalThis.document.documentElement.scrollWidth > globalThis.innerWidth,
       metrics: {
-        newInput: valueFor("输入（未缓存）"),
+        input: valueFor("输入（含缓存）"),
         output: valueFor("输出"),
-        cacheRead: valueFor("缓存读取"),
-        total: valueFor("总计"),
+        cacheRead: valueFor("含缓存读取"),
+        cacheWrite: valueFor("含缓存写入"),
+        total: valueFor("总计（输入 + 输出）"),
         cacheRate: valueFor("缓存命中率"),
         context: valueFor("上下文"),
         used: valueFor("已用"),
       },
     };
   });
+  const contextLabel = await page
+    .getByRole("progressbar", { name: "上下文使用量", exact: true })
+    .getAttribute("aria-valuetext");
   assert.equal(initialFacts.classNames.includes("ja-floating-surface"), true);
   assert.equal(initialFacts.userSelect, "text");
-  // WebView2 在非整数 DPI 下会把 280px CSS 宽度投影为 279px 的布局边界；限定紧凑范围，
-  // 既锁住约 280px 的信息密度，也不把平台子像素取整误判为响应式回归。
+  // WebView2 的 150% DPI 实测会把 280px CSS 宽度投影为 277px 的 DOM 边界；分别锁住设计宽度
+  // 与可见边界，允许平台子像素取整而不掩盖真实的浮层扩宽。
   assert.equal(
-    initialFacts.width >= 278 && initialFacts.width <= 280,
+    initialFacts.computedWidth,
+    "280px",
+    "context usage popover CSS width must stay compact",
+  );
+  assert.equal(
+    initialFacts.width >= 277 && initialFacts.width <= 280,
     true,
-    "context usage popover must retain its compact width",
+    `context usage popover must retain its compact width: ${JSON.stringify({ width: initialFacts.width, computedWidth: initialFacts.computedWidth, devicePixelRatio: initialFacts.devicePixelRatio })}`,
   );
   assert.equal(
     initialFacts.left >= 12 && initialFacts.right <= initialFacts.viewportWidth - 12,
     true,
   );
   assert.equal(initialFacts.documentOverflows, false);
+  await popover
+    .getByText("缓存已计入输入和总计，不重复累加。", { exact: true })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  await popover
+    .getByText("最近请求的占用，估算校正或压缩后可能降低。", { exact: true })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
   assert.deepEqual(initialFacts.metrics, {
-    newInput: "60",
+    input: "60",
     output: "36",
-    cacheRead: "0",
+    cacheRead: "30",
+    cacheWrite: null,
     total: "96",
-    // cacheCompleteRequestCount/inputTokens 已覆盖完整样本；读取量为零是已知 0.0%，不是未知横线。
-    cacheRate: "0.0%",
-    context: "0.0%",
-    used: "20 / 128k",
+    cacheRate: "50.0%",
+    context: "<0.1%",
+    used: "32 / 128k",
   });
+  assert.equal(contextLabel, "当前上下文 <0.1%，32 / 128k tokens，Provider 完整用量");
   await page.screenshot({
     path: join(evidenceDirectory, "context-usage-light-wide.png"),
+    animations: "disabled",
+  });
+  await popover.screenshot({
+    path: join(evidenceDirectory, "context-usage-popover-light.png"),
     animations: "disabled",
   });
 
@@ -1144,7 +1173,159 @@ async function verifyContextUsagePopover(page, evidenceDirectory, deadline) {
     path: join(evidenceDirectory, "context-usage-dark-narrow.png"),
     animations: "disabled",
   });
-  return { ...initialFacts, narrow: narrowFacts };
+  return { ...initialFacts, contextLabel, narrow: narrowFacts };
+}
+
+/**
+ * 用隔离 Provider 的真实 Composer 请求验收上下文账本；只释放模型流门闩，不执行独立的 flicker/resync 与失败继续流程，
+ * 让当前计量验收不依赖无关的 Timeline store identity gate，同时仍通过真实 Thread 持久化和 reload 回读。
+ * @author kongweiguang
+ */
+export async function runContextUsageWebView2({ page, workspaceRoot, evidenceDirectory, fixture }) {
+  assert.ok(page, "page is required");
+  assert.ok(workspaceRoot, "workspaceRoot is required");
+  assert.ok(fixture, "fixture is required");
+  await mkdir(evidenceDirectory, { recursive: true });
+  const deadline = Date.now() + 5 * 60_000;
+  const pageErrors = [];
+  const consoleErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(String(error?.message ?? error).slice(0, 500)));
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text().slice(0, 1_000));
+  });
+
+  await instrumentRuntimeInvocations(page);
+  await waitForApplication(page, deadline);
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "application must start without an overlay",
+  );
+  const created = await configureFixtureAndCreateThread(page, workspaceRoot, fixture.baseUrl);
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
+  await instrumentRuntimeInvocations(page);
+  await restoreRuntimeAfterReload(page, deadline);
+  await waitForApplication(page, deadline);
+  const runtimeInvocationProbe = await assertRuntimeInvocationProbe(page);
+  await selectProject(page, created.workspaceName, deadline);
+  await selectThread(page, created.threadId, deadline);
+
+  await page.getByRole("textbox", { name: "消息", exact: true }).fill(PROMPT);
+  await page.getByRole("button", { name: "发送", exact: true }).click({
+    timeout: timeout(deadline),
+  });
+  await page
+    .locator('.ja-chat-message-user[data-role="user"]')
+    .filter({ hasText: PROMPT })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  const dispatchContext = await captureDispatchContextPopover(page, evidenceDirectory, deadline);
+
+  // 估算证据到手后才放开 fixture 的流式 gate；三次 Provider 响应和两项真实 Tool 仍由生产链路完成。
+  fixture.releaseFirstText();
+  fixture.releaseSecondNarrative();
+  fixture.releaseFinalNarrative();
+  fixture.releaseFinalText();
+  const completedAnswer = page
+    .locator('.ja-chat-message-final[data-response-state="completed"]')
+    .last();
+  await completedAnswer.waitFor({ state: "visible", timeout: timeout(deadline) });
+  await completedAnswer
+    .getByText(conversationProgressFixtureMarkers.final, { exact: false })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  const turnAttempts = fixture.snapshot().attempts.filter((attempt) => attempt.kind === "turn");
+  assert.deepEqual(
+    turnAttempts.map((attempt) => attempt.step),
+    [0, 1, 2],
+    "the fixture must complete all three real Provider requests before usage is reread",
+  );
+
+  await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
+  await restoreRuntimeAfterReload(page, deadline);
+  await waitForApplication(page, deadline);
+  const restoredRuntimeInvocationProbe = await assertRuntimeInvocationProbe(page);
+  await selectProject(page, created.workspaceName, deadline);
+  await selectThread(page, created.threadId, deadline);
+  await page
+    .getByText(conversationProgressFixtureMarkers.final, { exact: false })
+    .last()
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  await page.waitForFunction(() => globalThis.innerWidth >= 1280, undefined, {
+    timeout: timeout(deadline),
+  });
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "restored Thread must have no blocking overlay",
+  );
+  const contextUsage = await verifyContextUsagePopover(page, evidenceDirectory, deadline);
+  assert.deepEqual(pageErrors, [], `WebView2 page errors: ${pageErrors.join(" | ")}`);
+  assert.deepEqual(consoleErrors, [], `WebView2 console errors: ${consoleErrors.join(" | ")}`);
+
+  return {
+    schemaVersion: 1,
+    status: "passed",
+    runtime: { platform: process.platform, surface: "tauri_webview2", boundary: "jvm_jar" },
+    runtimeInvocationProbe,
+    restoredRuntimeInvocationProbe,
+    provider: {
+      kind: "deterministic_loopback",
+      externalCalls: 0,
+      turnRequests: turnAttempts.length,
+    },
+    thread: { created: true, selectedByIdentity: true, reloaded: true },
+    dispatchContext,
+    contextUsage,
+    noBlockingOverlay: true,
+    pageErrors,
+    consoleErrors,
+    screenshots: [
+      "context-usage-dispatch.png",
+      "context-usage-light-wide.png",
+      "context-usage-popover-light.png",
+      "context-usage-light-narrow.png",
+      "context-usage-dark-narrow.png",
+    ],
+  };
+}
+
+/** 在首个请求进入 Provider 后立即验收 dispatch 估算，避免后续 Tool/模型轮次失败掩盖当前上下文展示。 */
+async function captureDispatchContextPopover(page, evidenceDirectory, deadline) {
+  const trigger = page.getByRole("button", { name: "上下文用量详情", exact: true });
+  const popover = page.locator(".ja-context-usage-popover");
+  const progress = page.locator('.ja-context-usage[role="progressbar"]');
+  await trigger.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const estimateDeadline = Math.min(deadline, Date.now() + 5_000);
+  try {
+    await progress.waitFor({ state: "visible", timeout: timeout(estimateDeadline) });
+  } catch {
+    // 仍捕获实际不可用态；下面的断言会让报告明确失败，而不是丢失有用的 UI 证据。
+  }
+  const contextLabel =
+    (await progress.count()) === 0 ? null : await progress.getAttribute("aria-valuetext");
+  await trigger.click({ timeout: timeout(deadline) });
+  await popover.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const sectionHeadings = await popover.locator("section h2").allTextContents();
+  await page.screenshot({
+    path: join(evidenceDirectory, "context-usage-dispatch.png"),
+    animations: "disabled",
+  });
+  await page.keyboard.press("Escape");
+  await popover.waitFor({ state: "hidden", timeout: timeout(deadline) });
+  assert.equal(
+    contextLabel?.startsWith("当前上下文约 "),
+    true,
+    "dispatch must publish a measured or local current-context value",
+  );
+  assert.equal(
+    sectionHeadings[0] === "当前上下文 · 本地估算" ||
+      sectionHeadings[0] === "当前上下文 · Provider 实测",
+    true,
+    "the current context must be the first popover section",
+  );
+  assert.equal(sectionHeadings[1], "Token · 本会话");
+  return { contextLabel, sectionHeadings, screenshot: "context-usage-dispatch.png" };
 }
 
 /**
@@ -1427,20 +1608,36 @@ export function validateConversationProgressReport(report) {
   assert.equal(report?.reload?.readSummaryVisible, true);
   assert.equal(report?.reload?.sameThread, true);
   assert.equal(report?.finalVisible, true);
+  assert.equal(report?.dispatchContext?.contextLabel?.startsWith("当前上下文约 "), true);
+  assert.deepEqual(report?.dispatchContext?.sectionHeadings, [
+    report?.dispatchContext?.sectionHeadings?.[0],
+    "Token · 本会话",
+  ]);
+  assert.equal(
+    report?.dispatchContext?.sectionHeadings?.[0] === "当前上下文 · 本地估算" ||
+      report?.dispatchContext?.sectionHeadings?.[0] === "当前上下文 · Provider 实测",
+    true,
+  );
+  assert.equal(report?.dispatchContext?.screenshot, "context-usage-dispatch.png");
   assert.equal(
     report?.contextUsage?.width >= 278 && report?.contextUsage?.width <= 280,
     true,
     "context usage report must retain compact width across WebView2 DPI rounding",
   );
   assert.equal(report?.contextUsage?.userSelect, "text");
+  assert.equal(
+    report?.contextUsage?.contextLabel,
+    "当前上下文 <0.1%，32 / 128k tokens，Provider 完整用量",
+  );
   assert.deepEqual(report?.contextUsage?.metrics, {
-    newInput: "60",
+    input: "60",
     output: "36",
-    cacheRead: "0",
+    cacheRead: "30",
+    cacheWrite: null,
     total: "96",
-    cacheRate: "0.0%",
-    context: "0.0%",
-    used: "20 / 128k",
+    cacheRate: "50.0%",
+    context: "<0.1%",
+    used: "32 / 128k",
   });
   assert.equal(report?.contextUsage?.narrow?.documentOverflows, false);
   assert.equal(report?.failureContinuation?.failedTerminalVisible, true);
@@ -1546,6 +1743,7 @@ export async function runConversationProgressWebView2({
       state: "visible",
       timeout: timeout(deadline),
     });
+  const dispatchContext = await captureDispatchContextPopover(page, evidenceDirectory, deadline);
 
   const responseShell = page.locator('.ja-chat-message-final[data-role="response"]').last();
   await responseShell.getByText("正在工作", { exact: true }).waitFor({
@@ -2048,11 +2246,14 @@ export async function runConversationProgressWebView2({
     finalVisible: true,
     failureContinuation,
     identity,
+    dispatchContext,
     contextUsage,
     screenshots: [
       "conversation-progress-live.png",
       "conversation-progress-reload.png",
+      "context-usage-dispatch.png",
       "context-usage-light-wide.png",
+      "context-usage-popover-light.png",
       "context-usage-light-narrow.png",
       "context-usage-dark-narrow.png",
       ...failureContinuation.screenshots,

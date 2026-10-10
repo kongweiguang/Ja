@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -18,15 +18,11 @@ import {
   type ConversationInteractionController,
   type ConversationModelOption,
   type ConversationThreadPreferences,
+  type InteractionController,
+  type InteractionRequest,
   type TimelineSnapshot,
 } from "@/features/conversation";
-import type {
-  GoalController,
-  GoalReadModel,
-  PlanReadModel,
-  PlanRevision,
-  PlanSummary,
-} from "@/features/goals";
+import type { PlanController, PlanReadModel, PlanRevision } from "@/features/plans";
 import { taskWorkbenchTab } from "@/features/workbench";
 
 const runningTask: TaskSummary = {
@@ -78,7 +74,6 @@ function detail(task: TaskSummary): TaskReadModel {
     thread: {
       threadId: task.taskThreadId,
       workspaceId: "ws_root",
-      activeGoalId: null,
       preferences: {
         providerId: "provider_test",
         modelId: "model_test",
@@ -146,7 +141,7 @@ const preferences: ConversationThreadPreferences = {
   titleSource: "placeholder",
 };
 
-/** UI mock 保持 shared controller 窄契约完整，发送和控制动作只从 Composer 回调观察。 */
+/** UI mock 保持 shared controller 窄契约完整，发送和控制动作只从 Composer 回调观察。@author kongweiguang */
 function conversation(
   overrides: Partial<ConversationInteractionController> = {},
 ): ConversationInteractionController {
@@ -170,6 +165,7 @@ function conversation(
     cancelling: false,
     resuming: false,
     error: undefined,
+    modelSettingsRequired: false,
     clipboardNotice: undefined,
     inputQueue: undefined,
     queuedInputs: [],
@@ -197,6 +193,7 @@ function conversation(
     resume: vi.fn(async () => undefined),
     cancel: vi.fn(async () => undefined),
     approve: vi.fn(async () => undefined),
+    clearClosedThreads: vi.fn(() => true),
     ...overrides,
     continuationAvailable: overrides.continuationAvailable ?? false,
   };
@@ -221,7 +218,6 @@ function prepareSnapshot(threadId: string, overrides: Partial<TimelineSnapshot> 
     contextUsage: null,
     liveStream: null,
     taskActivities: [],
-    goalActivities: [],
     nextCursor: null,
     ...overrides,
   };
@@ -259,8 +255,8 @@ const taskPlanRevision: PlanRevision = {
   planId: "plan_1",
   revisionNumber: 2,
   planHash: "a".repeat(64),
-  objective: "交付生产级 Plan 与 Goal",
-  scope: ["React 投影", "Goal Workbench"],
+  objective: "交付生产级 Plan",
+  scope: ["React 投影", "Plan Workbench"],
   nonGoals: ["发布"],
   constraints: ["Java 是唯一状态 owner"],
   steps: [
@@ -289,80 +285,41 @@ const taskPlanRevision: PlanRevision = {
   approvedAt: null,
 };
 
-/** Goal/Plan projection 在测试文件内闭合，避免 UI 切片跨 feature 借用 fixture。 */
-function taskGoalModel(ownerThreadId: string): GoalReadModel {
-  const plan: PlanSummary = {
-    planId: "plan_1",
-    ownerThreadId,
-    objective: taskPlanRevision.objective,
-    status: "awaiting_approval",
-    revision: 3,
-    activePlanRevisionId: null,
-    activeRunId: null,
-    createdAt: "2026-09-04T10:00:00+08:00",
-    updatedAt: "2026-09-04T10:10:00+08:00",
-  };
-  return {
-    goal: {
-      goalId: "goal_1",
+/** 侧聊和主会话接收相同的 Plan 投影与命令。 */
+function planController(ownerThreadId: string): PlanController {
+  const planModel: PlanReadModel = {
+    plan: {
+      planId: "plan_1",
       ownerThreadId,
-      revision: 7,
-      status: "active",
-      phase: "working",
       objective: taskPlanRevision.objective,
-      goalDefinitionRevision: 1,
-      acceptanceCriteria: [],
-      activePlanId: plan.planId,
+      status: "awaiting_approval",
+      revision: 3,
       activePlanRevisionId: taskPlanRevision.planRevisionId,
-      activePlanHash: taskPlanRevision.planHash,
-      currentStepId: taskPlanRevision.steps[0]?.stepId ?? null,
+      activeRunId: null,
+      createdAt: taskPlanRevision.createdAt,
+      updatedAt: taskPlanRevision.createdAt,
+    },
+    progress: {
+      currentStepId: null,
+      currentStepTitle: null,
       completedRequiredSteps: 1,
       totalRequiredSteps: 1,
-      attentionSummary: null,
-      updatedAt: "2026-09-04T10:10:00+08:00",
     },
-    eventSequence: 7,
-    planState: plan,
-    planEventSequence: 3,
-    plan: taskPlanRevision,
-    draft: null,
-    evaluation: null,
-  };
-}
-
-/** Goal controller 只暴露 TaskDetailPanel 实际读取的 projection 与动作契约。 */
-function goalController(ownerThreadId: string): GoalController {
-  const model = taskGoalModel(ownerThreadId);
-  const planModel: PlanReadModel = {
-    plan: model.planState!,
-    progress: {
-      currentStepId: model.goal.currentStepId,
-      currentStepTitle:
-        taskPlanRevision.steps.find((step) => step.stepId === model.goal.currentStepId)?.title ??
-        null,
-      completedRequiredSteps: model.goal.completedRequiredSteps,
-      totalRequiredSteps: model.goal.totalRequiredSteps,
-    },
-    revision: model.plan!,
+    revision: taskPlanRevision,
     revisionHydrationRequired: false,
-    draft: model.draft,
+    draft: null,
     approvedPlanRevisionId: null,
-    eventSequence: model.planEventSequence!,
+    eventSequence: 3,
   };
   return {
-    model,
     planModel,
-    revisions: [model.plan!],
+    revisions: [taskPlanRevision],
     evidence: [],
     loading: false,
     error: undefined,
     busyAction: undefined,
     refresh: vi.fn(async () => undefined),
-    create: vi.fn(async () => true),
     createPlan: vi.fn(async () => true),
-    pause: vi.fn(async () => true),
-    resume: vi.fn(async () => true),
-    stop: vi.fn(async () => true),
     saveDraft: vi.fn(async () => true),
     discardDraft: vi.fn(async () => true),
     propose: vi.fn(async () => true),
@@ -371,19 +328,16 @@ function goalController(ownerThreadId: string): GoalController {
     pausePlan: vi.fn(async () => true),
     resumePlan: vi.fn(async () => true),
     stopPlan: vi.fn(async () => true),
-    attachPlan: vi.fn(async () => true),
-    detachPlan: vi.fn(async () => true),
     reject: vi.fn(async () => true),
   };
 }
 
-/** 独立 Side Task 只有 Plan projection 时仍可执行，不能伪造一个待挂载的 Goal。 */
-function standalonePlanController(ownerThreadId: string): GoalController {
-  const base = goalController(ownerThreadId);
+/** 已批准的 Plan 保留其冻结版本，供用户明确执行。 */
+function standalonePlanController(ownerThreadId: string): PlanController {
+  const base = planController(ownerThreadId);
   const planModel = base.planModel!;
   return {
     ...base,
-    model: undefined,
     planModel: {
       ...planModel,
       plan: {
@@ -392,26 +346,6 @@ function standalonePlanController(ownerThreadId: string): GoalController {
         activePlanRevisionId: taskPlanRevision.planRevisionId,
       },
       approvedPlanRevisionId: taskPlanRevision.planRevisionId,
-    },
-  };
-}
-
-/** 终态 Goal projection 模拟 mutation ACK，owner 与当前 Side Task 保持同一 identity。 */
-function terminalGoalController(
-  ownerThreadId: string,
-  status: "achieved" | "stopped",
-): GoalController {
-  const base = goalController(ownerThreadId);
-  if (base.model === undefined) throw new Error("terminal Goal fixture requires a model");
-  return {
-    ...base,
-    model: {
-      ...base.model,
-      goal: {
-        ...base.model.goal,
-        status,
-        phase: status,
-      },
     },
   };
 }
@@ -505,6 +439,149 @@ describe("Task product panels", () => {
     expect(current.followup).not.toHaveBeenCalled();
   });
 
+  /** Side Composer 的回答 ACK 复用主 Timeline 临时投影，并在权威终态到达后原位退让。 */
+  it("projects a side-chat answer ACK until the authoritative Tool result arrives", async () => {
+    const task = idleSideTask();
+    const request: InteractionRequest = {
+      interactionId: "interaction_side_ack",
+      threadId: task.taskThreadId,
+      turnId: "turn_side_ack",
+      toolCallId: "call_side_ack",
+      questions: [
+        {
+          questionId: "scope",
+          prompt: "采用哪种范围？",
+          type: "single",
+          required: true,
+          allowFreeText: true,
+          options: [
+            { optionId: "project", label: "按项目覆盖" },
+            { optionId: "global", label: "全局统一" },
+          ],
+        },
+      ],
+      answers: [{ questionId: "scope", optionIds: ["project"], freeText: null, skipped: false }],
+      status: "answered",
+      interactionRevision: 2,
+      createdAt: "2026-09-03T08:00:00Z",
+      updatedAt: "2026-09-03T08:00:01Z",
+    };
+    const answeredAnswers = {
+      scope: { questionId: "scope", optionIds: ["project"], freeText: null, skipped: false },
+    };
+    const clarification: InteractionController = {
+      request: null,
+      answeredRequest: request,
+      answeredAnswers,
+      answers: answeredAnswers,
+      pageIndex: 0,
+      collapsed: false,
+      loading: false,
+      saving: false,
+      submitting: false,
+      answered: true,
+      resumeState: "settled",
+      conflict: false,
+      error: undefined,
+      retryAction: undefined,
+      setAnswer: vi.fn(),
+      goToPage: vi.fn(),
+      next: vi.fn(),
+      previous: vi.fn(),
+      submit: vi.fn(async () => undefined),
+      retryDraft: vi.fn(async () => undefined),
+      retrySubmit: vi.fn(async () => undefined),
+      cancel: vi.fn(async () => undefined),
+      setCollapsed: vi.fn(),
+      clearError: vi.fn(),
+      refresh: vi.fn(async () => undefined),
+    };
+    const toolCall: Extract<TimelineSnapshot["items"][number], { kind: "tool_call" }> = {
+      origin: "native" as const,
+      itemId: "item_side_ack",
+      createdAt: "2026-09-03T08:00:01Z",
+      turnId: "turn_side_ack",
+      kind: "tool_call",
+      callId: "call_side_ack",
+      toolName: "request_user_input",
+      ordinal: 0,
+      presentation: {
+        kind: "read",
+        title: "询问偏好",
+        status: "running",
+        inputPreview: "采用哪种范围？",
+        relativePaths: [],
+        truncated: false,
+      },
+    };
+    const snapshot: TimelineSnapshot = {
+      threadId: task.taskThreadId,
+      revision: 5,
+      turns: [
+        {
+          origin: "native" as const,
+          turnId: "turn_side_ack",
+          status: "running",
+          requestedAt: "2026-09-03T08:00:00Z",
+          updatedAt: "2026-09-03T08:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [toolCall],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      taskActivities: [],
+      nextCursor: null,
+    };
+    prepareSnapshot(task.taskThreadId, snapshot);
+    render(
+      <TaskDetailPanel
+        tab={taskWorkbenchTab({ ...task, label: task.taskName })}
+        controller={controller({ tasks: [task], detail: detail(task) })}
+        conversation={conversation()}
+        clarification={clarification}
+      />,
+    );
+
+    const toolResult = screen.getByRole("button", { name: /request_user_input/u });
+    expect(toolResult).toHaveTextContent("已回答 1 个问题");
+
+    act(() => {
+      expect(
+        useTimelineStore.getState().applySnapshot(
+          {
+            ...snapshot,
+            revision: 6,
+            turns: [
+              {
+                ...snapshot.turns[0]!,
+                status: "completed",
+                updatedAt: "2026-09-03T08:00:02Z",
+                completedAt: "2026-09-03T08:00:02Z",
+              },
+            ],
+            items: [
+              {
+                ...toolCall,
+                presentation: {
+                  ...toolCall.presentation,
+                  status: "success",
+                  summary: "服务端最终摘要",
+                },
+              },
+            ],
+          },
+          "ws_root",
+        ),
+      ).toBe("applied");
+    });
+    await waitFor(() => expect(toolResult).toHaveTextContent("服务端最终摘要"));
+    expect(toolResult).not.toHaveTextContent("已回答 1 个问题");
+  });
+
   it("子任务总览不展示侧聊及其委派分支", () => {
     const side = idleSideTask();
     const sideAgent = {
@@ -569,6 +646,7 @@ describe("Task product panels", () => {
     prepareSnapshot(task.taskThreadId, {
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_running",
           status: "running",
           requestedAt: "2026-09-03T08:00:00Z",
@@ -639,13 +717,13 @@ describe("Task product panels", () => {
     );
   });
 
-  it("Plan/Goal 内容在侧边 Thread 中可打开详情并由受控回调返回对话", () => {
+  it("Plan 内容在侧边 Thread 中可打开详情并由受控回调返回对话", () => {
     const task = idleSideTask();
     const onPlanDetailsChange = vi.fn();
     const shared = conversation({
       preferences: { ...preferences, collaborationMode: "plan" },
     });
-    const goal = goalController(task.taskThreadId);
+    const plan = planController(task.taskThreadId);
     prepareSnapshot(task.taskThreadId);
     const { rerender } = render(
       <TaskDetailPanel
@@ -653,14 +731,14 @@ describe("Task product panels", () => {
         controller={controller({ tasks: [task], detail: detail(task) })}
         conversation={shared}
         composerEnvironment={{ workspaceId: "ws_root" }}
-        goal={goal}
+        plan={plan}
         onPlanDetailsChange={onPlanDetailsChange}
       />,
     );
 
-    expect(screen.getAllByText("交付生产级 Plan 与 Goal")).not.toHaveLength(0);
+    expect(screen.getAllByText("交付生产级 Plan")).not.toHaveLength(0);
     const planTimeline = screen.getByRole("article", {
-      name: "计划版本 2：交付生产级 Plan 与 Goal",
+      name: "计划版本 2：交付生产级 Plan",
     });
     fireEvent.click(within(planTimeline).getByRole("button", { name: "查看详情" }));
     expect(onPlanDetailsChange).toHaveBeenCalledWith(true);
@@ -671,90 +749,38 @@ describe("Task product panels", () => {
         controller={controller({ tasks: [task], detail: detail(task) })}
         conversation={shared}
         composerEnvironment={{ workspaceId: "ws_root" }}
-        goal={goal}
+        plan={plan}
         planDetailsOpen
         onPlanDetailsChange={onPlanDetailsChange}
       />,
     );
-    expect(screen.getByRole("main")).toHaveAttribute("data-goal-id", "goal_1");
+    expect(screen.getByRole("main")).toHaveAttribute("data-plan-id", "plan_1");
     fireEvent.click(screen.getByRole("button", { name: "返回对话" }));
     expect(onPlanDetailsChange).toHaveBeenCalledWith(false);
   });
 
-  it("独立 Side Task 的 Plan 详情直接执行，不把 Plan 伪装成当前 Goal", async () => {
+  it("独立 Side Task 的 Plan 详情直接执行", async () => {
     const task = idleSideTask();
     const execute = vi.fn(async () => true);
-    const attachPlan = vi.fn(async () => true);
-    const goal = {
+    const plan = {
       ...standalonePlanController(task.taskThreadId),
       execute,
-      attachPlan,
     };
     prepareSnapshot(task.taskThreadId);
     render(
       <TaskDetailPanel
         tab={taskWorkbenchTab({ ...task, label: task.taskName })}
         controller={controller({ tasks: [task], detail: detail(task) })}
-        goal={goal}
+        plan={plan}
         planDetailsOpen
       />,
     );
 
     expect(screen.getByRole("main")).toHaveAttribute("data-plan-id", "plan_1");
     expect(screen.getByRole("button", { name: "执行" })).toBeVisible();
-    expect(screen.queryByRole("button", { name: "用于当前目标" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "执行" }));
     await waitFor(() => expect(execute).toHaveBeenCalledOnce());
-    expect(attachPlan).not.toHaveBeenCalled();
   });
-
-  /** 终态 ACK 先行、持久 snapshot 后到时，GoalActivityCard 必须按 Goal identity 去重。 */
-  it.each(["achieved", "stopped"] as const)(
-    "Side Task 的 %s Goal ACK 立即显示，持久 snapshot 不重复卡片",
-    async (status) => {
-      const task = idleSideTask();
-      const goal = terminalGoalController(task.taskThreadId, status);
-      const objective = goal.model!.goal.objective;
-      const activityName = `${objective}，${status === "achieved" ? "已达成" : "已停止"}`;
-      prepareSnapshot(task.taskThreadId);
-      render(
-        <TaskDetailPanel
-          tab={taskWorkbenchTab({ ...task, label: task.taskName })}
-          controller={controller({ tasks: [task], detail: detail(task) })}
-          goal={goal}
-        />,
-      );
-
-      expect(screen.getAllByRole("article", { name: activityName })).toHaveLength(1);
-      const persistedSnapshot: TimelineSnapshot = {
-        threadId: task.taskThreadId,
-        revision: 6,
-        turns: [],
-        items: [],
-        inputQueue: null,
-        contextUsage: null,
-        liveStream: null,
-        taskActivities: [],
-        goalActivities: [
-          {
-            goalId: goal.model!.goal.goalId,
-            objective,
-            status,
-            goalRevision: goal.model!.goal.revision,
-            eventSequence: goal.model!.eventSequence!,
-            occurredAt: goal.model!.goal.updatedAt,
-          },
-        ],
-        nextCursor: null,
-      };
-      expect(useTimelineStore.getState().applySnapshot(persistedSnapshot, "ws_root")).toBe(
-        "applied",
-      );
-      await waitFor(() =>
-        expect(screen.getAllByRole("article", { name: activityName })).toHaveLength(1),
-      );
-    },
-  );
 
   it("Subagent 保持无 Composer，但审批仍走 Task controller 且取消需确认所有 attached 后代", async () => {
     const approvalRespond = vi.fn(async () => undefined);
@@ -771,6 +797,7 @@ describe("Task product panels", () => {
     prepareSnapshot(target.taskThreadId, {
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_child",
           status: "waiting_approval",
           requestedAt: "2026-09-03T08:00:00Z",
@@ -782,6 +809,7 @@ describe("Task product panels", () => {
       ],
       items: [
         {
+          origin: "native" as const,
           itemId: "item_approval",
           createdAt: "2026-09-03T08:00:20Z",
           turnId: "turn_child",
@@ -819,11 +847,120 @@ describe("Task product panels", () => {
     await waitFor(() => expect(cancel).toHaveBeenCalledWith(target));
   });
 
+  /** CAS 后必须退出旧确认，下一次确认展示刷新后的 attached 子树；终态不再给取消入口。 */
+  it("取消冲突后按最新后代范围重新确认，终态 Task 隐藏取消入口", async () => {
+    const target = runningTask;
+    const oldDescendant = {
+      ...runningTask,
+      taskThreadId: "thr_attached_old",
+      parentThreadId: target.taskThreadId,
+      taskName: "旧后代",
+      state: "running" as const,
+      unreadCount: 0,
+    };
+    const conflict = Object.assign(new Error("safe conflict"), {
+      code: "TASK_CONTEXT_REVISION_CONFLICT" as const,
+    });
+    const cancel = vi.fn(async (task: TaskSummary) => task);
+    cancel.mockRejectedValueOnce(conflict);
+    const current = controller({ tasks: [target, oldDescendant], detail: detail(target), cancel });
+    const view = render(
+      <TaskDetailPanel
+        tab={taskWorkbenchTab({ ...target, label: target.taskName })}
+        controller={current}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
+    expect(screen.getByText("将同时取消 1 个未结束后代")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() => expect(screen.getByText("safe conflict")).toBeVisible());
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("group", { name: "确认取消任务" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+
+    const latest = { ...target, revision: target.revision + 1 };
+    const attachedOne = {
+      ...oldDescendant,
+      taskThreadId: "thr_attached_new_1",
+      taskName: "新后代一",
+    };
+    const attachedTwo = {
+      ...oldDescendant,
+      taskThreadId: "thr_attached_new_2",
+      taskName: "新后代二",
+      parentThreadId: attachedOne.taskThreadId,
+    };
+    const terminalAttached = {
+      ...oldDescendant,
+      taskThreadId: "thr_attached_terminal",
+      taskName: "已结束后代",
+      state: "completed" as const,
+      completedAt: "2026-09-03T08:02:00Z",
+    };
+    const independent = {
+      ...oldDescendant,
+      taskThreadId: "thr_independent",
+      taskName: "独立侧聊",
+      taskKind: "side_task" as const,
+      lifecycle: "independent" as const,
+    };
+    view.rerender(
+      <TaskDetailPanel
+        tab={taskWorkbenchTab({ ...latest, label: latest.taskName })}
+        controller={controller({
+          tasks: [latest, attachedOne, attachedTwo, terminalAttached, independent],
+          detail: detail(latest),
+          cancel,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
+    expect(screen.getByText("将同时取消 2 个未结束后代")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
+    expect(cancel).toHaveBeenNthCalledWith(2, latest);
+
+    const terminal = { ...latest, state: "cancelled" as const, revision: latest.revision + 1 };
+    view.rerender(
+      <TaskDetailPanel
+        tab={taskWorkbenchTab({ ...terminal, label: terminal.taskName })}
+        controller={controller({ tasks: [terminal], detail: detail(terminal), cancel })}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "取消任务" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "确认取消任务" })).not.toBeInTheDocument();
+  });
+
+  /** 非 CAS 失败保留原确认控件作为唯一显式重试入口，不额外显示会重复副作用的 Retry。 */
+  it("普通取消失败保留确认态并通过同一确认按钮显式重试", async () => {
+    const target = runningTask;
+    const cancel = vi.fn(async (task: TaskSummary) => task);
+    cancel.mockRejectedValueOnce(new Error("transient"));
+    render(
+      <TaskDetailPanel
+        tab={taskWorkbenchTab({ ...target, label: target.taskName })}
+        controller={controller({ tasks: [target], detail: detail(target), cancel })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() => expect(screen.getByText("取消请求未完成，请重试。")).toBeVisible());
+    expect(screen.getByRole("group", { name: "确认取消任务" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
+    expect(cancel).toHaveBeenLastCalledWith(target);
+  });
+
   it("真实 Timeline snapshot 保留安全 Markdown、tool、approval、结果和 Turn error", async () => {
     const approvalRespond = vi.fn(async () => undefined);
     prepareSnapshot(runningTask.taskThreadId, {
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_child",
           status: "waiting_approval",
           requestedAt: "2026-09-03T08:00:00Z",
@@ -833,6 +970,7 @@ describe("Task product panels", () => {
           changeSet: null,
         },
         {
+          origin: "native" as const,
           turnId: "turn_failed",
           status: "failed",
           requestedAt: "2026-09-03T08:00:00Z",
@@ -844,22 +982,29 @@ describe("Task product panels", () => {
       ],
       items: [
         {
+          origin: "native" as const,
           itemId: "item_user",
           createdAt: "2026-09-03T08:00:01Z",
           turnId: "turn_child",
+          truncated: false,
+          totalCharacters: 9,
           kind: "user_input",
           content: [{ type: "text", text: "检查 **合同**" }],
           attachments: [],
         },
         {
+          origin: "native" as const,
           itemId: "item_reasoning",
           createdAt: "2026-09-03T08:00:10Z",
           turnId: "turn_child",
+          truncated: false,
+          totalCharacters: 6,
           kind: "reasoning_summary",
           text: "正在核对契约",
           modelRound: 1,
         },
         {
+          origin: "native" as const,
           itemId: "item_tool",
           createdAt: "2026-09-03T08:00:20Z",
           turnId: "turn_child",
@@ -877,6 +1022,7 @@ describe("Task product panels", () => {
           },
         },
         {
+          origin: "native" as const,
           itemId: "item_approval",
           createdAt: "2026-09-03T08:00:21Z",
           turnId: "turn_child",
@@ -889,9 +1035,12 @@ describe("Task product panels", () => {
           decision: null,
         },
         {
+          origin: "native" as const,
           itemId: "item_final",
           createdAt: "2026-09-03T08:01:01Z",
           turnId: "turn_failed",
+          truncated: false,
+          totalCharacters: 9,
           kind: "final_answer",
           text: "已生成安全收口结果",
         },

@@ -4,7 +4,7 @@
 import { RpcErrorSchema, type RpcError } from "./protocol";
 import { containsTokenShapedText } from "./readyToken";
 
-/** JA-RPC v1 的错误分类闭集；展示消息永远不参与分类。 */
+/** JA-RPC v2 的错误分类闭集；展示消息永远不参与分类。 */
 export type ErrorCategory =
   | "protocol"
   | "validation"
@@ -94,19 +94,21 @@ export const JA_ERROR_CATALOG = {
   TASK_TREE_DELETE_REQUIRED: { code: -32083, category: "conflict", retryable: false },
   TASK_OBSERVATION_INVALID: { code: -32084, category: "not_found", retryable: false },
   WORKSPACE_WRITE_LEASE_TIMEOUT: { code: -32085, category: "timeout", retryable: true },
-  GOAL_NOT_FOUND: { code: -32086, category: "not_found", retryable: false },
-  GOAL_REVISION_CONFLICT: { code: -32087, category: "conflict", retryable: true },
-  GOAL_INVALID_STATE: { code: -32088, category: "conflict", retryable: false },
+  PLAN_NOT_FOUND: { code: -32086, category: "not_found", retryable: false },
+  PLAN_REVISION_CONFLICT: { code: -32087, category: "conflict", retryable: true },
+  PLAN_INVALID_STATE: { code: -32088, category: "conflict", retryable: false },
   PLAN_INVALID: { code: -32089, category: "validation", retryable: false },
   PLAN_APPROVAL_STALE: { code: -32090, category: "conflict", retryable: false },
-  GOAL_EVIDENCE_INCOMPLETE: { code: -32091, category: "conflict", retryable: false },
-  GOAL_RECOVERY_REQUIRED: { code: -32092, category: "conflict", retryable: false },
+  PLAN_EVIDENCE_INCOMPLETE: { code: -32091, category: "conflict", retryable: false },
+  PLAN_RECOVERY_REQUIRED: { code: -32092, category: "conflict", retryable: false },
+  OUTPUT_SCHEMA_INVALID: { code: -32093, category: "validation", retryable: false },
   INTERACTION_NOT_FOUND: { code: -32094, category: "not_found", retryable: false },
   INTERACTION_REVISION_CONFLICT: { code: -32095, category: "conflict", retryable: true },
   INTERACTION_INVALID_STATE: { code: -32096, category: "conflict", retryable: false },
   INTERACTION_INVALID: { code: -32097, category: "validation", retryable: false },
-  PLAN_REVISION_CONFLICT: { code: -32098, category: "conflict", retryable: true },
-  PLAN_INVALID_STATE: { code: -32099, category: "conflict", retryable: false },
+  OUTPUT_SCHEMA_UNSUPPORTED: { code: -32098, category: "validation", retryable: false },
+  OUTPUT_SCHEMA_VALIDATION_FAILED: { code: -32099, category: "validation", retryable: false },
+  WORKSPACE_BUSY: { code: -32100, category: "conflict", retryable: true },
 } as const satisfies Record<string, { code: number; category: ErrorCategory; retryable: boolean }>;
 
 type CatalogErrorCode = keyof typeof JA_ERROR_CATALOG;

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test from "node:test";
@@ -16,7 +16,9 @@ import {
   writeBrowserFileFixture,
 } from "./browser-file-links-webview2.mjs";
 
-/** 构造闭合的 Windows 真窗成功报告；每个反例只破坏一项重要文件浏览语义。 */
+/** @author kongweiguang
+ * 构造闭合的 Windows 真窗成功报告；每个反例只破坏一项重要文件浏览语义。
+ */
 function validReport() {
   return {
     contractVersion: 1,
@@ -31,6 +33,10 @@ function validReport() {
       completed: true,
       referencesNotResolvedBeforeClick: true,
       markdownLinkClicked: true,
+      markdownHtmlSourceOpenedInFiles: true,
+      markdownHtmlPreviewWasExplicit: true,
+      relativeHtmlSourceOpenedInFiles: true,
+      relativeHtmlPreviewWasExplicit: true,
       inlineCodePathClicked: true,
       lineColumnPathClicked: true,
       legacyLineColumnPathClicked: true,
@@ -45,6 +51,9 @@ function validReport() {
       missingPathCtrlClickKeptPanelHidden: true,
       missingPathCtrlEnterReachedNativeExplorerCommand: true,
       duplicateExplorerChoiceDisplayed: true,
+      directoryOrdinaryClickSelectedInFiles: true,
+      directoryClickNoBrowserTabCreated: true,
+      explorerDirectoryOpened: false,
       absoluteWindowsPathClicked: true,
       absoluteFileUrlClicked: true,
     },
@@ -57,6 +66,20 @@ function validReport() {
           generation: 1,
           ackLatencyMs: 45,
         },
+        {
+          command: "ja_preview_open_file",
+          pageId: "22345678-1234-1234-1234-1234567890ab",
+          tabPageId: "22345678-1234-1234-1234-1234567890ab",
+          generation: 2,
+          ackLatencyMs: 45,
+        },
+        {
+          command: "ja_preview_open_file",
+          pageId: "32345678-1234-1234-1234-1234567890ab",
+          tabPageId: "32345678-1234-1234-1234-1234567890ab",
+          generation: 2,
+          ackLatencyMs: 45,
+        },
       ],
       htmlChildContentVerified: true,
       relativePngDecoded: true,
@@ -66,6 +89,56 @@ function validReport() {
       svgPageOpened: true,
       svgDocumentOpened: true,
       pdfDocumentOpened: true,
+      audioVisiblePreviewHealthy: true,
+      audioLocalPreview: {
+        contentType: "audio/wav",
+        mediaTag: "video",
+        mediaElementPresent: true,
+        controlsVisible: true,
+        readyState: 1,
+        metadataReady: true,
+        durationSeconds: 1,
+        localFileSource: true,
+        videoDimensions: { width: 0, height: 0 },
+        browserPreviewViewport: { width: 900, height: 650 },
+        documentViewport: { width: 900, height: 650 },
+        childScreenshotSize: { width: 900, height: 650 },
+        metadataTimeout: false,
+        width: null,
+        height: null,
+      },
+      audioNativePreviewReadiness: {
+        pageId: "22345678-1234-1234-1234-1234567890ab",
+        generation: 2,
+        status: "open",
+        loadStatus: "finished",
+        targetUrlMatched: true,
+      },
+      videoLocalPreview: {
+        contentType: "video/mp4",
+        mediaTag: "video",
+        mediaElementPresent: true,
+        controlsVisible: true,
+        readyState: 1,
+        metadataReady: true,
+        durationSeconds: 1,
+        localFileSource: true,
+        videoDimensions: { width: 160, height: 90 },
+        browserPreviewViewport: { width: 900, height: 650 },
+        documentViewport: { width: 900, height: 650 },
+        childScreenshotSize: { width: 900, height: 650 },
+        metadataTimeout: false,
+        width: 160,
+        height: 90,
+      },
+      videoNativePreviewReadiness: {
+        pageId: "32345678-1234-1234-1234-1234567890ab",
+        generation: 2,
+        status: "open",
+        loadStatus: "finished",
+        targetUrlMatched: true,
+      },
+      videoVisiblePreviewHealthy: true,
       multiplePagesOpen: true,
       pageIdsDistinct: true,
       addressFocused: true,
@@ -135,19 +208,25 @@ async function withTemporaryWorkspace(operation) {
   }
 }
 
+/** 验证回复里可见的项目目录在磁盘真实存在，且 Unicode/相对媒体 fixture 不逸出隔离根。 */
 test("workspace fixture covers Unicode paths, relative assets, and workspace-external read-only text", async () => {
   await withTemporaryWorkspace(async (root) => {
     const workspace = join(root, "workspace");
     const fixture = await writeBrowserFileFixture(workspace);
+    const directory = await stat(fixture.directoryPath);
     const html = await readFile(fixture.htmlPath, "utf8");
     const png = await readFile(fixture.imagePath);
     const svg = await readFile(fixture.svgPath, "utf8");
     const pdf = await readFile(fixture.pdfPath);
+    const audio = await readFile(fixture.audioPath);
+    const video = await readFile(fixture.videoPath);
     const duplicateA = await readFile(fixture.duplicateAPath, "utf8");
     const duplicateB = await readFile(fixture.duplicateBPath, "utf8");
     const reply = buildAssistantFileReply(fixture);
 
     assert.match(fixture.relativeHtmlPath, /图形 示例[\\/]首页 demo\.html/u);
+    assert.equal(directory.isDirectory(), true);
+    assert.equal(fixture.relativeDirectoryPath, "web/图形 示例");
     assert.ok(fixture.externalPath.startsWith(root));
     assert.ok(relative(workspace, fixture.externalPath).startsWith(".."));
     assert.match(html, /JA_BROWSER_FILE_HTML_CONTENT/u);
@@ -157,9 +236,19 @@ test("workspace fixture covers Unicode paths, relative assets, and workspace-ext
     assert.match(svg, /JA_BROWSER_FILE_SVG_CONTENT/u);
     assert.ok(pdf.subarray(0, 8).equals(Buffer.from("%PDF-1.4", "ascii")));
     assert.ok(pdf.includes(Buffer.from("JA_BROWSER_FILE_PDF_CONTENT", "ascii")));
+    assert.equal(audio.toString("ascii", 0, 4), "RIFF");
+    assert.equal(audio.toString("ascii", 8, 12), "WAVE");
+    assert.equal(audio.readUInt32LE(24), 8_000);
+    assert.equal(audio.readUInt32LE(40), audio.length - 44);
+    assert.equal(video.toString("ascii", 4, 8), "ftyp");
+    assert.ok(video.includes(Buffer.from("avc1", "ascii")));
+    assert.ok(video.includes(Buffer.from("mdat", "ascii")));
     assert.match(reply, /\[打开本地 HTML\]\(file:/u);
     assert.match(reply, /启动 模块\.ts#L2C4/u);
     assert.match(reply, /启动 模块\.ts:2:4/u);
+    assert.match(reply, /项目目录：`web\/图形 示例\/`/u);
+    assert.match(reply, /音频 demo\.wav/u);
+    assert.match(reply, /视频 demo\.mp4/u);
     assert.match(reply, /外部 只读说明\.txt/u);
     assert.match(reply, /重复 名称\.txt/u);
     assert.match(duplicateA, /JA_BROWSER_FILE_DUPLICATE_A/u);
@@ -233,12 +322,64 @@ test("WebView2 result validator rejects partial skeletons and missing native cle
   assert.throws(() => validateBrowserFileLinksReport(report));
 });
 
-/** 请求正向系统文件夹验收时，只有原生窗口真的落到父目录并选中目标才能通过。 */
+/** @author kongweiguang
+ * 普通 HTML 路径必须在 Files 打开源码，浏览器预览必须来自明确菜单动作并显示真实页面。
+ */
+test("HTML references require Files source opening and an explicit Browser preview action", () => {
+  const report = validReport();
+  assert.equal(validateBrowserFileLinksReport(report), report);
+  report.assistantTurn.markdownHtmlSourceOpenedInFiles = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.assistantTurn.markdownHtmlSourceOpenedInFiles = true;
+  report.assistantTurn.relativeHtmlPreviewWasExplicit = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+});
+
+/** @author kongweiguang 音视频真窗验收报告必须包含实际可读的本地媒体元素、metadata 和视频尺寸。 */
+test("media Preview result requires readable local audio and video metadata", () => {
+  const report = validReport();
+  assert.equal(validateBrowserFileLinksReport(report), report);
+  report.browser.audioLocalPreview.metadataReady = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioLocalPreview.metadataReady = true;
+  report.browser.audioLocalPreview.mediaTag = "canvas";
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioLocalPreview.mediaTag = "video";
+  report.browser.audioLocalPreview.videoDimensions = { width: 16, height: 9 };
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioLocalPreview.videoDimensions = { width: 0, height: 0 };
+  report.browser.audioVisiblePreviewHealthy = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioVisiblePreviewHealthy = true;
+  report.browser.videoVisiblePreviewHealthy = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.videoVisiblePreviewHealthy = true;
+  report.browser.videoLocalPreview.width = 0;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.videoLocalPreview.width = 160;
+  report.browser.audioLocalPreview.childScreenshotSize.height = 3;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioLocalPreview.childScreenshotSize.height = 650;
+  report.browser.videoLocalPreview.browserPreviewViewport.height = 3;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.videoLocalPreview.browserPreviewViewport.height = 650;
+  report.browser.audioNativePreviewReadiness.loadStatus = "failed";
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioNativePreviewReadiness.loadStatus = "finished";
+  report.browser.audioNativePreviewReadiness.generation = 3;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.browser.audioNativePreviewReadiness.generation = 2;
+  report.browser.videoNativePreviewReadiness.targetUrlMatched = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+});
+
+/** @author kongweiguang Explorer 验收同时要求文件选中与目录直接打开的闭环证据。 */
 test("Explorer folder verification requires a selected file result", () => {
   const report = validReport();
   report.fixture.explorerFolderVerificationRequested = true;
   assert.throws(() => validateBrowserFileLinksReport(report));
   report.assistantTurn.explorerFolderOpenedAndFileSelected = true;
+  report.assistantTurn.explorerDirectoryOpened = true;
   assert.equal(validateBrowserFileLinksReport(report), report);
 });
 

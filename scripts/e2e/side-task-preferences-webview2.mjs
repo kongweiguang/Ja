@@ -78,18 +78,15 @@ async function startLoopbackProvider() {
       return;
     }
     const serialized = JSON.stringify(body);
-    const evaluation = serialized.includes("independent acceptance evaluator");
-    const marker = evaluation
-      ? "evaluation"
-      : serialized.includes(FOLLOWUP_MARKER)
-        ? "followup"
-        : serialized.includes(PLAN_MARKER)
-          ? "plan"
-          : serialized.includes(SIDE_MARKER)
-            ? "side"
-            : serialized.includes(ROOT_MARKER)
-              ? "root"
-              : "unknown";
+    const marker = serialized.includes(FOLLOWUP_MARKER)
+      ? "followup"
+      : serialized.includes(PLAN_MARKER)
+        ? "plan"
+        : serialized.includes(SIDE_MARKER)
+          ? "side"
+          : serialized.includes(ROOT_MARKER)
+            ? "root"
+            : "unknown";
     const model = typeof body.model === "string" ? body.model : "unknown";
     const requestRecord = {
       sequence: ++sequence,
@@ -103,9 +100,8 @@ async function startLoopbackProvider() {
       await new Promise((resolve) => setTimeout(resolve, 2_000));
       if (response.destroyed || response.writableEnded) return;
     }
-    const text = evaluation
-      ? JSON.stringify({ verdict: "met", summary: "隔离 Goal 已验证", criteria: [] })
-      : marker === "followup"
+    const text =
+      marker === "followup"
         ? "JA_SIDE_TASK_FOLLOWUP_DONE"
         : marker === "plan"
           ? "JA_SIDE_TASK_PLAN_DONE"
@@ -322,7 +318,7 @@ async function readThreadSnapshot(page, threadId) {
   }, threadId);
 }
 
-/** 通过真实页面 bridge 调用闭集 Goal/Plan command；只返回稳定 projection 或错误码。 */
+/** Plan command 只返回稳定 projection 或错误码，避免 WebView2 断言依赖 Tauri 错误对象形状。 */
 async function invokePlanCommand(page, command, input) {
   return page.evaluate(
     async ({ commandName, commandInput }) => {
@@ -366,7 +362,7 @@ async function exerciseStandalonePlan(page, childThreadId, provider, composer) {
   const input = composer.getByRole("textbox", { name: "消息", exact: true });
   await input.fill("/plan on");
   await input.press("Enter");
-  await expect(composer.locator('[data-goal-ui="mode-status"]')).toBeVisible();
+  await expect(composer.locator('[data-plan-ui="mode-status"]')).toBeVisible();
   await input.fill(PLAN_MARKER);
   await composer.getByRole("button", { name: "发送", exact: true }).click();
   await page
@@ -381,7 +377,7 @@ async function exerciseStandalonePlan(page, childThreadId, provider, composer) {
     "UI Plan create",
   );
   assert.equal(created.plan.owner.threadId, childThreadId);
-  await composer.locator('[data-goal-ui="mode-status"]').click();
+  await composer.locator('[data-plan-ui="mode-status"]').click();
   await page.getByRole("button", { name: "查看计划", exact: true }).click();
   const panel = page.locator(".ja-task-detail .ja-plan-workbench");
   await panel.getByRole("button", { name: "编辑计划", exact: true }).click();
@@ -435,7 +431,7 @@ async function exerciseStandalonePlan(page, childThreadId, provider, composer) {
     )
     .toBe("stopped");
   const validation = await page.evaluate(async (projection) => {
-    const { PlanProjectionSchema } = await import("/src/api/protocol/goal.ts");
+    const { PlanProjectionSchema } = await import("/src/api/protocol/plan.ts");
     const parsed = PlanProjectionSchema.safeParse(projection);
     return parsed.success ? { ok: true } : { ok: false, issues: parsed.error.issues };
   }, stopped.value);
@@ -468,55 +464,6 @@ async function currentChildThreadId(page) {
   if (typeof key !== "string" || !key.startsWith("side-task:thr_"))
     throw new Error("无法从真实 Workbench Tab 读取侧边 Child Thread identity");
   return key.slice("side-task:".length);
-}
-
-/** 包住真实 Goal create ACK；后续 read 仍通过原生 command，证据不依赖 React 内部状态。 */
-async function captureGoalCreate(page) {
-  await page.evaluate(() => {
-    const internals = globalThis.__TAURI_INTERNALS__;
-    const invoke = internals?.invoke;
-    if (typeof invoke !== "function") throw new Error("Tauri invoke 不可用，无法验收 Goal owner");
-    const calls = [];
-    const wrapped = async (...args) => {
-      const result = await Reflect.apply(invoke, internals, args);
-      if (args[0] === "ja_runtime_goal_create") calls.push(result);
-      return result;
-    };
-    globalThis.__JA_SIDE_TASK_GOAL_CREATE_RESULTS__ = calls;
-    internals.invoke = wrapped;
-  });
-}
-
-/** 通过 Tauri 原生 command 读取 Goal owner，确保 UI ACK 没有把独立任务伪装成主任务。 */
-async function readCapturedChildGoal(page, childThreadId) {
-  return page.evaluate(async (taskThreadId) => {
-    const internals = globalThis.__TAURI_INTERNALS__;
-    const invoke = internals?.invoke;
-    if (typeof invoke !== "function") throw new Error("Tauri invoke 不可用，无法读取 Goal owner");
-    // Goal create 由 adapter 持有原生 bridge 引用，不能依赖替换 window.invoke 的旁路捕获；
-    // task/read 的 activeGoalId 是同一服务端状态的权威投影。
-    let taskRead;
-    let goalId;
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      taskRead = await invoke("ja_runtime_task_read", {
-        input: { taskThreadId, limit: 200 },
-      });
-      goalId = taskRead?.value?.thread?.activeGoalId ?? taskRead?.thread?.activeGoalId;
-      if (typeof goalId === "string") break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    if (typeof goalId !== "string")
-      throw new Error(`真实 Goal create 未在 task/read 投影：${JSON.stringify(taskRead)}`);
-    const read = await Reflect.apply(invoke, internals, [
-      "ja_runtime_goal_read",
-      { input: { goalId } },
-    ]);
-    const owner = read?.value?.goal?.owner ?? read?.goal?.owner;
-    if (owner?.kind !== "independent_task" || owner.taskThreadId !== taskThreadId)
-      throw new Error(`Goal owner 不匹配：${JSON.stringify(owner)}`);
-    return { goalId, owner };
-  }, childThreadId);
 }
 
 /** 通过主导航按钮取得当前 Thread identity，避免假设随机隔离 workspace 的固定 ID。 */
@@ -631,11 +578,11 @@ async function openSideTask(page) {
   return { composer, region, childThreadId, label };
 }
 
-/** 侧边 Composer 必须真正暴露主任务同款 slash 入口且能无损返回焦点。 */
-async function exercisePlanGoalEntrypoints(page, composer, { createGoal = false } = {}) {
+/** 侧边 Composer 的 Plan 入口复用主会话命令；操作后确认模式状态和焦点均已收敛。 */
+async function exercisePlanEntrypoint(page, composer) {
   const input = composer.getByRole("textbox", { name: "消息", exact: true });
   const waitForPlanStatus = async (visible) => {
-    const status = composer.locator('[data-goal-ui="mode-status"]');
+    const status = composer.locator('[data-plan-ui="mode-status"]');
     await status.waitFor({ state: visible ? "visible" : "hidden", timeout: 15_000 });
   };
   await input.fill("/");
@@ -643,7 +590,6 @@ async function exercisePlanGoalEntrypoints(page, composer, { createGoal = false 
   await listbox.waitFor({ state: "visible", timeout: 15_000 });
   const menuText = await listbox.innerText();
   assert.match(menuText, /先制定计划再决定是否执行/u);
-  assert.match(menuText, /设置要持续追求的目标/u);
   await input.press("Escape");
   await listbox.waitFor({ state: "hidden", timeout: 15_000 });
   await input.fill("/plan");
@@ -652,16 +598,6 @@ async function exercisePlanGoalEntrypoints(page, composer, { createGoal = false 
   await input.fill("/plan off");
   await input.press("Enter");
   await waitForPlanStatus(false);
-  let goalEditor = false;
-  if (createGoal) {
-    await input.fill("/goal");
-    await input.press("Enter");
-    const editor = page.getByRole("textbox", { name: /目标/u }).last();
-    await editor.waitFor({ state: "visible", timeout: 15_000 });
-    await editor.fill("侧边任务 Goal 入口隔离验收");
-    await composer.getByRole("button", { name: "创建目标", exact: true }).click();
-    goalEditor = true;
-  }
   await input.waitFor({ state: "visible", timeout: 15_000 });
   const focusDeadline = Date.now() + 5_000;
   let focusReturned = false;
@@ -671,7 +607,7 @@ async function exercisePlanGoalEntrypoints(page, composer, { createGoal = false 
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.equal(focusReturned, true, "slash 操作后焦点没有回到侧边 Composer");
-  return { slashMenu: true, planToggle: true, goalEditor, focusReturned };
+  return { slashMenu: true, planToggle: true, focusReturned };
 }
 
 /** 空闲 Child 的验收只看真实 Provider 请求和 Thread turns，避免把创建路径误判为模型启动。 */
@@ -791,40 +727,14 @@ async function run(page, provider) {
   await chooseModel(child, SECONDARY_MODEL);
   await chooseAccess(child, parentPreferences.access === "完全访问" ? "需要审批" : "完全访问");
   const firstSidePreferences = await readPreferences(child);
-  await captureGoalCreate(page);
-  const planGoal = await exercisePlanGoalEntrypoints(page, child, { createGoal: true });
-  const goalOwner = await readCapturedChildGoal(page, firstSide.childThreadId);
-  process.stdout.write("JA_SIDE_STAGE goal_created\n");
-  // 简单 fixture 不报告业务进展，Goal 应有界续跑后暂停；不能伪造“已达成”来结束测试。
-  let settledGoal;
-  await expect
-    .poll(
-      async () => {
-        settledGoal = await invokePlanCommand(page, "ja_runtime_goal_read", {
-          goalId: goalOwner.goalId,
-        });
-        return ["paused", "achieved", "stopped"].includes(settledGoal.value?.goal?.status);
-      },
-      { timeout: 30_000 },
-    )
-    .toBe(true);
-  goalOwner.observedStatus = settledGoal.value.goal.status;
-  await expect
-    .poll(async () => (await readThreadSnapshot(page, firstSide.childThreadId))?.activeTurnCount, {
-      timeout: 30_000,
-    })
-    .toBe(0);
-  if (settledGoal.value.goal.status === "paused") {
-    const stopped = await invokePlanCommand(page, "ja_runtime_goal_stop", {
-      goalId: goalOwner.goalId,
-      expectedGoalRevision: settledGoal.value.goal.revision,
-      idempotencyKey: `side-goal-cleanup-${Date.now()}`,
-    });
-    assert.equal(stopped.ok, true);
-  }
-  // Goal create 可按服务端策略立即启动独立 continuation；这里仍读取 Child 快照，
-  // 但不把该合法 Goal 请求误判为侧边任务创建时的隐式 Provider 启动。
-  const afterGoalSnapshot = await readThreadSnapshot(page, firstSide.childThreadId);
+  const firstPlanEntry = await exercisePlanEntrypoint(page, child);
+  const afterPlanSnapshot = await assertIdleChild(
+    page,
+    provider,
+    firstSide.childThreadId,
+    requestCountBeforeFirstSide,
+    firstSide.label,
+  );
   const sideInput = child.getByRole("textbox", { name: "消息", exact: true });
   await sideInput.fill(SIDE_MARKER);
   await child.getByRole("button", { name: "发送", exact: true }).click();
@@ -887,7 +797,7 @@ async function run(page, provider) {
     requestCountBeforeSecondSide,
     secondSide.label,
   );
-  const secondPlanGoal = await exercisePlanGoalEntrypoints(page, secondSide.composer);
+  const secondPlanEntry = await exercisePlanEntrypoint(page, secondSide.composer);
   const secondAfterPlanSnapshot = await assertIdleChild(
     page,
     provider,
@@ -915,7 +825,8 @@ async function run(page, provider) {
       label: firstSide.label,
       defaults: childDefaults,
       firstIdleSnapshot,
-      afterGoalSnapshot,
+      planEntry: firstPlanEntry,
+      afterPlanSnapshot,
       firstRequest: firstSideRequest,
       followupRequest,
       firstSidePreferences,
@@ -926,16 +837,14 @@ async function run(page, provider) {
       defaults: secondDefaults,
       idleSnapshot: secondIdleSnapshot,
       afterPlanSnapshot: secondAfterPlanSnapshot,
-      planGoal: secondPlanGoal,
+      planEntry: secondPlanEntry,
       standalonePlan,
     },
-    goalOwner,
     isolation: {
       parentPreferencesUnchanged: true,
       contextInherited:
         /继承自主任务 revision \d+/u.test(sideContext) && firstSideRequest.hasParentMarker,
     },
-    planGoal,
     composerParity: parity,
     requests: provider.requests,
     screenshots: ["01-parent-completed.png", "02-side-idle-wide.png", "03-side-task-narrow.png", "04-side-plan-ready.png", "05-side-plan-stopped.png"],

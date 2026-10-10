@@ -27,7 +27,7 @@ describe("TauriTurnArtifactAdapter", () => {
       workspaceId: "ws_demo",
       threadId: "thr_demo",
       turnId: "turn_demo",
-      callId: "call_demo",
+      callId: "toolu_01HABC123",
       artifactId: "artifact_tool",
       offsetCharacters: 0,
       limitCharacters: 65_536,
@@ -35,6 +35,10 @@ describe("TauriTurnArtifactAdapter", () => {
 
     await expect(adapter.readToolPage(input)).resolves.toMatchObject({ content: "完成" });
     expect(bridge.invoke).toHaveBeenCalledWith("ja_tool_artifact_read", { input });
+    await expect(adapter.readToolPage({ ...input, callId: "toolu/unsafe" })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+    });
+    expect(bridge.invoke).toHaveBeenCalledTimes(1);
   });
 
   it("一次读取完整本轮修改并拒绝非法路径或畸形返回", async () => {

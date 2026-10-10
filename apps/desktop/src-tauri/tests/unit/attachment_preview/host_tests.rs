@@ -76,6 +76,48 @@ fn request_from_url(url: &str) -> AttachmentProtocolRequest {
     parse_attachment_protocol_uri(url).expect("protocol request")
 }
 
+/// Host 按当前平台签发首个可加载 URL；解析出的 token 必须直接读取同一缓存衍生物。
+#[test]
+fn open_issues_platform_url_and_token_reads_cached_thumbnail() {
+    let host = host_with_clock(Arc::new(FakeClock::default()), 1024);
+    let opened = host
+        .open(
+            "main",
+            "ws_12345678".to_owned(),
+            descriptor("apv_12345678", AttachmentPreviewKind::Image),
+            Some(derivatives(8, 16)),
+        )
+        .expect("open image");
+    let preview = request_from_url(opened.resource_url.as_deref().expect("preview url"));
+    let thumbnail = request_from_url(opened.thumbnail_url.as_deref().expect("thumbnail url"));
+
+    #[cfg(target_os = "windows")]
+    {
+        assert!(opened
+            .thumbnail_url
+            .as_deref()
+            .expect("thumbnail url")
+            .starts_with("http://ja-attachment.localhost/thumbnail/"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert!(opened
+            .thumbnail_url
+            .as_deref()
+            .expect("thumbnail url")
+            .starts_with("ja-attachment://localhost/thumbnail/"));
+    }
+
+    assert_eq!(preview.token, thumbnail.token);
+    assert_eq!(thumbnail.variant, AttachmentResourceVariant::Thumbnail);
+    assert_eq!(
+        host.resource("main", thumbnail.variant, thumbnail.token)
+            .expect("cached thumbnail")
+            .as_ref(),
+        &[1; 8]
+    );
+}
+
 /// 辅助窗口即使取得不可猜 token 也不能读取缓存；失败不能延长该 token 的 TTL。
 #[test]
 fn resource_is_restricted_to_main_webview() {

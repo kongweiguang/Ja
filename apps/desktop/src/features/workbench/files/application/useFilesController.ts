@@ -12,6 +12,7 @@ import type {
   FilesSearchResult,
   FilesSearchSummary,
   FilesWorkspaceCloseLease,
+  FilesWorkspaceRebindLease,
   FilesWorkspaceLifecycle,
   OpenDocument,
   SaveAsRequest,
@@ -71,6 +72,9 @@ export function useFilesController({
   const [treeLoading, setTreeLoading] = useState(false);
   const [treeError, setTreeError] = useState<string>();
   const [selectedPath, setSelectedPath] = useState<string>();
+  const [directoryReveal, setDirectoryReveal] = useState<
+    { path: string; sequence: number } | undefined
+  >();
   const [documents, setDocuments] = useState<Record<string, OpenDocument>>({});
   const [documentOrder, setDocumentOrder] = useState<string[]>([]);
   const [activePath, setActivePath] = useState<string>();
@@ -98,6 +102,8 @@ export function useFilesController({
   const treeRequestRef = useRef(new Map<string, number>());
   const workspaceGenerationRef = useRef(0);
   const treeRequestSequenceRef = useRef(0);
+  const directoryRevealSequenceRef = useRef(0);
+  const openIntentSequenceRef = useRef(0);
   const rootTreeReadyRef = useRef(initialNodes.length > 0);
   const initialNodesRef = useRef(initialNodes);
   const nodesRef = useRef(nodes);
@@ -125,17 +131,24 @@ export function useFilesController({
   const activityWorkspaceRef = useRef(workspaceId);
   const lifecycleFenceRef = useRef(false);
   const lifecycleLeaseRef = useRef<Promise<void> | undefined>(undefined);
+  const lifecycleLeaseModeRef = useRef<"flush" | "rebind-save" | "rebind-discard" | undefined>(
+    undefined,
+  );
   const lifecycleLeaseHoldersRef = useRef(0);
   const mutationRecoveryRequiredRef = useRef(false);
   const flushRef = useRef<(path: string) => Promise<void>>(async () => undefined);
   const flushWorkspaceRef = useRef<() => Promise<FilesWorkspaceCloseLease>>(async () => ({
     release: () => undefined,
   }));
+  const prepareWorkspaceRebindRef = useRef<
+    (disposition: "save" | "discard") => Promise<FilesWorkspaceRebindLease>
+  >(async () => ({ commit: () => undefined, release: () => undefined }));
+  const listUnsavedDocumentsRef = useRef<FilesWorkspaceLifecycle["listUnsavedDocuments"]>(() => []);
   const scheduleSaveRef = useRef<(path: string) => void>(() => undefined);
   const externalRefreshRef = useRef<
     (path: string, mode: ExternalRefreshMode, expectedRevision?: FileRevision) => Promise<void>
   >(async () => undefined);
-  /** runtime port 只保存最新函数指针，用于打破 coordinator 与 document use cases 的装配环。 */
+  /** runtime 端口只保存最新函数指针，用于打破协调器与文档用例之间的装配环。 */
   const [documentSaveRuntime] = useState(() => new DocumentSaveRuntimePort());
   /** lazy state 只构造一个 coordinator；它不保存文档事实，只串行调用最新 runtime port。 */
   const [saveCoordinator] = useState(
@@ -261,7 +274,61 @@ export function useFilesController({
     [operations.tree, workspaceId],
   );
 
-  /** 延迟到事件执行阶段装配 Document 窄 context，render 不读取 refs。 */
+  /**
+   * @author kongweiguang
+   * 按层读取目标直属祖先目录；显式路径可定位默认忽略目录，序号 fence 防止慢请求覆盖后续选择。
+   */
+  const revealDirectory = useCallback(
+    async (path: string): Promise<boolean> => {
+      const normalized = path.replace(/\\/gu, "/");
+      if (
+        normalized.length > 4_096 ||
+        normalized.startsWith("/") ||
+        normalized.includes(":") ||
+        [...normalized].some((character) => {
+          const codePoint = character.codePointAt(0) ?? 0;
+          return codePoint <= 31 || codePoint === 127;
+        }) ||
+        (normalized !== "" &&
+          normalized.split("/").some((part) => part === "" || part === "." || part === ".."))
+      )
+        return false;
+      const generation = workspaceGenerationRef.current;
+      const intentSequence = ++openIntentSequenceRef.current;
+      const revealSequence = ++directoryRevealSequenceRef.current;
+      const isCurrentReveal = (): boolean =>
+        generation === workspaceGenerationRef.current &&
+        intentSequence === openIntentSequenceRef.current &&
+        revealSequence === directoryRevealSequenceRef.current;
+      if (normalized === "") {
+        if ((await loadDirectory("")) === undefined || !isCurrentReveal()) return false;
+        setSelectedPath(undefined);
+        setDirectoryReveal({ path: "", sequence: revealSequence });
+        return true;
+      }
+
+      let entries = await loadDirectory("");
+      if (entries === undefined || !isCurrentReveal()) return false;
+      let currentPath = "";
+      const segments = normalized.split("/");
+      for (const [index, segment] of segments.entries()) {
+        currentPath = currentPath === "" ? segment : `${currentPath}/${segment}`;
+        const entry = entries.find((candidate) => candidate.relativePath === currentPath);
+        if (entry?.kind !== "directory") return false;
+        if (index < segments.length - 1) {
+          const nextEntries = await loadDirectory(currentPath);
+          if (nextEntries === undefined || !isCurrentReveal()) return false;
+          entries = nextEntries;
+        }
+      }
+      setSelectedPath(currentPath);
+      setDirectoryReveal({ path: currentPath, sequence: revealSequence });
+      return true;
+    },
+    [loadDirectory],
+  );
+
+  /** @author kongweiguang：延迟装配 Document context，并共享点击序号以丢弃迟到文件读取。 */
   const getDocumentUseCases = useCallback(
     () =>
       createDocumentUseCases({
@@ -271,6 +338,7 @@ export function useFilesController({
         documents: documentsRef,
         documentOrder: documentOrderRef,
         activePath: activePathRef,
+        openIntentSequence: openIntentSequenceRef,
         workspaceGeneration: workspaceGenerationRef,
         revisions: revisionRef,
         inFlight: inFlightRef,
@@ -307,11 +375,12 @@ export function useFilesController({
       getDocumentUseCases().openDocument(path, reveal),
     [getDocumentUseCases],
   );
-  /** 将显式点击后由 Rust 有界读取的文本快照装入独立只读 Tab，不借用 workspace CAS 写入能力。 */
+  /** @author kongweiguang：装入显式点击的只读快照，并使较早的异步文件读取失去焦点提交权。 */
   const openExternalDocument = useCallback(
     (input: FilesExternalDocumentInput): boolean => {
       const path = input.path.trim();
       if (path === "" || lifecycleFenceRef.current) return false;
+      openIntentSequenceRef.current += 1;
       const content = input.content;
       const existing = documentsRef.current[path];
       const document: OpenDocument = {
@@ -404,6 +473,52 @@ export function useFilesController({
     externalRefreshRef.current = reloadExternal;
   }, [documentSaveRuntime, flushDocument, reloadExternal, saveDocumentOnce, scheduleSave]);
 
+  /** @author kongweiguang：仅在服务端确认新 root 后清空旧投影，并使所有旧路径 IO 失效。 */
+  const commitWorkspaceRebind = useCallback((): void => {
+    workspaceGenerationRef.current += 1;
+    openIntentSequenceRef.current += 1;
+    directoryRevealSequenceRef.current += 1;
+    treeRequestSequenceRef.current += 1;
+    treeRequestRef.current.clear();
+    rootTreeReadyRef.current = false;
+    saveCoordinator.reset();
+    inFlightRef.current.clear();
+    pendingMutationRef.current.clear();
+    deferredWatchRef.current.clear();
+    externalReadRef.current.clear();
+    externalConflictCheckRef.current.clear();
+    reconciliationTaskRef.current = undefined;
+    watcherReadyRef.current = false;
+    setNodes([]);
+    setTreeLoading(false);
+    setTreeError(undefined);
+    setSelectedPath(undefined);
+    setDirectoryReveal(undefined);
+    documentsRef.current = {};
+    documentOrderRef.current = [];
+    activePathRef.current = undefined;
+    commitDocuments(() => ({}));
+    setDocumentOrder([]);
+    setActivePath(undefined);
+    searchRequestRef.current += 1;
+    setSearchQuery("");
+    setSearchResults([]);
+    setSearchLoading(false);
+    setSearchError(undefined);
+    setComparePath(undefined);
+    setConflictAction(undefined);
+    conflictActionRef.current = undefined;
+    setSaveAsRequest(undefined);
+    saveAsRequestRef.current = undefined;
+    setCloseDocumentRequest(undefined);
+    trashRequestSequenceRef.current += 1;
+    trashOperationRef.current = undefined;
+    setTrashRequest(undefined);
+    trashRequestRef.current = undefined;
+    revisionRef.current.clear();
+    setOpenTargetsState({ workspaceId, targets: [] });
+  }, [commitDocuments, saveCoordinator, workspaceId]);
+
   /** Lifecycle context 只在切换 intent 执行时创建，render 不读取 fence refs。 */
   const getLifecycleUseCases = useCallback(
     () =>
@@ -412,21 +527,37 @@ export function useFilesController({
         mounted: mountedRef,
         lifecycleFence: lifecycleFenceRef,
         lifecycleLease: lifecycleLeaseRef,
+        lifecycleLeaseMode: lifecycleLeaseModeRef,
         lifecycleLeaseHolders: lifecycleLeaseHoldersRef,
         documents: documentsRef,
         scheduledSave: scheduleSaveRef,
         flush: flushRef,
         inFlight: inFlightRef,
         externalConflictChecks: externalConflictCheckRef,
+        mutationRecoveryRequired: mutationRecoveryRequiredRef,
+        commitWorkspaceRebind,
         setLifecycleClosing,
         onNotice,
       }),
-    [onNotice, saveCoordinator],
+    [commitWorkspaceRebind, onNotice, saveCoordinator],
   );
 
   /** Workspace change 只通过 lifecycle 协作者取得共享 lease。 */
   const flushForWorkspaceChange = useCallback(
     () => getLifecycleUseCases().flushForWorkspaceChange(),
+    [getLifecycleUseCases],
+  );
+
+  /** Ref-backed lifecycle API stays registered while component callbacks refresh after each commit. */
+  const prepareForWorkspaceRebind = useCallback(
+    (disposition: "save" | "discard") =>
+      getLifecycleUseCases().prepareForWorkspaceRebind(disposition),
+    [getLifecycleUseCases],
+  );
+
+  /** 返回当前未保存文件摘要，不提升正文和编辑文档对象到外层项目协调器。 */
+  const listUnsavedDocuments = useCallback(
+    () => getLifecycleUseCases().listUnsavedDocuments(),
     [getLifecycleUseCases],
   );
 
@@ -436,11 +567,18 @@ export function useFilesController({
   }, [flushForWorkspaceChange]);
 
   useEffect(() => {
+    prepareWorkspaceRebindRef.current = prepareForWorkspaceRebind;
+    listUnsavedDocumentsRef.current = listUnsavedDocuments;
+  }, [listUnsavedDocuments, prepareForWorkspaceRebind]);
+
+  useEffect(() => {
     mountedRef.current = true;
     const lifecycle: FilesWorkspaceLifecycle = {
       workspaceId,
+      listUnsavedDocuments: () => listUnsavedDocumentsRef.current(),
       /** 通过 ref 调用最新 flush 实现，注册对象无需随每次编辑重建。 */
       flushForWorkspaceChange: () => flushWorkspaceRef.current(),
+      prepareForWorkspaceRebind: (disposition) => prepareWorkspaceRebindRef.current(disposition),
     };
     onRegisterLifecycle?.(lifecycle);
     return () => {
@@ -638,6 +776,8 @@ export function useFilesController({
 
   useEffect(() => {
     workspaceGenerationRef.current += 1;
+    openIntentSequenceRef.current += 1;
+    directoryRevealSequenceRef.current += 1;
     treeRequestSequenceRef.current = 0;
     treeRequestRef.current.clear();
     rootTreeReadyRef.current = initialNodesRef.current.length > 0;
@@ -652,6 +792,7 @@ export function useFilesController({
     setNodes([...initialNodesRef.current]);
     setTreeError(undefined);
     setSelectedPath(undefined);
+    setDirectoryReveal(undefined);
     commitDocuments(() => ({}));
     setDocumentOrder([]);
     setActivePath(undefined);
@@ -670,6 +811,7 @@ export function useFilesController({
     revisionRef.current.clear();
     lifecycleFenceRef.current = false;
     lifecycleLeaseRef.current = undefined;
+    lifecycleLeaseModeRef.current = undefined;
     lifecycleLeaseHoldersRef.current = 0;
     setLifecycleClosing(false);
     mutationRecoveryRequiredRef.current = false;
@@ -801,6 +943,7 @@ export function useFilesController({
     viewModel: {
       nodes,
       selectedPath,
+      directoryReveal,
       treeLoading,
       treeError,
       searchQuery,
@@ -823,7 +966,9 @@ export function useFilesController({
       openTargets,
     },
     actions: {
+      /** 当前树选择也作废更早的异步读取，避免目录点击后旧文件夺回编辑器焦点。 */
       selectNode: (node) => {
+        if (node.kind !== "file") openIntentSequenceRef.current += 1;
         setSelectedPath(node.path);
         if (node.kind === "file") void openDocument(node.path);
       },
@@ -831,6 +976,7 @@ export function useFilesController({
         if (node.kind === "directory" && node.children === undefined) void loadDirectory(node.path);
       },
       retryTree: () => void loadDirectory(""),
+      revealDirectory,
       createFile:
         mutationRecoveryRequired || operations.createEntry === undefined
           ? undefined
@@ -865,7 +1011,9 @@ export function useFilesController({
       },
       openPath: (path, reveal) => openDocument(path, reveal),
       openExternalDocument,
+      /** 切换已打开 Tab 后冻结旧读取的激活权，迟到结果只可留在 Tab 列表。 */
       selectDocument: (path) => {
+        openIntentSequenceRef.current += 1;
         setActivePath(path);
         setSelectedPath(path);
       },

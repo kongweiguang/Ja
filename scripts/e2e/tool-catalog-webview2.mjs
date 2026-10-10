@@ -16,13 +16,20 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { parseArguments as parseProgressArguments } from "./conversation-progress-webview2.mjs";
 import { runProduction } from "./review-redesign-production.mjs";
-import {
-  startToolCatalogFixture,
-  toolCatalogFixtureMarkers,
-} from "./fixtures/tool-catalog.mjs";
+import { startToolCatalogFixture, toolCatalogFixtureMarkers } from "./fixtures/tool-catalog.mjs";
 
-const REQUIRED_BASE_TOOLS = Object.freeze(["read", "write", "edit", "shell", "grep", "find", "ls"]);
-const FORBIDDEN_DEFAULT_TOOLS = Object.freeze(["workspace_search", "read_attachment", "tool_search"]);
+export const REQUIRED_BASE_TOOLS = Object.freeze([
+  "read",
+  "write",
+  "edit",
+  "exec_command",
+  "write_stdin",
+  "view_image",
+  "grep",
+  "find",
+  "ls",
+]);
+const FORBIDDEN_DEFAULT_TOOLS = Object.freeze(["workspace_search", "tool_search"]);
 const TOOL_ACTIONS = Object.freeze({
   grep: "搜索内容",
   find: "查找文件",
@@ -131,14 +138,17 @@ async function readToolCatalogRuntimeDiagnostics(page) {
         appReady:
           globalThis.document.querySelector(".ja-shell")?.getAttribute("data-app-ready") ?? null,
         runtimeStatus:
-          globalThis.document.querySelector('[aria-label^="本地运行时："]')?.getAttribute("aria-label") ??
-          null,
+          globalThis.document
+            .querySelector('[aria-label^="本地运行时："]')
+            ?.getAttribute("aria-label") ?? null,
         projectListPresent: projectList !== null,
         projectButtonCount: projectList?.querySelectorAll("button").length ?? 0,
-        projectCount: projectList?.querySelectorAll('button[data-scope-kind="project"]').length ?? 0,
+        projectCount:
+          projectList?.querySelectorAll('button[data-scope-kind="project"]').length ?? 0,
         selectedProjectPresent:
           projectList !== null &&
-          projectList.querySelector('button[data-scope-kind="project"][aria-current="page"]') !== null,
+          projectList.querySelector('button[data-scope-kind="project"][aria-current="page"]') !==
+            null,
         threadListPresent: threadList !== null,
         threadCount: threadList?.querySelectorAll("button[data-thread-id]").length ?? 0,
         selectedThreadPresent:
@@ -170,7 +180,11 @@ async function writeToolCatalogWorkspaceFixture(workspaceRoot) {
   const deep = join(nested, "deep");
   await mkdir(deep, { recursive: true });
   await Promise.all([
-    writeFile(join(workspaceRoot, "catalog", "root.txt"), `${toolCatalogFixtureMarkers.grep}\n`, "utf8"),
+    writeFile(
+      join(workspaceRoot, "catalog", "root.txt"),
+      `${toolCatalogFixtureMarkers.grep}\n`,
+      "utf8",
+    ),
     writeFile(join(nested, "nested.txt"), `${HIDDEN_CONTENT}\n`, "utf8"),
     writeFile(join(deep, "deep.txt"), `${HIDDEN_CONTENT}_DEEP\n`, "utf8"),
   ]);
@@ -230,16 +244,22 @@ async function selectThread(page, threadId, deadline) {
   );
 }
 
-/** 等待真实应用 ready、运行时连接和消息 Composer，排除静态页面 preview；项目选择由生命周期 helper 负责。 */
+/** 直接核对原生握手而不依赖可移除的状态装饰，仍排除静态 preview 与未连接运行时。 */
 async function waitForApplication(page, deadline) {
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor({
     state: "visible",
     timeout: timeout(deadline),
   });
-  await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
+  await waitForCondition(
+    "native runtime ready",
+    () =>
+      page.evaluate(async () => {
+        const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+        const state = await createRuntimeHostAdapter().state();
+        return state.status === "ready" && state.generation > 0;
+      }),
+    deadline,
+  );
   await page.getByRole("textbox", { name: "消息", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -291,9 +311,7 @@ async function expandProcess(page, deadline) {
 
 /** 按真实 toolName 定位 Tool 详情；presentation kind 可以继续把只读工具归到 READ。 */
 function toolDetails(processLocator, name) {
-  return processLocator.locator(
-    `.ja-tool-details:has(.ja-tool-details__identity code[title="${name}"])`,
-  );
+  return processLocator.locator(`.ja-tool-details[data-tool-name="${name}"]`);
 }
 
 /** 读取真实 DOM 的动作、工具名、目标、状态和公开诊断正文，避免只按截图或退出码验收。 */
@@ -302,15 +320,14 @@ async function projectToolDetails(processLocator) {
     items.map((item) => {
       const trigger = item.querySelector(".ja-tool-details__trigger");
       const identity = item.querySelector(".ja-tool-details__identity");
-      const tool = identity?.querySelector("code[title]");
       const action = identity?.querySelector(".ja-tool-details__label");
       const target = item.querySelector(".ja-tool-details__target");
-      const output = item.querySelector(".ja-tool-details__output");
+      const output = item.querySelector(".ja-tool-details__output, .ja-tool-result-list");
       return {
-        toolName: tool?.getAttribute("title") ?? tool?.textContent?.trim() ?? "",
+        toolName: item.getAttribute("data-tool-name") ?? "",
         action: action?.textContent?.trim() ?? "",
         target: target?.textContent?.trim() ?? "",
-        status: output?.getAttribute("data-status") ?? "",
+        status: item.getAttribute("data-status") ?? "",
         triggerLabel: trigger?.getAttribute("aria-label") ?? "",
         expanded: trigger?.getAttribute("aria-expanded") ?? "",
         output: output?.textContent?.trim() ?? "",
@@ -319,15 +336,14 @@ async function projectToolDetails(processLocator) {
   );
 }
 
-/** Tool 行必须把动作、真实名称与首个目标放在同一可访问入口，并保留稳定状态。 */
+/** 紧凑行不重复工具名称，但可访问入口与数据身份必须保留准确工具和首个目标。 */
 async function assertToolIdentity(details, name, targetPattern) {
   const trigger = details.locator(".ja-tool-details__trigger");
   await trigger.waitFor({ state: "visible" });
   const label = await trigger.getAttribute("aria-label");
   const action = await details.locator(".ja-tool-details__label").textContent();
   const expectedAction = TOOL_ACTIONS[name];
-  const visibleName = details.locator(`.ja-tool-details__identity code[title="${name}"]`);
-  assert.ok((await visibleName.count()) > 0, `${name} must be visible in its Tool identity`);
+  assert.equal(await details.getAttribute("data-tool-name"), name);
   assert.notEqual(expectedAction, undefined, `${name} must have a closed action contract`);
   assert.equal(action?.trim(), expectedAction, `${name} must expose its exact action label`);
   assert.ok(label?.includes(name), `${name} must be in the accessible Tool summary`);
@@ -344,12 +360,13 @@ async function expandSuccessfulTool(details, name, targetPattern, deadline) {
     `${name} must be collapsed before the runner opens it`,
   );
   await trigger.click({ timeout: timeout(deadline) });
-  const output = details.locator('.ja-tool-details__output[data-status="success"]');
+  const output = details.locator(".ja-tool-details__output, .ja-tool-result-list");
+  assert.equal(await details.getAttribute("data-status"), "success");
   await output.waitFor({ state: "visible", timeout: timeout(deadline) });
   return output;
 }
 
-/** 真实回放单次 Tool 目录验收，并在空 query 失败后停在 UI 让 runner 观察。 */
+/** 真实回放当前 pattern 契约，并暂停纠错让 runner 核对用户可见诊断与恢复。 */
 export async function runToolCatalogWebView2({ page, workspaceRoot, evidenceDirectory, fixture }) {
   assert.ok(page, "page is required");
   assert.ok(workspaceRoot, "workspaceRoot is required");
@@ -389,22 +406,27 @@ export async function runToolCatalogWebView2({ page, workspaceRoot, evidenceDire
     "failed grep must be automatically expanded",
   );
   const invalidOutputText = await invalidOutput.textContent();
-  assert.match(invalidOutputText, /query/iu);
+  assert.match(invalidOutputText, /pattern/iu);
   assert.match(invalidOutputText, /(minLength|non-empty)/iu);
   assert.match(invalidOutputText, /(correct.*argument|retry)/iu);
   await assertToolIdentity(invalidGrep, "grep", /\.|catalog/u);
   fixture.releaseInvalidCorrection();
 
   for (const name of ["grep", "find", "ls"]) {
-    await toolDetails(liveProcess, name).last().waitFor({
+    await toolDetails(liveProcess, name)
+      .last()
+      .waitFor({
+        state: "visible",
+        timeout: timeout(deadline),
+      });
+  }
+  await page
+    .getByText(toolCatalogFixtureMarkers.final, { exact: false })
+    .last()
+    .waitFor({
       state: "visible",
       timeout: timeout(deadline),
     });
-  }
-  await page.getByText(toolCatalogFixtureMarkers.final, { exact: false }).last().waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
   await waitForCondition(
     "completed tool catalog turn",
     () =>
@@ -432,7 +454,7 @@ export async function runToolCatalogWebView2({ page, workspaceRoot, evidenceDire
   );
   const liveInvalid = liveTools[0];
   assert.equal(liveInvalid.status, "error");
-  assert.match(liveInvalid.output, /query/iu);
+  assert.match(liveInvalid.output, /pattern/iu);
   assert.match(liveInvalid.output, /(minLength|non-empty)/iu);
   assert.match(liveInvalid.output, /(correct.*argument|retry)/iu);
   assert.equal(liveInvalid.expanded, "true");
@@ -454,10 +476,13 @@ export async function runToolCatalogWebView2({ page, workspaceRoot, evidenceDire
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await waitForApplication(page, deadline);
   await restoreProjectAndThread(page, created.threadId, deadline);
-  await page.getByText(toolCatalogFixtureMarkers.final, { exact: false }).last().waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
+  await page
+    .getByText(toolCatalogFixtureMarkers.final, { exact: false })
+    .last()
+    .waitFor({
+      state: "visible",
+      timeout: timeout(deadline),
+    });
   const restoredProcess = await expandProcess(page, deadline);
   const restoredSuccessfulDetails = [
     ["grep", toolDetails(restoredProcess, "grep").last()],
@@ -531,7 +556,8 @@ export async function runToolCatalogWebView2({ page, workspaceRoot, evidenceDire
     },
     workspace: {
       findReturnsPathsOnly: !findOutput.includes(HIDDEN_CONTENT),
-      lsIsNonRecursive: !lsOutput.includes("nested/nested.txt") && !lsOutput.includes("nested\\nested.txt"),
+      lsIsNonRecursive:
+        !lsOutput.includes("nested/nested.txt") && !lsOutput.includes("nested\\nested.txt"),
       fixtureFiles: [files.root, files.nested, files.deep],
     },
     finalVisible: true,
@@ -551,14 +577,20 @@ export function validateToolCatalogReport(report) {
   assert.equal(report?.provider?.kind, "deterministic_loopback");
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.provider?.toolCalls, 4);
-  for (const name of REQUIRED_BASE_TOOLS) assert.ok(report?.provider?.defaultCatalog?.includes(name));
+  for (const name of REQUIRED_BASE_TOOLS)
+    assert.ok(report?.provider?.defaultCatalog?.includes(name));
   for (const name of FORBIDDEN_DEFAULT_TOOLS) {
     assert.equal(report?.provider?.defaultCatalog?.includes(name), false);
   }
   assert.equal(report?.live?.failedGrepExpanded, true);
   assert.equal(report?.live?.actionsVisible, true);
   assert.equal(report?.live?.targetsVisible, true);
-  assert.deepEqual(report?.live?.sequence, ["grep:error", "grep:success", "find:success", "ls:success"]);
+  assert.deepEqual(report?.live?.sequence, [
+    "grep:error",
+    "grep:success",
+    "find:success",
+    "ls:success",
+  ]);
   assert.equal(report?.reload?.sameThread, true);
   assert.equal(report?.reload?.failedGrepExpanded, true);
   assert.equal(report?.reload?.errorIdentityPreserved, true);
@@ -584,6 +616,8 @@ async function main() {
       untrackedFiles: 0,
       hiddenWindow: true,
       preserveFailedProfile: true,
+      // 首次初始化隔离 WebView2 profile 后再启用 CDP，不改变用户实例或超时预算。
+      prewarmWebview: true,
       driver: async (driverOptions) => {
         try {
           return await runToolCatalogWebView2({ ...driverOptions, fixture });

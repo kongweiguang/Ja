@@ -12,13 +12,14 @@ import {
   MenuSeparator,
   PointerContextMenu,
 } from "@/shared/ui/primitives";
+import { observeElementOffsetWhileActive } from "@/shared/ui/observeElementOffsetWhileActive";
 import type { FilesSearchResult } from "../application/types";
 import type { SearchPanelProps } from "./types";
 import "./SearchPanel.css";
 
 /**
  * Search Index 始终留在 Runtime，Files UI 只 virtualize application projection，
- * 避免前端建立第二套文件系统索引或越过 Files controller。
+ * 避免前端建立第二套文件系统索引或越过 Files controller；卸载后屏蔽 core debounce 尾回调。
  */
 export function SearchPanel({
   query,
@@ -92,6 +93,7 @@ export function SearchPanel({
   const rowVirtualizer = useVirtualizer({
     // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
     useFlushSync: false,
+    observeElementOffset: observeElementOffsetWhileActive,
     count: results.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 58,

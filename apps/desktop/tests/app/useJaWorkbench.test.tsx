@@ -15,7 +15,6 @@ import { capabilityWorkbenchTab } from "@/features/workbench";
 const project: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_fixture",
-  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\ja",
   displayName: "ja",
   trust: "trusted",
@@ -72,6 +71,7 @@ function createAdapters(): JaWorkbenchAdapters {
   return {
     workspace: {} as JaWorkbenchAdapters["workspace"],
     review: {} as JaWorkbenchAdapters["review"],
+    aiReview: {} as JaWorkbenchAdapters["aiReview"],
     terminal: {} as JaWorkbenchAdapters["terminal"],
     preview,
   };

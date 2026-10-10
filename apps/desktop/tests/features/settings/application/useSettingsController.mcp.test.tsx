@@ -99,7 +99,7 @@ function optionsFor(
       saveProjectMcpServers: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
-      restoreLastKnownGood: vi.fn(async () => "cfg_user"),
+      repairConfiguration: vi.fn(async () => ({ version: "cfg_user" })),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
       revealProviderCredential: vi.fn(async () => null),
@@ -202,7 +202,7 @@ describe("useSettingsController MCP state", () => {
     expect(server?.lastError).toBeUndefined();
   });
 
-  /** RPC rejection also becomes an authoritative card error instead of leaving the prior unknown state. */
+  /** RPC 拒绝也会生成权威卡片错误，不会保留先前的未知状态。 */
   it("MCP probe RPC 异常写入错误状态且不读取工具目录", async () => {
     const document = documentWithMcp(MCP);
     const listMcpTools = vi.fn(async () => ({ items: [], nextCursor: null }));

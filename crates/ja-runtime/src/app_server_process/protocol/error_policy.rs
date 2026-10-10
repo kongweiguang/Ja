@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! JA-RPC v1 错误目录投影、消息脱敏与稳定 codec 错误分类。
+//! JA-RPC v2 错误目录投影、消息脱敏与稳定 codec 错误分类。
 
 use super::catalog as codec_catalog;
 use super::codec::{is_ready_token_key, is_token_shaped};
@@ -60,12 +60,32 @@ pub struct RpcError {
 }
 
 impl std::fmt::Debug for RpcError {
-    /// 保留可定位的错误结构，同时移除 challenge 值与 marker key。
+    /// 保留可定位的错误结构，同时隐藏 challenge 值及公开 Busy 摘要里的 Thread 标题。
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let is_workspace_busy = self.data.as_object().is_some_and(|data| {
+            let error_code = data
+                .get("errorCode")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let category = data
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let retryable = data
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            is_workspace_busy_tuple(self.code, error_code, category, retryable)
+        });
+        let message = if is_workspace_busy {
+            "<workspace busy summary redacted>".to_owned()
+        } else {
+            redact_debug_text(&self.message)
+        };
         formatter
             .debug_struct("RpcError")
             .field("code", &self.code)
-            .field("message", &redact_debug_text(&self.message))
+            .field("message", &message)
             .field("data", &redact_debug_value(&self.data))
             .finish()
     }
@@ -135,7 +155,6 @@ pub(super) fn parse_error(object: &Map<String, Value>) -> Result<RpcError, Codec
     let message = object
         .get("message")
         .and_then(Value::as_str)
-        .filter(|message| valid_error_message(message))
         .ok_or(CodecError::InvalidEnvelope)?
         .to_owned();
     let data = object.get("data").ok_or(CodecError::InvalidEnvelope)?;
@@ -224,9 +243,6 @@ fn valid_error_id(identifier: &str) -> bool {
 
 /// 复用 decode 的 error 约束校验手工 response，防止内部 caller 绕过 schema。
 pub(super) fn validate_error(error: &RpcError) -> Result<(), CodecError> {
-    if !valid_error_message(&error.message) {
-        return Err(CodecError::InvalidEnvelope);
-    }
     if !(-32_768..=-32_000).contains(&error.code) {
         return Err(CodecError::InvalidErrorCatalog);
     }
@@ -246,10 +262,33 @@ pub(super) fn validate_error(error: &RpcError) -> Result<(), CodecError> {
         .get("retryable")
         .and_then(Value::as_bool)
         .ok_or(CodecError::InvalidErrorCatalog)?;
-    // code/errorCode/category/retryable 是唯一稳定分类元组，展示消息不得参与目录判定。
+    // 先冻结并核验错误 tuple，之后才允许唯一的公开 Busy 摘要分支绕过通用诊断 scanner。
     catalog_entry(error.code, error_code, category, retryable)
         .ok_or(CodecError::InvalidErrorCatalog)?;
+    let valid_message = if is_workspace_busy_tuple(error.code, error_code, category, retryable)
+        && error.message.starts_with("暂时无法更改项目目录：")
+    {
+        valid_workspace_busy_message(&error.message)
+    } else {
+        valid_error_message(&error.message)
+    };
+    if !valid_message {
+        return Err(CodecError::InvalidEnvelope);
+    }
     Ok(())
+}
+
+/// 仅识别 catalog 已冻结的 Busy tuple；任何相似错误都继续经过通用消息过滤。
+fn is_workspace_busy_tuple(code: i64, error_code: &str, category: &str, retryable: bool) -> bool {
+    code == -32_100 && error_code == "WORKSPACE_BUSY" && category == "conflict" && retryable
+}
+
+/// 项目门禁可公开最多 512 UTF-8 bytes 的既有 Thread 标题摘要，但不接纳诊断或控制字符。
+fn valid_workspace_busy_message(message: &str) -> bool {
+    !message.is_empty()
+        && message.len() <= 512
+        && message.starts_with("暂时无法更改项目目录：")
+        && !message.chars().any(char::is_control)
 }
 
 /// 只允许 bounded、可显示的错误 message，拒绝把路径、凭据或 challenge

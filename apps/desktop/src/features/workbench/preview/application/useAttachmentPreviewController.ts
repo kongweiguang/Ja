@@ -4,7 +4,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   actualSizeAttachmentZoom,
-  alternateAttachmentResourceUrl,
   attachmentPreviewTargetKey,
   ATTACHMENT_TEXT_CHUNK_BYTES,
   ATTACHMENT_TEXT_PREVIEW_LIMIT_BYTES,
@@ -25,6 +24,8 @@ export interface AttachmentPreviewControllerOptions {
 export interface AttachmentPreviewActions {
   dismiss: () => void;
   retry: () => void;
+  /** ACK 后只关闭授权 Thread 属于服务端关闭集合的当前附件 session。 */
+  closeForThreads: (threadIds: readonly string[]) => Promise<void>;
   zoomIn: () => void;
   zoomOut: () => void;
   fit: () => void;
@@ -99,12 +100,102 @@ export function useAttachmentPreviewController({
   const [retryVersion, setRetryVersion] = useState(0);
   const generationRef = useRef(0);
   const sessionRef = useRef<string | undefined>(undefined);
-  const imageFallbackAttemptsRef = useRef(new Set<string>());
+  const sessionTargetKeyRef = useRef<string | undefined>(undefined);
+  const cleanupFailureRef = useRef<
+    { readonly sessionId: string; readonly target: AttachmentPreviewTarget } | undefined
+  >(undefined);
+  const closingSessionRef = useRef<
+    { readonly sessionId: string; readonly promise: Promise<boolean> } | undefined
+  >(undefined);
+  const openingRef = useRef<
+    { readonly targetKey: string; readonly promise: Promise<void> } | undefined
+  >(undefined);
   const targetRef = useRef(target);
   const portRef = useRef(port);
   targetRef.current = target;
   portRef.current = port;
   const targetKey = attachmentPreviewTargetKey(target);
+
+  /** sessionId 只由当前 owner 关闭；失败记录保留身份，供现有预览错误动作重试。 */
+  const closeOwnedSession = useCallback(
+    (sessionId: string, ownerTarget: AttachmentPreviewTarget): Promise<boolean> => {
+      const pending = closingSessionRef.current;
+      if (pending?.sessionId === sessionId) return pending.promise;
+      const operation = (async (): Promise<boolean> => {
+        const currentPort = portRef.current;
+        if (currentPort === undefined) {
+          cleanupFailureRef.current = { sessionId, target: ownerTarget };
+          return false;
+        }
+        try {
+          await currentPort.close(sessionId);
+          if (sessionRef.current === sessionId) {
+            sessionRef.current = undefined;
+            sessionTargetKeyRef.current = undefined;
+          }
+          if (cleanupFailureRef.current?.sessionId === sessionId)
+            cleanupFailureRef.current = undefined;
+          return true;
+        } catch {
+          cleanupFailureRef.current = { sessionId, target: ownerTarget };
+          return false;
+        }
+      })();
+      const close = { sessionId, promise: operation };
+      closingSessionRef.current = close;
+      void operation.then(() => {
+        if (closingSessionRef.current === close) closingSessionRef.current = undefined;
+      });
+      return operation;
+    },
+    [],
+  );
+
+  /** 等当前 target 的 open/read 收敛，再确认关闭 session；失败时保留 target 供重试。 */
+  const closeTarget = useCallback(
+    async (currentTarget: AttachmentPreviewTarget): Promise<boolean> => {
+      const key = attachmentPreviewTargetKey(currentTarget);
+      const generation = ++generationRef.current;
+      const opening = openingRef.current;
+      if (opening?.targetKey === key) await opening.promise;
+      if (
+        generationRef.current !== generation ||
+        attachmentPreviewTargetKey(targetRef.current) !== key
+      )
+        return false;
+
+      const failedSession = cleanupFailureRef.current;
+      if (failedSession !== undefined && attachmentPreviewTargetKey(failedSession.target) === key) {
+        setProjection({
+          status: "error",
+          target: currentTarget,
+          message: "预览资源清理失败，请重试。",
+          retryable: true,
+        });
+        return false;
+      }
+
+      const sessionId = sessionTargetKeyRef.current === key ? sessionRef.current : undefined;
+      if (sessionId !== undefined && !(await closeOwnedSession(sessionId, currentTarget))) {
+        setProjection({
+          status: "error",
+          target: currentTarget,
+          message: "预览资源清理失败，请重试。",
+          retryable: true,
+        });
+        return false;
+      }
+      if (
+        generationRef.current !== generation ||
+        attachmentPreviewTargetKey(targetRef.current) !== key
+      )
+        return false;
+      setProjection(undefined);
+      onDismiss?.(currentTarget);
+      return true;
+    },
+    [closeOwnedSession, onDismiss],
+  );
 
   /** target identity 或 retry 变化时重开唯一 session，并在 text 场景内完成有界聚合。 */
   useEffect(() => {
@@ -132,7 +223,7 @@ export function useAttachmentPreviewController({
         ? current
         : { status: "loading", target: currentTarget },
     );
-    void (async (): Promise<void> => {
+    const opening = (async (): Promise<void> => {
       let openedSession: string | undefined;
       try {
         const session = await port.open({
@@ -141,12 +232,13 @@ export function useAttachmentPreviewController({
         });
         openedSession = session.previewSessionId;
         if (generationRef.current !== generation) {
-          await port.close(session.previewSessionId).catch(() => undefined);
+          await closeOwnedSession(session.previewSessionId, currentTarget);
           return;
         }
         if (session.mediaKind === "image") {
           if (session.resourceUrl === undefined) throw new Error(ATTACHMENT_PREVIEW_ERROR);
           sessionRef.current = session.previewSessionId;
+          sessionTargetKeyRef.current = attachmentPreviewTargetKey(currentTarget);
           setProjection({
             status: "ready",
             target: currentTarget,
@@ -159,10 +251,11 @@ export function useAttachmentPreviewController({
         }
         const content = await readTextPreview(port, session.previewSessionId);
         if (generationRef.current !== generation) {
-          await port.close(session.previewSessionId).catch(() => undefined);
+          await closeOwnedSession(session.previewSessionId, currentTarget);
           return;
         }
         sessionRef.current = session.previewSessionId;
+        sessionTargetKeyRef.current = attachmentPreviewTargetKey(currentTarget);
         setProjection({
           status: "ready",
           target: currentTarget,
@@ -173,20 +266,42 @@ export function useAttachmentPreviewController({
           await port.close(previousSession).catch(() => undefined);
       } catch (error) {
         if (generationRef.current !== generation) {
-          if (openedSession !== undefined) await port.close(openedSession).catch(() => undefined);
+          if (openedSession !== undefined) await closeOwnedSession(openedSession, currentTarget);
           return;
         }
-        if (openedSession !== undefined) await port.close(openedSession).catch(() => undefined);
+        if (openedSession !== undefined) {
+          const closed = await closeOwnedSession(openedSession, currentTarget);
+          if (!closed) {
+            setProjection({
+              status: "error",
+              target: currentTarget,
+              message: "预览资源清理失败，请重试。",
+              retryable: true,
+            });
+            return;
+          }
+        }
         if (previousSession !== undefined) await port.close(previousSession).catch(() => undefined);
-        sessionRef.current = undefined;
+        if (sessionRef.current === openedSession) {
+          sessionRef.current = undefined;
+          sessionTargetKeyRef.current = undefined;
+        }
         const failure = projectAttachmentError(error);
         setProjection({ status: "error", target: currentTarget, ...failure });
       }
     })();
+    const openOperation = {
+      targetKey: attachmentPreviewTargetKey(currentTarget),
+      promise: opening,
+    };
+    openingRef.current = openOperation;
+    void opening.then(() => {
+      if (openingRef.current === openOperation) openingRef.current = undefined;
+    });
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [port, retryVersion, targetKey]);
+  }, [closeOwnedSession, port, retryVersion, targetKey]);
 
   /** 组件最终卸载时释放最后一个 session；target 间切换由上方 handoff 保持无闪断。 */
   useEffect(
@@ -199,25 +314,59 @@ export function useAttachmentPreviewController({
     [],
   );
 
-  /** 返回网页前先使当前 generation 失效；close 失败也不能继续把附件资源显示在 DOM 中。 */
+  /** 返回网页前先确认 native close；关闭失败则保留可重试投影，不丢 session identity。 */
   const dismiss = useCallback((): void => {
     const currentTarget = targetRef.current;
-    generationRef.current += 1;
-    const sessionId = sessionRef.current;
-    sessionRef.current = undefined;
-    setProjection(undefined);
-    if (sessionId !== undefined && port !== undefined)
-      void port.close(sessionId).catch(() => undefined);
-    if (currentTarget !== undefined) onDismiss?.(currentTarget);
-  }, [onDismiss, port]);
+    if (currentTarget !== undefined) void closeTarget(currentTarget);
+  }, [closeTarget]);
+
+  /** 关闭回执包含完整 Thread 范围；不匹配的父 Thread 附件和其它 Host 资源不受影响。 */
+  const closeForThreads = useCallback(
+    async (threadIds: readonly string[]): Promise<void> => {
+      const currentTarget = targetRef.current;
+      if (
+        currentTarget?.authorization.kind !== "thread" ||
+        !threadIds.includes(currentTarget.authorization.threadId)
+      )
+        return;
+      await closeTarget(currentTarget);
+    },
+    [closeTarget],
+  );
 
   /** 重试只推进本地版本，effect 负责关闭旧 session 后重新授权。 */
   const retry = useCallback((): void => {
     const currentTarget = targetRef.current;
-    if (currentTarget !== undefined)
-      imageFallbackAttemptsRef.current.delete(attachmentPreviewTargetKey(currentTarget));
+    const failedSession = cleanupFailureRef.current;
+    if (
+      failedSession !== undefined &&
+      currentTarget !== undefined &&
+      attachmentPreviewTargetKey(failedSession.target) === attachmentPreviewTargetKey(currentTarget)
+    ) {
+      const generation = ++generationRef.current;
+      void closeOwnedSession(failedSession.sessionId, failedSession.target).then((closed) => {
+        if (!closed) {
+          setProjection({
+            status: "error",
+            target: failedSession.target,
+            message: "预览资源清理失败，请重试。",
+            retryable: true,
+          });
+          return;
+        }
+        if (
+          generationRef.current === generation &&
+          attachmentPreviewTargetKey(targetRef.current) ===
+            attachmentPreviewTargetKey(failedSession.target)
+        ) {
+          setProjection(undefined);
+          onDismiss?.(failedSession.target);
+        }
+      });
+      return;
+    }
     setRetryVersion((current) => current + 1);
-  }, []);
+  }, [closeOwnedSession, onDismiss]);
 
   /** 图片缩放转换集中更新 ready/image 分支，文本与错误投影保持不变。 */
   const updateZoom = useCallback(
@@ -254,19 +403,10 @@ export function useAttachmentPreviewController({
     [updateZoom],
   );
 
-  /** 图片协议请求失败只替换右栏投影，不影响附件自身可发送状态。 */
+  /** 图片加载失败不改写 native 签发 origin；用户可走既有显式重试或关闭路径。 */
   const reportImageFailure = useCallback((): void => {
     setProjection((current) => {
       if (current?.status !== "ready" || current.content.kind !== "image") return current;
-      const targetKey = attachmentPreviewTargetKey(current.target);
-      const fallback = alternateAttachmentResourceUrl(current.content.resourceUrl);
-      if (fallback !== undefined && !imageFallbackAttemptsRef.current.has(targetKey)) {
-        imageFallbackAttemptsRef.current.add(targetKey);
-        return {
-          ...current,
-          content: { ...current.content, resourceUrl: fallback },
-        };
-      }
       return {
         status: "error",
         target: current.target,
@@ -277,8 +417,17 @@ export function useAttachmentPreviewController({
   }, []);
 
   const actions = useMemo<AttachmentPreviewActions>(
-    () => ({ dismiss, retry, zoomIn, zoomOut, fit, actualSize, reportImageFailure }),
-    [actualSize, dismiss, fit, reportImageFailure, retry, zoomIn, zoomOut],
+    () => ({
+      dismiss,
+      retry,
+      closeForThreads,
+      zoomIn,
+      zoomOut,
+      fit,
+      actualSize,
+      reportImageFailure,
+    }),
+    [actualSize, closeForThreads, dismiss, fit, reportImageFailure, retry, zoomIn, zoomOut],
   );
   return { projection, actions };
 }

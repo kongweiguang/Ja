@@ -8,6 +8,8 @@
 export interface TimelineChronologyCandidate<T> {
   readonly identity: string;
   readonly occurredAt?: string;
+  /** Conversation row 的权威输入序号；仅作为同毫秒因果次序，identity 仍负责持久去重。 */
+  readonly causalOrder?: number;
   readonly value: T;
 }
 
@@ -25,8 +27,10 @@ function occurrenceMillis(value: string | undefined): number | undefined {
 }
 
 /**
- * 将 Conversation 与外部持久活动投影到同一确定性总序。重复 identity 采用最后一个权威投影，
- * 已提交事实按服务端时间排序；同毫秒与未提交事实再按 identity 排序，使 live、reload 和重放一致。
+ * 将 Conversation 与外部持久活动投影到同一确定性总序。重复 identity 采用最后一个权威投影；
+ * 同毫秒时先按固定的有序组区分 Conversation 与 external，再使用 Conversation 因果序号或稳定 identity，
+ * 让 snapshot 的 display Turn ID 不会覆盖因果顺序，同时确保混排比较满足传递性。
+ * @author kongweiguang
  */
 export function projectTimelineChronology<T>(
   candidates: readonly TimelineChronologyCandidate<T>[],
@@ -41,6 +45,14 @@ export function projectTimelineChronology<T>(
     }
     if (leftTime !== undefined && rightTime === undefined) return -1;
     if (leftTime === undefined && rightTime !== undefined) return 1;
+    // 先比较固定分组，再比较组内顺序，保证 conversation/external 混排仍是传递的总序。
+    const leftHasCausalOrder = left.causalOrder !== undefined;
+    const rightHasCausalOrder = right.causalOrder !== undefined;
+    if (leftHasCausalOrder !== rightHasCausalOrder) return leftHasCausalOrder ? -1 : 1;
+    if (left.causalOrder !== undefined && right.causalOrder !== undefined) {
+      if (left.causalOrder < right.causalOrder) return -1;
+      if (left.causalOrder > right.causalOrder) return 1;
+    }
     return compareIdentity(left.identity, right.identity);
   });
 }

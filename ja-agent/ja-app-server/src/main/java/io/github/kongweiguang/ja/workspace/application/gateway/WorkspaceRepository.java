@@ -1,0 +1,56 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.workspace.application.gateway;
+
+import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
+import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
+
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Optional;
+
+/**
+ * 隔离 workspace application 与 SQLite、MyBatis、事务和游标编码实现。
+ */
+public interface WorkspaceRepository {
+    /**
+     * 幂等注册一个由应用层派生身份的规范目录，并返回持久化权威 revision。
+     */
+    Workspace register(Workspace.Registration registration);
+
+    /**
+     * kind 在 SQL 查询阶段约束 keyset page，避免应用层过滤造成遗漏或无界扫描。
+     */
+    CursorPage<Workspace> list(String cursor, int limit, Workspace.Kind kind);
+
+    /**
+     * 按 opaque 身份读取工作区，不产生注册副作用。
+     */
+    Optional<Workspace> findById(String workspaceId);
+
+    /**
+     * 按规范根读取工作区，供并发打开与进程重启复用同一身份。
+     */
+    Optional<Workspace> findByRoot(Path canonicalRoot);
+
+    /**
+     * 更新持久化信任状态并返回新的权威 revision。
+     */
+    Workspace updateTrust(String workspaceId, Workspace.Trust trust);
+
+    /**
+     * 在一个 SQLite 事务内执行 Workspace revision CAS、根唯一性和运行中 Turn/Plan 检查。
+     */
+    Workspace updateProject(String workspaceId,
+                            long expectedRevision,
+                            Path root,
+                            String displayName,
+                            boolean rootChanged,
+                            Instant occurredAt);
+
+    /**
+     * 通过 revision CAS 删除注册元数据，不接触目录内容。
+     */
+    void unregister(String workspaceId, long expectedRevision);
+}

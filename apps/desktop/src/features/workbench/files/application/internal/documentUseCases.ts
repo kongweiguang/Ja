@@ -36,6 +36,7 @@ interface DocumentUseCasesContext {
   documents: ControllerRef<Record<string, OpenDocument>>;
   documentOrder: ControllerRef<string[]>;
   activePath: ControllerRef<string | undefined>;
+  openIntentSequence: ControllerRef<number>;
   workspaceGeneration: ControllerRef<number>;
   revisions: ControllerRef<Map<string, FileRevision>>;
   inFlight: ControllerRef<Map<string, number>>;
@@ -73,6 +74,8 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
     path: string,
     reveal?: { line: number; column?: number },
   ): Promise<boolean> {
+    if (context.lifecycleFence.current) return false;
+    const openIntent = ++context.openIntentSequence.current;
     const existing = context.documents.current[path];
     if (existing !== undefined) {
       context.setActivePath(path);
@@ -91,7 +94,12 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
         workspaceId: context.workspaceId,
         relativePath: path,
       });
-      if (generation !== context.workspaceGeneration.current) return false;
+      if (
+        generation !== context.workspaceGeneration.current ||
+        openIntent !== context.openIntentSequence.current ||
+        context.lifecycleFence.current
+      )
+        return false;
       const document = documentFromRead(result, reveal);
       context.revisions.current.set(path, document.revision);
       context.commitDocuments((current) =>
@@ -103,7 +111,8 @@ export function createDocumentUseCases(context: DocumentUseCasesContext): Docume
       context.setActivePath(path);
       return true;
     } catch {
-      context.onNotice?.("文件读取失败，请重试。");
+      if (openIntent === context.openIntentSequence.current && !context.lifecycleFence.current)
+        context.onNotice?.("文件读取失败，请重试。");
       return false;
     }
   }

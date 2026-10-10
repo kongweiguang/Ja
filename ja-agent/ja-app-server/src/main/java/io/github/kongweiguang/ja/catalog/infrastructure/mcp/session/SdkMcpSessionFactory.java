@@ -1,0 +1,218 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.catalog.infrastructure.mcp.session;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.kongweiguang.ja.agent.domain.json.JsonObject;
+import io.github.kongweiguang.ja.agent.domain.json.JsonValue;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.support.McpDeadline;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.support.McpJsonValues;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.support.McpLimits;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.support.McpServerDefinition;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.transport.JaBoundedHttpTransport;
+import io.github.kongweiguang.ja.catalog.infrastructure.mcp.transport.JaBoundedStdioTransport;
+import io.github.kongweiguang.ja.platform.windows.WindowsProcessLauncher;
+import io.modelcontextprotocol.client.McpClient;
+import io.modelcontextprotocol.client.McpSyncClient;
+import io.modelcontextprotocol.json.McpJsonMapper;
+import io.modelcontextprotocol.json.jackson2.JacksonMcpJsonMapper;
+import io.modelcontextprotocol.spec.McpClientTransport;
+import io.modelcontextprotocol.spec.McpSchema;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.TreeMap;
+
+/**
+ * 显式接线 Jackson 2 的 MCP Java SDK 适配器，不依赖 Runtime ServiceLoader 默认实现。
+ */
+public final class SdkMcpSessionFactory implements McpSessionFactory {
+    private final ObjectMapper objectMapper;
+    private final McpJsonMapper jsonMapper;
+    private final McpLimits limits;
+
+    /**
+     * 构建唯一生产 Session Factory，并显式绑定 SDK Mapper 以缩小 Native Image 反射面。
+     */
+    public SdkMcpSessionFactory(ObjectMapper objectMapper, McpLimits limits) {
+        this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper").copy();
+        this.jsonMapper = new JacksonMcpJsonMapper(this.objectMapper);
+        this.limits = Objects.requireNonNull(limits, "limits");
+    }
+
+    /**
+     * 在 Windows 环境名不区分大小写的前提下冻结宿主基线与 MCP 配置覆盖；同一份快照同时供预检查和启动，
+     * 让两条路径解析出相同的 PATH，并避免把完整宿主环境存进配置代际。
+     */
+    static Map<String, String> inheritedEnvironment(
+            Map<String, String> hostEnvironment, Map<String, String> configuredEnvironment) {
+        Objects.requireNonNull(hostEnvironment, "hostEnvironment");
+        Objects.requireNonNull(configuredEnvironment, "configuredEnvironment");
+        TreeMap<String, String> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        merged.putAll(hostEnvironment);
+        TreeMap<String, String> overlay = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        configuredEnvironment.forEach((name, value) -> {
+            if (overlay.containsKey(name)) {
+                throw new IllegalArgumentException("mcp_stdio_environment_conflict");
+            }
+            overlay.put(name, value);
+        });
+        overlay.forEach((name, value) -> {
+            merged.remove(name);
+            merged.put(name, value);
+        });
+        return Map.copyOf(merged);
+    }
+
+    /**
+     * 只使用 Java 配置代际解析出的私有定义，并禁用不完整的 SDK Schema 缓存。
+     */
+    @Override
+    public McpSession open(McpServerDefinition definition, McpDeadline deadline) {
+        return open(definition, deadline, () -> {
+        });
+    }
+
+    /**
+     * 把自有传输看到的原始 list_changed 直接发布给目录 owner，避免 SDK 自动聚合绕过 Ja 预算。
+     */
+    @Override
+    public McpSession open(
+            McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged) {
+        return open(definition, deadline, toolsChanged, System.getenv());
+    }
+
+    /**
+     * stdio 只继承当前 Turn 冻结的完整宿主环境，再叠加 Java 配置的 MCP 专属变量；
+     * HTTP 仍只使用配置的 endpoint/header，不能因环境快照触发额外透传。
+     */
+    @Override
+    public McpSession open(
+            McpServerDefinition definition, McpDeadline deadline, Runnable toolsChanged,
+            Map<String, String> hostEnvironment) {
+        Objects.requireNonNull(deadline, "deadline");
+        Objects.requireNonNull(toolsChanged, "toolsChanged");
+        Objects.requireNonNull(hostEnvironment, "hostEnvironment");
+        McpClientTransport transport;
+        if (definition.transport() == McpServerDefinition.Transport.STDIO) {
+            Map<String, String> processEnvironment = inheritedEnvironment(
+                    hostEnvironment, definition.environment());
+            try {
+                WindowsProcessLauncher.verifyExecutableAvailable(
+                        definition.command(), definition.workingDirectory(), processEnvironment);
+            } catch (IOException failure) {
+                throw new IllegalStateException("mcp_stdio_start_failed", failure);
+            }
+            transport = new JaBoundedStdioTransport(
+                    definition.command(),
+                    definition.workingDirectory(),
+                    processEnvironment,
+                    definition.protocolVersions(),
+                    jsonMapper,
+                    limits,
+                    deadline,
+                    toolsChanged);
+        } else {
+            transport = new JaBoundedHttpTransport(
+                    definition.endpoint(), definition.headers(), definition.protocolVersions(), jsonMapper,
+                    limits, deadline, toolsChanged);
+        }
+        McpSyncClient client = McpClient.sync(transport)
+                .requestTimeout(deadline.remaining(limits.requestTimeout(), "mcp_request_deadline_elapsed"))
+                .initializationTimeout(deadline.remaining(
+                        limits.startupTimeout(), "mcp_initialize_deadline_elapsed"))
+                .clientInfo(McpSchema.Implementation.builder("ja-kernel", "1").build())
+                .enableCallToolSchemaCaching(false)
+                .build();
+        return new SdkSession(client, objectMapper);
+    }
+
+    /**
+         * 将 SDK 与 Reactor 类型封闭在适配器内，对 Kernel 只暴露有界中性记录。
+     *
+     * @param client 客户端
+     * @param objectMapper JSON 对象映射器
+     */
+        private record SdkSession(McpSyncClient client,
+                                  ObjectMapper objectMapper) implements McpSession {
+        /**
+         * 每个服务独占一个 SDK Client，使 Gateway 取消能够关闭整个 Session。
+         */
+        private SdkSession {
+        }
+
+            /**
+             * 每个新 Session 只执行一次强制 MCP 生命周期握手。
+             */
+            @Override
+            public void initialize() {
+                client.initialize();
+            }
+
+            /**
+             * 首页面也使用 Cursor 重载，禁止 SDK 自动分页绕过聚合资源上限。
+             */
+            @Override
+            public ToolPage listTools(String cursor) {
+                McpSchema.ListToolsResult page = client.listTools(cursor);
+                List<RemoteTool> tools = page.tools().stream()
+                        .map(tool -> new RemoteTool(
+                                tool.name(),
+                                tool.description() == null || tool.description().isBlank()
+                                        ? "MCP tool " + tool.name()
+                                        : tool.description(),
+                                McpJsonValues.objectFromSdk(objectMapper, tool.inputSchema())))
+                        .toList();
+                return new ToolPage(tools, page.nextCursor());
+            }
+
+            /**
+             * 将所有 Content 变体转换为 JSON，防止二进制或 Provider 类型绕过结果预算。
+             */
+            @Override
+            public RemoteResult call(String toolName, JsonObject arguments) {
+                Map<String, Object> sdkArguments = McpJsonValues.toSdkArguments(objectMapper, arguments);
+                McpSchema.CallToolResult result = client.callTool(
+                        new McpSchema.CallToolRequest(toolName, sdkArguments, null));
+                List<RemoteImage> images = new java.util.ArrayList<>();
+                List<Object> visibleContent = new java.util.ArrayList<>();
+                for (McpSchema.Content block : result.content()) {
+                    if (block instanceof McpSchema.ImageContent image) {
+                        images.add(new RemoteImage(image.mimeType(), image.data()));
+                        visibleContent.add(Map.of("type", "image", "mimeType", image.mimeType(),
+                                "data", "[managed image]"));
+                    } else if (block instanceof McpSchema.EmbeddedResource embedded
+                            && embedded.resource() instanceof McpSchema.BlobResourceContents blob
+                            && blob.mimeType() != null && blob.mimeType().startsWith("image/")) {
+                        images.add(new RemoteImage(blob.mimeType(), blob.blob()));
+                        visibleContent.add(Map.of("type", "resource", "mimeType", blob.mimeType(),
+                                "uri", blob.uri(), "blob", "[managed image]"));
+                    } else {
+                        visibleContent.add(block);
+                    }
+                }
+                String content;
+                try {
+                    content = objectMapper.writeValueAsString(visibleContent);
+                } catch (Exception failure) {
+                    throw new IllegalStateException("mcp_result_serialization_failed", failure);
+                }
+                Optional<JsonValue> structured = result.structuredContent() == null
+                        ? Optional.empty()
+                        : Optional.of(McpJsonValues.fromSdk(objectMapper, result.structuredContent()));
+                return new RemoteResult(Boolean.TRUE.equals(result.isError()), content, structured, images);
+            }
+
+            /**
+             * 使用 SDK 有界优雅关闭，且不向调用方暴露易漂移的布尔诊断值。
+             */
+            @Override
+            public void close() {
+                client.closeGracefully();
+            }
+        }
+}

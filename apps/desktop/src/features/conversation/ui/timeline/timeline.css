@@ -152,9 +152,11 @@
 .ja-chat-message__actions {
   grid-area: actions;
   display: flex;
-  width: 1.75rem;
+  width: auto;
+  min-width: 1.75rem;
   min-height: 1.75rem;
   align-items: center;
+  gap: 0.2rem;
   opacity: 0;
   pointer-events: none;
   transform: translateY(2px);
@@ -164,8 +166,6 @@
 }
 
 .ja-chat-message-user .ja-chat-message__actions {
-  width: auto;
-  gap: 0.2rem;
   justify-self: end;
   margin-top: 0.08rem;
 }
@@ -183,6 +183,7 @@
 }
 
 .ja-chat-message-final .ja-chat-message__actions {
+  width: auto;
   justify-self: start;
   margin-left: var(--ja-turn-inline-inset, 8px);
   margin-top: 0.08rem;
@@ -781,11 +782,17 @@
 
 .ja-work-process__heading--archive {
   display: flex;
+  flex-wrap: wrap;
   min-width: 0;
   align-items: center;
   gap: 0.32rem;
-  overflow: hidden;
-  white-space: nowrap;
+}
+
+.ja-work-process__archive-label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.32rem;
 }
 
 .ja-work-process__heading--archive .ja-work-process__chevron {
@@ -793,12 +800,13 @@
 }
 
 .ja-work-process__archive-summary {
+  flex: 0 0 auto;
   min-width: 0;
-  overflow: hidden;
   color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
-  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .ja-work-process__archive-summary > span {
@@ -1012,9 +1020,14 @@
 .ja-work-step__icon {
   display: grid;
   place-items: center;
+  align-self: start;
   width: 1.24rem;
   height: 1.24rem;
   color: var(--ja-foreground-muted);
+}
+/* 图标只对齐 2rem 的 Tool 标题行，详情展开不能改变它的垂直位置。 */
+.ja-work-step:has(.ja-tool-details) > .ja-work-step__icon {
+  height: 2rem;
 }
 .ja-work-step__icon svg {
   width: 0.88rem;
@@ -1439,6 +1452,51 @@
   border-color: color-mix(in srgb, var(--ja-warning) 48%, var(--ja-border));
 }
 
+.ja-tool-media {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.ja-tool-media__item {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 2rem;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  overflow: hidden;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: var(--ja-surface-control);
+  font-size: var(--ja-text-caption-size);
+  text-align: left;
+}
+
+.ja-tool-media__item:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+
+.ja-tool-media__item:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-tool-media__item svg {
+  width: 0.95rem;
+  height: 0.95rem;
+  flex: 0 0 auto;
+}
+
+.ja-tool-media__item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 搜索与发现行是可扫描的数据表面，不套用浮层或按钮外观，避免把未接通的预览能力伪装成可点击操作。 */
 .ja-tool-result-list {
   display: grid;
@@ -1581,39 +1639,72 @@
 }
 
 .ja-turn-changes {
+  container: turn-changes / inline-size;
   display: grid;
   width: auto;
-  gap: 0.45rem;
+  min-width: 0;
   margin: 0.2rem var(--ja-turn-inline-inset, 8px) 0.75rem;
-  padding: 0.6rem 0.7rem;
+  overflow: hidden;
   border: 1px solid var(--ja-border);
-  border-radius: var(--ja-radius-md);
-  background: var(--ja-surface-control);
+  border-radius: var(--ja-radius-selection);
+  background: var(--ja-surface-raised);
 }
 
 .ja-turn-changes__header {
   display: grid;
   min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  min-height: 72px;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 0.45rem;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid var(--ja-border);
+  background: color-mix(in srgb, var(--ja-surface-muted) 35%, var(--ja-surface-raised));
 }
 
-.ja-turn-changes__header > svg {
-  width: 0.92rem;
-  height: 0.92rem;
+.ja-turn-changes__icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: var(--ja-radius-selection);
   color: var(--ja-foreground-muted);
+  background: var(--ja-content);
+}
+
+.ja-turn-changes__icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.ja-turn-changes__summary {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
 }
 
 .ja-turn-changes__header strong {
   color: var(--ja-foreground);
-  font-size: var(--ja-text-control-size);
+  font-size: var(--ja-text-subheading-size);
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-heading);
+  overflow-wrap: anywhere;
+}
+
+.ja-turn-changes__header > button {
+  min-height: 32px;
+  justify-self: end;
+  white-space: nowrap;
 }
 
 .ja-turn-changes__stats {
   display: inline-flex;
-  gap: 0.38rem;
-  font: var(--ja-text-caption-size) / 1 var(--ja-font-mono);
+  align-items: center;
+  gap: 6px;
+  font-size: var(--ja-text-control-size);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--ja-line-control);
+  white-space: nowrap;
 }
 
 .ja-turn-changes .is-addition {
@@ -1626,87 +1717,97 @@
 
 .ja-turn-changes__files {
   display: grid;
-  gap: 0.22rem;
   margin: 0;
-  padding: 0;
+  padding: 4px 6px;
   list-style: none;
 }
 
-/* 列表项只承载整行；三列布局仅属于内部控件，避免嵌套网格把文件名挤成零宽度。 */
+/* 列表项不建立第二层网格；路径与统计的两列布局只属于内部控件。 */
 .ja-turn-changes__files li {
   display: block;
   min-width: 0;
 }
 
-.ja-turn-changes__files li > button,
-.ja-turn-changes__files li > div {
+.ja-turn-changes__file {
   display: grid;
-  min-width: 0;
-  grid-template-columns: 3.2rem minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0.4rem;
-}
-
-.ja-turn-changes__files li > button,
-.ja-turn-changes__files li > div {
+  position: relative;
   width: 100%;
-  min-height: 2rem;
-  padding: 0 0.35rem;
+  min-width: 0;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 0 6px;
   border: 0;
   border-radius: var(--ja-radius-sm);
-  color: var(--ja-foreground-muted);
+  color: var(--ja-foreground);
   background: transparent;
   font: inherit;
-  font-size: var(--ja-text-caption-size);
+  font-family: var(--ja-font-ui);
+  font-size: var(--ja-text-body-size);
   text-align: left;
 }
 
-.ja-turn-changes__files li > button {
+button.ja-turn-changes__file {
   cursor: pointer;
   transition: background-color var(--ja-duration-fast) var(--ja-ease-native);
 }
 
-.ja-turn-changes__files li > button:hover {
+button.ja-turn-changes__file:hover {
   background: color-mix(in srgb, var(--ja-foreground) 5%, transparent);
 }
 
-.ja-turn-changes__files li > button:focus-visible {
+button.ja-turn-changes__file:focus-visible {
   outline: 2px solid var(--ja-focus);
   outline-offset: -2px;
 }
 
-.ja-turn-changes__files li > :is(button, div) > span {
-  color: var(--ja-foreground-tertiary);
-}
-
-.ja-turn-changes__files code {
+.ja-turn-changes__path {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
   overflow: hidden;
-  color: var(--ja-foreground);
-  font: inherit;
-  font-family: var(--ja-font-mono);
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.ja-turn-changes__files small {
-  color: var(--ja-foreground-tertiary);
-  font: inherit;
-  font-family: var(--ja-font-mono);
+.ja-turn-changes__directory,
+.ja-turn-changes__filename {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ja-turn-changes__directory {
+  flex: 0 1 auto;
+  color: var(--ja-foreground-muted);
+}
+
+.ja-turn-changes__filename {
+  flex: 0 0 auto;
+  max-width: 100%;
+  color: var(--ja-foreground);
+  font-weight: var(--ja-weight-medium);
+}
+
+.ja-turn-changes__binary {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-control-size);
   white-space: nowrap;
 }
 
 .ja-turn-changes__expand {
-  display: inline-flex;
-  min-height: 1.8rem;
+  display: flex;
+  width: 100%;
+  min-height: 36px;
   align-items: center;
   justify-content: flex-start;
-  gap: 0.35rem;
-  margin: 0 -0.25rem -0.2rem;
-  padding: 0.25rem;
+  gap: 6px;
+  padding: 0 12px 4px;
   border: 0;
   color: var(--ja-foreground-muted);
   background: transparent;
   font: inherit;
+  font-size: var(--ja-text-body-size);
   cursor: pointer;
 }
 
@@ -1716,14 +1817,14 @@
 }
 
 .ja-turn-changes__expand:focus-visible {
-  outline: 2px solid var(--ja-focus-ring);
-  outline-offset: 1px;
+  outline: 2px solid var(--ja-focus);
+  outline-offset: -2px;
 }
 
 .ja-turn-changes__expand svg {
   width: 0.9rem;
   height: 0.9rem;
-  transition: transform var(--ja-motion-fast) ease;
+  transition: transform var(--ja-duration-fast) var(--ja-ease-native);
 }
 
 .ja-turn-changes__expand[aria-expanded="true"] svg {
@@ -1732,8 +1833,21 @@
 
 .ja-turn-changes > p {
   margin: 0;
-  color: var(--ja-foreground-tertiary);
+  padding: 0 12px 12px;
+  color: var(--ja-foreground-muted);
   font-size: var(--ja-text-caption-size);
+}
+
+/* 会话栏可在宽窗口中变窄；响应卡片实际宽度，避免 viewport 断点遗漏右侧工作台占位。 */
+@container turn-changes (width < 420px) {
+  .ja-turn-changes__header {
+    grid-template-columns: 40px minmax(0, 1fr);
+    gap: 8px 12px;
+  }
+
+  .ja-turn-changes__header > button {
+    grid-column: 2;
+  }
 }
 
 .ja-turn-diff-dialog {
@@ -1820,13 +1934,6 @@
   .ja-chat-message-user {
     max-width: 90%;
   }
-  .ja-turn-changes__header {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-  }
-  .ja-turn-changes__header > button {
-    grid-column: 2 / -1;
-    justify-self: start;
-  }
 }
 
 @media (hover: none), (pointer: coarse) {
@@ -1876,6 +1983,7 @@
   .ja-tool-details__expand,
   .ja-turn-changes,
   .ja-turn-changes__files li > button,
+  .ja-turn-changes__expand svg,
   .ja-chat-timeline__jump-latest {
     animation: none;
     transition: none;

@@ -21,10 +21,11 @@ pub use domain::{
 };
 pub use interface::{
     JA_REVIEW_INVALIDATED_EVENT, ReviewApplyInput, ReviewApplyResultDto, ReviewCancelInput,
-    ReviewCancelResultDto, ReviewCatalogDto, ReviewCatalogInput, ReviewCommandError,
-    ReviewFileDiffDto, ReviewFileDiffInput, ReviewInvalidatedEventDto, ReviewInvalidatedReason,
-    ReviewSnapshotDto, ReviewSnapshotInput, ja_review_apply, ja_review_cancel, ja_review_catalog,
-    ja_review_file_diff, ja_review_snapshot, ja_turn_change_set_read,
+    ReviewCancelResultDto, ReviewCaptureInput, ReviewCaptureResultDto, ReviewCatalogDto,
+    ReviewCatalogInput, ReviewCommandError, ReviewFileDiffDto, ReviewFileDiffInput,
+    ReviewInvalidatedEventDto, ReviewInvalidatedReason, ReviewSnapshotDto, ReviewSnapshotInput,
+    ja_review_apply, ja_review_cancel, ja_review_catalog, ja_review_file_diff, ja_review_snapshot,
+    ja_turn_change_set_read,
 };
 
 /// 在 composition 边界把 canonical workspace 与唯一 native adapter 组装为 application service。

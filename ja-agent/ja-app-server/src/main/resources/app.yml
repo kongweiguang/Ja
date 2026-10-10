@@ -1,0 +1,22 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# 本地 app-server 仅保留非敏感应用标识，并以 sidecar 方式运行，不开放 Web 服务；stdout 专用于 JA-RPC JSONL 帧。
+solon.app:
+  name: ja-app-server
+  group: ja
+  http:
+    enable: false
+
+# Solon 负责发现持久化组合；启动器只能在启动前覆盖 ja.database-path/ja.data-dir，不会扫描已弃用的位置。
+ja:
+  persistence:
+    enabled: true
+
+# 命名的 MyBatis 工厂解析显式拆分职责的 Mapper 列表；不扫描包路径，确保 JVM 与 Native Image 注册结果确定。
+mybatis:
+  ja:
+    # Mapper 全部使用显式 SQL/记录映射，不依赖懒加载代理；JVM 与 Native 共用此设置。
+    configuration:
+      lazyLoadingEnabled: false
+    mappers: classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/SchemaMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/HistoryMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/AgentMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/InstructionScopeMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/AttachmentMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/TaskMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/SubagentPolicyMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/InteractionMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/PlanEvaluationMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/ThreadDiscoveryMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/SideChatMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/SideChatPurgeMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/ThreadForkMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/ToolCallPreviewMapper.xml,classpath:io/github/kongweiguang/ja/infrastructure/persistence/mapper/PlanMapper.xml

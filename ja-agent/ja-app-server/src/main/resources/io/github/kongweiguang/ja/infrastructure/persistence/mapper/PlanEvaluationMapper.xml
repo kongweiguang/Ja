@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanEvaluationMapper">
+    <resultMap id="prior"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PlanEvaluationPriorRow">
+        <constructor>
+            <idArg column="evaluation_id" javaType="String"/>
+            <arg column="model_request_id" javaType="String"/>
+            <arg column="attempt_ordinal" javaType="int"/>
+            <arg column="outcome" javaType="String"/>
+            <arg column="verdict" javaType="String"/>
+            <arg column="criteria_json" javaType="String"/>
+            <arg column="summary" javaType="String"/>
+        </constructor>
+    </resultMap>
+    <select id="selectPrior" resultMap="prior">
+        SELECT evaluation_id,model_request_id,attempt_ordinal,outcome,verdict,criteria_json,summary
+        FROM ja_plan_evaluation_attempt WHERE evaluation_id=#{evaluationId}
+    </select>
+    <select id="selectLatest" resultMap="prior">
+        SELECT evaluation_id,model_request_id,attempt_ordinal,outcome,verdict,criteria_json,summary
+        FROM ja_plan_evaluation_attempt
+        WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+        AND run_id=#{runId} AND input_digest=#{inputDigest}
+        ORDER BY attempt_ordinal DESC LIMIT 1
+    </select>
+    <update id="markInterrupted">
+        UPDATE ja_plan_evaluation_attempt SET outcome='UNKNOWN',completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE evaluation_id=#{evaluationId} AND outcome='RUNNING'
+    </update>
+    <insert id="insertIntent">
+        INSERT INTO ja_plan_evaluation_attempt(evaluation_id,model_request_id,plan_id,plan_revision_id,run_id,owner_thread_id,
+        input_digest,attempt_ordinal,profile_json,outcome,certainty,started_at_ms)
+        VALUES(#{evaluationId},#{modelRequestId},#{planId},#{planRevisionId},#{runId},#{ownerThreadId},#{inputDigest},#{attemptOrdinal},#{profileJson},
+        'RUNNING','UNKNOWN',#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <update id="recordModelRequest">
+        UPDATE ja_plan_execution
+        SET used_model_rounds=used_model_rounds+1,updated_at_ms=#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE run_id=#{runId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+        AND status IN ('RUNNING','VERIFYING')
+        AND is_pause_requested=0
+        AND EXISTS (
+        SELECT 1 FROM ja_plan p
+        WHERE p.plan_id=ja_plan_execution.plan_id
+        AND p.plan_id=#{planId}
+        AND p.owner_thread_id=#{ownerThreadId}
+        AND p.status='VERIFYING'
+        AND p.active_run_id=ja_plan_execution.run_id
+        AND p.active_plan_revision_id=ja_plan_execution.plan_revision_id
+        )
+    </update>
+    <!-- UTC 毫秒直接相减，避免日期函数把整数误认作儒略日；保留时钟回拨归零和空值传播。 -->
+    <update id="settleActiveMillis">
+        UPDATE ja_plan_execution
+        SET used_active_millis=used_active_millis + (
+        SELECT CAST(MAX(0,#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} - started_at_ms) AS INTEGER)
+        FROM ja_plan_evaluation_attempt
+        WHERE evaluation_id=#{evaluationId} AND model_request_id=#{modelRequestId} AND plan_id=#{planId}
+        AND plan_revision_id=#{planRevisionId} AND run_id=#{runId}
+        AND outcome='RUNNING'
+        ),
+        updated_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE run_id=#{runId} AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+        AND status IN ('RUNNING','VERIFYING','PAUSED','STOPPED')
+        AND EXISTS (
+        SELECT 1 FROM ja_plan_evaluation_attempt
+        WHERE evaluation_id=#{evaluationId} AND model_request_id=#{modelRequestId} AND plan_id=#{planId}
+        AND plan_revision_id=#{planRevisionId} AND run_id=#{runId}
+        AND outcome='RUNNING'
+        )
+    </update>
+    <update id="settleUsage">
+        UPDATE ja_plan_evaluation_attempt SET outcome=#{outcome},certainty=#{certainty},
+        input_tokens=#{inputTokens},output_tokens=#{outputTokens},total_tokens=#{totalTokens},
+        verdict=#{verdict},criteria_json=#{criteriaJson},summary=#{summary},
+        completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE evaluation_id=#{evaluationId} AND model_request_id=#{modelRequestId}
+        AND plan_id=#{planId} AND plan_revision_id=#{planRevisionId}
+        AND run_id=#{runId} AND outcome='RUNNING'
+    </update>
+</mapper>

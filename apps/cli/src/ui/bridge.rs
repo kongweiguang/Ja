@@ -9,26 +9,31 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
-use crossterm::execute;
+use crossterm::event::{self, Event};
 use crossterm::terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 
+#[path = "terminal_guard.rs"]
+mod terminal_guard;
+
+use self::terminal_guard::{TerminalGuard, TerminalUpdateGuard};
 use super::model::{UiAction, UiEvent, UiSnapshot};
-use super::render::{
-    WORKING_INDICATOR_INTERVAL, desired_viewport_height, insert_scrollback, render,
-};
+use super::native_backend::NativeBackend;
+use super::render::{WORKING_INDICATOR_INTERVAL, render};
 use super::state::UiState;
 
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const EVENT_DRAIN_LIMIT: usize = 64;
-const POLL_INTERVAL: Duration = Duration::from_millis(16);
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// 留出历史行，同时容纳八个候选、选择器标题和 Composer。
-const MAX_INLINE_VIEWPORT_HEIGHT: u16 = 16;
+/// 外部编辑器的模式交接有超时边界，避免 controller 无限等待已退出的终端线程。
+const TERMINAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
+enum TerminalControl {
+    Suspend(mpsc::SyncSender<Result<(), String>>),
+    Resume(mpsc::SyncSender<Result<(), String>>),
+}
 /// 队列接纳结果允许 controller 识别合并和重同步，不阻塞 RPC 通知读取线程。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventDelivery {
@@ -144,10 +149,10 @@ fn lock_queue(state: &Mutex<QueueState>) -> MutexGuard<'_, QueueState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 只有无状态或同一实体的投影可以替换，文本增量只合并相邻同一条目。
+/// 投影只覆盖同一实体；摘要与正文使用不同流身份，增量只合并相邻同一条目以保持顺序。
 fn coalesce_event(events: &mut VecDeque<UiEvent>, incoming: &UiEvent) -> bool {
-    if let Some(UiEvent::AppendAssistantDelta { entry_id, delta }) = events.back_mut()
-        && let UiEvent::AppendAssistantDelta {
+    if let Some(UiEvent::AppendStreamDelta { entry_id, delta }) = events.back_mut()
+        && let UiEvent::AppendStreamDelta {
             entry_id: incoming_id,
             delta: incoming_delta,
         } = incoming
@@ -172,6 +177,7 @@ fn same_projection_key(left: &UiEvent, right: &UiEvent) -> bool {
     match (left, right) {
         (UiEvent::UpsertEntry(left), UiEvent::UpsertEntry(right)) => left.id == right.id,
         (UiEvent::SetTurnState(_), UiEvent::SetTurnState(_))
+        | (UiEvent::SetLocalOperation(_), UiEvent::SetLocalOperation(_))
         | (UiEvent::SetContinuationAvailable(_), UiEvent::SetContinuationAvailable(_))
         | (UiEvent::SetHasOlderHistory(_), UiEvent::SetHasOlderHistory(_))
         | (UiEvent::SetModel { .. }, UiEvent::SetModel { .. })
@@ -182,6 +188,10 @@ fn same_projection_key(left: &UiEvent, right: &UiEvent) -> bool {
         | (UiEvent::SetThreadChoices(_), UiEvent::SetThreadChoices(_))
         | (UiEvent::SetAttachments(_), UiEvent::SetAttachments(_))
         | (UiEvent::SetNotice(_), UiEvent::SetNotice(_)) => true,
+        (
+            UiEvent::FinishAssistantStream { turn_id: left },
+            UiEvent::FinishAssistantStream { turn_id: right },
+        ) => left == right,
         (
             UiEvent::SetFileChoices { query_id: left, .. },
             UiEvent::SetFileChoices {
@@ -198,18 +208,30 @@ fn same_projection_key(left: &UiEvent, right: &UiEvent) -> bool {
     }
 }
 
-/// 草稿确认、文件引用和详情不能被普通展示更新覆盖。
+/// 异步动作的完成结果必须投递以释放 UI 等待状态；迟到结果仍由 reducer 核验身份。
 fn is_critical_event(event: &UiEvent) -> bool {
     matches!(
         event,
         UiEvent::Shutdown
+            | UiEvent::SetLocalOperation(_)
             | UiEvent::InsertFileReference { .. }
             | UiEvent::InsertSkillReference { .. }
             | UiEvent::ClearDraft
             | UiEvent::RestoreDraft(_)
+            | UiEvent::RestoreForkDraft
+            | UiEvent::ClearForkDraft
+            | UiEvent::ReplaceDraft(_)
             | UiEvent::ReleaseDraft
             | UiEvent::ReleasePromptSubmission
             | UiEvent::ShowDetails { .. }
+            | UiEvent::UpdateDetailsIfOpen { .. }
+            | UiEvent::OpenModelSettings { .. }
+            | UiEvent::ModelSettingsResult(_)
+            | UiEvent::ModelSettingsTrustRequired { .. }
+            | UiEvent::OlderHistoryLoaded { .. }
+            | UiEvent::OlderHistoryFailed { .. }
+            | UiEvent::TranscriptSelectionCopied { .. }
+            | UiEvent::TranscriptSelectionCopyFailed { .. }
     )
 }
 
@@ -217,6 +239,7 @@ fn is_critical_event(event: &UiEvent) -> bool {
 pub struct TuiBridge {
     events: UiEventSender,
     actions: mpsc::Receiver<UiAction>,
+    terminal_control: mpsc::Sender<TerminalControl>,
     thread: Option<JoinHandle<Result<(), TuiError>>>,
 }
 
@@ -226,12 +249,19 @@ impl TuiBridge {
         let events = UiEventSender::default();
         let worker_events = events.clone();
         let (action_tx, action_rx) = mpsc::channel();
+        let (terminal_control_tx, terminal_control_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("ja-tui".to_owned())
             .spawn(move || {
                 match catch_unwind(AssertUnwindSafe(|| {
-                    terminal_loop(snapshot, worker_events, action_tx, ready_tx)
+                    terminal_loop(
+                        snapshot,
+                        worker_events,
+                        action_tx,
+                        terminal_control_rx,
+                        ready_tx,
+                    )
                 })) {
                     Ok(result) => result,
                     Err(_) => Err(TuiError::ThreadPanicked),
@@ -242,6 +272,7 @@ impl TuiBridge {
             Ok(Ok(())) => Ok(Self {
                 events,
                 actions: action_rx,
+                terminal_control: terminal_control_tx,
                 thread: Some(thread),
             }),
             Ok(Err(message)) => {
@@ -285,6 +316,35 @@ impl TuiBridge {
         }
     }
 
+    /// 外部编辑器启动前等待终端完全释放，避免子进程与 Ja 同时读取或切换屏幕模式。
+    pub fn suspend_for_external_program(&self) -> Result<(), TuiError> {
+        self.change_terminal_mode(true)
+    }
+
+    /// 子进程退出后等待全屏和输入模式重新建立，确保编辑器返回时保留原草稿继续绘制。
+    pub fn resume_after_external_program(&self) -> Result<(), TuiError> {
+        self.change_terminal_mode(false)
+    }
+
+    /// A bounded control handshake prevents launching a child against a still-owned terminal.
+    fn change_terminal_mode(&self, suspend: bool) -> Result<(), TuiError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let request = if suspend {
+            TerminalControl::Suspend(reply_tx)
+        } else {
+            TerminalControl::Resume(reply_tx)
+        };
+        self.terminal_control
+            .send(request)
+            .map_err(|_| TuiError::TerminalControlClosed)?;
+        match reply_rx.recv_timeout(TERMINAL_CONTROL_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(TuiError::TerminalControlFailed(message)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(TuiError::TerminalControlTimeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TuiError::TerminalControlClosed),
+        }
+    }
+
     /// 显式退出并等待 guard 恢复终端模式，错误保留给调用方处理。
     pub fn shutdown(&mut self) -> Result<(), TuiError> {
         self.stop_and_join()
@@ -316,6 +376,9 @@ pub enum TuiError {
     EventQueueClosed,
     EventQueueFull,
     ActionChannelClosed,
+    TerminalControlClosed,
+    TerminalControlTimeout,
+    TerminalControlFailed(String),
     ThreadPanicked,
 }
 
@@ -329,6 +392,11 @@ impl fmt::Display for TuiError {
             Self::EventQueueClosed => formatter.write_str("terminal event queue is closed"),
             Self::EventQueueFull => formatter.write_str("terminal critical event queue is full"),
             Self::ActionChannelClosed => formatter.write_str("terminal action channel closed"),
+            Self::TerminalControlClosed => formatter.write_str("terminal control channel closed"),
+            Self::TerminalControlTimeout => formatter.write_str("terminal control timed out"),
+            Self::TerminalControlFailed(message) => {
+                write!(formatter, "terminal control failed: {message}")
+            }
             Self::ThreadPanicked => formatter.write_str("terminal thread panicked"),
         }
     }
@@ -344,47 +412,13 @@ impl std::error::Error for TuiError {
     }
 }
 
-/// 终端 raw mode 和 bracketed paste 分开记录，初始化失败时只恢复已开启项。
-struct TerminalGuard {
-    raw_mode: bool,
-    bracketed_paste: bool,
-}
-
-impl TerminalGuard {
-    /// 先完成终端输出模式，再启用 raw mode；之后第一步即发送启动确认。
-    fn activate() -> Result<Self, TuiError> {
-        let mut guard = Self {
-            raw_mode: false,
-            bracketed_paste: false,
-        };
-        execute!(io::stdout(), EnableBracketedPaste).map_err(TuiError::Io)?;
-        guard.bracketed_paste = true;
-        guard.raw_mode = true;
-        terminal::enable_raw_mode().map_err(TuiError::Io)?;
-        Ok(guard)
-    }
-}
-
-impl Drop for TerminalGuard {
-    /// 每项恢复独立尝试；一次清理失败不跳过剩余 shell 状态恢复。
-    fn drop(&mut self) {
-        if self.bracketed_paste {
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
-            self.bracketed_paste = false;
-        }
-        let _ = execute!(io::stdout(), crossterm::cursor::Show);
-        if self.raw_mode {
-            let _ = terminal::disable_raw_mode();
-            self.raw_mode = false;
-        }
-    }
-}
-
-/// 终端只占用当前 UI 实际需要的行数，让稳定对话紧接输入历史，交互面板仍可扩展到有界上限。
+/// 独占全屏终端绘制应用内 transcript；交接回滚再次失败时关闭 UI，让 Drop 重试残余模式。
+/// @author kongweiguang
 fn terminal_loop(
     snapshot: UiSnapshot,
     events: UiEventSender,
     action_tx: mpsc::Sender<UiAction>,
+    terminal_control_rx: mpsc::Receiver<TerminalControl>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), TuiError> {
     let (columns, rows) = match terminal::size() {
@@ -394,45 +428,74 @@ fn terminal_loop(
             return Err(TuiError::Io(error));
         }
     };
-    let maximum_viewport_height = rows.saturating_sub(1).clamp(1, MAX_INLINE_VIEWPORT_HEIGHT);
-    let mut state = UiState::new_for_terminal(snapshot, columns, maximum_viewport_height);
-    let viewport_height = desired_viewport_height(&state, columns, maximum_viewport_height);
-    let initial_scrollback = state.take_scrollback_entries();
+    let mut state = UiState::new_for_terminal(snapshot, columns, rows.max(1));
     let setup = (|| {
-        // Ratatui 的整屏 insert_before 路径会把宽字符后继占位 cell 输出为额外空格；
-        // 留一行进入 scrolling-regions 的 diff 路径，稳定中文历史才不会变成“中 文”。
-        let backend = CrosstermBackend::new(io::stdout());
-        let options = TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        };
-        let terminal = Terminal::with_options(backend, options).map_err(TuiError::Io)?;
-        let guard = TerminalGuard::activate()?;
+        let guard = TerminalGuard::activate().map_err(TuiError::Io)?;
+        // NativeBackend 只修正宽字符占位格输出；终端历史与视口现在完全由应用状态管理。
+        let backend = NativeBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).map_err(TuiError::Io)?;
+        terminal.clear().map_err(TuiError::Io)?;
         Ok::<_, TuiError>((terminal, guard))
     })();
-    let (mut terminal, guard) = match setup {
+    let (mut terminal, mut guard) = match setup {
         Ok(ready) => ready,
         Err(error) => {
             let _ = ready_tx.send(Err(error.to_string()));
             return Err(error);
         }
     };
-    let mut current_viewport_height = viewport_height;
     if ready_tx.send(Ok(())).is_err() {
         drop(guard);
         return Err(TuiError::StartupTimeout);
     }
-    insert_scrollback(&mut terminal, &initial_scrollback).map_err(TuiError::Io)?;
     let mut dirty = true;
     let mut last_frame: Option<Instant> = None;
     let mut last_working_indicator_frame: Option<Instant> = None;
+    let mut suspended = false;
     loop {
+        while let Ok(control) = terminal_control_rx.try_recv() {
+            let (result, next_suspended, reply) = match control {
+                TerminalControl::Suspend(reply) => {
+                    let result = terminal
+                        .clear()
+                        .and_then(|()| guard.suspend_for_external_program());
+                    if result.is_err() {
+                        // 清理命令可能只写出前缀，不能把不确定模式上的重新启用当作安全恢复。
+                        state.apply(UiEvent::Shutdown);
+                    }
+                    (result.map_err(|error| error.to_string()), true, reply)
+                }
+                TerminalControl::Resume(reply) => {
+                    let result = guard
+                        .resume_after_external_program()
+                        .and_then(|()| terminal.clear())
+                        .and_then(|()| terminal.autoresize())
+                        .map_err(|error| error.to_string());
+                    if result.is_err() {
+                        // 挂起尝试尽力清理恢复到一半的模式；即使成功，也不能让已挂起的 UI 永久忽略输入。
+                        let _ = guard.suspend_for_external_program();
+                        state.apply(UiEvent::Shutdown);
+                    }
+                    (result, false, reply)
+                }
+            };
+            let succeeded = result.is_ok();
+            if succeeded {
+                suspended = next_suspended;
+                if !suspended {
+                    dirty = true;
+                }
+            }
+            let _ = reply.send(result);
+            if state.is_closed() {
+                break;
+            }
+        }
+        if state.is_closed() {
+            break;
+        }
         for event in events.drain() {
             state.apply(event);
-            dirty = true;
-        }
-        let stable_entries = state.take_scrollback_entries();
-        if !stable_entries.is_empty() {
-            insert_scrollback(&mut terminal, &stable_entries).map_err(TuiError::Io)?;
             dirty = true;
         }
         if let Some(action) = events.take_snapshot_refresh_action()
@@ -445,7 +508,11 @@ fn terminal_loop(
         {
             state.apply(UiEvent::Shutdown);
         }
-        if event::poll(POLL_INTERVAL).map_err(TuiError::Io)? {
+        // 关闭后立即退出终端线程，避免再轮询并消费一条已无人处理的按键。
+        if state.is_closed() {
+            break;
+        }
+        if !suspended && event::poll(POLL_INTERVAL).map_err(TuiError::Io)? {
             match event::read().map_err(TuiError::Io)? {
                 Event::Key(key) => {
                     for action in state.handle_key(key) {
@@ -460,15 +527,29 @@ fn terminal_loop(
                     state.handle_paste(&text);
                     dirty = true;
                 }
-                Event::Resize(width, _) => {
-                    state.set_terminal_width(width);
+                Event::Mouse(mouse) => {
+                    for action in state.handle_mouse(mouse) {
+                        let quitting = action == UiAction::Quit;
+                        if action_tx.send(action).is_err() || quitting {
+                            state.apply(UiEvent::Shutdown);
+                        }
+                    }
+                    dirty = true;
+                }
+                Event::Resize(width, height) => {
+                    state.set_terminal_size(width, height.max(1));
                     dirty = true;
                 }
                 _ => {}
             }
         }
+        // 按键或鼠标动作可以同步关闭 UI；退出前跳过工作提示更新与最后一帧绘制。
         if state.is_closed() {
             break;
+        }
+        if suspended {
+            thread::sleep(POLL_INTERVAL);
+            continue;
         }
         let now = Instant::now();
         let working_indicator_visible = state.snapshot().turn_state
@@ -489,47 +570,19 @@ fn terminal_loop(
                 now.saturating_duration_since(previous) >= MIN_FRAME_INTERVAL
             })
         {
+            let update = TerminalUpdateGuard::begin(io::stdout()).map_err(TuiError::Io)?;
             terminal.autoresize().map_err(TuiError::Io)?;
-            let screen = terminal.size().map_err(TuiError::Io)?;
-            state.set_terminal_width(screen.width);
-            let maximum_viewport_height = screen
-                .height
-                .saturating_sub(1)
-                .clamp(1, MAX_INLINE_VIEWPORT_HEIGHT);
-            let desired_height =
-                desired_viewport_height(&state, screen.width, maximum_viewport_height);
-            if desired_height != current_viewport_height {
-                resize_inline_viewport(&mut terminal, desired_height).map_err(TuiError::Io)?;
-                current_viewport_height = desired_height;
-            }
+            let area = terminal.get_frame().area();
+            state.set_terminal_size(area.width, area.height.max(1));
             terminal
                 .draw(|frame| render(frame, &state))
                 .map_err(TuiError::Io)?;
+            update.finish().map_err(TuiError::Io)?;
             last_frame = Some(now);
             dirty = false;
         }
     }
     drop(terminal);
     drop(guard);
-    Ok(())
-}
-
-/** Ratatui 的 inline 高度在创建时固定；重建 viewport 前清除旧区域，稳定 scrollback 保留在其上方。 */
-fn resize_inline_viewport(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    height: u16,
-) -> io::Result<()> {
-    let area = terminal.get_frame().area();
-    execute!(
-        terminal.backend_mut(),
-        crossterm::cursor::MoveTo(0, area.y),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-    )?;
-    *terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )?;
     Ok(())
 }

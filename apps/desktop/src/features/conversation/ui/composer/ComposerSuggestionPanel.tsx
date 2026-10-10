@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Command, File, Folder, Lightbulb, RotateCw, Sparkles, Target } from "lucide-react";
+import { Command, File, Folder, Lightbulb, RotateCw, Sparkles } from "lucide-react";
 import type { MouseEvent, ReactElement } from "react";
 import type {
   ComposerSkillSuggestion,
@@ -66,7 +66,6 @@ function suggestionIcon(item: ComposerSuggestionItem): ReactElement {
   if (item.kind === "skill") return <Sparkles />;
   if (item.kind === "command") {
     if (item.value.icon === "plan") return <Lightbulb />;
-    if (item.value.icon === "goal") return <Target />;
     return <Command />;
   }
   return item.value.kind === "directory" ? <Folder /> : <File />;

@@ -1,7 +1,7 @@
 <!-- @author kongweiguang -->
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 
-# JA RPC v1 三端合同 Gate
+# JA RPC v2 三端合同 Gate
 
 `run.py` 是 schema-first 的唯一入口。它固定让 Java、Rust、TypeScript production parser
 读取同一绝对路径 corpus，并在末尾输出相同 digest 与实际 frame count。不存在跳过 production
@@ -33,8 +33,8 @@ Workspace 路径搜索语料冻结 `workspace/path/search` 的 Thread、Workspac
 query 回显栅栏，只允许最多 50 个相对路径和 `file/directory` 类型。独立消费者显式拒绝绝对路径
 与响应扩展字段，避免把路径搜索扩大为正文预读或 Rust 所有的 Workspace 扫描。
 
-Goal/Plan 语料冻结 17 个方法、3 个事件、8 个稳定错误、required-nullable 投影、结构化 DAG、
-精确 revision/hash 批准和证据来源闭集。Python 独立消费者必须实际读取正负 Goal corpus，逐个关联
+Plan 语料冻结 Plan 方法、`plan/changed` 事件、Plan 错误目录、required-nullable 投影、结构化 DAG、
+精确 revision/hash 批准和证据来源闭集。Python 独立消费者必须实际读取正负 Plan corpus，逐个关联
 method-specific result，并证明缺 CAS、缺幂等键、缺 hash、Markdown draft 和不完整事件均被拒绝。
 
 Agent 过程语料同时冻结 `ToolPresentation` 的严格字段和 Secret/路径边界、四种历史文本阶段、
@@ -45,6 +45,16 @@ summary-only 更新事件、2 MiB Diff 上限以及独立的 UTF-8 byte 分页�
 TypeScript probe 使用 renderer 的 method/event/result parser；任何一端暂未完成 breaking 迁移时，
 完整 Gate 必须保持失败。
 
+正文读取语料冻结公开 `thread/read` preview 与 `thread/item-content/read` hydration：
+`user_input`、`thread_message`、`assistant_progress`、`reasoning_summary` 和 `final_answer`
+携带最多 512 Unicode code point 的预览、按 Unicode code point 计算的 `totalCharacters` 与派生 `truncated`；长文分页请求通过当前
+Thread 内的 `itemId` 授权。Tool、approval、private reasoning 不可 hydration，附件仍走独立 preview API。
+
 `python_consumer.py` 另外按命名 `$defs` 消费 Agent 过程专用 transcript，直接验证新方法结果，
 并交叉检查 ChangeSet 统计、Tool 字符页和冻结/活动 Diff byte 页；这样
 invalid response 不会仅因为 orphan correlation 被误算成具体 DTO 已拒绝。
+
+Native 客户端生命周期语料明确拒绝缺少 `clientProcessId/clientLifetimeId` 的旧环境注册，
+并固定 `runtime/client/close {timeoutMs}` 的 1–20,000 毫秒退出预算、禁止指定其它 owner 的参数闭集及
+严格 `{accepted:true}` 回执。进程存活、PID 复用、跨客户端清理隔离与断线恢复由运行测试证明，
+不能用这里的字段 Shape 验证代替。

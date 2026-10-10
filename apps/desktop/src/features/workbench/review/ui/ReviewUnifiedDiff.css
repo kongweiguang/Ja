@@ -153,11 +153,21 @@
   background: color-mix(in srgb, var(--ja-danger) 8%, var(--surface-content));
 }
 
+.ja-review-unified-diff-row[data-review-finding-target="true"] {
+  background: color-mix(in srgb, var(--ja-warning) 16%, var(--surface-content));
+  box-shadow: inset 2px 0 var(--ja-warning);
+}
+
 .ja-review-unified-diff-cell {
   display: grid;
   min-width: 0;
   grid-template-columns: 3.35rem 1.35rem minmax(0, 1fr);
   align-items: stretch;
+}
+
+.ja-review-unified-diff-cell[data-review-finding-target="true"] {
+  background: color-mix(in srgb, var(--ja-warning) 16%, var(--surface-content));
+  box-shadow: inset 2px 0 var(--ja-warning);
 }
 
 .ja-review-unified-diff-cell[data-review-diff-side="old"] {

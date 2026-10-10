@@ -28,6 +28,7 @@ import {
   SubagentOverview,
   TaskDetailPanel,
   useTaskController,
+  subscribeTaskHostEvents,
   type TaskApprovalPort,
   type TaskComposerEnvironment,
   type TaskComposerSkillSuggestion,
@@ -37,6 +38,7 @@ import {
   type TaskThreadRenamePort,
   type TaskTranscriptActions,
   type TaskTranscriptPort,
+  type TaskTranscriptSnapshot,
   type TaskPreferencesPort,
   type TaskContentBlock,
 } from "@/features/tasks";
@@ -46,17 +48,16 @@ import {
   useTimelineStore,
   type ConversationArtifactPort,
   type ConversationAttachmentPort,
+  type ConversationAccessMode,
+  type ConversationModelOption,
+  type ConversationModelSelection,
+  type ConversationPreferencesPort,
   type ConversationPlanCreationPort,
+  type ConversationThreadPreferences,
   type ConversationTurnPort,
   type ConversationUsageReader,
   type InteractionPort,
-} from "@/features/conversation";
-import type {
-  ConversationAccessMode,
-  ConversationModelOption,
-  ConversationModelSelection,
-  ConversationPreferencesPort,
-  ConversationThreadPreferences,
+  type TimelineRuntimeFence,
 } from "@/features/conversation";
 import {
   FilesWorkspace,
@@ -75,7 +76,9 @@ import {
 import {
   ReviewPanelView,
   TurnReviewPanelView,
+  useAiReviewController,
   useReviewController,
+  type AiReviewAccepted,
   type ReviewNavigationState,
   type ReviewSource,
   type TurnReviewPort,
@@ -104,8 +107,12 @@ import {
 } from "../useJaWorkbench";
 import { filesBrowserControllerPorts } from "./filesBrowserControllerPorts";
 import { useRuntimeLifecycle, useRuntimeState, useRuntimeTurns } from "../RuntimeProvider";
-import { PlanWorkbench, type GoalController } from "@/features/goals";
-import { useGoalController, type GoalPort } from "@/features/goals";
+import {
+  PlanWorkbench,
+  usePlanController,
+  type PlanController,
+  type PlanPort,
+} from "@/features/plans";
 import type { ComposerSlashCommand } from "@/features/conversation";
 import type {
   ComposerWorkspaceReferenceTarget,
@@ -114,6 +121,7 @@ import type {
   ConversationOpenTargetOutcome,
   ConversationOpenTargetRequest,
 } from "./ConversationWorkspace";
+import type { MarkdownFileTarget } from "@/shared/ui/markdown/SharedMarkdown";
 import { ReviewSourceNavigation } from "./ReviewSourceNavigation";
 import { threadWorkbenchStorage } from "./threadWorkbenchStorage";
 import { conversationModeCommands } from "../application/conversationModeCommands";
@@ -132,19 +140,45 @@ const MAX_REVIEW_NAVIGATION_SCOPES = 16;
 const MAX_CHILD_SNAPSHOT_PAGES = 128;
 const OPEN_TARGET_TOAST_ID = "ja-open-target";
 
+/** @author kongweiguang：读取失败或被截断时保留 Explorer 恢复动作，不扩大原生文件读取预算。 */
+function explorerRecoveryAction(reveal: () => Promise<void>): {
+  label: string;
+  onClick: () => void;
+} {
+  return {
+    label: "在文件资源管理器中打开",
+    onClick: () => {
+      void Promise.resolve()
+        .then(reveal)
+        .catch(() => toast.error("无法在文件资源管理器中显示该路径。"));
+    },
+  };
+}
+
+/** 文件工作区 reader 的失败分类只解释原生返回的有界结果，不借用 Preview 的 1 MiB 投影猜测大小。@author kongweiguang */
+function workspaceReadRecoveryReason(
+  kind: "text" | "binary" | "unknown_encoding" | "too_large",
+  content: string | null,
+): string | undefined {
+  if (kind === "too_large") return "文件超过 Ja 文件编辑器的读取上限，无法显示正文。";
+  if (kind === "unknown_encoding") return "Ja 无法读取此文本文件正文，文件编码不受支持。";
+  if (kind === "binary") return "此文件是二进制内容，无法在 Ja 文件编辑器中显示。";
+  return content === null ? "Ja 无法读取此文本文件正文，可能是文件权限或编码不兼容。" : undefined;
+}
+
 interface SideChatSource {
   readonly threadId: string;
   readonly revision?: number;
   readonly preferences?: ConversationThreadPreferences;
 }
 
-/** 测试或能力未启用时只作为 hook 的不可见占位；任何误用都会失败关闭，不提供伪造 Goal 能力。 */
-const UNAVAILABLE_GOAL_PORT = new Proxy({} as GoalPort, {
+/** 能力未启用时只作为 hook 的不可见占位；任何误用都失败关闭。 */
+const UNAVAILABLE_PLAN_PORT = new Proxy({} as PlanPort, {
   get: (_target, property: string) =>
     property === "subscribe"
       ? () => () => undefined
       : async () => {
-          throw new Error("plan and goal capability unavailable");
+          throw new Error("plan capability unavailable");
         },
 });
 
@@ -197,23 +231,57 @@ function workspaceReferenceNode(request: WorkspaceReferencePreviewRequest): Work
   };
 }
 
-/** Files 投影提交后把焦点交给真实文件 Tab 或目录 TreeItem，目录只在当前确实折叠时展开。 */
-function focusWorkspaceReferenceInFiles(request: WorkspaceReferencePreviewRequest): void {
+/**
+ * @author kongweiguang
+ * 只在 request 所属 Thread Host 内定位可见目标，避免保留会话中同路径文件先命中隐藏节点。
+ */
+function focusWorkspaceReferenceInFiles(
+  request: WorkspaceReferencePreviewRequest,
+  rootThreadId: string | undefined,
+): void {
+  if (rootThreadId === undefined) return;
   const { relativePath, kind } = request.reference;
+  const scopeKey = `${request.reference.workspaceId}:${rootThreadId}`;
+  const hostRoot = [
+    ...document.querySelectorAll<HTMLElement>(
+      ".ja-thread-workbench-session[data-thread-workbench-scope]",
+    ),
+  ].find((candidate) => candidate.dataset["threadWorkbenchScope"] === scopeKey);
+  if (
+    hostRoot === undefined ||
+    hostRoot.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') !== null
+  )
+    return;
   if (kind === "file") {
-    const tab = [...document.querySelectorAll<HTMLElement>("[data-file-tab-path]")].find(
-      (candidate) => candidate.dataset["fileTabPath"] === relativePath,
+    const tab = [...hostRoot.querySelectorAll<HTMLElement>("[data-file-tab-path]")].find(
+      (candidate) =>
+        candidate.dataset["fileTabPath"] === relativePath &&
+        candidate.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null,
     );
-    tab?.querySelector<HTMLButtonElement>('[role="tab"]')?.focus();
+    const tabButton = tab?.querySelector<HTMLButtonElement>('[role="tab"]');
+    if (
+      tabButton !== undefined &&
+      tabButton !== null &&
+      tabButton.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null
+    )
+      tabButton.focus();
     return;
   }
-  const row = [...document.querySelectorAll<HTMLElement>(".ja-file-tree-host [data-path]")].find(
-    (candidate) => candidate.dataset["path"] === relativePath,
+  const row = [...hostRoot.querySelectorAll<HTMLElement>(".ja-file-tree-host [data-path]")].find(
+    (candidate) =>
+      candidate.dataset["path"] === relativePath &&
+      candidate.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null,
   );
   const treeItem = row?.closest<HTMLElement>('[role="treeitem"]');
   if (treeItem?.getAttribute("aria-expanded") === "false")
     row?.querySelector<HTMLButtonElement>(".ja-file-tree-disclosure")?.click();
-  (treeItem ?? document.querySelector<HTMLElement>('.ja-file-tree-host [role="tree"]'))?.focus();
+  const focusTarget =
+    treeItem ?? hostRoot.querySelector<HTMLElement>('.ja-file-tree-host [role="tree"]');
+  if (
+    focusTarget !== null &&
+    focusTarget.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null
+  )
+    focusTarget.focus();
 }
 
 /** 只对无目录分隔符的文件名启用候选查询，显式相对/绝对路径交给 Rust 精确解析。 */
@@ -257,7 +325,7 @@ export interface WorkbenchHostProps {
     accessMode: ConversationAccessMode;
   };
   readonly taskPreferencesPort?: TaskPreferencesPort;
-  readonly taskGoalPort?: GoalPort;
+  readonly taskPlanPort?: PlanPort;
   readonly taskNativeDropPort?: NativeDropSubscriptionPort;
   readonly taskInteractionPort?: InteractionPort;
   readonly selectedTab: WorkbenchTabKey;
@@ -267,6 +335,8 @@ export interface WorkbenchHostProps {
   readonly capabilityShortcuts: Partial<Record<WorkbenchCapability, string>>;
   readonly onCopyText: (text: string) => Promise<void>;
   readonly onOpenExternalUrl: (url: string) => Promise<void>;
+  /** 路径经 native resolver 分类后才展示对应工作面；hidden Workbench 不构成解析阻碍。 */
+  readonly onShowCapability?: (capability: "files" | "preview") => void;
   readonly onClose: () => void;
   /** 当前 Thread 的侧聊创建入口；隐藏 Workbench 仍可接收 slash 命令，但非当前会话不注册。 */
   readonly onRegisterSideChatLauncher?: (
@@ -312,16 +382,13 @@ export interface WorkbenchHostProps {
   readonly onShowRetainedTurnReview: () => void;
   readonly onShowLatestTurnReview: () => void;
   readonly onDismissTurnReview: () => void;
-  readonly planGoalAvailable?: boolean;
-  readonly goal?: GoalController;
+  readonly planAvailable?: boolean;
+  readonly plan?: PlanController;
 }
 
 /**
- * WorkbenchHost 持续挂载 feature controller 以保留编辑器、PTY 与 WebView 状态，但只在
- * Inspector 可见且 Review Tab 已打开并被选中时激活重型 Git snapshot。它只组合 view model
- * 与 lifecycle port；侧聊 identity 由服务端创建 ACK 签发，不在前端制造临时草稿。
- * Tab 菜单或其它会话暂时遮挡原生网页时只暂停 viewport 可见性，不释放网页会话；
- * 布局与恢复 hint 使用根 Thread 命名空间，真实目录授权仍只由 Workspace 决定。
+ * 保留各 Thread 的编辑器和原生资源；重型 I/O 仅由当前可见且选中的 Tab 激活。
+ * 异步结果按最新 Host/Thread owner 收口，不能用旧 render 闭包提交焦点或恢复状态。
  */
 export function WorkbenchHost({
   workspace,
@@ -343,7 +410,7 @@ export function WorkbenchHost({
   taskParentPreferences,
   taskDefaultPreferences,
   taskPreferencesPort,
-  taskGoalPort,
+  taskPlanPort,
   taskNativeDropPort,
   taskInteractionPort,
   selectedTab,
@@ -353,6 +420,7 @@ export function WorkbenchHost({
   capabilityShortcuts,
   onCopyText,
   onOpenExternalUrl,
+  onShowCapability,
   onClose,
   onRegisterSideChatLauncher,
   onRegisterFilesLifecycle,
@@ -382,8 +450,8 @@ export function WorkbenchHost({
   onShowRetainedTurnReview,
   onShowLatestTurnReview,
   onDismissTurnReview,
-  planGoalAvailable = false,
-  goal,
+  planAvailable = false,
+  plan,
 }: WorkbenchHostProps): ReactElement {
   // 持久化只隔离 UI 布局和 opaque hint，所有 native 调用仍使用真实 Workspace identity。
   const storageScope = JSON.stringify([workspace.workspaceId, rootThreadId ?? null]);
@@ -409,16 +477,37 @@ export function WorkbenchHost({
   const runtimeTurns = useRuntimeTurns();
   const { boot, turnAdmissionReady } = useRuntimeState();
   const { queryRuntime } = useRuntimeLifecycle();
+  const runtimeGeneration = useTimelineStore((state) => state.handshake.generation);
+  const runtimeServerInstanceId = useTimelineStore((state) => state.serverInstanceId);
+  const runtimeReady = useTimelineStore((state) => state.handshake.phase === "ready");
+  const runtimeFence =
+    runtimeReady && runtimeServerInstanceId !== undefined && runtimeGeneration > 0
+      ? { serverInstanceId: runtimeServerInstanceId, generation: runtimeGeneration }
+      : undefined;
+  const rootThreadRevision = useTimelineStore((state) =>
+    rootThreadId === undefined
+      ? undefined
+      : (state.threadRevisionByThread[rootThreadId] ?? state.threads[rootThreadId]?.revision),
+  );
   const workspaceReferencePreviewRequestRef = useRef(workspaceReferencePreviewRequest);
   const handledWorkspaceReferenceRequestRef = useRef<number | undefined>(undefined);
   const settledWorkspaceReferenceRequestRef = useRef<
-    { requestId: number; outcome: WorkspaceReferencePreviewOutcome } | undefined
+    | {
+        requestId: number;
+        outcome: WorkspaceReferencePreviewOutcome;
+        focusFrameId: number | undefined;
+        focusCompleted: boolean;
+        expectedFocus: HTMLElement | null;
+      }
+    | undefined
   >(undefined);
   const openTargetRequestRef = useRef(openTargetRequest);
+  const openTargetIntentSequenceRef = useRef(0);
   const openTargetHostScopeRef = useRef({
     active,
     workspaceId: workspace.workspaceId,
     threadId: rootThreadId,
+    bindingRevision: `${workspace.rootPath}:${workspace.revision ?? 0}`,
   });
   const processingOpenTargetRequestRef = useRef<number | undefined>(undefined);
   const settledOpenTargetRequestRef = useRef<number | undefined>(undefined);
@@ -432,26 +521,89 @@ export function WorkbenchHost({
     | undefined
   >();
   const parsedSelectedTask = parseTaskWorkbenchTabKey(selectedTab);
+  const activeTaskThreadId = parsedSelectedTask?.taskThreadId;
+  /** 仅将所选 Thread 与请求起点 Runtime 身份一致的侧聊历史写入共享 Store，避免迟到读取污染其它会话。@author kongweiguang */
+  const applyTaskTranscriptSnapshot = useCallback(
+    (snapshot: TaskTranscriptSnapshot): boolean => {
+      const timeline = useTimelineStore.getState();
+      if (
+        !active ||
+        activeTaskThreadId === undefined ||
+        snapshot.threadId !== activeTaskThreadId ||
+        !runtimeReady ||
+        runtimeGeneration <= 0 ||
+        runtimeServerInstanceId === undefined ||
+        timeline.handshake.phase !== "ready" ||
+        timeline.handshake.generation !== runtimeGeneration ||
+        timeline.serverInstanceId !== runtimeServerInstanceId
+      )
+        return false;
+      const priorSnapshotRevision = timeline.snapshotRevisionByThread[snapshot.threadId];
+      const outcome = timeline.applySnapshot(snapshot, workspace.workspaceId);
+      return (
+        outcome === "applied" ||
+        (outcome === "late" &&
+          priorSnapshotRevision !== undefined &&
+          priorSnapshotRevision >= snapshot.revision)
+      );
+    },
+    [
+      active,
+      activeTaskThreadId,
+      runtimeGeneration,
+      runtimeReady,
+      runtimeServerInstanceId,
+      workspace.workspaceId,
+    ],
+  );
   /** 通知回调和异步 Files 读取只读取最新请求，旧请求失败不能关闭较新的预览。 */
   useEffect(() => {
     workspaceReferencePreviewRequestRef.current = workspaceReferencePreviewRequest;
   }, [workspaceReferencePreviewRequest]);
   /** Host identity 在 layout commit 同步更新，避免旧 await 在 effect 间隙错误 ACK 新会话。 */
   useLayoutEffect(() => {
+    const bindingRevision = `${workspace.rootPath}:${workspace.revision ?? 0}`;
     openTargetRequestRef.current = openTargetRequest;
     openTargetHostScopeRef.current = {
       active,
       workspaceId: workspace.workspaceId,
       threadId: rootThreadId,
+      bindingRevision,
     };
-  }, [active, openTargetRequest, rootThreadId, workspace.workspaceId]);
-  /** 同一 request 的每个阶段只结算一次；opened 后仍允许 closed 完成来源焦点恢复。 */
+  }, [
+    active,
+    openTargetRequest,
+    rootThreadId,
+    workspace.rootPath,
+    workspace.revision,
+    workspace.workspaceId,
+  ]);
+  /**
+   * @author kongweiguang
+   * 本地 ready 事实可能先于 RAF；opened 通知只在焦点提交后发一次，且 opened 仍可转为 closed。
+   */
   const settleWorkspaceReferencePreview = useCallback(
     (requestId: number, outcome: WorkspaceReferencePreviewOutcome): void => {
       const settled = settledWorkspaceReferenceRequestRef.current;
-      if (settled?.requestId === requestId && settled.outcome === outcome) return;
-      if (settled?.requestId === requestId && settled.outcome !== "opened") return;
-      settledWorkspaceReferenceRequestRef.current = { requestId, outcome };
+      if (settled?.requestId === requestId) {
+        if (settled.outcome === outcome && outcome !== "opened") return;
+        if (settled.outcome !== "opened") return;
+        settledWorkspaceReferenceRequestRef.current = {
+          ...settled,
+          outcome,
+          focusFrameId: outcome === "opened" ? settled.focusFrameId : undefined,
+          focusCompleted: outcome === "opened" ? settled.focusCompleted : true,
+          expectedFocus: outcome === "opened" ? settled.expectedFocus : null,
+        };
+      } else {
+        settledWorkspaceReferenceRequestRef.current = {
+          requestId,
+          outcome,
+          focusFrameId: undefined,
+          focusCompleted: outcome !== "opened",
+          expectedFocus: null,
+        };
+      }
       onWorkspaceReferencePreviewSettled(requestId, outcome);
     },
     [onWorkspaceReferencePreviewSettled],
@@ -473,6 +625,23 @@ export function WorkbenchHost({
     }),
     [runtimeTurns],
   );
+  const closeTaskAttachmentPreviewsRef = useRef<
+    (closedThreadIds: readonly string[]) => Promise<void>
+  >(async () => undefined);
+  const clearClosedTaskThreadsRef = useRef<
+    (closedThreadIds: readonly string[], fence: TimelineRuntimeFence) => boolean
+  >(() => false);
+  /** ACK 已由 TaskController 验证；同一 Runtime fence 再约束 Thread 草稿与 Preview 清理。@author kongweiguang */
+  const handleClosedTaskThreads = useCallback(
+    async (closedThreadIds: readonly string[], fence: TimelineRuntimeFence): Promise<boolean> => {
+      if (!clearClosedTaskThreadsRef.current(closedThreadIds, fence)) return false;
+      if (activeTaskThreadId !== undefined && closedThreadIds.includes(activeTaskThreadId))
+        onTabChange("agents");
+      void closeTaskAttachmentPreviewsRef.current(closedThreadIds).catch(() => undefined);
+      return true;
+    },
+    [activeTaskThreadId, onTabChange],
+  );
   const tasks = useTaskController({
     rootThreadId,
     parentRevision: parentThreadRevision,
@@ -480,10 +649,13 @@ export function WorkbenchHost({
     visible: active && (selectedTab === "agents" || parsedSelectedTask !== undefined),
     port: taskPort,
     transcriptPort: taskTranscriptPort,
+    applyTranscriptSnapshot: applyTaskTranscriptSnapshot,
     renamePort: taskThreadRenamePort,
     approvalPort,
     resumePort,
     onSubagentDiscovered: ensureAgentsTab,
+    runtimeFence,
+    onSideTaskClosed: handleClosedTaskThreads,
   });
   const selectedTask =
     parsedSelectedTask === undefined
@@ -506,10 +678,6 @@ export function WorkbenchHost({
     childThreadId === undefined ? false : childPlanDetailsByThread[childThreadId] === true;
   const childComposerFocusRequest =
     childThreadId === undefined ? undefined : childComposerFocusByThread[childThreadId];
-  const childTranscript =
-    childThreadId !== undefined && tasks.transcript?.threadId === childThreadId
-      ? tasks.transcript
-      : undefined;
   const taskDetail = tasks.detail;
   const childThread =
     taskDetail === undefined || taskDetail.thread.threadId !== childThreadId
@@ -517,24 +685,19 @@ export function WorkbenchHost({
       : taskDetail.thread;
   // task/read 用 null 表示服务端尚未生成偏好；交互 controller 以 undefined 表示同一缺省态。
   const childPreferences = childThread?.preferences ?? undefined;
-  /** 仅按稳定 Thread identity 和新快照投影；Tab 解析对象每次 render 都新建，不能作为 effect 依赖。 */
-  useEffect(() => {
-    if (childTranscript === undefined || childTranscript.threadId !== childThreadId || !active)
-      return;
-    // Store 是 interaction controller 与 ChatTimeline 的唯一事实来源，workspace identity 由宿主注入。
-    useTimelineStore.getState().applySnapshot(childTranscript, workspace.workspaceId);
-  }, [active, childThreadId, childTranscript, workspace.workspaceId]);
   const childTaskRef = useRef(selectedTask);
   childTaskRef.current = selectedTask;
   const childRecoveryScopeRef = useRef({
     active,
     childThreadId,
     sideTask: childTaskIsSideTask,
+    closingTaskThreadId: tasks.closingTaskThreadId,
   });
   childRecoveryScopeRef.current = {
     active,
     childThreadId,
     sideTask: childTaskIsSideTask,
+    closingTaskThreadId: tasks.closingTaskThreadId,
   };
   /**
    * Child 的恢复 admission 依据完整、同 revision 的 thread/read；Task 摘要 revision 与 Thread CAS
@@ -696,32 +859,32 @@ export function WorkbenchHost({
       },
     };
   }, [childThread, taskPreferencesPort, taskTranscriptPort, refreshTaskDetail]);
-  const childGoal = useGoalController({
-    goalId: childThread?.activeGoalId ?? undefined,
+  const childPlan = usePlanController({
     ownerThreadId: childThreadId,
-    ownerKind: "independent_task",
     visible:
-      active && childTaskIsSideTask && childThreadId !== undefined && taskGoalPort !== undefined,
+      active && childTaskIsSideTask && childThreadId !== undefined && taskPlanPort !== undefined,
     // Plan 详情嵌入 child task，不能依赖全局 plan tab，否则切换到该 tab 会丢失 child identity。
     detailsVisible:
       active &&
       childTaskIsSideTask &&
       childPlanDetailsOpen &&
       childThreadId !== undefined &&
-      taskGoalPort !== undefined,
-    port: taskGoalPort ?? UNAVAILABLE_GOAL_PORT,
+      taskPlanPort !== undefined,
+    port: taskPlanPort ?? UNAVAILABLE_PLAN_PORT,
   });
+  const { createPlan: createChildPlan } = childPlan;
+  /** Plan 快照变化时保持 Composer 能力稳定，并在调用时校验子任务身份。 */
   const childPlanCreationPort = useMemo<ConversationPlanCreationPort | undefined>(() => {
-    if (taskGoalPort === undefined || !childTaskIsSideTask) return undefined;
+    if (taskPlanPort === undefined || !childTaskIsSideTask) return undefined;
     return {
-      /** Plan 首轮仍由 Goal controller 建立独立 artifact，CAS 只使用 child thread/read revision。 */
+      /** Plan 首轮用 child Thread 的已读 revision 创建独立 artifact。 */
       create: async (threadId, objective, expectedThreadRevision) => {
         const task = childTaskRef.current;
         if (task === undefined || task.taskThreadId !== threadId) return false;
-        return childGoal.createPlan(threadId, objective, expectedThreadRevision);
+        return createChildPlan(threadId, objective, expectedThreadRevision);
       },
     };
-  }, [childGoal, childTaskIsSideTask, taskGoalPort]);
+  }, [createChildPlan, childTaskIsSideTask, taskPlanPort]);
   const childInteraction = useConversationInteractionController({
     threadId: childThreadId,
     workspaceId: workspace.workspaceId,
@@ -733,8 +896,7 @@ export function WorkbenchHost({
       (boot.status === "ready" || boot.status === "busy") &&
       childPreferencesPort !== undefined &&
       childThread !== undefined &&
-      childTranscript !== undefined &&
-      childTranscript.threadId === childThreadId,
+      tasks.readyTaskThreadId === childThreadId,
     blocked: !active,
     turnPort: childTurnPort,
     readThreadRevision: readChildThreadRevision,
@@ -748,6 +910,7 @@ export function WorkbenchHost({
     onAttachmentRemoved,
     onAttachmentsBound,
   });
+  clearClosedTaskThreadsRef.current = childInteraction.clearClosedThreads;
   const childNativeDrop = useComposerNativeDropRouter(
     taskNativeDropPort,
     active && childTaskIsSideTask && childThreadId !== undefined,
@@ -763,6 +926,8 @@ export function WorkbenchHost({
   /**
    * 侧聊创建必须携带发起它的 Thread 身份；主入口传 root，侧聊 Composer 传当前 child。
    * root 只用于校验新 Task 仍属于当前树，避免异步 ACK 在会话切换后留下孤儿会话。
+   * 空侧聊的焦点意图等目标 Thread ready 且仍被当前可见 Tab 持有后才发出，避免首次挂载丢失或迟到抢焦。
+   * @author kongweiguang
    */
   const createSideChatFromSource = useCallback(
     async (source: SideChatSource, content?: string): Promise<void> => {
@@ -814,7 +979,19 @@ export function WorkbenchHost({
         if (!retained.includes(tab.key)) onOpenTabsChange([...retained, tab.key]);
         const normalizedContent = content?.trim() ?? "";
         if (normalizedContent === "") {
+          const taskReady = tasks.waitForTaskReady(task.taskThreadId);
           onTabChange(tab.key);
+          await taskReady;
+          const focusScope = childRecoveryScopeRef.current;
+          if (
+            currentRootThreadRef.current !== expectedRootThreadId ||
+            !currentOpenTabsRef.current.includes(tab.key) ||
+            !focusScope.active ||
+            !focusScope.sideTask ||
+            focusScope.childThreadId !== task.taskThreadId ||
+            focusScope.closingTaskThreadId === task.taskThreadId
+          )
+            return;
           setChildComposerFocusByThread((current) => ({
             ...current,
             [task.taskThreadId]: (current[task.taskThreadId] ?? 0) + 1,
@@ -857,24 +1034,21 @@ export function WorkbenchHost({
     };
     return [
       sideChatCommand,
-      ...(taskGoalPort === undefined
+      ...(taskPlanPort === undefined
         ? []
         : conversationModeCommands({
             available: true,
-            threadId: childThreadId,
             interaction: childInteraction,
-            goal: childGoal,
           })),
     ];
   }, [
-    childGoal,
     childInteraction,
     childPreferences,
     childTaskIsSideTask,
     childThread,
     childThreadId,
     createSideChatFromSource,
-    taskGoalPort,
+    taskPlanPort,
   ]);
 
   /** Task 的 @ 搜索使用当前 child Thread 的 Workspace 授权，避免把子会话请求伪装成根会话。 */
@@ -1158,6 +1332,42 @@ export function WorkbenchHost({
     attachmentPort: attachmentPreviewPort,
     onDismissAttachment,
   });
+  closeTaskAttachmentPreviewsRef.current = previewController.actions.attachment.closeForThreads;
+  /** 全局 close 事件用自身 SID/generation 验证共享清理，不能把 Task tree root 当作 Preview 归属。@author kongweiguang */
+  useEffect(
+    () =>
+      subscribeTaskHostEvents((event) => {
+        if (event.method !== "task/closed") return;
+        if (!event.params.closedThreadIds.includes(event.params.taskThreadId)) return;
+        const params = event.params as typeof event.params & {
+          serverInstanceId?: unknown;
+          generation?: unknown;
+        };
+        if (
+          typeof params.serverInstanceId !== "string" ||
+          !Number.isSafeInteger(params.generation) ||
+          (params.generation as number) <= 0
+        )
+          return;
+        const fence: TimelineRuntimeFence = {
+          serverInstanceId: params.serverInstanceId,
+          generation: params.generation as number,
+        };
+        // 同 root 的 TaskController 已在该事件监听中接受 close 并清理；避免丢失它关闭前的队列索引。
+        if (event.params.rootThreadId === rootThreadId) return;
+        if (!clearClosedTaskThreadsRef.current(event.params.closedThreadIds, fence)) return;
+        if (
+          activeTaskThreadId !== undefined &&
+          event.params.closedThreadIds.includes(activeTaskThreadId) &&
+          event.params.rootThreadId !== rootThreadId
+        )
+          onTabChange("agents");
+        void closeTaskAttachmentPreviewsRef
+          .current(event.params.closedThreadIds)
+          .catch(() => undefined);
+      }),
+    [activeTaskThreadId, onTabChange, rootThreadId],
+  );
   const review = useReviewController({
     catalogEnabled: active && openTabs.includes("review") && selectedTab === "review",
     workspaceId: workspace.workspaceId,
@@ -1170,7 +1380,46 @@ export function WorkbenchHost({
       selectedTab === "review",
     adapter: adapters.review,
   });
+  /** Review ACK is an ordinary Turn admission; authoritative transcript refresh resolves any early event race. */
+  const refreshAcceptedReviewThread = useCallback((accepted: AiReviewAccepted): void => {
+    const timeline = useTimelineStore.getState();
+    timeline.recordThreadMetadataRevision(accepted.threadId, accepted.threadRevision);
+    timeline.requestThreadResync(accepted.threadId);
+  }, []);
+  const reviewIsVisible =
+    turnReviewTarget === undefined &&
+    active &&
+    openTabs.includes("review") &&
+    selectedTab === "review";
+  const aiReview = useAiReviewController({
+    active: reviewIsVisible,
+    workspaceId: workspace.workspaceId,
+    threadId: rootThreadId,
+    threadRevision: rootThreadRevision,
+    runtimeGeneration,
+    serverInstanceId: runtimeServerInstanceId,
+    source: review.viewModel.state.source,
+    snapshotRevision: review.viewModel.state.snapshot?.revision,
+    gateway: adapters.aiReview,
+    cancelTurn: async (turnId) => {
+      await runtimeTurns.cancelTurn({ turnId });
+    },
+    onTurnAccepted: refreshAcceptedReviewThread,
+  });
+  /** 修复 Turn 复用主运行时准入，并把报告引用作为普通用户文本留在可审计 Timeline。 */
+  const submitReviewRepair = useCallback(
+    (prompt: string) => {
+      if (rootThreadId === undefined) return Promise.reject(new Error("review thread unavailable"));
+      return runtimeTurns.submitTurn({
+        threadId: rootThreadId,
+        content: [{ type: "text", text: prompt }],
+      });
+    },
+    [rootThreadId, runtimeTurns],
+  );
   const currentGitBranch = review.viewModel.state.catalog?.currentBranch?.trim() || undefined;
+  // 范围视图按 key 重挂载，触发器引用由 Thread Host 持有才能在旧菜单关闭时找到新入口。
+  const reviewSourceTriggerRef = useRef<HTMLButtonElement>(null);
   const source = review.viewModel.state.source;
   const reviewNavigationKey =
     turnReviewTarget === undefined
@@ -1219,6 +1468,7 @@ export function WorkbenchHost({
             : `提交 ${source.commitId.slice(0, 8)}`;
   const sourceNavigation = (
     <ReviewSourceNavigation
+      triggerRef={reviewSourceTriggerRef}
       currentLabel={
         turnReviewTarget === undefined ? workspaceReviewLabel : (turnReviewScopeLabel ?? "最后一轮")
       }
@@ -1254,7 +1504,7 @@ export function WorkbenchHost({
     terminalLayoutStorage,
   );
 
-  /** Files controller 的脱敏失败按文案去重，具体请求归属由 readFile wrapper 的 identity 判定。 */
+  /** Files controller 的脱敏失败按文案去重；具体读取结果只在当前 binding owner 仍有效时呈现恢复动作。 */
   const showFilesNotice = useCallback((message: string): void => {
     toast.error(message, { id: `ja-files:${message}` });
   }, []);
@@ -1262,9 +1512,10 @@ export function WorkbenchHost({
     const operations = createNotifyingFilesOperations(adapters.workspace, showFilesNotice);
     return {
       ...operations,
-      /** 在同一次真实 Files 读取外层冻结 request identity，迟到 rejection 不能误结算后续点击。 */
+      /** 保留原生 Files reader 的 4 MiB 边界；仅其真实超限/非文本结果出现 Explorer 恢复动作。 */
       readFile: async (input: Parameters<typeof operations.readFile>[0]) => {
         const request = workspaceReferencePreviewRequestRef.current;
+        const readOwner = openTargetHostScopeRef.current;
         const ownedRequestId =
           request?.reference.kind === "file" &&
           request.reference.workspaceId === input.workspaceId &&
@@ -1273,7 +1524,24 @@ export function WorkbenchHost({
             ? request.requestId
             : undefined;
         try {
-          return await operations.readFile(input);
+          const result = await operations.readFile(input);
+          const currentOwner = openTargetHostScopeRef.current;
+          if (
+            currentOwner.active &&
+            currentOwner.workspaceId === input.workspaceId &&
+            currentOwner.threadId === readOwner.threadId &&
+            currentOwner.bindingRevision === readOwner.bindingRevision
+          ) {
+            const reason = workspaceReadRecoveryReason(result.kind, result.content);
+            if (reason !== undefined)
+              toast.error(reason, {
+                id: `ja-files-read:${JSON.stringify([input.workspaceId, input.relativePath])}`,
+                action: explorerRecoveryAction(() =>
+                  adapters.preview.revealFile(input.relativePath, input.workspaceId),
+                ),
+              });
+          }
+          return result;
         } catch (error) {
           if (
             ownedRequestId !== undefined &&
@@ -1284,7 +1552,7 @@ export function WorkbenchHost({
         }
       },
     };
-  }, [adapters.workspace, settleWorkspaceReferencePreview, showFilesNotice]);
+  }, [adapters.preview, adapters.workspace, settleWorkspaceReferencePreview, showFilesNotice]);
   const files = useFilesController({
     workspaceId: workspace.workspaceId,
     operations: filesOperations,
@@ -1327,45 +1595,119 @@ export function WorkbenchHost({
     workspaceReferencePreviewRequest,
   ]);
 
-  /** 文件只在真实 readFile 投影进入 document 后成功；目录选择提交后才安排可取消的焦点转移。 */
+  /**
+   * @author kongweiguang
+   * 文档 ready 后先同步记录本地 opened，使首帧前关闭也能结算；RAF 只提交焦点和全局 opened，
+   * 并在重渲染清理后允许同一请求重排，避免丢失焦点提交或让失效 Host 抢焦点。
+   */
   useEffect(() => {
     const request = workspaceReferencePreviewRequest;
+    if (request === undefined || handledWorkspaceReferenceRequestRef.current !== request.requestId)
+      return;
+    const settled = settledWorkspaceReferenceRequestRef.current;
     if (
-      request === undefined ||
-      handledWorkspaceReferenceRequestRef.current !== request.requestId ||
-      settledWorkspaceReferenceRequestRef.current?.requestId === request.requestId
+      settled?.requestId === request.requestId &&
+      (settled.outcome !== "opened" || settled.focusCompleted || settled.focusFrameId !== undefined)
     )
       return;
+    const currentScope = openTargetHostScopeRef.current;
     if (
       !active ||
       selectedTab !== "files" ||
       !openTabs.includes("files") ||
-      request.reference.workspaceId !== workspace.workspaceId
-    )
+      request.reference.workspaceId !== workspace.workspaceId ||
+      !currentScope.active ||
+      currentScope.workspaceId !== request.reference.workspaceId ||
+      currentScope.threadId !== rootThreadId
+    ) {
+      if (settled?.requestId === request.requestId && settled.outcome === "opened") {
+        settledWorkspaceReferenceRequestRef.current = {
+          ...settled,
+          focusFrameId: undefined,
+          focusCompleted: true,
+        };
+      }
       return;
+    }
     const path = request.reference.relativePath;
     const ready =
       request.reference.kind === "directory"
         ? files.viewModel.selectedPath === path
         : files.viewModel.activePath === path && files.viewModel.documents?.[path] !== undefined;
     if (!ready) return;
-    const commit = (): void => {
-      if (workspaceReferencePreviewRequestRef.current?.requestId !== request.requestId) return;
-      focusWorkspaceReferenceInFiles(request);
+    if (settled?.requestId !== request.requestId) {
+      settledWorkspaceReferenceRequestRef.current = {
+        requestId: request.requestId,
+        outcome: "opened",
+        focusFrameId: undefined,
+        focusCompleted: false,
+        expectedFocus:
+          document.activeElement instanceof HTMLElement ? document.activeElement : null,
+      };
+    }
+    const commit = (frameId?: number): void => {
+      const current = settledWorkspaceReferenceRequestRef.current;
+      if (
+        workspaceReferencePreviewRequestRef.current?.requestId !== request.requestId ||
+        current?.requestId !== request.requestId ||
+        current.outcome !== "opened" ||
+        current.focusCompleted ||
+        current.focusFrameId !== frameId
+      )
+        return;
+      const scope = openTargetHostScopeRef.current;
+      if (
+        !scope.active ||
+        scope.workspaceId !== request.reference.workspaceId ||
+        scope.threadId !== rootThreadId
+      ) {
+        settledWorkspaceReferenceRequestRef.current = {
+          ...current,
+          focusFrameId: undefined,
+          focusCompleted: true,
+        };
+        return;
+      }
+      const expectedFocus = current.expectedFocus;
+      const activeElement = document.activeElement;
+      settledWorkspaceReferenceRequestRef.current = {
+        ...current,
+        focusFrameId: undefined,
+        focusCompleted: true,
+      };
+      if (activeElement === expectedFocus || activeElement === document.body)
+        focusWorkspaceReferenceInFiles(request, rootThreadId);
       settleWorkspaceReferencePreview(request.requestId, "opened");
     };
     if (typeof window.requestAnimationFrame !== "function") {
       commit();
       return;
     }
-    const frame = window.requestAnimationFrame(commit);
-    return () => window.cancelAnimationFrame(frame);
+    const frame = window.requestAnimationFrame(() => commit(frame));
+    const current = settledWorkspaceReferenceRequestRef.current;
+    if (current?.requestId === request.requestId && current.outcome === "opened") {
+      settledWorkspaceReferenceRequestRef.current = {
+        ...current,
+        focusFrameId: frame,
+      };
+    }
+    return () => {
+      window.cancelAnimationFrame(frame!);
+      const pending = settledWorkspaceReferenceRequestRef.current;
+      if (pending?.requestId === request.requestId && pending.focusFrameId === frame) {
+        settledWorkspaceReferenceRequestRef.current = {
+          ...pending,
+          focusFrameId: undefined,
+        };
+      }
+    };
   }, [
     active,
     files.viewModel.activePath,
     files.viewModel.documents,
     files.viewModel.selectedPath,
     openTabs,
+    rootThreadId,
     selectedTab,
     settleWorkspaceReferencePreview,
     workspace.workspaceId,
@@ -1395,21 +1737,26 @@ export function WorkbenchHost({
   /** 选择 Preview 或 Files 前先在唯一 shell state 中打开能力 Tab，保留既有会话标签顺序。 */
   const activateWorkbenchCapability = useCallback(
     (tab: "files" | "preview"): void => {
+      if (onShowCapability !== undefined) {
+        onShowCapability(tab);
+        return;
+      }
       if (!openTabs.includes(tab)) onOpenTabsChange([...openTabs, tab]);
       onTabChange(tab);
     },
-    [onOpenTabsChange, onTabChange, openTabs],
+    [onOpenTabsChange, onShowCapability, onTabChange, openTabs],
   );
 
-  /** 只允许当前 Host 结算请求；Explorer 可在右栏隐藏时执行，后台缓存 session 仍不得消费。 */
+  /** 只允许当前 Thread/绑定版本结算；Host 仅由 ThreadWorkbenchSessions 向当前会话提供请求。 */
   const isOpenTargetRequestCurrent = useCallback(
     (request: ConversationOpenTargetRequest): boolean => {
       const scope = openTargetHostScopeRef.current;
       const current = openTargetRequestRef.current;
       return (
-        (scope.active || request.target.kind === "explorer") &&
         scope.workspaceId === request.workspaceId &&
         scope.threadId === request.threadId &&
+        (request.bindingRevision === undefined ||
+          request.bindingRevision === scope.bindingRevision) &&
         current?.requestId === request.requestId &&
         current.threadId === request.threadId &&
         current.workspaceId === request.workspaceId
@@ -1418,18 +1765,22 @@ export function WorkbenchHost({
     [],
   );
 
-  /** 本机文件点击共用 basename 消歧；Explorer 直接定位，预览再按 Rust 类型路由。 */
+  /** 先由 Rust 确定路径类型，再显示所需工作面；迟到 resolve/open 不能覆盖新 Thread intent。 */
   const executeOpenTargetRequest = useCallback(
     async (
       request: ConversationOpenTargetRequest,
       selectedRelativePath?: string,
     ): Promise<void> => {
-      if (!isOpenTargetRequestCurrent(request)) return;
+      const intentSequence = ++openTargetIntentSequenceRef.current;
+      const isCurrentIntent = (): boolean =>
+        openTargetIntentSequenceRef.current === intentSequence &&
+        isOpenTargetRequestCurrent(request);
+      if (!isCurrentIntent()) return;
       try {
         if (request.target.kind === "url") {
           activateWorkbenchCapability("preview");
           await previewController.actions.openTarget(request.target);
-          if (!isOpenTargetRequestCurrent(request)) {
+          if (!isCurrentIntent()) {
             if (processingOpenTargetRequestRef.current === request.requestId)
               processingOpenTargetRequestRef.current = undefined;
             return;
@@ -1448,7 +1799,7 @@ export function WorkbenchHost({
             query: targetPath,
             limit: 50,
           });
-          if (!isOpenTargetRequestCurrent(request)) {
+          if (!isCurrentIntent()) {
             if (processingOpenTargetRequestRef.current === request.requestId)
               processingOpenTargetRequestRef.current = undefined;
             return;
@@ -1476,7 +1827,7 @@ export function WorkbenchHost({
 
         if (request.target.kind === "explorer") {
           await adapters.preview.revealFile(targetPath, request.workspaceId);
-          if (!isOpenTargetRequestCurrent(request)) {
+          if (!isCurrentIntent()) {
             if (processingOpenTargetRequestRef.current === request.requestId)
               processingOpenTargetRequestRef.current = undefined;
             return;
@@ -1487,13 +1838,20 @@ export function WorkbenchHost({
           return;
         }
 
+        const previewMode =
+          request.target.kind === "preview"
+            ? "browser"
+            : request.target.kind === "file"
+              ? (request.target.previewMode ?? "editor")
+              : "editor";
         const resolution = await adapters.preview.resolveFile(
           targetPath,
           request.workspaceId,
           request.target.line,
           request.target.column,
+          previewMode,
         );
-        if (!isOpenTargetRequestCurrent(request)) {
+        if (!isCurrentIntent()) {
           if (processingOpenTargetRequestRef.current === request.requestId)
             processingOpenTargetRequestRef.current = undefined;
           return;
@@ -1501,10 +1859,50 @@ export function WorkbenchHost({
         const line = resolution.line ?? request.target.line;
         const column = resolution.column ?? request.target.column;
         if (resolution.kind === "unsupported") {
-          toast.error("此文件类型暂不支持打开。", { id: OPEN_TARGET_TOAST_ID });
+          toast.error("此文件类型暂不支持在 Ja 中打开。", {
+            id: OPEN_TARGET_TOAST_ID,
+            action: {
+              label: "在资源管理器中打开",
+              onClick: () => {
+                void adapters.preview
+                  .revealFile(resolution.canonicalPath, request.workspaceId)
+                  .catch(() => toast.error("无法在文件资源管理器中显示该路径。"));
+              },
+            },
+          });
           settledOpenTargetRequestRef.current = request.requestId;
           processingOpenTargetRequestRef.current = undefined;
           onOpenTargetSettled?.(request.requestId, "failed");
+          return;
+        }
+        if (resolution.kind === "directory") {
+          if (resolution.withinWorkspace) {
+            if (resolution.workspaceRelativePath === null)
+              throw new Error("工作区目录路径无效，请重新打开项目后重试。");
+            activateWorkbenchCapability("files");
+            const revealed = await files.actions.revealDirectory(resolution.workspaceRelativePath);
+            if (!isCurrentIntent()) {
+              if (processingOpenTargetRequestRef.current === request.requestId)
+                processingOpenTargetRequestRef.current = undefined;
+              return;
+            }
+            if (!revealed) throw new Error("无法在文件树中定位该目录，请检查目录是否仍存在。");
+          } else {
+            toast.info("该目录位于当前项目之外。", {
+              id: OPEN_TARGET_TOAST_ID,
+              action: {
+                label: "在文件资源管理器中打开",
+                onClick: () => {
+                  void adapters.preview
+                    .revealFile(resolution.canonicalPath, request.workspaceId)
+                    .catch(() => toast.error("无法在文件资源管理器中显示该目录。"));
+                },
+              },
+            });
+          }
+          settledOpenTargetRequestRef.current = request.requestId;
+          processingOpenTargetRequestRef.current = undefined;
+          onOpenTargetSettled?.(request.requestId, "opened");
           return;
         }
         if (resolution.kind === "browser") {
@@ -1512,10 +1910,11 @@ export function WorkbenchHost({
           await previewController.actions.openTarget({
             kind: "file",
             path: resolution.canonicalPath,
+            previewMode,
             ...(line === null || line === undefined ? {} : { line }),
             ...(column === null || column === undefined ? {} : { column }),
           });
-          if (!isOpenTargetRequestCurrent(request)) {
+          if (!isCurrentIntent()) {
             if (processingOpenTargetRequestRef.current === request.requestId)
               processingOpenTargetRequestRef.current = undefined;
             return;
@@ -1526,18 +1925,20 @@ export function WorkbenchHost({
           return;
         }
 
-        activateWorkbenchCapability("files");
+        if (resolution.withinWorkspace && resolution.workspaceRelativePath === null)
+          throw new Error("工作区文件路径无效，请重新打开项目后重试。");
         if (
           resolution.withinWorkspace &&
           !resolution.readOnly &&
           resolution.workspaceRelativePath !== null
         ) {
+          activateWorkbenchCapability("files");
           const reveal =
             line === null || line === undefined
               ? undefined
               : { line, ...(column === null || column === undefined ? {} : { column }) };
           const opened = await files.actions.openPath(resolution.workspaceRelativePath, reveal);
-          if (!isOpenTargetRequestCurrent(request)) {
+          if (!isCurrentIntent()) {
             if (processingOpenTargetRequestRef.current === request.requestId)
               processingOpenTargetRequestRef.current = undefined;
             return;
@@ -1550,14 +1951,23 @@ export function WorkbenchHost({
           }
         } else {
           if (resolution.content === null) {
-            toast.error("无法读取此文本文件的正文，请检查文件权限后重试。", {
-              id: OPEN_TARGET_TOAST_ID,
-            });
+            toast.error(
+              resolution.truncated
+                ? "文件超过 Ja 的读取上限，无法在 Ja 中显示正文。"
+                : "Ja 无法读取此文本文件正文，可能是文件权限或编码不兼容。",
+              {
+                id: OPEN_TARGET_TOAST_ID,
+                action: explorerRecoveryAction(() =>
+                  adapters.preview.revealFile(resolution.canonicalPath, request.workspaceId),
+                ),
+              },
+            );
             settledOpenTargetRequestRef.current = request.requestId;
             processingOpenTargetRequestRef.current = undefined;
             onOpenTargetSettled?.(request.requestId, "failed");
             return;
           }
+          activateWorkbenchCapability("files");
           const opened = files.actions.openExternalDocument({
             path: resolution.canonicalPath,
             content: resolution.content,
@@ -1570,19 +1980,26 @@ export function WorkbenchHost({
                 ? "此文本文件以只读模式打开"
                 : "工作区外文件，只读",
           });
-          if (!opened || !isOpenTargetRequestCurrent(request)) {
-            if (!isOpenTargetRequestCurrent(request)) return;
+          if (!opened || !isCurrentIntent()) {
+            if (!isCurrentIntent()) return;
             settledOpenTargetRequestRef.current = request.requestId;
             processingOpenTargetRequestRef.current = undefined;
             onOpenTargetSettled?.(request.requestId, "failed");
             return;
           }
+          if (resolution.truncated && isCurrentIntent())
+            toast.info("文件超过 Ja 的读取上限，目前只显示部分内容。", {
+              id: OPEN_TARGET_TOAST_ID,
+              action: explorerRecoveryAction(() =>
+                adapters.preview.revealFile(resolution.canonicalPath, request.workspaceId),
+              ),
+            });
         }
         settledOpenTargetRequestRef.current = request.requestId;
         processingOpenTargetRequestRef.current = undefined;
         onOpenTargetSettled?.(request.requestId, "opened");
       } catch (error: unknown) {
-        if (!isOpenTargetRequestCurrent(request)) {
+        if (!isCurrentIntent()) {
           if (processingOpenTargetRequestRef.current === request.requestId)
             processingOpenTargetRequestRef.current = undefined;
           return;
@@ -1610,6 +2027,152 @@ export function WorkbenchHost({
       previewController.actions,
       queryRuntime,
     ],
+  );
+
+  /** 从 Files Markdown 发起的目标与回复路径共用 native resolver 和 click sequence fence。 */
+  const openMarkdownFileTarget = useCallback(
+    async (target: MarkdownFileTarget, _source: HTMLElement, mode?: "explorer" | "browser") => {
+      const intent = ++openTargetIntentSequenceRef.current;
+      const scope = openTargetHostScopeRef.current;
+      const isCurrent = (): boolean =>
+        openTargetIntentSequenceRef.current === intent &&
+        openTargetHostScopeRef.current.workspaceId === scope.workspaceId &&
+        openTargetHostScopeRef.current.threadId === scope.threadId &&
+        openTargetHostScopeRef.current.bindingRevision === scope.bindingRevision;
+      if (mode === "explorer") {
+        await adapters.preview.revealFile(target.path, workspace.workspaceId);
+        if (!isCurrent()) return;
+        return;
+      }
+      const previewMode = mode === "browser" ? "browser" : "editor";
+      const resolution = await adapters.preview.resolveFile(
+        target.path,
+        workspace.workspaceId,
+        target.line,
+        target.column,
+        previewMode,
+      );
+      if (!isCurrent()) return;
+      if (resolution.kind === "unsupported") {
+        toast.error("此文件类型暂不支持在 Ja 中打开。", {
+          action: {
+            label: "在资源管理器中打开",
+            onClick: () => {
+              void adapters.preview
+                .revealFile(resolution.canonicalPath, workspace.workspaceId)
+                .catch(() => toast.error("无法在文件资源管理器中显示该路径。"));
+            },
+          },
+        });
+        return;
+      }
+      if (resolution.kind === "directory") {
+        if (resolution.withinWorkspace) {
+          if (resolution.workspaceRelativePath === null)
+            throw new Error("工作区目录路径无效，请重新打开项目后重试。");
+          activateWorkbenchCapability("files");
+          if (!(await files.actions.revealDirectory(resolution.workspaceRelativePath)))
+            throw new Error("无法在文件树中定位该目录，请检查目录是否仍存在。");
+        } else {
+          toast.info("该目录位于当前项目之外。", {
+            action: {
+              label: "在文件资源管理器中打开",
+              onClick: () => {
+                void adapters.preview
+                  .revealFile(resolution.canonicalPath, workspace.workspaceId)
+                  .catch(() => toast.error("无法在文件资源管理器中显示该目录。"));
+              },
+            },
+          });
+        }
+        if (!isCurrent()) return;
+        return;
+      }
+      if (resolution.kind === "browser") {
+        activateWorkbenchCapability("preview");
+        await previewController.actions.openTarget({
+          kind: "file",
+          path: resolution.canonicalPath,
+          previewMode,
+        });
+        if (!isCurrent()) return;
+        return;
+      }
+      if (resolution.withinWorkspace && resolution.workspaceRelativePath === null)
+        throw new Error("工作区文件路径无效，请重新打开项目后重试。");
+      if (resolution.withinWorkspace && !resolution.readOnly) {
+        if (resolution.workspaceRelativePath === null)
+          throw new Error("工作区文件路径无效，请重新打开项目后重试。");
+        activateWorkbenchCapability("files");
+        const opened = await files.actions.openPath(
+          resolution.workspaceRelativePath,
+          target.line === undefined
+            ? undefined
+            : {
+                line: target.line,
+                ...(target.column === undefined ? {} : { column: target.column }),
+              },
+        );
+        if (!isCurrent()) return;
+        if (!opened) throw new Error("文件未能在 Ja 编辑器中打开。");
+      } else {
+        if (resolution.content === null) {
+          toast.error(
+            resolution.truncated
+              ? "文件超过 Ja 的读取上限，无法在 Ja 中显示正文。"
+              : "Ja 无法读取此文本文件正文，可能是文件权限或编码不兼容。",
+            {
+              action: explorerRecoveryAction(() =>
+                adapters.preview.revealFile(resolution.canonicalPath, workspace.workspaceId),
+              ),
+            },
+          );
+          return;
+        }
+        activateWorkbenchCapability("files");
+        const opened = files.actions.openExternalDocument({
+          path: resolution.canonicalPath,
+          content: resolution.content,
+          line: target.line,
+          column: target.column,
+          truncated: resolution.truncated,
+          readOnlyReason: resolution.truncated ? "只读快照，内容已截断" : "工作区外文件，只读",
+        });
+        if (!opened && isCurrent()) throw new Error("只读文本快照未能打开。");
+        if (opened && resolution.truncated && isCurrent())
+          toast.info("文件超过 Ja 的读取上限，目前只显示部分内容。", {
+            action: explorerRecoveryAction(() =>
+              adapters.preview.revealFile(resolution.canonicalPath, workspace.workspaceId),
+            ),
+          });
+      }
+    },
+    [
+      activateWorkbenchCapability,
+      adapters.preview,
+      files.actions,
+      openTargetIntentSequenceRef,
+      previewController.actions,
+      workspace.workspaceId,
+    ],
+  );
+
+  /** Markdown HTTP(S) 链接仍使用当前 Thread 的隔离 Preview。 */
+  const openMarkdownWebLink = useCallback(
+    async (url: string): Promise<void> => {
+      const intent = ++openTargetIntentSequenceRef.current;
+      const scope = openTargetHostScopeRef.current;
+      activateWorkbenchCapability("preview");
+      await previewController.actions.openTarget({ kind: "url", url });
+      if (
+        openTargetIntentSequenceRef.current !== intent ||
+        openTargetHostScopeRef.current.workspaceId !== scope.workspaceId ||
+        openTargetHostScopeRef.current.threadId !== scope.threadId ||
+        openTargetHostScopeRef.current.bindingRevision !== scope.bindingRevision
+      )
+        return;
+    },
+    [activateWorkbenchCapability, previewController.actions],
   );
 
   /** 用户选择 basename 候选后复用同一个请求与 resolver，选择器不自行访问文件系统。 */
@@ -1746,6 +2309,8 @@ export function WorkbenchHost({
                   sourceNavigation={sourceNavigation}
                   navigationState={reviewNavigationState}
                   onNavigationStateChange={rememberReviewNavigation}
+                  aiReview={aiReview}
+                  onRepairFinding={submitReviewRepair}
                 />
               ) : (
                 <TurnReviewPanelView
@@ -1766,6 +2331,9 @@ export function WorkbenchHost({
               <FilesWorkspace
                 viewModel={files.viewModel}
                 actions={files.actions}
+                onOpenMarkdownFile={openMarkdownFileTarget}
+                onOpenMarkdownLink={openMarkdownWebLink}
+                onCopyText={onCopyText}
                 onAddToConversation={(node) => {
                   if (node.kind !== "file" && node.kind !== "directory") return;
                   onAddWorkspaceReference({
@@ -1796,55 +2364,34 @@ export function WorkbenchHost({
               />
             ),
             plan:
-              planGoalAvailable && goal !== undefined ? (
+              planAvailable && plan !== undefined ? (
                 <PlanWorkbench
-                  model={goal.model}
-                  planModel={goal.planModel}
-                  revisions={goal.revisions}
-                  evidence={goal.evidence}
-                  loading={goal.loading}
-                  error={goal.error}
-                  busyAction={goal.busyAction}
-                  onRetry={goal.refresh}
-                  onSaveDraft={goal.saveDraft}
-                  onDiscardDraft={goal.discardDraft}
-                  onFinalizePlan={goal.finalizePlan}
-                  onExecute={goal.execute}
-                  onPausePlan={goal.pausePlan}
-                  onResumePlan={goal.resumePlan}
-                  onStopPlan={goal.stopPlan}
-                  onAttachPlan={
-                    goal.model === undefined ||
-                    goal.planModel === undefined ||
-                    (goal.model.goal.status !== "active" && goal.model.goal.status !== "paused") ||
-                    goal.model.goal.activePlanId === goal.planModel.plan.planId
-                      ? undefined
-                      : goal.attachPlan
-                  }
-                  onDetachPlan={
-                    goal.model?.goal.activePlanId === null ? undefined : goal.detachPlan
-                  }
-                  onReject={goal.reject}
-                  onPause={goal.pause}
-                  onResume={goal.resume}
-                  onBeginEdit={
-                    goal.model?.goal.status === "active" &&
-                    goal.model.goal.activePlanId === goal.planModel?.plan.planId
-                      ? goal.pause
-                      : undefined
-                  }
-                  onCancelEdit={goal.resume}
-                  onContinue={goal.resume}
+                  planModel={plan.planModel}
+                  revisions={plan.revisions}
+                  evidence={plan.evidence}
+                  loading={plan.loading}
+                  error={plan.error}
+                  busyAction={plan.busyAction}
+                  onRetry={plan.refresh}
+                  onSaveDraft={plan.saveDraft}
+                  onDiscardDraft={plan.discardDraft}
+                  onFinalizePlan={plan.finalizePlan}
+                  onExecute={plan.execute}
+                  onPausePlan={plan.pausePlan}
+                  onResumePlan={plan.resumePlan}
+                  onStopPlan={plan.stopPlan}
+                  onReject={plan.reject}
                 />
               ) : undefined,
           }}
           renderTaskView={(tab) => (
             <TaskDetailPanel
               tab={tab}
+              active={active}
               controller={tasks}
               composerEnvironment={taskComposerEnvironment}
               transcriptActions={taskTranscriptActions}
-              goal={parsedSelectedTask?.taskKind === "side_task" ? childGoal : undefined}
+              plan={parsedSelectedTask?.taskKind === "side_task" ? childPlan : undefined}
               clarification={
                 parsedSelectedTask?.taskKind === "side_task" ? childClarification : undefined
               }
@@ -1877,13 +2424,11 @@ export function WorkbenchHost({
       </aside>
       <Dialog
         open={
-          (active || openTargetRequest?.target.kind === "explorer") &&
           ambiguousOpenTarget !== undefined &&
           openTargetRequest?.requestId === ambiguousOpenTarget.requestId
         }
         onOpenChange={(nextOpen) => {
-          if (!nextOpen && (active || openTargetRequest?.target.kind === "explorer"))
-            cancelOpenTargetChoice();
+          if (!nextOpen) cancelOpenTargetChoice();
         }}
       >
         <DialogContent

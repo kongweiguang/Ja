@@ -14,7 +14,6 @@ function workspace() {
   return {
     workspaceId: "ws_server",
     kind: "project" as const,
-    legacySharedWorkspaceId: null,
     root: "C:\\demo",
     displayName: "demo",
     trust: "untrusted" as const,
@@ -28,8 +27,6 @@ function thread(threadId = "thr_fixture") {
     threadId,
     workspaceId: "ws_server",
     workspaceKind: "project" as const,
-    legacySharedWorkspaceId: null,
-    activeGoalId: null,
     preferences: {
       providerId: "provider_fixture",
       modelId: "model_fixture",
@@ -49,7 +46,7 @@ function thread(threadId = "thr_fixture") {
   };
 }
 
-/** 构造完整 Java thread/read 词汇，包括隐藏续答来源的 nullable identity，捕获 wire drift。 */
+/** 正文预览的 code-point 长度与 nullable source identity 都是 thread/read 的权威字段。 */
 function snapshot() {
   return {
     threadId: "thr_fixture",
@@ -57,6 +54,7 @@ function snapshot() {
     turns: [
       {
         turnId: "turn_fixture",
+        origin: "native" as const,
         sourceMessageId: null,
         status: "completed",
         requestedAt: "2026-08-18T00:00:00Z",
@@ -70,14 +68,18 @@ function snapshot() {
       {
         itemId: "item_user",
         turnId: "turn_fixture",
+        origin: "native" as const,
         kind: "user_input",
         createdAt: "2026-08-18T00:00:00Z",
         content: [{ type: "text", text: "hello" }],
+        totalCharacters: 5,
+        truncated: false,
         attachments: [],
       },
       {
         itemId: "item_call",
         turnId: "turn_fixture",
+        origin: "native" as const,
         kind: "tool_call",
         createdAt: "2026-08-18T00:00:01Z",
         callId: "call_fixture",
@@ -97,6 +99,7 @@ function snapshot() {
         itemId: "item_approval",
         kind: "approval",
         createdAt: "2026-08-18T00:00:03Z",
+        origin: "native" as const,
         approvalId: "appr_fixture",
         turnId: "turn_fixture",
         callId: "call_fixture",
@@ -109,19 +112,29 @@ function snapshot() {
     contextUsage: null,
     inputQueue: null,
     taskActivities: [],
-    goalActivities: [],
     liveStream: null,
     nextCursor: null,
   };
 }
 
 describe("TauriHistoryAdapter v1", () => {
+  /** 真窗启动 effect 会解构恢复端口；空账本仍必须保留 adapter 实例以免击穿 ErrorBoundary。 */
+  it("keeps fork recovery ports bound when the controller extracts them", async () => {
+    const invoke = vi.fn();
+    const adapter = new TauriHistoryAdapter({ invoke } as HistoryNativeBridge);
+    const { recoverThreadForks, acknowledgeThreadForkOpened } = adapter;
+    await expect(recoverThreadForks()).resolves.toEqual([]);
+    await expect(
+      acknowledgeThreadForkOpened("op_00000000000000000000000000000001"),
+    ).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
   /** 长答复只通过稳定消息身份读取一页；错配或多余字段不能进入 Renderer。 */
   it("按消息身份分页读取完整公开正文", async () => {
     const invoke = vi.fn(async (command: string): Promise<unknown> => {
-      expect(command).toBe(JA_HISTORY_COMMANDS.messageContentRead);
+      expect(command).toBe(JA_HISTORY_COMMANDS.itemContentRead);
       return {
-        messageId: "item_answer",
+        itemId: "item_answer",
         offsetCharacters: 0,
         nextOffsetCharacters: null,
         totalCharacters: 2,
@@ -131,19 +144,19 @@ describe("TauriHistoryAdapter v1", () => {
     }) as unknown as HistoryNativeBridge["invoke"];
     const adapter = new TauriHistoryAdapter({ invoke });
     await expect(
-      adapter.messageContentRead({
+      adapter.itemContentRead({
         threadId: "thr_fixture",
-        messageId: "item_answer",
+        itemId: "item_answer",
         offsetCharacters: 0,
-        limitCharacters: 32_768,
+        limitCharacters: 65_536,
       }),
     ).resolves.toMatchObject({ content: "甲😀", totalCharacters: 2 });
-    expect(invoke).toHaveBeenCalledWith(JA_HISTORY_COMMANDS.messageContentRead, {
+    expect(invoke).toHaveBeenCalledWith(JA_HISTORY_COMMANDS.itemContentRead, {
       input: {
         threadId: "thr_fixture",
-        messageId: "item_answer",
+        itemId: "item_answer",
         offsetCharacters: 0,
-        limitCharacters: 32_768,
+        limitCharacters: 65_536,
       },
     });
   });
@@ -180,6 +193,98 @@ describe("TauriHistoryAdapter v1", () => {
 
   it("uses the dedicated runtime workspace command instead of the file open-with command", () => {
     expect(JA_HISTORY_COMMANDS.workspaceOpen).toBe("ja_runtime_workspace_open");
+    expect(JA_HISTORY_COMMANDS.workspaceRead).toBe("ja_runtime_workspace_read");
+    expect(JA_HISTORY_COMMANDS.workspaceUpdate).toBe("ja_runtime_workspace_update");
+    expect(JA_HISTORY_COMMANDS.workspaceSetTrust).toBe("ja_workspace_set_trust");
+  });
+
+  /** 已登记项目只交付身份，避免前端重推路径而绕过服务端登记资料或恢复已失效目录。 */
+  it("reopens registered workspaces by ID through the typed workspace command", async () => {
+    const invoke = vi.fn(async () => workspace()) as unknown as HistoryNativeBridge["invoke"];
+    const adapter = new TauriHistoryAdapter({ invoke });
+
+    await expect(adapter.workspaceOpen({ workspaceId: "ws_server" })).resolves.toEqual(workspace());
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(JA_HISTORY_COMMANDS.workspaceOpen, {
+      input: { workspaceId: "ws_server" },
+    });
+    await expect(
+      adapter.workspaceOpen({ workspaceId: "ws_server", cwd: "D:\\other" } as never),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  /** 读写以稳定 ID 定位项目；CAS revision 与参数闭集由共享 schema 在 invoke 前校验。 */
+  it("reads and updates workspace metadata through dedicated runtime commands", async () => {
+    const invoke = vi.fn(async () => workspace()) as unknown as HistoryNativeBridge["invoke"];
+    const adapter = new TauriHistoryAdapter({ invoke });
+
+    await expect(adapter.workspaceRead({ workspaceId: "ws_server" })).resolves.toEqual(workspace());
+    await expect(
+      adapter.workspaceUpdate({
+        workspaceId: "ws_server",
+        expectedRevision: 0,
+        displayName: "Ja 项目",
+      }),
+    ).resolves.toEqual(workspace());
+    expect(invoke).toHaveBeenNthCalledWith(1, JA_HISTORY_COMMANDS.workspaceRead, {
+      input: { workspaceId: "ws_server" },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, JA_HISTORY_COMMANDS.workspaceUpdate, {
+      input: { workspaceId: "ws_server", expectedRevision: 0, displayName: "Ja 项目" },
+    });
+
+    await expect(
+      adapter.workspaceUpdate({
+        workspaceId: "ws_server",
+        expectedRevision: -1,
+        cwd: "D:\\new",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(
+      adapter.workspaceRead({ workspaceId: "ws_server", cwd: "D:\\old" } as never),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  /** Java 的真实 WORKSPACE_BUSY 摘要必须穿过 typed adapter 回到编辑 Dialog，而不是折叠成通用故障。 @author kongweiguang */
+  it("preserves the bounded Java workspace-busy summary from the runtime command", async () => {
+    const message = "暂时无法更改项目目录：项目诊断会话正在工作";
+    const invoke = vi.fn(async () => {
+      throw { code: "WORKSPACE_BUSY", message, retryable: true };
+    }) as unknown as HistoryNativeBridge["invoke"];
+    const adapter = new TauriHistoryAdapter({ invoke });
+
+    await expect(
+      adapter.workspaceUpdate({
+        workspaceId: "ws_server",
+        expectedRevision: 0,
+        displayName: "Ja 项目",
+        cwd: "D:\\next",
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_BUSY", message, retryable: true });
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(JA_HISTORY_COMMANDS.workspaceUpdate, {
+      input: {
+        workspaceId: "ws_server",
+        expectedRevision: 0,
+        displayName: "Ja 项目",
+        cwd: "D:\\next",
+      },
+    });
+  });
+
+  /** 打开只登记目录；权限提升必须通过独立、可审计的命令提交。 */
+  it("sets workspace trust through the dedicated command", async () => {
+    const invoke = vi.fn(async () => ({ accepted: true }));
+    const adapter = new TauriHistoryAdapter({
+      invoke: invoke as unknown as HistoryNativeBridge["invoke"],
+    });
+
+    await expect(
+      adapter.workspaceSetTrust({ workspaceId: "ws_demo", trust: "trusted" }),
+    ).resolves.toEqual({ accepted: true });
+    expect(invoke).toHaveBeenCalledWith(JA_HISTORY_COMMANDS.workspaceSetTrust, {
+      input: { workspaceId: "ws_demo", trust: "trusted" },
+    });
   });
 
   it("uses server-owned workspace/open and cwd-bound Thread creation", async () => {
@@ -298,10 +403,7 @@ describe("TauriHistoryAdapter v1", () => {
     });
 
     expect(invokeMock.mock.calls).toEqual([
-      [
-        JA_HISTORY_COMMANDS.workspaceOpen,
-        { input: { cwd: "C:\\demo", displayName: "demo", trust: "trusted" } },
-      ],
+      [JA_HISTORY_COMMANDS.workspaceOpen, { input: { cwd: "C:\\demo", displayName: "demo" } }],
       [JA_HISTORY_COMMANDS.workspaceList, { input: {} }],
       [JA_HISTORY_COMMANDS.workspaceList, { input: { kind: "project", limit: 200 } }],
       [
@@ -525,7 +627,7 @@ describe("TauriHistoryAdapter v1", () => {
     });
   });
 
-  /** MCP header reads are explicit thread-scoped IPC calls and keep unknown counts absent. */
+  /** MCP 标题状态通过显式的 Thread 级 IPC 查询，未知计数保持缺省。 */
   it("maps the thread MCP read to its strict native command", async () => {
     const status = {
       threadId: "thr_fixture",
@@ -554,7 +656,7 @@ describe("TauriHistoryAdapter v1", () => {
     });
   });
 
-  /** Optional unknown status fields must be omitted, and redacted projections cannot carry endpoint data. */
+  /** 可选的未知状态字段必须省略；脱敏投影不得携带端点数据。 */
   it("rejects null optional MCP fields and sensitive status data", async () => {
     const adapterFor = (result: unknown) =>
       new TauriHistoryAdapter({

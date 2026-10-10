@@ -26,9 +26,9 @@ function Get-LatestAppServerInputWriteTimeUtc {
 
     $inputFiles = @(
         Get-Item -LiteralPath (Join-Path $Root 'package.json') -ErrorAction Stop
-        Get-Item -LiteralPath (Join-Path $Root 'app-server/pom.xml') -ErrorAction Stop
+        Get-Item -LiteralPath (Join-Path $Root 'ja-agent/ja-app-server/pom.xml') -ErrorAction Stop
     )
-    foreach ($relativeRoot in @('app-server/src/main', 'contracts/ja-rpc/v1')) {
+    foreach ($relativeRoot in @('ja-agent/ja-app-server/src/main', 'contracts/ja-rpc/v2')) {
         $sourceRoot = Join-Path $Root $relativeRoot
         if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) {
             throw "App Server 构建输入目录缺失：$relativeRoot"

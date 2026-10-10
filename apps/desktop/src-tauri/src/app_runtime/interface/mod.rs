@@ -4,28 +4,31 @@
 // Tauri interface 与 composition 适配层；这里只做 DTO 交接、调用用例和错误透传。
 
 pub(crate) mod app_tray;
+pub(crate) mod coding;
 pub(crate) mod configuration;
 pub(crate) mod desktop_preferences;
 pub(crate) mod event_projection;
-pub(crate) mod goal;
 pub(crate) mod history;
 pub(crate) mod history_model;
+pub(crate) mod plans;
 pub(crate) mod runtime;
 pub(crate) mod settings;
 pub(crate) mod settings_model;
 pub(crate) mod task;
 
+pub use coding::*;
 pub use configuration::*;
 pub use dto::{
     RuntimeRecoveryStateDto, RuntimeStatusDto, ToolArtifactReadInputDto, ToolArtifactReadResultDto,
     ToolRecoveryResponseDto, TurnAcceptedDto, TurnCancelResultDto, TurnChangeSetReadInputDto,
     TurnChangeSetReadResultDto, WorkspaceActivationDto, WorkspaceActivationInputDto,
     WorkspaceKindDto, WorkspacePathSearchInputDto, WorkspacePathSearchResultDto,
+    WorkspaceReadInputDto, WorkspaceTrustAcceptedDto, WorkspaceUpdateInputDto,
 };
 pub use event_projection::RPC_FRAME_EVENT;
-pub use goal::*;
 pub use history::*;
 pub use history_model::{ThreadMcpReadInput, ThreadMcpStatusResult, WorkspaceWireDto};
+pub use plans::*;
 pub use runtime::*;
 pub use settings::*;
 pub use task::*;

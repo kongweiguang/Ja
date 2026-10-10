@@ -32,41 +32,49 @@ function checkedState(result: SettingsUpdateCheckResult): AppUpdaterState {
 
 /**
  * 设置页生命周期拥有一次自动检查和所有用户动作；operation token 阻止迟到结果覆盖更新中的新状态，
- * 同时让 React Strict Mode 的重复 effect 不会发出第二次自动请求。
+ * 自动检查延迟到可取消的 microtask，以避开 effect 内同步 setState；cleanup 同时撤销排队请求并推进 epoch，
+ * 让 Strict Mode 重放和真实卸载都不会遗留重复请求或迟到状态写入。
  */
 export function useAppUpdater(desktop: SettingsDesktopPort): AppUpdaterController {
   const [state, setState] = useState<AppUpdaterState>({ kind: "checking", automatic: true });
   const operation = useRef(0);
   const automaticCheckStarted = useRef(false);
+  const desktopRef = useRef(desktop);
+
+  /** Desktop port 可随 Settings render 重新投影；稳定 request callback 只读取最新能力 owner。 */
+  useEffect(() => {
+    desktopRef.current = desktop;
+  }, [desktop]);
 
   /** 自动与手动检查共用相同请求边界，只有当前 operation 能提交结果。 */
-  const runCheck = useCallback(
-    async (automatic: boolean): Promise<void> => {
-      const token = ++operation.current;
-      setState({ kind: "checking", automatic });
-      try {
-        const result = await desktop.checkForUpdate();
-        if (operation.current === token) setState(checkedState(result));
-      } catch {
-        if (operation.current === token) setState({ kind: "error", operation: "check" });
-      }
-    },
-    [desktop],
-  );
+  const runCheck = useCallback(async (automatic: boolean): Promise<void> => {
+    const token = ++operation.current;
+    setState({ kind: "checking", automatic });
+    try {
+      const result = await desktopRef.current.checkForUpdate();
+      if (operation.current === token) setState(checkedState(result));
+    } catch {
+      if (operation.current === token) setState({ kind: "error", operation: "check" });
+    }
+  }, []);
 
   useEffect(() => {
     if (automaticCheckStarted.current) return;
     automaticCheckStarted.current = true;
-    const token = ++operation.current;
-    void desktop
-      .checkForUpdate()
-      .then((result) => {
-        if (operation.current === token) setState(checkedState(result));
-      })
-      .catch(() => {
-        if (operation.current === token) setState({ kind: "error", operation: "check" });
-      });
-  }, [desktop]);
+
+    let cancelled = false;
+    const scheduledOperation = operation.current;
+    queueMicrotask(() => {
+      if (cancelled || operation.current !== scheduledOperation) return;
+      void runCheck(true);
+    });
+
+    return () => {
+      cancelled = true;
+      automaticCheckStarted.current = false;
+      operation.current += 1;
+    };
+  }, [runCheck]);
 
   /** 仅从 available 状态进入安装；进度回调只更新同一版本，重复点击不会并发安装。 */
   const install = useCallback(async (): Promise<void> => {

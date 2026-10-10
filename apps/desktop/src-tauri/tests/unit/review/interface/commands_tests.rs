@@ -6,6 +6,7 @@ use crate::review::domain::{
     ReviewFile, ReviewFileDiff, ReviewFileId, ReviewFileLayer, ReviewFileStatus, ReviewHunk,
     ReviewHunkId, ReviewLine, ReviewLineKind, ReviewRevision, ReviewSnapshot, ReviewStats,
 };
+use ja_review::{ReviewSnapshotSource, SnapshotCoverage, SnapshotPartialReason};
 use serde_json::json;
 
 /// 锁定 Rust projection 与 typed adapter 的当前四来源和扁平 diff wire shape。
@@ -87,6 +88,79 @@ fn uncommitted_source_wire_is_explicit() {
         serde_json::to_value(ReviewSourceDto::Uncommitted).expect("source fixture"),
         json!({ "kind": "uncommitted" })
     );
+}
+
+/// Capture input binds the UI revision and cancellable operation to one explicit source selection.
+#[test]
+fn review_capture_input_requires_source_revision_and_operation_identity() {
+    let input: ReviewCaptureInput = serde_json::from_value(json!({
+        "workspaceId": "ws_fixture",
+        "source": { "kind": "staged" },
+        "expectedSnapshotRevision": "revision_fixture",
+        "operationId": "review_capture_fixture"
+    }))
+    .expect("capture input");
+
+    assert_eq!(input.workspace_id, "ws_fixture");
+    assert_eq!(input.expected_snapshot_revision, "revision_fixture");
+    assert_eq!(input.operation_id, "review_capture_fixture");
+    assert!(matches!(input.source, ReviewSourceDto::Staged));
+}
+
+/// Capture result exposes only frozen identity, managed attachment identity, and measured coverage.
+#[test]
+fn review_capture_result_uses_shared_snapshot_source_and_coverage_wire() {
+    let value = serde_json::to_value(ReviewCaptureResultDto {
+        workspace_id: "ws_fixture".to_owned(),
+        source: ReviewSnapshotSource::Base {
+            base_commit_id: "a".repeat(40),
+        },
+        snapshot_id: "rev_fixture".to_owned(),
+        snapshot_hash: "b".repeat(64),
+        revision: "c".repeat(64),
+        attachment_id: "att_fixture".to_owned(),
+        coverage: SnapshotCoverage {
+            complete: false,
+            files: 1,
+            bytes: 7,
+            max_files: 2_000,
+            max_bytes: 64 * 1024 * 1024,
+            partial_reasons: vec![SnapshotPartialReason::BinaryFile],
+        },
+    })
+    .expect("capture result");
+
+    assert_eq!(
+        value["source"],
+        json!({ "kind": "base", "commitId": "a".repeat(40) })
+    );
+    assert_eq!(value["attachmentId"], "att_fixture");
+    assert_eq!(value["coverage"]["complete"], false);
+    assert_eq!(value["coverage"]["partialReasons"], json!(["binary_file"]));
+    assert!(value.get("files").is_none());
+}
+
+/// Mutable-layer selectors map one-to-one to collector selectors without broadening to uncommitted.
+#[test]
+fn review_capture_preserves_staged_and_unstaged_source_scope() {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let staged = freeze_source(
+        Path::new("missing"),
+        &ReviewSource::Staged,
+        &cancellation,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .expect("staged source");
+    let unstaged = freeze_source(
+        Path::new("missing"),
+        &ReviewSource::Unstaged,
+        &cancellation,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .expect("unstaged source");
+
+    assert_eq!(staged, ReviewSnapshotSource::Staged);
+    assert_eq!(unstaged, ReviewSnapshotSource::Unstaged);
 }
 
 /// 锁定 invalidation event 只是一条 refetch hint，不能演化为第二份 mutation ledger。

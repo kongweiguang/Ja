@@ -9,7 +9,7 @@ import type { TimelineItemAdapter } from "@/features/conversation/domain/timelin
 /** 构造与真实 request_user_input 相同的最小已回答请求，测试只关注 Timeline 归属。 */
 function answeredRequest(): InteractionRequest {
   return {
-    requestId: "interaction_demo",
+    interactionId: "interaction_demo",
     threadId: "thr_one",
     turnId: "turn_one",
     toolCallId: "call_question",
@@ -28,7 +28,7 @@ function answeredRequest(): InteractionRequest {
     ],
     answers: [{ questionId: "scope", optionIds: ["project"], freeText: null, skipped: false }],
     status: "answered",
-    revision: 2,
+    interactionRevision: 2,
     createdAt: "2026-09-18T00:00:00Z",
     updatedAt: "2026-09-18T00:00:01Z",
   };
@@ -37,6 +37,7 @@ function answeredRequest(): InteractionRequest {
 /** 构造仍在等待的 Tool 行，验证回答 ACK 会原位替换而不是新增重复行。 */
 function pendingTool(): TimelineItemAdapter {
   return {
+    origin: "native" as const,
     itemId: "item_question",
     threadId: "thr_one",
     turnId: "turn_one",

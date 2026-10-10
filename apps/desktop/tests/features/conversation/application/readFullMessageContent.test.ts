@@ -4,17 +4,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   readFullAnswerContent,
-  readFullMessageContent,
+  readFullItemContent,
 } from "@/features/conversation/application/readFullMessageContent";
 import type { TimelineSnapshot } from "@/features/conversation/domain/timelineContracts";
 
-describe("readFullMessageContent", () => {
+describe("readFullItemContent", () => {
   /** 跨页按 Unicode code point 前进，代理对不会重复或漏掉。 */
   it("reassembles ordered Unicode pages", async () => {
-    const read = vi.fn(async ({ offsetCharacters }: { offsetCharacters: number }) =>
-      offsetCharacters === 0
+    const read = vi.fn(async (input: { offsetCharacters: number; limitCharacters: number }) =>
+      input.offsetCharacters === 0
         ? {
-            messageId: "item_demo",
+            itemId: "item_demo",
             offsetCharacters: 0,
             nextOffsetCharacters: 2,
             totalCharacters: 3,
@@ -22,7 +22,7 @@ describe("readFullMessageContent", () => {
             content: "甲😀",
           }
         : {
-            messageId: "item_demo",
+            itemId: "item_demo",
             offsetCharacters: 2,
             nextOffsetCharacters: null,
             totalCharacters: 3,
@@ -30,16 +30,17 @@ describe("readFullMessageContent", () => {
             content: "乙",
           },
     );
-    await expect(readFullMessageContent(read, "thr_demo", "item_demo")).resolves.toBe("甲😀乙");
+    await expect(readFullItemContent(read, "thr_demo", "item_demo")).resolves.toBe("甲😀乙");
     expect(read.mock.calls.map((call) => call[0].offsetCharacters)).toEqual([0, 2]);
+    expect(read.mock.calls.map((call) => call[0].limitCharacters)).toEqual([65_536, 65_536]);
   });
 
   /** 错位页或切换后的迟到页不允许交付半条正文。 */
   it("rejects inconsistent progress and a stale thread fence", async () => {
     await expect(
-      readFullMessageContent(
+      readFullItemContent(
         async () => ({
-          messageId: "item_demo",
+          itemId: "item_demo",
           offsetCharacters: 0,
           nextOffsetCharacters: 0,
           totalCharacters: 2,
@@ -52,11 +53,11 @@ describe("readFullMessageContent", () => {
     ).rejects.toThrow("分页数据不一致");
     let current = true;
     await expect(
-      readFullMessageContent(
+      readFullItemContent(
         async () => {
           current = false;
           return {
-            messageId: "item_demo",
+            itemId: "item_demo",
             offsetCharacters: 0,
             nextOffsetCharacters: null,
             totalCharacters: 1,
@@ -81,22 +82,27 @@ describe("readFullMessageContent", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
     } satisfies Omit<TimelineSnapshot, "items" | "nextCursor">;
     const occurredAt = "2026-09-25T00:00:00Z";
     const latest: TimelineSnapshot = {
       ...base,
       items: [
         {
+          origin: "native" as const,
           itemId: "item_final",
           turnId: "turn_current",
+          truncated: false,
+          totalCharacters: 6,
           kind: "final_answer",
           text: "ending",
           createdAt: occurredAt,
         },
         ...Array.from({ length: 199 }, (_, index) => ({
+          origin: "native" as const,
           itemId: `item_later_${index}`,
           turnId: "turn_later",
+          truncated: false,
+          totalCharacters: 5,
           kind: "assistant_progress" as const,
           text: "later",
           modelRound: 1,
@@ -109,16 +115,22 @@ describe("readFullMessageContent", () => {
       ...base,
       items: [
         {
+          origin: "native" as const,
           itemId: "item_question",
           turnId: "turn_current",
+          truncated: false,
+          totalCharacters: 8,
           kind: "user_input",
           content: [{ type: "text", text: "question" }],
           attachments: [],
           createdAt: occurredAt,
         },
         {
+          origin: "native" as const,
           itemId: "item_prefix",
           turnId: "turn_current",
+          truncated: false,
+          totalCharacters: 8,
           kind: "assistant_progress",
           text: "earlier-",
           modelRound: 1,
@@ -131,10 +143,10 @@ describe("readFullMessageContent", () => {
       threadRead: vi.fn(async ({ cursor }: { cursor?: string }) =>
         cursor === undefined ? latest : older,
       ),
-      messageContentRead: vi.fn(async ({ messageId }: { messageId: string }) => {
-        const content = messageId === "item_prefix" ? "earlier-" : "ending";
+      itemContentRead: vi.fn(async ({ itemId }: { itemId: string }) => {
+        const content = itemId === "item_prefix" ? "earlier-" : "ending";
         return {
-          messageId,
+          itemId,
           offsetCharacters: 0,
           nextOffsetCharacters: null,
           totalCharacters: content.length,
@@ -147,7 +159,7 @@ describe("readFullMessageContent", () => {
       "earlier-ending",
     );
     expect(history.threadRead).toHaveBeenCalledTimes(2);
-    expect(history.messageContentRead.mock.calls.map((call) => call[0].messageId)).toEqual([
+    expect(history.itemContentRead.mock.calls.map((call) => call[0].itemId)).toEqual([
       "item_prefix",
       "item_final",
     ]);
@@ -162,7 +174,6 @@ describe("readFullMessageContent", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     } satisfies Omit<TimelineSnapshot, "items" | "revision">;
     const read = vi
@@ -175,6 +186,8 @@ describe("readFullMessageContent", () => {
           {
             itemId: "item_final",
             turnId: "turn_demo",
+            truncated: false,
+            totalCharacters: 8,
             kind: "final_answer",
             text: "complete",
             createdAt: "2026-09-25T00:00:00Z",
@@ -183,8 +196,8 @@ describe("readFullMessageContent", () => {
       });
     const history = {
       threadRead: read,
-      messageContentRead: vi.fn(async () => ({
-        messageId: "item_final",
+      itemContentRead: vi.fn(async () => ({
+        itemId: "item_final",
         offsetCharacters: 0,
         nextOffsetCharacters: null,
         totalCharacters: 8,
@@ -209,20 +222,22 @@ describe("readFullMessageContent", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
         items: [
           {
+            origin: "native" as const,
             itemId: "item_public_hash",
             turnId: "turn_demo",
+            truncated: false,
+            totalCharacters: 7,
             kind: "final_answer" as const,
             text: "preview",
             createdAt: "2026-09-25T00:00:00Z",
           },
         ],
       })),
-      messageContentRead: vi.fn(async ({ messageId }: { messageId: string }) => ({
-        messageId,
+      itemContentRead: vi.fn(async ({ itemId }: { itemId: string }) => ({
+        itemId,
         offsetCharacters: 0,
         nextOffsetCharacters: null,
         totalCharacters: 8,
@@ -233,9 +248,9 @@ describe("readFullMessageContent", () => {
     await expect(
       readFullAnswerContent(history, "thr_demo", "raw_live_id", () => true, 8, "turn_demo"),
     ).resolves.toBe("complete");
-    expect(history.messageContentRead).toHaveBeenCalledWith(
+    expect(history.itemContentRead).toHaveBeenCalledWith(
       expect.objectContaining({
-        messageId: "item_public_hash",
+        itemId: "item_public_hash",
       }),
     );
   });

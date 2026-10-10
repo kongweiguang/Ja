@@ -163,6 +163,18 @@ impl PendingRegistry {
         true
     }
 
+    /// 关闭单个 Native Host 的 admission 时唤醒其全部旧等待者，并保留 late-response tombstone。
+    pub(crate) fn cancel_all(&mut self) -> usize {
+        let ids: Vec<String> = self.active.keys().cloned().collect();
+        for id in &ids {
+            if let Some(entry) = self.active.remove(id) {
+                let _ = entry.completion.send(Err(AppServerProcessError::Cancelled));
+                self.remember(id.clone(), PendingTerminal::Cancelled);
+            }
+        }
+        ids.len()
+    }
+
     /// 关闭 session 时一次性释放 waiters，避免 UI 永久等待无意义的 receiver。
     pub(crate) fn close(&mut self) -> usize {
         let ids: Vec<String> = self.active.keys().cloned().collect();

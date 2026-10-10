@@ -1,6 +1,6 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* global document, window, location, HTMLImageElement, HTMLIFrameElement */
+/* global document, window, location, HTMLElement, HTMLButtonElement, HTMLImageElement, HTMLIFrameElement, HTMLMediaElement, HTMLVideoElement */
 
 /**
  * 文件引用与右栏浏览器的隔离 WebView2 验收入口。
@@ -31,6 +31,33 @@ const FIXTURE_DUPLICATE_B_MARKER = "JA_BROWSER_FILE_DUPLICATE_B";
 const FIXTURE_SVG_MARKER = "JA_BROWSER_FILE_SVG_CONTENT";
 const FIXTURE_PDF_MARKER = "JA_BROWSER_FILE_PDF_CONTENT";
 const FIXTURE_HTTP_HISTORY_MARKER = "JA_BROWSER_FILE_HTTP_HISTORY_ORIGIN";
+const MP4_MEDIA_FIXTURE = Buffer.from(
+  [
+    "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMzbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAA",
+    "AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAgAAAl50cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA",
+    "AAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAKAAAABaAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAHW",
+    "bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRl",
+    "b0hhbmRsZXIAAAABgW1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAA",
+    "AQAAAUFzdGJsAAAAuXN0c2QAAAAAAAAAAQAAAKlhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAKAAWgBIAAAASAAAAAAA",
+    "AAABFUxhdmM2Mi4xMS4xMDAgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAAL2F2Y0MBQsAK/+EAGGdCwAraCjfkwEQAAAMABAAA",
+    "AwAiPEiagAEABGjOD8gAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAAVYAAAAAAAAAAYc3R0cwAAAAAAAAABAAAABAAA",
+    "EAAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABxzdHNjAAAAAAAAAAEAAAABAAAABAAAAAEAAAAkc3RzegAAAAAAAAAAAAAABAAA",
+    "Ao4AAAAKAAAACgAAAAoAAAAUc3RjbwAAAAAAAAABAAADYwAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1k",
+    "aXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjIuMy4xMDAAAAAIZnJlZQAAArRt",
+    "ZGF0AAACRQYF//9B3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBD",
+    "b3B5bGVmdCAyMDAzLTIwMjUgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0w",
+    "IHJlZj0xIGRlYmxvY2s9MDowOjAgYW5hbHlzZT0wOjAgbWU9ZGlhIHN1Ym1lPTAgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBt",
+    "aXhlZF9yZWY9MCBtZV9yYW5nZT0xNiBjaHJvbWFfbWU9MSB0cmVsbGlzPTAgOHg4ZGN0PTAgY3FtPTAgZGVhZHpvbmU9MjEs",
+    "MTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9MCB0aHJlYWRzPTEgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRf",
+    "dGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJh",
+    "PTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MjUwIGtleWludF9taW49NCBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9",
+    "MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlv",
+    "PTEuNDAgYXE9MACAAAAAQWWIhDoRigACMXHAAEPKOAAIBcnJycnJycnJyddddddddddddddddddddddddddddddddddddddd",
+    "dddddddddddeAAAABkGaIBKgewAAAAZBmkASoHsAAAAGQZpgE6B7",
+  ].join(""),
+  "base64",
+);
 const PNG_FIXTURE = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
   "base64",
@@ -87,9 +114,105 @@ foreach ($window in @($shellApp.Windows())) {
   } catch { }
 }
 `;
+const CLOSE_EXPLORER_DIRECTORY_WINDOW_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$trimCharacters = [char[]]@([char]92, [char]47)
+$target = [IO.Path]::GetFullPath($env:JA_E2E_EXPLORER_TARGET).TrimEnd($trimCharacters)
+$expected = [int64]$env:JA_E2E_EXPLORER_HWND
+$shellApp = New-Object -ComObject Shell.Application
+foreach ($window in @($shellApp.Windows())) {
+  try {
+    if ([int64]$window.HWND -ne $expected) { continue }
+    $location = ([uri]$window.LocationURL).LocalPath.TrimEnd($trimCharacters)
+    if (-not [string]::Equals($location, $target, [StringComparison]::OrdinalIgnoreCase)) { continue }
+    $window.Quit()
+    Write-Output 'closed'
+    break
+  } catch { }
+}
+`;
 let activeBrowserEvidenceDirectory;
 let activeBrowserRuntimeHome;
 let activeBrowserFileOpenAcknowledgements;
+let activeExplorerProgressEvents;
+
+/** @author kongweiguang
+ * 将 UI 等待限制为短步长，避免一处 WebView/Locator 故障占满整轮十分钟预算。
+ */
+function boundedInteractionTimeout(deadline, maximumMs = 15_000) {
+  return Math.max(1, Math.min(maximumMs, deadline - Date.now()));
+}
+
+/** @author kongweiguang
+ * 记录隔离 Explorer 场景的最近阶段、真实 click 修饰键和脱敏 native 命令，便于定位边界停滞。
+ */
+async function writeExplorerProgress(page, evidenceDirectory, stage, details = {}) {
+  const ui = await page
+    .evaluate(() => {
+      const active = document.activeElement;
+      const workbench = document.querySelector(".ja-workbench");
+      return {
+        activeTag: active?.tagName ?? null,
+        activeRole: active?.getAttribute("role") ?? null,
+        activeDisabled: active instanceof HTMLButtonElement ? active.disabled : null,
+        activeReferenceKind:
+          active instanceof HTMLElement && active.matches(".ja-markdown__file-link")
+            ? "path-reference"
+            : null,
+        activeTab: workbench?.getAttribute("data-active-tab") ?? null,
+        visibleDialogs: Array.from(document.querySelectorAll('[role="dialog"]')).filter(
+          (node) => node.getClientRects().length > 0,
+        ).length,
+        visibleAlertCount: Array.from(document.querySelectorAll('[role="alert"]')).filter(
+          (node) => node.getClientRects().length > 0,
+        ).length,
+        trustedClickEvents: (window.__JA_BROWSER_FILE_EXPLORER_CLICK_EVENTS__ ?? []).slice(-4),
+      };
+    })
+    .catch(() => ({ stateUnavailable: true }));
+  const nativeCommands = (await browserCommandTrace(page).catch(() => []))
+    .slice(-32)
+    .map(({ command, phase, errorCode, errorName, targetBasename }) => ({
+      command,
+      phase,
+      errorCode,
+      errorName,
+      targetBasename,
+    }));
+  activeExplorerProgressEvents ??= [];
+  activeExplorerProgressEvents.push({
+    stage,
+    at: new Date().toISOString(),
+    details,
+    ui,
+    nativeCommands,
+  });
+  await writeFile(
+    join(evidenceDirectory, "explorer-progress.json"),
+    `${JSON.stringify({ events: activeExplorerProgressEvents }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+/** @author kongweiguang
+ * 观察随后一次可信 click 的修饰键，仍让 Playwright 发送真实鼠标输入，不用脚本合成事件代替验收。
+ */
+async function armTrustedExplorerClickCapture(locator) {
+  await locator.evaluate((button) => {
+    window.__JA_BROWSER_FILE_EXPLORER_CLICK_EVENTS__ = [];
+    button.addEventListener(
+      "click",
+      (event) => {
+        window.__JA_BROWSER_FILE_EXPLORER_CLICK_EVENTS__.push({
+          ctrlKey: event.ctrlKey,
+          isTrusted: event.isTrusted,
+          targetTag: event.target instanceof HTMLElement ? event.target.tagName : "other",
+        });
+      },
+      { capture: true, once: true },
+    );
+  });
+}
 
 /** 用 Shell COM 只读取隔离 fixture 的父目录和当前选中项，避免以进程已启动冒充正确落点。 */
 async function explorerTargetWindows(targetPath) {
@@ -135,6 +258,24 @@ async function closeExplorerTargetWindow(targetPath, hwnd) {
   assert.equal(stdout.trim(), "closed", "isolated Explorer verification window did not close");
 }
 
+/** 只关闭本轮新开的目标目录窗口；如果 Explorer 复用了已有窗口，绝不关闭它。 */
+async function closeExplorerDirectoryWindow(targetPath, hwnd) {
+  const { stdout } = await execFileAsync(
+    "pwsh",
+    ["-NoProfile", "-Command", CLOSE_EXPLORER_DIRECTORY_WINDOW_SCRIPT],
+    {
+      env: {
+        ...process.env,
+        JA_E2E_EXPLORER_TARGET: targetPath,
+        JA_E2E_EXPLORER_HWND: String(hwnd),
+      },
+      windowsHide: true,
+      timeout: 8_000,
+    },
+  );
+  assert.equal(stdout.trim(), "closed", "isolated Explorer directory window did not close");
+}
+
 /** 依据字节偏移生成最小单页 PDF，避免测试内容依赖 Office 或系统默认文件处理器。 */
 export function createPdfFixture() {
   const pdfText = `BT /F1 14 Tf 20 90 Td (${FIXTURE_PDF_MARKER}) Tj ET`;
@@ -160,18 +301,51 @@ export function createPdfFixture() {
   return Buffer.from(body, "latin1");
 }
 
-/**
+/** @author kongweiguang
+ * 生成 1 秒单声道 PCM WAV；固定采样率和长度让 WebView2 元数据断言不依赖播放设备。
+ */
+export function createWavFixture() {
+  const sampleRate = 8_000;
+  const sampleCount = sampleRate;
+  const dataBytes = sampleCount * 2;
+  const fixture = Buffer.alloc(44 + dataBytes);
+  fixture.write("RIFF", 0, "ascii");
+  fixture.writeUInt32LE(36 + dataBytes, 4);
+  fixture.write("WAVE", 8, "ascii");
+  fixture.write("fmt ", 12, "ascii");
+  fixture.writeUInt32LE(16, 16);
+  fixture.writeUInt16LE(1, 20);
+  fixture.writeUInt16LE(1, 22);
+  fixture.writeUInt32LE(sampleRate, 24);
+  fixture.writeUInt32LE(sampleRate * 2, 28);
+  fixture.writeUInt16LE(2, 32);
+  fixture.writeUInt16LE(16, 34);
+  fixture.write("data", 36, "ascii");
+  fixture.writeUInt32LE(dataBytes, 40);
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = Math.round(Math.sin((2 * Math.PI * 440 * index) / sampleRate) * 8_000);
+    fixture.writeInt16LE(sample, 44 + index * 2);
+  }
+  return fixture;
+}
+
+/** @author kongweiguang
+ *
  * 建立仅位于本轮 workspace 及其隔离兄弟目录的文件集合；外部文本专门验证绝对路径读取
- * 与 workspace 编辑权限的分离，浏览器资源则都用相对链接证明 file URL 的真实加载。
+ * 与 workspace 编辑权限的分离；HTML 媒体资源和独立音视频路径都留在临时 workspace，
+ * 让 WebView2 直接解码本地媒体并读取 metadata，不触发外部网络或播放设备。
  */
 export async function writeBrowserFileFixture(workspaceRoot) {
   const workspace = resolve(workspaceRoot);
   const htmlPath = join(workspace, "web", "图形 示例", "首页 demo.html");
+  const directoryPath = join(workspace, "web", "图形 示例");
   const nextPath = join(workspace, "web", "图形 示例", "历史 后页.html");
   const threadBPath = join(workspace, "web", "图形 示例", "会话 B 页面.html");
   const svgPath = join(workspace, "web", "图形 示例", "资源", "标记 图.svg");
   const imagePath = join(workspace, "web", "图形 示例", "资源", "像素图.png");
   const pdfPath = join(workspace, "web", "图形 示例", "阅读 指南.pdf");
+  const audioPath = join(workspace, "web", "图形 示例", "资源", "音频 demo.wav");
+  const videoPath = join(workspace, "web", "图形 示例", "资源", "视频 demo.mp4");
   const textPath = join(workspace, "说明", "本地 说明.txt");
   const sourcePath = join(workspace, "src", "导航", "启动 模块.ts");
   const duplicateAPath = join(workspace, "文档 A", "重复 名称.txt");
@@ -211,7 +385,12 @@ export async function writeBrowserFileFixture(workspaceRoot) {
     mkdir(dirname(imagePath), { recursive: true }),
     mkdir(dirname(pdfPath), { recursive: true }),
   ]);
-  await Promise.all([writeFile(imagePath, PNG_FIXTURE), writeFile(pdfPath, createPdfFixture())]);
+  await Promise.all([
+    writeFile(imagePath, PNG_FIXTURE),
+    writeFile(pdfPath, createPdfFixture()),
+    writeFile(audioPath, createWavFixture()),
+    writeFile(videoPath, MP4_MEDIA_FIXTURE),
+  ]);
   const externalRelation = relative(workspace, externalPath);
   assert.ok(externalRelation.startsWith("..") || isAbsolute(externalRelation));
   return {
@@ -222,13 +401,17 @@ export async function writeBrowserFileFixture(workspaceRoot) {
     svgPath,
     imagePath,
     pdfPath,
+    audioPath,
+    videoPath,
     textPath,
     sourcePath,
     duplicateAPath,
     duplicateBPath,
     externalPath,
     missingPath,
+    directoryPath,
     relativeHtmlPath: relative(workspace, htmlPath).replaceAll("\\", "/"),
+    relativeDirectoryPath: relative(workspace, directoryPath).replaceAll("\\", "/"),
     relativeTextPath: relative(workspace, textPath).replaceAll("\\", "/"),
     relativeSourcePath: relative(workspace, sourcePath).replaceAll("\\", "/"),
     relativeDuplicateAPath: relative(workspace, duplicateAPath).replaceAll("\\", "/"),
@@ -240,22 +423,27 @@ export async function writeBrowserFileFixture(workspaceRoot) {
     imageUrl: pathToFileURL(imagePath).href,
     svgUrl: pathToFileURL(svgPath).href,
     pdfUrl: pathToFileURL(pdfPath).href,
+    audioUrl: pathToFileURL(audioPath).href,
+    videoUrl: pathToFileURL(videoPath).href,
     textUrl: pathToFileURL(textPath).href,
     sourceUrl: pathToFileURL(sourcePath).href,
     externalUrl: pathToFileURL(externalPath).href,
   };
 }
 
-/** 返回真实文件引用语料，覆盖 Markdown URL、旧式行内代码相对/绝对路径及行列定位。 */
+/** @author kongweiguang 返回真实文件引用语料，并加入目录目标验证普通点击的 Files 定位语义。 */
 export function buildAssistantFileReply(files) {
   return [
     "文件引用验收 fixture 已创建以下目标：",
+    `- 项目目录：\`${files.relativeDirectoryPath}/\``,
     `- 首页相对路径：\`${files.relativeHtmlPath}\``,
     `- 首页 Markdown 链接：[打开本地 HTML](${files.htmlUrl})`,
     `- 会话 B 页面：\`${files.threadBPath}\``,
     `- 本地图片：\`${files.imagePath}\``,
     `- SVG 页面：\`${files.svgPath}\``,
     `- PDF 页面：\`${files.pdfPath}\``,
+    `- 音频片段：\`${files.audioPath}\``,
+    `- 视频片段：\`${files.videoPath}\``,
     `- 文本内容：\`${files.relativeTextPath}\``,
     `- 带行列定位的代码：\`${files.relativeSourcePath}#L2C4\``,
     `- 旧回复行列定位：\`${files.relativeSourcePath}:2:4\``,
@@ -404,7 +592,8 @@ export async function startBrowserFileProviderFixture() {
   };
 }
 
-/**
+/** @author kongweiguang
+ *
  * 在 reload 前记录浏览器 open/layout/close 命令 ACK，不复制 URL、文件路径或其它命令参数。
  * 以 shared probe chain 包装可保留现有真窗验收观察者的执行顺序。
  */
@@ -441,12 +630,15 @@ export function installBrowserFileInvokeProbe() {
         phase,
         atMs: Math.round(performance.now()),
         atUnixMillis: Date.now(),
-        ...(typeof request?.args?.input?.requestId === "string"
-          ? { requestId: request.args.input.requestId }
-          : {}),
         ...(typeof input?.sessionId === "string" ? { sessionId: input.sessionId } : {}),
         ...(Number.isInteger(input?.generation) ? { generation: input.generation } : {}),
-        ...(typeof target?.kind === "string" ? { targetKind: target.kind } : {}),
+        ...(typeof input?.kind === "string" && /^[a-z][a-z0-9_]{0,31}$/u.test(input.kind)
+          ? { requestKind: input.kind }
+          : {}),
+        targetKind: typeof target?.kind === "string" ? target.kind : null,
+        ...(input?.previewMode === "editor" || input?.previewMode === "browser"
+          ? { previewMode: input.previewMode }
+          : {}),
         ...(targetBasename === undefined ? {} : { targetBasename }),
         ...(command === "ja_preview_layout"
           ? { visible: request?.args?.input?.viewport?.visible === true }
@@ -680,14 +872,14 @@ async function browserCommandTrace(page) {
   );
 }
 
-/** 预览区进入产品错误态时立刻保留 page identity 与最近原生命令 ACK，避免仅看到模糊 toast。 */
+/** @author kongweiguang 预览异步失败可能晚于 open ACK，读取可见 pane 与 child 状态后才允许报告成功。 */
 async function assertNoPreviewFailure(workbench, page, stage, pageErrors = [], evidenceDirectory) {
   const panel = await activeBrowserPanel(workbench);
   const visible = await panel
     .getByText("浏览器预览异常", { exact: true })
     .isVisible()
     .catch(() => false);
-  if (!visible) return;
+  if (!visible) return true;
   if (evidenceDirectory !== undefined) {
     const screenshotName = stage.replace(/[^a-z0-9-]+/giu, "-").toLowerCase();
     await page.screenshot({
@@ -695,19 +887,117 @@ async function assertNoPreviewFailure(workbench, page, stage, pageErrors = [], e
       animations: "disabled",
     });
   }
-  const facts = await panel.evaluate((node) => ({
-    id: node.getAttribute("data-preview-page-id"),
-    url: node.getAttribute("data-preview-page-url"),
-    title: node.getAttribute("data-preview-page-title"),
-    loading: node.getAttribute("data-preview-page-loading"),
-    canGoBack: node.getAttribute("data-preview-can-go-back"),
-    canGoForward: node.getAttribute("data-preview-can-go-forward"),
-    text: node.innerText.slice(0, 300),
-  }));
+  const [panelFacts, childTargets] = await Promise.all([
+    panel.evaluate((node) => ({
+      id: node.getAttribute("data-preview-page-id"),
+      url: node.getAttribute("data-preview-page-url"),
+      title: node.getAttribute("data-preview-page-title"),
+      loading: node.getAttribute("data-preview-page-loading"),
+      canGoBack: node.getAttribute("data-preview-can-go-back"),
+      canGoForward: node.getAttribute("data-preview-can-go-forward"),
+      text: node.innerText.slice(0, 300),
+    })),
+    Promise.all(
+      page
+        .context()
+        .pages()
+        .filter((candidate) => candidate !== page)
+        .map(async (candidate) => ({
+          url: candidate.url(),
+          title: await candidate.title().catch(() => ""),
+          closed: candidate.isClosed(),
+          document: await candidate
+            .evaluate(() => {
+              const media = document.querySelector("audio, video");
+              return {
+                contentType: document.contentType,
+                width: document.documentElement?.clientWidth ?? 0,
+                height: document.documentElement?.clientHeight ?? 0,
+                mediaTag: media?.tagName.toLocaleLowerCase() ?? null,
+                mediaReadyState: media instanceof HTMLMediaElement ? media.readyState : null,
+                mediaErrorCode:
+                  media instanceof HTMLMediaElement ? (media.error?.code ?? null) : null,
+              };
+            })
+            .catch(() => null),
+        })),
+    ).catch(() => []),
+  ]);
   const trace = await browserCommandTrace(page);
   throw new Error(
-    `Browser preview failure at ${stage}: panel=${JSON.stringify(facts)}; nativeCommands=${JSON.stringify(trace.slice(-30))}; console=${JSON.stringify(pageErrors.slice(-12))}`,
+    `Browser preview failure at ${stage}: panel=${JSON.stringify(panelFacts)}; childTargets=${JSON.stringify(childTargets)}; nativeCommands=${JSON.stringify(trace.slice(-30))}; console=${JSON.stringify(pageErrors.slice(-12))}`,
   );
+}
+
+/** @author kongweiguang
+ * 等待打开 ACK 指定的同一 Browser page/generation 进入 finished，防止截图先于延迟 native 失败事件。
+ */
+async function assertAcknowledgedPreviewGenerationFinished(page, workbench, targetUrl, deadline) {
+  const acknowledgement = activeBrowserFileOpenAcknowledgements?.at(-1);
+  assert.equal(acknowledgement?.command, "ja_preview_open_file");
+  assert.ok(acknowledgement?.pageId);
+  assert.equal(acknowledgement?.tabPageId, acknowledgement?.pageId);
+  assert.ok(Number.isInteger(acknowledgement?.generation));
+  const panel = await activeBrowserPanel(workbench, acknowledgement.pageId);
+  await waitForCondition(
+    "acknowledged Browser Preview page finished",
+    async () => {
+      const selected = (await browserTabFacts(workbench)).find(({ selected }) => selected);
+      if (selected?.id !== acknowledgement.pageId) return false;
+      const panelState = await panel.evaluate((node) => ({
+        id: node.getAttribute("data-preview-page-id"),
+        url: node.getAttribute("data-preview-page-url"),
+        loading: node.getAttribute("data-preview-page-loading"),
+      }));
+      if (
+        panelState.id !== acknowledgement.pageId ||
+        panelState.loading !== "false" ||
+        normalizedFilePath(panelState.url ?? "") !== normalizedFilePath(targetUrl)
+      ) {
+        return false;
+      }
+      const state = await page.evaluate(async (sessionId) => {
+        const { TauriPreviewAdapter } = await import("/src/api/tauri/preview.ts");
+        const snapshot = await new TauriPreviewAdapter().state(sessionId);
+        return {
+          id: snapshot.id,
+          generation: snapshot.generation,
+          status: snapshot.status,
+          loadStatus: snapshot.load_status,
+          url: snapshot.url,
+        };
+      }, acknowledgement.pageId);
+      if (state.id !== acknowledgement.pageId || state.generation !== acknowledgement.generation)
+        throw new Error(`Preview identity changed while loading: ${JSON.stringify(state)}`);
+      if (state.status === "closed" || state.loadStatus === "failed")
+        throw new Error(`Preview navigation ended unsuccessfully: ${JSON.stringify(state)}`);
+      return state.status === "open" && state.loadStatus === "finished";
+    },
+    Math.min(deadline, Date.now() + 12_000),
+  );
+  const state = await page.evaluate(async (sessionId) => {
+    const { TauriPreviewAdapter } = await import("/src/api/tauri/preview.ts");
+    const snapshot = await new TauriPreviewAdapter().state(sessionId);
+    return {
+      id: snapshot.id,
+      generation: snapshot.generation,
+      status: snapshot.status,
+      loadStatus: snapshot.load_status,
+      url: snapshot.url,
+    };
+  }, acknowledgement.pageId);
+  assert.equal(state.id, acknowledgement.pageId);
+  assert.equal(state.generation, acknowledgement.generation);
+  assert.equal(state.status, "open");
+  assert.equal(state.loadStatus, "finished");
+  assert.equal(normalizedFilePath(state.url), normalizedFilePath(targetUrl));
+  return {
+    pageId: state.id,
+    generation: state.generation,
+    status: state.status,
+    loadStatus: state.loadStatus,
+    targetUrlMatched: true,
+  };
 }
 
 /** 统计某一命令前缀的 ACK；报告仅包含数量，不泄露命令载荷或本机路径。 */
@@ -772,7 +1062,7 @@ function referenceLocation(value) {
     : { suffix: match.groups.suffix, line: Number(line) };
 }
 
-/** 按 canonical 文件身份匹配引用；Markdown 的 file URL 在渲染时已解码，独立标签可区分同路径的行内代码。 */
+/** @author kongweiguang 按 canonical 路径匹配引用；菜单前缀统一描述目标路径，目标类型以真实打开结果验收。 */
 async function fileReference(
   page,
   message,
@@ -780,6 +1070,7 @@ async function fileReference(
   workspaceRoot,
   expectedLine,
   expectedReference,
+  expectedTargetKind = "file",
 ) {
   const selector = "button.ja-markdown__file-link[data-file-reference]";
   const references = message.locator(selector);
@@ -819,7 +1110,14 @@ async function fileReference(
     -1,
     `assistant message is missing a clickable path reference: ${expectedPath}`,
   );
-  assert.match(values[index].accessibleName, /在 Ja 中打开文件/u);
+  assert.match(values[index].accessibleName, /^在 Ja 中打开路径 /u);
+  assert.ok(["file", "directory"].includes(expectedTargetKind));
+  if (expectedTargetKind === "directory")
+    assert.match(
+      values[index].visibleName,
+      /[\\/]$/u,
+      "directory fixture must retain its trailing separator",
+    );
   const locator = references.nth(index);
   await locator.waitFor({ state: "visible" });
   const visibleLocation = referenceLocation(values[index].visibleName);
@@ -840,7 +1138,9 @@ async function fileReference(
   };
 }
 
-/** 保留引用元数据和定位器，供后续断言核对真实路径；点击后才检查原生入口与 Thread Workbench。 */
+/** @author kongweiguang
+ * 保留引用元数据和定位器，供后续断言核对真实路径；点击后才检查原生入口与 Thread Workbench。
+ */
 async function openFileReference(
   page,
   message,
@@ -882,6 +1182,150 @@ async function openFileReference(
   return entry;
 }
 
+/** @author kongweiguang
+ * HTML 路径普通打开必须停留在 Files 源码；只有明确选中路径菜单的浏览器动作才创建预览页。
+ */
+async function previewHtmlReferenceInBrowser(page, entry, files, deadline) {
+  const beforeTrace = await browserCommandTrace(page);
+  await entry.locator.click({
+    button: "right",
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  for (const name of ["在 Ja 中打开", "在浏览器中预览", "在文件资源管理器中打开", "复制路径"]) {
+    await page
+      .getByRole("menuitem", { name, exact: true })
+      .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  }
+  await page.getByRole("menuitem", { name: "在浏览器中预览", exact: true }).click({
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  const workbench = await ensureBrowserCapability(page, deadline);
+  await waitForFileOpenAcknowledgement(page, workbench, files.htmlPath, beforeTrace, deadline);
+  await waitForActiveBrowserUrl(workbench, files.htmlUrl, deadline);
+  const child = await waitForChildWebView(page, files.htmlUrl, deadline);
+  const facts = await inspectHtmlChild(child, deadline);
+  assert.equal(facts.markerVisible, true);
+  return { workbench, child, facts };
+}
+
+/** @author kongweiguang 目录普通点击应只定位 Files 树节点，不得增加 Browser 标签或原生预览页。 */
+async function openDirectoryReference(page, message, files, deadline) {
+  const entry = await fileReference(
+    page,
+    message,
+    files.directoryPath,
+    files.workspace,
+    undefined,
+    undefined,
+    "directory",
+  );
+  const workbench = currentWorkbench(page);
+  const beforeTabs = await workbench.getAttribute("data-open-tabs");
+  const beforeTrace = await browserCommandTrace(page);
+  await writeExplorerProgress(
+    page,
+    activeBrowserEvidenceDirectory,
+    "directory-ordinary-click-start",
+  );
+  await entry.locator.click({ timeout: boundedInteractionTimeout(deadline) });
+  await writeExplorerProgress(
+    page,
+    activeBrowserEvidenceDirectory,
+    "directory-ordinary-click-returned",
+  );
+  let directoryResolution;
+  const resolutionTraceStart = beforeTrace.length;
+  try {
+    await waitForCondition(
+      "directory path native resolution",
+      async () => {
+        directoryResolution = (await browserCommandTrace(page))
+          .slice(resolutionTraceStart)
+          .find(
+            ({ command, phase }) =>
+              command === "ja_preview_resolve_file" &&
+              (phase === "resolved" || phase === "rejected"),
+          );
+        return directoryResolution !== undefined;
+      },
+      Math.min(deadline, Date.now() + 15_000),
+    );
+  } catch (error) {
+    await page.screenshot({
+      path: join(activeBrowserEvidenceDirectory, "04-directory-resolution-timeout.png"),
+      animations: "disabled",
+    });
+    await writeExplorerProgress(
+      page,
+      activeBrowserEvidenceDirectory,
+      "directory-resolution-timeout",
+      {
+        errorName: error?.name ?? "Error",
+      },
+    );
+    throw error;
+  }
+  if (directoryResolution.phase === "rejected") {
+    await page.screenshot({
+      path: join(activeBrowserEvidenceDirectory, "04-directory-path-rejected.png"),
+      animations: "disabled",
+    });
+    await writeExplorerProgress(
+      page,
+      activeBrowserEvidenceDirectory,
+      "directory-path-native-rejected",
+      { errorCode: directoryResolution.errorCode ?? null },
+    );
+    assert.fail(
+      `directory path was rejected by the native resolver (${directoryResolution.errorCode ?? "unknown"})`,
+    );
+  }
+  await workbench.waitFor({ state: "visible", timeout: boundedInteractionTimeout(deadline) });
+  await waitForCondition(
+    "directory path opens the Files workbench",
+    async () => (await workbench.getAttribute("data-active-tab")) === "files",
+    Math.min(deadline, Date.now() + 15_000),
+  );
+  const directoryRow = workbench.locator(
+    `.ja-file-tree-row[data-path="${files.relativeDirectoryPath}"]`,
+  );
+  await directoryRow.waitFor({ state: "visible", timeout: boundedInteractionTimeout(deadline) });
+  await waitForCondition(
+    "directory path is selected in the Files tree",
+    async () =>
+      (await directoryRow.getAttribute("class"))?.split(/\s+/u).includes("is-selected") === true,
+    Math.min(deadline, Date.now() + 15_000),
+  );
+  const afterTabs = await workbench.getAttribute("data-open-tabs");
+  const afterTrace = await browserCommandTrace(page);
+  const browserOpenCommands = new Set([
+    "ja_preview_open",
+    "ja_preview_open_file",
+    "ja_preview_open_blank",
+    "ja_preview_navigate",
+    "ja_preview_navigate_file",
+  ]);
+  const beforeBrowserOpenCount = beforeTrace.filter(
+    ({ command, phase }) => browserOpenCommands.has(command) && phase === "resolved",
+  ).length;
+  const afterBrowserOpenCount = afterTrace.filter(
+    ({ command, phase }) => browserOpenCommands.has(command) && phase === "resolved",
+  ).length;
+  assert.equal(afterTabs, beforeTabs, "directory click must not add a Browser or workbench tab");
+  assert.equal(
+    afterBrowserOpenCount,
+    beforeBrowserOpenCount,
+    "directory click must not create a Browser page",
+  );
+  return {
+    entry,
+    workbench,
+    selected: true,
+    noBrowserTabCreated:
+      afterTabs === beforeTabs && afterBrowserOpenCount === beforeBrowserOpenCount,
+  };
+}
+
 /** 用只有 basename 的旧式引用触发候选选择，并验证用户选中的 workspace 相对目标。 */
 async function openAmbiguousFileReference(page, message, files, deadline) {
   const button = message
@@ -905,9 +1349,9 @@ async function openAmbiguousFileReference(page, message, files, deadline) {
   );
 }
 
-/** 等待入口真实 App Server 和项目目录就绪，未自动选择项目时通过用户界面加入隔离 workspace。 */
-async function prepareApplication(page, deadline) {
-  await waitForApplication(page, deadline);
+/** @author kongweiguang 等待真实 App Server 与项目就绪，未自动选择时加入隔离 workspace。 */
+async function prepareApplication(page, deadline, evidenceDirectory, pageErrors) {
+  await waitForApplication(page, deadline, evidenceDirectory, pageErrors);
   const selectedProject = page.locator(
     '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
   );
@@ -1234,6 +1678,182 @@ async function inspectHtmlChild(child, deadline) {
   });
 }
 
+/** @author kongweiguang
+ * Chromium 会用无画面的 video 元素承载原生音频文档；等待可读 metadata，同时保留失败现场供真窗定位。
+ */
+async function inspectLocalMediaDocument(
+  page,
+  workbench,
+  child,
+  kind,
+  deadline,
+  evidenceDirectory,
+) {
+  let metadataTimeout = false;
+  try {
+    await child.waitForFunction(
+      () => {
+        const media = document.querySelector("audio, video");
+        return (
+          media instanceof HTMLMediaElement &&
+          (media.error !== null ||
+            (media.readyState >= HTMLMediaElement.HAVE_METADATA &&
+              Number.isFinite(media.duration) &&
+              media.duration > 0))
+        );
+      },
+      undefined,
+      { timeout: boundedInteractionTimeout(deadline) },
+    );
+  } catch {
+    metadataTimeout = true;
+  }
+  const browserPreviewViewport = await inspectBrowserPreviewViewport(workbench);
+  const facts = await child.evaluate(
+    ({ requestedKind, browserPreviewViewport }) => {
+      const candidates = Array.from(document.querySelectorAll("audio, video"));
+      const media =
+        candidates.find((candidate) =>
+          requestedKind === "audio"
+            ? document.contentType.startsWith("audio/")
+            : candidate.tagName === "VIDEO",
+        ) ?? candidates[0];
+      const mediaElement = media instanceof HTMLMediaElement ? media : undefined;
+      const source = mediaElement?.currentSrc ?? "";
+      let sourceProtocol = "";
+      try {
+        sourceProtocol = source === "" ? "" : new URL(source).protocol;
+      } catch {
+        sourceProtocol = "invalid";
+      }
+      return {
+        contentType: document.contentType,
+        mediaTag: media?.tagName.toLocaleLowerCase() ?? null,
+        mediaElementPresent: mediaElement !== undefined,
+        controlsVisible: mediaElement?.controls ?? false,
+        readyState: mediaElement?.readyState ?? null,
+        metadataReady:
+          mediaElement !== undefined && mediaElement.readyState >= HTMLMediaElement.HAVE_METADATA,
+        durationSeconds: mediaElement?.duration ?? Number.NaN,
+        localFileSource: sourceProtocol === "file:",
+        videoDimensions:
+          mediaElement instanceof HTMLVideoElement
+            ? { width: mediaElement.videoWidth, height: mediaElement.videoHeight }
+            : null,
+        mediaErrorCode: mediaElement?.error?.code ?? null,
+        mediaErrorMessage: mediaElement?.error?.message?.slice(0, 240) ?? null,
+        sourceProtocol,
+        browserPreviewViewport,
+        documentViewport: {
+          width: document.documentElement?.clientWidth ?? 0,
+          height: document.documentElement?.clientHeight ?? 0,
+        },
+        title: document.title,
+        urlProtocol: location.protocol,
+        bodyText: document.body?.innerText.slice(0, 400) ?? "",
+      };
+    },
+    { requestedKind: kind, browserPreviewViewport },
+  );
+  let childScreenshotSize = null;
+  if (evidenceDirectory !== undefined) {
+    const screenshotPrefix = kind === "audio" ? "10a" : "10b";
+    const childScreenshotPath = join(
+      evidenceDirectory,
+      `${screenshotPrefix}-${kind}-local-preview-child.png`,
+    );
+    try {
+      await child.screenshot({ path: childScreenshotPath });
+      childScreenshotSize = await readPngDimensions(childScreenshotPath);
+    } catch {
+      childScreenshotSize = null;
+    }
+    await page
+      .screenshot({
+        path: join(evidenceDirectory, `${screenshotPrefix}-${kind}-local-preview.png`),
+        animations: "disabled",
+      })
+      .catch(() => undefined);
+  }
+  const diagnostic = { ...facts, childScreenshotSize, metadataTimeout };
+  if (evidenceDirectory !== undefined) {
+    const screenshotPrefix = kind === "audio" ? "10a" : "10b";
+    await writeFile(
+      join(evidenceDirectory, `${screenshotPrefix}-${kind}-local-preview-document.json`),
+      `${JSON.stringify(diagnostic, null, 2)}\n`,
+      "utf8",
+    );
+  }
+  assert.equal(
+    facts.mediaElementPresent,
+    true,
+    `${kind} local Preview must expose a media element: ${JSON.stringify(diagnostic)}`,
+  );
+  assert.equal(facts.controlsVisible, true, `${kind} local Preview must expose playback controls`);
+  assert.equal(
+    facts.metadataReady,
+    true,
+    `${kind} local Preview must read metadata: ${JSON.stringify(diagnostic)}`,
+  );
+  assert.equal(facts.localFileSource, true, `${kind} source must remain a local file`);
+  assert.ok(Number.isFinite(facts.durationSeconds) && facts.durationSeconds > 0);
+  assert.ok(
+    facts.browserPreviewViewport.width > 200 && facts.browserPreviewViewport.height > 100,
+    `${kind} Browser viewport must have usable dimensions: ${JSON.stringify(diagnostic)}`,
+  );
+  if (childScreenshotSize !== null) {
+    assert.ok(
+      childScreenshotSize.width > 200 && childScreenshotSize.height > 100,
+      `${kind} native Preview child must not be collapsed: ${JSON.stringify(diagnostic)}`,
+    );
+  }
+  if (kind === "audio") {
+    assert.equal(facts.contentType, "audio/wav");
+    assert.ok(
+      facts.videoDimensions === null ||
+        (facts.videoDimensions.width === 0 && facts.videoDimensions.height === 0),
+      "audio Preview must not expose video dimensions",
+    );
+  } else {
+    assert.equal(facts.contentType, "video/mp4");
+    assert.ok(
+      (facts.videoDimensions?.width ?? 0) > 0 && (facts.videoDimensions?.height ?? 0) > 0,
+      "video dimensions must be readable",
+    );
+  }
+  return {
+    ...facts,
+    childScreenshotSize,
+    width: facts.videoDimensions?.width ?? null,
+    height: facts.videoDimensions?.height ?? null,
+  };
+}
+
+/** @author kongweiguang
+ * 读取 PNG IHDR 的真实像素尺寸，避免把已加载但被压成几像素的隐藏 child 当作可用预览。
+ */
+async function readPngDimensions(path) {
+  const bytes = await readFile(path);
+  assert.equal(bytes.toString("ascii", 1, 4), "PNG");
+  assert.ok(bytes.length >= 24, "native Preview screenshot must contain a complete PNG header");
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+/** @author kongweiguang
+ * 读取当前 Browser tab 的真实 iframe viewport 几何，防止错误行挤压原生 child 内容区域。
+ */
+async function inspectBrowserPreviewViewport(workbench) {
+  const panel = await activeBrowserPanel(workbench);
+  return panel.evaluate((node) => {
+    const viewport = node.matches(".ja-preview-viewport")
+      ? node
+      : node.querySelector(".ja-preview-viewport");
+    if (!(viewport instanceof HTMLElement)) return { width: 0, height: 0 };
+    const rect = viewport.getBoundingClientRect();
+    return { width: Math.round(rect.width), height: Math.round(rect.height) };
+  });
+}
+
 /** 在 true Files editor wrapper 内读取只读标志和文字；不从文件路径本身推断权限结果。 */
 async function inspectFileDocument(
   page,
@@ -1427,7 +2047,8 @@ async function navigateAddress(
   return { tab, child, addressFocused };
 }
 
-/**
+/** @author kongweiguang
+ *
  * 在两个 Thread 内真实创建回复与文件，检验路径引用、文件内容路由、多页导航/history、
  * session 隔离和 close ACK；所有浏览器页面事实均与实际 child WebView 的 document 交叉核对。
  */
@@ -1445,6 +2066,8 @@ export async function runBrowserFileLinksWebView2({
   activeBrowserEvidenceDirectory = evidenceDirectory;
   activeBrowserRuntimeHome = isolatedRuntimeHome;
   activeBrowserFileOpenAcknowledgements = [];
+  activeExplorerProgressEvents = [];
+  page.setDefaultTimeout(15_000);
   await mkdir(evidenceDirectory, { recursive: true });
   const files = await writeBrowserFileFixture(workspaceRoot);
   fixture.setReply(buildAssistantFileReply(files));
@@ -1456,12 +2079,12 @@ export async function runBrowserFileLinksWebView2({
   });
   await page.context().addInitScript(installBrowserFileInvokeProbe);
   await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
-  await prepareApplication(page, deadline);
+  await prepareApplication(page, deadline, evidenceDirectory, pageErrors);
   const threadA = await createThread(page, files.workspace, "文件浏览器验收 A");
   const threadB = await createThread(page, files.workspace, "文件浏览器验收 B");
   assert.notEqual(threadA.threadId, threadB.threadId);
   await page.reload({ waitUntil: "domcontentloaded", timeout: Math.max(1, deadline - Date.now()) });
-  await prepareApplication(page, deadline);
+  await prepareApplication(page, deadline, evidenceDirectory, pageErrors);
   await page
     .locator(`[aria-label="最近对话列表"] button[data-thread-id="${threadA.threadId}"]`)
     .waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
@@ -1533,20 +2156,48 @@ export async function runBrowserFileLinksWebView2({
     animations: "disabled",
   });
 
+  const previewStartsBeforeMarkdownHtml = countCommandPrefix(
+    await browserCommandTrace(page),
+    "ja_preview_open_file",
+    "start",
+  );
   const markdownHtmlReference = await openFileReference(
     page,
     assistant,
     files,
     files.htmlPath,
-    "preview",
+    "files",
     deadline,
   );
-  let workbench = await ensureBrowserCapability(page, deadline);
-  await waitForActiveBrowserUrl(workbench, files.htmlUrl, deadline);
+  const markdownHtmlSourceFacts = await inspectFileDocument(
+    page,
+    files.htmlPath,
+    FIXTURE_HTML_MARKER,
+    false,
+    deadline,
+    files.workspace,
+  );
+  assert.equal(markdownHtmlSourceFacts.readOnly, false);
+  assert.equal(
+    countCommandPrefix(await browserCommandTrace(page), "ja_preview_open_file", "start"),
+    previewStartsBeforeMarkdownHtml,
+    "ordinary HTML path click must not create a Browser page",
+  );
+  await page.screenshot({
+    path: join(evidenceDirectory, "02-html-source-in-files.png"),
+    animations: "disabled",
+  });
+  const markdownHtmlPreview = await previewHtmlReferenceInBrowser(
+    page,
+    markdownHtmlReference,
+    files,
+    deadline,
+  );
+  let workbench = markdownHtmlPreview.workbench;
   let htmlTab = (await browserTabFacts(workbench)).find(({ selected }) => selected);
   assert.ok(htmlTab?.id);
-  let htmlChild = await waitForChildWebView(page, files.htmlUrl, deadline);
-  const htmlFacts = await inspectHtmlChild(htmlChild, deadline);
+  let htmlChild = markdownHtmlPreview.child;
+  const htmlFacts = markdownHtmlPreview.facts;
   assert.equal(htmlFacts.markerVisible, true);
   assert.equal(htmlFacts.pngDecoded, true);
   assert.equal(htmlFacts.svgDecoded, true);
@@ -1556,23 +2207,50 @@ export async function runBrowserFileLinksWebView2({
     animations: "disabled",
   });
 
+  const previewStartsBeforeRelativeHtml = countCommandPrefix(
+    await browserCommandTrace(page),
+    "ja_preview_open_file",
+    "start",
+  );
   const relativeHtmlReference = await openFileReference(
     page,
     assistant,
     files,
     files.htmlPath,
-    "preview",
+    "files",
     deadline,
     undefined,
     files.relativeHtmlPath,
   );
-  assert.match(relativeHtmlReference.reference.accessibleName, /在 Ja 中打开文件/u);
-  workbench = await ensureBrowserCapability(page, deadline);
-  await waitForActiveBrowserUrl(workbench, files.htmlUrl, deadline);
+  const relativeHtmlSourceFacts = await inspectFileDocument(
+    page,
+    files.htmlPath,
+    FIXTURE_HTML_MARKER,
+    false,
+    deadline,
+    files.workspace,
+  );
+  assert.equal(relativeHtmlSourceFacts.readOnly, false);
+  assert.equal(
+    countCommandPrefix(await browserCommandTrace(page), "ja_preview_open_file", "start"),
+    previewStartsBeforeRelativeHtml,
+    "ordinary relative HTML path click must not create a Browser page",
+  );
+  await page.screenshot({
+    path: join(evidenceDirectory, "02b-relative-html-source-in-files.png"),
+    animations: "disabled",
+  });
+  const relativeHtmlPreview = await previewHtmlReferenceInBrowser(
+    page,
+    relativeHtmlReference,
+    files,
+    deadline,
+  );
+  workbench = relativeHtmlPreview.workbench;
   htmlTab = (await browserTabFacts(workbench)).find(({ selected }) => selected);
   assert.ok(htmlTab?.id);
-  htmlChild = await waitForChildWebView(page, files.htmlUrl, deadline);
-  assert.equal((await inspectHtmlChild(htmlChild, deadline)).markerVisible, true);
+  htmlChild = relativeHtmlPreview.child;
+  assert.equal(relativeHtmlPreview.facts.markerVisible, true);
   const missingFileEntry = await fileReference(
     page,
     assistant,
@@ -1791,12 +2469,14 @@ export async function runBrowserFileLinksWebView2({
   await waitForCondition(
     "keyboard Explorer reveal rejection for missing file",
     async () =>
-      (await browserCommandTrace(page)).slice(keyboardRevealTraceBefore).some(
-        ({ command, phase, errorCode }) =>
-          command === "ja_preview_reveal_file" &&
-          phase === "rejected" &&
-          errorCode === "FileNotFound",
-      ),
+      (await browserCommandTrace(page))
+        .slice(keyboardRevealTraceBefore)
+        .some(
+          ({ command, phase, errorCode }) =>
+            command === "ja_preview_reveal_file" &&
+            phase === "rejected" &&
+            errorCode === "FileNotFound",
+        ),
     deadline,
   );
   assert.equal(
@@ -1834,29 +2514,59 @@ export async function runBrowserFileLinksWebView2({
   assert.equal(await page.getByRole("button", { name: "显示工作区面板" }).isVisible(), true);
   let explorerFolderVerified = false;
   if (verifyExplorerFolder) {
-    const sourceEntry = await fileReference(
-      page,
-      assistant,
-      files.sourcePath,
-      files.workspace,
-      2,
-    );
+    await writeExplorerProgress(page, evidenceDirectory, "source-reference-lookup-start");
+    const sourceEntry = await fileReference(page, assistant, files.sourcePath, files.workspace, 2);
+    await writeExplorerProgress(page, evidenceDirectory, "source-reference-lookup-complete");
+    await writeExplorerProgress(page, evidenceDirectory, "source-explorer-baseline-start");
     const existingWindows = await explorerTargetWindows(files.sourcePath);
     assert.deepEqual(existingWindows, [], "isolated fixture folder was already open in Explorer");
     const explorerBaseline = await explorerAllWindows();
-    const revealTraceStart = (await browserCommandTrace(page)).length;
-    await sourceEntry.locator.click({
-      modifiers: ["Control"],
-      timeout: Math.max(1, deadline - Date.now()),
+    await writeExplorerProgress(page, evidenceDirectory, "source-explorer-baseline-complete", {
+      existingTargetWindowCount: existingWindows.length,
+      baselineWindowCount: explorerBaseline.length,
     });
-    await waitForCondition(
-      "native Explorer folder reveal acknowledgement",
-      async () =>
-        (await browserCommandTrace(page)).slice(revealTraceStart).some(
-          ({ command, phase }) => command === "ja_preview_reveal_file" && phase === "resolved",
-        ),
-      deadline,
+    const revealTraceStart = (await browserCommandTrace(page)).length;
+    await armTrustedExplorerClickCapture(sourceEntry.locator);
+    await writeExplorerProgress(page, evidenceDirectory, "source-ctrl-click-start");
+    try {
+      await sourceEntry.locator.click({
+        modifiers: ["Control"],
+        timeout: boundedInteractionTimeout(deadline),
+      });
+    } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "source-ctrl-click-failed", {
+        errorName: error?.name ?? "Error",
+      });
+      throw error;
+    }
+    const sourceClickEvents = await page.evaluate(
+      () => window.__JA_BROWSER_FILE_EXPLORER_CLICK_EVENTS__ ?? [],
     );
+    await writeExplorerProgress(page, evidenceDirectory, "source-ctrl-click-returned", {
+      trustedClickEvents: sourceClickEvents,
+    });
+    assert.ok(
+      sourceClickEvents.some(({ ctrlKey, isTrusted }) => ctrlKey === true && isTrusted === true),
+      "Playwright Ctrl+click must arrive as a trusted DOM click with ctrlKey=true",
+    );
+    try {
+      await waitForCondition(
+        "native Explorer folder reveal acknowledgement",
+        async () =>
+          (await browserCommandTrace(page))
+            .slice(revealTraceStart)
+            .some(
+              ({ command, phase }) => command === "ja_preview_reveal_file" && phase === "resolved",
+            ),
+        Math.min(deadline, Date.now() + 15_000),
+      );
+    } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "source-reveal-ack-timeout", {
+        errorName: error?.name ?? "Error",
+      });
+      throw error;
+    }
+    await writeExplorerProgress(page, evidenceDirectory, "source-reveal-ack-complete");
     let selectedWindow;
     try {
       await waitForCondition(
@@ -1870,10 +2580,16 @@ export async function runBrowserFileLinksWebView2({
           );
           return selectedWindow !== undefined;
         },
-        Math.min(deadline, Date.now() + 12_000),
+        Math.min(deadline, Date.now() + 15_000),
       );
       explorerFolderVerified = true;
+      await writeExplorerProgress(page, evidenceDirectory, "source-explorer-selection-verified", {
+        selected: Array.isArray(selectedWindow?.selected) ? selectedWindow.selected.length : 0,
+      });
     } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "source-explorer-selection-failed", {
+        errorName: error?.name ?? "Error",
+      });
       const laterWindows = await explorerAllWindows();
       const openedWindows = laterWindows.filter(
         ({ hwnd }) => !explorerBaseline.some((baseline) => baseline.hwnd === hwnd),
@@ -1883,11 +2599,13 @@ export async function runBrowserFileLinksWebView2({
         `${String(error?.message ?? error)}; explorer=${JSON.stringify(openedWindows)}; native=${JSON.stringify(revealTrace)}`,
       );
     } finally {
+      await writeExplorerProgress(page, evidenceDirectory, "source-explorer-cleanup-start");
       for (const window of await explorerTargetWindows(files.sourcePath)) {
         if (!existingWindows.some(({ hwnd }) => hwnd === window.hwnd)) {
           await closeExplorerTargetWindow(files.sourcePath, window.hwnd);
         }
       }
+      await writeExplorerProgress(page, evidenceDirectory, "source-explorer-cleanup-complete");
     }
     assert.equal(explorerFolderVerified, true);
     assert.equal(await page.getByRole("button", { name: "显示工作区面板" }).isVisible(), true);
@@ -1916,6 +2634,119 @@ export async function runBrowserFileLinksWebView2({
     true,
     "source file opening should place focus in the file viewer",
   );
+  const directoryFacts = await openDirectoryReference(page, assistant, files, deadline);
+  const directoryTabsBeforeExplorer = await directoryFacts.workbench.getAttribute("data-open-tabs");
+  await page.screenshot({
+    path: join(evidenceDirectory, "04b-project-directory-in-files.png"),
+    animations: "disabled",
+  });
+  let explorerDirectoryVerified = false;
+  if (verifyExplorerFolder) {
+    await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-baseline-start");
+    const baseline = await explorerAllWindows();
+    const existingDirectoryWindows = baseline.filter(
+      ({ parent }) => normalizedFilePath(parent ?? "") === normalizedFilePath(files.directoryPath),
+    );
+    assert.deepEqual(
+      existingDirectoryWindows,
+      [],
+      "isolated fixture directory was already open in Explorer",
+    );
+    await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-baseline-complete", {
+      baselineWindowCount: baseline.length,
+      existingTargetWindowCount: existingDirectoryWindows.length,
+    });
+    const revealTraceStart = (await browserCommandTrace(page)).length;
+    await armTrustedExplorerClickCapture(directoryFacts.entry.locator);
+    await writeExplorerProgress(page, evidenceDirectory, "directory-ctrl-click-start");
+    try {
+      await directoryFacts.entry.locator.click({
+        modifiers: ["Control"],
+        timeout: boundedInteractionTimeout(deadline),
+      });
+    } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "directory-ctrl-click-failed", {
+        errorName: error?.name ?? "Error",
+      });
+      throw error;
+    }
+    const directoryClickEvents = await page.evaluate(
+      () => window.__JA_BROWSER_FILE_EXPLORER_CLICK_EVENTS__ ?? [],
+    );
+    await writeExplorerProgress(page, evidenceDirectory, "directory-ctrl-click-returned", {
+      trustedClickEvents: directoryClickEvents,
+    });
+    assert.ok(
+      directoryClickEvents.some(({ ctrlKey, isTrusted }) => ctrlKey === true && isTrusted === true),
+      "Playwright directory Ctrl+click must arrive as a trusted DOM click with ctrlKey=true",
+    );
+    try {
+      await waitForCondition(
+        "directory Ctrl-click reaches the native Explorer command",
+        async () =>
+          (await browserCommandTrace(page))
+            .slice(revealTraceStart)
+            .some(
+              ({ command, phase }) => command === "ja_preview_reveal_file" && phase === "resolved",
+            ),
+        Math.min(deadline, Date.now() + 15_000),
+      );
+    } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "directory-reveal-ack-timeout", {
+        errorName: error?.name ?? "Error",
+      });
+      throw error;
+    }
+    await writeExplorerProgress(page, evidenceDirectory, "directory-reveal-ack-complete");
+    let openedWindow;
+    try {
+      await waitForCondition(
+        "Explorer opens the selected project directory itself",
+        async () => {
+          const windows = await explorerAllWindows();
+          openedWindow = windows.find(
+            ({ parent }) =>
+              normalizedFilePath(parent ?? "") === normalizedFilePath(files.directoryPath),
+          );
+          return openedWindow !== undefined;
+        },
+        Math.min(deadline, Date.now() + 15_000),
+      );
+      explorerDirectoryVerified = true;
+      await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-open-verified", {
+        observedWindow: openedWindow !== undefined,
+      });
+    } catch (error) {
+      await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-open-failed", {
+        errorName: error?.name ?? "Error",
+      });
+      const observed = await explorerAllWindows();
+      const native = (await browserCommandTrace(page)).slice(revealTraceStart);
+      throw new Error(
+        `${String(error?.message ?? error)}; target=${JSON.stringify(observed.filter(({ parent }) => normalizedFilePath(parent ?? "") === normalizedFilePath(files.directoryPath)))}; native=${JSON.stringify(native)}`,
+      );
+    } finally {
+      await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-cleanup-start");
+      const baselineHwnds = new Set(baseline.map(({ hwnd }) => hwnd));
+      for (const window of await explorerAllWindows()) {
+        if (
+          !baselineHwnds.has(window.hwnd) &&
+          normalizedFilePath(window.parent ?? "") === normalizedFilePath(files.directoryPath)
+        ) {
+          await closeExplorerDirectoryWindow(files.directoryPath, window.hwnd);
+        }
+      }
+      await writeExplorerProgress(page, evidenceDirectory, "directory-explorer-cleanup-complete");
+    }
+    assert.equal(explorerDirectoryVerified, true);
+    assert.equal(await directoryFacts.workbench.getAttribute("data-active-tab"), "files");
+    assert.equal(
+      await directoryFacts.workbench.getAttribute("data-open-tabs"),
+      directoryTabsBeforeExplorer,
+    );
+  }
+  assert.equal(directoryFacts.selected, true);
+  assert.equal(directoryFacts.noBrowserTabCreated, true);
   const legacyLineColumnReference = await openFileReference(
     page,
     assistant,
@@ -2096,14 +2927,7 @@ export async function runBrowserFileLinksWebView2({
   );
   const restoredChildWidth = await imageChild.evaluate(() => window.innerWidth);
 
-  await openFileReference(
-    page,
-    assistant,
-    files,
-    files.svgPath,
-    "preview",
-    deadline,
-  );
+  await openFileReference(page, assistant, files, files.svgPath, "preview", deadline);
   workbench = await ensureBrowserCapability(page, deadline);
   await waitForActiveBrowserUrl(workbench, files.svgUrl, deadline);
   const svgChild = await waitForChildWebView(page, files.svgUrl, deadline);
@@ -2133,14 +2957,7 @@ export async function runBrowserFileLinksWebView2({
     animations: "disabled",
   });
 
-  await openFileReference(
-    page,
-    assistant,
-    files,
-    files.pdfPath,
-    "preview",
-    deadline,
-  );
+  await openFileReference(page, assistant, files, files.pdfPath, "preview", deadline);
   workbench = await ensureBrowserCapability(page, deadline);
   await waitForActiveBrowserUrl(workbench, files.pdfUrl, deadline);
   const pdfChild = await waitForChildWebView(page, files.pdfUrl, deadline);
@@ -2172,6 +2989,82 @@ export async function runBrowserFileLinksWebView2({
     path: join(evidenceDirectory, "10-pdf-browser-tab.png"),
     animations: "disabled",
   });
+
+  const mediaPreviewFailures = [];
+  await openFileReference(page, assistant, files, files.audioPath, "preview", deadline);
+  workbench = await ensureBrowserCapability(page, deadline);
+  await waitForActiveBrowserUrl(workbench, files.audioUrl, deadline);
+  const audioChild = await waitForChildWebView(page, files.audioUrl, deadline);
+  const audioFacts = await inspectLocalMediaDocument(
+    page,
+    workbench,
+    audioChild,
+    "audio",
+    deadline,
+    evidenceDirectory,
+  );
+  assert.equal(audioFacts.contentType, "audio/wav");
+  let audioNativeReadiness;
+  try {
+    await assertNoPreviewFailure(
+      workbench,
+      page,
+      "audio-local-media-preview",
+      pageErrors,
+      evidenceDirectory,
+    );
+    audioNativeReadiness = await assertAcknowledgedPreviewGenerationFinished(
+      page,
+      workbench,
+      files.audioUrl,
+      deadline,
+    );
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (!message.startsWith("Browser preview failure at ")) throw error;
+    mediaPreviewFailures.push(message);
+  }
+
+  await openFileReference(page, assistant, files, files.videoPath, "preview", deadline);
+  workbench = await ensureBrowserCapability(page, deadline);
+  await waitForActiveBrowserUrl(workbench, files.videoUrl, deadline);
+  const videoChild = await waitForChildWebView(page, files.videoUrl, deadline);
+  const videoFacts = await inspectLocalMediaDocument(
+    page,
+    workbench,
+    videoChild,
+    "video",
+    deadline,
+    evidenceDirectory,
+  );
+  assert.equal(videoFacts.contentType, "video/mp4");
+  assert.equal(videoFacts.width, 160);
+  assert.equal(videoFacts.height, 90);
+  let videoNativeReadiness;
+  try {
+    await assertNoPreviewFailure(
+      workbench,
+      page,
+      "video-local-media-preview",
+      pageErrors,
+      evidenceDirectory,
+    );
+    videoNativeReadiness = await assertAcknowledgedPreviewGenerationFinished(
+      page,
+      workbench,
+      files.videoUrl,
+      deadline,
+    );
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (!message.startsWith("Browser preview failure at ")) throw error;
+    mediaPreviewFailures.push(message);
+  }
+  assert.deepEqual(
+    mediaPreviewFailures,
+    [],
+    "audio and video must remain visible in the local media Preview without Browser errors",
+  );
 
   const htmlPageId = await selectBrowserPageById(
     workbench,
@@ -2451,11 +3344,14 @@ export async function runBrowserFileLinksWebView2({
 
   const screenshots = [
     "01-assistant-path-references.png",
+    "02-html-source-in-files.png",
     "02-html-local-child-webview.png",
+    "02b-relative-html-source-in-files.png",
     "03-missing-file-feedback.png",
     "03b-explorer-keyboard-feedback.png",
     "03c-explorer-duplicate-choice.png",
     "04-code-path-line-column.png",
+    "04b-project-directory-in-files.png",
     "05-workspace-text-file.png",
     "06-duplicate-file-choice.png",
     "07-external-text-read-only.png",
@@ -2463,6 +3359,10 @@ export async function runBrowserFileLinksWebView2({
     "08-image-browser-narrow.png",
     "09-svg-browser-page.png",
     "10-pdf-browser-tab.png",
+    "10a-audio-local-preview.png",
+    "10a-audio-local-preview-child.png",
+    "10b-video-local-preview.png",
+    "10b-video-local-preview-child.png",
     "11-browser-history-after-forward.png",
     "12-cross-scheme-forward-file.png",
     "13-thread-b-browser-isolated.png",
@@ -2477,6 +3377,7 @@ export async function runBrowserFileLinksWebView2({
       explorerFolderVerificationRequested: verifyExplorerFolder,
       assistantTurnCount: fixture.snapshot().acceptanceTurnCount,
       relativeHtmlPath: files.relativeHtmlPath,
+      relativeDirectoryPath: files.relativeDirectoryPath,
       unicodeAndSpaces: true,
       externalTextOutsideWorkspace: true,
     },
@@ -2485,6 +3386,10 @@ export async function runBrowserFileLinksWebView2({
       referencesNotResolvedBeforeClick: preClickFileResolveCount === 0,
       inlineCodePathClicked: relativeHtmlReference.reference.reference.length > 0,
       markdownLinkClicked: markdownHtmlReference.reference.reference.length > 0,
+      markdownHtmlSourceOpenedInFiles: markdownHtmlSourceFacts.readOnly === false,
+      markdownHtmlPreviewWasExplicit: markdownHtmlPreview.facts.markerVisible,
+      relativeHtmlSourceOpenedInFiles: relativeHtmlSourceFacts.readOnly === false,
+      relativeHtmlPreviewWasExplicit: relativeHtmlPreview.facts.markerVisible,
       lineColumnPathClicked: sourceReference.reference.reference.endsWith("#L2C4"),
       legacyLineColumnPathClicked: legacyLineColumnReference.reference.reference.endsWith(":2:4"),
       lineOnlyPathClicked: lineOnlyReference.reference.reference.endsWith("#L1"),
@@ -2500,6 +3405,9 @@ export async function runBrowserFileLinksWebView2({
       missingPathCtrlEnterReachedNativeExplorerCommand: true,
       duplicateExplorerChoiceDisplayed: true,
       explorerFolderOpenedAndFileSelected: explorerFolderVerified,
+      directoryOrdinaryClickSelectedInFiles: directoryFacts.selected,
+      directoryClickNoBrowserTabCreated: directoryFacts.noBrowserTabCreated,
+      explorerDirectoryOpened: explorerDirectoryVerified,
       absoluteWindowsPathClicked:
         isAbsolute(externalTextReference.reference.reference) &&
         referenceFilePath(externalTextReference.reference.reference, files.workspace) ===
@@ -2531,6 +3439,12 @@ export async function runBrowserFileLinksWebView2({
       svgPageCount: svgTabFacts.length,
       pdfDocumentOpened: pdfFacts.viewerDetected,
       pdfChildContentType: pdfFacts.contentType,
+      audioVisiblePreviewHealthy: true,
+      audioLocalPreview: audioFacts,
+      audioNativePreviewReadiness: audioNativeReadiness,
+      videoVisiblePreviewHealthy: true,
+      videoLocalPreview: videoFacts,
+      videoNativePreviewReadiness: videoNativeReadiness,
       multiplePagesOpen: aPageIds.length >= 4,
       pageIdsDistinct: new Set(aPageIds).size === aPageIds.length,
       addressFocused: bOpened.addressFocused,
@@ -2779,7 +3693,7 @@ export async function runNativePreviewFallback({
     const httpFacts = await httpChild.evaluate(() => ({
       markerVisible:
         document.body?.innerText.includes("JA_BROWSER_FILE_HTTP_HISTORY_ORIGIN") === true,
-      requestOrdinal: Number(document.querySelector("#history-request-count")?.textContent),
+      historyRequestCount: Number(document.querySelector("#history-request-count")?.textContent),
     }));
     assert.equal(httpFacts.markerVisible, true);
     await saveChildScreenshot(httpChild, "native-05-http-history-origin.png");
@@ -2926,7 +3840,7 @@ export async function runNativePreviewFallback({
           if (closed.status === "closed") cleanup.closeAckCount += 1;
         }
       } catch {
-        // Preserve the primary assertion failure; runProduction still owns parent-process cleanup.
+        // 保留主要断言失败；父进程清理由 runProduction 负责。
       }
     }
   }
@@ -2941,57 +3855,104 @@ async function waitForCondition(label, predicate, deadline) {
   throw new Error(`${label} 超时`);
 }
 
-/** 等待 App Server 就绪；运行时握手失败时读取无敏感数据的原生状态，避免耗尽场景总时限。 */
-async function waitForApplication(page, deadline) {
+/** @author kongweiguang 读取唯一 Runtime 状态 API，避免依赖已移除的可访问状态文案。 */
+async function readSafeRuntimeState(page) {
+  return page.evaluate(async () => {
+    try {
+      const { TauriRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+      const state = await new TauriRuntimeHostAdapter().state();
+      return {
+        status: state.status,
+        generation: state.generation,
+        serverInstanceIdPresent: typeof state.serverInstanceId === "string",
+        storageRecoveryPhase: state.storageRecovery?.phase,
+      };
+    } catch (error) {
+      const code = error?.code;
+      return {
+        status: "state_read_failed",
+        errorCode:
+          typeof code === "string" && /^[A-Z0-9_]{1,64}$/u.test(code)
+            ? code
+            : "STATE_READ_REJECTED",
+      };
+    }
+  });
+}
+
+/** @author kongweiguang 留下 readiness 失败快照，只记录可操作状态与有限 UI 计数，不落入正文或路径。 */
+async function captureStartupDiagnostics(page, evidenceDirectory, pageErrors, runtimeState) {
+  await mkdir(evidenceDirectory, { recursive: true });
+  const dom = await page
+    .evaluate(() => ({
+      shellReady: document.querySelector('.ja-shell[data-app-ready="true"]') !== null,
+      visibleStatusCount: [...document.querySelectorAll('[role="status"]')].filter((node) => {
+        const bounds = node.getBoundingClientRect();
+        return bounds.width > 0 && bounds.height > 0;
+      }).length,
+      visibleAlertCount: [...document.querySelectorAll('[role="alert"]')].filter((node) => {
+        const bounds = node.getBoundingClientRect();
+        return bounds.width > 0 && bounds.height > 0;
+      }).length,
+      navigationMounted: document.querySelector(".ja-navigation-shell") !== null,
+    }))
+    .catch(() => ({ shellReady: false, visibleStatusCount: 0, visibleAlertCount: 0 }));
+  const safeErrors = pageErrors.slice(-20).map((message) =>
+    String(message)
+      .replace(/(?:[A-Za-z]:\\|\\\\\?\\[A-Za-z]:\\)[^\s"'<>]+/gu, "[LOCAL_PATH]")
+      .slice(0, 300),
+  );
+  await page
+    .screenshot({
+      path: join(evidenceDirectory, "00-app-startup-status-timeout.png"),
+      animations: "disabled",
+    })
+    .catch(() => undefined);
+  await writeFile(
+    join(evidenceDirectory, "app-startup-status-timeout.json"),
+    `${JSON.stringify({ runtimeState, dom, pageErrors: safeErrors }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+/** @author kongweiguang 等 ready/busy 的权威 Runtime 状态；不要用壳层状态文字或视觉文案替代 RPC。 */
+async function waitForApplication(page, deadline, evidenceDirectory, pageErrors = []) {
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor({
     state: "visible",
     timeout: Math.max(1, deadline - Date.now()),
   });
-  const ready = page.getByRole("status", { name: "本地运行时：已连接", exact: true });
-  const failed = page.getByRole("status", { name: "本地运行时：连接失败", exact: true });
-  await waitForCondition(
-    "App Server startup status",
-    async () => (await ready.isVisible()) || (await failed.isVisible()),
-    Math.min(deadline, Date.now() + 60_000),
-  );
-  if (await failed.isVisible()) {
-    const nativeState = await page.evaluate(async () => {
-      const invoke = window.__TAURI_INTERNALS__?.invoke;
-      if (typeof invoke !== "function") return { error: "native invoke bridge unavailable" };
-      const readState = async () => invoke("ja_runtime_state", {});
-      let stateBefore;
-      try {
-        stateBefore = await readState();
-      } catch (error) {
-        return { stateError: String(error?.message ?? error).slice(0, 300) };
-      }
-      let retry;
-      let timer;
-      try {
-        retry = await Promise.race([
-          invoke("ja_runtime_start", {}),
-          new Promise((resolvePromise) => {
-            timer = window.setTimeout(() => resolvePromise({ timeout: true }), 20_000);
-          }),
-        ]);
-      } catch (error) {
-        retry = { error: String(error?.message ?? error).slice(0, 300) };
-      } finally {
-        if (timer !== undefined) window.clearTimeout(timer);
-      }
-      let stateAfter;
-      try {
-        stateAfter = await readState();
-      } catch (error) {
-        stateAfter = { error: String(error?.message ?? error).slice(0, 300) };
-      }
-      return { stateBefore, retry, stateAfter };
-    });
-    throw new Error(`App Server runtime failed to connect: ${JSON.stringify(nativeState)}`);
+  let runtimeState;
+  const startupDeadline = Math.min(deadline, Date.now() + 60_000);
+  try {
+    await waitForCondition(
+      "App Server startup status",
+      async () => {
+        runtimeState = await readSafeRuntimeState(page);
+        return [
+          "ready",
+          "busy",
+          "recovery_required",
+          "crashed",
+          "incompatible",
+          "faulted",
+        ].includes(runtimeState.status);
+      },
+      startupDeadline,
+    );
+  } catch (error) {
+    await captureStartupDiagnostics(page, evidenceDirectory, pageErrors, runtimeState);
+    throw new Error(
+      `App Server did not publish a settled Runtime status: ${JSON.stringify(runtimeState ?? { status: "unavailable" })}`,
+      { cause: error },
+    );
+  }
+  if (runtimeState.status !== "ready" && runtimeState.status !== "busy") {
+    await captureStartupDiagnostics(page, evidenceDirectory, pageErrors, runtimeState);
+    throw new Error(`App Server Runtime is ${runtimeState.status}`);
   }
 }
 
-/** 对已实现的报告使用失败关闭校验；骨架状态不能被误报为完整 WebView2 验收通过。 */
+/** @author kongweiguang 对报告使用失败关闭校验，避免把部分 WebView2 覆盖误报为完整验收。 */
 export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.contractVersion, 1);
   assert.equal(report?.status, "passed");
@@ -3005,6 +3966,10 @@ export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.assistantTurn?.referencesNotResolvedBeforeClick, true);
   assert.equal(report?.assistantTurn?.inlineCodePathClicked, true);
   assert.equal(report?.assistantTurn?.markdownLinkClicked, true);
+  assert.equal(report?.assistantTurn?.markdownHtmlSourceOpenedInFiles, true);
+  assert.equal(report?.assistantTurn?.markdownHtmlPreviewWasExplicit, true);
+  assert.equal(report?.assistantTurn?.relativeHtmlSourceOpenedInFiles, true);
+  assert.equal(report?.assistantTurn?.relativeHtmlPreviewWasExplicit, true);
   assert.equal(report?.assistantTurn?.lineColumnPathClicked, true);
   assert.equal(report?.assistantTurn?.legacyLineColumnPathClicked, true);
   assert.equal(report?.assistantTurn?.lineOnlyPathClicked, true);
@@ -3018,8 +3983,11 @@ export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.assistantTurn?.missingPathCtrlClickKeptPanelHidden, true);
   assert.equal(report?.assistantTurn?.missingPathCtrlEnterReachedNativeExplorerCommand, true);
   assert.equal(report?.assistantTurn?.duplicateExplorerChoiceDisplayed, true);
+  assert.equal(report?.assistantTurn?.directoryOrdinaryClickSelectedInFiles, true);
+  assert.equal(report?.assistantTurn?.directoryClickNoBrowserTabCreated, true);
   if (report?.fixture?.explorerFolderVerificationRequested) {
     assert.equal(report?.assistantTurn?.explorerFolderOpenedAndFileSelected, true);
+    assert.equal(report?.assistantTurn?.explorerDirectoryOpened, true);
   }
   assert.equal(report?.assistantTurn?.absoluteWindowsPathClicked, true);
   assert.equal(report?.assistantTurn?.absoluteFileUrlClicked, true);
@@ -3037,6 +4005,78 @@ export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.browser?.svgPageOpened, true);
   assert.equal(report?.browser?.svgDocumentOpened, true);
   assert.equal(report?.browser?.pdfDocumentOpened, true);
+  assert.equal(report?.browser?.audioVisiblePreviewHealthy, true);
+  assert.equal(report?.browser?.videoVisiblePreviewHealthy, true);
+  const audio = report?.browser?.audioLocalPreview;
+  assert.equal(audio?.contentType, "audio/wav");
+  assert.ok(["audio", "video"].includes(audio?.mediaTag));
+  assert.equal(audio?.mediaElementPresent, true);
+  assert.equal(audio?.controlsVisible, true);
+  assert.ok(Number.isInteger(audio?.readyState) && audio.readyState >= 1);
+  assert.equal(audio?.metadataReady, true);
+  assert.equal(audio?.localFileSource, true);
+  assert.ok(Number.isFinite(audio?.durationSeconds) && audio.durationSeconds > 0);
+  assert.ok(
+    Number.isInteger(audio?.browserPreviewViewport?.width) &&
+      audio.browserPreviewViewport.width > 200,
+  );
+  assert.ok(
+    Number.isInteger(audio?.browserPreviewViewport?.height) &&
+      audio.browserPreviewViewport.height > 100,
+  );
+  assert.ok(
+    Number.isInteger(audio?.childScreenshotSize?.width) && audio.childScreenshotSize.width > 200,
+  );
+  assert.ok(
+    Number.isInteger(audio?.childScreenshotSize?.height) && audio.childScreenshotSize.height > 100,
+  );
+  const audioReadiness = report?.browser?.audioNativePreviewReadiness;
+  const audioAck = report?.browser?.fileOpenAcknowledgements?.find(
+    ({ pageId }) => pageId === audioReadiness?.pageId,
+  );
+  assert.equal(audioAck?.command, "ja_preview_open_file");
+  assert.equal(audioAck?.generation, audioReadiness?.generation);
+  assert.equal(audioReadiness?.status, "open");
+  assert.equal(audioReadiness?.loadStatus, "finished");
+  assert.equal(audioReadiness?.targetUrlMatched, true);
+  assert.ok(
+    audio?.videoDimensions === null ||
+      (audio?.videoDimensions?.width === 0 && audio?.videoDimensions?.height === 0),
+  );
+  const video = report?.browser?.videoLocalPreview;
+  assert.equal(video?.contentType, "video/mp4");
+  assert.equal(video?.mediaTag, "video");
+  assert.equal(video?.mediaElementPresent, true);
+  assert.equal(video?.controlsVisible, true);
+  assert.ok(Number.isInteger(video?.readyState) && video.readyState >= 1);
+  assert.equal(video?.metadataReady, true);
+  assert.equal(video?.localFileSource, true);
+  assert.ok(Number.isFinite(video?.durationSeconds) && video.durationSeconds > 0);
+  assert.ok(
+    Number.isInteger(video?.browserPreviewViewport?.width) &&
+      video.browserPreviewViewport.width > 200,
+  );
+  assert.ok(
+    Number.isInteger(video?.browserPreviewViewport?.height) &&
+      video.browserPreviewViewport.height > 100,
+  );
+  assert.ok(
+    Number.isInteger(video?.childScreenshotSize?.width) && video.childScreenshotSize.width > 200,
+  );
+  assert.ok(
+    Number.isInteger(video?.childScreenshotSize?.height) && video.childScreenshotSize.height > 100,
+  );
+  const videoReadiness = report?.browser?.videoNativePreviewReadiness;
+  const videoAck = report?.browser?.fileOpenAcknowledgements?.find(
+    ({ pageId }) => pageId === videoReadiness?.pageId,
+  );
+  assert.equal(videoAck?.command, "ja_preview_open_file");
+  assert.equal(videoAck?.generation, videoReadiness?.generation);
+  assert.equal(videoReadiness?.status, "open");
+  assert.equal(videoReadiness?.loadStatus, "finished");
+  assert.equal(videoReadiness?.targetUrlMatched, true);
+  assert.ok(Number.isInteger(video?.width) && video.width > 0);
+  assert.ok(Number.isInteger(video?.height) && video.height > 0);
   assert.equal(report?.browser?.multiplePagesOpen, true);
   assert.equal(report?.browser?.addressFocused, true);
   assert.equal(report?.browser?.viewportResizeApplied, true);
@@ -3157,7 +4197,9 @@ function parseArguments(argv) {
   return options;
 }
 
-/** 执行 isolated JVM JAR/WebView2 runner，并无条件回收本轮 loopback Provider listener。 */
+/** @author kongweiguang
+ * 执行 isolated JVM JAR/WebView2 runner，并用不抢焦点、无任务栏窗口减少对用户桌面的干扰。
+ */
 async function main() {
   if (process.platform !== "win32")
     throw new Error("browser file-link acceptance requires Windows 11");
@@ -3172,7 +4214,7 @@ async function main() {
       fixture: "no-head",
       ignoredFiles: 0,
       untrackedFiles: 0,
-      hiddenWindow: options.mode === "native-preview",
+      hiddenWindow: true,
       prewarmWebview: true,
       preserveFailedProfile: true,
       driver:

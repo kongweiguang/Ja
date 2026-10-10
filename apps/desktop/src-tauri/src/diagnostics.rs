@@ -35,6 +35,7 @@ const SAFE_EVENT_QUEUE_METRICS: &[&str] = &[
 ];
 const SAFE_EVENT_QUEUE_LANES: &[&str] = &["control", "data"];
 const RUNTIME_STARTUP_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.runtime_startup";
+pub(crate) const PREVIEW_NAVIGATION_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.preview_navigation";
 const SAFE_RUNTIME_STARTUP_PHASES: &[&str] =
     &["supervisor_start", "ready_token_echo", "event_pump_take"];
 const SAFE_RUNTIME_STARTUP_VARIANTS: &[&str] = &[
@@ -76,6 +77,90 @@ const SAFE_RUNTIME_STARTUP_VARIANTS: &[&str] = &[
     "backoff",
     "faulted",
 ];
+const WEBSOCKET_PUMP_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.websocket_pump";
+const SAFE_WEBSOCKET_PUMP_EXIT_CATEGORIES: &[&str] = &[
+    "invalid_outbound_text",
+    "websocket_send_error",
+    "outbound_channel_closed",
+    "inbound_consumer_closed",
+    "inbound_text_too_large",
+    "inbound_text_contains_line_break",
+    "peer_close",
+    "unsupported_message",
+    "websocket_read_error",
+];
+const SAFE_WEBSOCKET_PUMP_ERROR_VARIANTS: &[&str] = &[
+    "none",
+    "connection_closed",
+    "already_closed",
+    "io",
+    "tls",
+    "capacity",
+    "protocol",
+    "write_buffer_full",
+    "utf8",
+    "attack_attempt",
+    "url",
+    "http",
+    "http_format",
+];
+const SAFE_WEBSOCKET_PUMP_ERROR_DETAILS: &[&str] = &[
+    "none",
+    "too_many_headers",
+    "message_too_long",
+    "wrong_http_method",
+    "wrong_http_version",
+    "missing_connection_upgrade_header",
+    "missing_upgrade_websocket_header",
+    "missing_websocket_version_header",
+    "missing_websocket_key",
+    "websocket_accept_key_mismatch",
+    "server_sent_unrequested_subprotocol",
+    "invalid_subprotocol",
+    "missing_subprotocol",
+    "junk_after_request",
+    "custom_response_successful",
+    "invalid_header",
+    "handshake_incomplete",
+    "http_parse_error",
+    "send_after_closing",
+    "received_after_closing",
+    "nonzero_reserved_bits",
+    "unmasked_frame_from_client",
+    "masked_frame_from_server",
+    "fragmented_control_frame",
+    "control_frame_too_big",
+    "unknown_control_frame_type",
+    "unknown_data_frame_type",
+    "unexpected_continue_frame",
+    "expected_fragment",
+    "reset_without_closing_handshake",
+    "invalid_opcode",
+    "invalid_close_sequence",
+];
+const SAFE_WEBSOCKET_PUMP_IO_KINDS: &[&str] = &[
+    "none",
+    "not_found",
+    "permission_denied",
+    "connection_refused",
+    "connection_reset",
+    "connection_aborted",
+    "not_connected",
+    "addr_in_use",
+    "addr_not_available",
+    "broken_pipe",
+    "already_exists",
+    "would_block",
+    "invalid_input",
+    "invalid_data",
+    "timed_out",
+    "write_zero",
+    "interrupted",
+    "unsupported",
+    "unexpected_eof",
+    "out_of_memory",
+    "other",
+];
 
 /// 在整个 Tauri 生命周期内持有非阻塞写入器，确保正常退出时能刷新缓冲记录。
 #[derive(Debug)]
@@ -114,7 +199,7 @@ pub(crate) fn initialize_native_tracing(
     })
 }
 
-/// 只格式化时间、级别、编译期 target，以及固定白名单中的 WebView 故障码、运行时计数和启动类别。
+/// 只格式化时间、级别、编译期 target，以及固定白名单中的 WebView 故障码、运行时计数、启动类别和 WS 退出诊断。
 /// 原生消息可能合法包含路径或工具输出，因此绝不序列化自由文本字段。
 #[derive(Default)]
 pub(crate) struct RedactedEventFormat {
@@ -127,6 +212,8 @@ where
     N: for<'writer> FormatFields<'writer> + 'static,
 {
     /// 在格式化阶段直接丢弃不受信任字段，使任何上游事件都无法绕过统一脱敏策略。
+    /// Preview 只通过专属 visitor 输出原生导航号、代际、成功位和错误码。
+    /// @author kongweiguang
     fn format_event(
         &self,
         _context: &FmtContext<'_, S, N>,
@@ -153,6 +240,14 @@ where
             visitor.write_to(&mut writer)?;
         } else if metadata.target() == RUNTIME_STARTUP_DIAGNOSTIC_TARGET {
             let mut visitor = SafeRuntimeStartupVisitor::default();
+            event.record(&mut visitor);
+            visitor.write_to(&mut writer)?;
+        } else if metadata.target() == PREVIEW_NAVIGATION_DIAGNOSTIC_TARGET {
+            let mut visitor = SafePreviewNavigationVisitor::default();
+            event.record(&mut visitor);
+            visitor.write_to(&mut writer)?;
+        } else if metadata.target() == WEBSOCKET_PUMP_DIAGNOSTIC_TARGET {
+            let mut visitor = SafeWebSocketPumpVisitor::default();
             event.record(&mut visitor);
             visitor.write_to(&mut writer)?;
         }
@@ -294,6 +389,154 @@ impl Visit for SafeRuntimeStartupVisitor {
     }
 
     /// 不接受 Debug 字段，使 path、token、message 和命令不可能通过非 typed 值绕过白名单。
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+/// Preview 导航诊断只输出有限数值和布尔状态，丢弃所有 path、URL 与正文载荷。
+#[derive(Default)]
+struct SafePreviewNavigationVisitor {
+    navigation_id: Option<u64>,
+    generation: Option<u64>,
+    succeeded: Option<bool>,
+    status_available: Option<bool>,
+    web_error_status: Option<i64>,
+}
+
+impl SafePreviewNavigationVisitor {
+    /// 字段不完整时整组隐藏，避免缺失数据被默认值伪装成有效错误码。
+    /// @author kongweiguang
+    fn write_to(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let (
+            Some(navigation_id),
+            Some(generation),
+            Some(succeeded),
+            Some(status_available),
+            Some(web_error_status),
+        ) = (
+            self.navigation_id,
+            self.generation,
+            self.succeeded,
+            self.status_available,
+            self.web_error_status,
+        )
+        else {
+            return Ok(());
+        };
+        write!(
+            writer,
+            " navigation_id={navigation_id} generation={generation} succeeded={succeeded} web_error_status_available={status_available} web_error_status={web_error_status}"
+        )
+    }
+}
+
+impl Visit for SafePreviewNavigationVisitor {
+    /// 只接受导航身份的 typed 整数；自由格式的字符串和 Debug 值永远不会进入日志。
+    /// @author kongweiguang
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "navigation_id" => self.navigation_id = Some(value),
+            "generation" => self.generation = Some(value),
+            _ => {}
+        }
+    }
+
+    /// 错误码保留为 typed 整数以便和当前 WebView2 投影对照。
+    /// @author kongweiguang
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if field.name() == "web_error_status" {
+            self.web_error_status = Some(value);
+        }
+    }
+
+    /// 成功位与 status 可用位是闭合布尔量，不接受字符串替代。
+    /// @author kongweiguang
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        match field.name() {
+            "succeeded" => self.succeeded = Some(value),
+            "web_error_status_available" => self.status_available = Some(value),
+            _ => {}
+        }
+    }
+
+    /// 非 typed 数值字段一律丢弃，尤其是不允许消息、URL 或文件路径。
+    /// @author kongweiguang
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+/// WebSocket pump 仅投影固定退出类别、错误变体、标准 I/O 类别和合法数值关闭码。
+#[derive(Default)]
+struct SafeWebSocketPumpVisitor {
+    exit_category: Option<&'static str>,
+    error_variant: Option<&'static str>,
+    error_detail: Option<&'static str>,
+    io_kind: Option<&'static str>,
+    close_code: Option<u16>,
+}
+
+impl SafeWebSocketPumpVisitor {
+    /// 无法识别退出类别时整条诊断字段保持隐藏，避免该 target 成为通用字符串日志入口。
+    fn write_to(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let Some(exit_category) = self.exit_category else {
+            return Ok(());
+        };
+        write!(writer, " exit_category={exit_category}")?;
+        if let Some(error_variant) = self.error_variant {
+            write!(writer, " error_variant={error_variant}")?;
+        }
+        if let Some(error_detail) = self.error_detail {
+            write!(writer, " error_detail={error_detail}")?;
+        }
+        if let Some(io_kind) = self.io_kind {
+            write!(writer, " io_kind={io_kind}")?;
+        }
+        if let Some(close_code) = self.close_code {
+            write!(writer, " close_code={close_code}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Visit for SafeWebSocketPumpVisitor {
+    /// 分类字段逐项匹配编译期闭集；其它字符串或额外事件字段完全不进入日志。
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "exit_category" => {
+                self.exit_category = SAFE_WEBSOCKET_PUMP_EXIT_CATEGORIES
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            "error_variant" => {
+                self.error_variant = SAFE_WEBSOCKET_PUMP_ERROR_VARIANTS
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            "error_detail" => {
+                self.error_detail = SAFE_WEBSOCKET_PUMP_ERROR_DETAILS
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            "io_kind" => {
+                self.io_kind = SAFE_WEBSOCKET_PUMP_IO_KINDS
+                    .iter()
+                    .copied()
+                    .find(|allowed| *allowed == value);
+            }
+            _ => {}
+        }
+    }
+
+    /// 仅输出与 tungstenite CloseCode::is_allowed 一致的 typed 数值；0、Status/Reserved/Bad 均不输出。
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "close_code" && matches!(value, 1000..=1003 | 1007..=1013 | 3000..=4999)
+        {
+            self.close_code = u16::try_from(value).ok();
+        }
+    }
+
+    /// Debug/Display 字段一律丢弃，避免自由文本通过同名 close_code 字段进入诊断。
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 }
 

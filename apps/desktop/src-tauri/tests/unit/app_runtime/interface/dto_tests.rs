@@ -3,6 +3,64 @@
 
 use super::*;
 
+/// Workspace 打开 DTO 必须只接受路径或 Java 稳定 ID 之一，避免混合输入绕过其权威身份来源。
+#[test]
+fn workspace_open_command_dto_requires_exactly_one_open_intent() {
+    let path = serde_json::from_value::<WorkspaceOpenInputDto>(serde_json::json!({
+        "cwd": "C:\\project",
+        "displayName": "Project"
+    }))
+    .expect("path-based open request");
+    assert!(matches!(path, WorkspaceOpenInputDto::ByPath(_)));
+
+    let id = serde_json::from_value::<WorkspaceOpenInputDto>(serde_json::json!({
+        "workspaceId": "ws_0123456789abcdef0123456789abcdef"
+    }))
+    .expect("ID-based open request");
+    assert!(matches!(id, WorkspaceOpenInputDto::ById(_)));
+
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({
+            "cwd": "C:\\project",
+            "workspaceId": "ws_0123456789abcdef0123456789abcdef"
+        }),
+        serde_json::json!({
+            "workspaceId": "ws_0123456789abcdef0123456789abcdef",
+            "displayName": "Project"
+        }),
+        serde_json::json!({"cwd": "C:\\project", "unexpected": true}),
+    ] {
+        assert!(
+            serde_json::from_value::<WorkspaceOpenInputDto>(invalid).is_err(),
+            "path and ID inputs must stay mutually exclusive and closed"
+        );
+    }
+}
+
+/// 历史打开命令返回完整 canonical Workspace projection，而不是仅供激活用的 rootPath DTO。
+#[test]
+fn workspace_wire_dto_serializes_complete_id_open_projection() {
+    let dto = crate::app_runtime::interface::history_model::WorkspaceWireDto::from(
+        crate::app_runtime::domain::WorkspaceDto {
+            workspace_id: "ws_0123456789abcdef0123456789abcdef".to_owned(),
+            root: "C:\\project".to_owned(),
+            display_name: "Project".to_owned(),
+            trust: "untrusted".to_owned(),
+            revision: 4,
+            kind: crate::app_runtime::domain::WorkspaceKind::Project,
+        },
+    );
+    let value = serde_json::to_value(dto).expect("workspace projection serializes");
+    assert_eq!(value["workspaceId"], "ws_0123456789abcdef0123456789abcdef");
+    assert_eq!(value["root"], "C:\\project");
+    assert_eq!(value["displayName"], "Project");
+    assert_eq!(value["trust"], "untrusted");
+    assert_eq!(value["revision"], 4);
+    assert_eq!(value["kind"], "project");
+    assert!(value.get("rootPath").is_none());
+}
+
 /// IPC 序列化必须保留活动根身份，否则前端严格校验会使真实侧聊 Composer 永久不可用。
 #[test]
 fn task_activity_dto_preserves_root_identity() {
@@ -116,20 +174,74 @@ fn turn_input_dtos_reject_cross_method_control_fields() {
     );
 }
 
-/// Turn DTO 只接受 strict content union；旧 input、text/attachment 混字段和路径字段均失败关闭。
+/// Turn DTO 保留当前来源限定 Skill ID，并拒绝旧 input、混字段和路径注入。
 #[test]
 fn turn_start_dto_accepts_content_union_and_rejects_legacy_or_mixed_parts() {
     let valid = serde_json::from_value::<TurnStartInputDto>(serde_json::json!({
         "threadId":"thr_fixture",
-        "clientOperationId":"op_0123456789abcdef0123456789abcdef",
+        "operationKey":"op_0123456789abcdef0123456789abcdef",
         "content":[
             {"type":"workspace_reference","workspaceId":"ws_fixture","relativePath":"src/main.rs","kind":"file"},
-            {"type":"skill_reference","skillId":"skill_fixture"},
+            {"type":"skill_reference","skillId":"user:runtime-refresh"},
             {"type":"attachment","attachmentId":"att_fixture"},
             {"type":"text","text":"hello"}
         ]
-    }));
-    assert!(valid.is_ok());
+    }))
+    .expect("valid current turn content must deserialize");
+    let mapped = crate::app_runtime::domain::TurnStartInput::from(valid);
+    assert!(mapped.validate().is_ok());
+    assert!(matches!(
+        &mapped.content[1],
+        crate::app_runtime::domain::TurnContentPart::SkillReference { skill_id }
+            if skill_id == "user:runtime-refresh"
+    ));
+    for skill_id in [
+        "user:runtime-refresh",
+        "ja:runtime-refresh",
+        "project:runtime-refresh",
+    ] {
+        let input = serde_json::from_value::<TurnStartInputDto>(serde_json::json!({
+            "threadId":"thr_fixture",
+            "operationKey":"op_0123456789abcdef0123456789abcdef",
+            "content":[
+                {"type":"skill_reference","skillId":skill_id},
+                {"type":"text","text":"hello"}
+            ]
+        }))
+        .expect("valid source-scoped skill reference must deserialize");
+        let mapped = crate::app_runtime::domain::TurnStartInput::from(input);
+        assert!(mapped.validate().is_ok(), "rejected {skill_id:?}");
+        assert!(matches!(
+            &mapped.content[0],
+            crate::app_runtime::domain::TurnContentPart::SkillReference { skill_id: actual }
+                if actual == skill_id
+        ));
+    }
+    let too_long_skill_id = format!("project:{}", "a".repeat(257));
+    for skill_id in [
+        "user:Runtime-refresh",
+        "user:runtime_refresh",
+        "user:runtime--refresh",
+        "user:café",
+        "other:runtime-refresh",
+        too_long_skill_id.as_str(),
+    ] {
+        let input = serde_json::from_value::<TurnStartInputDto>(serde_json::json!({
+            "threadId":"thr_fixture",
+            "operationKey":"op_0123456789abcdef0123456789abcdef",
+            "content":[
+                {"type":"skill_reference","skillId":skill_id},
+                {"type":"text","text":"hello"}
+            ]
+        }))
+        .expect("wire DTO leaves semantic skill validation to the domain");
+        assert!(
+            crate::app_runtime::domain::TurnStartInput::from(input)
+                .validate()
+                .is_err(),
+            "unexpectedly accepted {skill_id:?}"
+        );
+    }
     assert!(
         serde_json::from_value::<TurnStartInputDto>(serde_json::json!({
             "threadId":"thr_fixture",
@@ -168,7 +280,7 @@ fn continuation_dtos_are_exact_and_reask_reuses_content_union() {
         serde_json::from_value::<TurnContinueInputDto>(serde_json::json!({
             "threadId": "thr_fixture",
             "expectedThreadRevision": 7,
-            "clientOperationId":"op_0123456789abcdef0123456789abcdef"
+            "operationKey":"op_0123456789abcdef0123456789abcdef"
         }))
         .is_ok()
     );
@@ -183,7 +295,7 @@ fn continuation_dtos_are_exact_and_reask_reuses_content_union() {
 
     let reask = serde_json::json!({
         "threadId": "thr_fixture",
-        "clientOperationId":"op_0123456789abcdef0123456789abcdef",
+        "operationKey":"op_0123456789abcdef0123456789abcdef",
         "expectedThreadRevision": 7,
         "sourceMessageId": "item_user_fixture",
         "content": [{"type":"text", "text":"replacement"}]
@@ -226,7 +338,7 @@ fn task_create_dto_is_exact_and_requires_nullable_parent_turn() {
 fn task_message_dtos_reject_server_owned_fields() {
     let message = json!({
         "senderThreadId": "thr_parent", "targetThreadId": "thr_child",
-        "content": [{"type":"text","text":"状态如何"}], "idempotencyKey": "msg-1"
+        "content": [{"type":"text","text":"状态如何"}], "operationKey": "msg-1"
     });
     assert!(serde_json::from_value::<TaskMessageInputDto>(message.clone()).is_ok());
     let mut wake = message.clone();

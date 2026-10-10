@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","id":"c:execute-no-hash","method":"plan/execute","params":{"threadId":"thr_root","planId":"plan_demo","expectedPlanRevision":5,"operationKey":"plan:execute:demo","planRevisionId":"planrev_demo"}}
+{"jsonrpc":"2.0","id":"c:draft-markdown","method":"plan/draft/save","params":{"threadId":"thr_root","planId":"plan_demo","expectedPlanRevision":1,"operationKey":"plan:draft:save","draft":"- [ ] Markdown"}}
+{"jsonrpc":"2.0","id":"c:plan-independent-owner","method":"plan/create","params":{"owner":{"kind":"independent_task","taskThreadId":"thr_task"},"objective":"invalid owner","expectedThreadRevision":0,"operationKey":"plan:create:invalid"}}
+{"jsonrpc":"2.0","id":"c:plan-current-read-unknown","method":"plan/current/read","params":{"threadId":"thr_root","planId":"plan_demo"}}
+

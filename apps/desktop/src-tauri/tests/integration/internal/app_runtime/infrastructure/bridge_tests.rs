@@ -28,13 +28,12 @@ fn poison_mutex<T>(mutex: &std::sync::Mutex<T>) {
 /// 构造标准 Java Workspace 投影；parser 只验证协议，不创建 root。
 fn workspace_projection(root: &std::path::Path) -> serde_json::Value {
     json!({
-        "workspaceId": "ws_java_general",
+        "workspaceId": "ws_java_session",
         "root": root.to_string_lossy(),
-        "displayName": "无项目",
+        "displayName": "临时会话",
         "trust": "trusted",
         "revision": 7,
         "kind": "session",
-        "legacySharedWorkspaceId": null,
     })
 }
 
@@ -42,81 +41,68 @@ fn workspace_projection(root: &std::path::Path) -> serde_json::Value {
 /// 一次性严格解析，且解析本身不能创建 Rust-owned fallback 目录。
 #[test]
 fn parses_workspace_projection_without_creating_local_storage() {
-    let root = std::env::temp_dir().join("ja-java-general-root-that-is-not-created");
+    let root = std::env::temp_dir().join("ja-java-session-root-that-is-not-created");
     let parsed =
         parse_workspace_projection(workspace_projection(&root)).expect("server projection");
 
-    assert_eq!(parsed.workspace_id, "ws_java_general");
+    assert_eq!(parsed.workspace_id, "ws_java_session");
     assert_eq!(parsed.root, root.to_string_lossy());
-    assert_eq!(parsed.display_name, "无项目");
+    assert_eq!(parsed.display_name, "临时会话");
     assert_eq!(parsed.trust, "trusted");
     assert_eq!(parsed.revision, 7);
     assert_eq!(parsed.kind, WorkspaceKind::Session);
-    assert_eq!(parsed.legacy_shared_workspace_id, None);
     assert!(!root.exists(), "parser must not create Java storage");
 }
 
 /// unknown field、错误 identity prefix 与畸形 revision 必须在 native Workspace binding 前关闭失败。
 #[test]
 fn rejects_malformed_workspace_projection() {
-    let root = std::env::temp_dir().join("ja-java-general-invalid-root");
+    let root = std::env::temp_dir().join("ja-java-session-invalid-root");
     for invalid in [
         json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 1,
             "kind": "session",
-            "legacySharedWorkspaceId": null,
             "extra": true,
         }),
         json!({
             "workspaceId": "not-a-workspace",
             "root": root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 1,
             "kind": "session",
-            "legacySharedWorkspaceId": null,
         }),
         json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 9_007_199_254_740_992_u64,
             "kind": "session",
-            "legacySharedWorkspaceId": null,
         }),
         json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 1,
             "kind": "future",
-            "legacySharedWorkspaceId": null,
         }),
         json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 1,
             "kind": "session",
             "legacySharedWorkspaceId": "not-a-workspace",
         }),
         json!({
-            "workspaceId": "ws_java_general",
-            "root": root,
-            "displayName": "无项目",
-            "trust": "trusted",
-            "revision": 1,
-            "kind": "session",
-        }),
-        json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
             "displayName": "Project",
             "trust": "trusted",
@@ -125,7 +111,7 @@ fn rejects_malformed_workspace_projection() {
             "legacySharedWorkspaceId": "ws_legacy",
         }),
         json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": root,
             "displayName": "Legacy",
             "trust": "trusted",
@@ -147,13 +133,12 @@ fn rejects_malformed_workspace_projection() {
 #[test]
 fn rejects_unusable_workspace_root() {
     let relative = json!({
-        "workspaceId": "ws_java_general",
+        "workspaceId": "ws_java_session",
         "root": "sessions/thr_java_general",
-        "displayName": "无项目",
+        "displayName": "临时会话",
         "trust": "trusted",
         "revision": 1,
         "kind": "session",
-        "legacySharedWorkspaceId": null,
     });
     assert!(parse_workspace_projection(relative).is_err());
 
@@ -163,13 +148,12 @@ fn rejects_unusable_workspace_root() {
         .into_owned();
     assert!(
         parse_workspace_projection(json!({
-            "workspaceId": "ws_java_general",
+            "workspaceId": "ws_java_session",
             "root": long_root,
-            "displayName": "无项目",
+            "displayName": "临时会话",
             "trust": "trusted",
             "revision": 1,
-            "kind": "legacy_shared",
-            "legacySharedWorkspaceId": null,
+            "kind": "session",
         }))
         .is_err()
     );
@@ -198,7 +182,7 @@ fn webview_delivery_failure_does_not_terminal_the_sidecar() {
 
     let invalid = RuntimeCommandError {
         code: "SENSITIVE_EVENT_BLOCKED",
-        message: "runtime event contains protected data",
+        message: "runtime event contains protected data".into(),
         retryable: false,
     };
     assert!(projection_failure_is_terminal(&invalid));
@@ -250,7 +234,6 @@ fn workspace_open_accepts_authoritative_persisted_display_name() {
         "trust": "trusted",
         "revision": 1,
         "kind": "project",
-        "legacySharedWorkspaceId": null
     });
 
     let projection = validate_workspace_open_result(&result, &canonical)
@@ -265,43 +248,41 @@ fn workspace_open_accepts_authoritative_persisted_display_name() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// ID-only Java reopen accepts registered session/legacy kinds and defers Windows physical identity spelling to WorkspaceRegistry.
+/// 按 ID 重开允许已登记的项目和会话，并将 Windows 物理身份的拼写交由 WorkspaceRegistry 处理。
 #[test]
-fn workspace_open_by_id_accepts_registered_kinds_without_lexical_path_equality() {
+fn workspace_open_by_id_accepts_session_without_lexical_path_equality() {
     let root = std::env::temp_dir().join(format!("ja-session-workspace-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("session root");
     let alias = root.join(".");
-    for (workspace_id, kind) in [
-        ("ws_0123456789abcdef0123456789abcdef", "session"),
-        ("ws_abcdef0123456789abcdef0123456789", "legacy_shared"),
-    ] {
-        let projection = json!({
-            "workspaceId": workspace_id,
-            "root": alias.to_string_lossy(),
-            "displayName": "Session",
-            "trust": "trusted",
-            "revision": 3,
-            "kind": kind,
-            "legacySharedWorkspaceId": null,
-        });
-        let parsed = validate_workspace_open_by_id_result(&projection, workspace_id)
-            .expect("registered Java projection");
-        assert_eq!(parsed.kind.wire_name(), kind);
-        assert!(std::fs::canonicalize(&parsed.root).is_ok());
-    }
+    let workspace_id = "ws_0123456789abcdef0123456789abcdef";
+    let kind = "session";
+    let projection = json!({
+        "workspaceId": workspace_id,
+        "root": alias.to_string_lossy(),
+        "displayName": "Session",
+        "trust": "trusted",
+        "revision": 3,
+        "kind": kind,
+    });
+    let parsed = validate_workspace_open_by_id_result(&projection, workspace_id)
+        .expect("registered Java projection");
+    assert_eq!(parsed.kind.wire_name(), kind);
+    assert!(std::fs::canonicalize(&parsed.root).is_ok());
 
-    let wrong_kind = json!({
+    let project = json!({
         "workspaceId": "ws_0123456789abcdef0123456789abcdef",
         "root": root.to_string_lossy(),
         "displayName": "Project",
         "trust": "trusted",
         "revision": 3,
         "kind": "project",
-        "legacySharedWorkspaceId": null,
     });
-    assert!(
-        validate_workspace_open_by_id_result(&wrong_kind, "ws_0123456789abcdef0123456789abcdef")
-            .is_err()
+    let parsed_project =
+        validate_workspace_open_by_id_result(&project, "ws_0123456789abcdef0123456789abcdef")
+            .expect("registered project projection");
+    assert_eq!(
+        parsed_project.kind,
+        crate::app_runtime::WorkspaceKind::Project
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -320,7 +301,8 @@ fn attachment_result_accepts_uuid_identity_high_precision_time_and_null_binding(
         "state": "draft",
         "createdAt": "2026-09-04T15:31:22.123456789Z",
         "expiresAt": "2026-09-05T15:31:22.987654321Z",
-        "boundMessageId": null
+        "boundMessageId": null,
+        "boundThreadId": null
     });
 
     let metadata = parse_attachment_result(
@@ -355,6 +337,7 @@ fn attachment_result_rejects_unknown_fields() {
         "createdAt": "2026-09-04T15:31:22.123456789Z",
         "expiresAt": "2026-09-05T15:31:22.987654321Z",
         "boundMessageId": null,
+        "boundThreadId": null,
         "boundTurnId": null
     });
 
@@ -377,6 +360,55 @@ fn health_result_is_exact_and_secret_free() {
         ]
     });
     assert!(validate_health_result(&valid).is_ok());
+    let rebuilding = json!({
+        "status": "blocked",
+        "components": [
+            {"name": "sidecar", "status": "healthy"},
+            {"name": "sqlite", "status": "unavailable"},
+            {"name": "kernel", "status": "unavailable"},
+            {"name": "configuration", "status": "healthy"}
+        ],
+        "storageRecovery": {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "phase": "rebuilding",
+            "reason": "INITIALIZATION_FAILED",
+            "historyAvailable": false,
+            "backupAvailable": false,
+            "rebuilt": false
+        }
+    });
+    assert!(validate_health_result(&rebuilding).is_ok());
+    let ready_without_reason = json!({
+        "status": "ready",
+        "components": [
+            {"name": "sidecar", "status": "healthy"},
+            {"name": "sqlite", "status": "healthy"},
+            {"name": "kernel", "status": "healthy"},
+            {"name": "configuration", "status": "healthy"}
+        ],
+        "storageRecovery": {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "phase": "ready",
+            "reason": null,
+            "historyAvailable": false,
+            "backupAvailable": false,
+            "rebuilt": false
+        }
+    });
+    assert!(validate_health_result(&ready_without_reason).is_ok());
+    for (phase, reason) in [
+        ("upgrading", "INITIALIZATION_FAILED"),
+        ("blocked", "SCHEMA_UPGRADE"),
+        ("blocked", "MIGRATION_FAILED"),
+    ] {
+        let mut invalid = rebuilding.clone();
+        invalid["storageRecovery"]["phase"] = json!(phase);
+        invalid["storageRecovery"]["reason"] = json!(reason);
+        assert!(validate_health_result(&invalid).is_err());
+    }
+    let mut blocked_without_reason = rebuilding.clone();
+    blocked_without_reason["storageRecovery"]["reason"] = Value::Null;
+    assert!(validate_health_result(&blocked_without_reason).is_err());
     assert!(
         validate_health_result(&json!({
             "status": "ready",
@@ -439,7 +471,7 @@ fn health_result_is_exact_and_secret_free() {
 #[test]
 fn approval_params_are_business_scoped() {
     let input = ApprovalResponseInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
         approval_id: "appr_demo".to_owned(),
         turn_id: "turn_demo".to_owned(),
         decision: "deny".to_owned(),
@@ -448,10 +480,7 @@ fn approval_params_are_business_scoped() {
     let value = approval_params(&input).expect("approval params");
     assert_eq!(value["approvalId"], "appr_demo");
     assert_eq!(value["expectedThreadRevision"], 3);
-    assert_eq!(
-        value["clientOperationId"],
-        "op_0123456789abcdef0123456789abcdef"
-    );
+    assert_eq!(value["operationKey"], "op_0123456789abcdef0123456789abcdef");
     assert!(value.get("requestId").is_none());
 }
 
@@ -482,6 +511,135 @@ fn context_compaction_errors_map_to_stable_command_failures() {
         assert_eq!(error.code, error_code);
         assert_eq!(error.retryable, expected_retryable);
         assert_ne!(error.message, "private provider detail");
+    }
+}
+
+/// 精确 JA-RPC Busy 元组可携带受 UTF-8 字节约束的公开标题摘要，且 native wire 仍是普通 JSON 字符串。
+#[test]
+fn workspace_busy_rpc_summary_is_projected_and_serialized() {
+    const PREFIX: &str = "暂时无法更改项目目录：";
+    let public_summaries = [
+        format!("{PREFIX}会话「结算」正在执行 Turn。"),
+        format!("{PREFIX}会话「token」有排队输入。"),
+        format!("{PREFIX}会话「C:\\项目\\src\\README.md」有暂停 Plan。"),
+        format!("{PREFIX}会话「0123456789abcdef0123456789abcdef」正在执行 Turn。"),
+    ];
+
+    for summary in public_summaries {
+        // 形状与 RpcFrame JSONL 解码后传给 bridge mapper 的 `error` 对象一致。
+        let rpc_error = json!({
+            "code": -32100,
+            "message": summary,
+            "data": {
+                "errorCode": "WORKSPACE_BUSY",
+                "category": "conflict",
+                "retryable": true,
+                "errorId": "err_0123456789abcdef0123456789abcdef"
+            }
+        });
+
+        let projected = command_error_from_rpc(&rpc_error);
+        assert_eq!(projected.code, "WORKSPACE_BUSY");
+        assert!(projected.retryable);
+        assert_eq!(projected.message.as_ref(), summary);
+        assert_eq!(
+            serde_json::to_value(projected).expect("native error JSON"),
+            json!({"code":"WORKSPACE_BUSY", "message":summary, "retryable":true})
+        );
+    }
+}
+
+/// Bridge 自身也核对完整冻结元组和 512 UTF-8 byte 上限，防止白盒或未来调用绕过生产 decoder。
+#[test]
+fn workspace_busy_rpc_summary_rejects_untrusted_messages() {
+    const PREFIX: &str = "暂时无法更改项目目录：";
+    /// 构造 bridge 所消费的完整 RpcError 投影，避免测试只验证 message 而漏掉 error tuple。
+    fn busy_error(message: &str) -> Value {
+        json!({
+            "code": -32100,
+            "message": message,
+            "data": {
+                "errorCode": "WORKSPACE_BUSY",
+                "category": "conflict",
+                "retryable": true,
+                "errorId": "err_0123456789abcdef0123456789abcdef"
+            }
+        })
+    }
+
+    let mut at_byte_limit = PREFIX.to_owned();
+    while at_byte_limit.len() + "界".len() <= 512 {
+        at_byte_limit.push('界');
+    }
+    while at_byte_limit.len() < 512 {
+        at_byte_limit.push('x');
+    }
+    assert_eq!(at_byte_limit.len(), 512);
+    let projected_at_limit = command_error_from_rpc(&busy_error(&at_byte_limit));
+    assert_eq!(projected_at_limit.message, at_byte_limit);
+
+    let mut over_byte_limit = at_byte_limit.clone();
+    over_byte_limit.push('x');
+    let cases = [
+        (
+            busy_error("private server detail"),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            busy_error("没有固定前缀"),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            busy_error(&over_byte_limit),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            busy_error("暂时无法更改项目目录：第一行\n第二行"),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            json!({
+                "code":-32100,
+                "message":"暂时无法更改项目目录：对话「项目」仍在运行。",
+                "data":{"errorCode":"WORKSPACE_BUSY","category":"unavailable","retryable":true}
+            }),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            json!({
+                "code":-32028,
+                "message":"暂时无法更改项目目录：对话「项目」仍在运行。",
+                "data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":true}
+            }),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            json!({
+                "code":-32100,
+                "message":"暂时无法更改项目目录：对话「项目」仍在运行。",
+                "data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":false}
+            }),
+            "WORKSPACE_BUSY",
+            "workspace has active operations",
+        ),
+        (
+            json!({"code":-32100,"message":"暂时无法更改项目目录：对话仍在运行。","data":{"errorCode":"THREAD_BUSY","category":"conflict","retryable":true}}),
+            "THREAD_BUSY",
+            "thread is busy",
+        ),
+    ];
+
+    for (rpc_error, code, message) in cases {
+        let projected = command_error_from_rpc(&rpc_error);
+        assert_eq!(projected.code, code);
+        assert!(projected.retryable);
+        assert_eq!(projected.message, message);
     }
 }
 
@@ -523,26 +681,31 @@ fn attachment_errors_map_to_stable_retry_semantics() {
     }
 }
 
-/// Goal 错误必须逐项保留冻结的 JA-RPC code/retryable；未知码降级会把 stale approval
-/// 误报成存储故障，并破坏 UI 的冲突恢复动作。
+/// Plan 错误保留冻结的 JA-RPC code/retryable；运行身份不完整时要求先核查现状，避免盲目重跑。
 #[test]
-fn goal_errors_map_to_stable_retry_semantics() {
+fn plan_errors_map_to_stable_retry_semantics() {
     for (error_code, expected_retryable) in [
-        ("GOAL_NOT_FOUND", false),
-        ("GOAL_REVISION_CONFLICT", true),
-        ("GOAL_INVALID_STATE", false),
+        ("PLAN_NOT_FOUND", false),
+        ("PLAN_REVISION_CONFLICT", true),
+        ("PLAN_INVALID_STATE", false),
         ("PLAN_INVALID", false),
         ("PLAN_APPROVAL_STALE", false),
-        ("GOAL_EVIDENCE_INCOMPLETE", false),
-        ("GOAL_RECOVERY_REQUIRED", false),
+        ("PLAN_EVIDENCE_INCOMPLETE", false),
+        ("PLAN_RECOVERY_REQUIRED", false),
     ] {
         let error = command_error_from_rpc(&json!({
-            "message": "private goal persistence detail",
+            "message": "private plan persistence detail",
             "data": {"errorCode": error_code}
         }));
         assert_eq!(error.code, error_code);
         assert_eq!(error.retryable, expected_retryable);
-        assert_ne!(error.message, "private goal persistence detail");
+        assert_ne!(error.message, "private plan persistence detail");
+        if error_code == "PLAN_RECOVERY_REQUIRED" {
+            assert_eq!(
+                error.message,
+                "计划运行身份记录不完整，无法确认控制结果。请核查当前执行状态和已发生的修改；确认原因前不要重新执行。"
+            );
+        }
     }
 }
 
@@ -601,23 +764,22 @@ fn resume_result_parser_is_identity_bound_and_exact() {
     assert!(parse_turn_resume_result("turn_resume_fixture", &extra).is_err());
 }
 
-/// Continue omits synthetic content, while reask binds the replacement to one source USER item;
-/// exact builders prove the Rust client cannot send UI-only branches or hidden execution fields.
+/// 继续操作不接受合成内容；重新询问会将替换内容绑定到一个源 USER 项。精确构造器证明 Rust 客户端无法发送仅 UI 使用的分支或隐藏执行字段。
 #[test]
 fn continue_and_reask_params_match_the_fixed_wire_envelopes() {
     let continue_params = turn_continue_params(&TurnContinueInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
         thread_id: "thr_fixture".to_owned(),
         expected_thread_revision: 7,
     })
     .expect("continue params");
     assert_eq!(
         continue_params,
-        json!({"threadId":"thr_fixture","expectedThreadRevision":7,"clientOperationId":"op_0123456789abcdef0123456789abcdef"})
+        json!({"threadId":"thr_fixture","expectedThreadRevision":7,"operationKey":"op_0123456789abcdef0123456789abcdef"})
     );
 
     let reask_params = turn_reask_params(&TurnReaskInput {
-        client_operation_id: "op_0123456789abcdef0123456789abcdef".to_owned(),
+        operation_key: "op_0123456789abcdef0123456789abcdef".to_owned(),
         thread_id: "thr_fixture".to_owned(),
         expected_thread_revision: 8,
         source_message_id: "item_user_fixture".to_owned(),
@@ -633,12 +795,12 @@ fn continue_and_reask_params_match_the_fixed_wire_envelopes() {
             "expectedThreadRevision":8,
             "sourceMessageId":"item_user_fixture",
             "content":[{"type":"text","text":"replacement"}],
-            "clientOperationId":"op_0123456789abcdef0123456789abcdef"
+            "operationKey":"op_0123456789abcdef0123456789abcdef"
         })
     );
 }
 
-/// `turn_not_reaskable` becomes a stable public error without forwarding provider or repository details.
+/// `turn_not_reaskable` 会映射为稳定的公开错误，不转发 provider 或仓库细节。
 #[test]
 fn reask_eligibility_error_maps_to_a_safe_non_retryable_command_error() {
     let error = command_error_from_rpc(&json!({
@@ -656,7 +818,10 @@ fn input_operation_receipt_rejects_wrong_turn_or_uncommitted_result() {
     let committed = json!({"result":{"status":"committed","method":"turn/input/enqueue",
         "threadId":"thr_demo","result":{"accepted":true,"turnId":"turn_demo",
         "inputId":"input_demo","kind":"steering"}}});
-    assert_eq!(input_operation_receipt_identity(&committed, "turn_demo"), Some(("thr_demo", "input_demo")));
+    assert_eq!(
+        input_operation_receipt_identity(&committed, "turn_demo"),
+        Some(("thr_demo", "input_demo"))
+    );
     assert!(input_operation_receipt_identity(&committed, "turn_other").is_none());
     let mut wrong_method = committed.clone();
     wrong_method["result"]["method"] = json!("turn/start");
@@ -1002,7 +1167,106 @@ fn completion_poison_keeps_worker_completion_unconfirmed() {
     let completion = Completion::new();
     poison_mutex(&completion.lock);
 
+    completion.mark_done();
     assert!(!completion.wait_until(Instant::now()));
+}
+
+/// 设计原因：Completion 的通知必须在线性化条件锁内发布，避免 waiter 丢失最后一次唤醒。
+/// 持锁期间验证 worker 不能越过条件检查发布，解锁后仍按原绝对 deadline 等待。
+#[test]
+fn completion_publication_waits_for_condition_lock() {
+    let completion = Arc::new(Completion::new());
+    assert!(!completion.wait_until(Instant::now()));
+
+    let guard = completion.lock.lock().expect("healthy completion lock");
+    let (started, started_receiver) = std::sync::mpsc::channel();
+    let (published, published_receiver) = std::sync::mpsc::channel();
+    let worker_completion = Arc::clone(&completion);
+    let worker = std::thread::spawn(move || {
+        started.send(()).expect("test receiver remains open");
+        worker_completion.mark_done();
+        published.send(()).expect("test receiver remains open");
+    });
+
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion worker started");
+    let published_while_locked = published_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    drop(guard);
+
+    if !published_while_locked {
+        published_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion publishes after condition lock is released");
+    }
+    worker.join().expect("completion worker joins");
+
+    assert!(!published_while_locked);
+    assert!(completion.wait_until(Instant::now()));
+}
+
+/// 设计原因：EventDrain 超时属于可重试 cleanup debt，Runtime/quarantine 必须继续持有唯一 join handle。
+/// 通过 channel 固定 worker 清标记、finish 超时、worker 完成和二次成功 join 的顺序。
+#[test]
+fn event_drain_timeout_retains_owner_and_clears_only_after_successful_join() {
+    let generation = 23;
+    let detached_event_generation = Arc::new(AtomicU64::new(generation));
+    let completion = Arc::new(Completion::new());
+    let worker_marker = Arc::clone(&detached_event_generation);
+    let worker_completion = Arc::clone(&completion);
+    let (cleared, cleared_receiver) = std::sync::mpsc::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        worker_marker
+            .compare_exchange(
+                generation,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .expect("worker clears its own generation");
+        cleared.send(()).expect("test receiver remains open");
+        release_receiver
+            .recv()
+            .expect("test releases completion worker");
+        worker_completion.mark_done();
+    });
+    let (cancel, _cancel_receiver) = std::sync::mpsc::sync_channel(1);
+    let mut drain = EventDrain {
+        cancel,
+        completion,
+        generation,
+        detached_event_generation: Arc::clone(&detached_event_generation),
+        join: Some(join),
+    };
+
+    cleared_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker cleared its generation before exit publication");
+    assert_eq!(detached_event_generation.load(Ordering::Acquire), 0);
+    let timeout = drain
+        .finish(Instant::now())
+        .expect_err("expired first attempt must report its original timeout");
+    assert_eq!(timeout.code, "RUNTIME_SHUTDOWN_TIMEOUT");
+    assert_eq!(
+        detached_event_generation.load(Ordering::Acquire),
+        generation
+    );
+    assert!(
+        drain.join.is_some(),
+        "runtime owner retains the worker handle"
+    );
+
+    release
+        .send(())
+        .expect("worker is still owned by EventDrain");
+    drain
+        .finish(Instant::now() + Duration::from_secs(1))
+        .expect("retry joins the completed worker");
+    assert_eq!(detached_event_generation.load(Ordering::Acquire), 0);
+    assert!(drain.join.is_none());
 }
 
 /// exit attempt 锁中毒表示 deadline 或编号可能只提交了一半；控制器必须立即取消准入并

@@ -1,0 +1,16 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# 阿里巴巴 Java 格式基线；record 布局遵循 Ja 的明确约定。
+[*.java]
+charset = utf-8
+indent_style = space
+indent_size = 4
+end_of_line = lf
+insert_final_newline = true
+max_line_length = 120
+ij_java_continuation_indent_size = 4
+ij_java_record_components_wrap = split_into_lines
+ij_java_align_multiline_records = true
+ij_java_new_line_after_lparen_in_record_header = false
+ij_java_rparen_on_new_line_in_record_header = false

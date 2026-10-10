@@ -15,6 +15,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactElement,
 } from "react";
+import { SharedMarkdown, type MarkdownFileTarget } from "@/shared/ui/markdown/SharedMarkdown";
 import {
   EmptyState,
   IconButton,
@@ -95,10 +96,14 @@ export function FilesWorkspace({
   viewModel,
   actions,
   onAddToConversation,
+  onOpenMarkdownFile,
+  onOpenMarkdownLink,
+  onCopyText,
 }: FilesWorkspaceViewProps): ReactElement {
   const {
     nodes,
     selectedPath,
+    directoryReveal,
     treeLoading,
     treeError,
     searchQuery,
@@ -122,6 +127,7 @@ export function FilesWorkspace({
   } = viewModel;
   const editorTabsRef = useRef<HTMLDivElement>(null);
   const [tabContextMenu, setTabContextMenu] = useState<FileTabContextMenuSession | undefined>();
+  const [markdownPreviewPath, setMarkdownPreviewPath] = useState<string>();
   const tabContextMenuRef = useRef<FileTabContextMenuSession | undefined>(undefined);
   const tabContextMenuSequenceRef = useRef(0);
   const latestTabContextStateRef = useRef({
@@ -158,6 +164,23 @@ export function FilesWorkspace({
   ]);
   const openPathsKey = openPaths.join("\u0000");
   const fileCount = loadedFileCount(nodes);
+  const activeMarkdownDocument =
+    activeDocument !== undefined && /\.(?:md|markdown|mdx)$/iu.test(activeDocument.path);
+  const showMarkdownPreview =
+    activeMarkdownDocument && markdownPreviewPath === activeDocument?.path;
+
+  /** 路径菜单和源码 renderer 使用相同 typed target，保留行列且不构造 file:// URL。 */
+  const openMarkdownTarget = useCallback(
+    (target: MarkdownFileTarget, source: HTMLElement, mode?: "explorer" | "browser"): void => {
+      if (onOpenMarkdownFile === undefined) return;
+      const opening =
+        mode === undefined
+          ? onOpenMarkdownFile(target, source)
+          : onOpenMarkdownFile(target, source, mode);
+      void Promise.resolve(opening).catch(() => source.focus());
+    },
+    [onOpenMarkdownFile],
+  );
 
   /** 关闭后优先回到原控件；标签已移除时落到同标签或最近的剩余标签。 */
   const restoreFileTabFocus = useCallback((path: string, trigger?: HTMLElement): void => {
@@ -334,6 +357,7 @@ export function FilesWorkspace({
               <FileTree
                 nodes={nodes}
                 selectedPath={selectedPath}
+                revealRequest={directoryReveal}
                 loading={treeLoading}
                 error={treeError}
                 onSelect={actions.selectNode}
@@ -425,6 +449,28 @@ export function FilesWorkspace({
                     <span>{statusLabel(activeDocument)}</span>
                     <span>{activeDocument.encoding}</span>
                     <span>{activeDocument.newline.toUpperCase()}</span>
+                    {activeMarkdownDocument && comparePath !== activeDocument.path ? (
+                      <div
+                        className="ja-files-markdown-mode"
+                        role="group"
+                        aria-label="Markdown 显示方式"
+                      >
+                        <button
+                          type="button"
+                          aria-pressed={!showMarkdownPreview}
+                          onClick={() => setMarkdownPreviewPath(undefined)}
+                        >
+                          源码
+                        </button>
+                        <button
+                          type="button"
+                          aria-pressed={showMarkdownPreview}
+                          onClick={() => setMarkdownPreviewPath(activeDocument.path)}
+                        >
+                          阅读预览
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                   {activeDocument.status === "conflict" ? (
                     <div className="ja-files-conflict" role="alert">
@@ -499,24 +545,46 @@ export function FilesWorkspace({
                       </Suspense>
                     </div>
                   ) : (
-                    <Suspense
-                      fallback={
-                        <LoadingState className="ja-feature-state" label="正在加载编辑器…" />
-                      }
-                    >
-                      <CodeEditor
-                        filePath={activeDocument.path}
-                        content={activeDocument.content}
-                        revision={revisionKey(activeDocument.revision)}
-                        readOnly={
-                          activeDocument.readOnly || lifecycleClosing || mutationRecoveryRequired
-                        }
-                        reveal={activeDocument.reveal}
-                        onChange={(content) => actions.editDocument(activeDocument.path, content)}
-                        onSave={() => actions.saveDocument(activeDocument.path)}
-                        onBlur={() => actions.saveDocument(activeDocument.path)}
-                      />
-                    </Suspense>
+                    <>
+                      <div className="ja-files-markdown-source" hidden={showMarkdownPreview}>
+                        <Suspense
+                          fallback={
+                            <LoadingState className="ja-feature-state" label="正在加载编辑器…" />
+                          }
+                        >
+                          <CodeEditor
+                            filePath={activeDocument.path}
+                            content={activeDocument.content}
+                            revision={revisionKey(activeDocument.revision)}
+                            readOnly={
+                              activeDocument.readOnly ||
+                              lifecycleClosing ||
+                              mutationRecoveryRequired
+                            }
+                            reveal={activeDocument.reveal}
+                            onChange={(content) =>
+                              actions.editDocument(activeDocument.path, content)
+                            }
+                            onSave={() => actions.saveDocument(activeDocument.path)}
+                            onBlur={() => actions.saveDocument(activeDocument.path)}
+                          />
+                        </Suspense>
+                      </div>
+                      {showMarkdownPreview ? (
+                        <div
+                          className="ja-files-markdown-preview"
+                          data-markdown-path={activeDocument.path}
+                        >
+                          <SharedMarkdown
+                            content={activeDocument.content}
+                            basePath={activeDocument.path}
+                            onOpenFile={openMarkdownTarget}
+                            onOpenLink={onOpenMarkdownLink}
+                            onCopyText={onCopyText}
+                          />
+                        </div>
+                      ) : null}
+                    </>
                   )}
                 </div>
               )}

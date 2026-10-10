@@ -35,6 +35,7 @@ interface ManagedPreviewPage {
   snapshot: PreviewSessionSnapshot;
   error?: string;
   navigationIntent: number;
+  navigationBaseGeneration?: number;
   failedNavigationIntent?: number;
 }
 
@@ -105,6 +106,11 @@ function mergePreviewSnapshot(
   return { ...next, load_status: current.load_status };
 }
 
+/** 终态事实未越过当前导航起点时，仍属于旧页面，不能结束新 intent。 */
+function isPreNavigationGeneration(page: ManagedPreviewPage, generation: number): boolean {
+  return page.navigationBaseGeneration !== undefined && generation <= page.navigationBaseGeneration;
+}
+
 /** 比较完整矩形，让重复的 ResizeObserver 通知不重排原生 child WebView。 */
 function previewViewportEquals(left: PreviewViewport | undefined, right: PreviewViewport): boolean {
   return (
@@ -166,7 +172,6 @@ export function usePreviewLifecycleController(
   const viewportRef = useRef<PreviewViewport | undefined>(undefined);
   const pendingLayoutsRef = useRef(new Map<string, PendingPreviewLayout>());
   const lastRequestedLayoutRef = useRef(new Map<string, PreviewViewport>());
-  const lastAppliedLayoutRef = useRef(new Map<string, PreviewViewport>());
   const layoutTaskRef = useRef<Promise<void> | undefined>(undefined);
   const cleanupTaskRef = useRef<Promise<void> | undefined>(undefined);
   const pendingOpensRef = useRef(new Set<PendingPreviewOpen>());
@@ -230,7 +235,7 @@ export function usePreviewLifecycleController(
     [clearLoadDeadline, updatePage],
   );
 
-  /** 页面启动新的用户导航时先投影 loading，再设置每页独立的失败预算。 */
+  /** 固定 native generation 起点，使同代际旧终态不能收掉新导航的 loading 与 deadline。 */
   const beginPageNavigation = useCallback(
     (pageId: string): number | undefined => {
       const current = pagesRef.current.get(pageId);
@@ -239,6 +244,7 @@ export function usePreviewLifecycleController(
       updatePage(pageId, (page) => ({
         ...page,
         navigationIntent,
+        navigationBaseGeneration: current.snapshot.generation,
         failedNavigationIntent: undefined,
         error: undefined,
         snapshot: { ...page.snapshot, load_status: "loading" },
@@ -257,7 +263,7 @@ export function usePreviewLifecycleController(
     [clearLoadDeadline],
   );
 
-  /** 排空全局原生布局队列；每个 session 只保留最新 viewport，任何时候都不并发 show。 */
+  /** 串行排空每页最新 viewport；ACK 不覆盖最新请求，避免迟到的 hide 吞掉后续 show。 */
   const drainPendingLayouts = useCallback((): void => {
     if (layoutTaskRef.current !== undefined) return;
     const task = (async (): Promise<void> => {
@@ -270,7 +276,6 @@ export function usePreviewLifecycleController(
         pendingLayoutsRef.current.delete(pageId);
         try {
           await adapter.layout(pending.sessionId, pending.viewport);
-          lastAppliedLayoutRef.current.set(pageId, pending.viewport);
         } catch {
           const hasNewerRequest = pendingLayoutsRef.current.has(pageId);
           if (!hasNewerRequest) lastRequestedLayoutRef.current.delete(pageId);
@@ -289,7 +294,7 @@ export function usePreviewLifecycleController(
     layoutTaskRef.current = task;
   }, [adapter, updatePage]);
 
-  /** 布局请求按 page ID 去重；inactive WebView 收到 false 后保持隐藏直至再次选中。 */
+  /** 只按最新意图去重；已应用矩形可能正被在途请求替换，不能据此跳过新的显示意图。 */
   const requestLayout = useCallback(
     (
       pageId: string,
@@ -299,13 +304,6 @@ export function usePreviewLifecycleController(
       if (!pagesRef.current.has(pageId) || generation !== projectGenerationRef.current) return;
       const previousRequest = lastRequestedLayoutRef.current.get(pageId);
       if (previewViewportEquals(previousRequest, viewport)) return;
-      if (
-        !pendingLayoutsRef.current.has(pageId) &&
-        previewViewportEquals(lastAppliedLayoutRef.current.get(pageId), viewport)
-      ) {
-        lastRequestedLayoutRef.current.set(pageId, viewport);
-        return;
-      }
       lastRequestedLayoutRef.current.set(pageId, viewport);
       pendingLayoutsRef.current.set(pageId, {
         projectGeneration: generation,
@@ -317,12 +315,18 @@ export function usePreviewLifecycleController(
     [drainPendingLayouts],
   );
 
-  /** 原生快照只能更新现存或刚 ACK 的 page，陈旧 workspace/session generation 会被丢弃。 */
+  /** 原生快照只能更新现存 page；旧代际终态不能结束新 intent，陈旧 workspace 仍按原代际丢弃。 */
   const commitSnapshot = useCallback(
     (next: PreviewSessionSnapshot, generation: number): boolean => {
       if (projectGenerationRef.current !== generation) return false;
       const current = pagesRef.current.get(next.id);
       if (current === undefined || next.generation < current.snapshot.generation) return false;
+      if (
+        next.status === "open" &&
+        (next.load_status === "finished" || next.load_status === "failed") &&
+        isPreNavigationGeneration(current, next.generation)
+      )
+        return false;
       const snapshot = mergePreviewSnapshot(current.snapshot, next);
       let error = current.error;
       let failedNavigationIntent = current.failedNavigationIntent;
@@ -352,7 +356,7 @@ export function usePreviewLifecycleController(
     [finishPageNavigation, publishPages],
   );
 
-  /** 对单页事件按 sequence 单调应用；打开 ACK 前的少量事件先进入有界缓冲。 */
+  /** 单页事件按 sequence 应用；旧 navigation 起点的 load terminal 不得完成当前 intent。 */
   const applyEvent = useCallback(
     (event: PreviewEvent, generation: number): void => {
       if (projectGenerationRef.current !== generation) return;
@@ -378,6 +382,11 @@ export function usePreviewLifecycleController(
       const previousSequence = eventCursorRef.current.get(event.session_id);
       if (previousSequence !== undefined && event.sequence <= previousSequence) return;
       eventCursorRef.current.set(event.session_id, event.sequence);
+      if (
+        (event.kind.type === "load_failed" || event.kind.type === "load_finished") &&
+        isPreNavigationGeneration(current, event.generation)
+      )
+        return;
       const base =
         event.generation === current.snapshot.generation
           ? current.snapshot
@@ -573,7 +582,6 @@ export function usePreviewLifecycleController(
           clearLoadDeadline(pageId);
           pendingLayoutsRef.current.delete(pageId);
           lastRequestedLayoutRef.current.delete(pageId);
-          lastAppliedLayoutRef.current.delete(pageId);
           if (workspaceId !== undefined) sessionHints.forget(workspaceId, pageId);
           publishPages();
           if (wasActive) {
@@ -669,9 +677,8 @@ export function usePreviewLifecycleController(
           if (currentViewport?.visible === true) {
             requestLayout(result.snapshot.id, currentViewport, generation);
           } else {
-            // Native open contract guarantees hidden children start native_visible=false.
+            // 原生打开契约保证隐藏子窗口以 native_visible=false 启动。
             lastRequestedLayoutRef.current.set(result.snapshot.id, creationViewport);
-            lastAppliedLayoutRef.current.set(result.snapshot.id, creationViewport);
           }
           setGlobalError(undefined);
           if (result.snapshot.load_status === "loading")
@@ -735,11 +742,11 @@ export function usePreviewLifecycleController(
         (target.column !== undefined && (!Number.isSafeInteger(target.column) || target.column < 1))
       )
         return Promise.reject(new Error("文件路径无效。"));
-      return createPage((viewport) => adapter.openFile(path, workspaceId, viewport)).catch(
-        (error: unknown) => {
-          throw new Error(safePreviewError(error, PREVIEW_OPEN_ERROR));
-        },
-      );
+      return createPage((viewport) =>
+        adapter.openFile(path, workspaceId, viewport, target.previewMode ?? "browser"),
+      ).catch((error: unknown) => {
+        throw new Error(safePreviewError(error, PREVIEW_OPEN_ERROR));
+      });
     },
     [adapter, createPage, workspaceId],
   );
@@ -750,9 +757,16 @@ export function usePreviewLifecycleController(
     [adapter, createPage],
   );
 
-  /** 在当前 page 内导航时保留原生历史；没有选中页才创建一个新的原生页面。 */
+  /**
+   * 同页导航保留原生历史。命令失败可能发生在 native generation 推进前后，因此按
+   * workspace/page/intent 读取并提交权威状态，同时让同一意图的迟到 finished 保留诊断。
+   */
   const navigateExisting = useCallback(
-    (target: { kind: "url"; url: string } | { kind: "file"; path: string }): void => {
+    (
+      target:
+        | { kind: "url"; url: string }
+        | { kind: "file"; path: string; previewMode?: "editor" | "browser" },
+    ): void => {
       if (workspaceId === undefined || cleanupTaskRef.current !== undefined) {
         setGlobalError("当前没有可用的工作区浏览器。");
         return;
@@ -784,6 +798,7 @@ export function usePreviewLifecycleController(
                   current.snapshot.generation,
                   target.path,
                   workspaceId,
+                  target.previewMode ?? "browser",
                 );
           const latest = pagesRef.current.get(pageId);
           if (
@@ -797,14 +812,36 @@ export function usePreviewLifecycleController(
           commitSnapshot(next, generation);
           await reconcileSession(pageId, generation, next.generation);
         } catch (error) {
+          const current = pagesRef.current.get(pageId);
           if (
-            projectGenerationRef.current === generation &&
-            pagesRef.current.get(pageId)?.navigationIntent === navigationIntent
-          ) {
-            const message = safePreviewError(error, PREVIEW_LOAD_ERROR);
-            updatePage(pageId, (page) => ({ ...page, error: message }));
-            finishPageNavigation(pageId);
+            projectGenerationRef.current !== generation ||
+            current?.navigationIntent !== navigationIntent
+          )
+            return;
+          const message = safePreviewError(error, PREVIEW_LOAD_ERROR);
+          updatePage(pageId, (page) =>
+            page.navigationIntent === navigationIntent
+              ? { ...page, error: message, failedNavigationIntent: navigationIntent }
+              : page,
+          );
+          finishPageNavigation(pageId);
+
+          let authoritative: PreviewSessionSnapshot;
+          try {
+            authoritative = await adapter.state(pageId);
+          } catch {
+            return;
           }
+          const latest = pagesRef.current.get(pageId);
+          if (
+            projectGenerationRef.current !== generation ||
+            latest === undefined ||
+            latest.navigationIntent !== navigationIntent ||
+            authoritative.id !== pageId ||
+            authoritative.generation < latest.snapshot.generation
+          )
+            return;
+          commitSnapshot(authoritative, generation);
         }
       })();
       void operation;
@@ -958,7 +995,7 @@ export function usePreviewLifecycleController(
     void recoverPending(projectGenerationRef.current).catch(() => undefined);
   }, [recoverPending]);
 
-  /** workspace identity 改变时先废弃旧 continuation，再恢复该 workspace 的 page ID 列表。 */
+  /** 恢复先隐藏旧页面，ACK 后用最新 DOM 几何显示选中页，不依赖额外 resize 才完成恢复。 */
   useEffect(() => {
     const generation = ++projectGenerationRef.current;
     navigationIntentRef.current += 1;
@@ -967,7 +1004,6 @@ export function usePreviewLifecycleController(
     viewportRef.current = undefined;
     pendingLayoutsRef.current.clear();
     lastRequestedLayoutRef.current.clear();
-    lastAppliedLayoutRef.current.clear();
     earlyEventsRef.current = [];
     eventCursorRef.current.clear();
     for (const timer of loadTimersRef.current.values()) clearTimeout(timer);
@@ -1022,6 +1058,13 @@ export function usePreviewLifecycleController(
         activePageIdRef.current = latestPageId;
         setActivePageId(latestPageId);
         if (latestPageId !== undefined) {
+          requestLayout(
+            latestPageId,
+            viewportRef.current?.visible === true
+              ? viewportRef.current
+              : hiddenViewport(viewportRef.current),
+            generation,
+          );
           const activeSnapshot = validPages.find((snapshot) => snapshot.id === latestPageId);
           if (activeSnapshot !== undefined)
             await reconcileSession(latestPageId, generation, activeSnapshot.generation);
@@ -1037,7 +1080,15 @@ export function usePreviewLifecycleController(
         if (opening.projectGeneration === generation) opening.cancelRequested = true;
       if (projectGenerationRef.current === generation) projectGenerationRef.current += 1;
     };
-  }, [adapter, publishPages, reconcileSession, recoverPending, sessionHints, workspaceId]);
+  }, [
+    adapter,
+    publishPages,
+    reconcileSession,
+    recoverPending,
+    requestLayout,
+    sessionHints,
+    workspaceId,
+  ]);
 
   /** 每个 workspace 只保留一份原生事件订阅，迟到 handle 在注册后立即释放。 */
   useEffect(() => {
@@ -1107,7 +1158,7 @@ export function usePreviewLifecycleController(
     workspaceId,
   ]);
 
-  /** 卸载时释放每页 renderer timer；native sessions 的关闭由 ACK-first workspace owner 管理。 */
+  /** 卸载时释放每页的渲染层定时器；原生会话由先确认再关闭的工作区所属者统一管理。 */
   useEffect(
     () => () => {
       for (const timer of loadTimersRef.current.values()) clearTimeout(timer);

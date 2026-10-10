@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","id":"c:close-rejected","method":"runtime/client/close","params":{"timeoutMs":1000}}
+{"jsonrpc":"2.0","id":"c:close-rejected","result":{"accepted":false}}
+{"jsonrpc":"2.0","id":"c:close-extra","method":"runtime/client/close","params":{"timeoutMs":1000}}
+{"jsonrpc":"2.0","id":"c:close-extra","result":{"accepted":true,"status":"stopped"}}
+{"jsonrpc":"2.0","id":"c:close-other-owner","method":"runtime/client/close","params":{"timeoutMs":1000}}
+{"jsonrpc":"2.0","id":"c:close-other-owner","result":{"accepted":true,"clientLifetimeId":"native_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}

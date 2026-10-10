@@ -21,6 +21,44 @@ export async function exportPublicText(
   text: string,
   suggestedName: string,
 ): Promise<"saved" | "cancelled" | "unsupported"> {
+  return exportTextFile(text, suggestedName, "纯文本", "text/plain", ".txt");
+}
+
+/** 明确用户选择后以 Markdown 类型打开原生保存面板，文件路径不会回到 React 或 IPC。 */
+export async function exportPublicMarkdown(
+  markdown: string,
+  suggestedName: string,
+): Promise<"saved" | "cancelled" | "unsupported"> {
+  return exportTextFile(markdown, suggestedName, "Markdown", "text/markdown", ".md");
+}
+
+/** WebView2 没有原生保存面板时使用受浏览器管理的下载目录，避免导出入口无实际结果。 */
+export function downloadPublicMarkdown(markdown: string, suggestedName: string): "downloaded" {
+  const objectUrl = URL.createObjectURL(
+    new Blob([markdown], { type: "text/markdown;charset=utf-8" }),
+  );
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = suggestedName;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  try {
+    anchor.click();
+  } finally {
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+  }
+  return "downloaded";
+}
+
+/** 只在用户明确点击时使用浏览器原生保存面板；取消是正常结果，路径不进入 Ja 状态或 IPC。 */
+async function exportTextFile(
+  text: string,
+  suggestedName: string,
+  description: string,
+  mimeType: string,
+  extension: string,
+): Promise<"saved" | "cancelled" | "unsupported"> {
   const picker = (window as Window & { showSaveFilePicker?: SaveTextFilePicker })
     .showSaveFilePicker;
   if (picker === undefined) return "unsupported";
@@ -28,7 +66,7 @@ export async function exportPublicText(
   try {
     file = await picker.call(window, {
       suggestedName,
-      types: [{ description: "纯文本", accept: { "text/plain": [".txt"] } }],
+      types: [{ description, accept: { [mimeType]: [extension] } }],
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return "cancelled";

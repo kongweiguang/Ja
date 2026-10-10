@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useMemo, useRef, type ReactElement } from "react";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   shouldAdjustTimelineScrollPosition,
   TimelineScrollCache,
@@ -27,12 +27,14 @@ function ScrollHarness({
   latestOffset = 900,
   revision = threadId,
   rowStartOffset = 0,
+  onScrollToLatest,
 }: {
   cache: TimelineScrollCache;
   threadId: string;
   latestOffset?: number;
   revision?: string;
   rowStartOffset?: number;
+  onScrollToLatest?: () => void;
 }): ReactElement {
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useMemo<UseTimelineScrollOptions["virtualizer"]>(
@@ -56,6 +58,7 @@ function ScrollHarness({
     [rowStartOffset],
   );
   const scrollToLatest = (): void => {
+    onScrollToLatest?.();
     if (scrollRef.current !== null) scrollRef.current.scrollTop = latestOffset;
   };
   const { followingLatest } = useTimelineScroll({
@@ -73,7 +76,10 @@ function ScrollHarness({
 }
 
 describe("TimelineScrollCache", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
 
   /** 快照上限必须固定，避免频繁切换 Thread 将 renderer 内存变成隐藏的历史缓存。 */
   it("keeps only a bounded session-local LRU window", () => {
@@ -169,6 +175,84 @@ describe("TimelineScrollCache", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 40));
     expect(scroll).toHaveProperty("scrollTop", 40);
+  });
+
+  /** 已派发的流式滚动帧即使无法取消，也必须尊重 Wheel 刚写入的 following ref。 */
+  it("does not follow a queued stream frame after the user wheels upward", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+
+    const cache = new TimelineScrollCache();
+    const { container, rerender } = render(
+      <ScrollHarness cache={cache} threadId="thread:scroll" revision="initial" />,
+    );
+    const scroll = container.firstElementChild;
+    expect(scroll).not.toBeNull();
+    if (scroll === null) return;
+    Object.defineProperties(scroll, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 1_000 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+    act(() => frames.shift()?.(0));
+
+    rerender(<ScrollHarness cache={cache} threadId="thread:scroll" revision="stream" />);
+    const queuedStreamFrame = frames.shift();
+    expect(queuedStreamFrame).toBeTypeOf("function");
+    scroll.scrollTop = 40;
+    fireEvent.wheel(scroll, { deltaY: -20 });
+
+    act(() => queuedStreamFrame?.(1));
+    expect(scroll).toHaveProperty("scrollTop", 40);
+  });
+
+  /** Thread 切换后旧帧不能把新会话的 viewport 位置覆盖成来源会话的尾部。 */
+  it("ignores a queued stream frame after the active thread changes", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => undefined);
+
+    const cache = new TimelineScrollCache();
+    const onScrollToLatest = vi.fn();
+    const { rerender } = render(
+      <ScrollHarness
+        cache={cache}
+        threadId="thread:source"
+        revision="initial"
+        onScrollToLatest={onScrollToLatest}
+      />,
+    );
+    act(() => frames.shift()?.(0));
+    rerender(
+      <ScrollHarness
+        cache={cache}
+        threadId="thread:source"
+        revision="stream"
+        onScrollToLatest={onScrollToLatest}
+      />,
+    );
+    const queuedStreamFrame = frames.shift();
+    expect(queuedStreamFrame).toBeTypeOf("function");
+
+    rerender(
+      <ScrollHarness
+        cache={cache}
+        threadId="thread:target"
+        revision="target"
+        onScrollToLatest={onScrollToLatest}
+      />,
+    );
+    const callsAfterThreadSwitch = onScrollToLatest.mock.calls.length;
+    act(() => queuedStreamFrame?.(1));
+
+    expect(onScrollToLatest).toHaveBeenCalledTimes(callsAfterThreadSwitch);
   });
 
   /** 跟随尾部的会话切回后要追到新消息尾部，旧 offset 只适用于手动上滚的快照。 */

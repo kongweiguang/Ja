@@ -4,7 +4,11 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { WorkStepAdapter } from "@/features/conversation/domain/timelineTypes";
+import type {
+  TimelineApproval,
+  WorkStepAdapter,
+} from "@/features/conversation/domain/timelineTypes";
+import type { ConversationProcessPort } from "@/features/conversation/application/processSessionTypes";
 import { WorkProcess } from "@/features/conversation/ui/timeline/WorkProcess";
 import { TimelineDisclosureCache } from "@/features/conversation/ui/timeline/timelineDisclosure";
 
@@ -13,6 +17,7 @@ const turnId = "turn_tool_presentation";
 /** 构造最小真实 Tool Item，让断言覆盖 WorkProcess 到 ToolStepDetails 的完整渲染链。 */
 function toolStep(overrides: Partial<WorkStepAdapter> = {}): WorkStepAdapter {
   return {
+    origin: "native" as const,
     itemId: "item_tool_presentation",
     threadId: "thr_tool_presentation",
     turnId,
@@ -64,23 +69,104 @@ function recoveryToolStep(callId = "call_recovery"): WorkStepAdapter {
 describe("ToolStepDetails", () => {
   afterEach(() => cleanup());
 
-  /** 未知 MCP 的失败详情默认收起，但用户展开后仍能查看脱敏诊断正文。 */
-  it("显示动作、真实 Tool 名称和首个目标并按需查看失败详情", () => {
+  /** 失败原因直接可见，用户仍可从唯一紧凑入口手动收起诊断。 */
+  it("显示动作、真实 Tool 名称和首个目标并自动展示失败详情", () => {
     render(<WorkProcess steps={[toolStep()]} />);
 
     const trigger = screen.getByRole("button", { name: /调用工具，custom_mcp/u });
     expect(trigger).toBeVisible();
-    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(trigger).toHaveTextContent("调用工具");
     expect(trigger).toHaveTextContent('{"query":""}');
     expect(trigger.closest(".ja-tool-details")).toHaveAttribute("data-status", "error");
-    fireEvent.click(trigger);
     expect(screen.getByText("query 不能为空")).toBeVisible();
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("调用工具 .")).not.toBeInTheDocument();
   });
 
-  /** 失败的 shell 命令仍沿用普通命令的紧凑入口，用户需要时再手动查看诊断输出。 */
-  it("失败的 shell 命令保持收起", () => {
+  /** 不把未校验参数当目标；无安全输入目标时用真实 MCP 名称指认失败项一次。 */
+  it("未提供已验证目标的 MCP 失败行以真实工具名作为唯一目标", () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    const unavailableToolName = "unknown_tool";
+    const withoutMcpFallback: WorkStepAdapter = {
+      ...base,
+      itemId: "item_read_without_target",
+      metadata: {
+        ...base.metadata,
+        callId: "call_read_without_target",
+        toolName: "read",
+        presentation: {
+          ...presentation,
+          kind: "read",
+          inputPreview: undefined,
+          outputPreview: "读取失败。",
+        },
+      },
+    };
+    const blankMcpInput: WorkStepAdapter = {
+      ...base,
+      itemId: "item_blank_mcp_input",
+      metadata: {
+        ...base.metadata,
+        callId: "call_blank_mcp_input",
+        toolName: "blank_input_tool",
+        presentation: {
+          ...presentation,
+          inputPreview: " \t ",
+          outputPreview: "参数预览为空白。",
+        },
+      },
+    };
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...base,
+            metadata: {
+              ...base.metadata,
+              toolName: unavailableToolName,
+              presentation: {
+                ...presentation,
+                inputPreview: undefined,
+                outputPreview: "此工具当前不可用，未执行。",
+              },
+            },
+          },
+          blankMcpInput,
+          withoutMcpFallback,
+        ]}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", {
+      name: "调用工具，unknown_tool，失败",
+    });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(trigger).toHaveTextContent("unknown_tool");
+    expect(trigger.textContent?.match(/unknown_tool/gu)).toHaveLength(1);
+    expect(screen.getByText("此工具当前不可用，未执行。")).toBeVisible();
+    expect(screen.queryByText("等待参数校验")).not.toBeInTheDocument();
+    expect(
+      trigger.closest(".ja-tool-details")?.querySelector(".ja-tool-details__input"),
+    ).toBeNull();
+
+    const blankInputTrigger = screen.getByRole("button", {
+      name: "调用工具，blank_input_tool，失败",
+    });
+    expect(
+      blankInputTrigger.closest(".ja-tool-details")?.querySelector(".ja-tool-details__input"),
+    ).toBeNull();
+
+    const readTrigger = screen.getByRole("button", { name: "读取，read，失败" });
+    expect(readTrigger).not.toHaveTextContent("read");
+    expect(readTrigger).toHaveAttribute("aria-expanded", "true");
+  });
+
+  /** Shell 失败与其他 Tool 采用同一诊断策略，不额外增加错误入口。 */
+  it("失败的 shell 命令自动展开诊断", () => {
     const base = toolStep();
     const presentation = base.metadata?.presentation;
     if (presentation === undefined) throw new Error("test fixture presentation is missing");
@@ -108,7 +194,299 @@ describe("ToolStepDetails", () => {
     );
 
     const trigger = screen.getByRole("button", { name: /执行命令，shell，pnpm test，失败/u });
-    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/command failed/u)).toBeVisible();
+  });
+
+  /** 已绑定持续会话时实时输出取代 ToolResult 正文，保持命令结果只出现一次。 */
+  it("does not duplicate static shell output beside the live process output", async () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    const port: ConversationProcessPort = {
+      list: vi.fn().mockResolvedValue({
+        generation: 4,
+        sessions: [
+          {
+            workspaceId: "ws_project",
+            threadId: base.threadId,
+            generation: 3,
+            sessionId: "proc_0123456789abcdef0123456789abcdef",
+            startedTurnId: base.turnId,
+            startedCallId: "call_custom_mcp",
+            state: "running",
+            outputSequence: 5,
+            outputTruncated: false,
+            exitCode: null,
+          },
+        ],
+      }),
+      read: vi.fn().mockResolvedValue({
+        workspaceId: "ws_project",
+        threadId: base.threadId,
+        generation: 3,
+        sessionId: "proc_0123456789abcdef0123456789abcdef",
+        startedTurnId: base.turnId,
+        startedCallId: "call_custom_mcp",
+        state: "running",
+        outputSequence: 5,
+        outputTruncated: false,
+        exitCode: null,
+        output: "实时命令输出",
+        nextSequence: 5,
+      }),
+      write: vi.fn().mockImplementation(async (input) => ({
+        workspaceId: input.workspaceId,
+        threadId: input.threadId,
+        generation: 3,
+        sessionId: "proc_0123456789abcdef0123456789abcdef",
+        startedTurnId: base.turnId,
+        startedCallId: "call_custom_mcp",
+        state: "running" as const,
+        outputSequence: 5,
+        outputTruncated: false,
+        exitCode: null,
+        output: "实时命令输出",
+        nextSequence: 5,
+      })),
+      stop: vi.fn().mockImplementation(async (input) => ({
+        workspaceId: input.workspaceId,
+        threadId: input.threadId,
+        generation: 3,
+        sessionId: "proc_0123456789abcdef0123456789abcdef",
+        startedTurnId: base.turnId,
+        startedCallId: "call_custom_mcp",
+        state: "exited" as const,
+        outputSequence: 5,
+        outputTruncated: false,
+        exitCode: 0,
+        output: "实时命令输出",
+        nextSequence: 5,
+      })),
+    };
+    const { container } = render(
+      <WorkProcess
+        steps={[
+          {
+            ...base,
+            status: "completed",
+            metadata: {
+              ...base.metadata,
+              toolName: "exec_command",
+              presentation: {
+                ...presentation,
+                kind: "shell",
+                status: "success",
+                title: "执行命令",
+                command: "pnpm build",
+                outputPreview: "静态命令输出",
+                stdout: "静态命令输出",
+              },
+            },
+          },
+        ]}
+        processSession={{ workspaceId: "ws_project", generation: 4, port }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /查看工作过程/u }));
+    fireEvent.click(screen.getByRole("button", { name: /执行命令，exec_command，pnpm build/u }));
+    expect(await screen.findByText("实时命令输出")).toBeVisible();
+    expect(container.querySelectorAll(".ja-tool-details__output")).toHaveLength(0);
+    expect(container.querySelectorAll(".ja-process-session__output")).toHaveLength(1);
+  });
+
+  /** 已完成 Turn 的非零 shell 退出码只改变诊断可见性，不改写 Tool/Turn 的权威成功状态。 */
+  it("opens archived process details for a nonzero shell exit", async () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        displayMode="archived"
+        steps={[
+          {
+            ...base,
+            status: "completed",
+            metadata: {
+              ...base.metadata,
+              toolName: "exec_command",
+              presentation: {
+                ...presentation,
+                kind: "shell",
+                status: "success",
+                title: "执行命令",
+                command: "pnpm build",
+                stdout: "build failed",
+                exitCode: 2,
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("退出码 2");
+    expect(screen.getByRole("button", { name: /收起工作过程/u })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  /** 被 ApprovalCard 承载的 approval Item 隐去重复标题/状态，安全命令直接留在 Tool 行。 */
+  it("renders one actionable approval card beside the presented Tool row", () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    const approvalId = "appr_presented_command";
+    const approval: TimelineApproval = {
+      approvalId,
+      threadId: base.threadId,
+      turnId: base.turnId,
+      threadRevision: 2,
+      callId: "call_custom_mcp",
+      toolName: "exec_command",
+      reason: "执行外部命令",
+      expiresAt: "2099-08-17T12:00:00Z",
+    };
+    const tool = {
+      ...base,
+      status: "in_progress" as const,
+      metadata: {
+        ...base.metadata,
+        toolName: "exec_command",
+        presentation: {
+          ...presentation,
+          kind: "shell" as const,
+          status: "waiting_approval" as const,
+          title: "执行命令",
+          command: "Write-Output 'safe command'",
+        },
+      },
+    };
+    const approvalEvent: WorkStepAdapter = {
+      ...base,
+      itemId: "item_approval_event",
+      kind: "approval",
+      status: "in_progress",
+      title: "确认 exec_command",
+      metadata: { approvalId, callId: approval.callId, toolName: approval.toolName },
+    };
+    render(<WorkProcess steps={[tool, approvalEvent]} approvals={[approval]} />);
+
+    expect(screen.getAllByText("执行命令")).toHaveLength(2);
+    expect(screen.getAllByText("Write-Output 'safe command'")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "批准" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "拒绝" })).toBeVisible();
+    expect(screen.queryByText("确认 exec_command")).not.toBeInTheDocument();
+    expect(screen.queryByText("进行中", { exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByText(approval.callId)).not.toBeInTheDocument();
+  });
+
+  /** continuation 会把多个 Turn 合并进一个过程区；复用 callId 时审批仍按各自 Turn 排序。 */
+  it("隔离跨 Turn 重复 callId 的审批排序", () => {
+    const base = toolStep();
+    const firstTurn = {
+      ...base,
+      itemId: "item_first_turn",
+      turnId: "turn_first",
+      metadata: { ...base.metadata, callId: "call_reused" },
+    };
+    const secondTurn = {
+      ...base,
+      itemId: "item_second_turn",
+      turnId: "turn_second",
+      metadata: { ...base.metadata, callId: "call_reused" },
+    };
+    /** Keep each fixture tied to its owning Turn when the Provider reuses a call ID. */
+    const approval = (approvalId: string, turnId: string, reason: string): TimelineApproval => ({
+      approvalId,
+      threadId: "thr_tool_presentation",
+      turnId,
+      threadRevision: 1,
+      callId: "call_reused",
+      toolName: "custom_mcp",
+      reason,
+      expiresAt: "2099-08-17T12:00:00Z",
+    });
+
+    render(
+      <WorkProcess
+        steps={[firstTurn, secondTurn]}
+        approvals={[
+          approval("appr_second_turn", "turn_second", "第二轮审批"),
+          approval("appr_first_turn", "turn_first", "第一轮审批"),
+        ]}
+      />,
+    );
+
+    const cards = Array.from(document.querySelectorAll(".ja-approval-card"));
+    expect(cards.map((card) => card.textContent)).toEqual([
+      expect.stringContaining("第一轮审批"),
+      expect.stringContaining("第二轮审批"),
+    ]);
+  });
+
+  /** 正常详情只保留实际结果，协议中的状态、耗时和截断事实不应成为重复视觉噪声。 */
+  it("展开正常工具时不重复状态、耗时、根目录或成功退出码", () => {
+    const base = toolStep();
+    const presentation = base.metadata?.presentation;
+    if (presentation === undefined) throw new Error("test fixture presentation is missing");
+    render(
+      <WorkProcess
+        steps={[
+          {
+            ...base,
+            status: "completed",
+            metadata: {
+              ...base.metadata,
+              toolName: "shell",
+              presentation: {
+                ...presentation,
+                kind: "shell",
+                status: "success",
+                command: "pnpm test",
+                relativeCwd: ".",
+                stdout: "验证结果",
+                exitCode: 0,
+                durationMs: 1_250,
+                truncated: true,
+              },
+            },
+          },
+        ]}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看工作过程，已完成/u }));
+    fireEvent.click(screen.getByRole("button", { name: /执行命令，shell，pnpm test，完成/u }));
+    expect(screen.getByText(/验证结果/u)).toBeVisible();
+    expect(screen.queryByText("状态：完成")).not.toBeInTheDocument();
+    expect(screen.queryByText("1.3 s")).not.toBeInTheDocument();
+    expect(screen.queryByText("工作目录：.")).not.toBeInTheDocument();
+    expect(screen.queryByText("退出码 0")).not.toBeInTheDocument();
+    expect(screen.queryByText("预览已截断")).not.toBeInTheDocument();
+  });
+
+  /** 自动展开只提供默认值；历史重挂载不能推翻用户已收起的失败详情。 */
+  it("跨卸载保留用户手动收起的失败诊断", () => {
+    const cache = new TimelineDisclosureCache();
+    const props = {
+      steps: [toolStep()],
+      disclosureCache: cache,
+      disclosureKey: "exchange:failed-tool",
+      disclosureThreadId: "thr_tool_presentation",
+    };
+    const first = render(<WorkProcess {...props} />);
+    const trigger = screen.getByRole("button", { name: /调用工具，custom_mcp/u });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(trigger);
+    first.unmount();
+
+    render(<WorkProcess {...props} />);
+    expect(screen.getByRole("button", { name: /调用工具，custom_mcp/u })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   /** 新内建文件工具必须按真实名称呈现明确动作，避免 grep/find/ls 被误认成泛化 MCP 调用。 */
@@ -172,12 +550,14 @@ describe("ToolStepDetails", () => {
         steps={[
           {
             ...step,
+            status: "completed",
             metadata: {
               ...step.metadata,
               toolName: "grep",
               presentation: {
                 ...presentation,
                 kind: "read",
+                status: "success",
                 summary: "找到 2 个匹配项",
                 outputPreview:
                   "src/App.tsx:12: const needle = true;\nsrc/App.tsx-13- export default App;",
@@ -188,6 +568,7 @@ describe("ToolStepDetails", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /查看工作过程/u }));
     fireEvent.click(screen.getByRole("button", { name: /搜索内容，grep/u }));
     expect(screen.getByText("找到 2 个匹配项")).toBeVisible();
     expect(screen.getByRole("list", { name: "搜索结果" })).toBeVisible();
@@ -356,6 +737,7 @@ describe("ToolStepDetails", () => {
       <WorkProcess
         steps={[recoveryToolStep()]}
         turn={{
+          origin: "native",
           turnId: "turn_recovery",
           threadId: "thr_recovery",
           status: "suspended",
@@ -378,7 +760,7 @@ describe("ToolStepDetails", () => {
         expectedThreadRevision: 19,
         expectedRecoveryRevision: 7,
         decision: "retry",
-        idempotencyKey: expect.stringMatching(/^recovery-[0-9a-f]{8}$/u),
+        operationKey: expect.stringMatching(/^recovery-[0-9a-f]{8}$/u),
       }),
     );
     expect(retry).toBeDisabled();
@@ -399,6 +781,7 @@ describe("ToolStepDetails", () => {
       <WorkProcess
         steps={[recoveryToolStep("call_old_recovery")]}
         turn={{
+          origin: "native",
           turnId: "turn_recovery",
           threadId: "thr_recovery",
           status: "suspended",
@@ -420,6 +803,7 @@ describe("ToolStepDetails", () => {
           },
         ]}
         turn={{
+          origin: "native",
           turnId: "turn_new_recovery",
           threadId: "thr_new_recovery",
           status: "suspended",

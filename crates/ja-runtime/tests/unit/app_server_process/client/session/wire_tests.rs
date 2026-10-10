@@ -162,7 +162,7 @@ fn exact_turn_terminal_uses_control_routing() {
     );
 }
 
-/// Retry-started 是临时工作状态提示而非终态事实；它进入 v1 event catalog，但沿用普通 Turn data lane，不占 control reserve。
+/// Retry-started 是临时工作状态提示而非终态事实；它进入 v2 event catalog，但沿用普通 Turn data lane，不占 control reserve。
 #[test]
 fn retry_started_uses_the_turn_data_lane() {
     let retry_started = RpcFrame::notification(
@@ -201,15 +201,17 @@ fn context_compaction_notifications_use_control_lane() {
     }
 }
 
-/// Task 持久活动、Mailbox 变化和 Approval 交互不可按普通 delta 丢弃；只有 progress
-/// 保持可合并 data 语义。
+/// Task、Tool recovery 与 Approval 变化不可按普通 delta 丢弃；只有 progress 保持可合并 data 语义。
 #[test]
-fn task_and_approval_facts_use_control_while_progress_stays_data() {
+fn durable_task_recovery_and_approval_facts_use_control_while_progress_stays_data() {
     for method in [
         "task/activity",
         "task/mailbox-changed",
+        "task/closed",
+        "tool/recovery-changed",
         "approval/requested",
         "approval/resolved",
+        "approval/closed",
     ] {
         let frame = RpcFrame::notification(method, serde_json::json!({})).expect("notification");
         assert_eq!(

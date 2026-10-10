@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,15 +83,17 @@ pub enum TerminalReason {
 /// 连接终态回调；由 supervisor 注入以便协议线程立即终止其拥有的进程树。
 pub type TerminalCallback = Arc<dyn Fn(TerminalReason) + Send + Sync + 'static>;
 
-struct WriterCompletion {
+/// Writer 终态门；完成发布和 waiter 检查共享条件锁，避免关闭通知丢失。
+pub(crate) struct WriterCompletion {
     done: AtomicBool,
-    wait_lock: Mutex<()>,
+    /// 同步边界在 crate 内可见，供生命周期合同测试确定性构造通知交错。
+    pub(crate) wait_lock: Mutex<()>,
     wake: Condvar,
 }
 
 impl WriterCompletion {
-    /// 创建 writer completion gate，使生命周期 owner 可等待而不轮询。
-    fn new() -> Self {
+    /// crate 内可构造 gate 以验证关闭生命周期；不扩展为外部可见 API。
+    pub(crate) fn new() -> Self {
         Self {
             done: AtomicBool::new(false),
             wait_lock: Mutex::new(()),
@@ -99,14 +101,18 @@ impl WriterCompletion {
         }
     }
 
-    /// 标记 writer actor 已返回，唤醒所有 bounded join waiter。
-    fn mark_done(&self) {
+    /// 设计原因：完成条件与 waiter 的条件检查共用 `wait_lock`，防止发布落入检查与休眠之间。
+    /// 锁中毒时不恢复 guard，也不发布未经同步的完成状态。
+    pub(crate) fn mark_done(&self) {
+        let Ok(_guard) = self.wait_lock.lock() else {
+            return;
+        };
         self.done.store(true, Ordering::Release);
         self.wake.notify_all();
     }
 
-    /// 在绝对 deadline 内等待 writer actor 结束，避免 shutdown 持锁或无界 sleep。
-    fn wait_until(&self, deadline: Instant) -> bool {
+    /// 共享绝对 deadline 约束关闭等待；同锁检查条件可避免唤醒丢失。
+    pub(crate) fn wait_until(&self, deadline: Instant) -> bool {
         if self.done.load(Ordering::Acquire) {
             return true;
         }
@@ -253,7 +259,10 @@ pub(crate) struct SessionInner {
     limits: Limits,
     events: Arc<EventQueue>,
     pub(crate) pending: Mutex<PendingRegistry>,
-    pub(crate) outbound_request_ids: Mutex<OutboundRequestLedger>,
+    /// 与所有 SharedClient/lease 的 RPC 准入 gate 共用，close 可在线性化点封锁新操作。
+    admission_gate: Arc<Mutex<bool>>,
+    client_close_started: AtomicBool,
+    pub(crate) outbound_rpc_request_ids: Mutex<OutboundRpcRequestLedger>,
     terminal_identities: Mutex<TerminalLedger>,
     writer: WriterHandle,
     write_timeout: Duration,
@@ -282,7 +291,7 @@ pub(crate) struct SessionInner {
     writer_data_overflow_reported: AtomicBool,
 }
 
-pub(crate) struct OutboundRequestLedger {
+pub(crate) struct OutboundRpcRequestLedger {
     pub(crate) next: u64,
 }
 
@@ -303,8 +312,8 @@ impl SessionInner {
     }
 }
 
-impl OutboundRequestLedger {
-    /// 为 c: request 分配连接内永不复用的 ID，达到整数边界时轮换 session。
+impl OutboundRpcRequestLedger {
+    /// 为 c: JSON-RPC request 分配连接内永不复用的 ID，达到整数边界时轮换 session。
     pub(crate) fn new() -> Self {
         Self { next: 1 }
     }
@@ -316,7 +325,7 @@ impl OutboundRequestLedger {
         self.next = self
             .next
             .checked_add(1)
-            .ok_or(AppServerProcessError::RequestLedgerExhausted)?;
+            .ok_or(AppServerProcessError::RpcRequestLedgerExhausted)?;
         Ok(format!("c:rpc-{number}"))
     }
 }
@@ -394,7 +403,9 @@ impl Session {
             limits: limits.clone(),
             events: Arc::clone(&events),
             pending: Mutex::new(pending),
-            outbound_request_ids: Mutex::new(OutboundRequestLedger::new()),
+            admission_gate: Arc::new(Mutex::new(false)),
+            client_close_started: AtomicBool::new(false),
+            outbound_rpc_request_ids: Mutex::new(OutboundRpcRequestLedger::new()),
             terminal_identities: Mutex::new(TerminalLedger {
                 by_thread: HashMap::with_capacity(MAX_TERMINAL_IDENTITIES),
             }),
@@ -479,7 +490,7 @@ impl Session {
         params: Value,
         timeout: Duration,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        self.request_inner(method, params, Some(timeout), None)
+        self.request_inner(method, params, Some(timeout), None, false)
     }
 
     /// 在线性化准入锁内完成 pending 注册与 writer 入队；该入口保持 crate 私有，
@@ -491,7 +502,88 @@ impl Session {
         timeout: Duration,
         gate: &Mutex<bool>,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        self.request_inner(method, params, Some(timeout), Some(gate))
+        self.request_inner(method, params, Some(timeout), Some(gate), false)
+    }
+
+    /// 返回与 SharedClient 所有普通 RPC/lease 共用的 admission gate，不能另造生命周期状态。
+    pub(crate) fn admission_gate(&self) -> Arc<Mutex<bool>> {
+        Arc::clone(&self.inner.admission_gate)
+    }
+
+    /// Host close 先在线性化 gate 拒绝新请求并取消旧 waiter，但保留 reader/writer 供 close ACK 使用。
+    pub(crate) fn begin_client_close_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), AppServerProcessError> {
+        let mut admission = self.admission_gate_until(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(AppServerProcessError::ShutdownTimeout);
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(AppServerProcessError::SessionClosed);
+        }
+        *admission = true;
+        if !self.inner.client_close_started.swap(true, Ordering::AcqRel) {
+            let pending = self.inner.pending.lock();
+            let mut pending = match pending {
+                Ok(pending) => pending,
+                Err(error) => {
+                    drop(error);
+                    drop(admission);
+                    fail_closed(&self.inner);
+                    return Err(AppServerProcessError::ProtocolFault);
+                }
+            };
+            pending.cancel_all();
+        }
+        Ok(())
+    }
+
+    /// 仅为已封闭 admission 的 Native Host 发送生命周期 close，允许其 response reader 正常完成 ACK。
+    pub(crate) fn request_client_close(
+        &self,
+        timeout_ms: u64,
+        timeout: Duration,
+    ) -> Result<RpcFrame, AppServerProcessError> {
+        if !(1..=20_000).contains(&timeout_ms)
+            || !self.inner.client_close_started.load(Ordering::Acquire)
+        {
+            return Err(AppServerProcessError::InvalidState);
+        }
+        self.request_inner(
+            "runtime/client/close",
+            serde_json::json!({ "timeoutMs": timeout_ms }),
+            Some(timeout),
+            None,
+            true,
+        )
+    }
+
+    /// 返回 JSON-RPC 本地等待上限，供 scoped close 同时满足 server timeout 与调用方 deadline。
+    pub(crate) fn request_timeout_limit(&self) -> Duration {
+        Duration::from_millis(self.inner.limits.request_deadline_ms).min(MAX_OPERATION_TIMEOUT)
+    }
+
+    /// 在共享 Host admission gate 上有界获取关闭权，锁竞争不能绕过调用方绝对 deadline。
+    fn admission_gate_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'_, bool>, AppServerProcessError> {
+        loop {
+            match self.inner.admission_gate.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    fail_closed(&self.inner);
+                    return Err(AppServerProcessError::ProtocolFault);
+                }
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::yield_now();
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(AppServerProcessError::ShutdownTimeout);
+                }
+            }
+        }
     }
 
     /// `thread/compact` 的 Provider 恢复不受 RPC 等待时长中断；Session 关闭仍立刻唤醒 waiter。
@@ -500,7 +592,7 @@ impl Session {
         params: Value,
         gate: &Mutex<bool>,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        self.request_inner("thread/compact", params, None, Some(gate))
+        self.request_inner("thread/compact", params, None, Some(gate), false)
     }
 
     /// 共用 request 编码、pending 注册和关闭准入约束；None 只允许取消型手动压缩。
@@ -510,7 +602,17 @@ impl Session {
         params: Value,
         timeout: Option<Duration>,
         admission: Option<&Mutex<bool>>,
+        client_close: bool,
     ) -> Result<RpcFrame, AppServerProcessError> {
+        if client_close {
+            if method != "runtime/client/close"
+                || !self.inner.client_close_started.load(Ordering::Acquire)
+            {
+                return Err(AppServerProcessError::InvalidState);
+            }
+        } else if self.inner.client_close_started.load(Ordering::Acquire) {
+            return Err(AppServerProcessError::ShuttingDown);
+        }
         let request_timeout_limit =
             Duration::from_millis(self.inner.limits.request_deadline_ms).min(MAX_OPERATION_TIMEOUT);
         if timeout.is_some_and(|value| value > request_timeout_limit) {
@@ -530,6 +632,9 @@ impl Session {
             if *guard {
                 return Err(AppServerProcessError::ShuttingDown);
             }
+            if self.inner.client_close_started.load(Ordering::Acquire) {
+                return Err(AppServerProcessError::ShuttingDown);
+            }
             Some(guard)
         } else {
             None
@@ -537,15 +642,15 @@ impl Session {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(AppServerProcessError::SessionClosed);
         }
-        // 在分配不可回退的 request ID 前拒绝 challenge marker；只有两个精确握手
+        // 在分配不可回退的 RPC request ID 前拒绝 challenge marker；只有两个精确握手
         // notification 路径允许携带 token。
         if contains_forbidden_ready_token(&params, &self.inner.forbidden_ready_tokens)
             .inspect_err(|_| fail_closed(&self.inner))?
         {
             return Err(AppServerProcessError::HandshakeFailed);
         }
-        let id = {
-            let mut ledger = self.inner.outbound_request_ids.lock().map_err(|_| {
+        let rpc_request_id = {
+            let mut ledger = self.inner.outbound_rpc_request_ids.lock().map_err(|_| {
                 fail_closed(&self.inner);
                 AppServerProcessError::ProtocolFault
             })?;
@@ -557,7 +662,7 @@ impl Session {
                 }
             }
         };
-        let frame = RpcFrame::client_request(id.clone(), method.to_owned(), params)?;
+        let frame = RpcFrame::client_request(rpc_request_id.clone(), method.to_owned(), params)?;
         // 只有完整编码并成功送入 writer 后才消耗 initialized 一次性状态，避免本地编码失败让握手永久卡死。
         let encoded = match frame.encode(self.inner.limits.max_frame_bytes) {
             Ok(encoded) => encoded,
@@ -583,8 +688,8 @@ impl Session {
                 }
             };
             match deadline {
-                Some(deadline) => pending.register(id, deadline)?,
-                None => pending.register_until_closed(id)?,
+                Some(deadline) => pending.register(rpc_request_id, deadline)?,
+                None => pending.register_until_closed(rpc_request_id)?,
             }
         };
         let priority = if method == "runtime/shutdown" || method.starts_with("runtime/") {
@@ -632,8 +737,7 @@ impl Session {
             Ok(result) => result,
             Err(RecvTimeoutError::Disconnected) => Err(AppServerProcessError::SessionClosed),
             Err(RecvTimeoutError::Timeout) => {
-                // EOF close can win immediately after recv_timeout observes its deadline;
-                // preserve the terminal session fact instead of reporting a retryable timeout.
+                // recv_timeout 检测到期限后，EOF 关闭可能紧接着先完成；应保留会话已终止这一事实，而不要报告可重试的超时。
                 if self.inner.closed.load(Ordering::Acquire) {
                     return Err(AppServerProcessError::SessionClosed);
                 }

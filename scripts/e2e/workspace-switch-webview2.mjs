@@ -13,9 +13,9 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -40,6 +40,58 @@ const REQUIRED_UNTRACKED_FILES = 2_000;
 const SWITCH_P95_BUDGET_MS = 2_000;
 const HISTORY_TURNS = 4;
 const PROJECT_LABELS = Object.freeze({ a: "切换验收 A", b: "切换验收 B" });
+const HISTORY_LOADING_OBSERVATION_KEYS = Object.freeze([
+  "busyEmpty",
+  "busyWithRows",
+  "idleEmpty",
+  "idleWithRows",
+  "unavailable",
+]);
+const HISTORY_LOADING_VIOLATION_KEYS = Object.freeze([
+  "unavailableHistory",
+  "invalidBusyValue",
+  "missingExpectedSpinner",
+  "invisibleExpectedSpinner",
+  "misplacedExpectedSpinner",
+  "multipleSpinners",
+  "unexpectedSpinnerWhileCachedBusy",
+  "unexpectedSpinnerWhileIdle",
+]);
+const THREAD_SEEN_FAILURE_CODES = Object.freeze([
+  "CONFLICT",
+  "THREAD_NOT_FOUND",
+  "INVALID_STATE",
+  "STORAGE_CONFLICT",
+  "INVALID_PARAMS",
+  "INVALID_INPUT",
+  "RUNTIME_UNAVAILABLE",
+  "RUNTIME_QUEUE_FULL",
+  "RUNTIME_COMMAND_DEADLINE",
+  "RUNTIME_SHUTDOWN_TIMEOUT",
+  "RUNTIME_EVENT_DELIVERY_FAILED",
+  "RECOVERY_REQUIRED",
+  "RECOVERY_STALE",
+  "RUNTIME_FAULTED",
+  "RUNTIME_BACKOFF",
+  "SHUTTING_DOWN",
+  "RUNTIME_NOT_READY",
+  "RUNTIME_TIMEOUT",
+  "SIDECAR_CRASHED",
+  "RUNTIME_PROTOCOL_ERROR",
+  "PROTOCOL_INCOMPATIBLE",
+  "REQUEST_DEADLINE_EXCEEDED",
+]);
+const THREAD_SEEN_REPORT_CODES = new Set([...THREAD_SEEN_FAILURE_CODES, "INVOKE_FAILED"]);
+const THREAD_SEEN_TURN_STATES = new Set([
+  "queued",
+  "running",
+  "waiting_input",
+  "waiting_approval",
+  "suspended",
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 const BASE_NO_VALUE_ARGUMENTS = new Set(["--preflight-only", "--hidden-window"]);
 
@@ -124,21 +176,418 @@ export function summarize(values) {
 }
 
 /**
- * 校验跨阶段报告的闭集字段；baseline 允许暴露旧 loading/scroll 事实，after 才要求
- * 新的标题行 spinner、非空恢复、滚动位置和 ChatTimeline Thread identity 全部闭环。
+ * @author kongweiguang
+ * 只旁路观察正式 threadSeen 命令并原样串接既有 E2E probe；诊断仅保存 revision、闭集状态/错误码与警告计数。
+ */
+export function installThreadSeenInvokeProbe(knownFailureCodes) {
+  const commandName = "ja_thread_seen";
+  const warningText = "未读状态暂时无法同步，请重新打开会话重试。";
+  const turnStates = new Set([
+    "queued",
+    "running",
+    "waiting_input",
+    "waiting_approval",
+    "suspended",
+    "completed",
+    "failed",
+    "cancelled",
+  ]);
+  const failureCodes = new Set([...knownFailureCodes, "INVOKE_FAILED"]);
+  const diagnostics = {
+    invocations: [],
+    warningAppearanceCount: 0,
+    warningEverSeen: false,
+    warningVisible: false,
+  };
+  const previous = globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__;
+  globalThis.__JA_E2E_THREAD_SEEN_DIAGNOSTICS__ = diagnostics;
+  /** 保留既有 wrapper 的唯一委托入口，不让观察器额外发起或重试命令。 */
+  globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = async (request, delegate) => {
+    /** 原样串接 Review probe，避免覆盖其调用计数和失败身份。 */
+    const invokePrevious = () =>
+      previous === undefined ? delegate() : previous(request, delegate);
+    if (request?.command !== commandName) return invokePrevious();
+
+    const expectedRevision = request?.args?.input?.expectedThreadRevision;
+    const invocation = {
+      ordinal: diagnostics.invocations.length + 1,
+      expectedThreadRevision:
+        Number.isSafeInteger(expectedRevision) && expectedRevision >= 0 ? expectedRevision : null,
+      outcome: "pending",
+    };
+    diagnostics.invocations.push(invocation);
+    try {
+      const result = await invokePrevious();
+      const resultRevision = result?.revision;
+      const latestTurnStatus = result?.latestTurnStatus;
+      const latestTurnSeen = result?.latestTurnSeen;
+      invocation.outcome = "resolved";
+      invocation.resultValid =
+        Number.isSafeInteger(resultRevision) &&
+        resultRevision >= 0 &&
+        (latestTurnStatus === null || turnStates.has(latestTurnStatus)) &&
+        typeof latestTurnSeen === "boolean";
+      invocation.resultRevision =
+        Number.isSafeInteger(resultRevision) && resultRevision >= 0 ? resultRevision : null;
+      invocation.latestTurnStatus =
+        latestTurnStatus === null || turnStates.has(latestTurnStatus) ? latestTurnStatus : null;
+      invocation.latestTurnSeen =
+        typeof latestTurnSeen === "boolean" ? latestTurnSeen : null;
+      return result;
+    } catch (error) {
+      let code;
+      try {
+        code = error !== null && typeof error === "object" ? error.code : undefined;
+      } catch {
+        // 诊断读取器异常不能替换 bridge 原始拒绝对象。
+      }
+      invocation.outcome = "rejected";
+      invocation.errorCode =
+        typeof code === "string" && failureCodes.has(code) ? code : "INVOKE_FAILED";
+      throw error;
+    }
+  };
+
+  /** 排除离屏卸载和祖先隐藏节点，告警计数只对应用户可见的真实反馈。 */
+  const isVisible = (element) => {
+    if (
+      element?.isConnected !== true ||
+      typeof element.getClientRects !== "function" ||
+      element.getClientRects().length === 0
+    ) {
+      return false;
+    }
+    for (
+      let ancestor = element;
+      ancestor !== null && ancestor !== undefined;
+      ancestor = ancestor.parentElement
+    ) {
+      const style = globalThis.getComputedStyle(ancestor);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        style.contentVisibility === "hidden" ||
+        Number(style.opacity) === 0
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+  /** 只累计可见边沿，不把同一告警的每次 DOM 更新重复算作新故障。 */
+  const observeWarning = () => {
+    const visible = Array.from(
+      globalThis.document.querySelectorAll(".ja-navigation-error, .ja-notification-content"),
+    ).some(
+      (element) =>
+        element.getAttribute("role") === "alert" &&
+        typeof element.textContent === "string" &&
+        element.textContent.includes(warningText) &&
+        isVisible(element),
+    );
+    if (visible && !diagnostics.warningVisible) {
+      diagnostics.warningAppearanceCount += 1;
+      diagnostics.warningEverSeen = true;
+    }
+    diagnostics.warningVisible = visible;
+  };
+  const observer = new globalThis.MutationObserver(observeWarning);
+  /** 等待真实 DOM 根后一次安装，避免 init script 早于页面创建时漏掉告警。 */
+  const startObserving = () => {
+    if (globalThis.document.documentElement === null) return;
+    observer.observe(globalThis.document.documentElement, {
+      attributes: true,
+      attributeFilter: [
+        "aria-hidden",
+        "class",
+        "data-mounted",
+        "data-removed",
+        "data-state",
+        "hidden",
+        "role",
+        "style",
+      ],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    observeWarning();
+  };
+  if (globalThis.document.documentElement === null) {
+    globalThis.document.addEventListener("DOMContentLoaded", startObserving, { once: true });
+  } else {
+    startObserving();
+  }
+}
+
+/**
+ * @author kongweiguang
+ * Playwright 不保证多个 init script 的执行顺序；把现有 Review wrapper 与已读观察器组合成单一有序脚本，避免任一 wrapper 被覆盖。
+ */
+export function createWorkspaceSwitchInvokeProbeBootstrap() {
+  return [
+    `(${installReviewInvokeProbe.toString()})();`,
+    `(${installThreadSeenInvokeProbe.toString()})(${JSON.stringify(THREAD_SEEN_FAILURE_CODES)});`,
+  ].join("\n");
+}
+
+/**
+ * @author kongweiguang
+ * 仅在快速输入场景结束后等待已经发出的命令自然完成；不串行化每轮输入、不补发或重试。
+ * Deadline 只结束观察，pending 仍交给最终报告拒绝，避免 reload 把正常在途请求误写成永久 pending。
+ */
+export async function waitForThreadSeenSettled(page, timeoutMs = 60_000) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const diagnostics = globalThis.__JA_E2E_THREAD_SEEN_DIAGNOSTICS__;
+        return diagnostics === undefined ||
+          !Array.isArray(diagnostics.invocations) ||
+          diagnostics.invocations.every((invocation) => invocation.outcome !== "pending");
+      },
+      undefined,
+      { timeout: timeoutMs, polling: 100 },
+    );
+    return true;
+  } catch (error) {
+    if (error?.name === "TimeoutError") return false;
+    throw error;
+  }
+}
+
+/**
+ * @author kongweiguang
+ * 只把浏览器 probe 的 allowlist 字段汇入宿主报告，并给跨 reload 记录重新编号，避免任何 Thread 标识或正文外流。
+ */
+async function collectThreadSeenDiagnostics(page, aggregate) {
+  const current = await page.evaluate(() => {
+    const diagnostics = globalThis.__JA_E2E_THREAD_SEEN_DIAGNOSTICS__;
+    if (diagnostics === undefined || !Array.isArray(diagnostics.invocations)) return null;
+    return {
+      invocations: diagnostics.invocations,
+      warningAppearanceCount: diagnostics.warningAppearanceCount,
+      warningEverSeen: diagnostics.warningEverSeen,
+      warningVisible: diagnostics.warningVisible,
+    };
+  });
+  if (current === null) {
+    aggregate.probeInstalled = false;
+    return;
+  }
+
+  aggregate.probeInstalled = aggregate.probeInstalled !== false;
+  for (const source of current.invocations) {
+    const invocation = {
+      ordinal: aggregate.invocations.length + 1,
+      expectedThreadRevision:
+        Number.isSafeInteger(source?.expectedThreadRevision) && source.expectedThreadRevision >= 0
+          ? source.expectedThreadRevision
+          : null,
+      outcome: ["pending", "resolved", "rejected"].includes(source?.outcome)
+        ? source.outcome
+        : "unknown",
+    };
+    if (source?.outcome === "resolved") {
+      invocation.resultValid = source.resultValid === true;
+      invocation.resultRevision =
+        Number.isSafeInteger(source.resultRevision) && source.resultRevision >= 0
+          ? source.resultRevision
+          : null;
+      invocation.latestTurnStatus =
+        source.latestTurnStatus === null || THREAD_SEEN_TURN_STATES.has(source.latestTurnStatus)
+          ? source.latestTurnStatus
+          : null;
+      invocation.latestTurnSeen = typeof source.latestTurnSeen === "boolean" ? source.latestTurnSeen : null;
+    } else if (source?.outcome === "rejected") {
+      invocation.errorCode = THREAD_SEEN_REPORT_CODES.has(source.errorCode)
+        ? source.errorCode
+        : "INVOKE_FAILED";
+    }
+    aggregate.invocations.push(invocation);
+  }
+  aggregate.warningAppearanceCount +=
+    Number.isSafeInteger(current.warningAppearanceCount) && current.warningAppearanceCount >= 0
+      ? current.warningAppearanceCount
+      : -1;
+  aggregate.warningEverSeen =
+    typeof current.warningEverSeen === "boolean"
+      ? aggregate.warningEverSeen === true || current.warningEverSeen
+      : null;
+  aggregate.warningVisibleAtEnd =
+    typeof current.warningVisible === "boolean" ? current.warningVisible : null;
+}
+
+/**
+ * @author kongweiguang
+ * 压力 runner 只接受共享 launcher 实际捕获的桌面身份，避免有完整测量但无法证明运行二进制的报告通过。
+ */
+function assertOwnedTauriIdentity(identity) {
+  assert.ok(Number.isSafeInteger(identity?.pid) && identity.pid > 0, "execution.tauri.pid is required");
+  assert.ok(
+    Number.isSafeInteger(identity?.launcherPid) &&
+      identity.launcherPid > 0 &&
+      identity.launcherPid !== identity.pid,
+    "execution.tauri.launcherPid must identify its distinct owner",
+  );
+  assert.ok(
+    typeof identity?.executablePath === "string" && isAbsolute(identity.executablePath),
+    "execution.tauri.executablePath must be absolute",
+  );
+  assert.equal(
+    basename(identity.executablePath).toLowerCase(),
+    "ja-desktop.exe",
+    "execution.tauri must identify the desktop host",
+  );
+  assert.match(identity?.sha256 ?? "", /^[0-9a-f]{64}$/u, "execution.tauri.sha256 must be lowercase SHA-256");
+  assert.ok(
+    Number.isSafeInteger(identity?.sizeBytes) && identity.sizeBytes > 0,
+    `execution.tauri.sizeBytes=${identity?.sizeBytes}`,
+  );
+}
+
+/**
+ * @author kongweiguang
+ * 按明确运行边界校验 JAR 或 Native sidecar 报告；Native 必须与共享启动层已验证的 hash、尺寸和无 fallback 事实闭合。
+ * 共享 launch 回执必须同时给出实际 Tauri 后代身份；raw driver 结果尚未具备此身份，不可提前作为验收报告。
+ * 未观察的 loading 分支保持零计数，不转换成通过标记。
  */
 export function validateWorkspaceSwitchReport(report) {
   assert.equal(report?.schemaVersion, 1);
+  assert.ok(["baseline", "after"].includes(report?.phase), `phase=${report?.phase}`);
+  if (Object.hasOwn(report, "verdict")) {
+    assert.equal(report.verdict, "PASS", `verdict=${report.verdict}`);
+  }
   assert.equal(report?.runtime?.surface, "tauri_webview2");
   assert.equal(report?.runtime?.platform, "win32");
-  assert.equal(report?.runtime?.boundary, "jvm_jar");
-  assert.equal(report?.runtime?.nativeImageVerified, false);
+  assertOwnedTauriIdentity(report?.execution?.tauri);
+  const nativeSidecar = report?.runtime?.boundary === "native_sidecar";
+  assert.ok(
+    nativeSidecar || report?.runtime?.boundary === "jvm_jar",
+    `runtime.boundary=${report?.runtime?.boundary}`,
+  );
+  assert.equal(report?.runtime?.nativeImageVerified, nativeSidecar);
+  assert.equal(report?.runtime?.toolchain?.nodeMajor, 24);
+  assert.equal(report?.runtime?.toolchain?.pnpm, "10.33.0");
+  if (nativeSidecar) {
+    const image = report?.runtime?.nativeImage;
+    assert.match(image?.sha256 ?? "", /^[0-9a-f]{64}$/u, "nativeImage.sha256 must be lowercase SHA-256");
+    assert.ok(Number.isSafeInteger(image?.sizeBytes) && image.sizeBytes > 0, `nativeImage.sizeBytes=${image?.sizeBytes}`);
+    assert.equal(image?.resourceName, "sidecars/ja-app-server-x86_64-pc-windows-msvc.exe");
+    assert.equal(image?.noFallback, true);
+    assert.equal(image?.sourceHashMatched, true);
+    assert.equal(report?.runtime?.toolchain?.jdkMajor, undefined);
+    assert.equal(report?.runtime?.toolchain?.mavenJavaMajor, undefined);
+    assert.ok(report?.execution, "native execution identity is required before report acceptance");
+    assert.equal(report.execution.boundary, "native_sidecar");
+    assert.equal(report.execution.nativeImageVerified, true);
+    assert.deepEqual(report.execution.nativeImage, image, "runtime and shared Native identities differ");
+    assert.equal(report.execution.jar, undefined, "Native mode must not fall back to a JAR");
+  } else {
+    assert.equal(report?.runtime?.nativeImage, undefined);
+    assert.equal(report?.runtime?.toolchain?.jdkMajor, 25);
+    assert.equal(report?.runtime?.toolchain?.mavenJavaMajor, 25);
+    if (report?.execution !== undefined) {
+      assert.equal(report.execution.boundary, "debug_jar");
+      assert.equal(report.execution.nativeImageVerified, false);
+      assert.equal(report.execution.nativeImage, undefined);
+      assert.match(report.execution.jar?.sha256 ?? "", /^[0-9a-f]{64}$/u);
+      assert.ok(Number.isSafeInteger(report.execution.jar?.size) && report.execution.jar.size > 0);
+    }
+  }
   assert.equal(report?.provider?.kind, "deterministic_loopback");
   assert.equal(report?.provider?.externalCalls, 0);
   assert.equal(report?.fixture?.projectCount, 2);
   assert.equal(report?.fixture?.ignoredFiles, REQUIRED_IGNORED_FILES);
   assert.equal(report?.fixture?.untrackedFiles, REQUIRED_UNTRACKED_FILES);
+  const historyLoading = report?.correctness?.historyLoading;
+  assert.deepEqual(
+    Object.keys(historyLoading?.observations ?? {}).sort(),
+    [...HISTORY_LOADING_OBSERVATION_KEYS].sort(),
+  );
+  assert.deepEqual(
+    Object.keys(historyLoading?.violations ?? {}).sort(),
+    [...HISTORY_LOADING_VIOLATION_KEYS].sort(),
+  );
+  for (const [branch, count] of Object.entries(historyLoading.observations)) {
+    assert.ok(Number.isSafeInteger(count) && count >= 0, `historyLoading.observations.${branch}=${count}`);
+  }
+  for (const [violation, count] of Object.entries(historyLoading.violations)) {
+    assert.ok(Number.isSafeInteger(count) && count >= 0, `historyLoading.violations.${violation}=${count}`);
+  }
+  assert.ok(
+    Object.values(historyLoading.observations).some((count) => count > 0),
+    "historyLoading observations missing",
+  );
   assert.equal(report?.correctness?.hiddenReviewSnapshotDelta, 0);
+  assert.equal(report?.correctness?.pageErrors, 0, `pageErrors=${report?.correctness?.pageErrors}`);
+  const threadSeen = report?.correctness?.threadSeen;
+  assert.deepEqual(
+    Object.keys(threadSeen ?? {}).sort(),
+    [
+      "invocations",
+      "probeInstalled",
+      "warningAppearanceCount",
+      "warningEverSeen",
+      "warningVisibleAtEnd",
+    ].sort(),
+  );
+  assert.equal(threadSeen.probeInstalled, true);
+  assert.ok(Array.isArray(threadSeen.invocations));
+  for (const [index, invocation] of threadSeen.invocations.entries()) {
+    assert.equal(invocation.ordinal, index + 1, `threadSeen.invocations[${index}].ordinal`);
+    assert.ok(
+      Number.isSafeInteger(invocation.expectedThreadRevision) &&
+        invocation.expectedThreadRevision >= 0,
+      `threadSeen.invocations[${index}].expectedThreadRevision`,
+    );
+    const commonKeys = ["ordinal", "expectedThreadRevision", "outcome"];
+    if (invocation.outcome === "pending") {
+      assert.deepEqual(Object.keys(invocation).sort(), commonKeys.sort());
+    } else if (invocation.outcome === "resolved") {
+      assert.deepEqual(
+        Object.keys(invocation).sort(),
+        [
+          ...commonKeys,
+          "resultValid",
+          "resultRevision",
+          "latestTurnStatus",
+          "latestTurnSeen",
+        ].sort(),
+      );
+      assert.equal(invocation.resultValid, true);
+      assert.ok(
+        Number.isSafeInteger(invocation.resultRevision) && invocation.resultRevision >= 0,
+        `threadSeen.invocations[${index}].resultRevision`,
+      );
+      assert.ok(
+        invocation.latestTurnStatus === null ||
+          THREAD_SEEN_TURN_STATES.has(invocation.latestTurnStatus),
+        `threadSeen.invocations[${index}].latestTurnStatus`,
+      );
+      assert.equal(typeof invocation.latestTurnSeen, "boolean");
+    } else if (invocation.outcome === "rejected") {
+      assert.deepEqual(
+        Object.keys(invocation).sort(),
+        [...commonKeys, "errorCode"].sort(),
+      );
+      assert.ok(
+        THREAD_SEEN_REPORT_CODES.has(invocation.errorCode),
+        `threadSeen.invocations[${index}].errorCode`,
+      );
+    } else {
+      assert.fail(`threadSeen.invocations[${index}].outcome=${invocation.outcome}`);
+    }
+  }
+  assert.ok(
+    Number.isSafeInteger(threadSeen.warningAppearanceCount) &&
+      threadSeen.warningAppearanceCount >= 0,
+    `threadSeen.warningAppearanceCount=${threadSeen.warningAppearanceCount}`,
+  );
+  assert.equal(typeof threadSeen.warningEverSeen, "boolean");
+  assert.equal(typeof threadSeen.warningVisibleAtEnd, "boolean");
+  assert.equal(threadSeen.warningEverSeen, threadSeen.warningAppearanceCount > 0);
+  if (threadSeen.warningVisibleAtEnd) assert.equal(threadSeen.warningEverSeen, true);
   assert.equal(report?.correctness?.noBlankTimeline, true);
   assert.ok(Number.isInteger(report?.correctness?.blankFrameCount) && report.correctness.blankFrameCount >= 0, `blankFrameCount=${report?.correctness?.blankFrameCount}`);
   assert.ok(Number.isInteger(report?.correctness?.paintFrameCount) && report.correctness.paintFrameCount > 0, `paintFrameCount=${report?.correctness?.paintFrameCount}`);
@@ -150,8 +599,22 @@ export function validateWorkspaceSwitchReport(report) {
   assert.ok(Number.isFinite(report.metrics.bToA.p50Ms));
   assert.ok(Number.isFinite(report.metrics.bToA.p95Ms));
   if (report.phase === "after") {
+    assert.ok(threadSeen.invocations.length > 0, "threadSeen probe did not observe a production command");
+    assert.ok(
+      threadSeen.invocations.every((invocation) => invocation.outcome !== "pending"),
+      "threadSeen command was still pending when the after report was captured",
+    );
+    assert.equal(
+      threadSeen.warningAppearanceCount,
+      0,
+      `threadSeen.warningAppearanceCount=${threadSeen.warningAppearanceCount}`,
+    );
+    assert.equal(threadSeen.warningEverSeen, false);
+    assert.equal(threadSeen.warningVisibleAtEnd, false);
     assert.equal(report.correctness.spinnerLegacyPlaceholder, false);
-    assert.equal(report.correctness.spinnerInRecentHeading, true);
+    for (const [violation, count] of Object.entries(historyLoading.violations)) {
+      assert.equal(count, 0, `historyLoading.violations.${violation}=${count}`);
+    }
     assert.equal(report.correctness.explicitThreadIdentity, true);
     assert.equal(report.correctness.scrollRestored, true);
     assert.equal(report.correctness.blankFrameCount, 0, `blankFrameCount=${report.correctness.blankFrameCount}`);
@@ -163,6 +626,18 @@ export function validateWorkspaceSwitchReport(report) {
   }
   assert.equal(report.baseline?.absoluteOnly, report.baseline?.available !== true);
   return report;
+}
+
+/**
+ * @author kongweiguang
+ * 驱动层拒绝已采样报告时保留原始部分证据，只追加失败身份，不为未执行的分支合成结果。
+ */
+export function workspaceSwitchFailureReport(report, error) {
+  return {
+    ...report,
+    verdict: "FAIL",
+    error: error?.name === "AssertionError" ? "report_validation_failed" : "runner_failed_after_measurement",
+  };
 }
 
 /**
@@ -297,16 +772,18 @@ export async function createSecondaryWorkspace(workspaceRoot) {
 }
 
 /**
- * 经 typed History adapter 请求两个 server-owned workspace 与 Thread；直接调用只用于准备
- * 持久 fixture，真正切换仍必须点击侧栏项目按钮并经过 workspace controller。
+ * 两个 server-owned 项目分别登记并显式授信后才创建 Thread；直接调用只准备 fixture，
+ * 真正切换仍必须点击侧栏项目按钮并经过 workspace controller。
  */
 export async function createProjectsAndThreads(page, workspaceRoot, secondaryRoot) {
   return page.evaluate(
     async ({ firstRoot, secondRoot, labels }) => {
       const { TauriHistoryAdapter } = await import("/src/api/tauri/history.ts");
       const history = new TauriHistoryAdapter();
+      /** 两个目录分别授权，防止后一项目意外借用前一项目的信任状态。 */
       const create = async (cwd, displayName, title) => {
         const workspace = await history.workspaceOpen({ cwd, displayName });
+        await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
         const thread = await history.threadCreate({
           cwd: workspace.root,
           title,
@@ -336,16 +813,26 @@ export async function createProjectsAndThreads(page, workspaceRoot, secondaryRoo
 }
 
 /**
- * 等待真实 Ja Shell、runtime status 和最近对话列表，排除静态 Vite preview 或半初始化窗口。
+ * 健康连接文案可隐藏；以真实 Ja Shell、typed Host 身份和最近对话列表排除半初始化窗口。
  */
 async function waitForApplication(page, deadline = Date.now() + 60_000) {
   const timeout = () => Math.max(1, Math.min(30_000, deadline - Date.now()));
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor({ state: "visible", timeout: timeout() });
   try {
-    await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor({
-      state: "visible",
-      timeout: timeout(),
-    });
+    await page.waitForFunction(
+      async () => {
+        try {
+          const { TauriRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+          const state = await new TauriRuntimeHostAdapter().state();
+          return (state.status === "ready" || state.status === "busy") &&
+            typeof state.serverInstanceId === "string" && state.serverInstanceId.length > 0;
+        } catch {
+          return false;
+        }
+      },
+      undefined,
+      { timeout: timeout() },
+    );
   } catch (error) {
     const diagnostic = await page.evaluate(async () => {
       const statuses = [...globalThis.document.querySelectorAll('[role="status"]')].map((node) => ({
@@ -628,18 +1115,32 @@ async function scrollTimelineToMiddle(page, deadline) {
 }
 
 /**
- * 在浏览器自身 performance 时钟内测量项目点击到目标 Thread/正文出现，并同步观察 loading
- * projection 与每个 paint frame 的 Timeline 空态；这样 Playwright/CDP 往返不会污染主样本，
- * spinner 几何仍来自真实 DOM。
+ * @author kongweiguang
+ * 在浏览器自身时钟内测量项目切换，同时按 aria-busy 与真实历史行数分支观察标题 spinner；
+ * 固定大小计数避免 DOM 高频变化变成无界轨迹，也不让 CDP 往返污染性能样本。
  */
 async function measureProjectSwitch(page, displayName, threadId, marker, mode, strictIdentity) {
   return page.evaluate(
     ({ displayName: expectedName, expectedThreadId, expectedMarker, visibility, strict }) =>
       new Promise((resolvePromise, rejectPromise) => {
         const startedAt = globalThis.performance.now();
-        let spinnerSeen = false;
-        let spinnerInRecentHeading = true;
-        let spinnerOutsideHistoryList = true;
+        const historyLoadingObservations = {
+          busyEmpty: 0,
+          busyWithRows: 0,
+          idleEmpty: 0,
+          idleWithRows: 0,
+          unavailable: 0,
+        };
+        const historyLoadingViolations = {
+          unavailableHistory: 0,
+          invalidBusyValue: 0,
+          missingExpectedSpinner: 0,
+          invisibleExpectedSpinner: 0,
+          misplacedExpectedSpinner: 0,
+          multipleSpinners: 0,
+          unexpectedSpinnerWhileCachedBusy: 0,
+          unexpectedSpinnerWhileIdle: 0,
+        };
         let legacyPlaceholderSeen = false;
         let blankFrameCount = 0;
         let paintFrameCount = 0;
@@ -663,16 +1164,56 @@ async function measureProjectSwitch(page, displayName, threadId, marker, mode, s
           [...globalThis.document.querySelectorAll(
             '[aria-label="项目列表"] button[data-scope-kind="project"]',
           )].find((candidate) => candidate.textContent?.trim() === expectedName);
+        /** @author kongweiguang 忙空态才要求标题 spinner，缓存忙碌/空闲态必须没有该 indicator。 */
         const captureLoading = () => {
           const history = globalThis.document.querySelector(".ja-navigation-history");
           const heading = history?.querySelector(".ja-navigation-section-heading");
-          const spinner = heading?.querySelector(".ja-navigation-history-loading");
-          if (spinner instanceof globalThis.HTMLElement) {
-            spinnerSeen = true;
-            spinnerInRecentHeading &&= spinner.parentElement === heading;
-            spinnerOutsideHistoryList &&= spinner.closest(".ja-navigation-history-list") === null;
-          }
           const list = history?.querySelector(".ja-navigation-history-list");
+          if (
+            !(history instanceof globalThis.HTMLElement) ||
+            !(heading instanceof globalThis.HTMLElement) ||
+            !(list instanceof globalThis.HTMLElement)
+          ) {
+            historyLoadingObservations.unavailable += 1;
+            historyLoadingViolations.unavailableHistory += 1;
+          } else {
+            const busyValue = list.getAttribute("aria-busy");
+            const rowCount = list.querySelectorAll("button[data-thread-id]").length;
+            const busy = busyValue === "true";
+            if (busyValue !== null && busyValue !== "true" && busyValue !== "false") {
+              historyLoadingObservations.unavailable += 1;
+              historyLoadingViolations.invalidBusyValue += 1;
+            } else {
+              const branch = busy
+                ? rowCount === 0
+                  ? "busyEmpty"
+                  : "busyWithRows"
+                : rowCount === 0
+                  ? "idleEmpty"
+                  : "idleWithRows";
+              historyLoadingObservations[branch] += 1;
+              const spinners = history.querySelectorAll(".ja-navigation-history-loading");
+              const spinner = spinners.item(0);
+              const shouldShowSpinner = busy && rowCount === 0;
+              if (shouldShowSpinner) {
+                if (!(spinner instanceof globalThis.HTMLElement)) {
+                  historyLoadingViolations.missingExpectedSpinner += 1;
+                } else {
+                  if (!visible(spinner)) historyLoadingViolations.invisibleExpectedSpinner += 1;
+                  if (
+                    spinner.parentElement !== heading ||
+                    spinner.closest(".ja-navigation-history-list") !== null
+                  ) {
+                    historyLoadingViolations.misplacedExpectedSpinner += 1;
+                  }
+                }
+                if (spinners.length > 1) historyLoadingViolations.multipleSpinners += 1;
+              } else if (spinners.length > 0) {
+                if (busy) historyLoadingViolations.unexpectedSpinnerWhileCachedBusy += 1;
+                else historyLoadingViolations.unexpectedSpinnerWhileIdle += 1;
+              }
+            }
+          }
           if (/正在读取(?:会话|历史)/u.test(list?.textContent ?? "")) legacyPlaceholderSeen = true;
         };
         // 用浏览器 paint 时钟观察切换中实际可见的 Timeline；DOM mutation 本身可能在一帧内
@@ -737,9 +1278,10 @@ async function measureProjectSwitch(page, displayName, threadId, marker, mode, s
             durationMs: globalThis.performance.now() - startedAt,
             timelineIdentity: identity === expectedThreadId,
             timelineNonEmpty: timeline.querySelectorAll(".ja-chat-timeline__row").length > 0,
-            spinnerSeen,
-            spinnerInRecentHeading,
-            spinnerOutsideHistoryList,
+            historyLoading: {
+              observations: historyLoadingObservations,
+              violations: historyLoadingViolations,
+            },
             legacyPlaceholderSeen,
             blankFrameCount,
             paintFrameCount,
@@ -859,8 +1401,9 @@ async function measureSwitches(page, projects, markers, strictIdentity, samples,
 }
 
 /**
- * 执行完整真实窗口场景，并发布只含脱敏事实的 JSON；strict after 失败时仍由外层 runner
- * 写入失败报告并按既有 runProduction 所有权保留隔离 profile 供诊断。
+ * @author kongweiguang
+ * 执行真实窗口场景并返回完整只读证据；Native runtime identity 只取自共享启动层已验证的产物，
+ * 不在 driver 中猜测或重复散列，最终边界一致性由 runProduction 接管报告前的门禁闭合。
  */
 export async function runWorkspaceSwitchWebView2({
   page,
@@ -870,15 +1413,23 @@ export async function runWorkspaceSwitchWebView2({
   phase = "after",
   baseline,
   maven,
+  nativeImageIdentity,
 }) {
   const strictIdentity = phase === "after";
   await mkdir(evidenceDirectory, { recursive: true });
   const pageErrors = [];
+  const threadSeenDiagnostics = {
+    probeInstalled: true,
+    invocations: [],
+    warningAppearanceCount: 0,
+    warningEverSeen: false,
+    warningVisibleAtEnd: false,
+  };
   page.on("pageerror", (error) => pageErrors.push(String(error?.message ?? error).slice(0, 500)));
   page.on("console", (message) => {
     if (message.type() === "error") pageErrors.push(message.text().slice(0, 500));
   });
-  await page.context().addInitScript(installReviewInvokeProbe);
+  await page.context().addInitScript(createWorkspaceSwitchInvokeProbeBootstrap());
   await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
   await waitForApplication(page);
   const secondary = await createSecondaryWorkspace(workspaceRoot);
@@ -904,6 +1455,8 @@ export async function runWorkspaceSwitchWebView2({
     evidenceDirectory,
     Date.now() + 10 * 60_000,
   );
+  await waitForThreadSeenSettled(page);
+  await collectThreadSeenDiagnostics(page, threadSeenDiagnostics);
   await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
   await waitForApplication(page);
   await waitForProjectCatalog(page, 60_000);
@@ -917,6 +1470,8 @@ export async function runWorkspaceSwitchWebView2({
     evidenceDirectory,
   );
   const hiddenAfter = await reviewInvokeCounts(page);
+  await waitForThreadSeenSettled(page);
+  await collectThreadSeenDiagnostics(page, threadSeenDiagnostics);
   const hiddenReviewSnapshotDelta =
     Number(hiddenAfter.ja_review_snapshot?.start ?? 0) - Number(hiddenBefore.ja_review_snapshot?.start ?? 0);
   const switchRecords = [...switches.aToB, ...switches.bToA];
@@ -924,11 +1479,19 @@ export async function runWorkspaceSwitchWebView2({
     aToB: summarize(switches.aToB.map((entry) => entry.durationMs)),
     bToA: summarize(switches.bToA.map((entry) => entry.durationMs)),
   };
-  const spinnerRecords = switchRecords.map((entry) => entry);
-  const spinnerLegacyPlaceholder = spinnerRecords.some((entry) => entry.legacyPlaceholderSeen);
-  const spinnerInRecentHeading = spinnerRecords.every(
-    (entry) => entry.spinnerSeen && entry.spinnerInRecentHeading && entry.spinnerOutsideHistoryList,
-  );
+  const historyLoading = {
+    observations: Object.fromEntries(HISTORY_LOADING_OBSERVATION_KEYS.map((key) => [key, 0])),
+    violations: Object.fromEntries(HISTORY_LOADING_VIOLATION_KEYS.map((key) => [key, 0])),
+  };
+  for (const entry of switchRecords) {
+    for (const key of HISTORY_LOADING_OBSERVATION_KEYS) {
+      historyLoading.observations[key] += entry.historyLoading.observations[key];
+    }
+    for (const key of HISTORY_LOADING_VIOLATION_KEYS) {
+      historyLoading.violations[key] += entry.historyLoading.violations[key];
+    }
+  }
+  const spinnerLegacyPlaceholder = switchRecords.some((entry) => entry.legacyPlaceholderSeen);
   const explicitThreadIdentity = switchRecords.every((entry) => entry.timelineIdentity);
   const blankFrameCount = switchRecords.reduce((total, entry) => total + entry.blankFrameCount, 0);
   const paintFrameCount = switchRecords.reduce((total, entry) => total + entry.paintFrameCount, 0);
@@ -964,9 +1527,13 @@ export async function runWorkspaceSwitchWebView2({
     runtime: {
       platform: process.platform,
       surface: "tauri_webview2",
-      boundary: "jvm_jar",
-      nativeImageVerified: false,
-      toolchain: { jdkMajor: 25, mavenJavaMajor: maven.javaMajor, nodeMajor: 24, pnpm: "10.33.0" },
+      boundary: nativeImageIdentity === undefined ? "jvm_jar" : "native_sidecar",
+      nativeImageVerified: nativeImageIdentity !== undefined,
+      nativeImage: nativeImageIdentity,
+      toolchain:
+        nativeImageIdentity === undefined
+          ? { jdkMajor: 25, mavenJavaMajor: maven.javaMajor, nodeMajor: 24, pnpm: "10.33.0" }
+          : { nodeMajor: 24, pnpm: "10.33.0" },
     },
     provider: {
       kind: "deterministic_loopback",
@@ -992,9 +1559,10 @@ export async function runWorkspaceSwitchWebView2({
       explicitThreadIdentity,
       scrollRestored,
       spinnerLegacyPlaceholder,
-      spinnerInRecentHeading,
+      historyLoading,
       hiddenReviewSnapshotDelta,
       pageErrors: pageErrors.length,
+      threadSeen: threadSeenDiagnostics,
       persistenceReload: true,
       sampleCount: switchRecords.length,
     },
@@ -1005,26 +1573,6 @@ export async function runWorkspaceSwitchWebView2({
       "workspace-switch-a-restored.png",
     ],
   };
-  if (phase === "after") {
-    assert.equal(
-      report.correctness.hiddenReviewSnapshotDelta,
-      0,
-      `hiddenReviewSnapshotDelta=${report.correctness.hiddenReviewSnapshotDelta}`,
-    );
-    assert.equal(
-      report.correctness.noBlankTimeline,
-      true,
-      `noBlankTimeline=${report.correctness.noBlankTimeline} blankFrameCount=${report.correctness.blankFrameCount} paintFrameCount=${report.correctness.paintFrameCount}`,
-    );
-    assert.equal(report.correctness.blankFrameCount, 0, `blankFrameCount=${report.correctness.blankFrameCount}`);
-    assert.ok(report.correctness.paintFrameCount > 0, `paintFrameCount=${report.correctness.paintFrameCount}`);
-    assert.equal(report.correctness.explicitThreadIdentity, true, `explicitThreadIdentity=${report.correctness.explicitThreadIdentity}`);
-    assert.equal(report.correctness.scrollRestored, true, `scrollRestored=${report.correctness.scrollRestored}`);
-    assert.equal(report.correctness.spinnerLegacyPlaceholder, false, `spinnerLegacyPlaceholder=${report.correctness.spinnerLegacyPlaceholder}`);
-    assert.equal(report.correctness.spinnerInRecentHeading, true, `spinnerInRecentHeading=${report.correctness.spinnerInRecentHeading}`);
-    assert.equal(report.correctness.pageErrors, 0, `pageErrors=${report.correctness.pageErrors}`);
-  }
-  validateWorkspaceSwitchReport(report);
   return report;
 }
 
@@ -1047,8 +1595,8 @@ export async function validateMavenToolchain(javaHome) {
   });
   const javaOutput = `${javaVersion.stdout}\n${javaVersion.stderr}`;
   if (!/version\s+"25(?:[.]|\s)/iu.test(javaOutput)) throw new Error("JAVA_HOME must resolve JDK 25");
-  // Windows .cmd wrappers are launched through the host PowerShell so Node does not
-  // return EINVAL on installations where cmd shims are not directly executable.
+  // Windows .cmd 包装器通过宿主 PowerShell 启动，
+  // 避免在 cmd 脚本不能直接执行的环境中由 Node 返回 EINVAL。
   const { stdout, stderr } = await execFileAsync("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", "& mvn.cmd -version"], {
     env: environment,
     windowsHide: true,
@@ -1117,12 +1665,17 @@ export async function validateEmbeddedJarVersion(jarPath, javaHome) {
 }
 
 /**
- * CLI 只输出稳定阶段标记，详细性能和 UI 事实写入 evidence JSON；失败不吞掉 runner 的退出码。
+ * @author kongweiguang
+ * JAR 才读取内嵌版本并校验 Maven；Native 产物使用共享启动层的无 fallback 指纹验证，报告门禁在其执行身份补齐后运行。
+ * driver 的局部采样先留在 partialReport，门禁失败时外层只补写已完成证据并沿用失败现场保留边界。
  */
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  const embeddedJar = await validateEmbeddedJarVersion(options.jar, options.javaHome);
-  const maven = await validateMavenToolchain(options.javaHome);
+  const nativeSidecar = options.nativeExecutable !== undefined;
+  const embeddedJar = nativeSidecar
+    ? undefined
+    : await validateEmbeddedJarVersion(options.jar, options.javaHome);
+  const maven = nativeSidecar ? undefined : await validateMavenToolchain(options.javaHome);
   if (options.preflightOnly) {
     const toolchain = await validateToolchain(options);
     const edgeDriver = options.edgeDriver === undefined ? undefined : await validateEdgeDriver(options.edgeDriver);
@@ -1131,32 +1684,53 @@ async function main() {
   }
   const baseline = options.baselineReport === undefined ? undefined : await readBaselineReport(options.baselineReport);
   const fixture = await startSwitchFixture();
+  let partialReport;
   try {
-    await runProduction({
-      ...options,
-      hiddenWindow: true,
-      prewarmWebview: true,
-      providerBaseUrl: fixture.baseUrl,
-      ignoredFiles: Math.max(options.ignoredFiles, REQUIRED_IGNORED_FILES),
-      untrackedFiles: Math.max(options.untrackedFiles, REQUIRED_UNTRACKED_FILES),
-      fixture: "full",
-      preserveFailedProfile: true,
-      reportFileName: "workspace-switch-webview2-report.json",
-      driver: (driverOptions) =>
-        runWorkspaceSwitchWebView2({
-          ...driverOptions,
-          samples: options.samples,
-          phase: options.phase,
-          baseline,
-          maven: { ...maven, embeddedJar },
-        }),
-      validateReport: validateWorkspaceSwitchReport,
-    });
-    const expectedAttempts = HISTORY_TURNS * 2;
-    const actualAttempts = fixture.attempts.filter((attempt) => attempt.status === 200).length;
-    if (actualAttempts < expectedAttempts)
-      throw new Error(`loopback fixture attempts incomplete: ${actualAttempts}/${expectedAttempts}`);
-    console.log(`JA_WORKSPACE_SWITCH_WEBVIEW2_${options.phase.toUpperCase()} ${JSON.stringify({ samples: options.samples })}`);
+    /** @author kongweiguang 先捕获原始测量对象；mode/identity 门禁由共享 runner 补齐 execution 后调用。 */
+    const runValidatedDriver = async (driverOptions) => {
+      const report = await runWorkspaceSwitchWebView2({
+        ...driverOptions,
+        samples: options.samples,
+        phase: options.phase,
+        baseline,
+        maven: nativeSidecar ? undefined : { ...maven, embeddedJar },
+      });
+      partialReport = report;
+      const expectedAttempts = HISTORY_TURNS * 2;
+      const actualAttempts = fixture.attempts.filter((attempt) => attempt.status === 200).length;
+      if (actualAttempts < expectedAttempts)
+        throw new Error(
+          `loopback fixture attempts incomplete: ${actualAttempts}/${expectedAttempts}`,
+        );
+      return report;
+    };
+    try {
+      await runProduction({
+        ...options,
+        hiddenWindow: true,
+        prewarmWebview: true,
+        providerBaseUrl: fixture.baseUrl,
+        ignoredFiles: Math.max(options.ignoredFiles, REQUIRED_IGNORED_FILES),
+        untrackedFiles: Math.max(options.untrackedFiles, REQUIRED_UNTRACKED_FILES),
+        fixture: "full",
+        preserveFailedProfile: true,
+        reportFileName: "workspace-switch-webview2-report.json",
+        driver: runValidatedDriver,
+        validateReport: validateWorkspaceSwitchReport,
+      });
+    } catch (error) {
+      if (partialReport !== undefined) {
+        await writeFile(
+          join(options.evidenceDirectory, "workspace-switch-webview2-report.json"),
+          `${JSON.stringify(workspaceSwitchFailureReport(partialReport, error), null, 2)}\n`,
+          "utf8",
+        );
+      }
+      throw error;
+    }
+    console.log(
+      `JA_WORKSPACE_SWITCH_WEBVIEW2_${options.phase.toUpperCase()} ${JSON.stringify({ samples: options.samples })}`,
+    );
   } finally {
     await fixture.close();
   }

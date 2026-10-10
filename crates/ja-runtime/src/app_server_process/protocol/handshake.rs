@@ -5,7 +5,7 @@
 //!
 //! 校验独立于进程监督，避免协议 schema 与 child 生命周期清理互相耦合。
 
-use super::catalog::{V1_CLIENT_METHODS, V1_EVENT_METHODS};
+use super::catalog::{CLIENT_METHODS, EVENT_METHODS};
 use super::frame::RpcFrame;
 use super::limits::{Limits, MIN_MAX_FRAME_BYTES};
 use crate::app_server_process::error::AppServerProcessError;
@@ -21,32 +21,22 @@ const READY_TOKEN_HEX_BYTES: usize = READY_TOKEN_BYTES * 2;
 pub(crate) const MAX_READY_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 构造不携带业务配置的 v1 initialize。配置、凭据和 workspace 解析均由
+/// 构造不携带业务配置的 v2 initialize。配置、凭据和 workspace 解析均由
 /// Ja App Server 自己读取/持有；Rust 只协商 transport capability 与资源预算。
 pub(crate) fn default_initialize_params(limits: &Limits) -> Value {
     serde_json::json!({
-        "protocolMajor": 1,
+        "protocolMajor": 2,
         "protocolMinor": 0,
         "clientVersion": "ja-host",
         "capabilities": {
-            "methods": V1_CLIENT_METHODS,
-            "events": V1_EVENT_METHODS,
+            "methods": CLIENT_METHODS,
+            "events": EVENT_METHODS,
             "accessModes": ["approval_required", "full_access"],
             "collaborationModes": ["default", "plan"],
-            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"]
+            "features": ["task_threads", "plan", "interaction"]
         },
         "limits": limits.to_value(),
     })
-}
-
-/// 检查启动参数中的凭据标记；环境变量不经过此规则，避免把正常用户环境误判为非法。
-pub(crate) fn contains_secret_marker(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    [
-        "secret", "token", "password", "api_key", "apikey", "bearer", "cookie",
-    ]
-    .iter()
-    .any(|marker| value.contains(marker))
 }
 
 /// 在启动前完整验证 host initialize，保证握手发送的声明就是 session 实际使用的预算。
@@ -57,7 +47,7 @@ pub(crate) fn validate_initialize_params(
     let object = value
         .as_object()
         .ok_or(AppServerProcessError::InvalidConfig)?;
-    if object.get("protocolMajor").and_then(Value::as_i64) != Some(1) {
+    if object.get("protocolMajor").and_then(Value::as_i64) != Some(2) {
         return Err(AppServerProcessError::InvalidConfig);
     }
     if object.get("protocolMinor").and_then(Value::as_i64) != Some(0) {
@@ -213,7 +203,7 @@ pub(crate) fn validate_capabilities(value: Option<&Value>) -> Result<(), AppServ
         object.get("features"),
         3,
         32,
-        Some(&["task_threads_v1", "plan_goal_v1", "interaction_v1"]),
+        Some(&["task_threads", "plan", "interaction"]),
     )?;
     if object
         .get("features")

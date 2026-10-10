@@ -79,6 +79,34 @@ fn timeout_cancel_and_close_are_bounded_terminal_paths() {
     }
 }
 
+/// Host close cancels every admitted waiter without closing the registry, so its own ACK can still register.
+#[test]
+fn cancel_all_preserves_capacity_and_classifies_late_responses() {
+    let mut pending = PendingRegistry::new(2, 4).unwrap();
+    let first = pending
+        .register("c:first", Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let second = pending
+        .register("c:second", Instant::now() + Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(pending.cancel_all(), 2);
+    assert_eq!(first.recv().unwrap(), Err(AppServerProcessError::Cancelled));
+    assert_eq!(second.recv().unwrap(), Err(AppServerProcessError::Cancelled));
+    assert_eq!(
+        pending.resolve(response("c:first")),
+        ResolveDisposition::LateResponse
+    );
+    let close = pending
+        .register("c:close", Instant::now() + Duration::from_secs(1))
+        .expect("lifecycle close retains request capacity");
+    assert_eq!(
+        pending.resolve(response("c:close")),
+        ResolveDisposition::Delivered
+    );
+    assert_eq!(close.recv().unwrap().unwrap().id(), "c:close");
+}
+
 /// 压缩等待不受旧请求 deadline 影响，仍受 active 容量、明确结果和 Session 关闭收口。
 #[test]
 fn compaction_pending_waits_for_result_or_close_without_expiring() {

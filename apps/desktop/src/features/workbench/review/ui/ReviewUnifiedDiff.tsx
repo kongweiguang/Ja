@@ -14,6 +14,7 @@ import {
 } from "react";
 import { useUiFontSize } from "@/shared/hooks/useInterfacePreferencesValue";
 import { CopyTextButton } from "@/shared/ui/CopyTextButton";
+import { observeElementOffsetWhileActive } from "@/shared/ui/observeElementOffsetWhileActive";
 import { IconButton } from "@/shared/ui/primitives";
 import {
   createReviewSyntaxHighlighter,
@@ -51,8 +52,24 @@ export interface ReviewUnifiedDiffProps {
   readonly file: ReviewUnifiedDiffFile;
   readonly revision: string;
   readonly viewMode?: "unified" | "split";
+  readonly focusLocation?: {
+    readonly side: "base" | "current";
+    readonly line: number;
+    readonly token: string;
+  };
   readonly onCopyText?: (text: string) => Promise<void>;
   readonly renderHunkActions?: (hunk: ReviewUnifiedDiffHunk, index: number) => ReactNode;
+}
+
+/** 统一按 base/current 对应 old/new 行号，避免报告位置在拆分视图中反向匹配。 */
+function matchesFindingLine(
+  line: ReviewUnifiedDiffLine | null,
+  location: ReviewUnifiedDiffProps["focusLocation"],
+  side: "old" | "new",
+): boolean {
+  if (line === null || location === undefined) return false;
+  const lineNumber = location.side === "base" ? line.oldLine : line.newLine;
+  return lineNumber === location.line && (side === "old") === (location.side === "base");
 }
 
 interface DiffHunkProjection {
@@ -415,12 +432,13 @@ interface HighlighterLifetime {
 
 /**
  * 统一承载 Git 与 Turn 的单文件 Unified Diff；只消费既有结构化事实，纵向虚拟化限制
- * 1 MiB/10,000 行场景的 DOM 数量，同时保留代码长行的原生横向滚动。
+ * 1 MiB/10,000 行场景的 DOM 数量，同时保留代码长行的原生横向滚动；卸载时屏蔽 core debounce 尾回调。
  */
 export function ReviewUnifiedDiff({
   file,
   revision,
   viewMode = "unified",
+  focusLocation,
   onCopyText,
   renderHunkActions,
 }: ReviewUnifiedDiffProps): ReactElement {
@@ -464,6 +482,7 @@ export function ReviewUnifiedDiff({
   const virtualizer = useVirtualizer({
     // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
     useFlushSync: false,
+    observeElementOffset: observeElementOffsetWhileActive,
     count: rows.length,
     getScrollElement: () => viewportRef.current,
     estimateSize: (index) =>
@@ -590,6 +609,34 @@ export function ReviewUnifiedDiff({
     setExpandedState({ fileIdentity, keys: next });
   };
 
+  /** 展开并滚动至 report 的行号；若该行位于折叠上下文中，先展开对应区间再定位。 */
+  const focusSide = focusLocation?.side;
+  const focusLine = focusLocation?.line;
+  useEffect(() => {
+    if (focusSide === undefined || focusLine === undefined) return;
+    const matches = (line: ReviewUnifiedDiffLine | null): boolean =>
+      line !== null && (focusSide === "base" ? line.oldLine : line.newLine) === focusLine;
+    const targetIndex = rows.findIndex((row) =>
+      row.kind === "line"
+        ? matches(row.line)
+        : row.kind === "split-line" && (matches(row.oldLine) || matches(row.newLine)),
+    );
+    if (targetIndex >= 0) {
+      virtualizer.scrollToIndex(targetIndex, { align: "center" });
+      return;
+    }
+    const collapsed = rows.find(
+      (row) => row.kind === "context-toggle" && row.range.lines.some((line) => matches(line)),
+    );
+    if (collapsed?.kind === "context-toggle") {
+      setExpandedState((current) => {
+        const next = new Set(current.fileIdentity === fileIdentity ? current.keys : EMPTY_SET);
+        next.add(collapsed.range.key);
+        return { fileIdentity, keys: next };
+      });
+    }
+  }, [fileIdentity, focusLine, focusSide, focusLocation?.token, rows, virtualizer]);
+
   return (
     <section
       ref={containerRef}
@@ -645,6 +692,18 @@ export function ReviewUnifiedDiff({
                 data-index={virtualRow.index}
                 data-review-diff-row-kind={row.kind === "line" ? row.line.kind : row.kind}
                 data-review-hunk-index={row.kind === "hunk" ? row.hunkIndex : undefined}
+                data-review-finding-target={
+                  focusLocation !== undefined &&
+                  (row.kind === "line"
+                    ? (focusLocation.side === "base" ? row.line.oldLine : row.line.newLine) ===
+                      focusLocation.line
+                    : row.kind === "split-line" &&
+                      (focusLocation.side === "base"
+                        ? row.oldLine?.oldLine
+                        : row.newLine?.newLine) === focusLocation.line)
+                    ? "true"
+                    : undefined
+                }
                 style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
                 {row.kind === "hunk" ? (
@@ -712,6 +771,9 @@ export function ReviewUnifiedDiff({
                         className={`ja-review-unified-diff-cell${line === null ? " is-empty" : ""}`}
                         data-review-diff-side={side}
                         data-review-diff-cell-kind={line?.kind ?? "empty"}
+                        data-review-finding-target={
+                          matchesFindingLine(line, focusLocation, side) ? "true" : undefined
+                        }
                         aria-label={line === null ? lineNumber.label : undefined}
                       >
                         <span

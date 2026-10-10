@@ -79,7 +79,7 @@ const WorkspaceSearchInputSchema = z
   })
   .strict();
 
-/** 封闭 target id 防止 renderer 把 open-with 扩张为通用 RPC。 */
+/** 封闭目标 ID，防止渲染层将 open-with 扩展成通用 RPC。 */
 const WorkspaceOpenTargetSchema = z.enum([
   "vscode",
   "visual_studio",

@@ -5,7 +5,12 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 const sourceRoots = [
-  "app-server/src/main",
+  "ja-agent/ja-agent-core/src/main",
+  "ja-agent/extensions/ja-agent-store-local/src/main",
+  "ja-agent/extensions/ja-agent-store-pg/src/main",
+  "ja-agent/extensions/ja-agent-skills-local/src/main",
+  "ja-agent/extensions/ja-agent-skills-pg/src/main",
+  "ja-agent/ja-app-server/src/main",
   "apps/desktop/src",
   "crates/ja-runtime/src",
   "apps/cli/src",
@@ -13,11 +18,16 @@ const sourceRoots = [
 ];
 const textExtensions = new Set([".java", ".rs", ".ts", ".tsx", ".json", ".xml", ".sql"]);
 const retiredTokens =
-  /\b(?:StorageBaseline|DatabaseMigrationRecovery|LEGACY_UNAVAILABLE|legacy_unavailable|profileOrigin)\b|ja-context-v[2-9]\d*\b|ja-context-summary-v[2-9]\d*\b|ja-ui-preferences-v(?:[2-9]\d*|1\d+)\b|__JA_TIMELINE_STORE_V(?:[2-9]\d*|1\d+)__/;
+  /\b(?:StorageBaseline|DatabaseMigrationRecovery|LEGACY_UNAVAILABLE|legacy_unavailable|profileOrigin|LegacySessionWorkspaceMigration|LegacyAgentStoreBackfill)\b|LEGACY_SHARED|legacy_shared|legacySharedWorkspaceId|assistant_public_text|ja_agent_store_[a-z0-9_]+|JA-RPC\s+v1|contracts\/ja-rpc\/v1|contracts\/golden\/v1|ja-rpc-v1/iu;
 
-/** 只约束生产实现，不禁止负例测试保存旧输入，也不混淆第三方协议版本。 */
+/** 只扫描有效生产源码；注释与测试负例保留历史说明，不触发兼容实现拦截。 */
 export function initialBaselineSourceViolation(source) {
-  return retiredTokens.exec(source)?.[0] ?? null;
+  const implementation = source
+    .replace(/\/\*[\s\S]*?\*\//gu, "")
+    .replace(/<!--[\s\S]*?-->/gu, "")
+    .replace(/^[\t ]*\/\/.*$/gmu, "")
+    .replace(/^[\t ]*--.*$/gmu, "");
+  return retiredTokens.exec(implementation)?.[0] ?? null;
 }
 
 /** 仅遍历明确的源码目录且不跟随链接，避免扫描用户数据、缓存或构建产物。 */
@@ -31,45 +41,20 @@ async function sourceFiles(directory) {
   return files;
 }
 
-/** 只允许逐项审定的初始化、恢复、Workspace 身份与执行回执迁移，禁止加入未审定转换。 */
+/** 固定实际注册的 V1 kernel 基线和 wire major，避免历史升级链或备用基线重新进入新版本。 */
 export async function checkInitialBaseline(root) {
   const violations = [];
-  const migrationRoot = path.join(root, "app-server/src/main/resources/db/migration");
+  const migrationRoot = path.join(root, "ja-agent/ja-app-server/src/main/resources/db/migration");
   const migrations = await readdir(migrationRoot);
-  const expectedMigrations = [
-    "V1__kernel.sql",
-    "V2__thread_subagent_policies.sql",
-    "V3__subagent_reasoning.sql",
-    "V4__conversation_recovery_usage_projection.sql",
-    "V6__conversation_current_path_reask.sql",
-    "V7__session_workspace_identity.sql",
-    "V8__client_operation_receipts.sql",
-    "V9__goal_progress_counter.sql",
-    "V10__unbounded_round_counters.sql",
-    "V11__execution_cursor_without_budget.sql",
-    "V12__drop_execution_budgets.sql",
-    "V13__plan_evaluation_attempts.sql",
-    "V14__assistant_public_text_pages.sql",
-    "V15__input_operation_receipts.sql",
-  ];
-  if (
-    migrations.length !== expectedMigrations.length ||
-    expectedMigrations.some((name) => !migrations.includes(name))
-  ) {
-    violations.push("数据库迁移必须只包含已登记的 V1-V15 脚本");
+  if (migrations.length !== 1 || migrations[0] !== "V1__kernel.sql") {
+    violations.push("0.2 数据库必须只从 V1__kernel.sql 建立新基线");
   }
-  const protocolEntries = await readdir(path.join(root, "contracts/ja-rpc"), {
-    withFileTypes: true,
-  });
-  if (!protocolEntries.some((entry) => entry.isDirectory() && entry.name === "v1")) {
-    violations.push("缺少 JA-RPC 首版 v1 合同目录");
-  }
-  if (
-    protocolEntries.some(
-      (entry) => entry.isDirectory() && /^v\d+$/.test(entry.name) && entry.name !== "v1",
-    )
-  ) {
-    violations.push("JA-RPC 只允许首版 v1 合同目录");
+  for (const relativeRoot of ["contracts/ja-rpc", "contracts/golden"]) {
+    const entries = await readdir(path.join(root, relativeRoot), { withFileTypes: true });
+    const versions = entries.filter((entry) => entry.isDirectory() && /^v\d+$/.test(entry.name));
+    if (versions.length !== 1 || versions[0]?.name !== "v2") {
+      violations.push(`${relativeRoot} 必须只包含 v2 合同语料`);
+    }
   }
   for (const relativeRoot of sourceRoots) {
     for (const file of await sourceFiles(path.join(root, relativeRoot))) {

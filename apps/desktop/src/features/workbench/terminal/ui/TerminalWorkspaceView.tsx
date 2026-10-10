@@ -1,9 +1,10 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Columns2, Plus, RotateCcw, Rows2, X } from "lucide-react";
+import { Columns2, MoreHorizontal, Plus, RotateCcw, Rows2, X } from "lucide-react";
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -21,10 +22,7 @@ import type {
   TerminalWorkspaceViewController,
 } from "../application";
 import {
-  MAX_SPLIT_RATIO,
   MAX_TERMINAL_RELATIVE_CWD_LENGTH,
-  MIN_SPLIT_RATIO,
-  clampSplitRatio,
   isValidTerminalRelativeCwd,
   type TerminalLayoutNode,
   type TerminalPaneLayout,
@@ -33,6 +31,12 @@ import {
   type TerminalTabCreateOptions,
   type TerminalTabLayout,
 } from "../domain";
+import {
+  clampTerminalSplitRatio,
+  terminalSplitGeometry,
+  type TerminalSplitGeometry,
+  type TerminalSplitMeasurement,
+} from "./terminalSplitGeometry";
 import {
   IconButton,
   MenuItem,
@@ -53,6 +57,54 @@ const TERMINAL_PROFILE_LABELS: Readonly<Record<TerminalProfile, string>> = {
   zsh: "Zsh",
   fish: "Fish",
 };
+
+/**
+ * 将分屏 CSS 几何换算为像素，兼容 computed style 返回 px、rem 或 em；约束值来源于
+ * 当前样式，避免在 TypeScript 中另存一份 2rem 或句柄尺寸常量。
+ */
+function terminalCssPixels(value: string, element: Element): number {
+  const match = /^(\d+(?:\.\d+)?)(px|rem|em)?$/u.exec(value.trim());
+  if (match === null) return 0;
+  const amount = Number(match[1]);
+  const unit = match[2] ?? "px";
+  if (!Number.isFinite(amount)) return 0;
+  if (unit === "px") return amount;
+
+  const remSize = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  if (unit === "rem") return amount * remSize;
+  const elementSize = Number.parseFloat(getComputedStyle(element).fontSize) || remSize;
+  return amount * elementSize;
+}
+
+/**
+ * 从活动分屏实际 DOM 读取轴长、句柄厚度和 CSS 最小子项；隐藏窗格不为测量安装观察器。
+ */
+function readTerminalSplitMeasurement(
+  container: HTMLElement,
+  orientation: TerminalSplitLayout["orientation"],
+): TerminalSplitMeasurement | undefined {
+  const [firstChild, handle] = Array.from(container.children);
+  if (firstChild === undefined || handle === undefined) return undefined;
+
+  const horizontal = orientation === "horizontal";
+  const rect = container.getBoundingClientRect();
+  const handleRect = handle.getBoundingClientRect();
+  const axisExtent = horizontal ? rect.width : rect.height;
+  const measuredHandleExtent = horizontal ? handleRect.width : handleRect.height;
+  const splitStyle = getComputedStyle(container);
+  const handleBasis = terminalCssPixels(
+    splitStyle.getPropertyValue("--ja-terminal-split-handle-size"),
+    container,
+  );
+  const handleExtent = measuredHandleExtent > 0 ? measuredHandleExtent : handleBasis;
+  const paneMinimumExtent = terminalCssPixels(
+    splitStyle.getPropertyValue("--ja-terminal-split-pane-minimum"),
+    container,
+  );
+  if (!Number.isFinite(axisExtent) || axisExtent <= 0) return undefined;
+
+  return { axisExtent, handleExtent, paneMinimumExtent };
+}
 
 interface TerminalContextMenuPosition {
   x: number;
@@ -461,7 +513,7 @@ function TerminalNodeView({
 }
 
 /**
- * 保持嵌套分屏几何独立，使每个手柄只更新自己的 splitId；短暂拖放失败只传给
+ * 每个 split 独立测量并应用递归子树约束，只更新自己的 splitId；短暂拖放失败只传给
  * 实际拥有失败原生操作的窗格。
  */
 function TerminalSplitView({
@@ -481,28 +533,71 @@ function TerminalSplitView({
   dropFailure?: TerminalDropFailure;
   onDismissDropFailure: (paneId: string) => void;
 }): ReactElement {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [measurement, setMeasurement] = useState<TerminalSplitMeasurement>();
   const [preview, setPreview] = useState<{ splitId: string; ratio: number }>();
-  const visibleRatio = preview?.splitId === split.splitId ? preview.ratio : split.ratio;
-  const firstBasis = `${visibleRatio * 100}%`;
+  const preferredRatio = preview?.splitId === split.splitId ? preview.ratio : split.ratio;
+  const visibleMeasurement = active ? measurement : undefined;
+  const geometry = terminalSplitGeometry(
+    split,
+    visibleMeasurement ?? { axisExtent: 0, handleExtent: 0, paneMinimumExtent: 0 },
+    preferredRatio,
+  );
+  const firstBasis =
+    visibleMeasurement === undefined ? `${geometry.ratio * 100}%` : `${geometry.firstExtent}px`;
+  const releasePaneMinimum = visibleMeasurement !== undefined && !geometry.fitsMinimums;
+
+  /** 只测活动分屏的 DOM 几何；ResizeObserver 不参与布局或持久化决策。 */
+  useLayoutEffect(() => {
+    if (!active) return;
+    const container = containerRef.current;
+    if (container === null) return;
+
+    const measure = (): void => {
+      const next = readTerminalSplitMeasurement(container, split.orientation);
+      if (next === undefined) return;
+      setMeasurement((current) =>
+        current !== undefined &&
+        Math.abs(current.axisExtent - next.axisExtent) < 0.1 &&
+        Math.abs(current.handleExtent - next.handleExtent) < 0.1 &&
+        Math.abs(current.paneMinimumExtent - next.paneMinimumExtent) < 0.1
+          ? current
+          : next,
+      );
+    };
+
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [active, split.orientation, split.splitId]);
 
   /** 只更新 renderer 本地几何，避免高频 pointer 事件写入 localStorage。 */
   const previewRatio = (ratio: number | undefined): void => {
     setPreview(ratio === undefined ? undefined : { splitId: split.splitId, ratio });
   };
 
-  /** pointer 或键盘事务结束时只提交一次最终有界比例。 */
+  /** pointer 或键盘事务结束时提交用户偏好，窗口临时约束仍只在渲染时应用。 */
   const commitRatio = (ratio: number): void => {
     controller.setSplitRatio(tab.tabId, split.splitId, ratio);
     setPreview(undefined);
   };
 
   return (
-    <div className={`ja-terminal-split is-${split.orientation}`}>
+    <div className={`ja-terminal-split is-${split.orientation}`} ref={containerRef}>
       <div
         className="ja-terminal-split-child"
-        style={
-          split.orientation === "horizontal" ? { flexBasis: firstBasis } : { flexBasis: firstBasis }
-        }
+        style={{
+          flexBasis: firstBasis,
+          flexGrow: 0,
+          flexShrink: 0,
+          ...(releasePaneMinimum
+            ? split.orientation === "horizontal"
+              ? { minWidth: 0 }
+              : { minHeight: 0 }
+            : {}),
+        }}
       >
         <TerminalNodeView
           node={split.first}
@@ -516,11 +611,22 @@ function TerminalSplitView({
       </div>
       <SplitHandle
         split={split}
-        ratio={visibleRatio}
+        ratio={geometry.ratio}
+        geometry={geometry}
+        measurement={visibleMeasurement}
         onPreview={previewRatio}
         onCommit={commitRatio}
       />
-      <div className="ja-terminal-split-child is-rest">
+      <div
+        className="ja-terminal-split-child is-rest"
+        style={
+          releasePaneMinimum
+            ? split.orientation === "horizontal"
+              ? { minWidth: 0 }
+              : { minHeight: 0 }
+            : undefined
+        }
+      >
         <TerminalNodeView
           node={split.second}
           tab={tab}
@@ -536,17 +642,21 @@ function TerminalSplitView({
 }
 
 /**
- * 高频 pointer 几何只留在本地，在 release、capture loss、cancel 或 window blur 时
- * 提交一次持久比例；键盘变化是离散操作，因此立即提交。
+ * 高频 pointer 几何只留在本地并以句柄中心计算可行比例，在 release、cancel 或 blur 时
+ * 提交一次偏好；键盘变化是离散操作，因此立即提交。
  */
 function SplitHandle({
   split,
   ratio,
+  geometry,
+  measurement,
   onPreview,
   onCommit,
 }: {
   split: TerminalSplitLayout;
   ratio: number;
+  geometry: TerminalSplitGeometry;
+  measurement?: TerminalSplitMeasurement;
   onPreview: (ratio: number | undefined) => void;
   onCommit: (ratio: number) => void;
 }): ReactElement {
@@ -556,7 +666,7 @@ function SplitHandle({
   /** React 在拖拽中卸载分屏时只移除全局 listener，不持久化已失效几何。 */
   useEffect(() => () => disposeDragRef.current?.(), []);
 
-  /** 启动一个有界拖拽事务，并安装条带外终止 listener。 */
+  /** 从活动句柄读取约束并保留抓取偏移，避免按下时跳动或把子树拖出父容器。 */
   const onPointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
     if (
       (typeof event.button === "number" && event.button !== 0) ||
@@ -569,16 +679,48 @@ function SplitHandle({
     const rect = container.getBoundingClientRect();
     const extent = split.orientation === "horizontal" ? rect.width : rect.height;
     if (!Number.isFinite(extent) || extent <= 0) return;
+    const measured = readTerminalSplitMeasurement(container, split.orientation) ?? measurement;
+    const dragMeasurement = {
+      axisExtent: extent,
+      handleExtent: measured?.handleExtent ?? 0,
+      paneMinimumExtent: measured?.paneMinimumExtent ?? 0,
+    };
+    const initialGeometry = terminalSplitGeometry(split, dragMeasurement, ratio);
+    if (initialGeometry.availableExtent <= 0) return;
     event.preventDefault();
     const pointerId = event.pointerId;
     const target = event.currentTarget;
-    let latestRatio = clampSplitRatio(ratio);
+    const horizontal = split.orientation === "horizontal";
+    const start = horizontal ? rect.left : rect.top;
+    const pointerCoordinate = horizontal ? event.clientX : event.clientY;
+    const targetRect = target.getBoundingClientRect();
+    const targetExtent = horizontal ? targetRect.width : targetRect.height;
+    const targetStart = horizontal ? targetRect.left : targetRect.top;
+    const handleCenter =
+      targetExtent > 0
+        ? targetStart + targetExtent / 2
+        : start + initialGeometry.firstExtent + dragMeasurement.handleExtent / 2;
+    const grabOffset = pointerCoordinate - handleCenter;
+    let latestRatio = initialGeometry.ratio;
     let finished = false;
 
-    /** 把 pointer 坐标投影到 0.2 至 0.8 的 renderer 预览范围。 */
+    /** 让句柄中心跟随指针，并按扣除句柄后的剩余轴长应用同一可行范围。 */
     const update = (client: number): void => {
-      const offset = split.orientation === "horizontal" ? client - rect.left : client - rect.top;
-      latestRatio = clampSplitRatio(offset / extent);
+      const currentRect = container.getBoundingClientRect();
+      const currentStart = horizontal ? currentRect.left : currentRect.top;
+      const currentExtent = horizontal ? currentRect.width : currentRect.height;
+      const currentGeometry = terminalSplitGeometry(
+        split,
+        { ...dragMeasurement, axisExtent: currentExtent },
+        latestRatio,
+      );
+      if (currentGeometry.availableExtent <= 0) return;
+      const firstExtent = client - grabOffset - currentStart - dragMeasurement.handleExtent / 2;
+      latestRatio = clampTerminalSplitRatio(
+        firstExtent / currentGeometry.availableExtent,
+        currentGeometry.minimumRatio,
+        currentGeometry.maximumRatio,
+      );
       onPreview(latestRatio);
     };
 
@@ -649,8 +791,8 @@ function SplitHandle({
   /** 把 separator 键盘意图映射为一次立即且有界的持久化提交。 */
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>): void => {
     let nextRatio: number | undefined;
-    if (event.key === "Home") nextRatio = MIN_SPLIT_RATIO;
-    else if (event.key === "End") nextRatio = MAX_SPLIT_RATIO;
+    if (event.key === "Home") nextRatio = geometry.minimumRatio;
+    else if (event.key === "End") nextRatio = geometry.maximumRatio;
     else if (
       (split.orientation === "horizontal" && event.key === "ArrowLeft") ||
       (split.orientation === "vertical" && event.key === "ArrowUp")
@@ -663,7 +805,8 @@ function SplitHandle({
       nextRatio = ratio + 0.05;
     if (nextRatio === undefined) return;
     event.preventDefault();
-    onCommit(clampSplitRatio(nextRatio));
+    const next = clampTerminalSplitRatio(nextRatio, geometry.minimumRatio, geometry.maximumRatio);
+    if (next !== ratio) onCommit(next);
   };
 
   return (
@@ -673,9 +816,9 @@ function SplitHandle({
       role="separator"
       aria-orientation={split.orientation === "horizontal" ? "vertical" : "horizontal"}
       aria-label="调整终端分屏比例"
-      aria-valuemin={Math.round(MIN_SPLIT_RATIO * 100)}
-      aria-valuemax={Math.round(MAX_SPLIT_RATIO * 100)}
-      aria-valuenow={Math.round(ratio * 100)}
+      aria-valuemin={geometry.minimumRatio * 100}
+      aria-valuemax={geometry.maximumRatio * 100}
+      aria-valuenow={ratio * 100}
       onPointerDown={onPointerDown}
       onPointerCancel={() => finishDragRef.current?.()}
       onLostPointerCapture={() => finishDragRef.current?.()}
@@ -686,7 +829,7 @@ function SplitHandle({
   );
 }
 
-/** 每个窗格只持有一个 xterm 实例，右键动作复用 controller 并在异步收口后恢复焦点。 */
+/** 每个窗格只持有一个 xterm 实例；窄窗格操作仍复用同一菜单并恢复到可见控件。 */
 function TerminalPaneView({
   pane,
   tab,
@@ -712,6 +855,9 @@ function TerminalPaneView({
   const inputProps = controller.terminalInputProps(pane.paneId);
   const lifecycle = runtime?.lifecycle ?? "dormant";
   const visibleLifecycle = controller.closeAllPending ? "closing" : lifecycle;
+  const profileLabel = terminalProfileLabel(tab.profile);
+  const statusLabel = lifecycleLabel(visibleLifecycle);
+  const paneHeading = `${profileLabel} · ${statusLabel}`;
   const splitAvailable = controller.canSplitPane(tab.tabId, pane.paneId);
   const closing = visibleLifecycle === "closing";
   const canRestart = !closing && (lifecycle === "exited" || lifecycle === "failed");
@@ -728,11 +874,12 @@ function TerminalPaneView({
       ? undefined
       : "已达到每标签 4 个或工作区 8 个终端窗格上限";
   const splitDisabled = splitBlockedReason !== undefined;
-  /** 窗格仍存在时优先返回工具栏；移除后回到当前工作区的活动标签。 */
+  /** 窗格仍存在时回到第一个可见操作；极窄窗格隐藏的按钮不能接收焦点。 */
   const restorePaneFocus = (): void => {
-    const toolbarAction =
-      toolbarRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)");
-    if (toolbarAction?.isConnected) {
+    const toolbarAction = Array.from(
+      toolbarRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [],
+    ).find((button) => button.getClientRects().length > 0);
+    if (toolbarAction !== undefined) {
       toolbarAction.focus();
       return;
     }
@@ -778,12 +925,17 @@ function TerminalPaneView({
       onPointerDown={() => controller.activatePane(tab.tabId, pane.paneId)}
     >
       <header className="ja-terminal-pane-toolbar" ref={toolbarRef} onContextMenu={openContextMenu}>
-        <span className="ja-terminal-pane-label">{terminalProfileLabel(tab.profile)}</span>
+        <span className="ja-terminal-pane-heading" title={paneHeading}>
+          <span className="ja-terminal-pane-label">{profileLabel}</span>
+          <span className="ja-terminal-pane-separator" aria-hidden="true">
+            ·
+          </span>
+          <span className="ja-terminal-pane-state" role="status">
+            {statusLabel}
+          </span>
+        </span>
         <span className="ja-terminal-pane-cwd" title={tab.relativeCwd ?? "工作区根目录"}>
           {tab.relativeCwd ?? "."}
-        </span>
-        <span className="ja-terminal-pane-state" role="status">
-          {lifecycleLabel(visibleLifecycle)}
         </span>
         <div className="ja-terminal-pane-actions">
           <IconButton
@@ -829,6 +981,16 @@ function TerminalPaneView({
             }}
           >
             <X aria-hidden="true" size={14} />
+          </IconButton>
+          <IconButton
+            label={`终端窗格操作：${paneHeading}`}
+            tooltip={`${paneHeading} · 终端窗格操作`}
+            className="ja-terminal-pane-menu-trigger"
+            aria-haspopup="menu"
+            aria-expanded={contextMenu !== undefined}
+            onClick={openContextMenu}
+          >
+            <MoreHorizontal aria-hidden="true" size={14} />
           </IconButton>
         </div>
         {contextMenu === undefined ? null : (

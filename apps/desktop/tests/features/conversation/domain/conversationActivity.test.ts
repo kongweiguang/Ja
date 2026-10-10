@@ -12,12 +12,13 @@ function item(
   phase?: "assistant_progress" | "reasoning_summary",
 ): TimelineItemAdapter {
   return {
+    origin: "native" as const,
     itemId,
     threadId: "thr_current",
     turnId: "turn_current",
     kind,
     status: "completed",
-    ...(phase === undefined ? {} : { metadata: { phase } }),
+    ...(phase === undefined ? {} : { origin: "native" as const, metadata: { phase } }),
   };
 }
 

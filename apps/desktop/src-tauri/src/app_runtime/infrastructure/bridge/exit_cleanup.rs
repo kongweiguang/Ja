@@ -150,14 +150,16 @@ impl ExitControl {
     }
 
     /// 设计原因：该函数复用调用方绝对 deadline，并保留未确认 cleanup 债务供恢复或重试。
-    /// 应用退出只关闭当前连接并唤醒本地等待；Java Runtime 持有的 Turn 与侧聊继续运行。
+    /// 取消只封闭本连接的新请求并唤醒旧 waiter；reader 必须保留到 scoped-close 收到 ACK。
     pub(super) fn attach_session(&self, session: Session) {
         let hook: ExitCancellationHook = Arc::new(move |deadline| {
-            // 退出只关闭这个 WebView 的连接；后台任务继续由 Java Runtime 持有。
-            if let Err(error) = SharedAppServerClient::close_session_until(&session, deadline) {
+            // Hook 同步执行且会先于 actor shutdown；它只能封闭本地 admission，不能关闭 ACK 所需 reader。
+            if let Err(error) =
+                SharedAppServerClient::prepare_native_client_close_until(&session, deadline)
+            {
                 tracing::debug!(
                     ?error,
-                    "session cancellation did not finish before exit deadline"
+                    "native client admission cancellation did not finish before exit deadline"
                 );
             }
         });
@@ -165,7 +167,7 @@ impl ExitControl {
         match self.cancellation_hook.lock() {
             Ok(mut slot) => *slot = Some(hook.clone()),
             Err(_) => {
-                // Hook slot 中毒时无法证明旧 session 是否仍被持有；立即关闭刚注册的 session，
+                // Hook slot 中毒时无法证明旧 session 是否仍被持有；立即封闭刚注册的 session，
                 // 同时使整个 exit gate 失效，避免 actor 继续准入新 operation。
                 let attempt = self.mark_poisoned_exit(0);
                 hook(attempt.deadline);
@@ -269,7 +271,7 @@ impl CleanupFault {
 }
 
 /// 设计原因：该函数复用调用方绝对 deadline，并保留未确认 cleanup 债务供恢复或重试。
-/// 在同一 absolute deadline 下停止 event worker 并断开当前客户端；socket 关闭唤醒未观察
+/// 在同一 absolute deadline 下停止 event worker 并断开当前客户端；连接关闭唤醒未观察
 /// cancel 的 worker，不能借此停止共享后台。
 pub(super) fn shutdown_components(
     current: &mut RunningRuntime,
@@ -300,8 +302,11 @@ pub(super) fn shutdown_components(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stop_runtime(
     sink: &EventSink,
+    config: &LaunchConfig,
     runtime: &mut Option<RunningRuntime>,
     pending_cleanup: &mut Option<SharedAppServerClient>,
+    native_identity: &mut NativeClientIdentity,
+    rotate_identity_after_close: bool,
     current_generation: &Arc<AtomicU64>,
     terminal_fault: &Arc<TerminalFault>,
     cleanup_fault: &Arc<CleanupFault>,
@@ -318,7 +323,15 @@ pub(super) fn stop_runtime(
     }
     if let Some(mut client) = pending_cleanup.take() {
         let generation = client.generation();
-        let mut cleanup_result = disconnect_client_until(&mut client, deadline, runtime_control);
+        let mut cleanup_result = close_native_client_and_rotate(
+            &mut client,
+            config,
+            native_identity,
+            rotate_identity_after_close,
+            deadline,
+            runtime_control,
+        )
+        .and_then(|_| disconnect_client_until(&mut client, deadline, runtime_control));
         if cleanup_result.is_ok()
             && exit_control
                 .deadline()
@@ -350,7 +363,15 @@ pub(super) fn stop_runtime(
     terminal_fault.clear();
     let generation = current.generation;
     let server_instance_id = current.server_instance_id.clone();
-    let mut result = shutdown_components(&mut current, deadline, runtime_control);
+    let mut result = close_native_client_and_rotate(
+        &mut current.client,
+        config,
+        native_identity,
+        rotate_identity_after_close,
+        deadline,
+        runtime_control,
+    )
+    .and_then(|_| shutdown_components(&mut current, deadline, runtime_control));
     // cleanup 执行期间 caller 可缩短共享 deadline；若 cleanup 越过边界才返回，则保留
     // unconfirmed owner，使 caller 继续阻止退出并可显式 retry。
     if result.is_ok()
@@ -393,21 +414,57 @@ pub(super) fn stop_runtime(
     result.and(emit_result).map(|_| status)
 }
 
+/// 预备下个 Native epoch 后等待本 Owner 的 ACK；只有本次新确认才提交新 token。
+pub(super) fn close_native_client_and_rotate(
+    client: &mut SharedAppServerClient,
+    config: &LaunchConfig,
+    native_identity: &mut NativeClientIdentity,
+    rotate_identity_after_close: bool,
+    deadline: Instant,
+    runtime_control: &dyn RuntimeControlPort,
+) -> Result<(), RuntimeCommandError> {
+    let next_identity = if rotate_identity_after_close {
+        Some(
+            NativeClientIdentity::new_current_process()
+                .map_err(|error| RuntimeCommandError::from_process(&error))?,
+        )
+    } else {
+        None
+    };
+    if runtime_control.close_native_client_until(config, client, deadline)?
+        && let Some(next_identity) = next_identity
+    {
+        *native_identity = next_identity;
+    }
+    Ok(())
+}
+
 /// 设计原因：该函数复用调用方绝对 deadline，并保留未确认 cleanup 债务供恢复或重试。
 /// 在同一 absolute deadline 下给每个失败 pre-runtime owner 一次 cleanup attempt；确认失败时
 /// 保留其 process/session。
 pub(super) fn retain_failed_client(
     mut client: SharedAppServerClient,
+    config: &LaunchConfig,
+    native_identity: &mut NativeClientIdentity,
     pending_cleanup: &mut Option<SharedAppServerClient>,
     cleanup_fault: &Arc<CleanupFault>,
     deadline: Instant,
     runtime_control: &dyn RuntimeControlPort,
 ) {
     let generation = client.generation();
-    if let Err(error) = disconnect_client_until(&mut client, deadline, runtime_control) {
+    let cleanup = close_native_client_and_rotate(
+        &mut client,
+        config,
+        native_identity,
+        true,
+        deadline,
+        runtime_control,
+    )
+    .and_then(|()| disconnect_client_until(&mut client, deadline, runtime_control));
+    if let Err(error) = cleanup {
         cleanup_fault.mark(generation);
         *pending_cleanup = Some(client);
-        tracing::error!(?error, generation, "client connection cleanup deferred");
+        tracing::error!(?error, generation, "native client owner cleanup deferred");
     } else {
         cleanup_fault.clear(generation);
     }

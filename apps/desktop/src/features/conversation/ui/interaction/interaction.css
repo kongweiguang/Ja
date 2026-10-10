@@ -83,6 +83,9 @@
   display: grid;
   min-height: 0;
   gap: 10px;
+  /* 为外扩 4px 的焦点框预留滚动视口空间，负外边距保持选项对齐和卡片尺寸。 */
+  margin: -4px;
+  padding: 4px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;

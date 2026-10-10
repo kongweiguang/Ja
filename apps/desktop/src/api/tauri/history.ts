@@ -6,7 +6,7 @@ import {
   CursorSchema,
   ThreadIdSchema,
   ThreadReadResultSchema,
-  MessageContentReadResultSchema,
+  ItemContentReadResultSchema,
   ThreadObservationParamsSchema,
   ThreadObservationResultSchema,
   ThreadUsageSummarySchema,
@@ -15,7 +15,10 @@ import {
   ThreadSchema,
   WorkspaceIdSchema,
   WorkspaceKindSchema,
+  WorkspaceOpenParamsSchema,
   WorkspaceSchema,
+  WorkspaceReadParamsSchema,
+  WorkspaceUpdateParamsSchema,
   ProviderIdSchema,
   ModelIdSchema,
   ReasoningLevelSchema,
@@ -23,29 +26,37 @@ import {
   ThreadDiscoveryItemSchema,
   ThreadDiscoveryParamsSchema,
   ThreadDiscoveryResultSchema,
+  ThreadForkParamsSchema,
+  ThreadForkResultSchema,
   type Thread,
   type ThreadReadResult,
   type ThreadUsageSummary,
 } from "../protocol/protocol";
-import { CollaborationModeSchema } from "../protocol/goal";
+import { CollaborationModeSchema } from "../protocol/plan";
 import {
   defaultNativeBridge,
   normalizeRuntimeError,
   RuntimeHostError,
+  TauriRuntimeHostAdapter,
+  type ThreadForkRecovery,
   type RuntimeNativeBridge,
 } from "./runtime";
 
 /** 固定 Tauri command 映射冻结的 history 能力，不向 React 暴露通用 RPC tunnel。 */
 export const JA_HISTORY_COMMANDS = {
-  // 此 command 与现有文件 open-with command `ja_workspace_open` 语义不同，不能复用名称。
+  // 此命令与现有文件“用其他程序打开”命令 `ja_workspace_open` 语义不同，不能复用名称。
   workspaceOpen: "ja_runtime_workspace_open",
+  workspaceRead: "ja_runtime_workspace_read",
+  workspaceUpdate: "ja_runtime_workspace_update",
+  workspaceSetTrust: "ja_workspace_set_trust",
   workspaceList: "ja_workspace_list",
   threadCreate: "ja_thread_create",
   threadDiscover: "ja_thread_discover",
   threadList: "ja_thread_list",
   threadSearch: "ja_thread_search",
   threadRead: "ja_thread_read",
-  messageContentRead: "ja_thread_message_content_read",
+  threadFork: "ja_thread_fork",
+  itemContentRead: "ja_thread_item_content_read",
   threadObserve: "ja_thread_observe",
   threadUnobserve: "ja_thread_unobserve",
   threadUsageRead: "ja_thread_usage_read",
@@ -70,16 +81,7 @@ const PageInputSchema = z
 const WorkspaceListInputSchema = PageInputSchema.extend({
   kind: WorkspaceKindSchema.optional(),
 }).strict();
-const WorkspaceOpenInputSchema = z
-  .object({
-    cwd: z
-      .string()
-      .min(1)
-      .max(4_096)
-      .refine((value) => !value.includes("\u0000"), "cwd contains NUL"),
-    displayName: z.string().min(1).max(1_024).optional(),
-  })
-  .strict();
+const WorkspaceOpenInputSchema = WorkspaceOpenParamsSchema;
 const ThreadCreateInputSchema = z
   .object({
     cwd: z.string().min(1).max(4_096).optional(),
@@ -140,7 +142,6 @@ const ThreadPreferencesUpdateInputSchema = z
     expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   })
   .strict();
-const AcceptedResultSchema = z.object({ accepted: z.literal(true) }).strict();
 const ThreadCompactCancelResultSchema = z.object({ accepted: z.boolean() }).strict();
 const ThreadCompactResultSchema = z
   .object({
@@ -180,12 +181,22 @@ const ThreadCompactResultSchema = z
 const WorkspaceListResultSchema = z
   .object({ items: z.array(WorkspaceSchema).max(200), nextCursor: CursorSchema.nullable() })
   .strict();
+const WorkspaceTrustInputSchema = z
+  .object({
+    workspaceId: WorkspaceIdSchema,
+    trust: z.enum(["trusted", "untrusted"]),
+  })
+  .strict();
+const AcceptedResultSchema = z.object({ accepted: z.literal(true) }).strict();
 const ThreadListResultSchema = z
   .object({ items: z.array(ThreadSchema).max(200), nextCursor: CursorSchema.nullable() })
   .strict();
 
 export type HistoryWorkspace = z.infer<typeof WorkspaceSchema>;
-export type HistoryWorkspaceOpenInput = z.infer<typeof WorkspaceOpenInputSchema>;
+export type HistoryWorkspaceOpenInput = z.infer<typeof WorkspaceOpenParamsSchema>;
+export type HistoryWorkspaceReadInput = z.infer<typeof WorkspaceReadParamsSchema>;
+export type HistoryWorkspaceUpdateInput = z.infer<typeof WorkspaceUpdateParamsSchema>;
+export type HistoryWorkspaceTrustInput = z.infer<typeof WorkspaceTrustInputSchema>;
 export type HistoryThread = Thread;
 export type HistoryWorkspaceListInput = z.infer<typeof WorkspaceListInputSchema>;
 export type HistoryThreadCreateInput = z.infer<typeof ThreadCreateInputSchema>;
@@ -193,10 +204,12 @@ export type HistoryThreadListInput = z.infer<typeof ThreadListInputSchema>;
 export type HistoryThreadDiscoverInput = z.infer<typeof ThreadDiscoverInputSchema>;
 export type HistoryThreadSearchInput = z.infer<typeof ThreadSearchInputSchema>;
 export type HistoryThreadReadInput = z.infer<typeof ThreadReadInputSchema>;
-export type HistoryMessageContentReadInput = z.infer<
-  (typeof ParamsSchemaByMethod)["thread/message-content/read"]
+export type HistoryThreadForkInput = z.infer<typeof ThreadForkParamsSchema>;
+export type HistoryThreadForkResult = z.infer<typeof ThreadForkResultSchema>;
+export type HistoryItemContentReadInput = z.infer<
+  (typeof ParamsSchemaByMethod)["thread/item-content/read"]
 >;
-export type HistoryMessageContentReadResult = z.infer<typeof MessageContentReadResultSchema>;
+export type HistoryItemContentReadResult = z.infer<typeof ItemContentReadResultSchema>;
 export type HistoryThreadObservationInput = z.infer<typeof ThreadObservationParamsSchema>;
 export type HistoryThreadObservationResult = z.infer<typeof ThreadObservationResultSchema>;
 export type HistoryThreadUsageReadInput = z.infer<typeof ThreadUsageReadInputSchema>;
@@ -232,6 +245,9 @@ export type HistoryNativeBridge = Pick<RuntimeNativeBridge, "invoke">;
 export interface HistoryAdapter {
   /** 注入式测试 bridge 可省略此能力；生产 adapter 必须始终实现。 */
   workspaceOpen?: (input: HistoryWorkspaceOpenInput) => Promise<HistoryWorkspace>;
+  workspaceRead?: (input: HistoryWorkspaceReadInput) => Promise<HistoryWorkspace>;
+  workspaceUpdate?: (input: HistoryWorkspaceUpdateInput) => Promise<HistoryWorkspace>;
+  workspaceSetTrust(input: HistoryWorkspaceTrustInput): Promise<{ accepted: true }>;
   workspaceList(input?: HistoryWorkspaceListInput): Promise<HistoryWorkspaceListResult>;
   threadCreate(input: HistoryThreadCreateInput): Promise<HistoryThread>;
   /** 全局发现是只读目录能力，保持可选以兼容不需要会话发现的注入式测试 adapter。 */
@@ -239,15 +255,17 @@ export interface HistoryAdapter {
   threadList(input: HistoryThreadListInput): Promise<HistoryThreadListResult>;
   threadSearch(input: HistoryThreadSearchInput): Promise<HistoryThreadListResult>;
   threadRead(input: HistoryThreadReadInput): Promise<HistoryThreadReadResult>;
-  /** 只读能力；注入式测试 adapter 可省略，生产始终由 Java 权威消息分页提供。 */
-  messageContentRead?: (
-    input: HistoryMessageContentReadInput,
-  ) => Promise<HistoryMessageContentReadResult>;
+  /** Production adapter freezes and recovers source identity through the RuntimeHost pending journal. */
+  threadFork?: (input: HistoryThreadForkInput) => Promise<HistoryThreadForkResult>;
+  recoverThreadForks?: () => Promise<readonly ThreadForkRecovery[]>;
+  acknowledgeThreadForkOpened?: (operationKey: string) => Promise<void>;
+  /** 正文按 Thread/Item identity 分页读取；生产端口必需，测试替身必须明确提供。 */
+  itemContentRead(input: HistoryItemContentReadInput): Promise<HistoryItemContentReadResult>;
   threadObserve(input: HistoryThreadObservationInput): Promise<HistoryThreadObservationResult>;
   threadUnobserve(input: HistoryThreadObservationInput): Promise<HistoryThreadObservationResult>;
   /** 用量在旧注入式测试 adapter 中可缺席；生产 adapter 固定提供此只读能力。 */
   threadUsageRead?: (input: HistoryThreadUsageReadInput) => Promise<HistoryThreadUsageSummary>;
-  /** MCP status is queried only while the header popover is open. */
+  /** 只有标题栏弹出层打开时才查询 MCP 状态。 */
   threadMcpRead?: (input: HistoryThreadMcpReadInput) => Promise<HistoryThreadMcpStatusResult>;
   threadRename(input: HistoryThreadRenameInput): Promise<HistoryThread>;
   threadPreferencesUpdate(input: HistoryThreadPreferencesUpdateInput): Promise<HistoryThread>;
@@ -269,7 +287,7 @@ function parseInput<T>(schema: z.ZodType<T>, input: unknown): T {
   }
 }
 
-/** 只调用 allow-list command，并在 React 看到结果前完成整体校验。 */
+/** 只调用白名单命令，并在 React 看到结果前完成整体校验。 */
 async function invokeHistory<I, O>(
   bridge: HistoryNativeBridge,
   command: string,
@@ -291,19 +309,58 @@ async function invokeHistory<I, O>(
 
 /** typed history adapter 使用严格 cursor 与 revision 边界，禁止隐式默认身份。 */
 export class TauriHistoryAdapter implements HistoryAdapter {
-  constructor(private readonly bridge: HistoryNativeBridge = defaultNativeBridge) {}
+  private readonly runtime: TauriRuntimeHostAdapter;
+
+  /** 复用同一原生桥接建立恢复边界，让分叉 journal 的查询与历史读取使用一致的 Host 身份。 */
+  constructor(private readonly bridge: HistoryNativeBridge = defaultNativeBridge) {
+    this.runtime = new TauriRuntimeHostAdapter({
+      invoke: bridge.invoke,
+      listen: defaultNativeBridge.listen,
+    });
+  }
 
   /** 请求 app-server 规范化 cwd 并分配 durable workspace identity，renderer 不自行生成。 */
   async workspaceOpen(input: HistoryWorkspaceOpenInput): Promise<HistoryWorkspace> {
     const parsedInput = parseInput(WorkspaceOpenInputSchema, input);
-    // 原生目录选择器是显式信任动作；该策略不能下放给任意 renderer 输入，
-    // 同时仍需满足 Rust 的封闭 workspace admission DTO。
     return invokeHistory(
       this.bridge,
       JA_HISTORY_COMMANDS.workspaceOpen,
-      { ...parsedInput, trust: "trusted" },
-      WorkspaceOpenInputSchema.extend({ trust: z.literal("trusted") }),
+      parsedInput,
+      WorkspaceOpenInputSchema,
       WorkspaceSchema,
+    );
+  }
+
+  /** 按稳定 ID 读取数据库投影，目录不存在时仍可展示项目和原会话历史。 */
+  workspaceRead(input: HistoryWorkspaceReadInput): Promise<HistoryWorkspace> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.workspaceRead,
+      input,
+      WorkspaceReadParamsSchema,
+      WorkspaceSchema,
+    );
+  }
+
+  /** 用期望 revision 原子更新项目显示名/目录；调用方回读以核实传输结果不确定的写入。 */
+  workspaceUpdate(input: HistoryWorkspaceUpdateInput): Promise<HistoryWorkspace> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.workspaceUpdate,
+      input,
+      WorkspaceUpdateParamsSchema,
+      WorkspaceSchema,
+    );
+  }
+
+  /** Trust 是独立且显式的权限变更，打开目录只登记 identity，不代表用户授信。 */
+  workspaceSetTrust(input: HistoryWorkspaceTrustInput): Promise<{ accepted: true }> {
+    return invokeHistory(
+      this.bridge,
+      JA_HISTORY_COMMANDS.workspaceSetTrust,
+      input,
+      WorkspaceTrustInputSchema,
+      AcceptedResultSchema,
     );
   }
 
@@ -373,16 +430,29 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
-  /** Unicode 字符分页只接受已提交消息身份；完整正文不进入 thread/read 大帧。 */
-  messageContentRead(
-    input: HistoryMessageContentReadInput,
-  ): Promise<HistoryMessageContentReadResult> {
+  /** 分叉端口可被 Controller 解构调用，因此捕获实例，同时保留 RuntimeHost 的持久恢复账本。 */
+  threadFork = (input: HistoryThreadForkInput): Promise<HistoryThreadForkResult> => {
+    return this.runtime.threadFork(input);
+  };
+
+  /** 启动 effect 独立调用恢复端口时仍保留实例 owner，只查询既有 receipt。 */
+  recoverThreadForks = (): Promise<readonly ThreadForkRecovery[]> => {
+    return this.runtime.recoverThreadForks();
+  };
+
+  /** 回执确认也允许解构调用；只有会话成功打开后才消费持久 created receipt。 */
+  acknowledgeThreadForkOpened = (operationKey: string): Promise<void> => {
+    return this.runtime.acknowledgeThreadForkOpened(operationKey);
+  };
+
+  /** Unicode code point 分页使用公开 Item identity；完整正文不进入 thread/read 大帧。 */
+  itemContentRead(input: HistoryItemContentReadInput): Promise<HistoryItemContentReadResult> {
     return invokeHistory(
       this.bridge,
-      JA_HISTORY_COMMANDS.messageContentRead,
+      JA_HISTORY_COMMANDS.itemContentRead,
       input,
-      ParamsSchemaByMethod["thread/message-content/read"],
-      MessageContentReadResultSchema,
+      ParamsSchemaByMethod["thread/item-content/read"],
+      ItemContentReadResultSchema,
     );
   }
 
@@ -429,7 +499,7 @@ export class TauriHistoryAdapter implements HistoryAdapter {
     );
   }
 
-  /** Read the real thread-scoped MCP projection; the renderer cannot enumerate configuration secrets. */
+  /** 读取真实的 Thread 级 MCP 投影；渲染层不能枚举配置密钥。 */
   threadMcpRead(input: HistoryThreadMcpReadInput): Promise<HistoryThreadMcpStatusResult> {
     return invokeHistory(
       this.bridge,

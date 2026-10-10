@@ -184,7 +184,7 @@ async function waitForApplication(page, deadline, { retryFailedRuntime = false }
       await popover.waitFor({ state: "visible", timeout: 1_000 }).catch(() => undefined);
       issue = (await popover.textContent().catch(() => null))?.trim() ?? null;
       if (retryFailedRuntime) {
-        // The current WebView predates init scripts, so wrap the already-loaded typed bridge before its explicit retry.
+// 当前 WebView 版本不支持 init script，因此在显式重试前包装已加载的类型化桥接。
         const runtimeProbeInstalled = await installRuntimeStartProbe(page);
         assert.equal(runtimeProbeInstalled, true, "the typed runtime probe must arm before retry");
         await popover.getByRole("button", { name: "重新启动", exact: true }).click({
@@ -299,7 +299,7 @@ async function installRuntimeStartProbe(page) {
   });
 }
 
-/** 经生产 typed adapter 创建 Thread，并验证服务端将两者持久绑定到隔离 Workspace identity。 */
+/** fixture 显式授信后再创建两条 Thread，菜单验收不能借普通登记绕过项目权限边界。 */
 async function createNavigationFixture(page, workspaceRoot, providerBaseUrl) {
   return page.evaluate(
     async ({ cwd, endpoint }) => {
@@ -319,6 +319,7 @@ async function createNavigationFixture(page, workspaceRoot, providerBaseUrl) {
 
       const history = createHistoryAdapter();
       const workspace = await history.workspaceOpen({ cwd, displayName: "右键菜单 E2E" });
+      await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
       const createThread = (title) =>
         history.threadCreate({
           cwd: workspace.root,
@@ -438,8 +439,8 @@ async function restoreNavigationContext(page, navigation, deadline) {
   await threadRows.first().waitFor({ state: "visible", timeout: timeout(deadline) });
   await selectProject(page, navigation.workspaceName, deadline);
   await selectThread(page, navigation.primaryThreadId, deadline);
-  // selectConversation can finish its controller-side workspace activation after the row click;
-  // settle the explicit project scope last so aria-current reflects the same stable workspace.
+  // 点击会话行后，selectConversation 可能还会完成控制器侧的工作区切换；
+  // 最后再确认显式项目范围，确保 aria-current 与稳定的工作区状态一致。
   await selectProject(page, navigation.workspaceName, deadline);
 
   const [activeProject, activeThread] = await Promise.all([
@@ -622,7 +623,7 @@ async function captureScenarioFailure(page, area, error, evidenceDirectory, scre
     screenshots.push({ screenshot, background: "", targetNearEdge: false });
     screenshotCaptured = true;
   } catch {
-    // A failed/closed WebView can prevent screenshot capture; preserve the structured failure regardless.
+    // WebView 失败或关闭时可能无法截图；无论如何都要保留结构化失败信息。
   }
   const diagnostics = await page
     .evaluate(() => ({
@@ -1120,7 +1121,7 @@ async function verifyFilesMenus(page, workbench, evidenceDirectory, deadline, sc
       "composer-reference-menu-light.png",
     ),
   );
-  // The chip handler records the nested open button as the pointer target, so Escape returns focus there rather than to its list item.
+  // 标签处理器会把内部的打开按钮记为指针目标，因此按 Escape 后焦点应返回该按钮，而非列表项。
   const referenceOpener = reference.getByRole("button", { name: /^在文件中预览 /u });
   await closeMenuAndRestoreFocus(page, referenceOpener, referenceMenu, deadline);
   const removeReferenceMenu = await openContextMenu(page, reference, "引用操作", deadline);

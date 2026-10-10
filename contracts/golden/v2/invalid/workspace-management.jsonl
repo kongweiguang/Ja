@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","id":"c:workspace-read-extra","method":"workspace/read","params":{"workspaceId":"ws_project_stable","cwd":"C:\\wrong"}}
+{"jsonrpc":"2.0","id":"c:workspace-update-empty","method":"workspace/update","params":{"workspaceId":"ws_project_stable","expectedRevision":0}}
+{"jsonrpc":"2.0","id":"c:workspace-update-null","method":"workspace/update","params":{"workspaceId":"ws_project_stable","expectedRevision":0,"cwd":null}}
+{"jsonrpc":"2.0","id":"c:workspace-update-no-revision","method":"workspace/update","params":{"workspaceId":"ws_project_stable","displayName":"新名称"}}
+{"jsonrpc":"2.0","id":"c:workspace-update-bad-name","method":"workspace/update","params":{"workspaceId":"ws_project_stable","expectedRevision":0,"displayName":"bad\nname"}}
+{"jsonrpc":"2.0","method":"workspace/metadata-changed","params":{"workspaceId":"ws_project_stable","revision":1}}

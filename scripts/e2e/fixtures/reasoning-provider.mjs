@@ -20,15 +20,15 @@ const ALL_PROTOCOLS = Object.freeze([
 const TOOL_CALLS = Object.freeze({
   openai_responses: Object.freeze({
     read: "call_reasoning_responses_read",
-    shell: "call_reasoning_responses_shell",
+    exec_command: "call_reasoning_responses_exec_command",
   }),
   openai_chat_completions: Object.freeze({
     read: "call_reasoning_chat_read",
-    shell: "call_reasoning_chat_shell",
+    exec_command: "call_reasoning_chat_exec_command",
   }),
   anthropic_messages: Object.freeze({
     read: "call_reasoning_anthropic_read",
-    shell: "call_reasoning_anthropic_shell",
+    exec_command: "call_reasoning_anthropic_exec_command",
   }),
 });
 
@@ -259,11 +259,11 @@ function responsesStream(contract, body, round, responseIndex) {
     openAiEvent("response.output_item.done", 4, { output_index: 0, item: reasoning }),
   ];
   if (round < 2) {
-    const name = round === 0 ? "read" : "shell";
+    const name = round === 0 ? "read" : "exec_command";
     const argumentsValue =
       name === "read"
         ? { path: "reasoning-fixture.txt", offset: 1, limit: 32 }
-        : { command: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 };
+        : { cmd: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 };
     const item = responsesToolItem(contract, responseIndex, name, argumentsValue);
     frames.push(
       openAiEvent("response.output_item.added", 5, {
@@ -333,11 +333,11 @@ function chatStream(contract, body, round, responseIndex) {
     ]),
   ];
   if (round < 2) {
-    const name = round === 0 ? "read" : "shell";
+    const name = round === 0 ? "read" : "exec_command";
     const argumentsValue =
       name === "read"
         ? JSON.stringify({ path: "reasoning-fixture.txt", offset: 1, limit: 32 })
-        : JSON.stringify({ command: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 });
+        : JSON.stringify({ cmd: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 });
     const callId = contract.toolCalls[name];
     const split = Math.max(1, Math.floor(argumentsValue.length / 2));
     frames.push(
@@ -443,11 +443,11 @@ function anthropicStream(contract, body, round, responseIndex) {
     anthropicEvent("content_block_stop", { index: 0 }),
   ];
   if (round < 2) {
-    const name = round === 0 ? "read" : "shell";
+    const name = round === 0 ? "read" : "exec_command";
     const input =
       name === "read"
         ? { path: "reasoning-fixture.txt", offset: 1, limit: 32 }
-        : { command: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 };
+        : { cmd: "Write-Output JA_REASONING_TOOL_OK", timeout_ms: 5_000 };
     const callId = contract.toolCalls[name];
     const toolIndex = 2;
     frames.push(
@@ -594,13 +594,13 @@ async function readBoundedJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-/** 用 provider-neutral call id 判断当前模型轮次，只检查历史身份不保存完整输入。 */
+/** 按真实 Tool 名映射的 call id 判断当前模型轮次，只检查身份不保存完整输入。 */
 function requestRound(contract, payload) {
   const serialized = JSON.stringify(payload ?? {});
   if (serialized.includes("<user_request>") && serialized.includes("<assistant_reply>")) {
     return { kind: "title", round: undefined };
   }
-  if (serialized.includes(contract.toolCalls.shell)) return { kind: "turn", round: 2 };
+  if (serialized.includes(contract.toolCalls.exec_command)) return { kind: "turn", round: 2 };
   if (serialized.includes(contract.toolCalls.read)) return { kind: "turn", round: 1 };
   return { kind: "turn", round: 0 };
 }

@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:turn-override-unknown","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"text","text":"x"}],"operationKey":"op_2123456789abcdef0123456789abcdef","runtimeOverrides":{"configRevision":"cfg_demo"}}}
+{"jsonrpc":"2.0","id":"c:turn-schema-secret","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"text","text":"x"}],"operationKey":"op_3123456789abcdef0123456789abcdef","runtimeOverrides":{"outputSchema":{"type":"object","properties":{"safe":{"type":"string","password":"not-a-schema-keyword"}}}}}}

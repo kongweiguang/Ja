@@ -43,6 +43,7 @@ function createActions(): FilesActions {
     selectNode: vi.fn(),
     toggleDirectory: vi.fn(),
     retryTree: vi.fn(),
+    revealDirectory: vi.fn(async () => true),
     refreshTree: vi.fn(),
     changeSearchQuery: vi.fn(),
     openSearchResult: vi.fn(),
@@ -393,5 +394,51 @@ describe("FilesWorkspaceView", () => {
 
     await waitFor(() => expect(tab).toHaveFocus());
     expect(actions.selectDocument).not.toHaveBeenCalled();
+  });
+
+  /** Markdown 源码与阅读预览复用同一文档；相对链接只扩展基准，不构造本地 URL。 */
+  it("在 Markdown 源码和阅读预览间切换，并以文档目录解析本地链接", async () => {
+    const path = "docs/guide.md";
+    const documentModel: OpenDocument = {
+      path,
+      content: "# 使用说明\n\n[示例](./examples/start.html#L8)",
+      savedContent: "# 使用说明\n\n[示例](./examples/start.html#L8)",
+      revision: { kind: "file", size: 48, modifiedUnixMillis: null, sha256: null },
+      encoding: "utf8",
+      newline: "lf",
+      kind: "text",
+      readOnly: false,
+      status: "clean",
+      draftGeneration: 0,
+    };
+    const onOpenMarkdownFile = vi.fn();
+    render(
+      <FilesWorkspace
+        viewModel={createViewModel({
+          documents: { [path]: documentModel },
+          openPaths: [path],
+          activePath: path,
+          activeDocument: documentModel,
+        })}
+        actions={createActions()}
+        onOpenMarkdownFile={onOpenMarkdownFile}
+      />,
+    );
+
+    const sourceEditor = document.querySelector<HTMLElement>(".ja-files-markdown-source");
+    expect(sourceEditor).not.toHaveAttribute("hidden");
+    await userEvent.click(screen.getByRole("button", { name: "阅读预览" }));
+    expect(screen.getByRole("heading", { name: "使用说明" })).toBeVisible();
+    expect(sourceEditor).toHaveAttribute("hidden");
+
+    const link = screen.getByRole("button", { name: "在 Ja 中打开路径 docs/examples/start.html" });
+    await userEvent.click(link);
+    expect(onOpenMarkdownFile).toHaveBeenCalledWith(
+      { path: "docs/examples/start.html", line: 8 },
+      link,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "源码" }));
+    expect(sourceEditor).not.toHaveAttribute("hidden");
   });
 });

@@ -1,0 +1,36 @@
+# @author kongweiguang
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+target/
+# Maven 验证任务使用隔离的 target-* 目录，避免共用过期输出。
+target-*/
+/.tmp/
+/logs/
+!.mvn/wrapper/maven-wrapper.jar
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+*.log
+*.flattened-pom.xml
+
+### NetBeans ###
+nbproject/private/
+build/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+### Mac files ###
+*.DS_Store

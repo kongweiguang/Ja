@@ -9,15 +9,14 @@ const snapshot = {
   eventSequence: 2,
   resumeState: "waiting_for_answer",
   request: {
-    requestId: "interaction_demo",
+    interactionId: "interaction_demo",
     threadId: "thr_demo",
     turnId: "turn_demo",
-    toolCallId: "call_demo",
+    toolCallId: "toolu_01HABC123",
     planRevisionId: null,
     runId: null,
-    goalId: null,
     status: "pending",
-    revision: 1,
+    interactionRevision: 1,
     questions: [
       {
         questionId: "question_mode",
@@ -59,16 +58,19 @@ describe("TauriInteractionAdapter", () => {
 
     await adapter.respond({
       threadId: "thr_demo",
-      requestId: "interaction_demo",
-      expectedRevision: 1,
-      idempotencyKey: "interaction:respond:1",
+      interactionId: "interaction_demo",
+      expectedInteractionRevision: 1,
+      operationKey: "interaction:respond:1",
       answers: [
         { questionId: "question_mode", optionIds: ["option_safe"], freeText: null, skipped: false },
       ],
     });
 
     expect(native.invoke).toHaveBeenCalledWith(JA_INTERACTION_COMMANDS.respond, {
-      input: expect.objectContaining({ requestId: "interaction_demo", expectedRevision: 1 }),
+      input: expect.objectContaining({
+        interactionId: "interaction_demo",
+        expectedInteractionRevision: 1,
+      }),
     });
   });
 
@@ -79,9 +81,9 @@ describe("TauriInteractionAdapter", () => {
     await expect(
       adapter.cancel({
         threadId: "wrong",
-        requestId: "input_demo",
-        expectedRevision: 1,
-        idempotencyKey: "interaction:cancel:1",
+        interactionId: "interaction_demo",
+        expectedInteractionRevision: 1,
+        operationKey: "interaction:cancel:1",
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(native.invoke).not.toHaveBeenCalled();

@@ -302,7 +302,7 @@ describe("TerminalWorkspace", () => {
     expect(rendered.getByRole("button", { name: "重启终端" })).toBeInTheDocument();
   });
 
-  /** shell 只接收 close-all 闭包，cleanup 在后续工作区复用 ref 前将其移除。 */
+  /** shell 只接收 close-all 闭包；后续工作区复用 ref 前，清理逻辑会将其移除。 */
   it("registers and unregisters the narrow close-all lifecycle operation", async () => {
     const bridge = fakeAdapter();
     const onRegisterCloseAll = vi.fn();
@@ -713,6 +713,7 @@ describe("TerminalWorkspace", () => {
     );
   });
 
+  /** 实测句柄中心与可用轴长决定比例，拖动只预览一次提交且键盘继续使用同一比例。 */
   it("previews split dragging locally and persists once on release while keyboard changes remain immediate", async () => {
     const bridge = fakeAdapter();
     const onLayoutChange = vi.fn();
@@ -756,6 +757,24 @@ describe("TerminalWorkspace", () => {
       configurable: true,
       value: vi.fn(() => false),
     });
+    Object.defineProperty(separator, "getBoundingClientRect", {
+      configurable: true,
+      value: () => {
+        const ratio = Number.parseFloat(firstChild.style.flexBasis) / 100;
+        const left = (1_000 - 12) * ratio;
+        return {
+          left,
+          top: 0,
+          width: 12,
+          height: 500,
+          right: left + 12,
+          bottom: 500,
+          x: left,
+          y: 0,
+          toJSON: () => ({}),
+        };
+      },
+    });
 
     dispatchPointer(separator, "pointerdown", {
       button: 0,
@@ -764,7 +783,7 @@ describe("TerminalWorkspace", () => {
       clientX: 500,
     });
     dispatchPointer(window, "pointermove", { pointerId: 31, clientX: 700 });
-    expect(firstChild).toHaveStyle({ flexBasis: "70%" });
+    expect(Number.parseFloat(firstChild.style.flexBasis) / 100).toBeCloseTo(694 / 988);
     expect(onLayoutChange).not.toHaveBeenCalled();
     dispatchPointer(window, "pointerup", { pointerId: 31, clientX: 750 });
 
@@ -773,16 +792,17 @@ describe("TerminalWorkspace", () => {
       onLayoutChange.mock.calls[0]?.[0].tabs[0].root.kind === "split"
         ? onLayoutChange.mock.calls[0][0].tabs[0].root.ratio
         : undefined,
-    ).toBe(0.75);
+    ).toBeCloseTo(744 / 988);
     fireEvent.keyDown(separator, { key: "ArrowRight" });
     expect(onLayoutChange).toHaveBeenCalledTimes(2);
     expect(
       onLayoutChange.mock.calls[1]?.[0].tabs[0].root.kind === "split"
         ? onLayoutChange.mock.calls[1][0].tabs[0].root.ratio
         : undefined,
-    ).toBe(0.8);
+    ).toBeCloseTo(744 / 988 + 0.05);
   });
 
+  /** 拖拽异常收口沿用中心坐标和扣除句柄后的轴长，不留下过期 pointer listener。 */
   it("commits the last visible split ratio once on cancel, capture loss, and window blur", async () => {
     const bridge = fakeAdapter();
     const onLayoutChange = vi.fn();
@@ -806,6 +826,7 @@ describe("TerminalWorkspace", () => {
     onLayoutChange.mockClear();
     const separator = rendered.getByRole("separator", { name: "调整终端分屏比例" });
     const splitContainer = separator.parentElement!;
+    const firstChild = splitContainer.querySelector<HTMLElement>(".ja-terminal-split-child")!;
     Object.defineProperty(splitContainer, "getBoundingClientRect", {
       configurable: true,
       value: () => ({
@@ -824,6 +845,24 @@ describe("TerminalWorkspace", () => {
     Object.defineProperty(separator, "hasPointerCapture", {
       configurable: true,
       value: vi.fn(() => false),
+    });
+    Object.defineProperty(separator, "getBoundingClientRect", {
+      configurable: true,
+      value: () => {
+        const ratio = Number.parseFloat(firstChild.style.flexBasis) / 100;
+        const left = (1_000 - 12) * ratio;
+        return {
+          left,
+          top: 0,
+          width: 12,
+          height: 500,
+          right: left + 12,
+          bottom: 500,
+          x: left,
+          y: 0,
+          toJSON: () => ({}),
+        };
+      },
     });
 
     dispatchPointer(separator, "pointerdown", {
@@ -855,10 +894,12 @@ describe("TerminalWorkspace", () => {
     dispatchPointer(window, "pointermove", { pointerId: 43, clientX: 700 });
     fireEvent.blur(window);
     expect(onLayoutChange).toHaveBeenCalledTimes(3);
-    expect(
-      onLayoutChange.mock.calls.map(([next]) =>
-        next.tabs[0].root.kind === "split" ? next.tabs[0].root.ratio : undefined,
-      ),
-    ).toEqual([0.6, 0.65, 0.7]);
+    const ratios = onLayoutChange.mock.calls.map(([next]) =>
+      next.tabs[0].root.kind === "split" ? next.tabs[0].root.ratio : undefined,
+    );
+    expect(ratios).toHaveLength(3);
+    expect(ratios[0]).toBeCloseTo(594 / 988);
+    expect(ratios[1]).toBeCloseTo(644 / 988);
+    expect(ratios[2]).toBeCloseTo(694 / 988);
   });
 });

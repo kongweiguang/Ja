@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { mkdir } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { chromium, expect } from "@playwright/test";
 
 const endpoint = process.env.JA_E2E_SETTINGS_CDP_ENDPOINT?.trim();
-const artifacts = process.env.JA_E2E_SETTINGS_ARTIFACT_DIR?.trim();
-const labels = ["通用", "外观", "模型", "子智能体", "执行确认", "Skills", "MCP", "关于"];
+let artifacts = process.env.JA_E2E_SETTINGS_ARTIFACT_DIR?.trim();
+const labels = ["通用", "外观", "模型", "子智能体", "执行确认", "Skills", "MCP", "数据与存储", "关于"];
+let navigationStep;
 
 /** 仅允许显式指定的隔离 Windows WebView2，避免接触用户主实例与真实设置。 */
 function validateEnvironment() {
@@ -37,24 +39,43 @@ async function capture(page, name) {
   await page.screenshot({ path: join(artifacts, `${name}.png`), animations: "disabled" });
 }
 
-/** 不创建会话或发起模型请求，直接验收首次设置中的真实分类、搜索与原生通知端口。 */
+/** 首屏保持对话工作区，设置必须由用户可见入口打开；reload 后不依赖内存导航状态。 */
+async function openSettings(page) {
+  navigationStep = "open_visible_settings_entry";
+  const settings = page.locator(".ja-settings");
+  if (!(await settings.isVisible())) {
+    const reveal = page.getByRole("button", { name: "显示侧边栏", exact: true });
+    if (await reveal.isVisible()) await reveal.click();
+    await page.getByRole("button", { name: "设置", exact: true }).click();
+  }
+  navigationStep = "wait_visible_settings";
+  await expect(settings).toBeVisible({ timeout: 60000 });
+  navigationStep = "wait_settings_enabled";
+  await expect(settings).not.toHaveAttribute("inert", "", { timeout: 60000 });
+  return settings;
+}
+
+/** 不创建会话或发起模型请求，通过真实设置入口验收分类、搜索与原生通知端口。 */
 async function verifySettings(page) {
   await page.reload();
-  const settings = page.locator(".ja-settings");
-  await expect(settings).toBeVisible({ timeout: 60000 });
-  await expect(settings).not.toHaveAttribute("inert", "", { timeout: 60000 });
+  const settings = await openSettings(page);
+  navigationStep = "verify_nine_categories";
   await expect(settings.getByRole("tab")).toHaveText(labels);
+  navigationStep = "verify_initial_models_category";
   await expect(settings.getByRole("tab", { name: "模型", exact: true })).toHaveAttribute(
     "data-state",
     "active",
   );
   for (const [index, label] of labels.entries()) {
+    navigationStep = `wide_category_${index + 1}`;
     await settings.getByRole("tab", { name: label, exact: true }).click();
     await expect(settings.getByRole("tabpanel", { name: label, exact: true })).toBeVisible();
     await capture(page, `wide-${index + 1}`);
   }
 
+  navigationStep = "keyboard_navigation";
   await settings.getByRole("tab", { name: "通用", exact: true }).click();
+  await expect(settings.getByRole("tab", { name: "通用", exact: true })).toBeFocused();
   await page.keyboard.press("ArrowDown");
   await expect(settings.getByRole("tab", { name: "外观", exact: true })).toHaveAttribute(
     "data-state",
@@ -63,17 +84,20 @@ async function verifySettings(page) {
   await expect(
     settings.getByRole("tabpanel", { name: "外观" }).getByRole("switch", { name: "桌面通知" }),
   ).toHaveCount(0);
+  navigationStep = "notification_search_focus";
   await settings.getByRole("textbox", { name: "搜索设置" }).fill("桌面通知");
   await expect(settings.getByRole("option")).toHaveCount(1);
   await settings.getByRole("option", { name: /桌面通知/ }).click();
   const toggle = settings.getByRole("switch", { name: "桌面通知", exact: true });
   await expect(toggle).toBeFocused();
   await expect(toggle).toHaveAttribute("aria-checked", "false");
+  navigationStep = "notification_enable";
   await toggle.click();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
   await expect(settings.getByRole("status")).toContainText("桌面通知已开启");
   await page.reload();
-  await expect(settings).not.toHaveAttribute("inert", "", { timeout: 60000 });
+  await openSettings(page);
+  navigationStep = "notification_readback";
   await settings.getByRole("tab", { name: "通用", exact: true }).click();
   await expect(toggle).toHaveAttribute("aria-checked", "true");
   await toggle.click();
@@ -85,6 +109,7 @@ async function verifySettings(page) {
   await page.setViewportSize({ width: 720, height: 640 });
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   for (const [index, label] of labels.entries()) {
+    navigationStep = `narrow_category_${index + 1}`;
     await settings.getByRole("tab", { name: label, exact: true }).click();
     await expect(settings.getByRole("tabpanel", { name: label, exact: true })).toBeVisible();
     await expect
@@ -95,6 +120,20 @@ async function verifySettings(page) {
   await settings.getByRole("tab", { name: "通用", exact: true }).click();
   await page.emulateMedia({ forcedColors: "active" });
   await capture(page, "narrow-general-forced-colors");
+  await page.emulateMedia({ forcedColors: "none", colorScheme: "light", reducedMotion: "reduce" });
+  await settings.getByRole("textbox", { name: "搜索设置" }).fill("");
+}
+
+/** 启动器已验证本轮进程与隔离 profile；导航复用生产控件，禁止创建替代 HTML 或 mock 端口。 */
+export async function runSettingsNavigation(page, evidenceDirectory) {
+  artifacts = evidenceDirectory;
+  await mkdir(artifacts, { recursive: true });
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  try { await verifySettings(page); }
+  catch (error) { error.settingsNavigationStep = navigationStep; throw error; }
+  await page.setViewportSize({ width: 1280, height: 820 });
+  return { categories: labels.length, keyboard: true, searchFocus: true, notificationReadback: true };
 }
 
 /** 仅断开 CDP transport；实例生命周期由创建它的隔离启动器负责。 */
@@ -112,11 +151,13 @@ async function main() {
     await verifySettings(page);
     expect(pageErrors).toEqual([]);
     process.stdout.write(
-      `JA_SETTINGS_NAVIGATION_OK seven-tabs notification-roundtrip search-focus keyboard narrow-layout pageErrors=0 evidence=${artifacts}\n`,
+      `JA_SETTINGS_NAVIGATION_OK categories=${labels.length} notification-roundtrip search-focus keyboard narrow-layout pageErrors=0 evidence=${artifacts}\n`,
     );
   } finally {
     await browser.close();
   }
 }
 
-await main();
+if (process.argv[1] !== undefined && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  await main();
+}

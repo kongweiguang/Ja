@@ -1,6 +1,6 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""以 Python 独立消费 Agent 过程、终态修改记录与输入队列的 breaking JA-RPC v1 语料。"""
+"""以 Python 独立消费 Agent 过程、终态修改记录与输入队列的 breaking JA-RPC v2 语料。"""
 
 from __future__ import annotations
 
@@ -17,29 +17,35 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[2]
 GOLDEN = Path(os.environ.get("JA_GOLDEN_PATH", ROOT / "contracts" / "golden"))
-SCHEMA_PATH = ROOT / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
-VALID = GOLDEN / "v1" / "valid" / "agent-process.jsonl"
-INVALID = GOLDEN / "v1" / "invalid" / "agent-presentation.jsonl"
-MESSAGE_CONTENT_VALID = GOLDEN / "v1" / "valid" / "thread-message-content.jsonl"
-MESSAGE_CONTENT_INVALID = GOLDEN / "v1" / "invalid" / "thread-message-content.jsonl"
-CHANGE_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "change-set-results.jsonl"
-WORKSPACE_IDENTITY_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-identities.jsonl"
-QUEUE_VALID = GOLDEN / "v1" / "valid" / "input-queue.jsonl"
-PATH_SEARCH_VALID = GOLDEN / "v1" / "valid" / "workspace-path-search.jsonl"
-PATH_SEARCH_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "workspace-path-search-results.jsonl"
-THREAD_VALID = GOLDEN / "v1" / "valid" / "lists.jsonl"
-THREAD_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "thread-seen-results.jsonl"
-USAGE_VALID = GOLDEN / "v1" / "valid" / "thread-usage-summary.jsonl"
-MCP_STATUS_VALID = GOLDEN / "v1" / "valid" / "thread-mcp-status.jsonl"
-MCP_STATUS_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "thread-mcp-status-results.jsonl"
-TASK_VALID = GOLDEN / "v1" / "valid" / "task-threads.jsonl"
-TASK_INVALID = GOLDEN / "v1" / "invalid" / "task-threads.jsonl"
-TASK_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "task-thread-results.jsonl"
-GOAL_VALID = GOLDEN / "v1" / "valid" / "plan-goals.jsonl"
-GOAL_INVALID = GOLDEN / "v1" / "invalid" / "plan-goals.jsonl"
-GOAL_RESULT_INVALID = GOLDEN / "v1" / "invalid" / "correlated" / "plan-goal-results.jsonl"
+SCHEMA_PATH = ROOT / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
+VALID = GOLDEN / "v2" / "valid" / "agent-process.jsonl"
+CONTEXT_ESTIMATE_VALID = GOLDEN / "v2" / "valid" / "context-estimate.jsonl"
+INVALID = GOLDEN / "v2" / "invalid" / "agent-presentation.jsonl"
+ITEM_CONTENT_VALID = GOLDEN / "v2" / "valid" / "thread-item-content.jsonl"
+ITEM_CONTENT_INVALID = GOLDEN / "v2" / "invalid" / "thread-item-content.jsonl"
+CHANGE_RESULT_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "change-set-results.jsonl"
+WORKSPACE_IDENTITY_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "workspace-identities.jsonl"
+QUEUE_VALID = GOLDEN / "v2" / "valid" / "input-queue.jsonl"
+PATH_SEARCH_VALID = GOLDEN / "v2" / "valid" / "workspace-path-search.jsonl"
+PATH_SEARCH_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "workspace-path-search-results.jsonl"
+THREAD_VALID = GOLDEN / "v2" / "valid" / "lists.jsonl"
+THREAD_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "thread-seen-results.jsonl"
+USAGE_VALID = GOLDEN / "v2" / "valid" / "thread-usage-summary.jsonl"
+MCP_STATUS_VALID = GOLDEN / "v2" / "valid" / "thread-mcp-status.jsonl"
+MCP_STATUS_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "thread-mcp-status-results.jsonl"
+TASK_VALID = GOLDEN / "v2" / "valid" / "task-threads.jsonl"
+TASK_INVALID = GOLDEN / "v2" / "invalid" / "task-threads.jsonl"
+TASK_RESULT_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "task-thread-results.jsonl"
+PLAN_VALID = GOLDEN / "v2" / "valid" / "plans.jsonl"
+PLAN_INVALID = GOLDEN / "v2" / "invalid" / "plans.jsonl"
+PLAN_RESULT_INVALID = GOLDEN / "v2" / "invalid" / "correlated" / "plans-results.jsonl"
+INTERACTION_PLAN_VALID = GOLDEN / "v2" / "valid" / "interaction-plan.jsonl"
 RESULT_DEFS = {
+    "runtime/context/register": "runtimeContextRegisterResult",
+    "runtime/client/close": "taskAcceptedResult",
     "workspace/open": "workspaceResult",
+    "workspace/read": "workspaceResult",
+    "workspace/update": "workspaceResult",
     "workspace/list": "workspacePageResult",
     "thread/create": "threadResult",
     "thread/list": "threadListResult",
@@ -51,7 +57,7 @@ RESULT_DEFS = {
     "thread/archive": "threadResult",
     "thread/restore": "threadResult",
     "thread/read": "threadReadResult",
-    "thread/message-content/read": "messageContentReadResult",
+    "thread/item-content/read": "itemContentReadResult",
     "thread/usage/read": "threadUsageSummary",
     "thread/mcp/read": "threadMcpStatusResult",
     "tool/artifact/read": "toolArtifactReadResult",
@@ -72,19 +78,9 @@ RESULT_DEFS = {
     "task/cancel": "taskMutationResult",
     "task/tree/delete": "taskTreeDeleteResult",
     "task/close": "taskCloseResult",
-    "goal/read": "goalProjectionResult",
-    "goal/events/read": "goalEventsResult",
-    "goal/observe": "goalObserveResult",
-    "goal/unobserve": "taskAcceptedResult",
     "plan/read": "planProjection",
+    "plan/current/read": "planCurrentReadResult",
     "plan/revisions/list": "planRevisionsResult",
-    "goal/evidence/list": "goalEvidenceResult",
-    "goal/create": "goalProjectionResult",
-    "goal/plan/attach": "goalProjectionResult",
-    "goal/plan/detach": "goalProjectionResult",
-    "goal/pause": "goalProjectionResult",
-    "goal/resume": "goalProjectionResult",
-    "goal/stop": "goalProjectionResult",
     "plan/create": "planProjection",
     "plan/draft/save": "planProjection",
     "plan/draft/discard": "planProjection",
@@ -139,8 +135,8 @@ def require_invalid(validator: Draft202012Validator, value: Any, label: str) -> 
 
 
 def validate_artifact_result(method: str, result: dict[str, Any]) -> None:
-    """分别锁定 Tool 字符分页与冻结文件完整 Base64 的语义。"""
-    if method in {"tool/artifact/read", "thread/message-content/read"}:
+    """分别锁定 Tool/Thread item 字符分页与冻结文件完整 Base64 的语义。"""
+    if method in {"tool/artifact/read", "thread/item-content/read"}:
         offset = result["offsetCharacters"]
         end = result["totalCharacters"] if result["nextOffsetCharacters"] is None \
             else result["nextOffsetCharacters"]
@@ -162,6 +158,61 @@ def validate_artifact_result(method: str, result: dict[str, Any]) -> None:
         raise RuntimeError("change-set artifact byte length mismatch")
     if hashlib.sha256(decoded).hexdigest() != result.get("sha256"):
         raise RuntimeError("change-set artifact digest mismatch")
+
+
+def validate_item_content_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """验证 item 内容分页复用稳定身份、连续 code point offset 与一致总长度。"""
+    frames = documents(ITEM_CONTENT_VALID)
+    pending: dict[str, dict[str, Any]] = {}
+    pages: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for frame in frames:
+        require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
+        method = frame.get("method")
+        if method == "thread/item-content/read" and isinstance(frame.get("id"), str):
+            pending[frame["id"]] = frame["params"]
+            continue
+        if "result" not in frame:
+            raise RuntimeError("item content corpus contains an uncorrelated frame")
+        request_id = frame.get("id")
+        params = pending.pop(request_id, None) if isinstance(request_id, str) else None
+        if params is None:
+            raise RuntimeError("item content response lost its request")
+        result = frame["result"]
+        require_valid(
+            definition_validator(schema, "itemContentReadResult"), result, "thread/item-content/read"
+        )
+        validate_artifact_result("thread/item-content/read", result)
+        if result["itemId"] != params["itemId"] or result["offsetCharacters"] != params["offsetCharacters"]:
+            raise RuntimeError("item content response identity or offset mismatch")
+        pages.append((params, result))
+
+    if pending or len(pages) < 2:
+        raise RuntimeError("item content corpus lacks correlated pagination")
+    ordered = sorted(pages, key=lambda page: page[0]["offsetCharacters"])
+    first_params = ordered[0][0]
+    total_characters = ordered[0][1]["totalCharacters"]
+    cursor = 0
+    terminal_pages = 0
+    contains_non_bmp = False
+    for params, result in ordered:
+        content = result["content"]
+        contains_non_bmp |= any(ord(character) > 0xFFFF for character in content)
+        offset = params["offsetCharacters"]
+        end = offset + len(content)
+        if params["threadId"] != first_params["threadId"] or params["itemId"] != first_params["itemId"]:
+            raise RuntimeError("item content pages changed their stable identity")
+        if offset != cursor or result["totalCharacters"] != total_characters:
+            raise RuntimeError("item content pages are not contiguous")
+        if result["nextOffsetCharacters"] is None:
+            terminal_pages += 1
+            if end != total_characters or result["truncated"] is not False:
+                raise RuntimeError("item content terminal page is inconsistent")
+        elif result["nextOffsetCharacters"] != end or end >= total_characters or result["truncated"] is not True:
+            raise RuntimeError("item content continuation page is inconsistent")
+        cursor = end
+    if terminal_pages != 1 or cursor != total_characters or not contains_non_bmp:
+        raise RuntimeError("item content corpus does not prove code point pagination")
+    return len(frames)
 
 
 def compact_json_bytes(value: Any) -> int:
@@ -342,7 +393,7 @@ def validate_thread_seen_contract(schema: dict[str, Any], root: Draft202012Valid
 
 
 def validate_workspace_identity_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
-    """PROJECT 与 LEGACY_SHARED 投影不得携带只属于 SESSION 的旧共享恢复 ID。"""
+    """独立证明 Workspace 与 Thread 投影拒绝已删除字段，即使旧字段值为 null。"""
     pending: dict[str, str] = {}
     requests: set[str] = set()
     results: set[str] = set()
@@ -400,7 +451,7 @@ def validate_thread_usage_contract(schema: dict[str, Any], root: Draft202012Vali
 
 
 def validate_thread_mcp_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
-    """Cross-check MCP status requests, thread/server identity, and omission semantics independently."""
+    """独立交叉校验 MCP 状态请求、会话与服务标识，以及字段省略语义。"""
     frames = documents(MCP_STATUS_VALID)
     pending: dict[str, tuple[str, dict[str, Any]]] = {}
     observed: set[str] = set()
@@ -444,7 +495,7 @@ def validate_thread_mcp_contract(schema: dict[str, Any], root: Draft202012Valida
 
 
 def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
-    """独立消费完整 Task Thread transcript，锁定十个方法、三个事件及严格结果闭集。"""
+    """独立消费完整 Task Thread transcript，锁定十一方法、四事件及关闭身份关系。"""
     pending: dict[str, str] = {}
     observed_methods: set[str] = set()
     observed_events: set[str] = set()
@@ -464,15 +515,23 @@ def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Vali
         "task/create", "task/list", "task/read", "task/observe", "task/unobserve", "task/seen",
         "thread/message/send", "task/followup", "task/cancel", "task/tree/delete", "task/close",
     }
-    expected_events = {"task/activity", "task/progress", "task/mailbox-changed"}
+    expected_events = {"task/activity", "task/progress", "task/mailbox-changed", "task/closed"}
     if observed_methods != expected_methods or observed_events != expected_events or pending:
-        raise RuntimeError("task thread corpus does not cover the exact v1 surface")
+        raise RuntimeError("task thread corpus does not cover the exact v2 surface")
 
     for frame in documents(TASK_INVALID):
         schema_rejected = next(root.iter_errors(frame), None) is not None
         confirmation_rejected = frame.get("method") == "task/tree/delete" \
             and frame.get("params", {}).get("confirmTaskThreadId") != frame.get("params", {}).get("taskThreadId")
-        if not schema_rejected and not confirmation_rejected:
+        params = frame.get("params", {})
+        closed_ids = params.get("closedThreadIds") if isinstance(params, dict) else None
+        close_identity_rejected = frame.get("method") == "task/closed" and (
+            not isinstance(params, dict)
+            or params.get("rootThreadId") == params.get("taskThreadId")
+            or not isinstance(closed_ids, list)
+            or params.get("taskThreadId") not in closed_ids
+        )
+        if not schema_rejected and not confirmation_rejected and not close_identity_rejected:
             raise RuntimeError(f"invalid projection accepted: {frame.get('method', 'task invalid')}")
 
     invalid_results = documents(TASK_RESULT_INVALID)
@@ -491,12 +550,12 @@ def validate_task_threads_contract(schema: dict[str, Any], root: Draft202012Vali
     return len(frames) + len(documents(TASK_INVALID)) + len(invalid_results)
 
 
-def validate_plan_goal_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
-    """独立消费 Goal/Plan transcript，锁定 21 个方法、3 个事件及每种严格结果投影。"""
+def validate_plan_interaction_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """消费 Plan 与 Interaction 的部分 transcript，按原始请求关联每个已给出的结果。"""
     pending: dict[str, str] = {}
     observed_methods: set[str] = set()
     observed_events: set[str] = set()
-    frames = documents(GOAL_VALID)
+    frames = documents(PLAN_VALID) + documents(INTERACTION_PLAN_VALID)
     for frame in frames:
         require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
         method = frame.get("method")
@@ -510,29 +569,27 @@ def validate_plan_goal_contract(schema: dict[str, Any], root: Draft202012Validat
             require_valid(definition_validator(schema, RESULT_DEFS[correlated]), frame["result"], correlated)
 
     expected_methods = {
-        "goal/read", "goal/events/read", "goal/observe", "goal/unobserve", "plan/read",
-        "plan/revisions/list", "goal/evidence/list", "goal/create", "goal/plan/attach",
-        "goal/plan/detach", "goal/pause", "goal/resume", "goal/stop",
+        "plan/read", "plan/revisions/list", "plan/current/read",
         "plan/create", "plan/draft/save", "plan/draft/discard", "plan/propose", "plan/execute",
         "plan/observe", "plan/unobserve", "plan/events/read", "plan/evidence/list", "plan/pause",
         "plan/resume", "plan/stop", "plan/reject", "interaction/read", "interaction/observe",
         "interaction/unobserve", "interaction/draft/save", "interaction/respond", "interaction/cancel",
     }
-    expected_events = {"goal/changed", "goal/activity", "interaction/changed", "plan/changed"}
-    if observed_methods != expected_methods or observed_events != expected_events or pending:
-        raise RuntimeError("plan goal corpus does not cover the exact v1 surface")
+    expected_events = {"interaction/changed", "plan/changed"}
+    if observed_methods != expected_methods or observed_events != expected_events:
+        raise RuntimeError("Plan and Interaction corpus does not cover the exact v2 surface")
 
-    invalid_frames = documents(GOAL_INVALID)
+    invalid_frames = documents(PLAN_INVALID)
     for frame in invalid_frames:
-        require_invalid(root, frame, str(frame.get("method", "goal invalid")))
-    invalid_results = documents(GOAL_RESULT_INVALID)
+        require_invalid(root, frame, str(frame.get("method", "plan invalid")))
+    invalid_results = documents(PLAN_RESULT_INVALID)
     if len(invalid_results) % 2 != 0:
-        raise RuntimeError("plan goal invalid result transcript is not correlated")
+        raise RuntimeError("plan invalid result transcript is not correlated")
     for index in range(0, len(invalid_results), 2):
         request, response = invalid_results[index:index + 2]
-        require_valid(root, request, str(request.get("method", "goal invalid request")))
+        require_valid(root, request, str(request.get("method", "plan invalid request")))
         if request.get("id") != response.get("id") or "result" not in response:
-            raise RuntimeError("plan goal invalid response lost correlation")
+            raise RuntimeError("plan invalid response lost correlation")
         require_invalid(definition_validator(schema, RESULT_DEFS[request["method"]]),
                         response["result"], request["method"])
     return len(frames) + len(invalid_frames) + len(invalid_results)
@@ -608,13 +665,45 @@ def validate_change_set_file_boundaries(schema: dict[str, Any]) -> int:
     return 1 + len(malformed) + len(semantic_failures) + 2
 
 
+def validate_native_client_lifetime_contract(schema: dict[str, Any], root: Draft202012Validator) -> int:
+    """直接验证 Native 私有身份与 scoped ACK；Shape 通过不代表进程身份或清理运行已获证明。"""
+    methods = {"runtime/context/register", "runtime/client/close"}
+    pending: dict[str, str] = {}
+    observed: set[str] = set()
+    positive = documents(GOLDEN / "v2" / "valid" / "shared-daemon.jsonl")
+    for frame in positive:
+        require_valid(root, frame, "shared daemon frame")
+        if frame.get("method") in methods:
+            pending[frame["id"]] = frame["method"]
+            observed.add(frame["method"])
+        elif "result" in frame and frame["id"] in pending:
+            method = pending.pop(frame["id"])
+            require_valid(definition_validator(schema, RESULT_DEFS[method]), frame["result"], method)
+    if observed != methods or pending:
+        raise RuntimeError("native lifecycle corpus lacks a complete scoped acknowledgement")
+    negative = documents(GOLDEN / "v2" / "invalid" / "native-client-lifetime.jsonl")
+    for frame in negative:
+        require_invalid(root, frame, "native lifecycle request")
+    correlated = documents(GOLDEN / "v2" / "invalid" / "correlated" / "native-client-close-results.jsonl")
+    for frame in correlated:
+        if "method" in frame:
+            require_valid(root, frame, "native close request")
+            pending[frame["id"]] = frame["method"]
+        else:
+            method = pending.pop(frame["id"])
+            require_invalid(definition_validator(schema, RESULT_DEFS[method]), frame["result"], method)
+    if pending:
+        raise RuntimeError("native close negative corpus lacks a correlated result")
+    return len(positive) + len(negative) + len(correlated)
+
+
 def main() -> int:
     """消费正例 transcript 与专用负例，证明 Python 对新合同的独立理解。"""
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     root = Draft202012Validator(schema, format_checker=FormatChecker())
     pending: dict[str, str] = {}
     observed: set[str] = set()
-    positive = documents(VALID) + documents(MESSAGE_CONTENT_VALID)
+    positive = documents(VALID) + documents(CONTEXT_ESTIMATE_VALID) + documents(ITEM_CONTENT_VALID)
     for frame in positive:
         require_valid(root, frame, str(frame.get("method", frame.get("id", "response"))))
         if "method" in frame and "id" in frame:
@@ -625,14 +714,14 @@ def main() -> int:
         elif "result" in frame:
             method = pending.pop(frame["id"])
             require_valid(definition_validator(schema, RESULT_DEFS[method]), frame["result"], method)
-            if method in {"tool/artifact/read", "thread/message-content/read", "turn/change-set/read"}:
+            if method in {"tool/artifact/read", "thread/item-content/read", "turn/change-set/read"}:
                 validate_artifact_result(method, frame["result"])
-    expected = {"assistant/model-step-committed", "tool/started", "tool/batch-committed", "thread/read",
-                "tool/artifact/read", "thread/message-content/read", "turn/change-set/read"}
+    expected = {"assistant/model-step-committed", "assistant/context-estimated", "tool/started", "tool/batch-committed", "thread/read",
+                "tool/artifact/read", "thread/item-content/read", "turn/change-set/read"}
     if not expected <= observed:
         raise RuntimeError("positive corpus lacks Agent process methods")
 
-    negative = documents(INVALID) + documents(MESSAGE_CONTENT_INVALID)
+    negative = documents(INVALID) + documents(ITEM_CONTENT_INVALID)
     for frame in negative:
         if "method" in frame:
             require_invalid(root, frame, str(frame["method"]))
@@ -648,14 +737,18 @@ def main() -> int:
     mcp_status_frames = validate_thread_mcp_contract(schema, root)
     path_search_frames = validate_workspace_path_search_contract(schema, root)
     task_frames = validate_task_threads_contract(schema, root)
-    goal_frames = validate_plan_goal_contract(schema, root)
+    plan_frames = validate_plan_interaction_contract(schema, root)
+    item_content_frames = validate_item_content_contract(schema, root)
+    native_client_frames = validate_native_client_lifetime_contract(schema, root)
     change_set_cases = validate_change_set_file_boundaries(schema)
     print(f"PYTHON_CONSUMER_OK positiveFrames={len(positive)} invalidFrames={len(negative)} "
                 f"queueFrames={queue_frames} threadFrames={thread_frames} workspaceIdentityFrames={identity_frames} "
                 f"usageFrames={usage_frames} "
           f"mcpStatusFrames={mcp_status_frames} "
           f"pathSearchFrames={path_search_frames} "
-          f"taskFrames={task_frames} goalFrames={goal_frames} changeSetCases={change_set_cases}")
+          f"taskFrames={task_frames} planFrames={plan_frames} itemContentFrames={item_content_frames} "
+          f"nativeClientFrames={native_client_frames} "
+          f"changeSetCases={change_set_cases}")
     return 0
 
 

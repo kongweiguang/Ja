@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","method":"tool/started","params":{"serverInstanceId":"srv_demo","eventId":"evt_unsafe_call_id","sequence":42,"occurredAt":"2026-09-26T00:00:02Z","generation":1,"workspaceId":"ws_demo","threadId":"thr_demo","turnId":"turn_demo","threadRevision":42,"callId":"toolu/unsafe","ordinal":0}}
+

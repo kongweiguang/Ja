@@ -5,6 +5,7 @@
 
 use super::path_policy::is_reparse_point;
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -86,19 +87,33 @@ impl HomePaths {
     }
 }
 
-/// 唯一负责创建和校验 `~/.ja`，其他组件不得另建同级应用数据树或绕过 reparse-point 检查。
+/// 唯一负责创建和校验 Ja home，其他组件不得另建应用数据树或绕过 reparse-point 检查。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HomeLayout {
     paths: HomePaths,
 }
 
 impl HomeLayout {
-    /// 解析当前用户 profile 并初始化固定 Ja 布局，使测试与生产构造共享同一安全策略。
+    /// 显式 JA_HOME 统一重定向配置、数据库和 runtime；未指定时沿用用户目录，非法输入不得回落旧库。
     pub(crate) fn new() -> Result<Self, HomeError> {
-        let profile = env::var_os("USERPROFILE")
-            .or_else(|| env::var_os("HOME"))
-            .ok_or(HomeError::InvalidRoot)?;
-        Self::from_root(PathBuf::from(profile).join(".ja"))
+        Self::from_environment(|name| env::var_os(name))
+    }
+
+    /// 注入环境查找以验证路径优先级，避免测试修改全局环境；所有来源仍通过同一绝对路径及 reparse 校验。
+    pub(crate) fn from_environment<F>(mut lookup: F) -> Result<Self, HomeError>
+    where
+        F: FnMut(&str) -> Option<OsString>,
+    {
+        let root = match lookup("JA_HOME") {
+            Some(root) => PathBuf::from(root),
+            None => {
+                let profile = lookup("USERPROFILE")
+                    .or_else(|| lookup("HOME"))
+                    .ok_or(HomeError::InvalidRoot)?;
+                PathBuf::from(profile).join(".ja")
+            }
+        };
+        Self::from_root(root)
     }
 
     /// 从显式绝对根目录初始化当前实际使用的目录；拒绝相对路径和 traversal，同时不创建
@@ -176,9 +191,9 @@ fn validate_existing_ancestor_chain(path: &Path) -> Result<(), HomeError> {
     Ok(())
 }
 
-/// 在任何文件系统调用前拒绝相对路径、`.` 和 `..`，避免跟随用户输入的 traversal 分量。
+/// 在任何文件系统调用前拒绝根目录、相对路径、`.` 和 `..`，避免把用户盘根当配置目录或跟随 traversal。
 fn validate_root_shape(path: &Path) -> Result<(), HomeError> {
-    if !path.is_absolute() {
+    if !path.is_absolute() || path.parent().is_none() {
         return Err(HomeError::InvalidRoot);
     }
     if path

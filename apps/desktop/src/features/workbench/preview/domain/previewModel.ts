@@ -23,10 +23,13 @@ export type PreviewNavigationIntent =
   | { kind: "reload" }
   | { kind: "invalid"; message: string };
 
+/** 普通文件打开进入 editor 分类；只有显式预览动作可要求 Rust 以 browser 分类 HTML。 */
+export type PreviewMode = "editor" | "browser";
+
 /** 对外只传用户明确选中的地址或文件目标；路径解析和文件权限始终由 Rust 复核。 */
 export type PreviewTarget =
   | { kind: "url"; url: string }
-  | { kind: "file"; path: string; line?: number; column?: number };
+  | { kind: "file"; path: string; line?: number; column?: number; previewMode?: PreviewMode };
 
 /** Rust 已显式解析的本机目标投影；这只允许在用户点击后取得，不构成文件能力 token。 */
 export interface PreviewFileResolution {
@@ -35,9 +38,9 @@ export interface PreviewFileResolution {
   workspaceId: string | null;
   workspaceRelativePath: string | null;
   withinWorkspace: boolean;
-  kind: "text" | "browser" | "unsupported";
+  kind: "text" | "browser" | "directory" | "unsupported";
   mimeType: string | null;
-  fileUrl: string;
+  fileUrl: string | null;
   content: string | null;
   truncated: boolean;
   line: number | null;

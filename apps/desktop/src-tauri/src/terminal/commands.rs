@@ -156,8 +156,7 @@ impl TerminalCommandHost {
         if lifecycle.shutdown_started {
             return Err(TerminalError::new(TerminalErrorCode::InvalidConfig));
         }
-        // The former single supervisor enforced one host-wide eight-session ceiling; retaining it
-        // here avoids multiplying PTY and worker budgets by the number of open Threads.
+        // 原先的单一 supervisor 将整个宿主限制为最多八个会话；保留该限制可避免 PTY 和 worker 预算随打开的 Thread 数量增长。
         let total_sessions = lifecycle
             .supervisors
             .values()

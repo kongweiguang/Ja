@@ -70,7 +70,7 @@ impl AttachmentRuntimePort for FakeRuntime {
         if self.fail_at == Some(ordinal) {
             return Err(RuntimeCommandError {
                 code: "RUNTIME_UNAVAILABLE",
-                message: "runtime bridge is unavailable",
+                message: "runtime bridge is unavailable".into(),
                 retryable: self.retryable,
             });
         }

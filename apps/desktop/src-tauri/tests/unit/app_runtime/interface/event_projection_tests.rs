@@ -16,16 +16,42 @@ fn ready_projection_consumes_the_validated_echo() {
             "occurredAt": "2026-08-18T00:00:00Z",
             "status": "ready",
             "generation": 1,
-            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+            "features": ["task_threads", "plan", "interaction"],
             "readyToken": "0123456789abcdef0123456789abcdef"
         }
     });
     let sanitized = sanitize_webview_value(value).expect("ready projection is safe");
     assert_eq!(
         sanitized["params"]["features"],
-        json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
+        json!(["task_threads", "plan", "interaction"])
     );
     assert!(sanitized["params"].get("readyToken").is_none());
+}
+
+/// Workspace invalidation needs the shared server fence and exact projection shape before native bindings are revoked.
+#[test]
+fn workspace_metadata_changed_requires_complete_revision_fence() {
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/metadata-changed",
+        "params": {
+            "serverInstanceId": "srv_1",
+            "eventId": "evt_workspace_1",
+            "sequence": 7,
+            "occurredAt": "2026-08-18T00:00:00Z",
+            "generation": 2,
+            "workspaceId": "ws_1",
+            "revision": 3
+        }
+    });
+    assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    let mut stale_shape = value;
+    stale_shape["params"]
+        .as_object_mut()
+        .unwrap()
+        .remove("generation");
+    assert!(sanitize_webview_value(stale_shape).is_err());
 }
 
 /// 已脱敏展示文本可能与 challenge 共享 32-hex shape；Session 消费精确 challenge 后，该普通
@@ -46,7 +72,7 @@ fn arbitrary_hex_business_id_is_preserved() {
             "threadRevision": 1,
             "occurredAt": "2026-08-18T00:00:00Z",
             "messageId": "item_assistant_1",
-            "text": "",
+            "text": "", "totalCharacters": 0, "truncated": false,
             "modelRound": 1,
             "toolCalls": [{
                 "callId": "call_1",
@@ -98,6 +124,97 @@ fn semantic_projection_requires_thread_revision() {
     invalid["params"]["seq"] = json!(2);
     assert_eq!(
         sanitize_webview_value(invalid).unwrap_err().code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+}
+
+/// 恢复通知校验连接排序序号，但不把它解释为持久事件游标或业务诊断正文。
+#[test]
+fn resync_required_projection_accepts_only_the_frozen_identity_shape() {
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "turn/resync-required",
+        "params": {
+            "serverInstanceId": "srv_1",
+            "eventId": "evt_resync_1",
+            "sequence": 66,
+            "occurredAt": "2026-09-27T00:00:00Z",
+            "generation": 1,
+            "workspaceId": "ws_1",
+            "threadId": "thr_1",
+            "turnId": "turn_1",
+            "reasonCode": "projection_failed"
+        }
+    });
+    assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    let mut unknown_reason = value.clone();
+    unknown_reason["params"]["reasonCode"] = json!("provider_failure");
+    assert!(sanitize_webview_value(unknown_reason).is_err());
+
+    let mut invalid_sequence = value.clone();
+    invalid_sequence["params"]["sequence"] = json!(0);
+    assert!(sanitize_webview_value(invalid_sequence).is_err());
+
+    let mut fabricated_cursor = value;
+    fabricated_cursor["params"]["threadRevision"] = json!(1);
+    assert!(sanitize_webview_value(fabricated_cursor).is_err());
+}
+
+/// 派发估算必须经 Rust 代理按 UNKNOWN/本地数据传递，并保留冻结的窗口身份。
+#[test]
+fn context_estimate_projection_accepts_local_dispatch_and_rejects_mismatch() {
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "assistant/context-estimated",
+        "params": {
+            "serverInstanceId": "srv_1", "eventId": "evt_estimate_1",
+            "sequence": 3, "generation": 1, "workspaceId": "ws_1",
+            "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 3,
+            "occurredAt": "2026-09-26T00:00:03Z",
+            "usage": {
+                "modelRequestId": "modelreq_1", "modelRequestOrdinal": 2, "modelRound": 2,
+                "purpose": "assistant", "certainty": "unknown",
+                "profile": {
+                    "providerId": "provider_1", "modelId": "model_1", "api": "openai_responses",
+                    "upstreamModel": "gpt-5", "requestedReasoning": "medium",
+                    "effectiveReasoning": "medium", "accessMode": "approval_required",
+                    "collaborationMode": "default", "configGeneration": "cfg_1",
+                    "promptRevision": "prompt_2", "toolCatalogRevision": "tools_1",
+                    "contextWindowTokens": 128000, "maxOutputTokens": 4096
+                },
+                "inputTokens": null, "outputTokens": null, "totalTokens": null,
+                "measuredAt": "2026-09-26T00:00:03Z",
+                "contextEstimate": {
+                    "certainty": "estimated", "source": "local", "usedTokens": 18500,
+                    "limitTokens": 128000, "measuredAt": "2026-09-26T00:00:03Z"
+                }
+            }
+        }
+    });
+
+    let sanitized = sanitize_webview_value(value.clone()).expect("local dispatch estimate is safe");
+    assert_eq!(
+        sanitized["params"]["usage"]["contextEstimate"]["usedTokens"],
+        18500
+    );
+
+    let mut wrong_window = value.clone();
+    wrong_window["params"]["usage"]["contextEstimate"]["limitTokens"] = json!(1);
+    assert_eq!(
+        sanitize_webview_value(wrong_window).unwrap_err().code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+
+    let mut measured_with_estimate = value;
+    measured_with_estimate["params"]["usage"]["certainty"] = json!("known");
+    measured_with_estimate["params"]["usage"]["inputTokens"] = json!(1);
+    measured_with_estimate["params"]["usage"]["outputTokens"] = json!(1);
+    measured_with_estimate["params"]["usage"]["totalTokens"] = json!(2);
+    assert_eq!(
+        sanitize_webview_value(measured_with_estimate)
+            .unwrap_err()
+            .code,
         "SENSITIVE_EVENT_BLOCKED"
     );
 }
@@ -176,10 +293,11 @@ fn turn_input_events_enforce_queue_and_thread_revision_boundaries() {
             "threadRevision": 8, "input": queued_input,
             "userItem": {"itemId": "item_user_1", "createdAt": "2026-09-01T01:00:02Z",
                 "turnId": "turn_1", "kind": "user_input",
-                "content": [{"type":"text","text":"下一步检查测试"}], "attachments": []},
+                "content": [{"type":"text","text":"下一步检查测试"}], "attachments": [],
+                "totalCharacters": 7, "truncated": false},
             "inputQueue": {"turnId": "turn_1", "revision": 3, "accepting": true, "items": []},
             "assistantSettlement": {"messageId": "item_assistant_1", "text": "上一轮完成。",
-                "modelRound": 1}
+                "totalCharacters": 6, "truncated": false, "modelRound": 1}
         }
     });
     assert!(sanitize_webview_value(consumed.clone()).is_ok());
@@ -211,11 +329,15 @@ fn messages_received_event_requires_bound_thread_messages() {
                 "kind": "thread_message",
                 "sourceThreadId": "thr_source",
                 "sourceTitle": "临时侧聊",
-                "content": "来自侧聊的结果"
+                "content": "来自侧聊的结果", "totalCharacters": 7, "truncated": false
             }]
         }
     });
     assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    let mut snapshot_only_origin = value.clone();
+    snapshot_only_origin["params"]["items"][0]["origin"] = json!("native");
+    assert!(sanitize_webview_value(snapshot_only_origin).is_err());
 
     let mut wrong_turn = value.clone();
     wrong_turn["params"]["items"][0]["turnId"] = json!("turn_other");
@@ -423,54 +545,81 @@ fn task_events_are_strictly_projected_without_transcript_materialization() {
     );
 }
 
-/// Goal changed 是首次发现 identity 的低频事件；Rust 必须接受严格完整投影，同时拒绝
-/// 外层 Goal identity 与内层快照不一致，避免跨 Goal 状态被送入 React。
+/// Close 通知必须路由到存活顶层 root，并携带请求 root 的完整唯一 purge 身份集。
 #[test]
-fn goal_changed_projection_accepts_discovery_and_rejects_cross_goal_payload() {
+fn task_closed_event_requires_exact_live_purge_ids_and_top_level_route() {
     let value = json!({
-        "jsonrpc": "2.0", "method": "goal/changed",
+        "jsonrpc": "2.0", "method": "task/closed",
         "params": {
-            "serverInstanceId": "srv_1", "eventId": "evt_goal_1", "sequence": 6,
+            "serverInstanceId": "srv_1", "eventId": "evt_task_closed", "sequence": 7,
+            "occurredAt": "2026-09-03T08:00:02Z", "generation": 1,
+            "rootThreadId": "thr_top_root", "taskThreadId": "thr_closed_root",
+            "closedThreadIds": ["thr_closed_root", "thr_subagent"]
+        }
+    });
+    assert!(sanitize_webview_value(value.clone()).is_ok());
+
+    let mut missing_closed_root = value.clone();
+    missing_closed_root["params"]["closedThreadIds"] = json!(["thr_subagent"]);
+    assert_eq!(
+        sanitize_webview_value(missing_closed_root)
+            .unwrap_err()
+            .code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+
+    let mut duplicate_ids = value.clone();
+    duplicate_ids["params"]["closedThreadIds"] = json!(["thr_closed_root", "thr_closed_root"]);
+    assert_eq!(
+        sanitize_webview_value(duplicate_ids).unwrap_err().code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+
+    let mut old_revision_shape = value.clone();
+    old_revision_shape["params"]["taskRevision"] = json!(4);
+    assert_eq!(
+        sanitize_webview_value(old_revision_shape).unwrap_err().code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+
+    let mut self_routed_event = value;
+    self_routed_event["params"]["rootThreadId"] = json!("thr_closed_root");
+    assert_eq!(
+        sanitize_webview_value(self_routed_event).unwrap_err().code,
+        "SENSITIVE_EVENT_BLOCKED"
+    );
+}
+
+/// Plan 事件的外层身份与快照必须一致，避免陈旧进度拼接到另一个计划。
+#[test]
+fn plan_changed_projection_rejects_mismatched_identity() {
+    let value = json!({
+        "jsonrpc": "2.0", "method": "plan/changed",
+        "params": {
+            "serverInstanceId": "srv_1", "eventId": "evt_plan_1", "sequence": 6,
             "occurredAt": "2026-09-04T08:00:01Z", "generation": 1,
-            "goalId": "goal_demo", "goalRevision": 1, "eventSequence": 1,
-            "goal": {
-                "goalId": "goal_demo", "owner": {"kind": "thread", "threadId": "thr_root"},
-                "objective": "交付 Plan Goal", "goalDefinitionRevision": 1,
-                "acceptanceCriteria": [], "status": "active", "phase": "working",
-                "revision": 1, "planLink": null,
-                "currentRunId": "run_demo", "currentStepId": null, "completedRequiredSteps": 0,
-                "totalRequiredSteps": 0, "attentionReason": null,
-                "latestEvaluation": null,
-                "createdAt": "2026-09-04T08:00:00Z", "updatedAt": "2026-09-04T08:00:00Z",
-                "achievedAt": null, "stoppedAt": null
+            "ownerThreadId": "thr_root", "planId": "plan_demo", "planRevision": 1,
+            "eventSequence": 1,
+            "plan": {
+                "planId": "plan_demo", "owner": {"kind": "thread", "threadId": "thr_root"},
+                "objective": "完成独立计划", "status": "draft", "revision": 1,
+                "activePlanRevisionId": null, "activeRunId": null,
+                "createdAt": "2026-09-04T08:00:00Z", "updatedAt": "2026-09-04T08:00:00Z"
+            },
+            "progress": {
+                "currentStepId": null, "currentStepTitle": null,
+                "completedRequiredSteps": 0, "totalRequiredSteps": 0
             }
         }
     });
     assert!(sanitize_webview_value(value.clone()).is_ok());
 
-    let mut cross_goal = value;
-    cross_goal["params"]["goal"]["goalId"] = json!("goal_other");
+    let mut mismatched = value;
+    mismatched["params"]["plan"]["planId"] = json!("plan_other");
     assert_eq!(
-        sanitize_webview_value(cross_goal).unwrap_err().code,
+        sanitize_webview_value(mismatched).unwrap_err().code,
         "SENSITIVE_EVENT_BLOCKED"
     );
-}
-
-/// Goal activity 使用独立 revision 流且保持严格闭集；未知字段不能借助非 Turn
-/// notification 绕过 WebView 投影边界。
-#[test]
-fn goal_activity_and_input_projection_enforce_closed_payloads() {
-    let activity = json!({
-        "jsonrpc": "2.0", "method": "goal/activity",
-        "params": {
-            "serverInstanceId": "srv_1", "eventId": "evt_goal_2", "sequence": 7,
-            "occurredAt": "2026-09-04T08:00:02Z", "generation": 1,
-            "goalId": "goal_demo", "goalRevision": 2, "eventSequence": 3,
-            "activity": {"kind": "step", "status": "working",
-                "summary": "正在同步合同", "stepId": "step_contract"}
-        }
-    });
-    assert!(sanitize_webview_value(activity).is_ok());
 }
 
 /// Activity 内嵌 Task 与外层 taskRevision 必须一致，防止跨任务或陈旧投影拼接。
@@ -519,15 +668,14 @@ fn runtime_status_projection_matches_v1_lifecycle_union() {
             "occurredAt": "2026-08-25T12:00:04Z",
             "status": "failed",
             "generation": 1,
-            "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+            "features": ["task_threads", "plan", "interaction"],
             "reason": "runtime_lifecycle"
         }
     });
     assert!(sanitize_webview_value(failed.clone()).is_ok());
 
     let mut unknown_feature = failed;
-    unknown_feature["params"]["features"] =
-        json!(["task_threads_v1", "plan_goal_v1", "unknown_feature_v1"]);
+    unknown_feature["params"]["features"] = json!(["task_threads", "plan", "unknown_feature_v1"]);
     assert_eq!(
         sanitize_webview_value(unknown_feature).unwrap_err().code,
         "SENSITIVE_EVENT_BLOCKED"
@@ -579,7 +727,7 @@ fn status_emitter_uses_the_v1_feature_set() {
     };
     assert_eq!(
         emitted["params"]["features"],
-        json!(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
+        json!(["task_threads", "plan", "interaction"])
     );
     assert_eq!(emitted["params"]["status"], "ready");
     assert_eq!(emitted["params"]["generation"], 7);
@@ -616,10 +764,18 @@ fn event_sink_failure_is_reported() {
     assert_eq!(error.code, "RUNTIME_EVENT_DELIVERY_FAILED");
 }
 
-/// Java durable approval notification 原样转发；Rust 不合成第二套 sequence，也不向 WebView
-/// 暴露私有 server-request identity。
+/// 使用共享 canonical approval fixture 验证生产投影接受安全 pending 展示并原样转发公共身份。
 #[test]
 fn approval_notification_is_forwarded_without_private_request_id() {
+    let canonical = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../contracts/golden/v2/valid/approval-presentation.jsonl"
+    ));
+    let event: Value = serde_json::from_str(canonical.trim()).expect("canonical approval fixture");
+    let params = event
+        .get("params")
+        .expect("canonical approval params")
+        .clone();
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let target = std::sync::Arc::clone(&received);
     let sink: EventSink = std::sync::Arc::new(move |value| {
@@ -629,28 +785,8 @@ fn approval_notification_is_forwarded_without_private_request_id() {
         received.push(value);
         Ok(())
     });
-    let frame = RpcFrame::notification(
-        "approval/requested",
-        json!({
-            "serverInstanceId": "srv_1",
-            "eventId": "evt_approval_2",
-            "sequence": 2,
-            "generation": 1,
-            "workspaceId": "ws_1",
-            "threadId": "thr_1",
-            "turnId": "turn_1",
-            "threadRevision": 2,
-            "occurredAt": "2026-08-18T00:00:00Z",
-            "approvalId": "appr_1",
-            "callId": "call_1",
-            "toolName": "shell",
-            "reason": "Tool requires approval",
-            "expiresAt": "2026-08-18T00:05:00Z",
-            "from": "running",
-            "to": "waiting_approval"
-        }),
-    )
-    .expect("approval notification");
+    let frame =
+        RpcFrame::notification("approval/requested", params).expect("approval notification");
     emit_frame(&sink, &frame).expect("notification sink");
     let received = match received.lock() {
         Ok(received) => received,
@@ -659,7 +795,28 @@ fn approval_notification_is_forwarded_without_private_request_id() {
     let value = &received[0];
     assert!(value.get("id").is_none());
     assert_eq!(value["method"], "approval/requested");
-    assert_eq!(value["params"]["approvalId"], "appr_1");
+    assert_eq!(value["params"]["approvalId"], "appr_fixture");
+    assert_eq!(value["params"]["presentation"]["status"], "pending");
+}
+
+/// 共享 canonical 负例必须经真实事件投影器拒绝，覆盖缺失/非 pending 展示、原始参数和媒体。
+#[test]
+fn approval_projection_rejects_canonical_invalid_presentations() {
+    let invalid = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../contracts/golden/v2/invalid/approval-presentation.jsonl"
+    ));
+    for (line, fixture) in invalid.lines().enumerate() {
+        let event: Value = serde_json::from_str(fixture).expect("canonical invalid approval JSON");
+        let error = sanitize_webview_value(event)
+            .expect_err("invalid approval presentation must be blocked before WebView delivery");
+        assert_eq!(
+            error.code,
+            "SENSITIVE_EVENT_BLOCKED",
+            "canonical approval negative {} must use the sensitive event boundary",
+            line + 1
+        );
+    }
 }
 
 /// Suspended 只作为 Turn 事件状态透传；显式 Resume 先回到 queued，不能跳过 Java 队列直接 running。
@@ -702,7 +859,8 @@ fn event_projection_rejects_unknown_methods_and_sensitive_arguments() {
             "sequence": 1, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 1,
             "occurredAt": "2026-08-18T00:00:00Z",
-            "messageId": "item_1", "text": "", "modelRound": 1,
+            "messageId": "item_1", "text": "", "totalCharacters": 0, "truncated": false,
+            "modelRound": 1,
             "toolCalls": [{"callId": "call_1", "toolName": "shell",
                 "arguments": {"apiKey": "hidden"}, "ordinal": 0}]
         }
@@ -719,7 +877,8 @@ fn event_projection_rejects_unknown_methods_and_sensitive_arguments() {
             "sequence": 2, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 2,
             "occurredAt": "2026-08-18T00:00:00Z",
-            "messageId": "item_2", "text": "", "modelRound": 1,
+            "messageId": "item_2", "text": "", "totalCharacters": 0, "truncated": false,
+            "modelRound": 1,
             "toolCalls": [{"callId": "call_2", "toolName": "shell",
                 "presentation": {
                     "kind": "shell", "title": "运行命令", "status": "pending",
@@ -744,8 +903,10 @@ fn composite_events_enforce_transaction_shapes() {
             "sequence": 3, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 3,
             "occurredAt": "2026-08-18T00:00:00Z",
-            "messageId": "item_1", "text": "", "modelRound": 1,
-            "reasoningSummary": "需要先检查工作树。",
+            "messageId": "item_1", "text": "", "totalCharacters": 0, "truncated": false,
+            "modelRound": 1,
+            "reasoningSummary": "需要先检查工作树。", "reasoningSummaryTotalCharacters": 9,
+            "reasoningSummaryTruncated": false,
             "toolCalls": [{"callId": "call_1", "toolName": "shell",
                 "presentation": {
                     "kind": "shell", "title": "运行命令", "status": "waiting_approval",
@@ -766,7 +927,7 @@ fn composite_events_enforce_transaction_shapes() {
             "serverInstanceId": "srv_1", "eventId": "evt_started_1",
             "sequence": 4, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 4,
-            "occurredAt": "2026-08-18T00:00:01Z", "callId": "call_1", "ordinal": 0
+            "occurredAt": "2026-08-18T00:00:01Z", "callId": "toolu_01Jabc:part.2", "ordinal": 0
         }
     });
     assert!(sanitize_webview_value(started.clone()).is_ok());
@@ -799,12 +960,82 @@ fn composite_events_enforce_transaction_shapes() {
         batch["params"]["results"][0]["presentation"]["summary"],
         json!("命令执行成功")
     );
+    let mut clarification = batch.clone();
+    clarification["params"]["results"][0]["presentation"] = json!({
+        "kind": "mcp", "title": "request_user_input", "status": "success",
+        "relativePaths": [], "truncated": false,
+        "interactionAnswers": [
+            {"question": "要继续吗？", "answers": ["继续"], "skipped": false},
+            {"question": "补充信息", "answers": [], "skipped": true}
+        ]
+    });
+    assert!(sanitize_webview_value(clarification.clone()).is_ok());
+
+    let mut extra_interaction_field = clarification.clone();
+    extra_interaction_field["params"]["results"][0]["presentation"]["interactionAnswers"][0]["privateId"] =
+        json!("must-not-cross");
+    assert!(sanitize_webview_value(extra_interaction_field).is_err());
+    let mut answered_skip = clarification.clone();
+    answered_skip["params"]["results"][0]["presentation"]["interactionAnswers"][1]["answers"] =
+        json!(["not allowed"]);
+    assert!(sanitize_webview_value(answered_skip).is_err());
+    let mut blank_question = clarification.clone();
+    blank_question["params"]["results"][0]["presentation"]["interactionAnswers"][0]["question"] =
+        json!(" \u{feff} ");
+    assert!(sanitize_webview_value(blank_question).is_err());
+    let mut blank_answer = clarification.clone();
+    blank_answer["params"]["results"][0]["presentation"]["interactionAnswers"][0]["answers"][0] =
+        json!("\u{00a0}\u{feff}");
+    assert!(sanitize_webview_value(blank_answer).is_err());
+    let mut nul_answer = clarification.clone();
+    nul_answer["params"]["results"][0]["presentation"]["interactionAnswers"][0]["answers"][0] =
+        json!("unsafe\0answer");
+    assert!(sanitize_webview_value(nul_answer).is_err());
+    let mut too_many_answers = clarification.clone();
+    too_many_answers["params"]["results"][0]["presentation"]["interactionAnswers"][0]["answers"] =
+        json!(vec!["answer"; 65]);
+    assert!(sanitize_webview_value(too_many_answers).is_err());
+    let mut too_many_interactions = clarification.clone();
+    too_many_interactions["params"]["results"][0]["presentation"]["interactionAnswers"] = json!([
+        {"question": "Q", "answers": [], "skipped": false},
+        {"question": "Q", "answers": [], "skipped": false},
+        {"question": "Q", "answers": [], "skipped": false},
+        {"question": "Q", "answers": [], "skipped": false}
+    ]);
+    assert!(sanitize_webview_value(too_many_interactions).is_err());
+
+    let mut max_question_length = clarification.clone();
+    max_question_length["params"]["results"][0]["presentation"]["interactionAnswers"][0]["question"] =
+        json!("q".repeat(4_096));
+    assert!(sanitize_webview_value(max_question_length.clone()).is_ok());
+    max_question_length["params"]["results"][0]["presentation"]["interactionAnswers"][0]["question"] =
+        json!("q".repeat(4_097));
+    assert!(sanitize_webview_value(max_question_length).is_err());
+    let mut max_answer_length = clarification.clone();
+    max_answer_length["params"]["results"][0]["presentation"]["interactionAnswers"][0]["answers"]
+        [0] = json!("a".repeat(4_097));
+    assert!(sanitize_webview_value(max_answer_length).is_err());
+
+    let mut utf16_boundary = clarification;
+    utf16_boundary["params"]["results"][0]["presentation"]["interactionAnswers"][0]["question"] =
+        json!("🙂".repeat(2_048));
+    assert!(sanitize_webview_value(utf16_boundary.clone()).is_ok());
+    utf16_boundary["params"]["results"][0]["presentation"]["interactionAnswers"][0]["question"] =
+        json!("🙂".repeat(2_049));
+    assert!(sanitize_webview_value(utf16_boundary).is_err());
+
     let mut unknown_outcome = batch.clone();
     unknown_outcome["params"]["results"][0]["outcome"] = json!("unknown");
     assert!(sanitize_webview_value(unknown_outcome).is_err());
     let mut unknown_status = batch.clone();
     unknown_status["params"]["results"][0]["presentation"]["status"] = json!("unknown");
     assert!(sanitize_webview_value(unknown_status).is_err());
+    let mut recovery_snapshot = batch.clone();
+    recovery_snapshot["params"]["results"][0]["presentation"]["recovery"] = json!({"revision": 1});
+    assert!(sanitize_webview_value(recovery_snapshot.clone()).is_ok());
+    recovery_snapshot["params"]["results"][0]["presentation"]["recovery"]["command"] =
+        json!("hidden");
+    assert!(sanitize_webview_value(recovery_snapshot).is_err());
     let mut missing_identity = batch.clone();
     missing_identity["params"]
         .as_object_mut()
@@ -823,8 +1054,26 @@ fn composite_events_enforce_transaction_shapes() {
     assert!(sanitize_webview_value(raw_result).is_err());
 }
 
-/// Terminal 投影要求 completion 携带 final message、failure 携带稳定 error，并始终原子携带
-/// Java 冻结的最终 ChangeSet。
+/// 显式接受普通澄清的 waiting_input 状态边，并拒绝将等待输入直接伪装成审批。
+#[test]
+fn turn_input_wait_state_is_a_closed_transition() {
+    let waiting = json!({
+        "jsonrpc": "2.0", "method": "turn/state-changed",
+        "params": {
+            "serverInstanceId": "srv_1", "eventId": "evt_waiting_input_1",
+            "sequence": 4, "generation": 1, "workspaceId": "ws_1",
+            "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 4,
+            "occurredAt": "2026-08-18T00:00:01Z", "from": "running", "to": "waiting_input"
+        }
+    });
+    assert!(sanitize_webview_value(waiting.clone()).is_ok());
+    let mut fake_approval = waiting;
+    fake_approval["params"]["from"] = json!("waiting_input");
+    fake_approval["params"]["to"] = json!("waiting_approval");
+    assert!(sanitize_webview_value(fake_approval).is_err());
+}
+
+/// Terminal 投影要求完成态有消息和 ChangeSet，失败/取消则保留真实 ChangeSet 或明确 null。
 #[test]
 fn terminal_projection_enforces_state_dependent_fields() {
     let completed = json!({
@@ -834,7 +1083,9 @@ fn terminal_projection_enforces_state_dependent_fields() {
             "sequence": 5, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 5,
             "occurredAt": "2026-08-18T00:00:02Z", "state": "completed",
-            "summary": "done", "finalMessage": {"messageId": "item_2", "text": "done"},
+            "summary": "done", "summaryTotalCharacters": 4, "summaryTruncated": false,
+            "finalMessage": {"messageId": "item_2", "text": "done", "totalCharacters": 4,
+                "truncated": false},
             "changeSet": {
                 "state": "complete", "incompleteReasons": [],
                 "files": [{"path": "src/main.rs", "status": "modified",
@@ -852,6 +1103,16 @@ fn terminal_projection_enforces_state_dependent_fields() {
         .expect("params")
         .remove("finalMessage");
     assert!(sanitize_webview_value(missing_message).is_err());
+    let mut cancelled = completed.clone();
+    cancelled["params"]["state"] = json!("cancelled");
+    cancelled["params"]
+        .as_object_mut()
+        .expect("params")
+        .remove("finalMessage");
+    assert!(sanitize_webview_value(cancelled.clone()).is_ok());
+    cancelled["params"]["finalMessage"] = json!({"messageId": "item_3", "text": "not a final",
+        "totalCharacters": 11, "truncated": false});
+    assert!(sanitize_webview_value(cancelled).is_err());
 
     let failed = json!({
         "jsonrpc": "2.0", "method": "turn/terminal",
@@ -860,14 +1121,15 @@ fn terminal_projection_enforces_state_dependent_fields() {
             "sequence": 6, "generation": 1, "workspaceId": "ws_1",
             "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 6,
             "occurredAt": "2026-08-18T00:00:03Z", "state": "failed",
-            "summary": "failed", "errorCode": "MODEL_ERROR", "errorMessage": "failed",
+            "summary": "failed", "summaryTotalCharacters": 6, "summaryTruncated": false,
+            "errorCode": "MODEL_ERROR", "errorMessage": "failed",
             "changeSet": {
                 "state": "partial", "incompleteReasons": ["commit_unconfirmed"],
                 "files": [], "stats": {"files": 0, "additions": 0, "deletions": 0,
                     "binaryFiles": 0, "truncated": false}
             },
             "usage": {
-                "requestId": "request_1", "requestOrdinal": 1, "modelRound": 1,
+                "modelRequestId": "modelreq_1", "modelRequestOrdinal": 1, "modelRound": 1,
                 "purpose": "assistant", "certainty": "unknown",
                 "profile": {
                     "providerId": "provider_1", "modelId": "model_1", "api": "openai_responses",
@@ -882,18 +1144,95 @@ fn terminal_projection_enforces_state_dependent_fields() {
             }
         }
     });
-    assert!(sanitize_webview_value(failed.clone()).is_ok());
-    let mut missing_collaboration_mode = failed;
+    let projected_failed =
+        sanitize_webview_value(failed.clone()).expect("persisted ChangeSet survives");
+    assert_eq!(
+        projected_failed["params"]["changeSet"],
+        failed["params"]["changeSet"]
+    );
+    let mut failed_with_null_change_set = failed.clone();
+    failed_with_null_change_set["params"]["changeSet"] = Value::Null;
+    assert!(sanitize_webview_value(failed_with_null_change_set.clone()).is_ok());
+    failed_with_null_change_set["params"]
+        .as_object_mut()
+        .expect("params")
+        .remove("changeSet");
+    assert!(sanitize_webview_value(failed_with_null_change_set).is_err());
+    let mut failed_with_message = failed.clone();
+    failed_with_message["params"]["finalMessage"] = json!({"messageId": "item_3", "text": "partial", "totalCharacters": 7,
+            "truncated": false});
+    assert!(sanitize_webview_value(failed_with_message).is_ok());
+    let mut missing_collaboration_mode = failed.clone();
     missing_collaboration_mode["params"]["usage"]["profile"]
         .as_object_mut()
         .expect("provider profile")
         .remove("collaborationMode");
     assert!(sanitize_webview_value(missing_collaboration_mode).is_err());
 
-    let mut missing_change_set = completed;
+    let mut missing_change_set = completed.clone();
     missing_change_set["params"]
         .as_object_mut()
         .expect("params")
         .remove("changeSet");
     assert!(sanitize_webview_value(missing_change_set).is_err());
+
+    let mut completed_without_change_set = completed.clone();
+    completed_without_change_set["params"]["changeSet"] = Value::Null;
+    assert!(sanitize_webview_value(completed_without_change_set).is_err());
+
+    let mut malformed_failed_change_set = failed.clone();
+    malformed_failed_change_set["params"]["changeSet"] = json!("unknown");
+    assert!(sanitize_webview_value(malformed_failed_change_set).is_err());
+
+    let mut cancelled_with_null_change_set = completed;
+    cancelled_with_null_change_set["params"]["state"] = json!("cancelled");
+    cancelled_with_null_change_set["params"]
+        .as_object_mut()
+        .expect("params")
+        .remove("finalMessage");
+    cancelled_with_null_change_set["params"]["changeSet"] = Value::Null;
+    assert!(sanitize_webview_value(cancelled_with_null_change_set.clone()).is_ok());
+    cancelled_with_null_change_set["params"]
+        .as_object_mut()
+        .expect("params")
+        .remove("changeSet");
+    assert!(sanitize_webview_value(cancelled_with_null_change_set).is_err());
+}
+
+/// 保证恢复状态与审批系统关闭按显式事件投影，native callId 不被 Ja 前缀规则拒绝。
+#[test]
+fn recovery_and_approval_close_events_enforce_closed_contracts() {
+    let recovery = json!({
+        "jsonrpc": "2.0", "method": "tool/recovery-changed",
+        "params": {
+            "serverInstanceId": "srv_1", "eventId": "evt_recovery_1",
+            "sequence": 7, "generation": 1, "workspaceId": "ws_1",
+            "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 7,
+            "occurredAt": "2026-08-18T00:00:04Z", "recoveryId": "recovery_1",
+            "callId": "toolu_01Jabc:part.2", "revision": 1,
+            "status": "pending", "requiresUserAction": true
+        }
+    });
+    assert!(sanitize_webview_value(recovery.clone()).is_ok());
+    let mut inconsistent_recovery = recovery;
+    inconsistent_recovery["params"]["requiresUserAction"] = json!(false);
+    assert!(sanitize_webview_value(inconsistent_recovery).is_err());
+
+    let closed = json!({
+        "jsonrpc": "2.0", "method": "approval/closed",
+        "params": {
+            "serverInstanceId": "srv_1", "eventId": "evt_approval_closed_1",
+            "sequence": 8, "generation": 1, "workspaceId": "ws_1",
+            "threadId": "thr_1", "turnId": "turn_1", "threadRevision": 8,
+            "occurredAt": "2026-08-18T00:00:05Z", "approvalId": "appr_1",
+            "reason": "superseded"
+        }
+    });
+    assert!(sanitize_webview_value(closed.clone()).is_ok());
+    let mut expired = closed.clone();
+    expired["params"]["reason"] = json!("expired");
+    assert!(sanitize_webview_value(expired).is_ok());
+    let mut fake_user_decision = closed;
+    fake_user_decision["params"]["reason"] = json!("deny");
+    assert!(sanitize_webview_value(fake_user_decision).is_err());
 }

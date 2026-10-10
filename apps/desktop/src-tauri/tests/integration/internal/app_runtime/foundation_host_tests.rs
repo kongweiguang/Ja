@@ -10,9 +10,9 @@ use crate::app_runtime::{
 };
 use crate::runtime_test_support::RuntimeHostHarness;
 use base64::Engine;
-use ja_runtime::app_server_process::SharedAppServerClient;
+use ja_runtime::app_server_process::{NativeClientIdentity, SharedAppServerClient};
 use serde_json::Value;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -23,6 +23,20 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TempRunDir(PathBuf);
+
+struct TestOwnedJvmIdentity {
+    executable: String,
+    jar: String,
+    marker_argument: String,
+}
+
+struct TestServerCleanup {
+    host: RuntimeHost,
+    config: LaunchConfig,
+    marker: String,
+    host_shutdown_attempted: bool,
+    finished: bool,
+}
 
 static JVM_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -60,6 +74,59 @@ impl Drop for TempRunDir {
     /// 清理失败不掩盖进程生命周期结果，残留目录仍可用于定位文件句柄或恢复问题。
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl TestServerCleanup {
+    /// 持有本用例唯一 Host 与 sidecar 身份，让断言 unwind 也经过显式本地 shutdown 和服务端清理。
+    fn new(host: RuntimeHost, config: LaunchConfig, marker: String) -> Self {
+        Self {
+            host,
+            config,
+            marker,
+            host_shutdown_attempted: false,
+            finished: false,
+        }
+    }
+
+    /// 正常尾部校验 Host 与 Java owner 都已关闭；失败时 Drop 仍执行不抛异常的精确兜底。
+    fn finish(mut self, deadline: Instant) -> Result<(), &'static str> {
+        self.host_shutdown_attempted = true;
+        let host_result = self
+            .host
+            .shutdown_until(deadline)
+            .map_err(|_| "test Host actor shutdown failed");
+        let server_result = try_stop_test_shared_server(&self.config, &self.marker, deadline);
+        let server_result = match server_result {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = terminate_test_owned_server(&self.config, &self.marker, deadline);
+                Err("graceful test server shutdown failed; marker-scoped cleanup was attempted")
+            }
+        };
+        let result = host_result.and(server_result);
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for TestServerCleanup {
+    /// 测试 panic 时有界关闭本用例 actor 和共享 JVM；兜底只按唯一 marker/JAR/可执行文件身份杀单个 PID。
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if !self.host_shutdown_attempted {
+            self.host_shutdown_attempted = true;
+            let _ = self
+                .host
+                .shutdown_until(Instant::now() + Duration::from_secs(5));
+        }
+        if try_stop_test_shared_server(&self.config, &self.marker, deadline).is_err() {
+            let _ = terminate_test_owned_server(&self.config, &self.marker, deadline);
+        }
+        self.finished = true;
     }
 }
 
@@ -200,13 +267,14 @@ fn test_jar() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../..")
-                .join("app-server")
+                .join("ja-agent")
+                .join("ja-app-server")
                 .join("target")
                 .join("ja-app-server.jar")
         });
     assert!(
         jar.is_file(),
-        "build app-server/target/ja-app-server.jar first or set JA_TEST_JAR"
+        "build ja-agent/ja-app-server/target/ja-app-server.jar first or set JA_TEST_JAR"
     );
     jar
 }
@@ -323,15 +391,239 @@ fn assert_process_tree_gone(marker: &str, deadline: Instant) {
     }
 }
 
-/// 测试夹具在桌面断连后显式管理自己启动的后台；生产窗口退出没有此权限或副作用。
-fn stop_test_shared_server(config: &LaunchConfig, marker: &str, deadline: Instant) {
-    let mut admin = SharedAppServerClient::connect_existing(&config.sidecar, 1)
-        .expect("connect test-owned shared server");
+/// 构造只能指向本次 fixture JAR、Java 可执行文件与随机 marker 的进程身份。
+fn test_owned_jvm_identity(
+    config: &LaunchConfig,
+    marker: &str,
+) -> Result<TestOwnedJvmIdentity, &'static str> {
+    let executable = std::fs::canonicalize(&config.sidecar.executable)
+        .map_err(|_| "test Java executable identity unavailable")?
+        .to_string_lossy()
+        .into_owned();
+    let executable = if cfg!(windows) {
+        executable
+            .strip_prefix("\\\\?\\")
+            .map(|path| {
+                path.strip_prefix("UNC\\")
+                    .map(|unc| format!("\\\\{unc}"))
+                    .unwrap_or_else(|| path.to_owned())
+            })
+            .unwrap_or(executable)
+    } else {
+        executable
+    };
+    let jar = config
+        .sidecar
+        .args
+        .windows(2)
+        .find(|args| args[0].as_os_str() == OsStr::new("-jar"))
+        .map(|args| args[1].to_string_lossy().into_owned())
+        .ok_or("test JAR argument missing")?;
+    let marker_argument = format!("-Dja.test.marker={marker}");
+    if !config
+        .sidecar
+        .args
+        .iter()
+        .any(|argument| argument.as_os_str() == OsStr::new(&marker_argument))
+    {
+        return Err("test JVM marker argument missing");
+    }
+    Ok(TestOwnedJvmIdentity {
+        executable,
+        jar,
+        marker_argument,
+    })
+}
+
+#[cfg(not(windows))]
+impl TestOwnedJvmIdentity {
+    /// 验证命令行以配置的 Java 可执行文件启动，并包含本用例唯一的 JAR 与 marker。
+    fn matches_command_line(&self, command_line: &str) -> bool {
+        let command_line = command_line.trim_start();
+        let executable = self.executable.as_str();
+        let executable_suffix = command_line.strip_prefix(executable).or_else(|| {
+            command_line
+                .strip_prefix('"')
+                .and_then(|quoted| quoted.strip_prefix(executable))
+                .and_then(|quoted| quoted.strip_prefix('"'))
+        });
+        let executable_matches = executable_suffix
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace));
+
+        executable_matches
+            && command_line.contains(&self.jar)
+            && command_line.contains(&self.marker_argument)
+    }
+}
+
+/// Windows 查询仅返回可执行文件、测试 JAR 与唯一 marker 同时匹配的 PID。
+#[cfg(windows)]
+fn test_owned_jvm_process_ids(
+    config: &LaunchConfig,
+    marker: &str,
+) -> Result<Vec<u32>, &'static str> {
+    let identity = test_owned_jvm_identity(config, marker)?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let script = format!(
+        "$me=$PID; $exe={}; $jar={}; $marker={}; Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $me -and $_.ExecutablePath -and $_.ExecutablePath.Equals($exe,[System.StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -and $_.CommandLine.IndexOf($jar,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine.IndexOf($marker,[System.StringComparison]::Ordinal) -ge 0 }} | Select-Object -ExpandProperty ProcessId",
+        quote(&identity.executable),
+        quote(&identity.jar),
+        quote(&identity.marker_argument)
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|_| "test JVM identity query failed")?;
+    if !output.status.success() {
+        return Err("test JVM identity query failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
+/// Unix 查询按 PID 与完整命令行身份筛选，保持清理范围与 Windows 一致。
+#[cfg(not(windows))]
+fn test_owned_jvm_process_ids(
+    config: &LaunchConfig,
+    marker: &str,
+) -> Result<Vec<u32>, &'static str> {
+    let identity = test_owned_jvm_identity(config, marker)?;
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+        .map_err(|_| "test JVM identity query failed")?;
+    if !output.status.success() {
+        return Err("test JVM identity query failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().splitn(2, char::is_whitespace);
+            let pid = fields.next()?.parse().ok()?;
+            let command_line = fields.next()?.trim();
+            identity.matches_command_line(command_line).then_some(pid)
+        })
+        .collect())
+}
+
+/// 有界确认本用例 marker/JAR 进程全部消失；查询失败不在 Drop 中 panic。
+fn wait_for_test_owned_jvm_gone(
+    config: &LaunchConfig,
+    marker: &str,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        if test_owned_jvm_process_ids(config, marker)?.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("test-owned JVM PID remains");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 对唯一候选 PID 再次核验 executable、JAR 和 marker 后终止，不使用进程名或进程树清理。
+#[cfg(windows)]
+fn terminate_test_owned_jvm_pid(
+    config: &LaunchConfig,
+    marker: &str,
+    pid: u32,
+) -> Result<(), &'static str> {
+    let identity = test_owned_jvm_identity(config, marker)?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let script = format!(
+        "$target=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $target) {{ exit 0 }}; $exe={}; $jar={}; $marker={}; if (-not $target.ExecutablePath -or -not $target.ExecutablePath.Equals($exe,[System.StringComparison]::OrdinalIgnoreCase) -or -not $target.CommandLine -or $target.CommandLine.IndexOf($jar,[System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or $target.CommandLine.IndexOf($marker,[System.StringComparison]::Ordinal) -lt 0) {{ exit 32 }}; Stop-Process -Id {pid} -Force -ErrorAction Stop",
+        quote(&identity.executable),
+        quote(&identity.jar),
+        quote(&identity.marker_argument)
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|_| "test JVM PID identity recheck failed")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("test JVM PID identity recheck failed")
+    }
+}
+
+/// Unix 终止前重新读取同一个 PID 的完整命令行，避免 PID 重用时误杀其他进程。
+#[cfg(not(windows))]
+fn terminate_test_owned_jvm_pid(
+    config: &LaunchConfig,
+    marker: &str,
+    pid: u32,
+) -> Result<(), &'static str> {
+    let identity = test_owned_jvm_identity(config, marker)?;
+    let pid_text = pid.to_string();
+    let output = Command::new("ps")
+        .args(["-p", &pid_text, "-o", "args="])
+        .output()
+        .map_err(|_| "test JVM PID identity recheck failed")?;
+    if !output.status.success() {
+        return Err("test JVM PID identity recheck failed");
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout);
+    let command_line = command_line.trim();
+    if command_line.is_empty() {
+        return Ok(());
+    }
+    if !identity.matches_command_line(command_line) {
+        return Err("test JVM PID identity changed before termination");
+    }
+    let output = Command::new("kill")
+        .args(["-KILL", &pid_text])
+        .output()
+        .map_err(|_| "test JVM PID termination failed")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("test JVM PID termination failed")
+    }
+}
+
+/// 仅在 graceful admin stop 失败时终止恰好一个经过二次身份核验的测试 JVM。
+fn terminate_test_owned_server(
+    config: &LaunchConfig,
+    marker: &str,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let pids = test_owned_jvm_process_ids(config, marker)?;
+    match pids.as_slice() {
+        [] => Ok(()),
+        [pid] => {
+            terminate_test_owned_jvm_pid(config, marker, *pid)?;
+            wait_for_test_owned_jvm_gone(config, marker, deadline)
+        }
+        _ => Err("multiple test-owned JVM PIDs matched; none were terminated"),
+    }
+}
+
+/// 优先通过本 fixture 的 admin channel 停止 Java，供 RAII Drop 调用且全程返回错误而不 panic。
+fn try_stop_test_shared_server(
+    config: &LaunchConfig,
+    marker: &str,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let identity =
+        NativeClientIdentity::new_current_process().map_err(|_| "admin identity failed")?;
+    let mut admin = SharedAppServerClient::connect_existing(&config.sidecar, 1, &identity)
+        .map_err(|_| "connect test-owned shared server failed")?;
     admin
         .stop_server(deadline.saturating_duration_since(Instant::now()))
-        .expect("stop test-owned shared server");
+        .map_err(|_| "stop test-owned shared server failed")?;
     drop(admin);
-    assert_process_tree_gone(marker, deadline);
+    wait_for_test_owned_jvm_gone(config, marker, deadline)
+}
+
+/// 测试夹具在桌面断连后显式管理自己启动的后台；生产窗口退出没有此权限或副作用。
+fn stop_test_shared_server(config: &LaunchConfig, marker: &str, deadline: Instant) {
+    try_stop_test_shared_server(config, marker, deadline)
+        .unwrap_or_else(|error| panic!("test-owned shared server shutdown failed: {error}"));
 }
 
 /// 在关闭前等待操作系统观测到真实 child，避免 Java 或慢启动夹具根本未启动时测试仍然通过。
@@ -363,10 +655,10 @@ fn join_with_deadline<T: Send + 'static>(
         .map_err(|_| "test worker join deadline elapsed")?
 }
 
-/// 只构造 JA-RPC v1 当前 Turn 输入；Thread 身份必须先由 Java 持久化用例签发。
+/// 只构造 JA-RPC v2 当前 Turn 输入；Thread 身份必须先由 Java 持久化用例签发。
 fn valid_turn(thread_id: String, text: &str) -> TurnStartInput {
     TurnStartInput {
-        client_operation_id: format!("op_{}", uuid::Uuid::new_v4().simple()),
+        operation_key: format!("op_{}", uuid::Uuid::new_v4().simple()),
         thread_id,
         content: vec![TurnContentPart::Text {
             text: text.to_owned(),
@@ -393,7 +685,7 @@ fn assert_no_token(value: &Value) {
     }
 }
 
-/// 只读取公开的 `method` 字段，避免测试绑定完整内部 JA-RPC v1 帧结构。
+/// 只读取公开的 `method` 字段，避免测试绑定完整内部 JA-RPC v2 帧结构。
 fn method(value: &Value) -> Option<&str> {
     value.get("method").and_then(Value::as_str)
 }
@@ -460,8 +752,8 @@ fn concurrent_calls_have_bounded_queue_admission() {
     });
 }
 
-/// 使用 Tauri 官方 MockRuntime 覆盖 command 注册、managed state、原生事件投影、
-/// Java25 隔离 Turn 与有界关闭，确保测试经过同一 production composition。
+/// 使用 Tauri 官方 MockRuntime 覆盖 command 注册、managed state、原生事件投影和 Java25 隔离 Turn。
+/// Workspace 打开与授信保持独立 typed command，停止后仍须可读状态并重连以支持 renderer reload。
 #[test]
 fn tauri_mock_composition_smoke_uses_typed_commands() {
     let _jvm_guard = jvm_runtime_test_guard();
@@ -563,21 +855,43 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
             serde_json::json!({
                 "input": {
                     "cwd": workspace_root.to_string_lossy(),
-                    "displayName": "Tauri mock workspace",
-                    "trust": "trusted"
+                    "displayName": "Tauri mock workspace"
                 }
             }),
         )
         .expect("typed workspace open command"),
     )
     .expect("workspace response");
-    let workspace_id = workspace.workspace_id;
+    assert_eq!(workspace.trust, "untrusted");
+    let workspace_id = workspace.workspace_id.clone();
+    let reopened: crate::app_runtime::WorkspaceWireDto = serde_json::from_value(
+        invoke(
+            "ja_runtime_workspace_open",
+            serde_json::json!({
+                "input": {"workspaceId": workspace_id.clone()}
+            }),
+        )
+        .expect("typed ID-only workspace open command"),
+    )
+    .expect("complete workspace response from ID-only open");
+    assert_eq!(reopened.workspace_id, workspace.workspace_id);
+    assert_eq!(reopened.root, workspace.root);
+    assert_eq!(reopened.display_name, workspace.display_name);
+    assert_eq!(reopened.trust, "untrusted");
+    assert_eq!(reopened.revision, workspace.revision);
+    assert_eq!(reopened.kind, workspace.kind);
     let started: RuntimeStatus = serde_json::from_value(
         invoke("ja_runtime_state", serde_json::json!({})).expect("typed state command"),
     )
     .expect("runtime state response");
     assert_eq!(started.status, RuntimeStatusKind::Ready);
     assert_process_marker_visible(&marker, total_deadline);
+    let trust_result = invoke(
+        "ja_workspace_set_trust",
+        serde_json::json!({"input": {"workspaceId": workspace_id, "trust": "trusted"}}),
+    )
+    .expect("typed workspace trust command");
+    assert_eq!(trust_result["accepted"].as_bool(), Some(true));
     // 配置和凭据必须经 Java-owned Tauri commands 写入；测试不再借由 Runtime 启动参数注入配置快照。
     let configuration = invoke(
         "ja_configuration_read",
@@ -776,6 +1090,21 @@ fn tauri_mock_composition_smoke_uses_typed_commands() {
         process_marker_visible(&marker),
         "typed stop must only disconnect desktop"
     );
+    let stopped_snapshot = invoke("ja_runtime_state", serde_json::json!({}))
+        .expect("stopped actor must remain queryable for renderer reload");
+    assert_eq!(stopped_snapshot["status"], "stopped");
+    assert!(stopped_snapshot.get("storageRecovery").is_none());
+    let stopped_storage = invoke("ja_runtime_storage_info", serde_json::json!({}))
+        .expect("stopped storage query must not require a disconnected Session");
+    assert!(stopped_storage.get("storageRecovery").is_none());
+    let reconnected: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_start", serde_json::json!({})).expect("reconnect existing actor"),
+    )
+    .expect("runtime reconnect response");
+    assert_eq!(reconnected.status, RuntimeStatusKind::Ready);
+    assert_eq!(reconnected.server_instance_id, started.server_instance_id);
+    assert_eq!(reconnected.generation, started.generation);
+    invoke("ja_runtime_stop", serde_json::json!({})).expect("disconnect reconnected client");
     cleanup_on_exit(&app.state::<RuntimeHost>()).expect("mock actor shutdown");
     stop_test_shared_server(&config, &marker, total_deadline);
 }
@@ -996,6 +1325,7 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
 /// 两个 Thread 串行启动用于锁定 accepted 提交边界：先经生产 general workspace 入口绑定
 /// App Server identity 与原生 capability，后续 Turn 才能捕获不混入既有 dirty 状态的基线；
 /// 前一个 Turn 完成后，后一个 Turn 也不能因生命周期投影而误报失败并诱发 UI 重试。
+/// accepted revision 是不可变准入回执；只与同 Turn 的终态比较，不假设未公开事务之间的 revision 连续。
 /// 总预算覆盖真实 JVM 冷启动、配置与 workspace 写入以及两个连续 Turn，为 hosted CI 负载留出余量；
 /// 本地 Provider 用真实结构化调用产生审批，不依赖生产测试分支或不可达网络的最终失败。
 #[test]
@@ -1003,12 +1333,13 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
     let _jvm_guard = jvm_runtime_test_guard();
     let provider = crate::responses_provider::ResponsesProvider::start();
     let run_dir = TempRunDir::create("turn");
-    let marker = format!("ja-marker-{}", std::process::id());
+    let marker = format!("ja-turn-test-{}", uuid::Uuid::new_v4().simple());
     let total_deadline = Instant::now() + Duration::from_secs(60);
     let (sink, receiver) = event_sink();
     let config = marked_fixture_config(&run_dir, &marker);
     let harness = RuntimeHostHarness::new(config.clone(), sink);
     let host = harness.host();
+    let cleanup = TestServerCleanup::new(host.clone(), config.clone(), marker.clone());
     let started = host.start().expect("sidecar ready");
     assert_eq!(started.status, RuntimeStatusKind::Ready);
     let ready_events = receive_until_at(&receiver, total_deadline, |value| {
@@ -1075,7 +1406,6 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
     host.open_workspace(WorkspaceOpenInput {
         cwd: project_root.to_string_lossy().into_owned(),
         display_name: Some("Rust host project".to_owned()),
-        trust: "trusted".to_owned(),
     })
     .expect("project workspace opened");
     let second_thread_id = harness
@@ -1107,14 +1437,19 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
             .recv_timeout(total_deadline.saturating_duration_since(Instant::now()))
             .expect("approval fixture event before deadline");
         let params = event.get("params").and_then(Value::as_object);
-        let belongs_to_second = params
+        let belongs_to_second_thread = params
             .and_then(|value| value.get("threadId"))
             .and_then(Value::as_str)
             == Some(second_thread_id.as_str());
-        if belongs_to_second && method(&event) == Some("approval/requested") {
+        let belongs_to_second_turn = belongs_to_second_thread
+            && params
+                .and_then(|value| value.get("turnId"))
+                .and_then(Value::as_str)
+                == Some(second_accepted.turn_id.as_str());
+        if belongs_to_second_turn && method(&event) == Some("approval/requested") {
             let params = params.expect("approval params");
             host.approval_respond(ApprovalResponseInput {
-                client_operation_id: format!("op_{}", uuid::Uuid::new_v4().simple()),
+                operation_key: format!("op_{}", uuid::Uuid::new_v4().simple()),
                 approval_id: params
                     .get("approvalId")
                     .and_then(Value::as_str)
@@ -1133,33 +1468,38 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
             })
             .expect("approval response accepted");
         }
-        let terminal = belongs_to_second && method(&event) == Some("turn/terminal");
-        second_events.push(event);
+        let terminal = belongs_to_second_turn && method(&event) == Some("turn/terminal");
+        if belongs_to_second_thread {
+            second_events.push(event);
+        }
         if terminal {
             break;
         }
     }
-    let second_first_revision = second_events
+    let second_terminal = second_events
         .iter()
-        .filter(|value| {
-            value
-                .get("params")
-                .and_then(|params| params.get("threadId"))
-                .and_then(Value::as_str)
-                == Some(second_thread_id.as_str())
+        .find(|value| {
+            method(value) == Some("turn/terminal")
+                && value.pointer("/params/threadId").and_then(Value::as_str)
+                    == Some(second_thread_id.as_str())
+                && value.pointer("/params/turnId").and_then(Value::as_str)
+                    == Some(second_accepted.turn_id.as_str())
         })
-        .filter_map(|value| {
-            value
-                .get("params")
-                .and_then(|params| params.get("threadRevision"))
-                .and_then(Value::as_u64)
-        })
-        .min()
-        .expect("second turn revision event");
+        .expect("terminal event for second accepted Turn");
     assert_eq!(
-        second_first_revision,
-        second_accepted.thread_revision.saturating_add(1),
-        "accepted revision 必须与第二个 Turn 的首个持久事件连续"
+        second_terminal
+            .pointer("/params/state")
+            .and_then(Value::as_str),
+        Some("completed"),
+        "approved second Turn must reach its completed terminal"
+    );
+    let second_terminal_revision = second_terminal
+        .pointer("/params/threadRevision")
+        .and_then(Value::as_u64)
+        .expect("second Turn terminal revision");
+    assert!(
+        second_terminal_revision > second_accepted.thread_revision,
+        "terminal revision must advance beyond this Turn's immutable admission receipt"
     );
 
     assert_process_marker_visible(&marker, total_deadline);
@@ -1176,11 +1516,46 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
             .and_then(Value::as_str)
             == Some("stopped")
     });
-    host.shutdown().expect("desktop actor shutdown");
-    stop_test_shared_server(&config, &marker, total_deadline);
+    cleanup
+        .finish(total_deadline)
+        .expect("desktop actor and test-owned server shutdown");
+    assert_process_tree_gone(&marker, total_deadline);
 }
 
-/// 桌面在审批等待中退出后，第二个原生宿主必须从 Java 权威快照找回同一个 Turn 并继续完成。
+/// 验证断言 unwind 会执行 test-only RAII，关闭本用例 Host actor 并回收唯一 Java fixture。
+#[test]
+fn test_owned_server_cleanup_runs_during_unwind() {
+    let _jvm_guard = jvm_runtime_test_guard();
+    let run_dir = TempRunDir::create("cleanup-unwind");
+    let marker = format!("ja-cleanup-test-{}", uuid::Uuid::new_v4().simple());
+    let config = marked_fixture_config(&run_dir, &marker);
+    let (sink, _receiver) = event_sink();
+    let harness = RuntimeHostHarness::new(config.clone(), sink);
+    let host = harness.host();
+    let injected_panic = "exercise test-owned cleanup during assertion unwind";
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = TestServerCleanup::new(host.clone(), config.clone(), marker.clone());
+        let started = host.start().expect("test-owned sidecar ready");
+        assert_eq!(started.status, RuntimeStatusKind::Ready);
+        assert_process_marker_visible(&marker, Instant::now() + Duration::from_secs(20));
+        panic!("{injected_panic}");
+    }));
+
+    let panic = outcome.expect_err("fixture must reach the injected panic after marker visibility");
+    let panic_message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(
+        panic_message,
+        Some(injected_panic),
+        "cleanup regression must reach the injected panic after marker visibility"
+    );
+    assert_process_tree_gone(&marker, Instant::now() + Duration::from_secs(15));
+}
+
+/// 桌面断连后从权威快照恢复同一审批与 Turn；失败路径也由标记限定的清理 owner 回收本用例服务端。
 #[test]
 fn desktop_disconnect_preserves_pending_turn_for_reconnected_host() {
     let _jvm_guard = jvm_runtime_test_guard();
@@ -1192,6 +1567,7 @@ fn desktop_disconnect_preserves_pending_turn_for_reconnected_host() {
     let (first_sink, first_events) = event_sink();
     let first_harness = RuntimeHostHarness::new(config.clone(), first_sink);
     let first_host = first_harness.host();
+    let cleanup = TestServerCleanup::new(first_host.clone(), config.clone(), marker.clone());
     let original_status = first_host.start().expect("first desktop connected");
     configure_profile_with_provider(&first_harness, &provider.base_url());
 
@@ -1207,7 +1583,6 @@ fn desktop_disconnect_preserves_pending_turn_for_reconnected_host() {
         .open_workspace(WorkspaceOpenInput {
             cwd: project_root.to_string_lossy().into_owned(),
             display_name: Some("Shared turn project".to_owned()),
-            trust: "trusted".to_owned(),
         })
         .expect("open Java-owned project");
     let thread_id = first_harness
@@ -1269,7 +1644,7 @@ fn desktop_disconnect_preserves_pending_turn_for_reconnected_host() {
     );
     second_host
         .approval_respond(ApprovalResponseInput {
-            client_operation_id: format!("op_{}", uuid::Uuid::new_v4().simple()),
+            operation_key: format!("op_{}", uuid::Uuid::new_v4().simple()),
             approval_id,
             turn_id: accepted.turn_id.clone(),
             decision: "approve".to_owned(),
@@ -1289,7 +1664,9 @@ fn desktop_disconnect_preserves_pending_turn_for_reconnected_host() {
         process_marker_visible(&marker),
         "desktop exit must preserve shared backend"
     );
-    stop_test_shared_server(&config, &marker, deadline);
+    cleanup
+        .finish(deadline)
+        .expect("reconnected test owner and server close");
 }
 
 /// 设计原因：当前 Cargo test 所在的 Windows Job 禁止 breakaway；此测试只连接由隔离 CLI
@@ -1322,10 +1699,12 @@ fn prestarted_cli_daemon_survives_two_desktop_hosts() {
         run,
         logs,
     );
-    let original_instance = SharedAppServerClient::connect_existing(&config.sidecar, 1)
-        .expect("CLI-prestarted backend must be healthy")
-        .server_instance_id()
-        .to_owned();
+    let admin_identity = NativeClientIdentity::new_current_process().expect("admin identity");
+    let original_instance =
+        SharedAppServerClient::connect_existing(&config.sidecar, 1, &admin_identity)
+            .expect("CLI-prestarted backend must be healthy")
+            .server_instance_id()
+            .to_owned();
 
     let first_harness = RuntimeHostHarness::new(config.clone(), Arc::new(|_| Ok(())));
     let first_host = first_harness.host();
@@ -1341,7 +1720,6 @@ fn prestarted_cli_daemon_survives_two_desktop_hosts() {
         .open_workspace(WorkspaceOpenInput {
             cwd: project.to_string_lossy().into_owned(),
             display_name: Some("Shared Desktop attach".to_owned()),
-            trust: "trusted".to_owned(),
         })
         .expect("open Java-owned workspace");
     let thread_id = first_harness
@@ -1385,7 +1763,8 @@ fn prestarted_cli_daemon_survives_two_desktop_hosts() {
         legacy_bytes,
         "shared attach may not delete historical user files"
     );
-    SharedAppServerClient::connect_existing(&config.sidecar, 1)
+    let verifier_identity = NativeClientIdentity::new_current_process().expect("verifier identity");
+    SharedAppServerClient::connect_existing(&config.sidecar, 1, &verifier_identity)
         .expect("CLI owner survives both Desktop disconnects");
 }
 
@@ -1605,4 +1984,147 @@ fn launch_failure_does_not_crash_loop() {
     assert!(position("start_client_connect_error") < position("actor_start_reply_err"));
     assert!(position("actor_start_reply_err") < position("actor_shutdown_received"));
     assert!(position("actor_shutdown_received") < position("actor_shutdown_confirmed"));
+}
+
+/// 强杀用例等待终态清理投影后再注入一次 cleanup 失败，验证故障 identity/debt 保留且重试前不创建新 owner。
+#[cfg(windows)]
+#[test]
+fn tauri_closed_connection_remains_crashed_until_explicit_start() {
+    let _jvm_guard = jvm_runtime_test_guard();
+    use crate::app_runtime::{cleanup_on_exit, register_commands};
+    use tauri::Manager;
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder, mock_context, noop_assets};
+    use tauri::webview::InvokeRequest;
+
+    let run_dir = TempRunDir::create("closed-connection");
+    let marker = format!("ja-tauri-closed-{}", std::process::id());
+    let config = marked_fixture_config(&run_dir, &marker);
+    let (sink, events) = event_sink();
+    let cleanup_failures = Arc::new(AtomicUsize::new(0));
+    let host = RuntimeHostHarness::with_exit_control(
+        config.clone(),
+        sink,
+        Duration::from_secs(2),
+        Arc::clone(&cleanup_failures),
+    )
+    .host();
+    let app = register_commands(mock_builder())
+        .manage(host.clone())
+        .build(mock_context(noop_assets()))
+        .expect("mock Tauri app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview");
+    let invoke = |cmd: &str| -> Result<Value, Value> {
+        let request = InvokeRequest {
+            cmd: cmd.to_owned(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "http://tauri.localhost".parse().expect("mock invoke URL"),
+            body: InvokeBody::Json(serde_json::json!({})),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_owned(),
+        };
+        get_ipc_response(&webview, request).and_then(|body| {
+            body.deserialize::<Value>()
+                .map_err(|error| Value::String(error.to_string()))
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let started: RuntimeStatus =
+        serde_json::from_value(invoke("ja_runtime_start").expect("typed runtime start"))
+            .expect("runtime start response");
+    assert_eq!(started.status, RuntimeStatusKind::Ready);
+    assert_process_marker_visible(&marker, deadline);
+
+    let script = format!(
+        "$targets = @(Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{marker}*' }}); if ($targets.Count -ne 1) {{ exit 31 }}; Stop-Process -Id $targets[0].ProcessId -Force -ErrorAction Stop"
+    );
+    let killed = Command::new("pwsh.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("force-stop isolated test sidecar");
+    assert!(
+        killed.status.success(),
+        "test sidecar marker must identify exactly one process: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert_process_tree_gone(&marker, Instant::now() + Duration::from_secs(10));
+
+    let crashed = loop {
+        let status: RuntimeStatus =
+            serde_json::from_value(invoke("ja_runtime_state").expect("state after process exit"))
+                .expect("crashed state response");
+        if status.status == RuntimeStatusKind::Crashed {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed connection did not become crashed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(crashed.generation, started.generation);
+    assert_eq!(crashed.server_instance_id, started.server_instance_id);
+    for _ in 0..3 {
+        let status: RuntimeStatus = serde_json::from_value(
+            invoke("ja_runtime_state").expect("repeated state after process exit"),
+        )
+        .expect("repeated state response");
+        assert_eq!(status.status, crashed.status);
+        assert_eq!(status.generation, crashed.generation);
+        assert_eq!(status.server_instance_id, crashed.server_instance_id);
+        assert!(
+            !process_marker_visible(&marker),
+            "state must not auto-start the sidecar"
+        );
+    }
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "terminal cleanup did not publish its crashed projection"
+        );
+        let event = events
+            .recv_timeout(remaining)
+            .expect("terminal crashed projection before deadline");
+        if event.get("method").and_then(Value::as_str) == Some("runtime/status-changed")
+            && event.pointer("/params/status").and_then(Value::as_str) == Some("crashed")
+        {
+            break;
+        }
+    }
+
+    cleanup_failures.store(1, std::sync::atomic::Ordering::Release);
+    let cleanup_error = invoke("ja_runtime_start")
+        .expect_err("unconfirmed cleanup must reject a replacement connection");
+    assert_eq!(cleanup_error["code"], "RUNTIME_SHUTDOWN_TIMEOUT");
+    let retained: RuntimeStatus =
+        serde_json::from_value(invoke("ja_runtime_state").expect("state after failed cleanup"))
+            .expect("retained crash state response");
+    assert_eq!(retained.status, RuntimeStatusKind::Crashed);
+    assert_eq!(retained.generation, crashed.generation);
+    assert_eq!(retained.server_instance_id, crashed.server_instance_id);
+    assert!(
+        !process_marker_visible(&marker),
+        "failed cleanup must not launch a replacement sidecar"
+    );
+
+    let reconnected: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_start").expect("explicit retry after confirmed cleanup"),
+    )
+    .expect("reconnected state response");
+    assert_eq!(reconnected.status, RuntimeStatusKind::Ready);
+    assert_ne!(reconnected.server_instance_id, crashed.server_instance_id);
+    assert_process_marker_visible(&marker, deadline);
+    let stopped: RuntimeStatus = serde_json::from_value(
+        invoke("ja_runtime_stop").expect("typed stop disconnects new client"),
+    )
+    .expect("stopped state response");
+    assert_eq!(stopped.status, RuntimeStatusKind::Stopped);
+    cleanup_on_exit(&app.state::<RuntimeHost>()).expect("mock actor shutdown");
+    stop_test_shared_server(&config, &marker, deadline);
 }

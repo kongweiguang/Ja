@@ -1,0 +1,150 @@
+/* @author kongweiguang */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
+.ja-toaster {
+  --ja-titlebar-height: 36px;
+  z-index: 1000;
+}
+.ja-toaster[data-sonner-toaster] {
+  display: flex;
+  width: min(356px, calc(100vw - 1.5rem));
+  max-width: calc(100vw - 1.5rem);
+  max-height: calc(
+    100dvh - var(--ja-titlebar-height) - 3rem - 1.5rem - env(safe-area-inset-top, 0px)
+  );
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 3px;
+  font-family: var(--ja-font-ui);
+  overflow: auto;
+  pointer-events: none;
+}
+.ja-toaster[data-sonner-toaster] [data-sonner-toast] {
+  position: relative;
+  top: auto;
+  width: 100%;
+  max-width: 100%;
+  min-height: 2.75rem;
+  max-height: min(50vh, 20rem);
+  flex: 0 0 auto;
+  align-items: flex-start;
+  padding: 0.72rem 2.85rem 0.72rem 0.9rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-md);
+  color: var(--ja-foreground);
+  background: var(--ja-surface-elevated, var(--ja-surface));
+  box-shadow: var(--ja-shadow-floating);
+  font-size: var(--ja-text-control-size);
+  line-height: var(--ja-line-body);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  pointer-events: auto;
+}
+/* 队列按正常流滚动；只覆盖展开后的位移，Sonner 仍负责入场、退出和手势动画。 */
+.ja-toaster[data-sonner-toaster]
+  [data-sonner-toast][data-mounted="true"][data-expanded="true"]:not([data-removed="true"]):not(
+    [data-swiping="true"]
+  ):not([data-swipe-out="true"]) {
+  --y: translateY(0);
+}
+.ja-toaster[data-sonner-toaster] [data-content],
+.ja-notification-content {
+  min-width: 0;
+  width: 100%;
+}
+.ja-toaster[data-sonner-toaster] [data-title] {
+  font-weight: var(--ja-weight-regular);
+}
+.ja-toaster[data-sonner-toaster] [data-description] {
+  color: var(--ja-foreground-muted);
+}
+.ja-toaster[data-sonner-toaster] [data-icon] {
+  margin-top: 0.15rem;
+}
+.ja-toaster[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-close-button],
+.ja-toaster[data-sonner-toaster] .ja-notification-close {
+  appearance: none;
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  left: auto;
+  display: inline-grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-foreground-muted);
+  background: transparent;
+  line-height: 0;
+  transform: none;
+  cursor: pointer;
+}
+.ja-toaster[data-sonner-toaster] [data-close-button]:hover,
+.ja-toaster[data-sonner-toaster] .ja-notification-close:hover {
+  color: var(--ja-foreground);
+  background: var(--ja-control-hover);
+}
+.ja-toaster[data-sonner-toaster] [data-close-button]:focus-visible,
+.ja-toaster[data-sonner-toaster] .ja-notification-close:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+.ja-toaster[data-sonner-toaster] [data-close-button] svg,
+.ja-notification-close svg {
+  display: block;
+  width: 1rem;
+  height: 1rem;
+}
+.ja-notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.ja-notification-actions:empty {
+  display: none;
+}
+.ja-toaster[data-sonner-toaster] [data-button],
+.ja-notification-actions button:not(.ja-icon-button) {
+  appearance: none;
+  min-height: 1.75rem;
+  height: auto;
+  margin: 0;
+  padding: 0.3rem 0.5rem;
+  border: 0;
+  border-radius: var(--ja-radius-sm);
+  color: var(--ja-accent);
+  background: var(--ja-control-hover);
+  font: inherit;
+  font-weight: var(--ja-weight-semibold);
+  line-height: var(--ja-line-control);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.ja-notification-actions button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+.ja-notification-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+@media (max-width: 600px) {
+  .ja-toaster[data-sonner-toaster] {
+    width: min(356px, calc(100vw - 1rem));
+    max-width: calc(100vw - 1rem);
+    left: auto;
+    right: var(--mobile-offset-right);
+  }
+}
+@media (forced-colors: active) {
+  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
+    border: 1px solid CanvasText;
+    background: Canvas;
+  }
+}

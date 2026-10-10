@@ -4,6 +4,20 @@
 name: Publish Ja CLI to npm
 
 on:
+  workflow_call:
+    inputs:
+      source_commit:
+        description: Exact verified main commit SHA
+        required: true
+        type: string
+      native_run_id:
+        description: Successful native-app-server push run for that commit
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        description: Optional granular token for the first package publication
+        required: false
   workflow_dispatch:
     inputs:
       source_commit:
@@ -79,7 +93,9 @@ jobs:
 
       - name: Build the matching Rust CLI
         shell: pwsh
-        run: cargo build --locked --release -p ja-cli
+        run: |
+          cargo build --locked --release -p ja-cli
+          if ($LASTEXITCODE -ne 0) { throw 'CLI release build failed' }
 
       - name: Stage, inspect, and install the npm tarball
         shell: pwsh
@@ -90,8 +106,9 @@ jobs:
           $reuse = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
           node packages/ja-npm/scripts/stage.mjs `
             --cli 'target/release/ja.exe' `
-            --app-server (Join-Path $reuse 'app-server/target/ja-app-server.exe') `
+            --app-server (Join-Path $reuse 'ja-agent/ja-app-server/target/ja-app-server.exe') `
             --native-report (Join-Path $reuse 'native-evidence/build-report.json') `
+            --search-tools (Join-Path $reuse 'tools') `
             --source-commit $env:JA_SOURCE_COMMIT `
             --out $stage
           if ($LASTEXITCODE -ne 0) { throw 'npm staging failed' }
@@ -113,14 +130,58 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'clean npm install failed' }
           & (Join-Path $install 'node_modules/.bin/ja.cmd') --help
           if ($LASTEXITCODE -ne 0) { throw 'installed Ja launcher failed' }
+          & (Join-Path $install 'node_modules/.bin/ja.cmd') --version
+          if ($LASTEXITCODE -ne 0) { throw 'installed Ja version check failed' }
+          node packages/ja-npm/scripts/verify-runtime.mjs `
+            --package-root (Join-Path $install 'node_modules/@kongweiguang/ja') `
+            --evidence-directory (Join-Path $env:RUNNER_TEMP 'ja-npm-candidate-smoke')
+          if ($LASTEXITCODE -ne 0) { throw 'installed npm native runtime or bundled file search failed' }
 
-      - name: Publish the verified public package through npm OIDC
+      - name: Preserve the verified npm tarball for first-publish recovery
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ja-npm-windows-x64
+          path: ${{ runner.temp }}/ja-npm-stage/*.tgz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish and read back the verified public npm package
         shell: pwsh
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          Push-Location (Join-Path $env:RUNNER_TEMP 'ja-npm-stage')
-          try {
-            npm publish --access public
-            if ($LASTEXITCODE -ne 0) { throw 'npm publish failed' }
-          } finally {
-            Pop-Location
+          $stage = Join-Path $env:RUNNER_TEMP 'ja-npm-stage'
+          $version = (Get-Content -Raw -LiteralPath (Join-Path $stage 'package.json') | ConvertFrom-Json).version
+          $spec = "@kongweiguang/ja@$version"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $metadata = npm view $spec --json --registry=https://registry.npmjs.org 2> (Join-Path $env:RUNNER_TEMP 'ja-npm-view.stderr')
+          if ($LASTEXITCODE -ne 0) {
+            $failure = ($metadata -join "`n") | ConvertFrom-Json
+            if ($failure.error.code -cne 'E404') { throw "npm lookup failed: $($failure.error.code)" }
+            Push-Location $stage
+            try {
+              npm publish --access public --registry=https://registry.npmjs.org
+              if ($LASTEXITCODE -ne 0) {
+                throw 'npm publish failed; configure the npm Trusted Publisher for the calling workflow or supply a first-publish NPM_TOKEN'
+              }
+            } finally {
+              Pop-Location
+            }
           }
+          # npm 的版本不可覆盖；成功上传后重跑只能验证同源码的已发布包。
+          $published = Join-Path $env:RUNNER_TEMP 'ja-npm-published'
+          npm install --ignore-scripts --no-audit --no-fund --prefix $published $spec --registry=https://registry.npmjs.org
+          if ($LASTEXITCODE -ne 0) { throw 'published npm package could not be installed' }
+          $package = Join-Path $published 'node_modules/@kongweiguang/ja'
+          node packages/ja-npm/scripts/verify-published.mjs $package $stage
+          if ($LASTEXITCODE -ne 0) { throw 'published npm package differs from the verified release' }
+          & (Join-Path $published 'node_modules/.bin/ja.cmd') --help
+          if ($LASTEXITCODE -ne 0) { throw 'published Ja launcher failed' }
+          & (Join-Path $published 'node_modules/.bin/ja.cmd') --version
+          if ($LASTEXITCODE -ne 0) { throw 'published Ja version check failed' }
+          node packages/ja-npm/scripts/verify-runtime.mjs `
+            --package-root $package `
+            --evidence-directory (Join-Path $env:RUNNER_TEMP 'ja-npm-published-smoke')
+          if ($LASTEXITCODE -ne 0) { throw 'published npm native runtime or bundled file search failed' }
+          "Verified public npm package: $spec" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY

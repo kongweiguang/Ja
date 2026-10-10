@@ -134,30 +134,21 @@ fn host_workspace_open_switch_replaces_pending_binding() {
             .expect_err("runtime is not ready"),
         WorkspaceLookup::Unknown
     );
-    let first_open = host
-        .open_workspace(WorkspaceOpenInput {
+    host.open_workspace(WorkspaceOpenInput {
             cwd: first.to_string_lossy().into_owned(),
             display_name: None,
-            trust: "trusted".to_owned(),
         })
         .expect("first binding");
-    assert!(first_open.accepted);
-    assert!(first_open.workspace_id.is_none());
     assert_eq!(
         host.with_configured_workspace("ws_first", |_| ())
             .expect_err("workspace open is not Ready yet"),
         WorkspaceLookup::Unknown
     );
-    let second_open = host
-        .open_workspace(WorkspaceOpenInput {
+    host.open_workspace(WorkspaceOpenInput {
             cwd: second.to_string_lossy().into_owned(),
             display_name: None,
-            trust: "trusted".to_owned(),
         })
         .expect("second binding");
-    assert!(second_open.accepted);
-    assert!(second_open.workspace_id.is_none());
-    assert_ne!(first_open.cwd, second_open.cwd);
     assert_eq!(
         host.with_configured_workspace("ws_first", |_| ())
             .expect_err("old binding must be gone"),
@@ -191,7 +182,6 @@ fn host_workspace_binding_clears_on_failure_stop_and_shutdown() {
         host.open_workspace(WorkspaceOpenInput {
             cwd: root.to_string_lossy().into_owned(),
             display_name: None,
-            trust: "trusted".to_owned(),
         })
     };
 
@@ -204,7 +194,6 @@ fn host_workspace_binding_clears_on_failure_stop_and_shutdown() {
     let failed = host.open_workspace(WorkspaceOpenInput {
         cwd: base.join("missing").to_string_lossy().into_owned(),
         display_name: None,
-        trust: "trusted".to_owned(),
     });
     assert!(failed.is_err());
     assert_eq!(
@@ -248,7 +237,6 @@ fn host_workspace_binding_clears_on_failure_stop_and_shutdown() {
         .open_workspace(WorkspaceOpenInput {
             cwd: failed_start_root.to_string_lossy().into_owned(),
             display_name: None,
-            trust: "trusted".to_owned(),
         })
         .expect("binding before failed start");
     assert!(

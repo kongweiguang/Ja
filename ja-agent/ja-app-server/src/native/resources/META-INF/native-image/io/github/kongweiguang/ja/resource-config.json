@@ -1,0 +1,71 @@
+{
+  "resources": {
+    "includes": [
+      {
+        "pattern": "draft/2020-12/schema"
+      },
+      {
+        "pattern": "draft/2020-12/meta/core"
+      },
+      {
+        "pattern": "draft/2020-12/meta/applicator"
+      },
+      {
+        "pattern": "draft/2020-12/meta/unevaluated"
+      },
+      {
+        "pattern": "draft/2020-12/meta/validation"
+      },
+      {
+        "pattern": "draft/2020-12/meta/meta-data"
+      },
+      {
+        "pattern": "draft/2020-12/meta/format-annotation"
+      },
+      {
+        "pattern": "draft/2020-12/meta/content"
+      },
+      {
+        "pattern": "app.*\\.yml"
+      },
+      {
+        "pattern": "app.*\\.properties"
+      },
+      {
+        "pattern": "META-INF/.*"
+      },
+      {
+        "pattern": "WEB-INF/.*"
+      },
+      {
+        "pattern": "static/.*"
+      },
+      {
+        "pattern": "templates/.*"
+      },
+      {
+        "pattern": "db/migration/.*"
+      },
+      {
+        "pattern": "logback\\.xml"
+      },
+      {
+        "pattern": "skills/.*"
+      }
+    ],
+    "excludes": [
+      {
+        "pattern": "META-INF/native-image/.*"
+      },
+      {
+        "pattern": "META-INF/maven/.*"
+      },
+      {
+        "pattern": "META-INF/(LICENSE|NOTICE|DEPENDENCIES|COPYING)(\\..*)?"
+      },
+      {
+        "pattern": "META-INF/MANIFEST\\.MF"
+      }
+    ]
+  }
+}

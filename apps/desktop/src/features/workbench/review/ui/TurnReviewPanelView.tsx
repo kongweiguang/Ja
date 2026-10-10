@@ -53,6 +53,13 @@ interface ReaderLifetime {
   disposeToken?: object;
 }
 
+interface RetryFocusRequest {
+  readonly targetIdentity: string;
+  readonly selectedPath: string | undefined;
+  readonly requestedPathRevision: number;
+  readonly reloadToken: number;
+}
+
 /** 冻结身份包含 artifact；后续 Turn 不能把正在阅读的历史证据替换成新事实。 */
 function reviewTargetIdentity(target: TurnReviewTarget): string {
   return `${target.workspaceId}:${target.threadId}:${target.turnId}:${target.artifactId}`;
@@ -83,6 +90,8 @@ export function TurnReviewPanelView({
 }: TurnReviewPanelViewProps): ReactElement {
   const readerLifetimeRef = useRef<ReaderLifetime | undefined>(undefined);
   const selectedButtonRef = useRef<HTMLButtonElement | null>(null);
+  const detailTitleRef = useRef<HTMLElement | null>(null);
+  const retryFocusRequestRef = useRef<RetryFocusRequest | undefined>(undefined);
   const targetIdentity = reviewTargetIdentity(target);
   const selectionGenerationRef = useRef(0);
   const [reloadToken, setReloadToken] = useState(0);
@@ -231,12 +240,59 @@ export function TurnReviewPanelView({
     !selectedFile.truncated &&
     currentResult === undefined;
 
+  /** 只在原重试操作确实持焦点、且目标和请求身份未变化时恢复焦点。 */
+  useEffect(() => {
+    const request = retryFocusRequestRef.current;
+    if (request === undefined) return;
+    if (
+      !active ||
+      request.targetIdentity !== targetIdentity ||
+      request.selectedPath !== effectiveSelectedPath ||
+      request.requestedPathRevision !== requestedPathRevision ||
+      request.reloadToken !== reloadToken
+    ) {
+      retryFocusRequestRef.current = undefined;
+      return;
+    }
+    if (currentResult?.error !== undefined) {
+      retryFocusRequestRef.current = undefined;
+      return;
+    }
+    if (currentResult?.files === undefined) return;
+
+    retryFocusRequestRef.current = undefined;
+    if (document.activeElement === document.body)
+      detailTitleRef.current?.focus({ preventScroll: true });
+  }, [
+    active,
+    currentResult,
+    effectiveSelectedPath,
+    readKey,
+    reloadToken,
+    requestedPathRevision,
+    targetIdentity,
+  ]);
+
   /** 重试建立新的读取 generation，并重建可能故障的解析 Worker。 */
   const refresh = (): void => {
     const lifetime = readerLifetimeRef.current;
     readerLifetimeRef.current = undefined;
     lifetime?.reader.dispose();
     setReloadToken((current) => current + 1);
+  };
+
+  /** 按钮卸载会清除浏览器焦点；仅记录它在触发时确实持焦点的读取。 */
+  const retry = (trigger: HTMLButtonElement): void => {
+    retryFocusRequestRef.current =
+      document.activeElement === trigger
+        ? {
+            targetIdentity,
+            selectedPath: effectiveSelectedPath,
+            requestedPathRevision,
+            reloadToken: reloadToken + 1,
+          }
+        : undefined;
+    refresh();
   };
 
   const visibleFiles = useMemo(() => {
@@ -330,7 +386,15 @@ export function TurnReviewPanelView({
     >
       {selectedFile === undefined ? null : (
         <header className="ja-turn-review-diff-header">
-          <strong title={selectedFile.path}>{selectedFile.path}</strong>
+          <strong
+            ref={detailTitleRef}
+            role="heading"
+            aria-level={2}
+            tabIndex={-1}
+            title={selectedFile.path}
+          >
+            {selectedFile.path}
+          </strong>
           <span>{{ added: "新增", modified: "修改", deleted: "删除" }[selectedFile.status]}</span>
         </header>
       )}
@@ -343,7 +407,12 @@ export function TurnReviewPanelView({
         ) : currentResult?.error !== undefined ? (
           <div className="ja-turn-review-state is-error" role="alert">
             <p>{currentResult.error}</p>
-            <Button type="button" variant="secondary" size="sm" onClick={refresh}>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={(event) => retry(event.currentTarget)}
+            >
               重试
             </Button>
           </div>

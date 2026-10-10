@@ -30,7 +30,7 @@ export interface TerminalPanelProps {
   initialText?: string;
   /** 重连快照保持原始字节，避免破坏跨 chunk 的 UTF-8 或 ANSI 状态。 */
   initialData?: Uint8Array | readonly number[];
-  /** 单个 append-only PTY 输出事件以 sequence 区分相邻的相同字节 chunk。 */
+  /** 单个仅追加的 PTY 输出事件通过 sequence 区分相邻的相同字节块。 */
   output?: TerminalOutputChunk;
   /** controller 提供的有序未确认事件批次可跨 React state 合并，且不转换终端字节。 */
   outputs?: readonly TerminalOutputChunk[];

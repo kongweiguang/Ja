@@ -36,13 +36,26 @@ export function sourceLabel(source: ReviewSource, branchLabel?: string): string 
     case "uncommitted":
       return "未提交";
     case "unstaged":
-      return "未暂存";
     case "staged":
-      return "已暂存";
+      return reviewLayerLabel(source.kind);
     case "branch":
       return branchLabel ?? source.refId;
     case "commit":
       return `提交 ${source.commitId.slice(0, 8)}`;
+  }
+}
+
+/** Review 文件层只维护一份中文名，使文件树和发现位置不会各自翻译协议枚举。 */
+export function reviewLayerLabel(layer: ReviewFile["layer"]): string {
+  switch (layer) {
+    case "staged":
+      return "已暂存";
+    case "unstaged":
+      return "未暂存";
+    case "untracked":
+      return "未跟踪";
+    case "comparison":
+      return "比较";
   }
 }
 

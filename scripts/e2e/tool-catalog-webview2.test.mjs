@@ -3,11 +3,8 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  startToolCatalogFixture,
-  toolCatalogFixtureMarkers,
-} from "./fixtures/tool-catalog.mjs";
-import { validateToolCatalogReport } from "./tool-catalog-webview2.mjs";
+import { startToolCatalogFixture, toolCatalogFixtureMarkers } from "./fixtures/tool-catalog.mjs";
+import { REQUIRED_BASE_TOOLS, validateToolCatalogReport } from "./tool-catalog-webview2.mjs";
 
 const TOOL_DEFINITIONS = Object.freeze([
   {
@@ -39,9 +36,49 @@ const TOOL_DEFINITIONS = Object.freeze([
   {
     type: "function",
     strict: true,
-    name: "shell",
+    name: "exec_command",
     description: "Run a command",
     parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+  },
+  {
+    type: "function",
+    strict: true,
+    name: "write_stdin",
+    description: "Continue a process session",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", minLength: 1, maxLength: 128 },
+        input: { type: "string", maxLength: 1_048_576 },
+        close_input: { type: "boolean" },
+        after_sequence: {
+          type: "integer",
+          minimum: 0,
+          maximum: Number.MAX_SAFE_INTEGER,
+          default: 0,
+        },
+        yield_time_ms: {
+          type: "integer",
+          minimum: 0,
+          maximum: 10_000,
+          default: 1_000,
+        },
+      },
+      required: ["session_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    strict: true,
+    name: "view_image",
+    description: "Read an image from the workspace",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", minLength: 1 } },
+      required: ["path"],
+      additionalProperties: false,
+    },
   },
   {
     type: "function",
@@ -51,12 +88,15 @@ const TOOL_DEFINITIONS = Object.freeze([
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string" },
-        filePattern: { type: ["string", "null"] },
+        pattern: { type: "string" },
+        glob: { type: ["string", "null"] },
         path: { type: ["string", "null"] },
-        maxResults: { type: ["integer", "null"] },
+        literal: { type: ["boolean", "null"] },
+        ignoreCase: { type: ["boolean", "null"] },
+        context: { type: ["integer", "null"] },
+        limit: { type: ["integer", "null"] },
       },
-      required: ["filePattern", "maxResults", "path", "query"],
+      required: ["context", "glob", "ignoreCase", "limit", "literal", "path", "pattern"],
       additionalProperties: false,
     },
   },
@@ -70,9 +110,9 @@ const TOOL_DEFINITIONS = Object.freeze([
       properties: {
         pattern: { type: "string" },
         path: { type: ["string", "null"] },
-        maxResults: { type: ["integer", "null"] },
+        limit: { type: ["integer", "null"] },
       },
-      required: ["maxResults", "path", "pattern"],
+      required: ["limit", "path", "pattern"],
       additionalProperties: false,
     },
   },
@@ -110,7 +150,7 @@ function continuation(callId, name, argumentsValue, output) {
   ];
 }
 
-/** 构造满足 WebView2 报告闭集的最小可接受报告，避免测试依赖真实截图。 */
+/** 使用 runner 的权威基础工具闭集构造最小报告，新增公开工具时同步约束假报告。 */
 function validReport() {
   return {
     schemaVersion: 1,
@@ -125,7 +165,7 @@ function validReport() {
       kind: "deterministic_loopback",
       externalCalls: 0,
       toolCalls: 4,
-      defaultCatalog: ["read", "write", "edit", "shell", "grep", "find", "ls"],
+      defaultCatalog: [...REQUIRED_BASE_TOOLS],
     },
     live: {
       sequence: ["grep:error", "grep:success", "find:success", "ls:success"],
@@ -144,6 +184,7 @@ function validReport() {
   };
 }
 
+/** 对齐真实 Provider 的全量基础目录，避免只核对文件子集而漏掉进程与图片工具。 */
 test("loopback fixture 严格回放空 grep、纠正 grep、find、ls 四次 Tool continuation", async () => {
   const fixture = await startToolCatalogFixture();
   try {
@@ -159,8 +200,16 @@ test("loopback fixture 严格回放空 grep、纠正 grep、find、ls 四次 Too
       continuation(
         toolCatalogFixtureMarkers.invalidGrepCallId,
         "grep",
-        { query: "", filePattern: "*.txt", path: ".", maxResults: 50 },
-        "Tool field at $.query violates the 'minLength' constraint. Correct the arguments and retry this Tool.",
+        {
+          pattern: "",
+          glob: "*.txt",
+          path: ".",
+          literal: true,
+          ignoreCase: false,
+          context: 0,
+          limit: 50,
+        },
+        "Tool field at $.pattern violates the 'minLength' constraint. Correct the arguments and retry this Tool.",
       ),
     );
     fixture.releaseInvalidCorrection();
@@ -172,7 +221,15 @@ test("loopback fixture 严格回放空 grep、纠正 grep、find、ls 四次 Too
       continuation(
         toolCatalogFixtureMarkers.validGrepCallId,
         "grep",
-        { query: toolCatalogFixtureMarkers.grep, filePattern: "*.txt", path: ".", maxResults: 50 },
+        {
+          pattern: toolCatalogFixtureMarkers.grep,
+          glob: "*.txt",
+          path: ".",
+          literal: true,
+          ignoreCase: false,
+          context: 0,
+          limit: 50,
+        },
         "catalog/root.txt:1: JA_TOOL_CATALOG_NEEDLE",
       ),
     );
@@ -183,7 +240,7 @@ test("loopback fixture 严格回放空 grep、纠正 grep、find、ls 四次 Too
       continuation(
         toolCatalogFixtureMarkers.findCallId,
         "find",
-        { pattern: "*.txt", path: ".", maxResults: 200 },
+        { pattern: "*.txt", path: ".", limit: 200 },
         "catalog/root.txt\ncatalog/nested/nested.txt",
       ),
     );
@@ -200,11 +257,14 @@ test("loopback fixture 严格回放空 grep、纠正 grep、find、ls 四次 Too
     );
     assert.match(await fifth.text(), new RegExp(toolCatalogFixtureMarkers.final, "u"));
     const turns = fixture.snapshot().attempts.filter((attempt) => attempt.kind === "turn");
-    assert.deepEqual(turns.map((attempt) => attempt.step), [0, 1, 2, 3, 4]);
-    for (const name of ["read", "write", "edit", "shell", "grep", "find", "ls"]) {
+    assert.deepEqual(
+      turns.map((attempt) => attempt.step),
+      [0, 1, 2, 3, 4],
+    );
+    for (const name of REQUIRED_BASE_TOOLS) {
       assert.ok(turns[0].toolNames.includes(name), `${name} must be exposed`);
     }
-    for (const name of ["workspace_search", "read_attachment", "tool_search", "list_threads"]) {
+    for (const name of ["workspace_search", "tool_search", "list_threads"]) {
       assert.equal(turns[0].toolNames.includes(name), false, `${name} must be hidden`);
     }
   } finally {
@@ -217,4 +277,7 @@ test("工具目录报告验证器要求基础闭集、失败展开和 reload ide
   const invalid = validReport();
   invalid.provider.defaultCatalog = invalid.provider.defaultCatalog.filter((name) => name !== "ls");
   assert.throws(() => validateToolCatalogReport(invalid));
+  const attachmentsAvailable = validReport();
+  attachmentsAvailable.provider.defaultCatalog.push("read_attachment");
+  assert.equal(validateToolCatalogReport(attachmentsAvailable).status, "passed");
 });

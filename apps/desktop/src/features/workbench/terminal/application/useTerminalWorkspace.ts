@@ -321,7 +321,7 @@ export function useTerminalWorkspace(
     [appendRuntimeOutput, updateRuntime],
   );
 
-  /** 每个窗格只启动一个串行 poll loop，使并发 ensure-open 不会创建重复读取者。 */
+  /** 每个窗格只启动一个串行轮询循环，避免并发打开操作创建重复读取者。 */
   const startPolling = useCallback(
     (paneId: string, session: TerminalSessionInfo): void => {
       if (pollingRef.current.has(paneId)) return;
@@ -655,7 +655,7 @@ export function useTerminalWorkspace(
     [commitLayout, ensurePaneOpen],
   );
 
-  /** 在最新布局中维护焦点身份，同时拒绝失败 session 替换与 close-all 竞态。 */
+  /** 在最新布局中维护焦点身份，同时阻止失败会话替换和 close-all 竞态。 */
   const activatePane = useCallback(
     (tabId: string, paneId: string): void => {
       if (closeAllAdmissionRef.current) return;

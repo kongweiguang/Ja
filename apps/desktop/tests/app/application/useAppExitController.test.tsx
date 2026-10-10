@@ -31,10 +31,12 @@ describe("useAppExitController", () => {
     const release = vi.fn();
     const files = {
       workspaceId: "workspace-1",
+      listUnsavedDocuments: vi.fn(() => []),
       flushForWorkspaceChange: vi.fn(async () => {
         order.push("files");
         return { release };
       }),
+      prepareForWorkspaceRebind: vi.fn(async () => ({ commit: vi.fn(), release: vi.fn() })),
     };
     const preview = {
       workspaceId: "workspace-1",
@@ -69,7 +71,9 @@ describe("useAppExitController", () => {
     const release = vi.fn();
     const files = {
       workspaceId: "workspace-1",
+      listUnsavedDocuments: vi.fn(() => []),
       flushForWorkspaceChange: vi.fn(async () => ({ release })),
+      prepareForWorkspaceRebind: vi.fn(async () => ({ commit: vi.fn(), release: vi.fn() })),
     };
     const preview = {
       workspaceId: "workspace-1",

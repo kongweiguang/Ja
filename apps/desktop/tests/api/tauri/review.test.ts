@@ -139,6 +139,37 @@ describe("TauriReviewAdapter", () => {
     });
   });
 
+  /** source CAS revision 与冻结工件 revision 语义不同，不能在 renderer 再做相等比较。 */
+  it("accepts a captured artifact revision that differs from the source CAS revision", async () => {
+    const bridge = createBridge();
+    const capture = {
+      workspaceId: "ws_demo",
+      source: { kind: "uncommitted" },
+      snapshotId: "rev_0123456789abcdef01234567",
+      snapshotHash: "a".repeat(64),
+      revision: "frozen_artifact_revision",
+      attachmentId: "att_review_snapshot",
+      coverage: {
+        complete: true,
+        files: 1,
+        bytes: 128,
+        maxFiles: 2_000,
+        maxBytes: 64 * 1024 * 1024,
+        partialReasons: [],
+      },
+    };
+    bridge.invoke = vi.fn(async () => capture) as RuntimeNativeBridge["invoke"];
+    const input = {
+      workspaceId: "ws_demo",
+      source: { kind: "uncommitted" },
+      expectedSnapshotRevision: "git_source_revision",
+      operationId: "review_op",
+    } as const;
+
+    await expect(new TauriReviewAdapter(bridge).captureSnapshot(input)).resolves.toEqual(capture);
+    expect(bridge.invoke).toHaveBeenCalledWith(JA_REVIEW_COMMANDS.captureSnapshot, { input });
+  });
+
   it("rejects removed review sources before IPC", async () => {
     const bridge = createBridge();
     const adapter = new TauriReviewAdapter(bridge);
@@ -205,6 +236,24 @@ describe("TauriReviewAdapter", () => {
     expect(normalizeReviewError({ code: "UNKNOWN", message: "C:\\private\\file" }).code).toBe(
       "RUNTIME_UNAVAILABLE",
     );
+  });
+
+  /** Tauri DTO 的 PARSE_ERROR 必须在 adapter 边界转换为 Review feature 的 PARSE 码。 */
+  it("maps the native parse wire code to the feature parse failure", async () => {
+    const bridge = createBridge();
+    bridge.invoke = vi.fn(async () => {
+      throw { code: "PARSE_ERROR", message: "C:\\private\\repo\\file.rs" };
+    }) as RuntimeNativeBridge["invoke"];
+    const error = await new TauriReviewAdapter(bridge)
+      .fileDiff({ workspaceId: "ws_demo", source, revision: "rev_1", fileId: "file_a" })
+      .catch((value: unknown) => value);
+
+    expect(error).toMatchObject({
+      code: "PARSE",
+      message: "Git 输出解析失败",
+      retryable: false,
+    });
+    expect((error as Error).message).not.toContain("C:\\private");
   });
 
   it("rejects malformed paths and unknown DTO fields at the boundary", async () => {

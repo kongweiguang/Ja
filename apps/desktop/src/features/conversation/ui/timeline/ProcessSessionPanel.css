@@ -1,0 +1,151 @@
+/* @author kongweiguang */
+
+.ja-process-session {
+  display: grid;
+  min-width: 0;
+  gap: 0.6rem;
+  padding-top: 0.65rem;
+  color: var(--ja-foreground);
+  font-size: var(--ja-text-control-size);
+}
+
+.ja-process-session[role="status"] {
+  display: flex;
+  align-items: center;
+  color: var(--ja-foreground-muted);
+}
+
+.ja-process-session svg {
+  width: 0.95rem;
+  height: 0.95rem;
+  flex: none;
+}
+
+.ja-process-session__output {
+  max-height: 18rem;
+  min-height: 2rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-background);
+  color: var(--ja-foreground);
+  font: var(--ja-code-font-size) / 1.5 var(--ja-font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ja-process-session__output:focus {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-process-session__input {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.ja-process-session__label {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-process-session__input textarea {
+  width: 100%;
+  min-height: 3.5rem;
+  max-height: 9rem;
+  resize: vertical;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--ja-border);
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-surface);
+  color: var(--ja-foreground);
+  font: var(--ja-code-font-size) / 1.45 var(--ja-font-mono);
+}
+
+.ja-process-session__input textarea:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
+}
+
+.ja-process-session__close-input {
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-process-session__close-input input {
+  accent-color: var(--ja-accent);
+}
+
+.ja-process-session__actions,
+.ja-process-session__error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ja-process-session__actions button,
+.ja-process-session__error button {
+  display: inline-flex;
+  min-height: 1.9rem;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--ja-border-strong);
+  border-radius: var(--ja-radius-sm);
+  background: var(--ja-surface);
+  color: var(--ja-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ja-process-session__actions button:hover,
+.ja-process-session__error button:hover {
+  background: var(--ja-surface-muted);
+}
+
+.ja-process-session__actions button:focus-visible,
+.ja-process-session__error button:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 2px;
+}
+
+.ja-process-session__actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ja-process-session__actions button.is-danger {
+  color: var(--ja-danger);
+}
+
+.ja-process-session__notice,
+.ja-process-session__empty {
+  margin: 0;
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-caption-size);
+}
+
+.ja-process-session__notice.is-error {
+  color: var(--ja-danger);
+}
+
+.ja-process-session__error {
+  color: var(--ja-danger);
+}
+
+.ja-process-session__error[role="alert"] {
+  justify-content: space-between;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ja-process-session svg {
+    animation: none;
+  }
+}

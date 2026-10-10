@@ -15,6 +15,7 @@ import {
 } from "@/app/useDesktopNotifications";
 
 const runningTurn: Turn = {
+  origin: "native" as const,
   turnId: "turn_notice",
   threadId: "thr_notice",
   status: "running",

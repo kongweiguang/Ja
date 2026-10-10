@@ -1,12 +1,11 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Run the production Native Image sidecar through a bounded activation handshake.
+"""通过有界激活握手运行生产 Native Image sidecar。
 
-This is a CI-only smoke gate. It deliberately uses the current protocol fixture shape instead of
-implementing a second protocol client: the gate proves that the built executable starts, publishes
-the Ja Kernel identity, opens fresh SQLite and Skills through the production graph, exercises only
-host-local Provider/MCP probes, and shuts down cleanly.
+这是一道仅用于 CI 的 smoke 门禁。脚本沿用当前协议夹具形状，不另实现协议客户端：门禁会确认已构建的
+可执行文件能够启动、通过生产组合图发布 Ja Kernel 身份、初始化全新的 SQLite 和 Skills、仅执行本机
+Provider/MCP 探针，并正常关闭。
 """
 
 from __future__ import annotations
@@ -28,21 +27,24 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import jsonschema
 
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_FAILURE_EVIDENCE_STDERR_BYTES = 64 * 1024
+MAX_FAILURE_EVIDENCE_FRAMES = 64
+ITEM_CONTENT_PAGE_LIMIT = 65_536
 READY_TOKEN = "0123456789abcdef0123456789abcdef"
 EXPECTED_ENGINE_VERSION = json.loads(
     (Path(__file__).parents[2] / "package.json").read_text(encoding="utf-8")
 )["version"]
 PROTOCOL_SCHEMA_PATH = (
-    Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
+    Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
 )
 PROTOCOL_GOLDEN_PATH = (
-    Path(__file__).parents[2] / "contracts" / "golden" / "v1" / "valid" / "core.jsonl"
+    Path(__file__).parents[2] / "contracts" / "golden" / "v2" / "valid" / "core.jsonl"
 )
 
 
@@ -50,7 +52,7 @@ def load_capability_names(
     schema_path: Path = PROTOCOL_SCHEMA_PATH,
     golden_path: Path = PROTOCOL_GOLDEN_PATH,
 ) -> tuple[list[str], list[str]]:
-    """Use golden handshake order and fail closed unless its names match the authoritative schema."""
+    """使用 golden 握手顺序；名称与权威 schema 不匹配时失败关闭。"""
 
     try:
         definitions = json.loads(schema_path.read_text(encoding="utf-8"))["$defs"]
@@ -66,7 +68,7 @@ def load_capability_names(
         methods = golden_capabilities["methods"]
         events = golden_capabilities["events"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError, StopIteration, ValueError) as failure:
-        raise RuntimeError("JA-RPC v1 capability enums are unavailable") from failure
+        raise RuntimeError("JA-RPC v2 capability enums are unavailable") from failure
     for label, values in (
         ("methodName", schema_methods),
         ("eventName", event_names),
@@ -79,13 +81,13 @@ def load_capability_names(
             or any(not isinstance(value, str) or not value for value in values)
             or len(values) != len(set(values))
         ):
-            raise RuntimeError(f"JA-RPC v1 {label} enum is invalid")
+            raise RuntimeError(f"JA-RPC v2 {label} enum is invalid")
     if event_names.count("runtime/initialized") != 1:
-        raise RuntimeError("JA-RPC v1 runtime/initialized event is missing or duplicated")
-    # The schema includes this handshake frame in eventName, but Java advertises only later events.
+        raise RuntimeError("JA-RPC v2 runtime/initialized event is missing or duplicated")
+    # schema 的 eventName 包含此握手帧，但 Java 只会公布后续事件。
     schema_events = [name for name in event_names if name != "runtime/initialized"]
     if set(methods) != set(schema_methods) or set(events) != set(schema_events):
-        raise RuntimeError("JA-RPC golden capability sets differ from the v1 schema")
+        raise RuntimeError("JA-RPC golden capability sets differ from the v2 schema")
     return list(methods), list(events)
 
 
@@ -105,7 +107,7 @@ LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SMOKE_SECRET = "ja-native-smoke-placeholder-secret"
-SCHEMA_PATH = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v1" / "schema" / "ja-rpc-v1.schema.json"
+SCHEMA_PATH = Path(__file__).parents[2] / "contracts" / "ja-rpc" / "v2" / "schema" / "ja-rpc-v2.schema.json"
 PROVIDER_ID = "provider_native_smoke"
 MODEL_ID = "model_native_smoke"
 CREDENTIAL_ID = "cred_native_smoke"
@@ -117,13 +119,14 @@ SMOKE_TEXT = "JA_NATIVE_PROVIDER_TEXT"
 SHELL_COMMAND = "Start-Sleep -Seconds 30"
 SHELL_CANCEL_CALL_ID = "call_shell_cancel"
 SHELL_STDIN_EOF_CALL_ID = "call_shell_stdin_eof"
+# 进程接口发送 UTF-8 bytes；探针显式解码，不依赖宿主 PowerShell 的 Console code page。
 SHELL_STDIN_EOF_COMMAND = (
-    "$input=[Console]::In.ReadToEnd(); "
-    "if ($input.Length -ne 0) { exit 9 }; Write-Output 'JA_NATIVE_STDIN_EOF'"
-) if os.name == "nt" else "test -z \"$(cat)\" && printf 'JA_NATIVE_STDIN_EOF\\n'"
+    "$jaProbeReader=[IO.StreamReader]::new([Console]::OpenStandardInput(),"
+    "[Text.UTF8Encoding]::new($false,$true)); $jaProbeInput=$jaProbeReader.ReadToEnd(); "
+    "if ($jaProbeInput -ne 'Ja-input-中文') { exit 9 }; Write-Output 'JA_NATIVE_STDIN_EOF'"
+) if os.name == "nt" else "test \"$(cat)\" = 'Ja-input-中文' && printf 'JA_NATIVE_STDIN_EOF\\n'"
 
-# Keep this closure deliberately explicit.  A Native smoke report is a release gate, so adding a
-# capability without adding it here would silently turn an unverified feature into a green result.
+# 有意在此显式列出完整能力集合。Native smoke 报告是发布门禁；若新增能力却不在此补充，未验证的功能就可能被误判为通过。
 REQUIRED_SUBGATES = (
     "jsonSchema",
     "configAuth",
@@ -138,7 +141,7 @@ REQUIRED_SUBGATES = (
 
 
 def executable_identity(executable: Path) -> dict[str, Any]:
-    """Hash the exact launched artifact so freshness evidence can correlate smoke to the build."""
+    """计算实际启动产物的摘要，使新鲜度证据能够与构建结果对应。"""
 
     digest = hashlib.sha256()
     with executable.open("rb") as stream:
@@ -158,7 +161,7 @@ def require_expected_identity(
     expected_size: int | None,
     expected_mtime_ns: int | None,
 ) -> bool:
-    """Fail closed when a caller supplies an incomplete or mismatched build-artifact identity."""
+    """调用方提供的构建产物身份不完整或不匹配时失败关闭。"""
 
     expected = (expected_sha256, expected_size, expected_mtime_ns)
     if all(value is None for value in expected):
@@ -179,11 +182,10 @@ def require_expected_identity(
 
 
 def evaluate_required_subgates(subgates: Any) -> dict[str, Any]:
-    """Require every declared Native capability to report an explicit passed status.
+    """要求每项声明的 Native 能力都明确报告通过状态。
 
-    The smoke intentionally does not manufacture evidence for capabilities implemented by other
-    owners.  Missing and blocked entries therefore remain visible and fail the top-level report;
-    an unknown or malformed status is treated as a failed assertion rather than a permissive skip.
+    Smoke 不会替其他能力所有者伪造证据。缺失或受阻项目仍保留在报告中，并导致顶层报告失败；未知或格式错误的
+    状态按断言失败处理，不会宽松跳过。
     """
 
     missing: list[str] = []
@@ -199,8 +201,7 @@ def evaluate_required_subgates(subgates: Any) -> dict[str, Any]:
                 continue
             status = entry.get("status")
             if status == "passed":
-                # A producer may include a boolean assertion as a second field.  If present it
-                # must agree with status so a mutated report cannot masquerade as a pass.
+                # 生成方可能会在第二个字段中附带布尔断言；若存在，该值必须与 status 一致，避免被篡改的报告伪装成通过。
                 if "passed" in entry and entry.get("passed") is not True:
                     failed.append(name)
             elif status in {"blocked", "skipped"}:
@@ -224,11 +225,10 @@ def evaluate_required_subgates(subgates: Any) -> dict[str, Any]:
 
 
 def initialize_frame() -> dict[str, Any]:
-    """Build the smallest client capability document that exercises the real handshake.
+    """构造执行真实握手所需的完整客户端能力文档。
 
-    The production runtime must remain startable before a Provider/model selection is activated. The smoke
-    sends the complete current v1 capability vocabulary because the server rejects negotiation
-    subsets. No configuration or credential is sent, so this gate cannot call a provider.
+    生产运行时必须能在启用 Provider/模型选择前启动。Smoke 发送完整的 v2 能力词表，因为服务端拒绝协商
+    子集。请求不包含配置或凭据，因此此门禁不会调用 Provider。
     """
 
     return {
@@ -236,7 +236,7 @@ def initialize_frame() -> dict[str, Any]:
         "id": "c:init",
         "method": "runtime/initialize",
         "params": {
-            "protocolMajor": 1,
+            "protocolMajor": 2,
             "protocolMinor": 0,
             "clientVersion": "ja-native-ci",
             "capabilities": {
@@ -244,7 +244,7 @@ def initialize_frame() -> dict[str, Any]:
                 "events": EVENTS,
                 "accessModes": ["approval_required", "full_access"],
                 "collaborationModes": ["default", "plan"],
-                "features": ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+                "features": ["task_threads", "plan", "interaction"],
             },
             "limits": {
                 "maxFrameBytes": 4194304,
@@ -265,7 +265,7 @@ def initialize_frame() -> dict[str, Any]:
 
 
 def initialized_frame() -> dict[str, Any]:
-    """Return the challenge response required before the runtime can publish ready."""
+    """返回运行时发布 ready 前所需的 challenge 响应。"""
 
     return {
         "jsonrpc": "2.0",
@@ -288,13 +288,13 @@ def require_initialize_identity(result: Any, expected_engine_version: str) -> di
 
 
 def shutdown_frame() -> dict[str, Any]:
-    """Return the normal close request so the smoke observes the graceful path."""
+    """返回正常关闭请求，以便 smoke 验证优雅退出路径。"""
 
     return {"jsonrpc": "2.0", "id": "c:shutdown", "method": "runtime/shutdown", "params": {}}
 
 
 def workspace_open_frame(workspace: Path) -> dict[str, Any]:
-    """Bind an isolated workspace before graph construction can inspect files or tools config."""
+    """在组合图检查文件或工具配置前绑定隔离的工作区。"""
 
     return {
         "jsonrpc": "2.0",
@@ -308,7 +308,7 @@ def workspace_open_frame(workspace: Path) -> dict[str, Any]:
 
 
 def workspace_trust_frame(workspace_id: str) -> dict[str, Any]:
-    """Trust the exact server-owned Workspace before project Skills may enter a Turn snapshot."""
+    """信任服务端实际创建的 Workspace，然后项目 Skills 才能进入 Turn 快照。"""
 
     return {
         "jsonrpc": "2.0",
@@ -319,32 +319,31 @@ def workspace_trust_frame(workspace_id: str) -> dict[str, Any]:
 
 
 def skill_list_frame(workspace_id: str | None = None) -> dict[str, Any]:
-    """Request the real Skill catalog while keeping project roots behind an opaque identity."""
+    """请求真实的 Skill 目录，同时用不透明身份隐藏项目根目录。"""
 
     params = {} if workspace_id is None else {"workspaceId": workspace_id}
     return {"jsonrpc": "2.0", "id": "c:skills", "method": "skill/list", "params": params}
 
 
 def health_read_frame() -> dict[str, Any]:
-    """Read live SQLite and Kernel component state after the ready barrier."""
+    """ready 屏障之后读取实时 SQLite 和 Kernel 组件状态。"""
 
     return {"jsonrpc": "2.0", "id": "c:health", "method": "runtime/health", "params": {}}
 
 
 def config_read_frame() -> dict[str, Any]:
-    """Read both configuration layers and the global credential CAS before mutating the smoke home."""
+    """修改 smoke home 前读取两层配置和全局 credential CAS。"""
 
     return {"jsonrpc": "2.0", "id": "c:config-read", "method": "configuration/read", "params": {}}
 
 
 def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[str, Any]:
-    """Build the bounded local-loopback document used by runtime probes.
+    """构造运行时探针使用的有界本地 loopback 文档。
 
-    The document contains no credential bytes and points only at servers owned by this smoke
-    process. Keeping Provider and models in the same v2 batch as the MCP descriptor proves that the
-    executable resolves one immutable generation instead of relying on a test-only provider hook.
-    Agent defaults retain only the schema-supported context policy; turn limits are not config fields.
-    The v2 document records skill suppression through disabled_skills; discovered skills stay in the workspace.
+    文档不包含凭据字节，且只指向此 smoke 进程拥有的服务器。将 Provider 和模型与 MCP 描述符放在同一 v2
+    批次中，可验证可执行文件解析的是单一不可变代际，而不是依赖仅供测试使用的 Provider hook。Agent 默认值
+    只保留 schema 支持的 context policy；turn limit 不是配置字段。v2 文档通过 disabled_skills 记录
+    skills 禁用状态，已发现的 skills 仍留在工作区。
     """
 
     return {
@@ -394,7 +393,7 @@ def configuration_document(provider_endpoint: str, mcp_endpoint: str) -> dict[st
 
 
 def write_workspace_skill(workspace: Path) -> Path:
-    """Create one real project Skill so Native discovery is tested without bundled fixtures."""
+    """创建一个真实项目 Skill，避免使用内置夹具测试 Native 发现行为。"""
 
     skill_root = workspace / ".agents" / "skills" / SKILL_NAME
     skill_root.mkdir(parents=True)
@@ -479,10 +478,9 @@ def thread_create_frame(
     frame_id: str = "c:thread",
     title: str = "Native activation smoke",
 ) -> dict[str, Any]:
-    """Persist an isolated probe Thread while Java retains canonical workspace identity.
+    """持久化一个隔离的探针 Thread，同时由 Java 保留规范的工作区身份。
 
-    Distinct probe identities prevent an earlier Tool result from changing the deterministic
-    loopback Provider route selected for a later lifecycle probe.
+    不同的探针身份可防止先前的 Tool 结果改变后续生命周期探针所选择的确定性 loopback Provider 路由。
     """
 
     params: dict[str, Any] = {
@@ -503,19 +501,19 @@ def thread_create_frame(
 
 
 def mcp_list_frame() -> dict[str, Any]:
-    """Request the redacted MCP catalog projection used as the transport probe."""
+    """请求供传输探针使用的脱敏 MCP 目录投影。"""
 
     return {"jsonrpc": "2.0", "id": "c:mcp-list", "method": "mcp/list", "params": {}}
 
 
 def mcp_test_frame() -> dict[str, Any]:
-    """Run the bounded MCP initialize/tools-list probe through the production catalog."""
+    """通过生产目录执行有界的 MCP initialize/tools-list 探针。"""
 
     return {"jsonrpc": "2.0", "id": "c:mcp-test", "method": "mcp/test", "params": {"mcpId": MCP_ID}}
 
 
 def mcp_tools_read_frame() -> dict[str, Any]:
-    """Read one MCP schema page so networknt validation is exercised by the live generation."""
+    """读取一个 MCP schema 页，以便通过实时代际执行 networknt 校验。"""
 
     return {
         "jsonrpc": "2.0", "id": "c:mcp-tools", "method": "mcp/list-tools",
@@ -524,23 +522,22 @@ def mcp_tools_read_frame() -> dict[str, Any]:
 
 
 def turn_start_frame(thread_id: str, text: str) -> dict[str, Any]:
-    """Keep timeout ownership in the harness; the v1 frame carries only admission identity and content."""
+    """将超时控制权留给 harness；v2 帧携带内容和独立操作回执键。"""
 
     return {
         "jsonrpc": "2.0", "id": "c:turn-start", "method": "turn/start",
         "params": {
             "threadId": thread_id, "content": [{"type": "text", "text": text}],
-            "clientOperationId": f"op_{uuid.uuid4().hex}",
+            "operationKey": f"op_{uuid.uuid4().hex}",
         },
     }
 
 
 def turn_cancel_frame(turn_id: str) -> dict[str, Any]:
-    """Cancel one admitted Turn using the v1 cancellation contract.
+    """使用 v2 取消契约取消一个已准入的 Turn。
 
-    Cancellation is intentionally identity-bound but not CAS-bound: the Kernel owns the terminal
-    transition and accepts a late cancel idempotently, so carrying a UI-observed Thread revision
-    would turn a valid stop request into an invalid v1 frame.
+    取消请求绑定身份但不绑定 CAS：Kernel 负责终止状态转换，并以幂等方式接受延迟的取消。因此，携带 UI 观察到的
+    Thread 修订号会使本来有效的停止请求变成无效的 v2 帧。
     """
 
     return {
@@ -550,25 +547,41 @@ def turn_cancel_frame(turn_id: str) -> dict[str, Any]:
 
 
 def approval_response_frame(approval_id: str, turn_id: str, expected_revision: int) -> dict[str, Any]:
-    """Approve one fixture call with a fresh idempotency key before exercising its outcome."""
+    """在验证夹具调用结果前，使用全新的幂等键批准该调用。"""
 
     return {
         "jsonrpc": "2.0", "id": "c:approval", "method": "approval/respond",
         "params": {
             "approvalId": approval_id, "turnId": turn_id, "decision": "approve",
-            "expectedThreadRevision": expected_revision, "clientOperationId": f"op_{uuid.uuid4().hex}",
+            "expectedThreadRevision": expected_revision, "operationKey": f"op_{uuid.uuid4().hex}",
         },
     }
 
 
 def thread_read_frame(thread_id: str) -> dict[str, Any]:
-    """Read the durable Thread projection before or after a process restart."""
+    """在进程重启前后读取持久化的 Thread 投影。"""
 
     return {"jsonrpc": "2.0", "id": "c:thread-read", "method": "thread/read", "params": {"threadId": thread_id}}
 
 
+def thread_item_content_read_frame(thread_id: str, item_id: str) -> dict[str, Any]:
+    """按终态公开 item 身份读取首个正文页，验证持久化文本读取闭环。"""
+
+    return {
+        "jsonrpc": "2.0",
+        "id": "c:item-content-read",
+        "method": "thread/item-content/read",
+        "params": {
+            "threadId": thread_id,
+            "itemId": item_id,
+            "offsetCharacters": 0,
+            "limitCharacters": ITEM_CONTENT_PAGE_LIMIT,
+        },
+    }
+
+
 def thread_rename_frame(thread_id: str, expected_revision: int) -> dict[str, Any]:
-    """Take manual title ownership so the Provider request-count probe has exactly one producer."""
+    """取得手动标题控制权，使 Provider 请求计数探针仅有一个写入方。"""
 
     return {
         "jsonrpc": "2.0",
@@ -585,7 +598,7 @@ def thread_rename_frame(thread_id: str, expected_revision: int) -> dict[str, Any
 def require_known_context_usage(
     snapshot: dict[str, Any], expected_turn_id: str, expected_model_round: int = 1,
 ) -> dict[str, Any]:
-    """Require the latest exact request Usage so an older KNOWN record cannot mask current state."""
+    """要求最新的精确请求 Usage，避免较早的 KNOWN 记录掩盖当前状态。"""
 
     usage = snapshot.get("contextUsage")
     expected = {
@@ -606,11 +619,10 @@ def require_known_context_usage(
 
 
 def sanitized_environment() -> dict[str, str]:
-    """Remove credential-like variables and Java discovery variables from the child environment.
+    """从子进程环境中移除类似凭据的变量和 Java 发现变量。
 
-    A native executable must not depend on a developer JDK or inherit model credentials. Retaining
-    ordinary platform variables preserves Windows loader and macOS process behavior while the
-    name-based filter prevents CI secrets from entering the smoke process.
+    原生可执行文件不得依赖开发者 JDK，也不得继承模型凭据。保留普通平台变量，以维持 Windows loader 和
+    macOS 进程行为；按名称过滤可阻止 CI secrets 进入 smoke 子进程。
     """
 
     environment = dict(os.environ)
@@ -623,10 +635,10 @@ def sanitized_environment() -> dict[str, str]:
 
 
 class BinaryStreamCollector:
-    """Collect one child pipe without allowing a noisy sidecar to exceed the smoke bound."""
+    """收集一个子进程管道，同时限制嘈杂 sidecar 的输出不超过 smoke 上限。"""
 
     def __init__(self, stream: Any) -> None:
-        """Keep one binary pipe's bounded capture and queue separate from the handshake state."""
+        """分别保存一个二进制管道的有界捕获内容和队列，避免与握手状态混杂。"""
 
         self._stream = stream
         self.lines = Queue()
@@ -637,12 +649,12 @@ class BinaryStreamCollector:
         self._thread = threading.Thread(target=self._consume, daemon=True)
 
     def start(self) -> None:
-        """Start a dedicated reader because Windows does not support select() on anonymous pipes."""
+        """启动专用读取线程，因为 Windows 不支持对匿名管道使用 select()。"""
 
         self._thread.start()
 
     def _consume(self) -> None:
-        """Read bounded binary lines and publish them to the handshake reader in arrival order."""
+        """分块读取有界二进制行，并按到达顺序交给握手读取器。"""
 
         try:
             while True:
@@ -661,31 +673,31 @@ class BinaryStreamCollector:
             self.lines.put(None)
 
     def join(self, timeout: float) -> None:
-        """Join the reader only for the remaining smoke deadline so pipe cleanup cannot hang CI."""
+        """只在剩余 smoke 时限内等待读取线程，避免清理管道时卡住 CI。"""
 
         self._thread.join(max(0.0, timeout))
 
     def bytes(self) -> bytes:
-        """Return the captured bytes after the reader has reached EOF or the hard cap."""
+        """读取线程到达 EOF 或输出达到硬上限后，返回已捕获的字节。"""
 
         return b"".join(self.chunks)
 
 
 class LoopbackProvider:
-    """Serve one deterministic OpenAI Responses stream without any external network access."""
+    """提供确定性的 OpenAI Responses 流，不访问外部网络。"""
 
     def __init__(self) -> None:
-        """Bind an ephemeral IPv4 loopback listener so provider evidence cannot leave the host."""
+        """绑定临时 IPv4 loopback 监听器，确保 Provider 证据不会离开本机。"""
 
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
-            """Keep HTTP logging and request-body retention out of the smoke process."""
+            """不记录 HTTP 日志，也不在 smoke 进程中保留请求正文。"""
 
             protocol_version = "HTTP/1.1"
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                """Serve only the bounded generation path so remote token counting fails visibly."""
+                """只提供有界生成路径，使远程 token count 请求明确失败。"""
 
                 if self.path != "/v1/responses":
                     self.send_error(404)
@@ -710,18 +722,17 @@ class LoopbackProvider:
                     for item in input_items
                 )
                 advertises_shell = isinstance(tools, list) and any(
-                    isinstance(tool, dict) and tool.get("name") == "shell"
+                    isinstance(tool, dict) and tool.get("name") == "exec_command"
                     for tool in tools
                 )
-                # Dynamic guidance now lives in Provider instructions, so input contains only
-                # durable conversation messages. Automatic title requests may contain the same
-                # user text but advertise no tools, so capability presence is also required.
+                # 动态指引现由 Provider instructions 提供，因此输入只包含持久化的对话消息。自动标题请求也可能包含相同的用户文本，
+                # 但不会声明任何工具，所以还必须检查是否存在对应能力。
                 prompt = json.dumps(input_items or [], ensure_ascii=False)
                 if has_tool_result:
                     stream = owner.text_stream("JA_NATIVE_SHELL_CANCELLED")
                 elif advertises_shell and "stdin eof" in prompt.casefold():
                     stream = owner.shell_stream(SHELL_STDIN_EOF_COMMAND, SHELL_STDIN_EOF_CALL_ID)
-                elif advertises_shell and "shell" in prompt.casefold():
+                elif advertises_shell and "exec_command" in prompt.casefold():
                     stream = owner.shell_stream(SHELL_COMMAND, SHELL_CANCEL_CALL_ID)
                 else:
                     stream = owner.text_stream(SMOKE_TEXT)
@@ -735,7 +746,7 @@ class LoopbackProvider:
                     self.wfile.flush()
 
             def log_message(self, format: str, *args: Any) -> None:
-                """Suppress BaseHTTPRequestHandler diagnostics so paths and headers cannot leak."""
+                """禁止 BaseHTTPRequestHandler 输出诊断信息，避免泄露路径和请求头。"""
 
                 del format, args
 
@@ -746,13 +757,13 @@ class LoopbackProvider:
 
     @property
     def endpoint(self) -> str:
-        """Return the provider base path consumed by the Ja Responses adapter."""
+        """返回 Ja Responses adapter 使用的 Provider base path。"""
 
         return f"http://127.0.0.1:{self.server.server_port}/v1"
 
     @staticmethod
     def _response(response_id: str, status: str, output: list[dict[str, Any]], usage: bool) -> dict[str, Any]:
-        """Build the typed Responses envelope with exact non-negative token accounting."""
+        """构造强类型 Responses 信封，并提供精确的非负 token 统计。"""
 
         response: dict[str, Any] = {
             "id": response_id,
@@ -777,13 +788,13 @@ class LoopbackProvider:
 
     @staticmethod
     def _event(event_type: str, sequence: int, payload: dict[str, Any]) -> str:
-        """Encode one strict SSE event while retaining no provider request or credential bytes."""
+        """编码一个严格的 SSE 事件，不保留 Provider 请求或凭据字节。"""
 
         body = {"type": event_type, "sequence_number": sequence, **payload}
         return f"event: {event_type}\ndata: {json.dumps(body, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
     def text_stream(self, text: str) -> str:
-        """Return a complete public text stream for the provider HTTP/SSE gate."""
+        """为 Provider HTTP/SSE 门禁返回完整的公开文本流。"""
 
         response_id = f"resp_native_{self.request_count}"
         final_item = {
@@ -808,15 +819,15 @@ class LoopbackProvider:
         ))
 
     def shell_stream(self, command: str, call_id: str) -> str:
-        """Return one globally unique shell Tool identity for a deterministic lifecycle probe."""
+        """返回一个全局唯一的 exec_command Tool 身份，用于确定性生命周期探针。"""
 
         response_id = f"resp_native_{self.request_count}"
         item_id = f"item_{call_id}"
         arguments = json.dumps(
-            {"command": command}, separators=(",", ":")
+            {"cmd": command, "yield_time_ms": 10000}, separators=(",", ":")
         )
         item = {"id": item_id, "type": "function_call", "call_id": call_id,
-                "name": "shell", "arguments": arguments}
+                "name": "exec_command", "arguments": arguments}
         return "".join((
             self._event("response.created", 0, {"response": self._response(response_id, "in_progress", [], False)}),
             self._event("response.output_item.added", 1, {
@@ -826,7 +837,7 @@ class LoopbackProvider:
                 "item_id": item_id, "delta": arguments, "output_index": 0,
             }),
             self._event("response.function_call_arguments.done", 3, {
-                "item_id": item_id, "name": "shell", "arguments": arguments, "output_index": 0,
+                "item_id": item_id, "name": "exec_command", "arguments": arguments, "output_index": 0,
             }),
             self._event("response.output_item.done", 4, {"output_index": 0, "item": item}),
             self._event("response.completed", 5, {
@@ -835,7 +846,7 @@ class LoopbackProvider:
         ))
 
     def close(self) -> None:
-        """Stop the loopback listener and wait briefly so no fixture thread survives the gate."""
+        """停止 loopback 监听器并短暂等待，确保夹具线程不会遗留在门禁之后。"""
 
         self.server.shutdown()
         self.server.server_close()
@@ -843,20 +854,20 @@ class LoopbackProvider:
 
 
 class LoopbackMcp:
-    """Serve one bounded Streamable HTTP MCP catalog used by mcp and networknt probes."""
+    """提供有界的 Streamable HTTP MCP 目录，供 mcp 和 networknt 探针使用。"""
 
     def __init__(self) -> None:
-        """Bind only to IPv4 loopback and keep the MCP response vocabulary minimal."""
+        """仅绑定 IPv4 loopback，并保持 MCP 响应词表精简。"""
 
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
-            """Handle JSON-RPC MCP requests without logging headers or request bodies."""
+            """处理 JSON-RPC MCP 请求，不记录请求头或请求正文。"""
 
             protocol_version = "HTTP/1.1"
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                """Return initialize, tools/list, and tools/call responses under a byte cap."""
+                """在字节上限内返回 initialize、tools/list 和 tools/call 响应。"""
 
                 if self.path != "/mcp":
                     self.send_error(404)
@@ -874,8 +885,7 @@ class LoopbackMcp:
                     self.send_error(400)
                     return
                 owner.request_count += 1
-                # Keep only method shape and correlation presence; bodies and headers may carry
-                # credentials or workspace data and must never enter smoke diagnostics.
+                # 只保留方法形态和关联标识是否存在；请求体与请求头可能包含凭据或工作区数据，绝不能写入 smoke 诊断。
                 owner.request_methods.append((str(request.get("method")), "id" in request))
                 if "id" not in request:
                     self._send_empty(202)
@@ -905,7 +915,7 @@ class LoopbackMcp:
                 self.wfile.write(payload)
 
             def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                """Accept the client-owned session close without retaining session identifiers."""
+                """接受由客户端发起的会话关闭请求，不保留会话标识。"""
 
                 if self.path != "/mcp":
                     self.send_error(404)
@@ -913,12 +923,12 @@ class LoopbackMcp:
                 self._send_empty(204)
 
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                """Reject optional reconnect streams explicitly so the fixture cannot hang a probe."""
+                """明确拒绝可选的重连流，避免夹具令探针一直等待。"""
 
                 self._send_empty(405)
 
             def _send_empty(self, status: int) -> None:
-                """Frame empty HTTP/1.1 responses explicitly so OkHttp never waits for an ambiguous EOF."""
+                """明确标记空 HTTP/1.1 响应的分帧方式，避免 OkHttp 等待含糊的 EOF。"""
 
                 self.send_response(status)
                 self.send_header("Content-Length", "0")
@@ -927,7 +937,7 @@ class LoopbackMcp:
                 self.end_headers()
 
             def log_message(self, format: str, *args: Any) -> None:
-                """Suppress HTTP server logging because it can contain loopback paths or headers."""
+                """禁止 HTTP 服务日志输出，因为其中可能包含 loopback 路径或请求头。"""
 
                 del format, args
 
@@ -939,12 +949,12 @@ class LoopbackMcp:
 
     @property
     def endpoint(self) -> str:
-        """Return the streamable HTTP endpoint embedded in the Java-owned MCP document."""
+        """返回写入 Java 管理的 MCP 文档中的 Streamable HTTP endpoint。"""
 
         return f"http://127.0.0.1:{self.server.server_port}/mcp"
 
     def close(self) -> None:
-        """Stop the MCP listener and join its accept thread within the smoke deadline."""
+        """停止 MCP 监听器，并在 smoke 时限内等待其接受连接的线程退出。"""
 
         self.server.shutdown()
         self.server.server_close()
@@ -952,25 +962,25 @@ class LoopbackMcp:
 
 
 def probe_passed(**evidence: Any) -> dict[str, Any]:
-    """Convert observed runtime facts into the only green production-verification subgate shape."""
+    """将观测到的运行时事实转换为生产验证子门禁唯一允许的通过格式。"""
 
     return {"status": "passed", "passed": True, **evidence}
 
 
 def probe_blocked(reason: str, **evidence: Any) -> dict[str, Any]:
-    """Record a dynamically unavailable probe without treating it as an optional capability."""
+    """记录动态不可用的探针，但不将其视为可选能力。"""
 
     return {"status": "blocked", "passed": False, "reason": reason, **evidence}
 
 
 def probe_failed(reason: str, **evidence: Any) -> dict[str, Any]:
-    """Record a reached probe contradiction as a hard failed subgate."""
+    """将已执行探针发现的矛盾记录为硬失败子门禁。"""
 
     return {"status": "failed", "passed": False, "reason": reason, **evidence}
 
 
 def terminate_process(process: subprocess.Popen[Any]) -> None:
-    """Terminate the whole smoke process group after a deadline without leaving a child behind."""
+    """超过时限后终止整个 smoke 进程组，避免遗留子进程。"""
 
     if process.poll() is not None:
         return
@@ -1006,16 +1016,15 @@ def sidecar_command(
     run_directory: Path,
     log_directory: Path,
 ) -> list[str]:
-    """Build the only production App Server command without a retired runtime selector.
+    """构造唯一的生产 App Server 命令，不接受已废弃的 runtime selector。
 
-    The App Server now has one composition graph, so carrying a production/fake selector would
-    recreate a compatibility surface and makes the current Native Image reject an otherwise valid
-    smoke invocation. Directory arguments remain canonical unpadded Base64URL values so Windows
-    Unicode paths never depend on the active console encoding.
+    App Server 现在只有一张组合图，因此保留 production/fake selector 会重建兼容接口，并使当前 Native Image
+    拒绝原本有效的 smoke 调用。目录参数保持为规范且无填充的 Base64URL 值，避免 Windows Unicode 路径依赖当前
+    控制台编码。
     """
 
     def encoded_path(directory: Path) -> str:
-        """Encode one canonical Unicode root through the unpadded Base64URL argv contract."""
+        """按照无填充的 Base64URL argv 契约编码一个规范 Unicode 根目录。"""
 
         return base64.urlsafe_b64encode(str(directory.resolve()).encode("utf-8")).decode(
             "ascii"
@@ -1033,13 +1042,13 @@ def sidecar_command(
 
 
 def load_schema_validator() -> jsonschema.Draft202012Validator:
-    """Load the repository-owned v1 schema once so every outgoing smoke request is contract-checked."""
+    """只加载一次仓库内的 v2 schema，供每个发出的 smoke 请求进行合同校验。"""
 
     try:
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         return jsonschema.Draft202012Validator(schema)
     except (OSError, json.JSONDecodeError, jsonschema.SchemaError) as failure:
-        raise RuntimeError("v1 JSON Schema is unavailable or malformed") from failure
+        raise RuntimeError("v2 JSON Schema is unavailable or malformed") from failure
 
 
 def send_frame(
@@ -1047,13 +1056,13 @@ def send_frame(
     frame: dict[str, Any],
     validator: jsonschema.Draft202012Validator | None = None,
 ) -> None:
-    """Validate and write one UTF-8 JSONL frame so schema drift cannot hide behind a live sidecar."""
+    """校验并写入一个 UTF-8 JSONL 帧，避免实时 sidecar 掩盖 schema 漂移。"""
 
     if validator is not None:
         try:
             validator.validate(frame)
         except jsonschema.ValidationError as failure:
-            raise RuntimeError("native smoke emitted a frame outside the v1 schema") from failure
+            raise RuntimeError("native smoke emitted a frame outside the v2 schema") from failure
 
     if process.stdin is None:
         raise RuntimeError("native sidecar stdin is unavailable")
@@ -1066,7 +1075,7 @@ def send_frame(
 
 
 def next_line(collector: BinaryStreamCollector, deadline: float) -> bytes | None:
-    """Read one binary JSONL line with the shared process deadline and bounded queue."""
+    """使用共享进程时限和有界队列读取一行二进制 JSONL。"""
 
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -1086,7 +1095,7 @@ def decode_frame(
     line: bytes,
     validator: jsonschema.Draft202012Validator | None = None,
 ) -> dict[str, Any]:
-    """Decode one UTF-8 object and validate server frames before any event can affect a gate."""
+    """解码一个 UTF-8 对象并校验服务端帧，避免未验证事件影响门禁。"""
 
     try:
         document = json.loads(line.decode("utf-8"))
@@ -1122,7 +1131,7 @@ def read_until(
     method: str | None = None,
     predicate: Any = None,
 ) -> dict[str, Any]:
-    """Read frames until one correlated response or predicate match arrives, retaining events."""
+    """保留事件，直到收到关联响应或匹配条件的帧。"""
 
     for _ in range(128):
         line = next_line(collector, deadline)
@@ -1147,7 +1156,7 @@ def read_until_turn_event(
     *,
     validator: jsonschema.Draft202012Validator | None = None,
 ) -> dict[str, Any]:
-    """Stop on the expected Turn event or its terminal, preventing a failed Turn from consuming the global budget."""
+    """等待预期 Turn 事件或其终止状态，避免失败的 Turn 耗尽全局时限。"""
 
     event = read_until(
         collector,
@@ -1164,7 +1173,7 @@ def read_until_turn_event(
 
 
 def terminal_failure_label(event: dict[str, Any]) -> str:
-    """Expose only schema-bounded state/errorCode while keeping terminal messages out of smoke output."""
+    """只公开 schema 限定的 state/errorCode，不将终止消息写入 smoke 输出。"""
 
     params = event.get("params")
     if not isinstance(params, dict):
@@ -1177,7 +1186,7 @@ def terminal_failure_label(event: dict[str, Any]) -> str:
 
 
 def latest_tool_error_code(documents: list[dict[str, Any]], turn_id: str) -> str | None:
-    """Return only a bounded stable Tool error code for one Turn, never Tool content or arguments."""
+    """只返回一个 Turn 内有界且稳定的 Tool error code，不返回 Tool 内容或参数。"""
 
     for document in reversed(documents):
         if document.get("method") != "tool/batch-committed":
@@ -1202,7 +1211,7 @@ def drain_stdout(
     deadline: float,
     validator: jsonschema.Draft202012Validator | None = None,
 ) -> None:
-    """Drain trailing JSONL events after shutdown so the reader thread and child pipe fully close."""
+    """关闭后排空剩余 JSONL 事件，使读取线程和子进程管道彻底结束。"""
 
     while True:
         line = next_line(collector, deadline)
@@ -1213,7 +1222,7 @@ def drain_stdout(
 
 
 def ready_frame(document: dict[str, Any]) -> bool:
-    """Identify only the ready event carrying the exact challenge issued by the smoke client."""
+    """只识别携带 smoke 客户端所发精确 challenge 的 ready 事件。"""
 
     params = document.get("params")
     return (
@@ -1251,8 +1260,65 @@ def require_success(document: dict[str, Any], operation: str) -> dict[str, Any]:
     raise NativeRpcRejection(operation, error_code)
 
 
+def verify_persistent_stdin(
+    send: Callable[[dict[str, Any]], None],
+    collector: BinaryStreamCollector,
+    documents: list[dict[str, Any]],
+    deadline: float,
+    validator: Any,
+    workspace_id: str,
+    thread_id: str,
+    turn_id: str,
+) -> dict[str, Any]:
+    """在 Turn 结束后投递 stdin 并关闭输入，以真实退出和输出证明后台会话仍可使用。"""
+
+    def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """每次请求使用独立关联 ID，等待时保留异步事件并服从同一 smoke deadline。"""
+
+        frame_id = f"c:process-{uuid.uuid4().hex}"
+        send({"jsonrpc": "2.0", "id": frame_id, "method": method, "params": params})
+        return require_success(
+            read_until(collector, documents, deadline, validator=validator, frame_id=frame_id),
+            "persistent process control",
+        )
+
+    page = request("process/list", {
+        "workspaceId": workspace_id, "threadId": thread_id, "limit": 200,
+        "cursor": None, "startedCallId": SHELL_STDIN_EOF_CALL_ID,
+    })
+    sessions = page.get("sessions", [])
+    if len(sessions) != 1 or sessions[0].get("startedTurnId") != turn_id \
+            or sessions[0].get("state") != "running":
+        raise RuntimeError("stdin process did not survive its completed Turn")
+    session = sessions[0]
+    scope = {
+        "workspaceId": workspace_id, "threadId": thread_id,
+        "generation": page["generation"], "sessionId": session["sessionId"],
+    }
+    snapshot = request("process/write", {
+        **scope, "operationKey": f"op_{uuid.uuid4().hex}", "input": "Ja-input-中文",
+        "closeInput": True, "afterSequence": 0,
+    })
+    output = snapshot.get("output", "")
+    while snapshot.get("state") in ("running", "stopping"):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("persistent stdin process did not exit before its deadline")
+        time.sleep(0.05)
+        snapshot = request("process/read", {
+            **scope, "afterSequence": snapshot["nextSequence"], "maxBytes": 65_536,
+        })
+        output += snapshot.get("output", "")
+    if snapshot.get("state") != "exited" or snapshot.get("exitCode") != 0 \
+            or "JA_NATIVE_STDIN_EOF" not in output:
+        raise RuntimeError("persistent stdin process exited without its verified output")
+    return {
+        "sessionId": session["sessionId"], "survivedTurn": True,
+        "stdinDelivered": True, "inputClosed": True, "exitCode": 0, "markerVerified": True,
+    }
+
+
 def sanitized_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove workspace paths before scanning captured output for leaks."""
+    """扫描捕获输出是否泄露前，先移除工作区路径。"""
 
     sanitized = json.loads(json.dumps(documents, ensure_ascii=False))
     for document in sanitized:
@@ -1304,12 +1370,150 @@ def native_probe_diagnostics(documents: list[dict[str, Any]]) -> list[dict[str, 
                 "usage": {
                     key: usage.get(key)
                     for key in (
-                        "requestOrdinal", "modelRound", "purpose", "certainty",
+                        "modelRequestOrdinal", "modelRound", "purpose", "certainty",
                         "inputTokens", "outputTokens", "totalTokens",
                     )
                 } if isinstance(usage, dict) else None,
             })
     return diagnostics[-32:]
+
+
+def failure_protocol_trace(
+    sent_frames: list[dict[str, Any]], documents: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """只记录定位顺序所需的帧元数据，避免失败证据落入正文、参数或凭据。"""
+
+    allowed_fields = (
+        "state", "status", "scope", "outcome", "errorCode", "reasonCode", "generation",
+        "revision", "eventId", "turnId", "threadId", "workspaceId", "callId", "toolCallId",
+        "toolName", "occurredAt", "accepted", "configured", "toolCount",
+    )
+    safe_pattern = re.compile(r"[A-Za-z0-9_.:/+@-]{1,160}")
+
+    def summarize(document: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        method = document.get("method")
+        if isinstance(method, str) and safe_pattern.fullmatch(method):
+            summary["method"] = method
+        frame_id = document.get("id")
+        if isinstance(frame_id, (int, str)) and not isinstance(frame_id, bool):
+            if isinstance(frame_id, int) or safe_pattern.fullmatch(frame_id):
+                summary["id"] = frame_id
+        for section in ("params", "result"):
+            values = document.get(section)
+            if not isinstance(values, dict):
+                continue
+            safe_values: dict[str, Any] = {}
+            for key in allowed_fields:
+                value = values.get(key)
+                if isinstance(value, bool) or isinstance(value, int):
+                    safe_values[key] = value
+                elif isinstance(value, str) and safe_pattern.fullmatch(value):
+                    safe_values[key] = value
+            if safe_values:
+                summary[section] = safe_values
+        error = document.get("error")
+        data = error.get("data") if isinstance(error, dict) else None
+        code = data.get("errorCode") if isinstance(data, dict) else None
+        if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code):
+            summary["errorCode"] = code
+        return summary
+
+    outbound = [
+        summarize(frame) for frame in sent_frames[-MAX_FAILURE_EVIDENCE_FRAMES:]
+    ]
+    inbound = [
+        summarize(frame) for frame in documents[-MAX_FAILURE_EVIDENCE_FRAMES:]
+    ]
+    return {"client": outbound, "server": inbound}
+
+
+def failure_stage_summary(
+    sent_frames: list[dict[str, Any]], documents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """用最后一个请求及其应答状态区分等待 RPC、等待后续事件和进程启动失败。"""
+
+    if not sent_frames:
+        return {"kind": "native_process_launch"}
+    last_sent = sent_frames[-1]
+    rpc_request_id = last_sent.get("id")
+    method = last_sent.get("method")
+    rpc_response_received = rpc_request_id is not None and any(
+        document.get("id") == rpc_request_id for document in documents
+    )
+    last_server = documents[-1] if documents else None
+    last_server_method = last_server.get("method") if isinstance(last_server, dict) else None
+    last_server_id = last_server.get("id") if isinstance(last_server, dict) else None
+    return {
+        "kind": "awaiting_followup_frame" if rpc_response_received or rpc_request_id is None else "awaiting_rpc_response",
+        "requestMethod": method if isinstance(method, str) else "unknown",
+        "rpcRequestId": rpc_request_id if isinstance(rpc_request_id, str) else None,
+        "rpcResponseReceived": rpc_response_received,
+        "lastServerMethod": last_server_method if isinstance(last_server_method, str) else None,
+        "lastServerId": last_server_id if isinstance(last_server_id, str) else None,
+    }
+
+
+def redact_failure_stderr(stderr: bytes, sensitive_paths: list[Path]) -> str:
+    """保留 Native 排障行但移除隔离目录、已知 smoke 密钥及通用凭据值。"""
+
+    text = stderr.decode("utf-8", errors="replace")
+    for path in sorted((str(value) for value in sensitive_paths), key=len, reverse=True):
+        if path:
+            text = re.sub(re.escape(path), "[private-path]", text, flags=re.IGNORECASE)
+            text = re.sub(re.escape(path.replace("\\", "/")), "[private-path]", text, flags=re.IGNORECASE)
+    text = text.replace(SMOKE_SECRET, "[redacted-secret]")
+    text = re.sub(r"(?i)\b(bearer)\s+[^\s,;]+", r"\1 [redacted]", text)
+    text = re.sub(
+        r"(?i)(\b(?:api[_ -]?key|authorization|password|secret|token)\b\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+        r"\1[redacted]",
+        text,
+    )
+    text = LEAK_PATTERN.sub("[redacted-credential]", text)
+    return text[-MAX_FAILURE_EVIDENCE_STDERR_BYTES:]
+
+
+def write_failure_diagnostics(
+    profile_root: Path,
+    sent_frames: list[dict[str, Any]],
+    documents: list[dict[str, Any]],
+    stderr: bytes,
+    sensitive_paths: list[Path],
+    phase: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """仅在显式排障时保存脱敏帧摘要，并让隔离 SQLite 与日志留在独立 profile 内。"""
+
+    inventory = [
+        {"path": path.relative_to(profile_root).as_posix(), "sizeBytes": path.stat().st_size}
+        for path in sorted(profile_root.rglob("*"))
+        if path.is_file() and path.name != "failure-diagnostics.json"
+    ]
+    trace = failure_protocol_trace(sent_frames, documents)
+    diagnostic = {
+        "schemaVersion": 1,
+        "stage": phase or failure_stage_summary(sent_frames, documents),
+        "frameCount": len(documents),
+        "protocolFrames": trace,
+        "stderrRedacted": redact_failure_stderr(stderr, sensitive_paths),
+        "files": inventory[:256],
+        "databaseFiles": [
+            entry for entry in inventory
+            if entry["path"].casefold().endswith((".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm"))
+        ],
+    }
+    (profile_root / "failure-diagnostics.json").write_text(
+        json.dumps(diagnostic, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return {
+        "profileDirectory": profile_root.name,
+        "diagnosticsFile": "failure-diagnostics.json",
+        "databaseFileCount": len(diagnostic["databaseFiles"]),
+        "protocolFrameCount": len(documents),
+        "stage": diagnostic["stage"],
+    }
 
 
 def auth_acl_evidence(auth_path: Path) -> dict[str, Any]:
@@ -1340,7 +1544,7 @@ def auth_acl_evidence(auth_path: Path) -> dict[str, Any]:
         if acl.returncode != 0:
             return {"status": "blocked", "reason": "icacls could not inspect auth.json"}
         lines = [line.strip() for line in f"{acl.stdout}\n{acl.stderr}".splitlines() if line.strip()]
-        # icacls prints the first ACE on the target-path line and indents only later entries.
+        # icacls 会把第一条 ACE 打印在目标路径所在行，只有后续条目才会缩进。
         ace_lines = [line for line in lines if ":(" in line]
         inherited = any("(I)" in line for line in ace_lines)
         current_user_ace = bool(identity) and any(identity.casefold() in line.casefold() for line in ace_lines)
@@ -1363,13 +1567,14 @@ def run_smoke(
     expected_sha256: str | None = None,
     expected_size: int | None = None,
     expected_mtime_ns: int | None = None,
+    keep_failed_profile: bool = False,
+    failure_evidence_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Execute the v1 lifecycle and every reachable local probe with bounded cleanup.
+    """执行 v2 生命周期；失败现场默认清理，仅在显式保留时回传脱敏定位信息。
 
-    The real executable path receives loopback Provider/MCP servers so transport, schema, cancel,
-    and recovery gates exercise production RPC.  A supplied command prefix denotes a contract
-    fixture; it is intentionally reported as dynamically blocked for probes that fixture cannot
-    expose, keeping unit smoke useful without turning a mock into Native evidence.
+    真实可执行文件会收到 loopback Provider/MCP 服务，使传输、schema、取消和恢复门禁都经过生产 RPC。传入命令
+    前缀表示使用合同夹具；对于夹具无法覆盖的探针，脚本会有意报告为动态受阻，既保留单元 smoke 的用途，也不把
+    mock 伪装成 Native 证据。可选 sink 只在异常处理中传递相对诊断指针，不传递子进程输出。
     """
 
     if not executable.is_file():
@@ -1392,8 +1597,8 @@ def run_smoke(
         directory.mkdir()
     agent_instructions = workspace / "AGENTS.md"
     if not agent_instructions.exists():
-        # Harness intentionally warns when the workspace has no agent contract. Supplying a tiny
-        # smoke-owned contract keeps stderr meaningful without weakening production logging.
+        # 工作区没有 Agent 合同时，Harness 会按设计输出警告。提供一份由 smoke 管理的最小合同，
+        # 可让 stderr 保持有效信息，同时不削弱生产日志要求。
         agent_instructions.write_text(
             "# Native smoke workspace\n\nDo not perform a model turn.\n",
             encoding="utf-8",
@@ -1426,12 +1631,35 @@ def run_smoke(
             creationflags=creationflags,
             start_new_session=os.name != "nt",
         )
-    except BaseException:
+    except BaseException as failure:
         if provider_probe is not None:
             provider_probe.close()
         if mcp_probe is not None:
             mcp_probe.close()
-        shutil.rmtree(owned_root)
+        if keep_failed_profile:
+            try:
+                evidence = write_failure_diagnostics(
+                    owned_root,
+                    [],
+                    [],
+                    b"",
+                    [owned_root, home_directory, runtime_data_directory, run_directory, log_directory,
+                     workspace, Path.home()],
+                    {"kind": "native_process_launch"},
+                )
+                if failure_evidence_sink is not None:
+                    failure_evidence_sink.update(evidence)
+                setattr(failure, "native_smoke_failure_evidence", evidence)
+            except OSError:
+                evidence = {
+                    "profileDirectory": owned_root.name,
+                    "diagnosticsWriteFailed": True,
+                }
+                if failure_evidence_sink is not None:
+                    failure_evidence_sink.update(evidence)
+                setattr(failure, "native_smoke_failure_evidence", evidence)
+        else:
+            shutil.rmtree(owned_root)
         raise
     stdout_collector = BinaryStreamCollector(process.stdout)
     stderr_collector = BinaryStreamCollector(process.stderr)
@@ -1439,10 +1667,12 @@ def run_smoke(
     stderr_collector.start()
     documents: list[dict[str, Any]] = []
     sent_frames: list[dict[str, Any]] = []
+    captured_failure: BaseException | None = None
+    result: dict[str, Any] | None = None
     deadline = time.monotonic() + timeout_seconds
 
     def send(frame: dict[str, Any]) -> None:
-        """Keep schema-validated outbound frames countable without retaining secret-bearing responses."""
+        """让经过 schema 校验的出站帧可计数，同时不保留含凭据的响应。"""
 
         sent_frames.append({"method": frame.get("method"), "id": frame.get("id")})
         send_frame(process, frame, schema_validator)
@@ -1474,7 +1704,7 @@ def run_smoke(
         )
         if configuration_replace.get("accepted") is not True or configuration_replace.get("scope") != "user" \
                 or not isinstance(configuration_replace.get("version"), str):
-            raise RuntimeError("configuration replace returned an invalid v1 projection")
+            raise RuntimeError("configuration replace returned an invalid v2 projection")
 
         send(credential_set_frame(expected_credential_version))
         credential_set = require_success(
@@ -1639,6 +1869,31 @@ def run_smoke(
                 text_turn_requests = provider_probe.request_count
                 if not text_ok or text_turn_requests != 1:
                     raise RuntimeError(f"Provider text Turn {terminal_failure_label(text_terminal)}")
+                final_message = text_terminal.get("params", {}).get("finalMessage")
+                item_id = final_message.get("messageId") if isinstance(final_message, dict) else None
+                if not isinstance(item_id, str):
+                    raise RuntimeError("Provider text Turn did not return its committed item identity")
+                send(thread_item_content_read_frame(thread["threadId"], item_id))
+                content_page = require_success(
+                    read_until(
+                        stdout_collector,
+                        documents,
+                        deadline,
+                        validator=schema_validator,
+                        frame_id="c:item-content-read",
+                    ),
+                    "Provider final item content",
+                )
+                if (
+                    content_page.get("itemId") != item_id
+                    or content_page.get("offsetCharacters") != 0
+                    or content_page.get("nextOffsetCharacters") is not None
+                    or content_page.get("totalCharacters") != len(SMOKE_TEXT)
+                    or content_page.get("truncated") is not False
+                    or content_page.get("content") != SMOKE_TEXT
+                    or final_message.get("text") != content_page.get("content")
+                ):
+                    raise RuntimeError("thread/item content did not reproduce the committed Provider reply")
                 send(thread_read_frame(thread["threadId"]))
                 persisted_thread = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator,
@@ -1667,7 +1922,7 @@ def run_smoke(
             try:
                 send(turn_start_frame(
                     thread["threadId"],
-                    "Use the shell tool with the exact command and wait for approval, then report completion.",
+                    "Use exec_command with the exact command and wait for approval, then report completion.",
                 ))
                 shell_accept = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:turn-start"),
@@ -1764,7 +2019,7 @@ def run_smoke(
                     raise RuntimeError("shell stdin EOF probe did not persist an isolated Thread")
                 send(turn_start_frame(
                     eof_thread["threadId"],
-                    "Use the shell tool to run the stdin EOF probe, then report completion.",
+                    "Use exec_command to run the stdin EOF probe, then report completion.",
                 ))
                 eof_accept = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator,
@@ -1821,6 +2076,12 @@ def run_smoke(
                     and eof_result.get("ordinal") == 0 \
                     and eof_result.get("outcome") == "succeeded" \
                     and eof_terminal.get("params", {}).get("state") == "completed"
+                if not eof_ok:
+                    raise RuntimeError("stdin process Tool did not settle and complete in order")
+                process_evidence = verify_persistent_stdin(
+                    send, stdout_collector, documents, deadline, schema_validator,
+                    workspace_id, eof_thread["threadId"], eof_turn_id,
+                )
                 recovery_usage_thread_id = eof_thread["threadId"]
                 recovery_usage_turn_id = eof_turn_id
                 recovery_usage_model_round = 2
@@ -1829,6 +2090,7 @@ def run_smoke(
                     started=True,
                     toolOutcome=eof_result.get("outcome"),
                     terminalState=eof_terminal.get("params", {}).get("state"),
+                    **process_evidence,
                 ) if eof_ok else probe_failed(
                     "shell stdin EOF probe did not start, settle and complete in order",
                 )
@@ -2002,7 +2264,7 @@ def run_smoke(
             "networknt": networknt_evidence,
         }
         required_subgates = evaluate_required_subgates(subgates)
-        return {
+        result = {
             "status": "passed" if required_subgates["passed"] else "failed",
             "passed": required_subgates["passed"],
             "failureCode": None if required_subgates["passed"] else "required-subgate-failed",
@@ -2023,10 +2285,18 @@ def run_smoke(
             "logBytes": runtime_log.stat().st_size,
             "environment": {"javaHomeRemoved": True, "credentialLikeVariablesRemoved": True},
         }
-    except RuntimeError as failure:
+        if not required_subgates["passed"] and keep_failed_profile:
+            captured_failure = RuntimeError("native sidecar smoke required subgate failed")
+        return result
+    except (OSError, RuntimeError) as caught_failure:
+        failure: BaseException = caught_failure
         if process.poll() not in (None, 0):
-            raise RuntimeError(f"native sidecar exited with status {process.returncode}") from failure
-        raise
+            failure = RuntimeError(f"native sidecar exited with status {process.returncode}")
+            failure.__cause__ = caught_failure
+        captured_failure = failure
+        if failure is caught_failure:
+            raise
+        raise failure
     finally:
         if process.stdin is not None:
             try:
@@ -2045,11 +2315,34 @@ def run_smoke(
             provider_probe.close()
         if mcp_probe is not None:
             mcp_probe.close()
-        shutil.rmtree(owned_root)
+        if captured_failure is not None and keep_failed_profile:
+            try:
+                evidence = write_failure_diagnostics(
+                    owned_root,
+                    sent_frames,
+                    documents,
+                    stderr_collector.bytes(),
+                    [owned_root, home_directory, runtime_data_directory, run_directory, log_directory,
+                     workspace, Path.home()],
+                )
+            except OSError:
+                evidence = {
+                    "profileDirectory": owned_root.name,
+                    "diagnosticsWriteFailed": True,
+                    "stage": failure_stage_summary(sent_frames, documents),
+                }
+            if result is not None:
+                result["failureEvidence"] = evidence
+            else:
+                setattr(captured_failure, "native_smoke_failure_evidence", evidence)
+            if failure_evidence_sink is not None:
+                failure_evidence_sink.update(evidence)
+        else:
+            shutil.rmtree(owned_root)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse the narrow CI interface so callers cannot accidentally select a different runtime."""
+    """解析受限的 smoke 参数；失败现场保留须显式开启且必须有结构化报告输出。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--executable", required=True, type=Path)
@@ -2059,11 +2352,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-sha256")
     parser.add_argument("--expected-size", type=int)
     parser.add_argument("--expected-mtime-ns", type=int)
-    return parser.parse_args()
+    parser.add_argument("--keep-failed-profile", action="store_true")
+    args = parser.parse_args()
+    if args.keep_failed_profile and args.output is None:
+        parser.error("--keep-failed-profile requires --output")
+    return args
 
 
 def stable_failure_code(failure: BaseException) -> str:
-    """Map controlled failures to bounded codes without persisting paths or child output."""
+    """将可控故障映射为有界代码，不持久化路径或子进程输出。"""
 
     message = str(failure).lower()
     mappings = (
@@ -2084,9 +2381,10 @@ def stable_failure_code(failure: BaseException) -> str:
 
 
 def main() -> int:
-    """Run the smoke gate and write only sanitized structured evidence."""
+    """运行 smoke 门禁并仅写脱敏结构化证据；失败现场只由显式参数保留。"""
 
     args = parse_args()
+    failure_evidence: dict[str, Any] = {}
     try:
         report = run_smoke(
             args.executable,
@@ -2095,6 +2393,8 @@ def main() -> int:
             expected_sha256=args.expected_sha256,
             expected_size=args.expected_size,
             expected_mtime_ns=args.expected_mtime_ns,
+            keep_failed_profile=args.keep_failed_profile,
+            failure_evidence_sink=failure_evidence,
         )
     except (OSError, RuntimeError) as failure:
         report = {
@@ -2105,6 +2405,9 @@ def main() -> int:
         if isinstance(failure, NativeRpcRejection):
             report["operation"] = failure.operation
             report["rpcErrorCode"] = failure.error_code
+        evidence = failure_evidence or getattr(failure, "native_smoke_failure_evidence", None)
+        if isinstance(evidence, dict):
+            report["failureEvidence"] = evidence
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

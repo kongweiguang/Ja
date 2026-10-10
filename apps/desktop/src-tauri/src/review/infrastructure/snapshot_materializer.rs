@@ -529,7 +529,8 @@ impl NativeReviewAdapter {
         })
     }
 
-    /// 只物化所选文件，并让每条 Git 命令沿用完整安全检查与同一读取期限。
+    /// 只物化所选文件；rename 同时限定旧、新路径，unmerged combined diff 由现有 parser 明确拒绝。
+    /// 继续用受校验的 pathspec 保持单文件读取边界，不把不支持的 patch 伪装成快照过期。
     pub(super) fn materialize_one_file(
         &self,
         source: &ReviewSource,
@@ -547,6 +548,10 @@ impl NativeReviewAdapter {
         let path = self.validated_path_arg(&file.path)?;
         let mut args = diff_args(&kind, false);
         args.push(OsString::from("--"));
+        if let Some(old_path) = file.old_path.as_deref() {
+            let old_path = self.validated_path_arg(old_path)?;
+            args.push(OsString::from(old_path));
+        }
         args.push(OsString::from(path));
         let bytes = self.git.run_review_command(&args, budget.cancellation())?;
         budget.check()?;
@@ -558,7 +563,11 @@ impl NativeReviewAdapter {
             })
         };
         if parsed.is_none() && bytes.len() <= MAX_REVIEW_DIFF_BYTES {
-            return Err(ReviewError::ReviewStale);
+            return Err(if file.status == ReviewFileStatus::Conflict {
+                ReviewError::Parse
+            } else {
+                ReviewError::ReviewStale
+            });
         }
         let mut materialized = self.build_review_file(
             &file.path,

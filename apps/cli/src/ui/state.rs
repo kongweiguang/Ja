@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use super::composer::Composer;
+use super::markdown_stream::{MarkdownStream, MarkdownStreamPiece};
 use super::model::{
-    InteractionAnswer, InteractionQuestion, InteractionQuestionKind, PendingPrompt, TimelineEntry,
-    TimelineKind, TurnState, UiAction, UiChoice, UiCommand, UiEvent, UiReferenceKind, UiSnapshot,
-    UiSubmitMode,
+    InteractionAnswer, InteractionQuestion, InteractionQuestionKind, PendingPrompt,
+    StreamPresentation, TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice,
+    UiCommand, UiEvent, UiReferenceKind, UiSnapshot, UiSubmitMode,
 };
+use super::model_settings::{ModelSettingsEffect, ModelSettingsOutcome, ModelSettingsState};
+use super::transcript::Transcript;
 
-const MAX_TIMELINE_ENTRIES: usize = 400;
-const MAX_ENTRY_BYTES: usize = 16 * 1024;
 const MAX_DETAIL_BYTES: usize = 96 * 1024;
 const MAX_CHOICES: usize = 64;
+const MODEL_SETTINGS_CHOICE_ID: &str = "ui:manage-models";
 const MAX_CHOICE_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_INPUT_HISTORY_BYTES: usize = 32 * 1024;
-const MAX_SCROLLBACK_ENTRIES: usize = 200;
-const MAX_INITIAL_SCROLLBACK_BYTES: usize = 192 * 1024;
-const MAX_COMMITTED_IDS: usize = 8192;
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(140);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,10 +32,12 @@ pub(super) enum ChoiceKind {
     Reasoning,
     Permissions,
     Threads,
+    ForkReplies,
     InputHistory,
     Files,
     Skills,
     Attachments,
+    ToolSteps,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,12 +47,38 @@ struct ActiveFileQuery {
     query: String,
 }
 
+#[derive(Clone)]
+struct StreamProgress {
+    source_key: String,
+    turn_id: String,
+    kind: StreamKind,
+    committed_bytes: usize,
+    committed_hash: Sha256,
+    first_fragment: bool,
+    layout: MarkdownStream,
+}
+
+#[derive(Clone)]
+struct StreamReceipt {
+    turn_id: String,
+    kind: StreamKind,
+    byte_len: usize,
+    digest: [u8; 32],
+}
+
+/// 公开摘要与正文共用接续账本，但同文不能跨类别互相去重。
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StreamKind {
+    Assistant,
+    Reasoning,
+}
+
 /// 多题回答共用同一份服务端 CAS 身份，避免按键分支重复排列参数时漏传 revision。
 struct ClarificationContext {
     thread_id: String,
-    request_id: String,
-    expected_revision: u64,
-    idempotency_key: String,
+    interaction_id: String,
+    expected_interaction_revision: u64,
+    operation_key: String,
     question_count: usize,
 }
 
@@ -69,7 +97,10 @@ pub(super) enum Panel {
         scroll: DetailScroll,
     },
     Pending,
-    Help,
+    ModelSettings,
+    Help {
+        scroll: DetailScroll,
+    },
     Details {
         entry_id: String,
         title: String,
@@ -86,34 +117,64 @@ pub(super) enum DetailScroll {
     FromBottom(usize),
 }
 
+/// 保留完整发送缓冲与发送前最后的问题身份，权威问题先到时可去掉临时副本，且不误合并历史相同文本。
+enum PendingSubmission {
+    Message {
+        composer: Composer,
+        previous_user_id: Option<String>,
+    },
+    Attachment(String),
+}
+
+/// 取消等待与失败可重试共用一份状态；自动快照不能盖掉尚未处理的错误提示。
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CancellationState {
+    Idle,
+    Pending,
+    Retry,
+}
+
 /// 状态 reducer 是展示事实的唯一写入口，恢复与副作用仍由 controller 所有。
 pub struct UiState {
     snapshot: UiSnapshot,
     composer: Composer,
+    fork_source_composers: HashMap<String, Composer>,
+    active_fork_source: Option<String>,
     terminal_width: usize,
     terminal_height: usize,
     deferred_composer: Option<Composer>,
     panel: Option<Panel>,
+    model_settings: Option<ModelSettingsState>,
+    settings_return_panel: Option<Panel>,
+    settings_start_pending: bool,
     question_index: usize,
     selected_prompt_choice: usize,
     selected_multiple: HashSet<String>,
     thread_query: String,
     input_history_query: String,
     input_history_texts: Vec<(String, String, bool)>,
+    tool_choices: Vec<UiChoice>,
+    tool_detail_return_id: Option<String>,
     interaction_answers: Vec<InteractionAnswer>,
     using_free_text: bool,
     prompt_responded: bool,
-    pending_submission: Option<String>,
+    pending_submission: Option<PendingSubmission>,
+    suspended_control_pending: bool,
     continuation_pending: bool,
-    cancel_pending: bool,
+    cancellation: CancellationState,
     exit_confirmation: Option<Instant>,
     scheduled_file_search: Option<(String, u64, Instant)>,
     query_sequence: u64,
     active_query_id: Option<u64>,
     reference_popup_dismissed: bool,
     committed_ids: HashSet<String>,
-    committed_order: VecDeque<String>,
-    pending_scrollback: VecDeque<TimelineEntry>,
+    pub(super) transcript: RefCell<Transcript>,
+    older_page_loading: bool,
+    older_page_failed: bool,
+    stream_progress: HashMap<String, StreamProgress>,
+    stream_receipts: VecDeque<StreamReceipt>,
+    welcome_visible: bool,
+    next_stream_output_id: u64,
     closed: bool,
 }
 
@@ -123,7 +184,7 @@ impl UiState {
         Self::new_for_terminal(snapshot, 80, 24)
     }
 
-    /// 首次历史提交按实际终端列和行预算计算；后续缩放不能撤回已写入原生 scrollback 的段落。
+    /// 首次加载保留完整语义条目，已确定正文进入应用视口；流账本继续核对快照与增量。
     pub fn new_for_terminal(snapshot: UiSnapshot, width: u16, height: u16) -> Self {
         let snapshot = sanitize_snapshot(snapshot);
         let panel = if snapshot.pending_prompt.is_some() {
@@ -139,33 +200,54 @@ impl UiState {
         let mut state = Self {
             snapshot,
             composer: Composer::new(),
+            fork_source_composers: HashMap::new(),
+            active_fork_source: None,
             terminal_width: usize::from(width.max(1)),
             terminal_height: usize::from(height.max(1)),
             deferred_composer: None,
             panel,
+            model_settings: None,
+            settings_return_panel: None,
+            settings_start_pending: false,
             question_index: 0,
             selected_prompt_choice: 0,
             selected_multiple: HashSet::new(),
             thread_query: String::new(),
             input_history_query: String::new(),
             input_history_texts: Vec::new(),
+            tool_choices: Vec::new(),
+            tool_detail_return_id: None,
             interaction_answers: Vec::new(),
             using_free_text: false,
             prompt_responded: false,
             pending_submission: None,
+            suspended_control_pending: false,
             continuation_pending: false,
-            cancel_pending: false,
+            cancellation: CancellationState::Idle,
             exit_confirmation: None,
             scheduled_file_search: None,
             query_sequence: 0,
             active_query_id: None,
             reference_popup_dismissed: false,
             committed_ids: HashSet::new(),
-            committed_order: VecDeque::new(),
-            pending_scrollback: VecDeque::new(),
+            transcript: RefCell::new(Transcript::default()),
+            older_page_loading: false,
+            older_page_failed: false,
+            stream_progress: HashMap::new(),
+            stream_receipts: VecDeque::new(),
+            welcome_visible: false,
+            next_stream_output_id: 1,
             closed: false,
         };
-        state.seed_initial_scrollback();
+        remove_unstarted_duplicate_streams(&mut state.snapshot, &state.stream_progress);
+        state.welcome_visible = state.snapshot.thread_id.is_some()
+            && state.snapshot.timeline.is_empty()
+            && !state.snapshot.has_older_history;
+        state.flush_stable_prefix();
+        if state.has_live_stream_entries() {
+            state.flush_stable_prefix();
+            state.sync_snapshot_streams();
+        }
         state
     }
 
@@ -184,17 +266,23 @@ impl UiState {
         self.closed
     }
 
-    /// 编辑器的上下移动以最近一次终端列宽定位，避免缩放后沿旧折行跳转。
-    pub fn set_terminal_width(&mut self, width: u16) {
-        self.terminal_width = usize::from(width.max(4));
+    /// 新会话介绍属于同一对话文档，首条消息到来后也能向上翻回；恢复历史不重复插入介绍。
+    pub(crate) fn should_show_welcome(&self) -> bool {
+        self.welcome_visible
     }
 
-    /// 取出刚变为稳定的段落，bridge 只插入一次到终端原生 scrollback。
-    pub fn take_scrollback_entries(&mut self) -> Vec<TimelineEntry> {
-        self.pending_scrollback.drain(..).collect()
+    /// 单次更新列宽与可用行数，让折行、历史预算和短窗详情共同响应终端缩放。
+    pub fn set_terminal_size(&mut self, width: u16, height: u16) {
+        self.terminal_width = usize::from(width.max(1));
+        self.terminal_height = usize::from(height.max(1));
     }
 
-    /// 未完成的活动尾部留在可重绘 viewport，稳定行已提交给终端历史。
+    /// Composer 上限取物理终端高度，不能随活动视口收缩再次减少可见草稿行数。
+    pub(crate) fn terminal_height(&self) -> usize {
+        self.terminal_height
+    }
+
+    /// 稳定条目由 transcript 唯一持有，快照只提供未提交的活动尾部和状态。
     pub(crate) fn visible_entries(&self) -> impl DoubleEndedIterator<Item = &TimelineEntry> {
         self.snapshot
             .timeline
@@ -202,13 +290,168 @@ impl UiState {
             .filter(|entry| !self.is_committed(&entry.id))
     }
 
-    /// 权威快照只更新事实；同会话菜单、回答进度和字素光标保留，身份或 CAS 变化才重置交互。
+    /// 首个前缀进入对话文档后，活动尾部只显示缩进续行。
+    pub(crate) fn stream_has_started(&self, entry_id: &str) -> bool {
+        self.stream_progress
+            .get(entry_id)
+            .is_some_and(|progress| !progress.first_fragment)
+    }
+
+    /// 活动尾部读取同一分块器的样式和间距，避免代码正文在归档前被重新解释成 Markdown。
+    pub(crate) fn stream_tail_layout(&self, entry_id: &str) -> Option<(StreamPresentation, bool)> {
+        self.stream_progress.get(entry_id).map(|progress| {
+            (
+                progress.layout.tail_presentation(),
+                progress.layout.tail_needs_spacing(),
+            )
+        })
+    }
+
+    /// 源身份和已消费字节属于流账本，排版重算和片段结算不能重新生成阅读锚点。
+    pub(super) fn transcript_source(&self, entry_id: &str) -> (String, usize) {
+        self.stream_progress.get(entry_id).map_or_else(
+            || (entry_id.to_owned(), 0),
+            |progress| (progress.source_key.clone(), progress.committed_bytes),
+        )
+    }
+
+    /// 只有顶部的显式浏览请求加载旧页；并发滚轮合并为一页，失败等待 F5 而不循环重试。
+    fn request_older_history(&mut self) -> Vec<UiAction> {
+        if self.older_page_loading || !self.snapshot.has_older_history {
+            return Vec::new();
+        }
+        let Some(thread_id) = self.snapshot.thread_id.clone() else {
+            return Vec::new();
+        };
+        if self.older_page_failed {
+            self.snapshot.notice = None;
+        }
+        self.older_page_loading = true;
+        self.older_page_failed = false;
+        vec![UiAction::LoadOlder { thread_id }]
+    }
+
+    /// 翻历史仅占用现有操作反馈行，不增加会挤动 Composer 的独立加载组件。
+    pub(super) fn older_history_loading(&self) -> bool {
+        self.older_page_loading
+    }
+
+    /// 分页重试属于原请求的继续，底栏需要区别于其它 F5 权威状态核实操作。
+    pub(super) fn older_history_failed(&self) -> bool {
+        self.older_page_failed
+    }
+
+    /// 鼠标坐标只由当前 RenderPlan 对应的正文视口解释，覆盖层不把动作透传到背后对话。
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<UiAction> {
+        if self.closed
+            || matches!(
+                self.panel,
+                Some(Panel::Details { .. } | Panel::ChoiceDetail { .. } | Panel::ModelSettings)
+            )
+        {
+            return Vec::new();
+        }
+        let changed = self.transcript.get_mut().handle_mouse(mouse);
+        if changed && !self.older_page_failed && self.transcript.get_mut().needs_older() {
+            return self.request_older_history();
+        }
+        Vec::new()
+    }
+
+    /// 选区复制始终先于取消；装饰性空选区也消费复制键，避免误中断正在运行的任务。
+    fn transcript_key(&mut self, key: KeyEvent) -> Option<Vec<UiAction>> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let copy_key = control && matches!(key.code, KeyCode::Char('c' | 'C') | KeyCode::Insert);
+        if copy_key && self.transcript.get_mut().has_selection() {
+            if let Some((selection_id, text)) = self.transcript.get_mut().selection_copy() {
+                return Some(vec![UiAction::CopyTranscriptSelection {
+                    selection_id,
+                    text,
+                }]);
+            }
+            self.snapshot.notice = Some("选区没有可复制文字；Esc 清除选区".into());
+            return Some(Vec::new());
+        }
+        match key.code {
+            KeyCode::Esc if self.transcript.get_mut().has_selection() => {
+                self.transcript.get_mut().clear_selection();
+            }
+            KeyCode::Esc if self.transcript.get_mut().is_browsing() => {
+                self.transcript.get_mut().follow_latest();
+            }
+            KeyCode::PageUp => {
+                self.transcript.get_mut().page_by(-1);
+            }
+            KeyCode::PageDown => {
+                self.transcript.get_mut().page_by(1);
+            }
+            KeyCode::Home if control => self.transcript.get_mut().jump_top(),
+            KeyCode::End if control => self.transcript.get_mut().follow_latest(),
+            _ => return None,
+        }
+        Some(
+            if !self.older_page_failed && self.transcript.get_mut().needs_older() {
+                self.request_older_history()
+            } else {
+                Vec::new()
+            },
+        )
+    }
+
+    /// 公开流移入 transcript 后只留稳定身份，避免 reducer 再保留一份完整正文。
+    fn clear_committed_assistant_text(&mut self) {
+        let thread_prefix = format!("{}\0", self.snapshot.thread_id.as_deref().unwrap_or(""));
+        let committed_ids = &self.committed_ids;
+        for entry in &mut self.snapshot.timeline {
+            let committed_key = format!("{thread_prefix}{}", entry.id);
+            if committed_ids.contains(&committed_key)
+                && matches!(
+                    &entry.kind,
+                    TimelineKind::Assistant
+                        | TimelineKind::FinalAnswer
+                        | TimelineKind::ReasoningSummary
+                )
+            {
+                entry.text.clear();
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// 快照先对账再归档；异步用量与详情增量不得触碰草稿、流账本、操作锁或已关闭面板。
     pub fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::ReplaceSnapshot(snapshot) => {
                 let mut snapshot = sanitize_snapshot(*snapshot);
                 let was_pending = self.snapshot.pending_prompt.is_some();
                 let thread_changed = self.snapshot.thread_id != snapshot.thread_id;
+                let previous_thread_id = self.snapshot.thread_id.clone();
+                if thread_changed
+                    && let Some(thread_id) = previous_thread_id.as_deref()
+                    && self.active_fork_source.as_deref() != Some(thread_id)
+                    && let Some(draft) = self.fork_source_composers.get_mut(thread_id)
+                {
+                    *draft = self.composer.clone();
+                }
+                if thread_changed && self.settings_start_pending {
+                    self.close_model_settings(false);
+                    self.settings_start_pending = false;
+                }
+                if !thread_changed && self.snapshot.local_operation.is_some() {
+                    snapshot.local_operation = self.snapshot.local_operation.clone();
+                    snapshot.turn_state = TurnState::Working;
+                    snapshot.turn_started_at = self.snapshot.turn_started_at;
+                }
+                if thread_changed || snapshot.turn_state != TurnState::Working {
+                    self.cancellation = CancellationState::Idle;
+                }
+                if !thread_changed
+                    && (self.pending_submission.is_some()
+                        || self.cancellation == CancellationState::Retry)
+                    && snapshot.notice.is_none()
+                {
+                    snapshot.notice = self.snapshot.notice.clone();
+                }
                 let active_choice_id = self.panel.as_ref().and_then(|panel| match panel {
                     Panel::Choices { kind, selected } => self
                         .choices(*kind)
@@ -217,8 +460,23 @@ impl UiState {
                     _ => None,
                 });
                 if thread_changed {
+                    self.tool_choices.clear();
+                    self.tool_detail_return_id = None;
                     self.active_query_id = None;
                     self.scheduled_file_search = None;
+                    self.finalize_all_streams();
+                    self.stream_receipts.clear();
+                    self.transcript.get_mut().clear();
+                    self.committed_ids.clear();
+                    self.older_page_loading = false;
+                    self.older_page_failed = false;
+                    self.welcome_visible = snapshot.thread_id.is_some()
+                        && snapshot.timeline.is_empty()
+                        && !snapshot.has_older_history;
+                }
+                remove_unstarted_duplicate_streams(&mut snapshot, &self.stream_progress);
+                if !thread_changed {
+                    self.reconcile_snapshot_streams(&mut snapshot);
                 }
                 if !thread_changed {
                     match self.panel.as_ref() {
@@ -258,6 +516,16 @@ impl UiState {
                             snapshot.input_history_next_cursor =
                                 self.snapshot.input_history_next_cursor.clone();
                         }
+                        Some(Panel::Choices {
+                            kind: ChoiceKind::ForkReplies,
+                            ..
+                        }) => {
+                            snapshot.fork_reply_choices = self.snapshot.fork_reply_choices.clone();
+                            snapshot.fork_reply_next_cursor =
+                                self.snapshot.fork_reply_next_cursor.clone();
+                            snapshot.fork_reply_loading = self.snapshot.fork_reply_loading;
+                            snapshot.fork_reply_load_failed = self.snapshot.fork_reply_load_failed;
+                        }
                         _ => {}
                     }
                 }
@@ -265,32 +533,116 @@ impl UiState {
                     self.snapshot.pending_prompt.as_ref(),
                     snapshot.pending_prompt.as_ref(),
                 );
+                if !thread_changed {
+                    self.suppress_streamed_entries(&mut snapshot);
+                }
                 self.snapshot = snapshot;
+                self.clear_committed_assistant_text();
+                self.rebuild_tool_choices();
                 if thread_changed || prompt_changed {
                     self.reset_prompt(was_pending);
                 } else {
                     self.clamp_visible_panel(active_choice_id.as_deref());
                 }
                 if thread_changed {
-                    self.seed_initial_scrollback();
+                    if let Some(thread_id) = self.snapshot.thread_id.as_deref()
+                        && let Some(composer) = self.fork_source_composers.get(thread_id)
+                    {
+                        self.composer = composer.clone();
+                    } else if self.active_fork_source.is_some() {
+                        // 分叉创建只复制来源草稿快照；新 child 的编辑器必须从空白状态开始。
+                        self.composer = Composer::new();
+                    }
+                }
+                self.flush_stable_prefix();
+                self.sync_snapshot_streams();
+            }
+            UiEvent::OlderHistoryLoaded {
+                thread_id,
+                entries,
+                has_older,
+            } => {
+                if self.snapshot.thread_id.as_deref() == Some(&thread_id) {
+                    self.older_page_loading = false;
+                    self.older_page_failed = false;
+                    self.snapshot.has_older_history = has_older;
+                    let entries = entries
+                        .into_iter()
+                        .map(sanitize_entry)
+                        .filter(|entry| !self.is_committed(&entry.id))
+                        .collect::<Vec<_>>();
+                    for entry in &entries {
+                        self.mark_committed(&entry.id);
+                    }
+                    self.transcript.get_mut().prepend(entries);
                 }
             }
-            UiEvent::UpsertEntry(entry) => self.upsert_entry(entry),
-            UiEvent::AppendAssistantDelta { entry_id, delta } => {
-                if let Some(entry) = self
-                    .snapshot
-                    .timeline
-                    .iter_mut()
-                    .find(|entry| entry.id == entry_id && entry.kind == TimelineKind::Assistant)
-                {
-                    let delta = sanitize_text(&delta, MAX_ENTRY_BYTES);
-                    append_bounded(&mut entry.text, &delta, MAX_ENTRY_BYTES);
+            UiEvent::OlderHistoryFailed { thread_id, notice } => {
+                if self.snapshot.thread_id.as_deref() == Some(&thread_id) {
+                    self.older_page_loading = false;
+                    self.older_page_failed = true;
+                    self.snapshot.notice = Some(sanitize_text(&notice, 1024));
                 }
+            }
+            UiEvent::TranscriptSelectionCopied { selection_id } => {
+                if self.transcript.get_mut().selection_copied(selection_id) {
+                    self.snapshot.notice = Some("选区已复制".into());
+                }
+            }
+            UiEvent::TranscriptSelectionCopyFailed {
+                selection_id,
+                notice,
+            } => {
+                if self
+                    .transcript
+                    .get_mut()
+                    .selection_copy_failed(selection_id)
+                {
+                    self.snapshot.notice = Some(sanitize_text(&notice, 1024));
+                }
+            }
+            UiEvent::UpsertEntry(entry) => {
+                self.transcript.get_mut().notify_activity();
+                let tool_changed = matches!(entry.kind, TimelineKind::Tool { .. });
+                self.upsert_entry(entry);
+                if tool_changed {
+                    self.rebuild_tool_choices();
+                }
+            }
+            UiEvent::AppendStreamDelta { entry_id, delta } => {
+                if !delta.is_empty() {
+                    self.transcript.get_mut().notify_activity();
+                }
+                self.append_stream_delta(&entry_id, &delta);
+            }
+            UiEvent::FinishAssistantStream { turn_id } => {
+                self.finalize_turn_streams(&turn_id);
             }
             UiEvent::SetTurnState(status) => {
+                if matches!(status, TurnState::Idle | TurnState::Failed) {
+                    self.finalize_all_streams();
+                }
                 self.snapshot.turn_state = status;
                 self.continuation_pending = false;
-                self.cancel_pending = false;
+                self.cancellation = CancellationState::Idle;
+            }
+            UiEvent::SetLocalOperation(label) => {
+                if label.is_some() && self.snapshot.local_operation.is_none() {
+                    self.snapshot.turn_state = TurnState::Working;
+                    self.snapshot.turn_started_at = Some(SystemTime::now());
+                } else if label.is_none() && self.snapshot.local_operation.is_some() {
+                    self.snapshot.turn_state = TurnState::Idle;
+                    self.snapshot.turn_started_at = None;
+                }
+                self.snapshot.local_operation = label;
+                self.cancellation = CancellationState::Idle;
+            }
+            UiEvent::SetSuspendedControlPending(pending) => {
+                self.suspended_control_pending = pending;
+            }
+            UiEvent::CancellationFailed(notice) => {
+                self.cancellation = CancellationState::Retry;
+                self.snapshot.notice = Some(sanitize_text(&notice, 1024));
             }
             UiEvent::SetContinuationAvailable(available) => {
                 self.snapshot.continuation_available = available;
@@ -298,6 +650,11 @@ impl UiState {
             }
             UiEvent::SetHasOlderHistory(available) => {
                 self.snapshot.has_older_history = available;
+            }
+            UiEvent::SetUsage { thread_id, usage } => {
+                if self.snapshot.thread_id.as_deref() == Some(thread_id.as_str()) {
+                    self.snapshot.usage = usage.map(|usage| *usage);
+                }
             }
             UiEvent::SetModel {
                 model_identifier,
@@ -322,8 +679,32 @@ impl UiState {
             }
             UiEvent::SetModelChoices(choices) => {
                 let selected_id = self.selected_choice_id(ChoiceKind::Models);
-                self.snapshot.model_choices = sanitize_choices(choices);
+                self.snapshot.model_choices = sanitize_model_choices(choices);
                 self.reconcile_choice_selection(ChoiceKind::Models, selected_id.as_deref());
+            }
+            UiEvent::OpenModelSettings {
+                operation_id,
+                standalone,
+            } => {
+                self.open_model_settings(operation_id, standalone);
+            }
+            UiEvent::ModelSettingsResult(result) => {
+                let saved = matches!(&result.outcome, ModelSettingsOutcome::Saved { .. });
+                if let Some(settings) = self.model_settings.as_mut() {
+                    let accepted = settings.apply_result(result);
+                    if accepted && saved && self.snapshot.thread_id.is_some() {
+                        self.close_model_settings(true);
+                    }
+                }
+            }
+            UiEvent::ModelSettingsTrustRequired { cwd } => {
+                if let Some(settings) = self.model_settings.as_mut() {
+                    settings.require_trust(cwd);
+                } else {
+                    self.model_settings = Some(ModelSettingsState::trust_required(cwd, false));
+                    self.settings_return_panel = self.panel.take();
+                }
+                self.panel = Some(Panel::ModelSettings);
             }
             UiEvent::SetReasoningChoices {
                 model_identifier,
@@ -410,6 +791,63 @@ impl UiState {
                     self.set_choice_selection(ChoiceKind::Threads, selected);
                 } else {
                     self.clamp_choice_selection(ChoiceKind::Threads);
+                }
+            }
+            UiEvent::SetForkReplyPage {
+                choices,
+                next_cursor,
+                selected_id,
+                prepend,
+            } => {
+                if !matches!(
+                    self.panel,
+                    Some(Panel::Choices {
+                        kind: ChoiceKind::ForkReplies,
+                        ..
+                    })
+                ) {
+                    return;
+                }
+                self.snapshot.fork_reply_loading = false;
+                self.snapshot.fork_reply_load_failed = false;
+                let selected_id =
+                    selected_id.or_else(|| self.selected_choice_id(ChoiceKind::ForkReplies));
+                let mut choices = sanitize_fork_reply_choices(choices);
+                if prepend {
+                    let existing = std::mem::take(&mut self.snapshot.fork_reply_choices);
+                    let mut seen = choices
+                        .iter()
+                        .map(|choice| choice.id.clone())
+                        .collect::<HashSet<_>>();
+                    choices.extend(
+                        existing
+                            .into_iter()
+                            .filter(|choice| seen.insert(choice.id.clone())),
+                    );
+                }
+                self.snapshot.fork_reply_choices = choices;
+                self.snapshot.fork_reply_next_cursor = next_cursor;
+                let selected = selected_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.snapshot
+                            .fork_reply_choices
+                            .iter()
+                            .position(|choice| choice.id == id)
+                    })
+                    .unwrap_or_else(|| self.snapshot.fork_reply_choices.len().saturating_sub(1));
+                self.set_choice_selection(ChoiceKind::ForkReplies, selected);
+            }
+            UiEvent::ForkReplyLoadFailed => {
+                if matches!(
+                    self.panel,
+                    Some(Panel::Choices {
+                        kind: ChoiceKind::ForkReplies,
+                        ..
+                    })
+                ) {
+                    self.snapshot.fork_reply_loading = false;
+                    self.snapshot.fork_reply_load_failed = true;
                 }
             }
             UiEvent::SetInputHistoryPage {
@@ -540,19 +978,62 @@ impl UiState {
                     .map(|query| (query.start, query.end));
                 self.insert_reference(label, range, UiReferenceKind::Skill { skill_id });
             }
+            UiEvent::BeginSubmission(text) => {
+                let mut submitted = Composer::new();
+                if submitted.set_text(&text) {
+                    self.retain_message_submission(submitted);
+                    self.snapshot.notice = None;
+                } else {
+                    self.snapshot.notice = Some("输入内容过长，请缩短正文或使用文件引用。".into());
+                }
+            }
             UiEvent::ClearDraft => {
-                if let Some(submitted) = self.pending_submission.take()
-                    && self.composer.text() == submitted
-                {
-                    self.composer.clear();
+                let needs_placeholder = self.visible_pending_message_text().is_some();
+                match self.pending_submission.take() {
+                    Some(PendingSubmission::Message {
+                        composer: submitted,
+                        ..
+                    }) if needs_placeholder => {
+                        // ACK 是接纳事实；临时问题保留在可重绘尾部，权威快照替换它之前不写入历史。
+                        let id = format!("submitted-input:{}", self.next_stream_output_id);
+                        self.next_stream_output_id = self.next_stream_output_id.saturating_add(1);
+                        self.upsert_entry(TimelineEntry {
+                            id,
+                            kind: TimelineKind::User,
+                            text: submitted.text().to_owned(),
+                            detail: None,
+                            status: Some(TimelineStatus::Running),
+                        });
+                    }
+                    Some(PendingSubmission::Attachment(submitted))
+                        if self.composer.text() == submitted =>
+                    {
+                        self.composer.clear()
+                    }
+                    _ => {}
                 }
             }
             UiEvent::RestoreDraft(draft) => {
-                if self.composer.is_empty() {
-                    self.composer
-                        .set_text(&sanitize_text(&draft, MAX_ENTRY_BYTES));
+                if let Some(PendingSubmission::Message {
+                    composer: submitted,
+                    ..
+                }) = self.pending_submission.take()
+                    && submitted.text() == draft
+                {
+                    self.composer.restore_submission(submitted);
+                } else if self.composer.is_empty() {
+                    self.composer.set_text(&draft);
                 }
-                self.pending_submission = None;
+            }
+            UiEvent::RestoreForkDraft => {
+                self.restore_fork_draft();
+            }
+            UiEvent::ClearForkDraft => self.active_fork_source = None,
+            UiEvent::ReplaceDraft(draft) => {
+                if self.pending_submission.is_none() && !self.composer.set_text(&draft) {
+                    self.snapshot.notice =
+                        Some("编辑后的草稿超过 32 KiB 容量，已保留原草稿。".into());
+                }
             }
             UiEvent::ReleaseDraft => self.pending_submission = None,
             UiEvent::ReleasePromptSubmission => self.prompt_responded = false,
@@ -561,32 +1042,109 @@ impl UiState {
                 title,
                 body,
             } => {
+                let scroll = match self.panel.as_ref() {
+                    Some(Panel::Details {
+                        entry_id: active_entry_id,
+                        scroll,
+                        ..
+                    }) if active_entry_id == &entry_id => *scroll,
+                    _ => DetailScroll::FromTop(0),
+                };
                 self.panel = Some(Panel::Details {
                     entry_id: sanitize_text(&entry_id, 512),
                     title: sanitize_text(&title, 256),
                     body: sanitize_text(&body, MAX_DETAIL_BYTES),
-                    scroll: DetailScroll::FromTop(0),
+                    scroll,
                     return_to_pending: false,
                 });
             }
+            UiEvent::UpdateDetailsIfOpen {
+                entry_id,
+                title,
+                body,
+            } => {
+                if let Some(Panel::Details {
+                    entry_id: active_entry_id,
+                    title: active_title,
+                    body: active_body,
+                    ..
+                }) = self.panel.as_mut()
+                    && active_entry_id == &entry_id
+                {
+                    *active_title = sanitize_text(&title, 256);
+                    *active_body = sanitize_text(&body, MAX_DETAIL_BYTES);
+                }
+            }
             UiEvent::SetNotice(notice) => {
+                if self.cancellation == CancellationState::Retry {
+                    self.cancellation = CancellationState::Idle;
+                }
                 self.snapshot.notice = notice.map(|value| sanitize_text(&value, 1024));
             }
-            UiEvent::Shutdown => self.closed = true,
+            UiEvent::Shutdown => {
+                self.finalize_all_streams();
+                self.closed = true;
+            }
         }
     }
 
-    /// 路由本地按键并返回意图；需要协议确认的动作等待 controller 更新状态。
+    /// 设置覆盖层仍允许 Ctrl+D 显式退出并先清密钥；F5 只读核实且不会解除未知提交锁或重放副作用。
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<UiAction> {
         if key.kind != KeyEventKind::Press || self.closed {
             return Vec::new();
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(self.panel, Some(Panel::ModelSettings))
+            && control
+            && key.code == KeyCode::Char('d')
+        {
+            self.close_model_settings(true);
+            self.closed = true;
+            return vec![UiAction::Quit];
+        }
+        if matches!(self.panel, Some(Panel::ModelSettings)) {
+            return self.model_settings_key(key);
+        }
+        if self.panel.is_none() {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            if control
+                && matches!(key.code, KeyCode::Char('c' | 'C') | KeyCode::Insert)
+                && let Some(actions) = self.transcript_key(key)
+            {
+                return actions;
+            }
+            if key.code == KeyCode::F(5) && self.older_page_failed {
+                return self.request_older_history();
+            }
+        }
+        if key.code == KeyCode::F(5) {
+            return vec![match &self.panel {
+                Some(Panel::Details { entry_id, .. }) if entry_id == "status" => {
+                    UiAction::Command(UiCommand::ShowStatus)
+                }
+                Some(Panel::Details { entry_id, .. })
+                    if entry_id.starts_with("diff:")
+                        || self.tool_detail_return_id.as_deref() == Some(entry_id) =>
+                {
+                    UiAction::OpenDetails {
+                        entry_id: entry_id.clone(),
+                    }
+                }
+                _ => UiAction::RefreshSnapshot,
+            }];
+        }
         if control && key.code == KeyCode::Char('d') && self.composer.is_empty() {
             self.closed = true;
             return vec![UiAction::Quit];
         }
         if control && key.code == KeyCode::Char('c') {
+            if self.snapshot.local_operation.is_some()
+                && self.cancellation != CancellationState::Pending
+            {
+                self.cancellation = CancellationState::Pending;
+                self.snapshot.notice = None;
+                return vec![UiAction::CancelLocalOperation];
+            }
             if let Some(Panel::ChoiceDetail {
                 kind, choice_id, ..
             }) = self.panel.clone()
@@ -596,7 +1154,7 @@ impl UiState {
             }
             if matches!(
                 self.panel,
-                Some(Panel::Choices { .. } | Panel::Help | Panel::Details { .. })
+                Some(Panel::Choices { .. } | Panel::Help { .. } | Panel::Details { .. })
             ) {
                 if matches!(
                     self.panel.as_ref(),
@@ -606,6 +1164,15 @@ impl UiState {
                     })
                 ) {
                     self.set_resume_picker_exit_notice();
+                }
+                if matches!(
+                    self.panel.as_ref(),
+                    Some(Panel::Choices {
+                        kind: ChoiceKind::ForkReplies,
+                        ..
+                    })
+                ) {
+                    self.restore_fork_draft();
                 }
                 self.panel = None;
                 return Vec::new();
@@ -627,6 +1194,7 @@ impl UiState {
                 scroll,
             }) => return self.choice_detail_key(key, kind, choice_id, scroll),
             Some(Panel::Pending) => return self.pending_panel_key(key),
+            Some(Panel::ModelSettings) => return self.model_settings_key(key),
             Some(Panel::Details {
                 entry_id,
                 title,
@@ -643,13 +1211,32 @@ impl UiState {
                     return_to_pending,
                 );
             }
-            Some(Panel::Help) => {
-                if key.code == KeyCode::Esc {
+            Some(Panel::Help { scroll }) => {
+                if key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('?')
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                {
                     self.panel = None;
+                    return Vec::new();
                 }
+                let next = match key.code {
+                    KeyCode::Up => scroll.up(1),
+                    KeyCode::Down => scroll.down(1),
+                    KeyCode::PageUp => scroll.up(10),
+                    KeyCode::PageDown => scroll.down(10),
+                    KeyCode::Home => DetailScroll::FromTop(0),
+                    KeyCode::End => DetailScroll::FromBottom(0),
+                    _ => return Vec::new(),
+                };
+                self.panel = Some(Panel::Help { scroll: next });
                 return Vec::new();
             }
             None => {}
+        }
+        if let Some(actions) = self.transcript_key(key) {
+            return actions;
         }
         if self.snapshot.pending_prompt.is_some() {
             if self.panel.is_none() {
@@ -661,13 +1248,41 @@ impl UiState {
             }
             return self.pending_panel_key(key);
         }
+        if key.modifiers.is_empty()
+            && self.panel.is_none()
+            && self.snapshot.local_operation.is_none()
+            && self.snapshot.turn_state == TurnState::Paused
+            && !self.suspended_control_pending
+        {
+            match key.code {
+                KeyCode::F(6) => {
+                    self.suspended_control_pending = true;
+                    let Some(thread_id) = self.snapshot.thread_id.clone() else {
+                        self.suspended_control_pending = false;
+                        return Vec::new();
+                    };
+                    return vec![UiAction::ResumeSuspendedTurn { thread_id }];
+                }
+                KeyCode::F(7) => {
+                    self.suspended_control_pending = true;
+                    let Some(thread_id) = self.snapshot.thread_id.clone() else {
+                        self.suspended_control_pending = false;
+                        return Vec::new();
+                    };
+                    return vec![UiAction::CancelSuspendedTurn { thread_id }];
+                }
+                _ => {}
+            }
+        }
         if key.code == KeyCode::Char('?')
             && self.composer.is_empty()
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            self.panel = Some(Panel::Help);
+            self.panel = Some(Panel::Help {
+                scroll: DetailScroll::FromTop(0),
+            });
             return Vec::new();
         }
         self.composer_key(key)
@@ -675,6 +1290,12 @@ impl UiState {
 
     /// 只在可见编辑态接纳粘贴，详情或选择器不能暗中改写被遮住的草稿。
     pub fn handle_paste(&mut self, text: &str) {
+        if matches!(self.panel, Some(Panel::ModelSettings)) {
+            if let Some(settings) = self.model_settings.as_mut() {
+                settings.handle_paste(text);
+            }
+            return;
+        }
         let editing = match self.panel.as_ref() {
             None | Some(Panel::Commands { .. }) => true,
             Some(Panel::Pending) => matches!(
@@ -687,8 +1308,9 @@ impl UiState {
             Some(
                 Panel::Choices { .. }
                 | Panel::ChoiceDetail { .. }
-                | Panel::Help
-                | Panel::Details { .. },
+                | Panel::Help { .. }
+                | Panel::Details { .. }
+                | Panel::ModelSettings,
             ) => false,
         };
         if !editing {
@@ -735,7 +1357,7 @@ impl UiState {
         }
     }
 
-    /// 命令输入与可见前缀候选同源，Tab 只补全、Enter 才执行，Esc 保留原草稿。
+    /// 命令输入与可见前缀候选同源；Plan 创建先留在编辑区补齐目标，避免空参数触发普通 Turn。
     fn command_panel_key(&mut self, key: KeyEvent, selected: usize) -> Vec<UiAction> {
         let candidates = matching_commands(self.composer.text());
         match key.code {
@@ -775,6 +1397,10 @@ impl UiState {
                     self.closed = true;
                     return vec![UiAction::Quit];
                 }
+                if command == UiCommand::CreatePlan {
+                    self.composer.set_text("/plan create ");
+                    return Vec::new();
+                }
                 self.prepare_command(command);
                 return vec![UiAction::Command(command)];
             }
@@ -797,7 +1423,7 @@ impl UiState {
         Vec::new()
     }
 
-    /// 工具与 Diff 详情只改变本地浏览位置；关闭时草稿、服务端状态和焦点目标不变。
+    /// 详情关闭保留草稿和焦点；Diff 额外释放后台读取，迟到结果不能重新打开面板。
     fn detail_panel_key(
         &mut self,
         key: KeyEvent,
@@ -813,6 +1439,23 @@ impl UiState {
             } else {
                 None
             };
+            if !return_to_pending && self.tool_detail_return_id.as_deref() == Some(&entry_id) {
+                self.rebuild_tool_choices();
+                if let Some(selected) = self
+                    .tool_choices
+                    .iter()
+                    .position(|choice| choice.id == entry_id)
+                {
+                    self.panel = Some(Panel::Choices {
+                        kind: ChoiceKind::ToolSteps,
+                        selected,
+                    });
+                }
+                self.tool_detail_return_id = None;
+            }
+            if entry_id.starts_with("diff:") {
+                return vec![UiAction::CloseDetails { entry_id }];
+            }
             return Vec::new();
         }
         let next = match key.code {
@@ -932,6 +1575,18 @@ impl UiState {
                 _ => {}
             }
         }
+        if kind == ChoiceKind::ForkReplies && key.code == KeyCode::PageDown {
+            if self.snapshot.fork_reply_next_cursor.is_some() {
+                return self
+                    .snapshot
+                    .thread_id
+                    .clone()
+                    .map_or_else(Vec::new, |thread_id| {
+                        vec![UiAction::LoadMoreForkReplies { thread_id }]
+                    });
+            }
+            return Vec::new();
+        }
         if kind == ChoiceKind::Threads {
             match key.code {
                 KeyCode::Backspace => {
@@ -976,6 +1631,9 @@ impl UiState {
                 }
                 if kind == ChoiceKind::Threads {
                     self.set_resume_picker_exit_notice();
+                }
+                if kind == ChoiceKind::ForkReplies {
+                    self.restore_fork_draft();
                 }
                 self.panel = if kind == ChoiceKind::Reasoning {
                     Some(Panel::Choices {
@@ -1120,9 +1778,9 @@ impl UiState {
             }
             Some(PendingPrompt::Clarification {
                 thread_id,
-                request_id,
-                expected_revision,
-                idempotency_key,
+                interaction_id,
+                expected_interaction_revision,
+                operation_key,
                 questions,
             }) => {
                 let Some(question) = questions.get(self.question_index).cloned() else {
@@ -1133,9 +1791,9 @@ impl UiState {
                     question,
                     ClarificationContext {
                         thread_id,
-                        request_id,
-                        expected_revision,
-                        idempotency_key,
+                        interaction_id,
+                        expected_interaction_revision,
+                        operation_key,
                         question_count: questions.len(),
                     },
                 );
@@ -1355,9 +2013,9 @@ impl UiState {
         answers.push(answer);
         vec![UiAction::RespondInteraction {
             thread_id: context.thread_id,
-            request_id: context.request_id,
-            expected_revision: context.expected_revision,
-            idempotency_key: context.idempotency_key,
+            interaction_id: context.interaction_id,
+            expected_interaction_revision: context.expected_interaction_revision,
+            operation_key: context.operation_key,
             answers,
         }]
     }
@@ -1399,7 +2057,7 @@ impl UiState {
         }
     }
 
-    /// 普通输入只清空草稿等待 controller 的成功 ACK，响应不确定时不允许盲目重复提交。
+    /// 发送立即腾出输入区；外部编辑只复制无结构引用的草稿，避免编辑器文本使引用身份失配。
     fn composer_key(&mut self, key: KeyEvent) -> Vec<UiAction> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1411,19 +2069,31 @@ impl UiState {
         }
         match key.code {
             KeyCode::Esc
+                if self.snapshot.local_operation.is_some()
+                    && self.cancellation != CancellationState::Pending =>
+            {
+                self.cancellation = CancellationState::Pending;
+                self.snapshot.notice = None;
+                actions.push(UiAction::CancelLocalOperation);
+            }
+            KeyCode::Esc
                 if self.snapshot.turn_state == TurnState::Working
                     && self.composer.is_empty()
-                    && !self.cancel_pending =>
+                    && self.cancellation != CancellationState::Pending =>
             {
-                self.cancel_pending = true;
+                self.cancellation = CancellationState::Pending;
+                self.snapshot.notice = None;
                 actions.push(UiAction::CancelTurn);
             }
             KeyCode::Char('c') if control => {
                 if !self.composer.is_empty() {
                     self.composer.clear();
                     self.scheduled_file_search = None;
-                } else if self.snapshot.turn_state == TurnState::Working && !self.cancel_pending {
-                    self.cancel_pending = true;
+                } else if self.snapshot.turn_state == TurnState::Working
+                    && self.cancellation != CancellationState::Pending
+                {
+                    self.cancellation = CancellationState::Pending;
+                    self.snapshot.notice = None;
                     actions.push(UiAction::CancelTurn);
                 } else if self.snapshot.turn_state != TurnState::Working {
                     let now = Instant::now();
@@ -1450,6 +2120,16 @@ impl UiState {
                     cursor: None,
                 });
             }
+            KeyCode::Char('g') if control => {
+                if self.composer.references().is_empty() {
+                    actions.push(UiAction::EditDraft {
+                        draft: self.composer.text().to_owned(),
+                    });
+                } else {
+                    self.snapshot.notice =
+                        Some("草稿含有文件或技能引用；请先移除引用，再按 Ctrl+G 编辑".into());
+                }
+            }
             KeyCode::Char('z') if control => self.composer.undo(),
             KeyCode::Char('y') if control => self.composer.redo(),
             KeyCode::Char('p') if control => {
@@ -1459,13 +2139,14 @@ impl UiState {
                 });
             }
             KeyCode::Up if control && self.snapshot.has_older_history => {
-                actions.push(UiAction::LoadOlder);
+                actions.extend(self.request_older_history());
             }
             KeyCode::Char('o') if control => {
-                if let Some(entry) = self.snapshot.timeline.last() {
-                    actions.push(UiAction::OpenDetails {
-                        entry_id: entry.id.clone(),
-                    });
+                self.rebuild_tool_choices();
+                if self.tool_choices.is_empty() {
+                    self.snapshot.notice = Some("当前会话尚无工具步骤".to_owned());
+                } else {
+                    self.open_picker(ChoiceKind::ToolSteps);
                 }
             }
             KeyCode::Enter if shift || control => {
@@ -1482,7 +2163,9 @@ impl UiState {
                     self.schedule_file_search(Instant::now());
                     return actions;
                 }
-                let mode = if self.snapshot.turn_state == TurnState::Working {
+                let mode = if self.snapshot.turn_state == TurnState::Working
+                    && self.snapshot.local_operation.is_none()
+                {
                     UiSubmitMode::Steer
                 } else {
                     UiSubmitMode::Immediate
@@ -1524,7 +2207,9 @@ impl UiState {
                         query_id,
                     });
                 } else {
-                    let mode = if self.snapshot.turn_state == TurnState::Working {
+                    let mode = if self.snapshot.turn_state == TurnState::Working
+                        && self.snapshot.local_operation.is_none()
+                    {
                         UiSubmitMode::Queue
                     } else {
                         UiSubmitMode::Immediate
@@ -1599,9 +2284,12 @@ impl UiState {
         actions
     }
 
-    /// 空草稿只在 controller 确认失败后允许继续；未知服务端命令仍作为普通提示提交。
+    /// 普通消息立即搬出编辑区并显示待发送问题；完整缓冲用于拒绝恢复，未知回执继续锁住重复提交。
     fn submit_or_continue(&mut self, mode: UiSubmitMode) -> Option<UiAction> {
-        if self.pending_submission.is_some() || self.snapshot.pending_prompt.is_some() {
+        if self.pending_submission.is_some()
+            || self.snapshot.pending_prompt.is_some()
+            || self.suspended_control_pending
+        {
             return None;
         }
         let text = self.composer.text().to_owned();
@@ -1617,9 +2305,15 @@ impl UiState {
         }
         if let Some(action) = parse_command(text.trim()) {
             if matches!(action, UiAction::AttachPaths { .. }) {
-                self.pending_submission = Some(text);
+                self.pending_submission = Some(PendingSubmission::Attachment(text));
                 self.scheduled_file_search = None;
                 return Some(action);
+            }
+            if action == UiAction::Command(UiCommand::ForkThread) {
+                let source_thread_id = self.snapshot.thread_id.clone().unwrap_or_default();
+                self.fork_source_composers
+                    .insert(source_thread_id.clone(), self.composer.clone());
+                self.active_fork_source = Some(source_thread_id);
             }
             self.composer.clear();
             self.scheduled_file_search = None;
@@ -1631,30 +2325,40 @@ impl UiState {
             }
             return Some(action);
         }
-        self.pending_submission = Some(text.clone());
+        let submitted = std::mem::take(&mut self.composer);
+        let references = submitted.references().to_vec();
+        self.retain_message_submission(submitted);
         self.scheduled_file_search = None;
+        self.snapshot.notice = None;
         Some(UiAction::Submit {
             text,
-            references: self.composer.references().to_vec(),
+            references,
             mode,
         })
     }
 
-    /// 需要先查询候选的命令会清空旧列表，避免跨 workspace 选中陈旧会话或模型。
+    /// @author kongweiguang
+    /// 需要先查询候选的命令会清空旧列表；fork 空缓存先标为加载，响应后才显示真正空历史。
     fn prepare_command(&mut self, command: UiCommand) {
         match command {
+            UiCommand::ForkThread => self.open_picker(ChoiceKind::ForkReplies),
             UiCommand::ResumeThread => self.open_picker(ChoiceKind::Threads),
             UiCommand::SelectModel => self.open_picker(ChoiceKind::Models),
             UiCommand::SelectPermissions => self.open_picker(ChoiceKind::Permissions),
             UiCommand::Attach => {
                 self.composer.set_text("/attach ");
             }
-            UiCommand::Help => self.panel = Some(Panel::Help),
+            UiCommand::Help => {
+                self.panel = Some(Panel::Help {
+                    scroll: DetailScroll::FromTop(0),
+                })
+            }
             _ => {}
         }
     }
 
-    /// 模型与权限先展示最近权威快照、再由 controller 更新；远端候选必须重新查询才清空。
+    /// @author kongweiguang
+    /// 工具列表只读已加载投影；Fork 清除陈旧候选并显示加载态直到 owner 返回本页。
     fn open_picker(&mut self, kind: ChoiceKind) {
         self.snapshot.notice = None;
         let selected = if kind == ChoiceKind::Models {
@@ -1668,6 +2372,10 @@ impl UiState {
                         .position(|choice| choice.id == id)
                 })
                 .unwrap_or(0)
+        } else if kind == ChoiceKind::ToolSteps {
+            self.tool_choices.len().saturating_sub(1)
+        } else if kind == ChoiceKind::ForkReplies {
+            self.snapshot.fork_reply_choices.len().saturating_sub(1)
         } else {
             0
         };
@@ -1685,14 +2393,21 @@ impl UiState {
                 self.snapshot.input_history_choices.clear();
                 self.snapshot.input_history_next_cursor = None;
             }
+            ChoiceKind::ForkReplies => {
+                self.snapshot.fork_reply_choices.clear();
+                self.snapshot.fork_reply_next_cursor = None;
+                self.snapshot.fork_reply_loading = true;
+                self.snapshot.fork_reply_load_failed = false;
+            }
             ChoiceKind::Files => self.snapshot.file_choices.clear(),
             ChoiceKind::Skills => self.snapshot.skill_choices.clear(),
-            ChoiceKind::Attachments => {}
+            ChoiceKind::Attachments | ChoiceKind::ToolSteps => {}
         }
         self.panel = Some(Panel::Choices { kind, selected });
     }
 
     /// 选择后回传 owner 给出的 ID；附件操作与文件引用选择保持不同语义。
+    /// 工具预览先同步占住只读面板，使用失败后仍成立的标签以保留返回与重试边界。
     fn activate_choice(
         &mut self,
         kind: ChoiceKind,
@@ -1702,14 +2417,20 @@ impl UiState {
         let Some(choice) = self.choices(kind).get(selected).cloned() else {
             return Vec::new();
         };
-        if kind != ChoiceKind::Threads || self.snapshot.thread_id.as_deref() == Some(&choice.id) {
+        if (kind != ChoiceKind::Threads || self.snapshot.thread_id.as_deref() == Some(&choice.id))
+            && (kind != ChoiceKind::Models || choice.id != MODEL_SETTINGS_CHOICE_ID)
+        {
             self.panel = None;
         }
         let action = match kind {
+            ChoiceKind::Models if choice.id == MODEL_SETTINGS_CHOICE_ID => {
+                UiAction::OpenModelSettings
+            }
             ChoiceKind::Models => UiAction::SelectModel { id: choice.id },
             ChoiceKind::Reasoning => UiAction::SelectReasoning { id: choice.id },
             ChoiceKind::Permissions => UiAction::SelectPermission { id: choice.id },
             ChoiceKind::Threads => UiAction::SelectThread { id: choice.id },
+            ChoiceKind::ForkReplies => UiAction::ForkReply { item_id: choice.id },
             ChoiceKind::InputHistory => {
                 if let Some((_, text, truncated)) = self
                     .input_history_texts
@@ -1732,6 +2453,28 @@ impl UiState {
             ChoiceKind::Skills => UiAction::SelectSkillReference { id: choice.id },
             ChoiceKind::Attachments if preview => UiAction::PreviewAttachment { id: choice.id },
             ChoiceKind::Attachments => UiAction::PreviewAttachment { id: choice.id },
+            ChoiceKind::ToolSteps => {
+                self.tool_detail_return_id = Some(choice.id.clone());
+                // 立即占住只读面板；读取期间 Esc 仍返回列表，迟到回读只能更新尚未关闭的同一详情。
+                // 预览在失败时会保留，因此正文不永久声称读取仍在进行。
+                let preview = self
+                    .snapshot
+                    .timeline
+                    .iter()
+                    .find(|entry| entry.id == choice.id)
+                    .map(|entry| entry.detail.as_deref().unwrap_or(&entry.text))
+                    .unwrap_or_default();
+                self.panel = Some(Panel::Details {
+                    entry_id: choice.id.clone(),
+                    title: choice.label,
+                    body: format!("以下为安全预览；读取成功后更新工具详情。\n\n{preview}"),
+                    scroll: DetailScroll::FromTop(0),
+                    return_to_pending: false,
+                });
+                UiAction::OpenDetails {
+                    entry_id: choice.id,
+                }
+            }
         };
         vec![action]
     }
@@ -1831,15 +2574,121 @@ impl UiState {
             ChoiceKind::Permissions => &self.snapshot.permission_choices,
             ChoiceKind::Threads => &self.snapshot.thread_choices,
             ChoiceKind::InputHistory => &self.snapshot.input_history_choices,
+            ChoiceKind::ForkReplies => &self.snapshot.fork_reply_choices,
             ChoiceKind::Files => &self.snapshot.file_choices,
             ChoiceKind::Skills => &self.snapshot.skill_choices,
             ChoiceKind::Attachments => &self.snapshot.attachments,
+            ChoiceKind::ToolSteps => &self.tool_choices,
+        }
+    }
+
+    /// 工具选择器只缓存已加载的安全身份；刷新按 ID 保留焦点，旧步骤移出窗口时不误选相邻操作。
+    fn rebuild_tool_choices(&mut self) {
+        let selected_id = self.selected_choice_id(ChoiceKind::ToolSteps);
+        self.tool_choices = self
+            .snapshot
+            .timeline
+            .iter()
+            .filter_map(|entry| {
+                let TimelineKind::Tool { action, target, .. } = &entry.kind else {
+                    return None;
+                };
+                Some(UiChoice {
+                    id: entry.id.clone(),
+                    label: format!("{action} {target}"),
+                    detail: None,
+                })
+            })
+            .collect();
+        if let Some(id) = selected_id {
+            if let Some(selected) = self.tool_choices.iter().position(|choice| choice.id == id) {
+                self.set_choice_selection(ChoiceKind::ToolSteps, selected);
+            } else {
+                self.panel = None;
+                self.snapshot.notice = Some("工具步骤已更新，请重新打开列表选择".to_owned());
+            }
         }
     }
 
     /// renderer 只读取当前 panel，确认动作仍由 reducer 产生。
     pub(super) fn panel(&self) -> Option<&Panel> {
         self.panel.as_ref()
+    }
+
+    /// 打开 controller 已发出读取的共享设置面板，只遮罩 panel 而完整保留 Composer 与引用状态。
+    fn open_model_settings(&mut self, operation_id: String, standalone: bool) {
+        if self.model_settings.is_some() {
+            return;
+        }
+        self.settings_return_panel = self.panel.take();
+        self.model_settings = Some(ModelSettingsState::open(operation_id, standalone));
+        self.settings_start_pending = false;
+        self.panel = Some(Panel::ModelSettings);
+    }
+
+    /// 面板的副作用先还原为 UiAction；请求与信任变更仍由 controller 执行。
+    fn apply_model_settings_effect(&mut self, effect: ModelSettingsEffect) -> Vec<UiAction> {
+        match effect {
+            ModelSettingsEffect::None => Vec::new(),
+            ModelSettingsEffect::Request(request) => vec![UiAction::ModelSettings(request)],
+            ModelSettingsEffect::Close { start_conversation } => {
+                if start_conversation {
+                    if let Some(settings) = self.model_settings.as_mut() {
+                        settings.starting_conversation();
+                    }
+                    self.settings_start_pending = true;
+                } else {
+                    self.close_model_settings(true);
+                }
+                vec![UiAction::CloseModelSettings { start_conversation }]
+            }
+            ModelSettingsEffect::Trust { trusted } => {
+                if !trusted {
+                    self.settings_start_pending = false;
+                    let returned_to_settings = self
+                        .model_settings
+                        .as_mut()
+                        .is_some_and(ModelSettingsState::trust_denied);
+                    if !returned_to_settings {
+                        self.close_model_settings(true);
+                    }
+                }
+                vec![UiAction::ConfirmModelSettingsWorkspaceTrust { trusted }]
+            }
+        }
+    }
+
+    /// 关闭覆盖层时先擦除凭据，再选择恢复原面板或将焦点交给新会话。
+    fn close_model_settings(&mut self, restore_return_panel: bool) {
+        if let Some(settings) = self.model_settings.as_mut() {
+            settings.clear_secrets();
+        }
+        self.model_settings = None;
+        self.panel = if restore_return_panel {
+            self.settings_return_panel.take()
+        } else {
+            None
+        };
+        if !restore_return_panel {
+            self.settings_return_panel = None;
+        }
+    }
+
+    /// Renderer 仅获得无凭据正文的展示投影。
+    pub(super) fn model_settings_view(&self) -> Option<super::model_settings::ModelSettingsView> {
+        self.model_settings
+            .as_ref()
+            .map(ModelSettingsState::view_for_render)
+    }
+
+    /// 面板拥有全部按键，F5 和 Esc 不得被通用快照刷新或 Composer 路径截获。
+    fn model_settings_key(&mut self, key: KeyEvent) -> Vec<UiAction> {
+        let has_thread = self.snapshot.thread_id.is_some();
+        let effect = self
+            .model_settings
+            .as_mut()
+            .map(|settings| settings.handle_key(key, has_thread));
+        effect.map_or_else(Vec::new, |effect| self.apply_model_settings_effect(effect))
     }
 
     /// 线程搜索词只用于选择器展示；权威结果仍必须由 Java 返回。
@@ -1867,14 +2716,80 @@ impl UiState {
         })
     }
 
-    /// renderer 查看有待 ACK 的原始草稿，避免将未知提交结果伪装成完成。
+    /// 提交锁只表示回执尚未核实，不能把等待内容继续显示成编辑草稿。
     pub(crate) fn has_pending_submission(&self) -> bool {
         self.pending_submission.is_some()
+    }
+
+    /// 恢复或取消回执待核实期间隐藏 F6/F7 重试入口，并避免重复提交草稿。
+    pub(crate) fn suspended_control_pending(&self) -> bool {
+        self.suspended_control_pending
+    }
+
+    /// Esc 只有空输入且后台仍工作时才可重试取消，底栏提示必须与按键入口一致。
+    pub(crate) fn can_retry_cancellation(&self) -> bool {
+        self.cancellation == CancellationState::Retry
+            && self.snapshot.turn_state == TurnState::Working
+            && self.composer.is_empty()
+    }
+
+    /// 待回执消息只在可重绘区域呈现；未接纳的输入不能提前进入不可撤回的原生历史。
+    pub(crate) fn pending_message_text(&self) -> Option<&str> {
+        match self.pending_submission.as_ref() {
+            Some(PendingSubmission::Message { composer, .. }) => Some(composer.text()),
+            _ => None,
+        }
+    }
+
+    /// 只对账发送后新增且正文完全一致的问题；原回执仍待核实时仅隐藏副本，不释放发送锁。
+    pub(crate) fn visible_pending_message_text(&self) -> Option<&str> {
+        let Some(PendingSubmission::Message {
+            composer,
+            previous_user_id,
+        }) = &self.pending_submission
+        else {
+            return None;
+        };
+        let latest_user = self
+            .snapshot
+            .timeline
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TimelineKind::User);
+        if latest_user.is_some_and(|entry| {
+            Some(entry.id.as_str()) != previous_user_id.as_deref() && entry.text == composer.text()
+        }) {
+            return None;
+        }
+        Some(composer.text())
+    }
+
+    /// 发送前记录一个既有问题身份，复用同一待提交状态，不通过相似正文猜测或另建历史账本。
+    fn retain_message_submission(&mut self, composer: Composer) {
+        self.transcript.get_mut().follow_latest();
+        let previous_user_id = self
+            .snapshot
+            .timeline
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TimelineKind::User)
+            .map(|entry| entry.id.clone());
+        self.pending_submission = Some(PendingSubmission::Message {
+            composer,
+            previous_user_id,
+        });
     }
 
     /// UI 仅展示审批/澄清已提交而未获权威基线确认，不将等待态解释成成功。
     pub(crate) fn prompt_submission_pending(&self) -> bool {
         self.prompt_responded
+    }
+
+    /// 回答已锁定且出现操作反馈时允许只读核实，普通的提交等待仍显示进行中。
+    pub(crate) fn prompt_response_needs_refresh(&self) -> bool {
+        self.prompt_responded
+            && self.snapshot.pending_prompt.is_some()
+            && self.snapshot.notice.is_some()
     }
 
     /// 输入期间保存最后一次文件查询，并在停顿后由 bridge 投递给 controller。
@@ -1929,9 +2844,14 @@ impl UiState {
         })
     }
 
-    /// 新增或更新一行按 ID 合并，旧会话历史只保留有限窗口供近期回看。
+    /// 切换公开流先提交前段尾部，再接续新类别；各自保留摘要，不把过程拖到最终回答后。
     fn upsert_entry(&mut self, entry: TimelineEntry) {
         let entry = sanitize_entry(entry);
+        let live_entry_id = is_live_stream_entry(&entry).then(|| entry.id.clone());
+        if is_live_stream_entry(&entry) && !self.stream_progress.contains_key(&entry.id) {
+            self.flush_other_stream_tails(&entry.id);
+            self.flush_stable_prefix();
+        }
         if let Some(existing) = self
             .snapshot
             .timeline
@@ -1941,68 +2861,374 @@ impl UiState {
             *existing = entry;
         } else {
             self.snapshot.timeline.push(entry.clone());
-            if self.snapshot.timeline.len() > MAX_TIMELINE_ENTRIES {
-                let overflow = self.snapshot.timeline.len() - MAX_TIMELINE_ENTRIES;
-                self.snapshot.timeline.drain(..overflow);
-            }
+        }
+        if let Some(entry_id) = live_entry_id {
+            self.begin_stream(&entry_id);
+            self.flush_stream_pending(&entry_id, false);
         }
         self.flush_stable_prefix();
     }
 
-    /// 首次恢复只写有界的较早稳定段，较新的尾部留在 viewport 并保持时间顺序。
-    fn seed_initial_scrollback(&mut self) {
-        let mut selected = Vec::new();
-        let mut bytes = 0usize;
-        let stable_count = self
+    /// 公开增量按来源顺序接续；仅 live 身份归档流片段，普通条目仍保留原有安全追加语义。
+    fn append_stream_delta(&mut self, entry_id: &str, delta: &str) {
+        let Some(index) = self
             .snapshot
             .timeline
             .iter()
-            .take_while(|entry| is_stable_entry(entry))
-            .count();
-        let visible_line_budget = self.terminal_height.saturating_sub(7).max(3);
-        let content_width = self.terminal_width.saturating_sub(3).max(1);
-        let mut visible_lines = 0usize;
-        let mut visible_count = 0usize;
-        for entry in self.snapshot.timeline.iter().take(stable_count).rev() {
-            let entry_lines = entry
-                .text
-                .lines()
-                .map(|line| UnicodeWidthStr::width(line).div_ceil(content_width).max(1))
-                .sum::<usize>()
-                .max(1);
-            if visible_count > 0 && visible_lines.saturating_add(entry_lines) > visible_line_budget
-            {
-                break;
+            .position(|entry| entry.id == entry_id)
+        else {
+            return;
+        };
+        let live = is_live_stream_entry(&self.snapshot.timeline[index]);
+        if live {
+            self.flush_other_stream_tails(entry_id);
+            if !self.stream_progress.contains_key(entry_id) {
+                self.flush_stable_prefix();
+                self.begin_stream(entry_id);
             }
-            visible_count += 1;
-            visible_lines = visible_lines.saturating_add(entry_lines);
         }
-        let older_count = stable_count.saturating_sub(visible_count);
-        for entry in self.snapshot.timeline.iter().take(older_count) {
-            if self.is_committed(&entry.id) {
+        let delta = sanitize_source(delta, usize::MAX, true);
+        self.snapshot.timeline[index].text.push_str(&delta);
+        if live {
+            self.flush_stream_pending(entry_id, false);
+        }
+    }
+
+    /// 两类公开流共用 Markdown 与摘要账本；类别随稳定身份冻结，避免同文摘要吞掉回答。
+    fn begin_stream(&mut self, entry_id: &str) {
+        let Some(kind) = self
+            .snapshot
+            .timeline
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .and_then(stream_kind)
+        else {
+            return;
+        };
+        let turn_id = live_turn_id(entry_id).unwrap_or_default();
+        self.stream_progress
+            .entry(entry_id.to_owned())
+            .or_insert_with(|| StreamProgress {
+                source_key: format!("{entry_id}:{}", self.next_stream_output_id),
+                turn_id,
+                kind,
+                committed_bytes: 0,
+                committed_hash: Sha256::new(),
+                first_fragment: true,
+                layout: MarkdownStream::default(),
+            });
+    }
+
+    /// 原生历史不可回插；切换类别先排空已有尾部，但保留其累计摘要供后续 delta 与终态对账。
+    fn flush_other_stream_tails(&mut self, entry_id: &str) {
+        for id in self.ordered_stream_ids() {
+            if id != entry_id {
+                self.flush_stream_pending(&id, true);
+            }
+        }
+    }
+
+    /// 多个公开流按可见时间线收口，避免 HashMap 的随机遍历把思考放到最终回答后。
+    fn ordered_stream_ids(&self) -> Vec<String> {
+        let mut ids = self.stream_progress.keys().cloned().collect::<Vec<_>>();
+        ids.sort_by_key(|id| {
+            (
+                self.snapshot
+                    .timeline
+                    .iter()
+                    .position(|entry| entry.id == *id)
+                    .unwrap_or(usize::MAX),
+                id.clone(),
+            )
+        });
+        ids
+    }
+
+    /// 同一帧只归档已确定的区块，源字节摘要与未闭合尾部各自保留，避免分片改变正文语义。
+    fn flush_stream_pending(&mut self, entry_id: &str, flush_all: bool) {
+        let Some(mut progress) = self.stream_progress.remove(entry_id) else {
+            return;
+        };
+        let Some(entry_index) = self
+            .snapshot
+            .timeline
+            .iter()
+            .position(|entry| entry.id == entry_id)
+        else {
+            self.stream_progress.insert(entry_id.to_owned(), progress);
+            return;
+        };
+        let tail = std::mem::take(&mut self.snapshot.timeline[entry_index].text);
+        let width = self.terminal_width.saturating_sub(2).max(1);
+        let (consumed, pieces) = progress.layout.consume(&tail, width, flush_all);
+        let source_start = progress.committed_bytes;
+        progress.committed_hash.update(&tail.as_bytes()[..consumed]);
+        progress.committed_bytes = progress.committed_bytes.saturating_add(consumed);
+        self.snapshot.timeline[entry_index].text = tail[consumed..].to_owned();
+        self.queue_stream_pieces(&mut progress, pieces, &tail[..consumed], source_start);
+        self.stream_progress.insert(entry_id.to_owned(), progress);
+    }
+
+    /// 结束一个流段时排空末行并记录摘要，供后续权威快照确认持久消息身份。
+    fn finalize_stream_with_tail(
+        &mut self,
+        entry_id: &str,
+        mut progress: StreamProgress,
+        tail: String,
+    ) -> StreamReceipt {
+        let width = self.terminal_width.saturating_sub(2).max(1);
+        let (consumed, pieces) = progress.layout.finish(&tail, width);
+        let source_start = progress.committed_bytes;
+        progress.committed_hash.update(&tail.as_bytes()[..consumed]);
+        progress.committed_bytes = progress.committed_bytes.saturating_add(consumed);
+        self.queue_stream_pieces(&mut progress, pieces, &tail[..consumed], source_start);
+        let receipt = StreamReceipt {
+            turn_id: progress.turn_id,
+            kind: progress.kind,
+            byte_len: progress.committed_bytes,
+            digest: progress.committed_hash.finalize().into(),
+        };
+        self.remember_stream_receipt(receipt.clone());
+        self.mark_committed(entry_id);
+        self.snapshot.timeline.retain(|entry| entry.id != entry_id);
+        receipt
+    }
+
+    /// 已确定片段移入同一对话文档；原始流偏移贯穿开放尾部与结算片段，缩放不会改变阅读点。
+    fn queue_stream_pieces(
+        &mut self,
+        progress: &mut StreamProgress,
+        pieces: Vec<MarkdownStreamPiece>,
+        source: &str,
+        source_start: usize,
+    ) {
+        self.transcript.get_mut().register_source(
+            progress.source_key.clone(),
+            source_start,
+            source.to_owned(),
+        );
+        let mut source_cursor = 0;
+        for piece in pieces {
+            let first = progress.first_fragment;
+            if piece.presentation != StreamPresentation::Spacer {
+                progress.first_fragment = false;
+            }
+            let id = format!("stream-output:{}", self.next_stream_output_id);
+            self.next_stream_output_id = self.next_stream_output_id.saturating_add(1);
+            let offset = if piece.text.is_empty() {
+                source_cursor
+            } else {
+                source[source_cursor..]
+                    .find(&piece.text)
+                    .map_or(source_cursor, |index| source_cursor + index)
+            };
+            source_cursor = offset.saturating_add(piece.text.len()).min(source.len());
+            while !source.is_char_boundary(source_cursor) {
+                source_cursor = source_cursor.saturating_sub(1);
+            }
+            if self.mark_committed(&id) {
+                self.transcript.get_mut().append(
+                    TimelineEntry {
+                        id,
+                        kind: TimelineKind::AssistantFragment {
+                            first,
+                            presentation: piece.presentation,
+                            reasoning: progress.kind == StreamKind::Reasoning,
+                        },
+                        text: piece.text,
+                        detail: None,
+                        status: Some(TimelineStatus::Complete),
+                    },
+                    progress.source_key.clone(),
+                    source_start.saturating_add(offset),
+                );
+            }
+        }
+    }
+
+    /// 摘要与当前 Thread 身份一起保留，长任务不能因显示缓存预算丢失去重证据。
+    fn remember_stream_receipt(&mut self, receipt: StreamReceipt) {
+        self.stream_receipts.push_back(receipt);
+    }
+
+    /// 重试或进入审批时按展示顺序结束该 Turn 的公开尾部，正文与摘要都只收口一次。
+    fn finalize_turn_streams(&mut self, turn_id: &str) {
+        let ids = self
+            .ordered_stream_ids()
+            .into_iter()
+            .filter(|id| {
+                self.stream_progress
+                    .get(id)
+                    .is_some_and(|progress| progress.turn_id == turn_id)
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.finalize_stream(&id);
+        }
+    }
+
+    /// 终态、切换或退出按原顺序排空公开尾部，不能因摘要与正文并存而随机交换位置。
+    fn finalize_all_streams(&mut self) {
+        let ids = self.ordered_stream_ids();
+        for id in ids {
+            self.finalize_stream(&id);
+        }
+    }
+
+    /// 消费尚未归档到 transcript 的尾部并记录摘要，终态快照无需重复展示这段正文。
+    fn finalize_stream(&mut self, entry_id: &str) {
+        let Some(progress) = self.stream_progress.remove(entry_id) else {
+            return;
+        };
+        let tail = self
+            .snapshot
+            .timeline
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .map_or_else(String::new, |entry| entry.text.clone());
+        self.finalize_stream_with_tail(entry_id, progress, tail);
+    }
+
+    /// 终态释放 liveStream 后按原顺序核对同类别正文，补齐尚未通知的尾部并保留后续去重凭据。
+    fn reconcile_snapshot_streams(&mut self, snapshot: &mut UiSnapshot) {
+        let live = snapshot
+            .timeline
+            .iter()
+            .filter(|entry| is_live_stream_entry(entry))
+            .map(|entry| (entry.id.clone(), (entry.text.clone(), entry.status)))
+            .collect::<HashMap<_, _>>();
+        let existing = self.ordered_stream_ids();
+        for id in existing {
+            let Some(progress) = self.stream_progress.remove(&id) else {
+                continue;
+            };
+            let Some((full_text, status)) = live.get(&id) else {
+                let old_tail = self
+                    .snapshot
+                    .timeline
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map_or_else(String::new, |entry| entry.text.clone());
+                let tail = self
+                    .match_persisted_stream_tail(snapshot, &progress, &old_tail)
+                    .unwrap_or(old_tail);
+                self.finalize_stream_with_tail(&id, progress, tail);
+                continue;
+            };
+            // 已归档摘要只核对稳定前缀；未归档尾部也必须连续，落后快照不能擦除已显示字节。
+            let old_tail = self
+                .snapshot
+                .timeline
+                .iter()
+                .find(|entry| entry.id == id)
+                .map_or_else(String::new, |entry| entry.text.clone());
+            let matching_tail = matching_stream_tail(&progress, full_text).and_then(|tail| {
+                if tail.starts_with(&old_tail) {
+                    Some(tail)
+                } else if *status == Some(TimelineStatus::Running) && old_tail.starts_with(&tail) {
+                    Some(old_tail.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(tail) = matching_tail {
+                if *status == Some(TimelineStatus::Running) {
+                    if let Some(entry) = snapshot.timeline.iter_mut().find(|entry| entry.id == id) {
+                        entry.text = tail;
+                    }
+                    self.stream_progress.insert(id, progress);
+                } else {
+                    self.finalize_stream_with_tail(&id, progress, tail);
+                    if let Some(entry) = snapshot.timeline.iter_mut().find(|entry| entry.id == id) {
+                        entry.text.clear();
+                    }
+                }
+            } else {
+                self.finalize_stream_with_tail(&id, progress, old_tail);
+                self.forget_committed(&id);
+            }
+        }
+    }
+
+    /// 只接续同 Turn、同类别且前缀摘要匹配的唯一持久消息；正文与思考同文也不能相互替代。
+    fn match_persisted_stream_tail(
+        &self,
+        snapshot: &UiSnapshot,
+        progress: &StreamProgress,
+        old_tail: &str,
+    ) -> Option<String> {
+        if progress.committed_bytes == 0 && old_tail.is_empty() {
+            return None;
+        }
+        let mut matches = snapshot
+            .timeline
+            .iter()
+            .filter(|entry| {
+                !is_live_stream_entry_by_id(&entry.id)
+                    && !self.is_committed(&entry.id)
+                    && stream_kind(entry) == Some(progress.kind)
+                    && is_stable_entry(entry)
+                    && snapshot.turn_id_by_entry_id.get(&entry.id) == Some(&progress.turn_id)
+            })
+            .filter_map(|entry| matching_stream_tail(progress, &entry.text))
+            .filter(|tail| tail.starts_with(old_tail));
+        let tail = matches.next()?;
+        matches.next().is_none().then_some(tail)
+    }
+
+    /// 按 Turn、类别和摘要匹配持久条目；公开思考实时输出后不会在最终回答后再补一份。
+    fn suppress_streamed_entries(&mut self, snapshot: &mut UiSnapshot) {
+        for entry in &snapshot.timeline {
+            let Some(kind) = stream_kind(entry) else {
+                continue;
+            };
+            if !is_stable_entry(entry) {
                 continue;
             }
-            if !is_stable_entry(entry) {
-                break;
-            }
-            let detail_bytes = entry
-                .detail
-                .as_ref()
-                .map_or(0, |detail| detail.len().min(1536));
-            let size = entry.text.len().saturating_add(detail_bytes);
-            if selected.len() >= MAX_SCROLLBACK_ENTRIES
-                || bytes.saturating_add(size) > MAX_INITIAL_SCROLLBACK_BYTES
-            {
-                break;
-            }
-            bytes = bytes.saturating_add(size);
-            selected.push(entry.clone());
-        }
-        for entry in selected {
-            if self.mark_committed(&entry.id) {
-                self.pending_scrollback.push_back(entry);
+            let Some(turn_id) = snapshot.turn_id_by_entry_id.get(&entry.id) else {
+                continue;
+            };
+            let digest: [u8; 32] = Sha256::digest(entry.text.as_bytes()).into();
+            let receipt_index = self.stream_receipts.iter().position(|receipt| {
+                receipt.turn_id == *turn_id
+                    && receipt.kind == kind
+                    && receipt.byte_len == entry.text.len()
+                    && receipt.digest == digest
+            });
+            if let Some(index) = receipt_index {
+                self.stream_receipts.remove(index);
+                self.mark_committed(&entry.id);
             }
         }
+    }
+
+    /// 仅首次发现流时提交前段尾部；已知流的快照只是对账，不能把旧摘要重放当成类别切换。
+    fn sync_snapshot_streams(&mut self) {
+        let streams = self
+            .snapshot
+            .timeline
+            .iter()
+            .filter(|entry| is_live_stream_entry(entry))
+            .map(|entry| (entry.id.clone(), entry.status))
+            .collect::<Vec<_>>();
+        for (id, status) in streams {
+            if self.is_committed(&id) {
+                continue;
+            }
+            if !self.stream_progress.contains_key(&id) {
+                self.begin_stream(&id);
+                self.flush_other_stream_tails(&id);
+            }
+            self.flush_stream_pending(&id, status != Some(TimelineStatus::Running));
+            if status != Some(TimelineStatus::Running) {
+                self.finalize_stream(&id);
+            }
+        }
+    }
+
+    /// 检查权威基线是否包含活动助手正文，以便初始化时先写入其前序历史。
+    fn has_live_stream_entries(&self) -> bool {
+        self.snapshot.timeline.iter().any(is_live_stream_entry)
     }
 
     /// 只提交稳定前缀，避免后到的工具终态跑到活动助手正文之前。
@@ -2017,24 +3243,23 @@ impl UiState {
             .collect::<Vec<_>>();
         for entry in entries {
             if self.mark_committed(&entry.id) {
-                self.pending_scrollback.push_back(entry);
+                let source_key = entry.id.clone();
+                self.transcript.get_mut().append(entry, source_key, 0);
+                self.clear_committed_assistant_text();
             }
         }
     }
 
-    /// 有界记住近期已提交 ID，重复通知和宽度重绘不会打印相同段落。
+    /// 身份账本与当前会话正文一起存活，避免浏览长历史时淘汰 ID 导致重连重复。
     fn mark_committed(&mut self, id: &str) -> bool {
         let key = self.committed_key(id);
-        if !self.committed_ids.insert(key.clone()) {
-            return false;
-        }
-        self.committed_order.push_back(key);
-        if self.committed_order.len() > MAX_COMMITTED_IDS
-            && let Some(expired) = self.committed_order.pop_front()
-        {
-            self.committed_ids.remove(&expired);
-        }
-        true
+        self.committed_ids.insert(key)
+    }
+
+    /// 流摘要不匹配时允许新代际显示，已归档正文仍留在当前会话文档中。
+    fn forget_committed(&mut self, id: &str) {
+        let key = self.committed_key(id);
+        self.committed_ids.remove(&key);
     }
 
     /// 消息 ID 常按 thread 局部生成，因此去重键同时包含当前会话身份。
@@ -2045,6 +3270,17 @@ impl UiState {
     /// 按当前 thread 检查稳定消息，切换会话不会把另一个会话的同名 ID 隐藏。
     fn is_committed(&self, id: &str) -> bool {
         self.committed_ids.contains(&self.committed_key(id))
+    }
+
+    /// @author kongweiguang
+    /// 取消选择器时还原来源 Composer 的完整快照，同时保留按 Thread 缓存供稍后切回恢复。
+    fn restore_fork_draft(&mut self) {
+        if let Some(source_thread_id) = self.active_fork_source.take()
+            && let Some(composer) = self.fork_source_composers.get(&source_thread_id)
+        {
+            self.composer = composer.clone();
+        }
+        self.panel = None;
     }
 
     /// 新交互暂存原任务草稿和字素光标；结束后还原，切换请求时清理旧 CAS 答案。
@@ -2097,10 +3333,49 @@ fn prefix_at_grapheme(value: &str, grapheme: usize) -> &str {
         .map_or(value, |(byte, _)| &value[..byte])
 }
 
-/// 只有不可再变的用户正文、Commentary 和明确终态才进入主屏 scrollback。
+/// 冷启动同类别只保留持久条目；已有流进度留下完整 synthetic 尾部供同 Turn 摘要对账。
+fn remove_unstarted_duplicate_streams(
+    snapshot: &mut UiSnapshot,
+    stream_progress: &HashMap<String, StreamProgress>,
+) {
+    let duplicates = snapshot
+        .timeline
+        .iter()
+        .filter(|entry| {
+            is_live_stream_entry(entry)
+                && entry.status == Some(TimelineStatus::Complete)
+                && !stream_progress.contains_key(&entry.id)
+        })
+        .filter(|stream| {
+            let Some(turn_id) = snapshot.turn_id_by_entry_id.get(&stream.id) else {
+                return false;
+            };
+            snapshot.timeline.iter().any(|entry| {
+                !is_live_stream_entry_by_id(&entry.id)
+                    && stream_kind(entry) == stream_kind(stream)
+                    && is_stable_entry(entry)
+                    && snapshot.turn_id_by_entry_id.get(&entry.id) == Some(turn_id)
+                    && entry.text == stream.text
+            })
+        })
+        .map(|entry| entry.id.clone())
+        .collect::<HashSet<_>>();
+    snapshot
+        .timeline
+        .retain(|entry| !duplicates.contains(&entry.id));
+    snapshot
+        .turn_id_by_entry_id
+        .retain(|id, _| !duplicates.contains(id));
+}
+
+/// 临时问题与运行中公开摘要留在重绘区，稳定内容沿用原归档边界，避免半截摘要被当成完整消息。
 fn is_stable_entry(entry: &TimelineEntry) -> bool {
     match &entry.kind {
-        TimelineKind::User | TimelineKind::Commentary => true,
+        TimelineKind::User => entry.status != Some(TimelineStatus::Running),
+        TimelineKind::Commentary
+        | TimelineKind::AssistantFragment { .. }
+        | TimelineKind::WorkSummary { .. } => true,
+        TimelineKind::ReasoningSummary => entry.status != Some(TimelineStatus::Running),
         TimelineKind::Assistant | TimelineKind::FinalAnswer | TimelineKind::Tool { .. } => {
             matches!(
                 entry.status,
@@ -2110,13 +3385,63 @@ fn is_stable_entry(entry: &TimelineEntry) -> bool {
     }
 }
 
-/// 终端输入只保留换行并移除控制字符，避免工具输出伪造 ANSI 控制序列。
+/// 公开正文与摘要都按 Turn 和首段序号接续，其它 Commentary 不参与流去重。
+fn is_live_stream_entry(entry: &TimelineEntry) -> bool {
+    is_live_stream_entry_by_id(&entry.id)
+        && stream_kind(entry).is_some()
+        && matches!(
+            entry.status,
+            Some(TimelineStatus::Running | TimelineStatus::Complete)
+        )
+}
+
+/// 流身份前缀与稳定 Thread message ID 分开，快照重放时才能验证已输出前缀。
+fn is_live_stream_entry_by_id(id: &str) -> bool {
+    id.strip_prefix("live:")
+        .or_else(|| id.strip_prefix("live-reasoning:"))
+        .is_some_and(|identity| identity.rsplit_once(':').is_some())
+}
+
+/// 从活动条目 ID 读取 Turn 身份，Thread message ID 本身不携带该关系。
+fn live_turn_id(id: &str) -> Option<String> {
+    let identity = id
+        .strip_prefix("live:")
+        .or_else(|| id.strip_prefix("live-reasoning:"))?;
+    let (turn_id, _) = identity.rsplit_once(':')?;
+    (!turn_id.is_empty()).then(|| turn_id.to_owned())
+}
+
+/// 使用公开类别而非文本猜测流来源；错误、线程通信等 Commentary 不被思考去重规则吞掉。
+fn stream_kind(entry: &TimelineEntry) -> Option<StreamKind> {
+    match entry.kind {
+        TimelineKind::Assistant | TimelineKind::FinalAnswer => Some(StreamKind::Assistant),
+        TimelineKind::ReasoningSummary => Some(StreamKind::Reasoning),
+        _ => None,
+    }
+}
+
+/// 用流式前缀摘要验证快照重放，确认失败时不裁剪用户已见字符。
+fn matching_stream_tail(progress: &StreamProgress, full_text: &str) -> Option<String> {
+    let prefix = full_text.as_bytes().get(..progress.committed_bytes)?;
+    let prefix = std::str::from_utf8(prefix).ok()?;
+    let digest = Sha256::digest(prefix.as_bytes());
+    (digest.as_slice() == progress.committed_hash.clone().finalize().as_slice())
+        .then(|| full_text[progress.committed_bytes..].to_owned())
+}
+
+/// 控件文本不保留制表符；公开正文另外保留语法所需缩进，控制字符始终不能进入终端 escape 流。
 fn sanitize_text(value: &str, max_bytes: usize) -> String {
+    sanitize_source(value, max_bytes, false)
+}
+
+/// 正文制表符交给 renderer 展开；只清理控制字符，完整历史不受显示预览预算裁剪。
+fn sanitize_source(value: &str, max_bytes: usize, preserve_tabs: bool) -> String {
     let mut output = String::with_capacity(value.len().min(max_bytes));
     let mut truncated = false;
     for ch in value.chars() {
         let safe = match ch {
             '\n' => '\n',
+            '\t' if preserve_tabs => '\t',
             '\t' => ' ',
             _ if ch.is_control() => continue,
             _ => ch,
@@ -2131,20 +3456,6 @@ fn sanitize_text(value: &str, max_bytes: usize) -> String {
         output.push_str("\n…内容已截断");
     }
     output
-}
-
-/// 流式追加有严格上限，超出时写可见标记而不静默丢弃尾部。
-fn append_bounded(target: &mut String, incoming: &str, max_bytes: usize) {
-    let room = max_bytes.saturating_sub(target.len());
-    let mut written = 0usize;
-    for ch in incoming.chars() {
-        if written + ch.len_utf8() > room {
-            target.push_str("\n…内容已截断");
-            return;
-        }
-        target.push(ch);
-        written += ch.len_utf8();
-    }
 }
 
 /// 仅身份或 CAS revision 变化才重置用户交互；相同审批刷新保留局部选择与防重标志。
@@ -2175,14 +3486,14 @@ fn same_pending_identity(old: Option<&PendingPrompt>, new: Option<&PendingPrompt
         (
             Some(PendingPrompt::Clarification {
                 thread_id: old_thread,
-                request_id: old_id,
-                expected_revision: old_revision,
+                interaction_id: old_id,
+                expected_interaction_revision: old_revision,
                 ..
             }),
             Some(PendingPrompt::Clarification {
                 thread_id: new_thread,
-                request_id: new_id,
-                expected_revision: new_revision,
+                interaction_id: new_id,
+                expected_interaction_revision: new_revision,
                 ..
             }),
         ) => old_thread == new_thread && old_id == new_id && old_revision == new_revision,
@@ -2218,18 +3529,22 @@ fn sanitize_snapshot(mut snapshot: UiSnapshot) -> UiSnapshot {
         .permission_label
         .map(|text| sanitize_text(&text, 256));
     snapshot.notice = snapshot.notice.map(|text| sanitize_text(&text, 1024));
-    snapshot.timeline = snapshot
+    snapshot.timeline = snapshot.timeline.into_iter().map(sanitize_entry).collect();
+    let retained_ids = snapshot
         .timeline
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    snapshot
+        .turn_id_by_entry_id
+        .retain(|entry_id, _| retained_ids.contains(entry_id.as_str()));
+    snapshot.turn_id_by_entry_id = snapshot
+        .turn_id_by_entry_id
         .into_iter()
-        .rev()
-        .take(MAX_TIMELINE_ENTRIES)
-        .map(sanitize_entry)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .map(|(entry_id, turn_id)| (sanitize_text(&entry_id, 512), sanitize_text(&turn_id, 256)))
         .collect();
     snapshot.attachments = sanitize_choices(snapshot.attachments);
-    snapshot.model_choices = sanitize_choices(snapshot.model_choices);
+    snapshot.model_choices = sanitize_model_choices(snapshot.model_choices);
     snapshot.reasoning_choices = sanitize_choices(snapshot.reasoning_choices);
     snapshot.reasoning_model_identifier = snapshot
         .reasoning_model_identifier
@@ -2243,14 +3558,26 @@ fn sanitize_snapshot(mut snapshot: UiSnapshot) -> UiSnapshot {
     snapshot
 }
 
-/// 对话行的 ID、目标、正文和折叠详情分别设限，失败详情仍保持可读上界。
+/// 本地用时不承载正文；消息原文完整保留，界面预览预算只在具体控件排版时应用。
 fn sanitize_entry(mut entry: TimelineEntry) -> TimelineEntry {
     entry.id = sanitize_text(&entry.id, 512);
-    entry.text = sanitize_text(&entry.text, MAX_ENTRY_BYTES);
+    let text_budget = if matches!(entry.kind, TimelineKind::WorkSummary { .. }) {
+        0
+    } else {
+        usize::MAX
+    };
+    entry.text = sanitize_source(
+        &entry.text,
+        text_budget,
+        !matches!(
+            entry.kind,
+            TimelineKind::Tool { .. } | TimelineKind::WorkSummary { .. }
+        ),
+    );
     entry.detail = entry
         .detail
         .map(|detail| sanitize_text(&detail, MAX_DETAIL_BYTES));
-    if let TimelineKind::Tool { action, target } = &mut entry.kind {
+    if let TimelineKind::Tool { action, target, .. } = &mut entry.kind {
         *action = sanitize_text(action, 128);
         *target = sanitize_text(target, 1024);
     }
@@ -2277,6 +3604,26 @@ fn sanitize_choices(choices: Vec<UiChoice>) -> Vec<UiChoice> {
         .collect()
 }
 
+/// Fork 只显示客户端已按需读到的历史；不能套用普通配置候选上限而隐藏更早的可选回复。
+fn sanitize_fork_reply_choices(choices: Vec<UiChoice>) -> Vec<UiChoice> {
+    choices.into_iter().map(sanitize_choice).collect()
+}
+
+/// 模型选择器始终保留一个管理入口，即使服务端当前没有任何可选模型。
+fn sanitize_model_choices(choices: Vec<UiChoice>) -> Vec<UiChoice> {
+    let mut choices = sanitize_choices(choices)
+        .into_iter()
+        .filter(|choice| choice.id != MODEL_SETTINGS_CHOICE_ID)
+        .take(MAX_CHOICES.saturating_sub(1))
+        .collect::<Vec<_>>();
+    choices.push(UiChoice {
+        id: MODEL_SETTINGS_CHOICE_ID.to_owned(),
+        label: "管理模型…".to_owned(),
+        detail: Some("新增或编辑供应商、API Key 和默认模型".to_owned()),
+    });
+    choices
+}
+
 /// 交互题按服务端合同最多保留三题，每题最多保留 32 个多选选项。
 fn sanitize_prompt(prompt: PendingPrompt) -> PendingPrompt {
     match prompt {
@@ -2297,15 +3644,15 @@ fn sanitize_prompt(prompt: PendingPrompt) -> PendingPrompt {
         },
         PendingPrompt::Clarification {
             thread_id,
-            request_id,
-            expected_revision,
-            idempotency_key,
+            interaction_id,
+            expected_interaction_revision,
+            operation_key,
             questions,
         } => PendingPrompt::Clarification {
             thread_id: sanitize_text(&thread_id, 512),
-            request_id: sanitize_text(&request_id, 512),
-            expected_revision,
-            idempotency_key: sanitize_text(&idempotency_key, 512),
+            interaction_id: sanitize_text(&interaction_id, 512),
+            expected_interaction_revision,
+            operation_key: sanitize_text(&operation_key, 512),
             questions: questions
                 .into_iter()
                 .take(3)
@@ -2325,17 +3672,17 @@ fn sanitize_prompt(prompt: PendingPrompt) -> PendingPrompt {
     }
 }
 
-/// 解析白名单斜杠命令；未知 `/...` 保留为普通提示，避免静默吞掉用户输入。
+/// 解析白名单斜杠命令；Plan 创建保留完整目标文本，缺少目标也作为命令交给 controller 报错。
 fn parse_command(text: &str) -> Option<UiAction> {
     let command_text = text.strip_prefix('/')?;
     let mut parts = command_text.splitn(2, char::is_whitespace);
     let command = parts.next()?.to_ascii_lowercase();
     let argument = parts.next().unwrap_or_default().trim();
     let command = match command.as_str() {
-        "new" => UiCommand::NewThread,
-        "resume" => UiCommand::ResumeThread,
-        "model" => UiCommand::SelectModel,
-        "permissions" => UiCommand::SelectPermissions,
+        "new" if argument.is_empty() => UiCommand::NewThread,
+        "resume" if argument.is_empty() => UiCommand::ResumeThread,
+        "model" if argument.is_empty() => UiCommand::SelectModel,
+        "permissions" if argument.is_empty() => UiCommand::SelectPermissions,
         "attach" => {
             let paths = split_paths(argument);
             if !paths.is_empty() {
@@ -2343,12 +3690,48 @@ fn parse_command(text: &str) -> Option<UiAction> {
             }
             UiCommand::Attach
         }
-        "tools" => UiCommand::ShowTools,
-        "diff" => UiCommand::ShowDiff,
-        "plan" => UiCommand::ShowPlan,
-        "goal" => UiCommand::ShowGoal,
-        "help" => UiCommand::Help,
-        "quit" => return Some(UiAction::Quit),
+        "tools" if argument.is_empty() => UiCommand::ShowTools,
+        "diff" if argument.is_empty() => UiCommand::ShowDiff,
+        "plan" => {
+            let mut plan_parts = argument.splitn(2, char::is_whitespace);
+            match plan_parts
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "" => UiCommand::TogglePlanMode,
+                "create" => {
+                    return Some(UiAction::CreatePlan {
+                        objective: plan_parts.next().unwrap_or_default().trim().to_owned(),
+                    });
+                }
+                "status" => UiCommand::ShowPlan,
+                "execute" => UiCommand::ExecutePlan,
+                "pause" => UiCommand::PausePlan,
+                "resume" => UiCommand::ResumePlan,
+                "stop" => UiCommand::StopPlan,
+                _ => return None,
+            }
+        }
+        "compact" if argument.is_empty() => UiCommand::CompactThread,
+        "status" if argument.is_empty() => UiCommand::ShowStatus,
+        "skills" if argument.is_empty() => UiCommand::ShowSkills,
+        "mcp" if argument.is_empty() => UiCommand::ShowMcp,
+        "review" if argument.is_empty() => UiCommand::ReviewThread,
+        "fork" if argument.is_empty() => UiCommand::ForkThread,
+        "copy" if argument.is_empty() => UiCommand::CopyLastReply,
+        "export" => {
+            let paths = split_paths(argument);
+            if paths.len() > 1 {
+                return None;
+            }
+            return Some(UiAction::ExportThread {
+                path: paths.into_iter().next(),
+            });
+        }
+        "help" if argument.is_empty() => UiCommand::Help,
+        "quit" if argument.is_empty() => return Some(UiAction::Quit),
         _ => return None,
     };
     Some(UiAction::Command(command))
@@ -2394,13 +3777,21 @@ const COMMANDS: &[UiCommand] = &[
     UiCommand::Attach,
     UiCommand::ShowTools,
     UiCommand::ShowDiff,
-    UiCommand::ShowPlan,
-    UiCommand::ShowGoal,
+    UiCommand::TogglePlanMode,
+    UiCommand::CreatePlan,
+    UiCommand::CompactThread,
+    UiCommand::ShowStatus,
+    UiCommand::ShowSkills,
+    UiCommand::ShowMcp,
+    UiCommand::ReviewThread,
+    UiCommand::ForkThread,
+    UiCommand::CopyLastReply,
+    UiCommand::ExportThread,
     UiCommand::Help,
     UiCommand::Quit,
 ];
 
-/// 返回菜单渲染所需标签，避免直接显示 enum 名称。
+/// 返回精确命令标签；创建目标由用户在补全后继续输入。
 pub(crate) fn command_label(command: UiCommand) -> &'static str {
     match command {
         UiCommand::NewThread => "/new",
@@ -2410,8 +3801,21 @@ pub(crate) fn command_label(command: UiCommand) -> &'static str {
         UiCommand::Attach => "/attach",
         UiCommand::ShowTools => "/tools",
         UiCommand::ShowDiff => "/diff",
+        UiCommand::TogglePlanMode => "/plan",
+        UiCommand::CreatePlan => "/plan create",
         UiCommand::ShowPlan => "/plan",
-        UiCommand::ShowGoal => "/goal",
+        UiCommand::ExecutePlan => "/plan execute",
+        UiCommand::PausePlan => "/plan pause",
+        UiCommand::ResumePlan => "/plan resume",
+        UiCommand::StopPlan => "/plan stop",
+        UiCommand::CompactThread => "/compact",
+        UiCommand::ShowStatus => "/status",
+        UiCommand::ShowSkills => "/skills",
+        UiCommand::ShowMcp => "/mcp",
+        UiCommand::ReviewThread => "/review",
+        UiCommand::ForkThread => "/fork",
+        UiCommand::CopyLastReply => "/copy",
+        UiCommand::ExportThread => "/export",
         UiCommand::Help => "/help",
         UiCommand::Quit => "/quit",
     }
@@ -2430,18 +3834,31 @@ pub(crate) fn matching_commands(draft: &str) -> Vec<UiCommand> {
         .collect()
 }
 
-/// 菜单描述只解释结果，不重复斜杠命令本身，窄窗口也能一眼识别动作。
+/// 菜单只列真实可调用的常用入口；动作说明保持简短以适应窄终端。
 pub(crate) fn command_description(command: UiCommand) -> &'static str {
     match command {
         UiCommand::NewThread => "新建会话",
         UiCommand::ResumeThread => "恢复会话",
-        UiCommand::SelectModel => "切换模型",
+        UiCommand::SelectModel => "切换或管理模型",
         UiCommand::SelectPermissions => "执行权限",
         UiCommand::Attach => "添加附件",
         UiCommand::ShowTools => "工具记录",
         UiCommand::ShowDiff => "查看变更",
-        UiCommand::ShowPlan => "查看计划",
-        UiCommand::ShowGoal => "查看目标",
+        UiCommand::TogglePlanMode => "切换规划模式",
+        UiCommand::CreatePlan => "创建并规划目标",
+        UiCommand::ShowPlan => "查看当前 Plan",
+        UiCommand::ExecutePlan => "执行已定稿 Plan",
+        UiCommand::PausePlan => "暂停 Plan Run",
+        UiCommand::ResumePlan => "继续 Plan Run",
+        UiCommand::StopPlan => "停止 Plan Run",
+        UiCommand::CompactThread => "压缩当前上下文",
+        UiCommand::ShowStatus => "查看会话状态",
+        UiCommand::ShowSkills => "查看可用 Skills",
+        UiCommand::ShowMcp => "查看 MCP 连接",
+        UiCommand::ReviewThread => "审查工作区变更",
+        UiCommand::ForkThread => "从当前会话分叉",
+        UiCommand::CopyLastReply => "复制最后回复",
+        UiCommand::ExportThread => "导出会话 Markdown",
         UiCommand::Help => "快捷键",
         UiCommand::Quit => "退出 Ja",
     }

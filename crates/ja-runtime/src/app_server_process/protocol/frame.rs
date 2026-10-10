@@ -9,7 +9,7 @@ use super::codec::{
 use super::error_policy::{
     CodecError, RpcError, redact_debug_text, redact_debug_value, validate_error,
 };
-use super::limits::{MAX_METHOD_BYTES, MAX_REQUEST_ID_BYTES};
+use super::limits::{MAX_METHOD_BYTES, MAX_RPC_REQUEST_ID_BYTES};
 use serde_json::{Map, Value};
 use std::fmt::Formatter;
 
@@ -258,7 +258,7 @@ impl RpcFrame {
 /// 检查冻结 c: namespace、ASCII 字符集和 98-byte 总长度。
 pub(super) fn valid_wire_id(id: &str) -> bool {
     let bytes = id.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_REQUEST_ID_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_RPC_REQUEST_ID_BYTES {
         return false;
     }
     let Some((prefix, suffix)) = id.split_once(':') else {

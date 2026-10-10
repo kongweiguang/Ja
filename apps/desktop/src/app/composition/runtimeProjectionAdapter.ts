@@ -11,6 +11,7 @@ type RuntimeProjectionEvent = Exclude<RuntimeHostEvent, { kind: "status" }>;
  * 仍需交给原有 reducer 处理，不能因 Child 隔离而吞掉 Runtime 级故障信号。
  */
 function timelineThreadId(event: RuntimeProjectionEvent): string | undefined {
+  if (event.kind === "resync_required") return event.event.threadId;
   if (event.kind !== "timeline") return undefined;
   const threadId = (event.event.params as { readonly threadId?: unknown }).threadId;
   return typeof threadId === "string" ? threadId : undefined;

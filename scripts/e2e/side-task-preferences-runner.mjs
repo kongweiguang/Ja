@@ -272,7 +272,7 @@ async function resolveJavaAndJar() {
   const java = join(javaHome, "bin", "java.exe");
   const jar = resolve(
     process.env.JA_E2E_APP_SERVER_JAR?.trim() ||
-      join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+      join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar"),
   );
   const version = await execFileAsync(java, ["-version"], {
     windowsHide: true,

@@ -19,8 +19,11 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  createContext,
+  useContext,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
@@ -29,7 +32,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactElement,
 } from "react";
-import { Tree, type NodeApi, type NodeRendererProps } from "react-arborist";
+import { Tree, type NodeApi, type NodeRendererProps, type TreeApi } from "react-arborist";
 import {
   EmptyState,
   ErrorState,
@@ -47,16 +50,20 @@ import { canMoveEntry, findTreeNode, findTreeNodeById, parentPath } from "../dom
 import type { FileTreeProps } from "./types";
 import "./files.css";
 
-type FileTreeNodeProps = NodeRendererProps<WorkspaceFileNode> & {
+type FileTreeNodeProps = NodeRendererProps<WorkspaceFileNode>;
+
+interface FileTreeNodeViewContextValue {
   renamePath?: string;
   renameValue: string;
   onRenameValueChange: (value: string) => void;
-  onRenameCommit: () => void;
+  onRenameCommit: (nodePath: string) => void;
   onRenameCancel: () => void;
   onPointerDown: (node: WorkspaceFileNode, event: ReactPointerEvent<HTMLDivElement>) => void;
   onContextMenu: (node: WorkspaceFileNode, event: ReactMouseEvent<HTMLDivElement>) => void;
   dragTargetPath?: string;
-};
+}
+
+const FileTreeNodeViewContext = createContext<FileTreeNodeViewContextValue | undefined>(undefined);
 
 interface ContextMenuState {
   nodeId?: string;
@@ -213,21 +220,23 @@ function useElementSize(): {
 }
 
 /**
- * 行只负责渲染并把 mutation 委托给 feature controller。action props 全部可选，
- * 没有真实 callback 时不渲染虚假菜单，因此树也可用于只读 Workbench projection。
+ * 行 renderer 类型固定供 Arborist 保留输入 DOM；易变视图状态从单一上下文更新，避免逐键重挂载。
+ * Rename 组合态按键留给原生输入法候选流程，只有 composition 结束后才接受 Enter/Escape。
+ * @author kongweiguang
  */
-function FileTreeNode({
-  node,
-  style,
-  renamePath,
-  renameValue,
-  onRenameValueChange,
-  onRenameCommit,
-  onRenameCancel,
-  onPointerDown,
-  onContextMenu,
-  dragTargetPath,
-}: FileTreeNodeProps): ReactElement {
+function FileTreeNode({ node, style }: FileTreeNodeProps): ReactElement {
+  const view = useContext(FileTreeNodeViewContext);
+  if (view === undefined) throw new Error("FileTreeNode must be rendered inside its view context");
+  const {
+    renamePath,
+    renameValue,
+    onRenameValueChange,
+    onRenameCommit,
+    onRenameCancel,
+    onPointerDown,
+    onContextMenu,
+    dragTargetPath,
+  } = view;
   const isDirectory = node.data.kind === "directory";
   const Icon = isDirectory
     ? node.isOpen
@@ -276,9 +285,11 @@ function FileTreeNode({
           aria-label={`重命名 ${node.data.name}`}
           value={renameValue}
           onChange={(event) => onRenameValueChange(event.target.value)}
-          onBlur={onRenameCommit}
+          onBlur={() => onRenameCommit(node.data.path)}
           onKeyDown={(event) => {
-            if (event.key === "Enter") onRenameCommit();
+            // 组合态按键用于输入法候选，不得被文件树解释为提交或取消操作。
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === "Enter") onRenameCommit(node.data.path);
             if (event.key === "Escape") onRenameCancel();
           }}
           onClick={(event) => event.stopPropagation()}
@@ -301,12 +312,14 @@ function FileTreeNode({
 }
 
 /**
- * 将虚拟树适配到只读 projection 与 typed 文件控制器；内部拖拽只提交已知相对
- * 目录，根目录使用固定空字符串，取消和失焦不会触发任何文件写入。
+ * 将虚拟树适配到只读 projection 与 typed 文件控制器；renderer 组件类型保持稳定，变化的行状态经上下文
+ * 更新，避免 Arborist 将重命名输入当成新组件替换并丢失用户光标。根目录使用固定空字符串，取消和失焦不写文件。
+ * @author kongweiguang
  */
 export function FileTree({
   nodes,
   selectedPath,
+  revealRequest,
   loading = false,
   error,
   onSelect,
@@ -325,6 +338,8 @@ export function FileTree({
   onOpenTarget,
 }: FileTreeProps): ReactElement {
   const { ref: viewportRef, size: viewportSize } = useElementSize();
+  const treeRef = useRef<TreeApi<WorkspaceFileNode> | undefined>(undefined);
+  const handledRevealSequenceRef = useRef<number | undefined>(undefined);
   const selectedNodeId =
     selectedPath === undefined ? undefined : findTreeNode(nodes, selectedPath)?.id;
   const selectedNode = selectedPath === undefined ? undefined : findTreeNode(nodes, selectedPath);
@@ -814,21 +829,43 @@ export function FileTree({
     [nodes, onDirectoryToggle],
   );
 
-  /** action 状态变化时保持行 renderer identity 稳定，避免虚拟列表重建。 */
-  const renderNode = useCallback(
-    (props: NodeRendererProps<WorkspaceFileNode>): ReactElement => (
-      <FileTreeNode
-        {...props}
-        renamePath={renamePath}
-        renameValue={renameValue}
-        onRenameValueChange={changeRenameValue}
-        onRenameCommit={() => commitRename(props.node.data.path)}
-        onRenameCancel={cancelRename}
-        onPointerDown={onPointerDown}
-        onContextMenu={onRowContextMenu}
-        dragTargetPath={dragTargetPath}
-      />
-    ),
+  /** @author kongweiguang：按需加载祖先；展开后等 Arborist 建立可见索引再选择，避免深层定位丢失 selection。 */
+  useEffect(() => {
+    if (revealRequest === undefined || handledRevealSequenceRef.current === revealRequest.sequence)
+      return;
+    const node = findTreeNode(nodes, revealRequest.path);
+    const tree = treeRef.current;
+    if (node === undefined || node.kind !== "directory" || tree === undefined) return;
+    tree.openParents(node.id);
+    let cancelled = false;
+    const scroll = tree.scrollTo(node.id);
+    if (scroll === undefined) {
+      tree.select(node.id, { focus: false });
+      handledRevealSequenceRef.current = revealRequest.sequence;
+    } else {
+      void scroll.then(() => {
+        if (cancelled || treeRef.current !== tree) return;
+        // Arborist indexes a child only after its ancestors render open; select after that index exists.
+        tree.select(node.id, { focus: false });
+        handledRevealSequenceRef.current = revealRequest.sequence;
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [nodes, revealRequest]);
+
+  const nodeViewContext = useMemo<FileTreeNodeViewContextValue>(
+    () => ({
+      renamePath,
+      renameValue,
+      onRenameValueChange: changeRenameValue,
+      onRenameCommit: commitRename,
+      onRenameCancel: cancelRename,
+      onPointerDown,
+      onContextMenu: onRowContextMenu,
+      dragTargetPath,
+    }),
     [
       cancelRename,
       changeRenameValue,
@@ -942,30 +979,33 @@ export function FileTree({
         {nodes.length === 0 ? (
           <EmptyState className="ja-feature-state" title="工作区没有可显示的文件" />
         ) : viewportSize.width === 0 || viewportSize.height === 0 ? null : (
-          <Tree<WorkspaceFileNode>
-            data={nodes}
-            width={viewportSize.width}
-            height={viewportSize.height}
-            rowHeight={30}
-            overscanCount={8}
-            indent={16}
-            openByDefault={false}
-            selection={selectedNodeId}
-            selectionFollowsFocus
-            disableMultiSelection
-            disableDeselectOnClick
-            disableEdit
-            disableDrag
-            disableDrop
-            childrenAccessor={(item) =>
-              item.kind === "directory" ? (item.children ?? (item.hasChildren ? [] : null)) : null
-            }
-            onSelect={handleSelect}
-            onToggle={handleDirectoryToggle}
-            aria-label="工作区文件"
-          >
-            {renderNode}
-          </Tree>
+          <FileTreeNodeViewContext.Provider value={nodeViewContext}>
+            <Tree<WorkspaceFileNode>
+              ref={treeRef}
+              data={nodes}
+              width={viewportSize.width}
+              height={viewportSize.height}
+              rowHeight={30}
+              overscanCount={8}
+              indent={16}
+              openByDefault={false}
+              selection={selectedNodeId}
+              selectionFollowsFocus
+              disableMultiSelection
+              disableDeselectOnClick
+              disableEdit
+              disableDrag
+              disableDrop
+              childrenAccessor={(item) =>
+                item.kind === "directory" ? (item.children ?? (item.hasChildren ? [] : null)) : null
+              }
+              onSelect={handleSelect}
+              onToggle={handleDirectoryToggle}
+              aria-label="工作区文件"
+            >
+              {FileTreeNode}
+            </Tree>
+          </FileTreeNodeViewContext.Provider>
         )}
       </div>
       {contextMenu === undefined || !contextMenuTargetAvailable ? null : (

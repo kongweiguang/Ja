@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { FolderOpen } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import { toast } from "sonner";
+import { Notification } from "@/shared/ui/notifications";
+import { Button } from "@/shared/ui/primitives";
 import { useShallow } from "zustand/react/shallow";
 import {
   TimelineDisclosureCache,
@@ -13,16 +15,17 @@ import {
   useInteractionController,
   type InteractionPort,
   ConversationSummaryPopover,
+  ConversationTimelineSurface,
   countCommittedConversationActivity,
   itemChangedFiles,
   itemDiffStat,
   ReplyFileOpenMenu,
   ThreadOperationsMenu,
-  selectApprovalClosedAt,
-  selectApprovalDecisions,
-  selectApprovals,
+  selectApprovalClosedAtForThread,
+  selectApprovalDecisionsForThread,
+  selectApprovalsForThread,
   selectCommittedItemsForThread,
-  selectGoalActivitiesForOwner,
+  selectTurnsForThread,
   turnDurationMs,
   turnStatusLabel,
   resolveContextUsage,
@@ -30,6 +33,7 @@ import {
   useReplyFileOpen,
   useTimelineStore,
   type ConversationController,
+  type ConversationProcessBinding,
   type ConversationAttachmentPort,
   type ConversationArtifactPort,
   type ConversationContextReference,
@@ -38,7 +42,6 @@ import {
   type ConversationUsageReader,
   type ComposerSlashCommand,
   type TimelineTurn as Turn,
-  type TimelineGoalActivity,
 } from "@/features/conversation";
 import type { SettingsController } from "@/features/settings";
 import type {
@@ -51,13 +54,11 @@ import type { WorkspaceController } from "@/features/workspace";
 import type { NativeDropEvent } from "@/api/tauri/nativeDrop";
 import { TaskActivityCard, useTaskActivityTimeline, type TaskSummary } from "@/features/tasks";
 import {
-  ComposerGoalStatus,
-  GoalActivityCard,
-  GoalStatusBar,
+  ComposerPlanStatus,
   PlanTimelineBlock,
   PlanStatusBar,
-  type GoalController,
-} from "@/features/goals";
+  type PlanController,
+} from "@/features/plans";
 import { RightPanelIcon } from "@/shared/ui/RightPanelIcon";
 import type { JaWorkbenchAdapters } from "../useJaWorkbench";
 import { useRuntimeLifecycle, useRuntimeState, useRuntimeTurns } from "../RuntimeProvider";
@@ -65,11 +66,15 @@ import { IconButton } from "@/shared/ui/primitives";
 import { modelSelectionId } from "@/shared/settings/types";
 import { useLatestTurnReviewPublisher } from "../application/useLatestTurnReviewPublisher";
 import { conversationModeCommands } from "../application/conversationModeCommands";
-import { ConversationTimelineSurface } from "./ConversationTimelineSurface";
+import { PendingOperationNotification } from "./PendingOperationNotification";
 
 export interface ConversationWorkspaceProps {
   readonly workspace: WorkspaceController;
   readonly conversation: ConversationController;
+  /** Host visibility gates retained Composer IO and high-frequency Timeline subscriptions. */
+  readonly active?: boolean;
+  /** 编辑项目 Modal 覆盖工作面时暂停会话提示，避免门户覆盖对话框并保留各 owner 身份。 */
+  readonly projectEditorOpen?: boolean;
   /** Composer 只消费 Thread 级只读账本，历史 adapter 与刷新时序仍留在 composition。 */
   readonly usageReader?: ConversationUsageReader;
   readonly settings: SettingsController;
@@ -78,14 +83,19 @@ export interface ConversationWorkspaceProps {
   readonly summaryContext: Pick<ConversationSummary, "scope" | "gitBranch" | "runtime">;
   readonly mcpReader?: ConversationMcpReader;
   readonly onOpenMcpSettings?: () => void;
+  readonly onOpenModelSettings?: () => void;
+  readonly onEditProject?: (workspaceId: string) => void | Promise<void>;
   readonly workspaceAdapter: JaWorkbenchAdapters["workspace"];
   readonly onOpenLink: (url: string, source?: HTMLElement) => void | Promise<void>;
   readonly onOpenFile: (
     target: { path: string; line?: number; column?: number },
     source: HTMLElement,
-    mode?: "explorer",
+    mode?: "explorer" | "browser",
   ) => void | Promise<void>;
   readonly onCopyText: (text: string) => Promise<void>;
+  readonly onExportConversation?: () => Promise<
+    "saved" | "cancelled" | "unsupported" | "downloaded"
+  >;
   readonly onConversationFocusAvailabilityChange: (available: boolean) => void;
   readonly onRegisterWorkspaceReferenceTarget: (
     target: ((reference: ComposerWorkspaceReferenceTarget) => void) | undefined,
@@ -97,6 +107,7 @@ export interface ConversationWorkspaceProps {
   readonly attachmentPort?: ConversationAttachmentPort;
   readonly attachmentPreviewPort?: AttachmentPreviewPort;
   readonly artifactPort?: ConversationArtifactPort;
+  readonly processSession?: ConversationProcessBinding;
   readonly nativeDropEvent?: NativeDropEvent;
   readonly onRegisterComposerDropZone?: (element: HTMLFormElement | null) => void;
   readonly onOpenAttachmentPreview?: (
@@ -113,10 +124,10 @@ export interface ConversationWorkspaceProps {
   readonly onAttachmentsBound?: (threadId: string, attachmentIds: readonly string[]) => void;
   readonly slashCommands?: readonly ComposerSlashCommand[];
   readonly onOpenTask: (task: TaskSummary) => void;
-  readonly planGoalAvailable: boolean;
-  readonly goal: GoalController;
+  readonly planAvailable: boolean;
+  readonly plan: PlanController;
   readonly interactionPort?: InteractionPort;
-  readonly onOpenGoal: () => void;
+  readonly onOpenPlan: () => void;
 }
 
 export type ComposerWorkspaceReferenceTarget = Extract<
@@ -135,7 +146,12 @@ export interface ConversationOpenTargetRequest {
   readonly requestId: number;
   readonly workspaceId: string;
   readonly threadId: string;
-  readonly target: PreviewTarget | { kind: "explorer"; path: string };
+  /** 同一项目 ID 换目录后也使旧点击失效，不能只比较 Workspace 和 Thread。 */
+  readonly bindingRevision?: string;
+  readonly target:
+    | PreviewTarget
+    | { kind: "explorer"; path: string }
+    | { kind: "preview"; path: string; line?: number; column?: number };
 }
 
 /** Host 仅结算实际打开结果；失败由来源消息保留并恢复键盘焦点。 */
@@ -145,13 +161,15 @@ export type ConversationOpenTargetOutcome = "opened" | "failed";
 export type WorkspaceReferencePreviewOutcome = "opened" | "failed" | "closed";
 
 /**
- * 对话工作区只负责组合 Conversation、Workspace、Settings 与 Runtime 窄端口，并把 application
- * view model 绑定到 UI；Timeline 摘要在已订阅该状态的边界内派生，避免把高频 delta 提升到应用壳。
- * 启动期间保留对话外壳但遵守发送准入；生命周期提示由侧栏统一承载。
+ * 组合 Conversation、Workspace、Settings 与窄 Runtime 端口；高频 Timeline 只在可见边界订阅 owner slice。
+ * 启动、恢复和操作反馈仍由各自 owner 负责，避免 App 壳重复持有状态或改变消息布局。
+ * @author kongweiguang
  */
 export function ConversationWorkspace({
   workspace,
   conversation,
+  active = true,
+  projectEditorOpen = false,
   usageReader,
   settings,
   inspectorOpen,
@@ -159,16 +177,20 @@ export function ConversationWorkspace({
   summaryContext,
   mcpReader,
   onOpenMcpSettings,
+  onOpenModelSettings,
   workspaceAdapter,
   onOpenLink,
   onOpenFile,
+  onEditProject,
   onCopyText,
+  onExportConversation,
   onConversationFocusAvailabilityChange,
   onRegisterWorkspaceReferenceTarget,
   onOpenWorkspaceReference,
   attachmentPort,
   attachmentPreviewPort,
   artifactPort,
+  processSession,
   nativeDropEvent,
   onRegisterComposerDropZone,
   onOpenAttachmentPreview,
@@ -178,21 +200,48 @@ export function ConversationWorkspace({
   onAttachmentsBound,
   slashCommands,
   onOpenTask,
-  planGoalAvailable,
-  goal,
+  planAvailable,
+  plan,
   interactionPort,
-  onOpenGoal,
+  onOpenPlan,
 }: ConversationWorkspaceProps): ReactElement {
   const { boot, turnAdmissionReady, runtimeState, pendingClientOperations } = useRuntimeState();
-  const { queryRuntime, recheckPendingOperations, acknowledgePendingOperation } =
-    useRuntimeLifecycle();
-  const [recheckedPendingId, setRecheckedPendingId] = useState<string>();
-  const [confirmPendingId, setConfirmPendingId] = useState<string>();
-  const [acknowledgedUnknownNotice, setAcknowledgedUnknownNotice] = useState<string>();
+  const { queryRuntime } = useRuntimeLifecycle();
   const turnPort = useRuntimeTurns();
-  // 后台对账提示沿用现有 inline error 展示，不新增常驻控件或改变 Composer 的发送准入。
-  const visibleConversationError = conversation.error ?? conversation.backgroundError;
+  // 后台恢复仍在自动重试时只呈现状态；同一时刻优先保留更可操作的前台错误。
+  const visibleConversationError = conversation.error;
+  const visibleRecoveryStatus =
+    conversation.error === undefined ? conversation.backgroundError : undefined;
   const threadId = conversation.currentThreadId ?? "";
+  const noticeScope = `${workspace.workspace?.workspaceId ?? ""}:${threadId}`;
+  const workspaceNoticeScope = `${workspace.workspace?.workspaceId ?? ""}:directory-unavailable`;
+  const [unavailableNoticeWorkspaceId, setUnavailableNoticeWorkspaceId] =
+    useState<string | undefined>(undefined);
+  const currentWorkspaceId = workspace.workspace?.workspaceId;
+  const projectWorkspaceId =
+    workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined;
+  /** 重新检查沿用原提示 owner，让快速失败更新同一 toast 并保留既有退出动画。 @author kongweiguang */
+  useEffect(() => {
+    if (projectWorkspaceId !== undefined && workspace.directoryState === "unavailable") {
+      setUnavailableNoticeWorkspaceId(projectWorkspaceId);
+    } else if (
+      workspace.directoryState === "available" ||
+      currentWorkspaceId !== unavailableNoticeWorkspaceId
+    ) {
+      setUnavailableNoticeWorkspaceId(undefined);
+    }
+  }, [
+    currentWorkspaceId,
+    projectWorkspaceId,
+    unavailableNoticeWorkspaceId,
+    workspace.directoryState,
+  ]);
+  const showUnavailableNotice =
+    workspace.workspace?.kind === "project" &&
+    (workspace.directoryState === "unavailable" ||
+      (workspace.directoryState === "checking" &&
+        workspace.workspace.workspaceId === unavailableNoticeWorkspaceId));
+  const notificationsEnabled = active && !projectEditorOpen;
   const timelineScrollCache = useMemo(() => new TimelineScrollCache(), []);
   const timelineDisclosureCache = useMemo(() => new TimelineDisclosureCache(), []);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
@@ -207,21 +256,22 @@ export function ConversationWorkspace({
   const clarification = useInteractionController({
     threadId: conversation.currentThreadId,
     // Runtime 恢复/重连只撤销发送准入，不能卸载 Interaction 快照；否则待回答卡会在恢复轮次中闪退再出现。
-    visible: runtimeState?.features.includes("interaction_v1") === true,
+    visible: runtimeState?.features.includes("interaction") === true,
     port: interactionPort,
   });
   /** 运行中修改先等待原 Run 暂停，再聚焦 Composer，不能让新需求偷偷替换已授权版本。 */
   const modifyPlan = useCallback(() => {
-    const status = goal.planModel?.plan.status;
+    const status = plan.planModel?.plan.status;
     if (status === "executing" || status === "verifying") {
-      void goal.pausePlan().then((paused) => {
+      void plan.pausePlan().then((paused) => {
         if (paused) setComposerFocusRequest((value) => value + 1);
       });
     } else setComposerFocusRequest((value) => value + 1);
-  }, [goal]);
+  }, [plan]);
   const taskActivities = useTaskActivityTimeline(
     threadId === "" ? undefined : threadId,
     runtimeState?.generation,
+    active,
   );
   /**
    * Task Activity 只映射持久摘要与稳定 identity；Child Transcript 不进入父 Conversation reducer，
@@ -238,49 +288,12 @@ export function ConversationWorkspace({
       })),
     [onOpenTask, taskActivities],
   );
-  const persistedGoalActivities = useTimelineStore(selectGoalActivitiesForOwner(threadId));
-  /**
-   * mutation ACK 可先于下一次 thread/read 到达；把同一服务端 Goal 投影临时并入持久基线，
-   * 让常驻状态行原位释放时终态卡片立即出现，后续快照按 goalId 去重接管。
-   */
-  const goalActivities = useMemo<readonly TimelineGoalActivity[]>(() => {
-    const current = goal.model?.goal;
-    if (
-      current === undefined ||
-      current.ownerThreadId !== threadId ||
-      (current.status !== "achieved" && current.status !== "stopped") ||
-      persistedGoalActivities.some((activity) => activity.goalId === current.goalId)
-    )
-      return persistedGoalActivities;
-    return [
-      ...persistedGoalActivities,
-      {
-        goalId: current.goalId,
-        objective: current.objective,
-        status: current.status,
-        goalRevision: current.revision,
-        eventSequence: goal.model?.eventSequence ?? current.revision,
-        occurredAt: current.updatedAt,
-      },
-    ].sort((left, right) => left.eventSequence - right.eventSequence);
-  }, [goal.model, persistedGoalActivities, threadId]);
-  const goalTimelineRows = useMemo(
-    () =>
-      goalActivities.map((activity) => ({
-        rowId: `goal-terminal:${activity.goalId}`,
-        occurredAt: activity.occurredAt,
-        revision: `${activity.goalRevision}:${activity.eventSequence}`,
-        content: <GoalActivityCard activity={activity} />,
-      })),
-    [goalActivities],
-  );
   /**
    * 当前冻结 Plan 作为 Timeline 的结构化事实展示；详情入口显式打开 capability，组件本身不让
    * PlanWorkbench 常驻，也不从 agent Markdown 推导步骤或验收状态。
    */
   const planTimelineRows = useMemo(() => {
-    const planModel = goal.planModel;
-    const model = goal.model;
+    const planModel = plan.planModel;
     if (planModel === undefined || planModel.plan.ownerThreadId !== threadId) return [];
     return [
       {
@@ -289,23 +302,18 @@ export function ConversationWorkspace({
         revision: `${planModel.plan.revision}:${planModel.eventSequence}`,
         content: (
           <PlanTimelineBlock
-            model={model}
             planModel={planModel}
-            onOpenDetails={onOpenGoal}
+            onOpenDetails={onOpenPlan}
             onModifyPlan={modifyPlan}
-            onExecute={() => void goal.execute()}
-            busy={goal.busyAction !== undefined}
+            onExecute={() => void plan.execute()}
+            busy={plan.busyAction !== undefined}
           />
         ),
       },
     ];
-  }, [goal, onOpenGoal, modifyPlan, threadId]);
+  }, [plan, onOpenPlan, modifyPlan, threadId]);
   const turns = useTimelineStore(
-    useShallow((state) =>
-      threadId === ""
-        ? []
-        : Object.values(state.turns).filter((turn) => turn.threadId === threadId),
-    ),
+    useShallow((state) => (threadId === "" ? [] : selectTurnsForThread(threadId)(state))),
   );
   const committedItems = useTimelineStore(
     useShallow((state) => (threadId === "" ? [] : selectCommittedItemsForThread(threadId)(state))),
@@ -322,21 +330,21 @@ export function ConversationWorkspace({
         .at(-1),
     [turns],
   );
-  const currentPlanId = goal.planModel?.plan.planId;
+  const currentPlanId = plan.planModel?.plan.planId;
   const latestTerminalPlanTurnId = latestTerminalPlanTurn?.turnId;
-  const refreshGoal = goal.refresh;
+  const refreshPlan = plan.refresh;
   /**
-   * standalone Plan 没有 Goal event 可借用；Plan mode Turn 到达终态后显式回读 Plan 聚合，
+   * Plan mode Turn 到达终态后显式回读 Plan 聚合，
    * 让 agent 提出的 revision/approval 状态进入 UI，同时不在流式阶段轮询或扫描 Workspace。
    */
   useEffect(() => {
     if (currentPlanId === undefined || latestTerminalPlanTurnId === undefined) return;
-    void refreshGoal();
-  }, [currentPlanId, latestTerminalPlanTurnId, refreshGoal]);
+    void refreshPlan();
+  }, [currentPlanId, latestTerminalPlanTurnId, refreshPlan]);
   const latestTurnReview = useMemo<TurnReviewTarget | undefined>(() => {
     const workspaceId = workspace.workspace?.workspaceId;
     if (workspaceId === undefined) return undefined;
-    // Object insertion order follows the committed Timeline sequence；只取最后一个终态 Turn，
+    // 对象插入顺序遵循已提交的 Timeline 序号；只取最后一个终态 Turn，
     // 该轮无可靠非零修改时必须返回空，不能回退展示更早的旧修改。
     const latestTerminal = [...turns]
       .reverse()
@@ -472,14 +480,18 @@ export function ConversationWorkspace({
     }),
   );
   const approvals = useTimelineStore(
+    useShallow((state) => (threadId === "" ? [] : selectApprovalsForThread(threadId)(state))),
+  );
+  const approvalDecisions = useTimelineStore(
     useShallow((state) =>
-      threadId === ""
-        ? []
-        : selectApprovals(state).filter((approval) => approval.threadId === threadId),
+      threadId === "" ? {} : selectApprovalDecisionsForThread(threadId)(state),
     ),
   );
-  const approvalDecisions = useTimelineStore(useShallow((state) => selectApprovalDecisions(state)));
-  const approvalClosedAt = useTimelineStore(useShallow((state) => selectApprovalClosedAt(state)));
+  const approvalClosedAt = useTimelineStore(
+    useShallow((state) =>
+      threadId === "" ? {} : selectApprovalClosedAtForThread(threadId)(state),
+    ),
+  );
   const isProjectScope = workspace.workspace?.kind === "project";
   const replyFileOpen = useReplyFileOpen(
     isProjectScope ? workspace.workspace?.workspaceId : undefined,
@@ -511,8 +523,8 @@ export function ConversationWorkspace({
   });
   /** 只由请求身份或结算/恢复事实变化推进，避免普通渲染与关闭浮层制造后台读取。 */
   const usageRefreshRevision = [
-    contextFacts.usage?.requestId,
-    contextFacts.usage?.requestOrdinal,
+    contextFacts.usage?.modelRequestId,
+    contextFacts.usage?.modelRequestOrdinal,
     contextFacts.usage?.modelRound,
     contextFacts.usage?.measuredAt,
     contextFacts.invalidatedAt,
@@ -526,7 +538,10 @@ export function ConversationWorkspace({
     settings.scopeWorkspaceId ===
       (workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined);
   const ready =
-    settingsScopeReady && turnAdmissionReady && (boot.status === "ready" || boot.status === "busy");
+    settingsScopeReady &&
+    turnAdmissionReady &&
+    (workspace.workspace === undefined || workspace.bindingReady) &&
+    (boot.status === "ready" || boot.status === "busy");
   /** 一次性取消失败使用全局 Portal 提示，避免在 Composer 下面留下不会自动消失的红字。 */
   const reportConversationTransientError = useCallback((message: string): void => {
     toast.error(message, { id: "ja-conversation-cancel-failed" });
@@ -543,7 +558,7 @@ export function ConversationWorkspace({
       expectedThreadRevision: number;
       expectedRecoveryRevision: number;
       decision: "retry" | "skip";
-      idempotencyKey: string;
+      operationKey: string;
     }): Promise<void> => {
       const matchingTurn = turns.find((turn) => turn.turnId === input.turnId);
       if (
@@ -567,11 +582,11 @@ export function ConversationWorkspace({
     blocked: workspace.busy || conversation.busy,
     turnPort,
     readThreadRevision: conversation.readThreadRevision,
-    planCreationPort: planGoalAvailable
+    planCreationPort: planAvailable
       ? {
           // 模式切换 ACK 可能先于 Timeline 快照；采用同 Thread 已确认的最高 revision 创建计划。
           create: (ownerThreadId, objective, revision) =>
-            goal.createPlan(
+            plan.createPlan(
               ownerThreadId,
               objective,
               Math.max(
@@ -635,14 +650,11 @@ export function ConversationWorkspace({
     [settings.snapshot.skills],
   );
   /**
-   * Goal/Plan slash actions 绑定当前 Thread 的真实 controller：Plan 只改协作模板，Goal 只创建
-   * 持久聚合；两者都不读写 AccessMode，也不会把命令文本提交给模型。
+   * Plan slash action 只修改协作模板，不读写 AccessMode，也不把命令文本提交给模型。
    */
-  const goalPlanSlashCommands = conversationModeCommands({
-    available: planGoalAvailable,
-    threadId,
+  const planSlashCommands = conversationModeCommands({
+    available: planAvailable,
     interaction,
-    goal,
   });
   const hasConversationContent =
     committedItems.length > 0 ||
@@ -664,13 +676,25 @@ export function ConversationWorkspace({
 
   /** Composer 可用性只作为壳层快捷键 capability 发布，卸载时立即撤销。 */
   useEffect(() => {
-    onConversationFocusAvailabilityChange(!interaction.disabled);
+    onConversationFocusAvailabilityChange(active && !interaction.disabled);
     return () => onConversationFocusAvailabilityChange(false);
-  }, [interaction.disabled, onConversationFocusAvailabilityChange]);
+  }, [active, interaction.disabled, onConversationFocusAvailabilityChange]);
+
+  /** 打开新 Thread 后聚焦目标 Composer；若首次打开失败则控制器恢复来源，再聚焦以保住原草稿操作路径。 @author kongweiguang */
+  const forkReply = useCallback(
+    async (anchor: { threadId: string; itemId: string }) => {
+      const outcome = await conversation.forkReply(anchor);
+      if (outcome === "opened" || outcome === "open_failed")
+        setComposerFocusRequest((value) => value + 1);
+      return outcome;
+    },
+    [conversation.forkReply],
+  );
 
   // 空 Thread 与有内容 Thread 共用同一受控 Composer，视觉 dock 迁移不会丢失 Thread draft。
   const composer = (
     <Composer
+      active={active}
       focusRequest={composerFocusRequest}
       interactionSlot={<InteractionCard controller={clarification} />}
       text={interaction.draft}
@@ -681,10 +705,12 @@ export function ConversationWorkspace({
       workspaceId={workspace.workspace?.workspaceId}
       runtimeGeneration={runtimeState?.generation}
       skills={composerSkills}
-      slashCommands={[...goalPlanSlashCommands, ...(slashCommands ?? [])]}
+      slashCommands={[...planSlashCommands, ...(slashCommands ?? [])]}
       onSearchWorkspacePaths={searchWorkspacePaths}
       preferences={interaction.preferences}
       models={interaction.models}
+      modelSettingsRequired={interaction.modelSettingsRequired}
+      onOpenModelSettings={onOpenModelSettings}
       attachments={interaction.attachments}
       attachmentDraftItems={interaction.attachmentDraftItems}
       attachmentThumbnailPort={attachmentPreviewPort}
@@ -719,49 +745,26 @@ export function ConversationWorkspace({
           : "随心输入"
       }
       modeStatus={
-        planGoalAvailable && interaction.preferences !== undefined ? (
-          <ComposerGoalStatus
+        planAvailable && interaction.preferences !== undefined ? (
+          <ComposerPlanStatus
             mode={interaction.preferences.collaborationMode}
-            goal={goal.model?.goal}
-            currentStepTitle={
-              goal.model?.plan?.steps.find((step) => step.stepId === goal.model?.goal.currentStepId)
-                ?.title
-            }
             busy={interaction.preferenceBusy}
-            onOpenGoal={onOpenGoal}
-            onOpenPlan={goal.planModel === undefined ? undefined : onOpenGoal}
+            onOpenPlan={plan.planModel === undefined ? undefined : onOpenPlan}
             onDisablePlan={() => interaction.changeCollaborationMode("default")}
           />
         ) : undefined
       }
-      goalStatus={
-        planGoalAvailable && goal.model !== undefined ? (
-          <GoalStatusBar
-            goal={goal.model.goal}
-            evaluation={goal.model.evaluation}
-            currentStepTitle={
-              goal.model.plan?.steps.find((step) => step.stepId === goal.model?.goal.currentStepId)
-                ?.title
-            }
-            busy={goal.busyAction !== undefined}
-            onOpen={onOpenGoal}
-            onPause={() => void goal.pause()}
-            onResume={() => void goal.resume()}
-            onResolve={onOpenGoal}
-            onContinue={() => void goal.resume()}
-            hasPendingQuestion={clarification.request?.status === "pending"}
-            onAnswerQuestion={() => clarification.setCollapsed(false)}
-          />
-        ) : planGoalAvailable &&
-          goal.planModel !== undefined &&
-          goal.planModel.plan.activeRunId !== null ? (
+      planStatus={
+        planAvailable &&
+        plan.planModel !== undefined &&
+        plan.planModel.plan.activeRunId !== null ? (
           <PlanStatusBar
-            planModel={goal.planModel}
-            busy={goal.busyAction !== undefined}
-            onOpen={onOpenGoal}
-            onPause={() => void goal.pausePlan()}
-            onResume={() => void goal.resumePlan()}
-            onStop={() => void goal.stopPlan()}
+            planModel={plan.planModel}
+            busy={plan.busyAction !== undefined}
+            onOpen={onOpenPlan}
+            onPause={() => void plan.pausePlan()}
+            onResume={() => void plan.resumePlan()}
+            onStop={() => void plan.stopPlan()}
             hasPendingQuestion={clarification.request?.status === "pending"}
             onAnswerQuestion={() => clarification.setCollapsed(false)}
           />
@@ -786,8 +789,8 @@ export function ConversationWorkspace({
       onDropAttachments={
         attachmentPort === undefined ? undefined : interaction.importDroppedAttachments
       }
-      nativeDropEvent={nativeDropEvent}
-      dropZoneRef={onRegisterComposerDropZone}
+      nativeDropEvent={active ? nativeDropEvent : undefined}
+      dropZoneRef={active ? onRegisterComposerDropZone : undefined}
       onOpenAttachmentPreview={(attachment, source) => {
         if (
           workspace.workspace === undefined ||
@@ -856,11 +859,18 @@ export function ConversationWorkspace({
             onOpenMcpSettings={onOpenMcpSettings}
           />
           <ThreadOperationsMenu
+            key={noticeScope}
+            scope={noticeScope}
+            enabled={notificationsEnabled}
             showCompactAction={conversation.canCompact}
+            showExportAction={
+              onExportConversation !== undefined && (committedItems.length > 0 || turns.length > 0)
+            }
             compaction={conversation.compaction}
             onCompact={conversation.compact}
             onCancelCompaction={conversation.cancelCompaction}
             onDismissFeedback={conversation.dismissCompactionFeedback}
+            onExportConversation={onExportConversation}
           />
           {inspectorOpen ? null : (
             <IconButton
@@ -873,84 +883,82 @@ export function ConversationWorkspace({
           )}
         </div>
       </header>
-      {scopeError === undefined ? null : (
-        <p className="ja-inline-error" role="alert">
-          {scopeError}
-        </p>
-      )}
-      {pendingOperationForThread !== undefined && (
-        <div className="ja-inline-attention" role="status">
-          上一次操作结果待核实，可能已产生副作用。
-          {pendingOperationForThread.threadId === null
-            ? "审批可能属于其他会话，请检查相关会话。"
-            : "请先查看当前会话状态。"}
-          <button
-            className="ja-button ja-button-sm ja-button-ghost"
-            type="button"
-            onClick={() =>
-              void recheckPendingOperations()
-                .then((pending) => {
-                  if (
-                    pending.some(
-                      (record) =>
-                        record.clientOperationId === pendingOperationForThread.clientOperationId,
-                    )
-                  )
-                    setRecheckedPendingId(pendingOperationForThread.clientOperationId);
-                })
-                .catch(() => undefined)
-            }
-          >
-            重新检查
-          </button>
-          {recheckedPendingId === pendingOperationForThread.clientOperationId &&
-            confirmPendingId !== pendingOperationForThread.clientOperationId && (
-              <button
-                className="ja-button ja-button-sm ja-button-ghost"
-                type="button"
-                onClick={() => setConfirmPendingId(pendingOperationForThread.clientOperationId)}
-              >
-                我已检查，允许新操作
-              </button>
-            )}
-          {confirmPendingId === pendingOperationForThread.clientOperationId && (
-            <span>
-              原操作仍可能已经执行。确认后仅解除本机阻挡，不会重发原请求。
-              <button
-                className="ja-button ja-button-sm ja-button-ghost"
-                type="button"
-                onClick={() =>
-                  void acknowledgePendingOperation(pendingOperationForThread.clientOperationId)
-                    .then((outcome) => {
-                      setConfirmPendingId(undefined);
-                      if (outcome.status === "unknown_acknowledged")
-                        setAcknowledgedUnknownNotice(
-                          "已解除本机阻挡；原操作是否执行仍未确认。请避免重复同一副作用。",
-                        );
-                    })
-                    .catch(() => undefined)
-                }
-              >
-                确认解除阻挡
-              </button>
-            </span>
-          )}
-        </div>
-      )}
-      {acknowledgedUnknownNotice !== undefined && (
-        <p className="ja-inline-error" role="status">
-          {acknowledgedUnknownNotice}
-        </p>
-      )}
-      {visibleConversationError === undefined ? null : (
-        <p className="ja-inline-error" role="alert">
-          {visibleConversationError}
-        </p>
-      )}
       <div
         className={`ja-conversation-body${hasConversationContent ? "" : " ja-conversation-empty"}`}
         data-state={hasConversationContent ? "content" : "empty"}
       >
+        <Notification
+          scope={workspaceNoticeScope}
+          message={workspace.error?.includes("已保存") ? workspace.error : "项目目录不可用"}
+          tone="warning"
+          dismissible={false}
+          enabled={notificationsEnabled && showUnavailableNotice}
+        >
+          <Button
+            type="button"
+            disabled={
+              workspace.busy ||
+              workspace.directoryState === "checking" ||
+              workspace.workspace?.kind !== "project"
+            }
+            onClick={() => {
+              if (workspace.workspace?.kind === "project")
+                void onEditProject?.(workspace.workspace.workspaceId);
+            }}
+          >
+            修改目录
+          </Button>
+          <Button
+            type="button"
+            disabled={
+              workspace.busy ||
+              workspace.directoryState === "checking" ||
+              workspace.workspace?.kind !== "project"
+            }
+            onClick={() => void workspace.retryBinding()}
+          >
+            重新检查
+          </Button>
+        </Notification>
+        {active ? (
+          <Fragment key={noticeScope}>
+            {showUnavailableNotice ? null : scopeError === undefined ? null : (
+              <Notification
+                scope={noticeScope}
+                message={scopeError}
+                tone="error"
+                enabled={notificationsEnabled}
+              />
+            )}
+            <PendingOperationNotification
+              scope={noticeScope}
+              pending={pendingOperationForThread}
+              enabled={notificationsEnabled}
+            />
+            {visibleRecoveryStatus === undefined ? null : (
+              <Notification
+                scope={noticeScope}
+                message={visibleRecoveryStatus}
+                dismissible={false}
+                enabled={notificationsEnabled}
+              />
+            )}
+            {visibleConversationError === undefined ? null : (
+              <Notification
+                scope={noticeScope}
+                message={visibleConversationError.message}
+                tone="error"
+                enabled={notificationsEnabled}
+              >
+                {visibleConversationError.source === "history-load" ? (
+                  <button type="button" onClick={() => void conversation.retryHistory()}>
+                    重试
+                  </button>
+                ) : undefined}
+              </Notification>
+            )}
+          </Fragment>
+        ) : null}
         {!hasConversationContent ? (
           <div className="ja-conversation-empty-greeting">
             <img
@@ -971,6 +979,7 @@ export function ConversationWorkspace({
           </div>
         ) : (
           <ConversationTimelineSurface
+            active={active}
             threadId={threadId === "" ? undefined : threadId}
             hasOlderHistory={conversation.hasOlderHistory}
             loadingOlderHistory={conversation.loadingOlderHistory}
@@ -982,6 +991,12 @@ export function ConversationWorkspace({
             answeredAnswers={clarification.answeredAnswers}
             skills={composerSkills}
             turns={turns as Turn[]}
+            onForkReply={forkReply}
+            forkingReplies={conversation.forkingReplies}
+            forkCreatedReplies={conversation.forkCreatedReplies}
+            forkOpenFailures={conversation.forkOpenFailures}
+            forkConflictReplies={conversation.forkConflictReplies}
+            forkUnconfirmedReplies={conversation.forkUnconfirmedReplies}
             approvals={approvals}
             approvalDecisions={approvalDecisions}
             approvalClosedAt={approvalClosedAt}
@@ -1024,8 +1039,9 @@ export function ConversationWorkspace({
                       artifactId,
                     })
             }
+            processSession={processSession}
             onReviewTurn={openFrozenTurnReview}
-            externalRows={[...taskTimelineRows, ...planTimelineRows, ...goalTimelineRows]}
+            externalRows={[...taskTimelineRows, ...planTimelineRows]}
           />
         )}
       </div>

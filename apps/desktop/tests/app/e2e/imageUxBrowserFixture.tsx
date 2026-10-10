@@ -70,6 +70,7 @@ const IMAGE_ATTACHMENTS = [
 
 const ITEMS: readonly TimelineItemAdapter[] = [
   {
+    origin: "native" as const,
     itemId: "item_multi_image",
     threadId: THREAD_ID,
     turnId: MULTI_TURN_ID,
@@ -80,6 +81,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
     createdAt: "2026-09-23T09:00:00.000Z",
   },
   {
+    origin: "native" as const,
     itemId: "item_pure_image",
     threadId: THREAD_ID,
     turnId: PURE_TURN_ID,
@@ -93,6 +95,7 @@ const ITEMS: readonly TimelineItemAdapter[] = [
 
 const TURNS: readonly TimelineTurn[] = [
   {
+    origin: "native" as const,
     turnId: MULTI_TURN_ID,
     threadId: THREAD_ID,
     status: "completed",
@@ -101,6 +104,7 @@ const TURNS: readonly TimelineTurn[] = [
     changeSet: null,
   },
   {
+    origin: "native" as const,
     turnId: PURE_TURN_ID,
     threadId: THREAD_ID,
     status: "completed",

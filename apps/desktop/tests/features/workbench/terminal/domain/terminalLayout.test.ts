@@ -176,6 +176,7 @@ describe("terminal layout model", () => {
     }
   });
 
+  /** 布局仅持久化有限比例偏好，尺寸可行范围留给活动视口按 CSS 几何计算。 */
   it("splits, focuses, resizes and removes panes by immutable operations", () => {
     let layout = createDefaultTerminalLayout("ws_fixture");
     const tabId = layout.activeTabId as string;
@@ -188,7 +189,9 @@ describe("terminal layout model", () => {
     expect(layout.tabs[0]?.activePaneId).toBe(secondPane);
     const splitId = layout.tabs[0]?.root.kind === "split" ? layout.tabs[0].root.splitId : "";
     layout = setTerminalSplitRatio(layout, tabId, splitId, 0.99);
-    expect(layout.tabs[0]?.root.kind === "split" ? layout.tabs[0].root.ratio : 0).toBe(0.8);
+    expect(layout.tabs[0]?.root.kind === "split" ? layout.tabs[0].root.ratio : 0).toBe(0.99);
+    layout = setTerminalSplitRatio(layout, tabId, splitId, -0.25);
+    expect(layout.tabs[0]?.root.kind === "split" ? layout.tabs[0].root.ratio : 1).toBe(0);
     layout = removeTerminalPane(layout, tabId, firstPane);
     expect(layout.tabs[0] === undefined ? 0 : countPanes(layout.tabs[0].root)).toBe(1);
   });

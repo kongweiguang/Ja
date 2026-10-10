@@ -72,7 +72,7 @@ const completeProjectSkillDocument = {
   disabled_skills: [],
 } as const;
 
-describe("JA RPC v1 protocol", () => {
+describe("JA RPC v2 protocol", () => {
   it("accepts a configuration-free initialize request", () => {
     const params = {
       protocolMajor: JA_PROTOCOL_MAJOR,
@@ -83,7 +83,7 @@ describe("JA RPC v1 protocol", () => {
         events: ["runtime/status-changed"],
         accessModes: ["approval_required", "full_access"],
         collaborationModes: ["default", "plan"],
-        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+        features: ["task_threads", "plan", "interaction"],
       },
       limits,
     } as const;
@@ -112,21 +112,21 @@ describe("JA RPC v1 protocol", () => {
         occurredAt: "2026-09-04T00:00:00Z",
         status: "ready",
         generation: 1,
-        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+        features: ["task_threads", "plan", "interaction"],
         readyToken: "0123456789abcdef0123456789abcdef",
       },
     } as const;
 
     expect(parseNotification(ready)).toMatchObject(ready);
     expect(() =>
-      parseNotification({ ...ready, params: { ...ready.params, features: ["task_threads_v1"] } }),
+      parseNotification({ ...ready, params: { ...ready.params, features: ["task_threads"] } }),
     ).toThrow();
     expect(() =>
       parseNotification({
         ...ready,
         params: {
           ...ready.params,
-          features: ["plan_goal_v1", "task_threads_v1", "interaction_v1"],
+          features: ["plan", "task_threads", "interaction"],
         },
       }),
     ).toThrow();
@@ -195,6 +195,78 @@ describe("JA RPC v1 protocol", () => {
     ).toMatchObject({
       patch: { default_provider_id: "provider_demo", default_model_id: "model_demo" },
     });
+    /** User Provider/Model 写入只接受稳定 ID map；实体 null 删除，显式配置 null 使用 sentinel。 */
+    const sparseUserProviderPatch = {
+      providers: {
+        provider_demo: {
+          network_timeouts: { request_timeout_ms: 60_000 },
+          models: {
+            model_demo: {
+              model: "gpt-tuned",
+              default_reasoning_level: { __ja_null: true },
+            },
+            model_preview: {
+              name: "Preview",
+              model: "gpt-preview",
+              capabilities: { context_window_tokens: 128_000, max_output_tokens: 8_192 },
+              reasoning_level_map: {},
+              default_reasoning_level: { __ja_null: true },
+            },
+            model_removed: null,
+          },
+          model_order: ["model_demo", "model_preview"],
+        },
+        provider_removed: null,
+      },
+      provider_order: ["provider_demo"],
+    };
+    expect(
+      parseMethodParams("configuration/patch", {
+        scope: "user",
+        patch: sparseUserProviderPatch,
+        expectedVersion: "cfg_missing",
+      }),
+    ).toMatchObject({ patch: sparseUserProviderPatch });
+    for (const invalidPatch of [
+      { providers: [{ ...completeConfigDocument.providers[0] }] },
+      { providers: { provider_demo: { provider_id: "provider_demo" } } },
+      {
+        providers: {
+          provider_demo: { models: [{ ...completeConfigDocument.providers[0]!.models[0] }] },
+        },
+      },
+      {
+        providers: {
+          provider_demo: { models: { model_demo: { default_reasoning_level: null } } },
+        },
+      },
+      { provider_order: ["provider_demo", "provider_demo"] },
+      { providers: { invalid: null } },
+    ]) {
+      expect(() =>
+        parseMethodParams("configuration/patch", {
+          scope: "user",
+          patch: invalidPatch,
+          expectedVersion: "cfg_missing",
+        }),
+      ).toThrow();
+    }
+    const projectModelPatch = {
+      providers: [
+        {
+          provider_id: "provider_demo",
+          models: [{ model_id: "model_demo", model: "project-model" }],
+        },
+      ],
+    };
+    expect(
+      parseMethodParams("configuration/patch", {
+        scope: "project",
+        workspaceId: "ws_demo",
+        patch: projectModelPatch,
+        expectedVersion: "cfg_A",
+      }),
+    ).toMatchObject({ patch: projectModelPatch });
     expect(
       parseMethodParams("configuration/replace", {
         scope: "project",
@@ -309,7 +381,7 @@ describe("JA RPC v1 protocol", () => {
     ).toMatchObject({ document });
   });
 
-  /** Provider 必须各自持有 credential ID，Renderer 不允许把共享 Secret 引用写入 v1。 */
+  /** Provider 必须各自持有 credential ID，Renderer 不允许把共享 Secret 引用写入 Wire。 */
   it("rejects shared credential identities across providers", () => {
     const duplicate = {
       ...structuredClone(completeConfigDocument.providers[0]),
@@ -410,13 +482,95 @@ describe("JA RPC v1 protocol", () => {
       createdAt: "2026-09-03T01:00:00Z",
       expiresAt: "2026-09-04T01:00:00Z",
       boundMessageId: "item_user",
+      boundThreadId: null,
     };
     expect(parseMethodResult("attachment/import", metadata)).toEqual(metadata);
+    const forkBoundMetadata = {
+      ...metadata,
+      boundMessageId: null,
+      boundThreadId: "thr_fork",
+    };
+    expect(parseMethodResult("attachment/import", forkBoundMetadata)).toEqual(forkBoundMetadata);
     expect(() =>
       parseMethodResult("attachment/import", {
         ...metadata,
         boundMessageId: undefined,
+        boundThreadId: null,
         boundTurnId: "turn_demo",
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("attachment/import", {
+        ...metadata,
+        boundThreadId: "thr_fork",
+      }),
+    ).toThrow();
+  });
+
+  /** Fork 身份固定到真实 Item；旧 Turn 锚点不能通过严格请求或回执 schema。 */
+  it("anchors fork requests and receipts to the exact source item", () => {
+    const input = {
+      sourceThreadId: "thr_source",
+      sourceItemId: "item_answer",
+      expectedThreadRevision: 7,
+      operationKey: "op_0123456789abcdef0123456789abcdef",
+    };
+    expect(parseMethodParams("thread/fork", input)).toEqual(input);
+    expect(() =>
+      parseMethodParams("thread/fork", {
+        sourceThreadId: input.sourceThreadId,
+        sourceTurnId: "turn_answer",
+        expectedThreadRevision: input.expectedThreadRevision,
+        operationKey: input.operationKey,
+      }),
+    ).toThrow();
+    expect(
+      parseMethodParams("operation/read", {
+        operationKey: input.operationKey,
+        sourceThreadId: input.sourceThreadId,
+      }),
+    ).toEqual({ operationKey: input.operationKey, sourceThreadId: input.sourceThreadId });
+
+    const result = {
+      thread: {
+        threadId: "thr_fork",
+        workspaceId: "ws_demo",
+        workspaceKind: "project",
+        preferences: null,
+        title: "Source title (fork)",
+        status: "active",
+        pinned: false,
+        latestTurnStatus: null,
+        latestTurnSeen: true,
+        revision: 1,
+        createdAt: "2026-10-10T00:00:00Z",
+        updatedAt: "2026-10-10T00:00:00Z",
+      },
+      source: {
+        threadId: input.sourceThreadId,
+        itemId: input.sourceItemId,
+        threadRevision: input.expectedThreadRevision,
+      },
+    } as const;
+    expect(parseMethodResult("thread/fork", result)).toEqual(result);
+    expect(
+      parseMethodResult("operation/read", {
+        status: "committed",
+        method: "thread/fork",
+        threadId: input.sourceThreadId,
+        result,
+      }),
+    ).toMatchObject({ result: { source: result.source } });
+    expect(() =>
+      parseMethodResult("thread/fork", {
+        ...result,
+        source: { threadId: input.sourceThreadId, turnId: "turn_answer", threadRevision: 7 },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/fork", {
+        ...result,
+        thread: { ...result.thread, threadId: input.sourceThreadId },
       }),
     ).toThrow();
   });
@@ -432,6 +586,7 @@ describe("JA RPC v1 protocol", () => {
     };
     const turn = {
       turnId: "turn_demo",
+      origin: "native" as const,
       sourceMessageId: null,
       status: "running" as const,
       requestedAt: "2026-09-03T01:00:00Z",
@@ -447,7 +602,10 @@ describe("JA RPC v1 protocol", () => {
       kind: "user_input" as const,
       content: [{ type: "attachment" as const, attachmentId: "att_capture" }],
       attachments: [summary],
+      totalCharacters: 0,
+      truncated: false,
     };
+    const snapshotItem = { ...item, origin: "native" as const };
     const queuedInput = {
       inputId: "input_capture",
       turnId: "turn_demo",
@@ -467,11 +625,10 @@ describe("JA RPC v1 protocol", () => {
       threadId: "thr_demo",
       revision: 2,
       turns: [turn],
-      items: [item],
+      items: [snapshotItem],
       inputQueue: { turnId: "turn_demo", revision: 1, accepting: true, items: [queuedInput] },
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: null,
       nextCursor: null,
     };
@@ -494,13 +651,13 @@ describe("JA RPC v1 protocol", () => {
     expect(() =>
       parseMethodResult("thread/read", {
         ...snapshot,
-        items: [{ ...item, attachments: [{ ...summary, attachmentId: "att_other" }] }],
+        items: [{ ...snapshotItem, attachments: [{ ...summary, attachmentId: "att_other" }] }],
       }),
     ).toThrow();
     expect(() =>
       parseMethodResult("thread/read", {
         ...snapshot,
-        items: [{ ...item, kind: "attachment", state: "bound" }],
+        items: [{ ...snapshotItem, kind: "attachment", state: "bound" }],
       }),
     ).toThrow();
     expect(() =>
@@ -552,8 +709,8 @@ describe("JA RPC v1 protocol", () => {
     ).toThrow();
   });
 
-  /** Skill 发现按 Workspace identity 取项目来源，同时来源闭集不接受旧 workspace 别名。 */
-  it("validates workspace-scoped four-source Skill discovery", () => {
+  /** Skill 发现只使用三种公开来源，Core 专用扩展来源不能出现在 RPC 投影。 */
+  it("validates workspace-scoped public Skill discovery", () => {
     expect(parseMethodParams("skill/list", { workspaceId: "ws_project", limit: 20 })).toEqual({
       workspaceId: "ws_project",
       limit: 20,
@@ -563,7 +720,7 @@ describe("JA RPC v1 protocol", () => {
       parseMethodResult("skill/list", {
         items: [
           {
-            skillId: "skill_demo",
+            skillId: "bundled:demo",
             name: "Demo",
             scope: "workspace",
             enabled: false,
@@ -582,14 +739,12 @@ describe("JA RPC v1 protocol", () => {
       threadId: "thr_legacy",
       workspaceId: "ws_demo",
       workspaceKind: "project",
-      legacySharedWorkspaceId: null,
       preferences: null,
       title: "Historical thread",
       status: "archived",
       pinned: false,
       latestTurnStatus: null,
       latestTurnSeen: true,
-      activeGoalId: null,
       revision: 2,
       createdAt: "2026-08-24T12:00:00Z",
       updatedAt: "2026-08-25T12:00:00Z",
@@ -672,7 +827,7 @@ describe("JA RPC v1 protocol", () => {
         events: [],
         accessModes: ["approval_required", "full_access"],
         collaborationModes: ["default", "plan"],
-        features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+        features: ["task_threads", "plan", "interaction"],
       },
       limits,
     };
@@ -777,7 +932,7 @@ describe("JA RPC v1 protocol", () => {
     ).toThrow();
   });
 
-  /** MCP status metadata mirrors the configuration name budget and known tool-count ceiling. */
+  /** MCP 状态元数据遵循配置名称长度上限和已知工具数量上限。 */
   it("accepts MCP status values through their configured bounds", () => {
     const server = {
       serverId: "mcp_bounded",

@@ -7,9 +7,11 @@ export { FileTree } from "./ui/FileTree";
 export type {
   FilesActions,
   FilesControllerPorts,
+  FilesUnsavedDocumentSummary,
   FilesViewModel,
   FilesWorkspaceCloseLease,
   FilesWorkspaceLifecycle,
+  FilesWorkspaceRebindLease,
   FilesWorkspaceProps,
   OpenDocument,
 } from "./application/types";

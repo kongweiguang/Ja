@@ -69,12 +69,16 @@ const REVIEW_FAILURES: Readonly<Record<string, Omit<ReviewFailure, "code">>> = {
   REVIEW_CONFLICT: { message: "当前文件存在重叠修改，无法安全应用。", retryable: false },
   REVIEW_READ_ONLY: { message: "此 Review 来源为只读。", retryable: false },
   REVIEW_UNAVAILABLE: { message: "当前轮次没有可精确归因的变更。", retryable: false },
-  REVIEW_LIMIT: { message: "Review 内容超过安全上限。", retryable: false },
+  REVIEW_LIMIT: {
+    message: "审阅内容超出当前安全上限。请切换到改动较少的审阅来源，再点顶部“重新读取审阅”按钮。",
+    retryable: false,
+  },
   NOT_GIT_REPOSITORY: { message: "当前目录不是 Git 工作区，审查不可用。", retryable: false },
   INVALID_INPUT: { message: "Review 请求参数无效。", retryable: false },
   WORKSPACE_ESCAPE: { message: "请求路径不在工作区内。", retryable: false },
   HOST_BUSY: { message: "工作区正被其他操作占用，请稍后重试。", retryable: true },
   CANCELLED: { message: "Review 操作已取消。", retryable: true },
+  PARSE: { message: "Git 输出解析失败", retryable: false },
   RUNTIME_UNAVAILABLE: { message: "运行时暂不可用，请稍后重试。", retryable: true },
   RUNTIME_PROTOCOL_ERROR: { message: "运行时返回的数据无效。", retryable: false },
 };

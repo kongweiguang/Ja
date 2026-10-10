@@ -25,7 +25,7 @@ pub enum AppServerProcessError {
     QueueFull(QueueKind),
     QueueClosed(QueueKind),
     PendingLimit,
-    RequestLedgerExhausted,
+    RpcRequestLedgerExhausted,
     DuplicateRequest,
     DeadlineExceeded,
     Cancelled,
@@ -54,8 +54,8 @@ impl Display for AppServerProcessError {
             Self::QueueFull(kind) => write!(formatter, "sidecar {kind:?} queue is full"),
             Self::QueueClosed(kind) => write!(formatter, "sidecar {kind:?} queue is closed"),
             Self::PendingLimit => formatter.write_str("sidecar pending request limit reached"),
-            Self::RequestLedgerExhausted => {
-                formatter.write_str("sidecar request id ledger exhausted")
+            Self::RpcRequestLedgerExhausted => {
+                formatter.write_str("sidecar RPC request id ledger exhausted")
             }
             Self::DuplicateRequest => formatter.write_str("duplicate sidecar request"),
             Self::DeadlineExceeded => formatter.write_str("sidecar request deadline exceeded"),

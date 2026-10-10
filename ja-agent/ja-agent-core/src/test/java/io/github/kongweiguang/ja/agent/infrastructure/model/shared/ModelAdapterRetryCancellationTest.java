@@ -1,0 +1,644 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.agent.infrastructure.model.shared;
+
+import io.github.kongweiguang.ja.agent.infrastructure.model.ModelAdapter;
+import io.github.kongweiguang.ja.agent.infrastructure.model.ModelAdapterFactory;
+import io.github.kongweiguang.ja.agent.infrastructure.model.ProviderProtocolException;
+import io.github.kongweiguang.ja.agent.infrastructure.model.openai.OpenAiChatCompletionsAdapter;
+import io.github.kongweiguang.ja.agent.infrastructure.model.openai.OpenAiResponsesAdapter;
+import io.github.kongweiguang.ja.conversation.adapter.out.provider.support.ModelAdapterTestSupport;
+import io.github.kongweiguang.ja.agent.domain.model.ModelUsage;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.agent.application.gateway.ModelPort;
+import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.URI;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import mockwebserver3.MockResponse;
+import mockwebserver3.MockWebServer;
+import mockwebserver3.RecordedRequest;
+import okhttp3.ConnectionPool;
+import okhttp3.Dispatcher;
+import okhttp3.OkHttpClient;
+import org.junit.jupiter.api.Test;
+
+/** 传输 Policy 测试证明格式恢复有界且不重复正文，活动交换仍遵守取消与 Deadline。 */
+final class ModelAdapterRetryCancellationTest {
+    private static final String COMPLETE = """
+            event: response.created
+            data: {"type":"response.created","sequence_number":0,"response":%s}
+
+            event: response.completed
+            data: {"type":"response.completed","sequence_number":1,"response":%s}
+
+            """.formatted(
+                    ModelAdapterTestSupport.openAiResponse("resp_ok", "in_progress"),
+                    ModelAdapterTestSupport.openAiResponse(
+                            "resp_ok", "completed", new ModelUsage(1, 1, 2)));
+
+    /** Provider Adapter 每次只发送一个 HTTP 请求，瞬时错误交给持久会话重试。 */
+    @Test
+    void transientStatusStopsSingleAdapterAttempt() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.status(exchange, 429, "0"))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                assertTrue(failure.getCause() instanceof ProviderProtocolException);
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 408/409 在两种 Provider 上都保留一次请求的重试语义，由持久会话负责下一次尝试。 */
+    @Test
+    void timeoutAndConflictRemainRetryableForOpenAiAndAnthropic() throws Exception {
+        try (ModelAdapterFactory factory = new ModelAdapterFactory()) {
+            for (ModelPort.Api api : List.of(ModelPort.Api.OPENAI_RESPONSES, ModelPort.Api.ANTHROPIC_MESSAGES)) {
+                for (int status : List.of(408, 409)) {
+                    try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                            (call, exchange) -> ModelAdapterTestSupport.status(exchange, status, "0"))) {
+                        ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                                server.baseUri(), api, Duration.ofSeconds(5));
+                        try (ModelAdapter adapter = factory.create(configuration)) {
+                            ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                                    adapter.start(ModelAdapterTestSupport.request(configuration),
+                                                    event -> CompletableFuture.completedFuture(null),
+                                                    CancellationToken.none())
+                                            .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                            ProviderProtocolException providerFailure = assertInstanceOf(
+                                    ProviderProtocolException.class, failure.getCause());
+                            assertTrue(providerFailure.retryable());
+                            assertEquals("MODEL_UNAVAILABLE", providerFailure.terminalErrorCode());
+                        }
+                        assertEquals(1, server.calls());
+                    }
+                }
+            }
+        }
+    }
+
+    /** 代理返回巨大的 429 错误正文时仍按状态进入会话重试，诊断容量不能夺走错误分类。 */
+    @Test
+    void oversizedRateLimitBodyStillClassifiesAsRetryable() throws Exception {
+        String errorBody = "x".repeat(AbstractStreamingModelAdapter.MAX_ERROR_BODY_BYTES + 1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.json(exchange, 429, errorBody))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                ProviderProtocolException status = assertInstanceOf(ProviderProtocolException.class,
+                        failure.getCause());
+                assertEquals("HTTP_STATUS", status.code());
+                assertTrue(status.retryable());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** Adapter 不记录跨请求熔断状态；显式创建的第十次请求仍真实到达 HTTP。 */
+    @Test
+    void explicitRequestsReachHttpAfterRepeatedFailures() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
+            if (call <= 9) {
+                ModelAdapterTestSupport.status(exchange, 503, "0");
+            }
+            else {
+                ModelAdapterTestSupport.sse(exchange, COMPLETE, 9);
+            }
+        }); ModelAdapterFactory factory = new ModelAdapterFactory()) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            for (int index = 0; index < 9; index++) {
+                try (ModelAdapter adapter = factory.create(configuration)) {
+                    assertThrows(ExecutionException.class, () -> adapter.start(
+                            ModelAdapterTestSupport.request(configuration), event -> CompletableFuture.completedFuture(null),
+                            CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS));
+                }
+                assertEquals(index + 1, server.calls());
+            }
+            try (ModelAdapter adapter = factory.create(configuration)) {
+                assertEquals(ModelPort.FinishReason.STOP, adapter.start(ModelAdapterTestSupport.request(configuration),
+                        event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS).finishReason());
+            }
+            assertEquals(10, server.calls());
+        }
+    }
+
+
+    /** 连接预算较短时，首个 SSE 正文仍可等待到请求总预算，避免慢首 token 被误判为断连。 */
+    @Test
+    void allowsFirstSseBodyAfterConnectTimeoutWithinRequestTimeout() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.setDispatcher(new mockwebserver3.Dispatcher() {
+                /** 将首个正文延迟到连接预算之后，验证读超时使用请求总预算而非连接预算。 */
+                @Override
+                public MockResponse dispatch(RecordedRequest request) {
+                    return new MockResponse.Builder().code(200)
+                            .setHeader("Content-Type", "text/event-stream; charset=utf-8")
+                            .body(COMPLETE)
+                            .bodyDelay(2_500, TimeUnit.MILLISECONDS)
+                            .build();
+                }
+            });
+            server.start(InetAddress.getByName("127.0.0.1"), 0);
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                    URI.create("http://127.0.0.1:" + server.getPort()),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(8, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+            assertEquals(1, server.getRequestCount());
+        }
+    }
+
+    /** 流式请求逐次读取遵守配置空闲上限且不启动短于 Turn 的绝对 Call 超时。 */
+    @Test
+    void requestClientUsesRequestTimeoutForBodyIo() throws Exception {
+        ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
+                URI.create("http://127.0.0.1:1"), ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(17));
+        try (ModelTransport transport = new ModelTransport()) {
+            OkHttpClient client = transport.clientFor(configuration);
+            assertEquals(configuration.connectTimeout(), client.connectTimeoutMillis() == 0
+                    ? Duration.ZERO : Duration.ofMillis(client.connectTimeoutMillis()));
+            assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.readTimeoutMillis()));
+            assertEquals(configuration.requestTimeout(), Duration.ofMillis(client.writeTimeoutMillis()));
+            assertEquals(0, client.callTimeoutMillis());
+        }
+    }
+
+
+    /** 截断流保留已经送达的单次文本，Adapter 不自行回放第二次响应。 */
+    @Test
+    void truncatedStreamStopsAfterOneAttempt() throws Exception {
+        String truncated = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"persisted","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                """.formatted(ModelAdapterTestSupport.openAiResponse("resp_partial", "in_progress"));
+        StringBuilder text = new StringBuilder();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, truncated, 5))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration), event -> {
+                            if (event instanceof ModelPort.TextDelta delta) {
+                                text.append(delta.text());
+                            }
+                            return CompletableFuture.completedFuture(null);
+                        }, CancellationToken.none()).toCompletableFuture().get(5, TimeUnit.SECONDS));
+                assertEquals("MODEL_STREAM_INVALID",
+                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).terminalErrorCode());
+            }
+            assertEquals("persisted", text.toString());
+            assertEquals(1, server.calls());
+        }
+    }
+
+
+    /** 单个 Provider SSE delta 超过旧帧阈值时仍完整交付给调用方。 */
+    @Test
+    void acceptsTextDeltaLargerThanFormerFrameLimit() throws Exception {
+        String text = "x".repeat(3 * 1024 * 1024);
+        String oversized = "data: {\"id\":\"chatcmpl_large\",\"object\":\"chat.completion.chunk\","
+                + "\"created\":0,\"model\":\"test-model\",\"choices\":[{\"index\":0,"
+                + "\"delta\":{\"content\":\"" + text + """
+                    "},"finish_reason":null}]}
+                    
+                    data: {"id":"chatcmpl_large","object":"chat.completion.chunk",\
+                    "created":0,"model":"test-model","choices":[{"index":0,\
+                    "delta":{},"finish_reason":"stop"}]}
+                    
+                    data: [DONE]
+                    
+                    """;
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, oversized, 4096))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_CHAT_COMPLETIONS, Duration.ofSeconds(15));
+            StringBuilder delivered = new StringBuilder();
+            try (OpenAiChatCompletionsAdapter adapter = new OpenAiChatCompletionsAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> {
+                                    if (event instanceof ModelPort.TextDelta delta) {
+                                        delivered.append(delta.text());
+                                    }
+                                    return CompletableFuture.completedFuture(null);
+                                }, CancellationToken.none())
+                        .toCompletableFuture().get(20, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+            assertEquals(text.length(), delivered.length());
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 未知扩展事件被跳过，后续已知完成事件仍只结算一次。 */
+    @Test
+    void ignoresUnknownProviderEventBeforeCompletion() throws Exception {
+        String unknown = """
+            event: response.future_event
+            data: {"type":"response.future_event"}
+            
+            event: response.created
+            data: {"type":"response.created",\
+            "sequence_number":0,"response":\
+            """
+                + ModelAdapterTestSupport.openAiResponse("resp_future", "in_progress") + """
+                    }
+                    
+                    event: response.completed
+                    data: {"type":"response.completed",\
+                    "sequence_number":1,"response":\
+                    """
+                + ModelAdapterTestSupport.openAiResponse("resp_future", "completed") + "}\n\n";
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, unknown, 3))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ModelPort.ModelOutcome outcome = adapter.start(ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 覆盖面向组合根的 Factory ModelPort 路径，并证明请求 Codec 生命周期仅限单次请求。 */
+    @Test
+    void factoryStartsRequestScopedAdapter() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, COMPLETE, 5))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (ModelAdapterFactory factory = new ModelAdapterFactory()) {
+                ModelPort.ModelOutcome outcome = factory.start(ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture().get(5, TimeUnit.SECONDS);
+                assertEquals(ModelPort.FinishReason.STOP, outcome.finishReason());
+                assertEquals(1, server.calls());
+            }
+        }
+    }
+
+    /**
+     * 目录读取必须保留反向代理路径、在已有 `/v1` 后只补 `models`，并按 Anthropic 协议使用
+     * x-api-key 而不把凭据误放入 Bearer Header。
+     */
+    @Test
+    void factoryDiscoversModelsThroughBoundedProviderCatalogEndpoint() throws Exception {
+        try (MockWebServer server = new MockWebServer(); ModelAdapterFactory factory = new ModelAdapterFactory()) {
+            server.enqueue(new MockResponse.Builder().code(200)
+                    .setHeader("Content-Type", "application/json")
+                    .body("{\"data\":[{\"id\":\"claude-fixture\"},{\"id\":\"claude-second\"}]}")
+                    .build());
+            server.start(InetAddress.getByName("127.0.0.1"), 0);
+            ModelPort.ModelDiscoveryRequest request = new ModelPort.ModelDiscoveryRequest(
+                    "provider_test", "cfg_test", ModelPort.Api.ANTHROPIC_MESSAGES,
+                    URI.create("http://127.0.0.1:" + server.getPort() + "/gateway/v1"),
+                    "test-secret", Duration.ofSeconds(2), Duration.ofSeconds(5));
+
+            ModelPort.ModelDiscoveryResult result = factory.discoverModels(request, CancellationToken.none())
+                    .toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertEquals(List.of("claude-fixture", "claude-second"), result.items());
+            assertFalse(result.truncated());
+            RecordedRequest recorded = server.takeRequest(1, TimeUnit.SECONDS);
+            assertEquals("/gateway/v1/models", recorded.getUrl().encodedPath());
+            assertEquals("test-secret", recorded.getHeaders().get("x-api-key"));
+            assertNull(recorded.getHeaders().get("Authorization"));
+        }
+    }
+
+    /** 关闭 Factory 持有的共享传输，并取消 Adapter 创建的活动流。 */
+    @Test
+    void factoryCloseStopsActiveSharedTransport() throws Exception {
+        CountDownLatch headersSent = new CountDownLatch(1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            ModelAdapterFactory factory = new ModelAdapterFactory();
+            ModelAdapter adapter = factory.create(configuration);
+            try {
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
+                                ModelAdapterTestSupport.request(configuration),
+                                event -> CompletableFuture.completedFuture(null), CancellationToken.none())
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                factory.close();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(2, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
+                assertSharedTransportClosed(factory);
+            } finally {
+                adapter.close();
+            }
+        }
+    }
+
+    /** 校验 Factory 关闭屏障覆盖 OkHttp Call、空闲连接和自有工作线程。 */
+    private static void assertSharedTransportClosed(ModelAdapterFactory factory) throws Exception {
+        Field transportField = ModelAdapterFactory.class.getDeclaredField("transport");
+        transportField.setAccessible(true);
+        ModelTransport transport = (ModelTransport) transportField.get(factory);
+        Field clientField = ModelTransport.class.getDeclaredField("client");
+        clientField.setAccessible(true);
+        OkHttpClient client = (OkHttpClient) clientField.get(transport);
+        Dispatcher dispatcher = client.dispatcher();
+        ConnectionPool pool = client.connectionPool();
+        assertEquals(0, dispatcher.queuedCallsCount());
+        assertEquals(0, dispatcher.runningCallsCount());
+        assertEquals(0, pool.connectionCount());
+        assertEquals(0, pool.idleConnectionCount());
+        assertTrue(dispatcher.executorService().isTerminated());
+        Field requestsField = ModelTransport.class.getDeclaredField("requests");
+        requestsField.setAccessible(true);
+        assertTrue(((java.util.concurrent.ExecutorService) requestsField.get(transport)).isTerminated());
+        Field deadlinesField = ModelTransport.class.getDeclaredField("deadlines");
+        deadlinesField.setAccessible(true);
+        assertTrue(((java.util.concurrent.ExecutorService) deadlinesField.get(transport)).isTerminated());
+    }
+
+    /** 即使此前没有语义事件，也将明确 Provider 错误事件视为不可重试。 */
+    @Test
+    void doesNotRetryExplicitProviderErrorEvent() throws Exception {
+        String error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"sensitive detail\"}}\n\n";
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, error, 4))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                        CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                ProviderProtocolException protocol =
+                        assertInstanceOf(ProviderProtocolException.class, failure.getCause());
+                assertEquals("PROVIDER_ERROR", protocol.code());
+                assertTrue(!protocol.getMessage().contains("sensitive detail"));
+                assertNull(protocol.getCause());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 将 sink 拒绝视为本地持久化失败，绝不重放 Provider 输出。 */
+    @Test
+    void doesNotRetryWhenEventSinkRejectsPersistence() throws Exception {
+        String text = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"cannot persist","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                """.formatted(ModelAdapterTestSupport.openAiResponse(
+                        "resp_sink", "in_progress"));
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, text, 8))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> java.util.concurrent.CompletableFuture.failedFuture(
+                                                new IllegalStateException("database unavailable")),
+                                        CancellationToken.none())
+                                .toCompletableFuture().get(5, TimeUnit.SECONDS));
+                assertEquals("EVENT_SINK",
+                        assertInstanceOf(ProviderProtocolException.class, failure.getCause()).code());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 持续收到流字节时允许单个模型调用超过空闲预算，最终仍服从 Turn 取消。 */
+    @Test
+    void cancellationClosesActiveStreamAndStopsRetries() throws Exception {
+        CountDownLatch headersSent = new CountDownLatch(1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+            ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
+            try (ModelTransport transport = new ModelTransport();
+                 OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration, transport)) {
+                OkHttpClient client = transport.clientFor(configuration);
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
+                                withDeadlinePolicy(ModelAdapterTestSupport.request(configuration),
+                                        ModelPort.RequestDeadlinePolicy.TURN_MANAGED),
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null), cancellation)
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(350);
+                assertFalse(future.isDone());
+                cancellation.cancel();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(1, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
+                assertEquals(0, client.dispatcher().runningCallsCount());
+                assertEquals(0, client.dispatcher().queuedCallsCount());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 仅在活动 sink Future 已取消且后续 SSE 事件无法到达后完成取消。 */
+    @Test
+    void cancellationBarrierStopsSinkFutureAndLateEvents() throws Exception {
+        String twoEvents = """
+                event: response.created
+                data: {"type":"response.created","sequence_number":0,"response":%s}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"first","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":1}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","content_index":0,"delta":"late","item_id":"message_1","logprobs":[],"output_index":0,"sequence_number":2}
+
+                event: response.completed
+                data: {"type":"response.completed","sequence_number":3,"response":%s}
+
+                """.formatted(
+                        ModelAdapterTestSupport.openAiResponse("resp_barrier", "in_progress"),
+                        ModelAdapterTestSupport.openAiResponse(
+                                "resp_barrier", "completed", new ModelUsage(1, 2, 3)));
+        CountDownLatch sinkEntered = new CountDownLatch(1);
+        CompletableFuture<Void> pendingSink = new CompletableFuture<>();
+        AtomicInteger sinkCalls = new AtomicInteger();
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, twoEvents, 1))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(
+                        ModelAdapterTestSupport.request(configuration), event -> {
+                    sinkCalls.incrementAndGet();
+                    sinkEntered.countDown();
+                    return pendingSink;
+                }, cancellation).toCompletableFuture();
+                assertTrue(sinkEntered.await(2, TimeUnit.SECONDS));
+                cancellation.cancel();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(2, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
+                assertTrue(pendingSink.isCancelled());
+                assertEquals(1, sinkCalls.get());
+                assertEquals(0, cancellation.callbackCount());
+            }
+        }
+    }
+
+    /** 在 HTTP 启动前拒绝预取消 Token，并在完成时移除立即触发的回调。 */
+    @Test
+    void preCancelledTokenNeverStartsHttp() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.sse(exchange, COMPLETE, 4))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
+            ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
+            cancellation.cancel();
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(ModelAdapterTestSupport.request(configuration),
+                                        event -> CompletableFuture.completedFuture(null), cancellation)
+                                .toCompletableFuture().get(2, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
+                assertEquals(0, cancellation.callbackCount());
+            }
+            assertEquals(0, server.calls());
+        }
+    }
+
+    /** 响应读取空闲超过配置上限后关闭当前流，并保留可供外层 Turn 重试识别的超时类别。 */
+    @Test
+    void idleTimeoutClosesActiveStream() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.delayedSse(exchange, 1, TimeUnit.SECONDS))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest singleAttempt = new ModelPort.ModelRequest(
+                    base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
+                    base.round(),
+                    ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                ExecutionException failure = assertThrows(ExecutionException.class, () ->
+                        adapter.start(singleAttempt,
+                                        event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                        CancellationToken.none())
+                                .toCompletableFuture().get(2, TimeUnit.SECONDS));
+                ProviderProtocolException timeout = assertInstanceOf(
+                        ProviderProtocolException.class, failure.getCause());
+                assertEquals("REQUEST_IDLE_TIMEOUT", timeout.code());
+                assertEquals("MODEL_IDLE_TIMEOUT", timeout.terminalErrorCode());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** TURN_MANAGED 不受逐请求总时长限制，但仍由调用方的 Turn Deadline 取消活动心跳流。 */
+    @Test
+    void turnManagedRequestUsesCallerDeadlineDespiteContinuousHeartbeats() throws Exception {
+        CountDownLatch headersSent = new CountDownLatch(1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(150));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest turnManaged = withDeadlinePolicy(base,
+                    ModelPort.RequestDeadlinePolicy.TURN_MANAGED);
+            ModelAdapterTestSupport.TestCancellation cancellation = new ModelAdapterTestSupport.TestCancellation();
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(turnManaged,
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null), cancellation)
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(500);
+                assertFalse(future.isDone(), "continuous heartbeats must not trip the per-read idle limit");
+
+                cancellation.cancel();
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(2, TimeUnit.SECONDS));
+                assertInstanceOf(CancellationException.class, failure.getCause());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** CALL_BOUNDED 保留整次请求绝对上限，即便服务器持续发送字节而未触发逐次读取空闲超时。 */
+    @Test
+    void callBoundedRequestStopsContinuousStreamAtAbsoluteLimit() throws Exception {
+        CountDownLatch headersSent = new CountDownLatch(1);
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.stallingSse(exchange, headersSent))) {
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(server.baseUri(),
+                    ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(2));
+            ModelPort.ModelRequest base = ModelAdapterTestSupport.request(configuration);
+            ModelPort.ModelRequest bounded = new ModelPort.ModelRequest(
+                    base.configuration(), base.prompt(), base.messages(), base.tools(), base.continuation(),
+                    base.round(),
+                    ModelPort.RequestDeadlinePolicy.CALL_BOUNDED);
+            try (OpenAiResponsesAdapter adapter = new OpenAiResponsesAdapter(configuration)) {
+                CompletableFuture<ModelPort.ModelOutcome> future = adapter.start(bounded,
+                                event -> java.util.concurrent.CompletableFuture.completedFuture(null),
+                                CancellationToken.none())
+                        .toCompletableFuture();
+                assertTrue(headersSent.await(2, TimeUnit.SECONDS));
+                Thread.sleep(500);
+                assertFalse(future.isDone());
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> future.get(3, TimeUnit.SECONDS));
+                ProviderProtocolException timeout = assertInstanceOf(
+                        ProviderProtocolException.class, failure.getCause());
+                assertEquals("REQUEST_TIMEOUT", timeout.code());
+            }
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 显式选择生命周期策略，避免测试从配置值或请求内容推断绝对截止的所有者。 */
+    private static ModelPort.ModelRequest withDeadlinePolicy(
+            ModelPort.ModelRequest request, ModelPort.RequestDeadlinePolicy deadlinePolicy) {
+        return new ModelPort.ModelRequest(request.configuration(), request.prompt(), request.messages(),
+                request.tools(), request.continuation(), request.round(), deadlinePolicy);
+    }
+}

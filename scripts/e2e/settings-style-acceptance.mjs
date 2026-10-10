@@ -198,7 +198,7 @@ function launchNativeTauri(pnpm, configPath, environment) {
   return { child, stdout, stderr };
 }
 
-/** Job 受限的测试宿主先持有同一 Java TCP daemon，验收结束时由本 runner 终止它。 */
+/** Job 受限的测试宿主先持有同一 Java FeatHTTP 后台，验收结束时由本 runner 终止它。 */
 async function startNativeDaemonForJob(javaExecutable, jar, directories, environment) {
   const home = join(directories.userProfile, ".ja");
   const encoded = (path) => Buffer.from(path, "utf8").toString("base64url");
@@ -209,7 +209,7 @@ async function startNativeDaemonForJob(javaExecutable, jar, directories, environ
     `--run-dir-base64=${encoded(directories.runtime)}`,
     `--log-dir-base64=${encoded(join(home, "logs", "java"))}`,
     "--ja-runtime-generation=1",
-    "--ja-transport=tcp",
+    "--ja-transport=websocket",
   ];
   const child = spawn(javaExecutable, args, {
     cwd: directories.runtime,
@@ -465,7 +465,7 @@ async function runNativeProbe() {
   const javaHome = process.env.JA_E2E_JAVA_HOME?.trim() || process.env.JAVA_HOME?.trim();
   if (javaHome === undefined) throw new Error("native settings probe requires JA_E2E_JAVA_HOME");
   const javaExecutable = join(javaHome, "bin", "java.exe");
-  const jar = join(repoRoot, "app-server", "target", "ja-app-server.jar");
+  const jar = join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar");
   const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
   const environment = {
     ...process.env,

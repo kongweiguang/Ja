@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadDiscoveryMapper">
+    <select id="selectPage"
+            resultMap="selectPageTemporalRow">
+        WITH RECURSIVE closing_side_chats(thread_id) AS (
+        SELECT thread_id FROM ja_conversation_thread WHERE temporary_lifecycle_state='CLOSING'
+        UNION
+        SELECT l.child_thread_id
+        FROM ja_conversation_lineage l
+        JOIN closing_side_chats c ON c.thread_id=l.parent_thread_id
+        ), discovered AS (
+        SELECT t.thread_id AS threadId,t.title,'MAIN' AS kind,t.workspace_id AS workspaceId,
+        COALESCE((SELECT state FROM ja_conversation_turn x WHERE x.thread_id=t.thread_id AND x.is_current_path=1
+        ORDER BY x.turn_sequence DESC LIMIT 1),'IDLE') AS status,t.updated_at_ms AS updatedAt,
+        (SELECT turn_id FROM ja_conversation_turn x WHERE x.thread_id=t.thread_id AND x.is_current_path=1
+        ORDER BY x.turn_sequence DESC LIMIT 1) AS latestTurnId
+        FROM ja_conversation_thread t
+        WHERE t.deleted_at_ms IS NULL AND t.archived_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage l WHERE l.child_thread_id=t.thread_id)
+        UNION ALL
+        SELECT t.thread_id AS threadId,t.title,
+        CASE l.task_kind WHEN 'SIDE_TASK' THEN 'SIDE_CHAT' ELSE 'SUBAGENT' END AS kind,
+        t.workspace_id AS workspaceId,COALESCE(p.state,'IDLE') AS status,
+        COALESCE(p.updated_at_ms,t.updated_at_ms) AS updatedAt,
+        (SELECT turn_id FROM ja_conversation_turn x WHERE x.thread_id=t.thread_id AND x.is_current_path=1
+        ORDER BY x.turn_sequence DESC LIMIT 1) AS latestTurnId
+        FROM ja_conversation_thread t
+        JOIN ja_conversation_lineage l ON l.child_thread_id=t.thread_id
+        LEFT JOIN ja_task_projection p ON p.task_thread_id=l.child_thread_id
+        WHERE t.deleted_at_ms IS NULL AND t.archived_at_ms IS NULL
+        AND NOT EXISTS (
+        SELECT 1 FROM closing_side_chats c WHERE c.thread_id=l.child_thread_id
+        )
+        )
+        SELECT threadId,title,kind,workspaceId,status,updatedAt,latestTurnId FROM discovered
+        <where>
+            <if test="workspaceId != null">workspaceId=#{workspaceId}</if>
+            <if test="normalizedQuery != null and normalizedQuery != ''">
+                AND instr(lower(title),#{normalizedQuery})&gt;0
+            </if>
+            <if test="cursorTime != null">
+                AND (updatedAt&lt;#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (updatedAt=#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND threadId&lt;#{cursorId}))
+            </if>
+        </where>
+        ORDER BY updatedAt DESC,threadId DESC LIMIT #{limit}
+    </select>
+    <!-- Explicit timestamp adapters preserve INTEGER storage for immutable record constructors. -->
+    <resultMap id="selectPageTemporalRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadDiscoveryRow">
+        <constructor>
+            <arg column="threadId" javaType="string"/>
+            <arg column="title" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="workspaceId" javaType="string"/>
+            <arg column="status" javaType="string"/>
+            <arg column="updatedAt" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="latestTurnId" javaType="string"/>
+        </constructor>
+    </resultMap>
+</mapper>

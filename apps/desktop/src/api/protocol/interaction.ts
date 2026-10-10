@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
+import { ToolCallIdSchema } from "./identifiers";
 
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const revision = z.number().int().min(0).max(MAX_SAFE_INTEGER);
@@ -10,7 +11,7 @@ const threadId = z
   .string()
   .regex(/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(100);
-const requestId = z
+const interactionId = z
   .string()
   .regex(/^interaction_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(128);
@@ -34,11 +35,7 @@ const planRevisionId = z
   .string()
   .regex(/^planrev_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(104);
-const goalId = z
-  .string()
-  .regex(/^goal_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
-  .max(101);
-const idempotencyKey = z
+const operationKey = z
   .string()
   .min(8)
   .max(128)
@@ -108,23 +105,18 @@ export const InteractionAnswerSchema = z
 
 export const InteractionRequestSchema = z
   .object({
-    requestId,
+    interactionId,
     threadId,
     turnId: turnId.nullable(),
-    toolCallId: z
-      .string()
-      .regex(/^call_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
-      .max(101)
-      .nullable(),
+    toolCallId: ToolCallIdSchema.nullable(),
     planRevisionId: planRevisionId.nullable(),
     runId: z
       .string()
       .regex(/^run_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(100)
       .nullable(),
-    goalId: goalId.nullable(),
     status: z.enum(["pending", "answered", "cancelled", "superseded"]),
-    revision,
+    interactionRevision: revision,
     questions: z.array(InteractionQuestionSchema).min(1).max(3),
     answers: z.array(InteractionAnswerSchema).max(3),
     createdAt: timestamp,
@@ -147,11 +139,11 @@ export const InteractionRequestSchema = z
 export const InteractionDraftSchema = z
   .object({
     threadId,
-    requestId,
+    interactionId,
     answers: z.array(InteractionAnswerSchema).max(3),
     page: z.number().int().min(0).max(2),
     collapsed: z.boolean(),
-    revision,
+    draftRevision: revision,
     updatedAt: timestamp,
   })
   .strict();
@@ -189,15 +181,15 @@ export const InteractionSnapshotSchema = z
     }
   });
 
-const readParams = z.object({ threadId, requestId: requestId.optional() }).strict();
+const readParams = z.object({ threadId, interactionId: interactionId.optional() }).strict();
 const observeParams = z.object({ threadId }).strict();
 const unobserveParams = z.object({ observationId }).strict();
 const draftMutation = z
   .object({
     threadId,
-    requestId,
+    interactionId,
     expectedDraftRevision: revision,
-    idempotencyKey,
+    operationKey,
     answers: z.array(InteractionAnswerSchema).max(3),
     page: z.number().int().min(0).max(2),
     collapsed: z.boolean(),
@@ -206,14 +198,14 @@ const draftMutation = z
 const respondMutation = z
   .object({
     threadId,
-    requestId,
-    expectedRevision: revision,
-    idempotencyKey,
+    interactionId,
+    expectedInteractionRevision: revision,
+    operationKey,
     answers: z.array(InteractionAnswerSchema).max(3),
   })
   .strict();
 const cancelMutation = z
-  .object({ threadId, requestId, expectedRevision: revision, idempotencyKey })
+  .object({ threadId, interactionId, expectedInteractionRevision: revision, operationKey })
   .strict();
 
 export const InteractionParamsSchemaByMethod = {
@@ -248,8 +240,8 @@ export const InteractionChangedParamsSchema = z
     generation: z.number().int().min(1).max(MAX_SAFE_INTEGER),
     occurredAt: timestamp,
     threadId,
-    requestId,
-    requestRevision: revision,
+    interactionId,
+    interactionRevision: revision,
     eventSequence: revision,
     kind: z.enum(["created", "draft_changed", "answered", "cancelled", "superseded"]),
   })

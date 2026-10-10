@@ -1,7 +1,7 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Create a reproducible Native Image build report from real CI outputs."""
+"""根据真实 CI 输出生成可复现的 Native Image 构建报告。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ VERSION_PATTERN = re.compile(r"(?:\d+\.){2}\d+(?:[+.-][A-Za-z0-9.-]+)?")
 
 
 def sha256(path: Path) -> str:
-    """Hash an actual artifact in bounded chunks so report generation stays memory stable."""
+    """分块计算真实产物摘要，避免生成报告时占用过多内存。"""
 
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -29,7 +29,7 @@ def sha256(path: Path) -> str:
 
 
 def command_version(command: str, *arguments: str) -> str:
-    """Capture only version lines, excluding installation paths and arbitrary build output."""
+    """只提取版本行，排除安装路径和任意构建输出。"""
 
     candidates = [command]
     if command in {"native-image", "mvn"} and not command.endswith(".cmd"):
@@ -58,7 +58,7 @@ def command_version(command: str, *arguments: str) -> str:
 
 
 def file_entry(path: Path) -> dict[str, Any]:
-    """Describe a generated file using only its portable name, size, and content checksum."""
+    """仅用可移植文件名、大小和内容摘要描述生成文件。"""
 
     if not path.is_file():
         raise RuntimeError(f"required report input is missing: {path.name}")
@@ -66,7 +66,7 @@ def file_entry(path: Path) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse report inputs without allowing arbitrary host paths into the serialized report."""
+    """解析报告输入，避免将任意主机路径写入序列化报告。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True, type=Path)
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Validate the three evidence inputs and emit one machine-readable build record."""
+    """校验三项证据输入并输出一条机器可读的构建记录。"""
 
     args = parse_args()
     if not args.no_fallback:

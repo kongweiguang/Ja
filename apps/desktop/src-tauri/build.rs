@@ -3,8 +3,7 @@
 
 use std::fs;
 
-/// Tracks every staged sidecar file explicitly because Tauri's directory resource declaration
-/// does not make Cargo rerun this build script when an existing binary is replaced in place.
+/// 显式跟踪每个暂存的伴随进程文件，因为 Tauri 的目录资源声明不会让 Cargo 在已有二进制文件被原位替换时重新运行此构建脚本。
 fn track_staged_sidecars() {
     println!("cargo:rerun-if-changed=sidecar-manifest.json");
     let Ok(entries) = fs::read_dir("sidecars") else {
@@ -18,8 +17,7 @@ fn track_staged_sidecars() {
     }
 }
 
-/// Lets Tauri generate platform context during the build while also binding incremental builds
-/// to the exact staged Native Image inputs that will be copied into the development target.
+/// 构建时让 Tauri 生成平台上下文，同时将增量构建绑定到要复制到开发目标目录的确切 Native Image 输入。
 fn main() {
     track_staged_sidecars();
     tauri_build::build()

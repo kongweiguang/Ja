@@ -3,6 +3,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { useRef, useState, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReviewShell } from "@/features/workbench/review/ui/ReviewShell";
@@ -151,15 +152,20 @@ describe("ReviewShell", () => {
     expect(file).toHaveFocus();
   });
 
-  it("顶栏只保留刷新，并把前后文件导航放入第二控制行", () => {
+  /** 导航收进菜单后仍能键盘选择，Escape 将焦点还给稳定入口。 */
+  it("一行顶栏将文件导航收进更多，关闭后返回入口", async () => {
+    const user = userEvent.setup();
     render(<ShellHarness />);
     const header = document.querySelector(".ja-review-shell-header");
-    const toolbar = document.querySelector(".ja-review-shell-toolbar");
-
+    const more = screen.getByRole("button", { name: "审查更多操作" });
     expect(header).toContainElement(screen.getByRole("button", { name: "刷新未提交变更" }));
-    expect(header).not.toContainElement(screen.getByRole("button", { name: "上一个文件" }));
-    expect(toolbar).toContainElement(screen.getByRole("button", { name: "上一个文件" }));
-    expect(toolbar).toContainElement(screen.getByRole("button", { name: "下一个文件" }));
+    expect(header).toContainElement(more);
+    expect(screen.queryByRole("menuitem", { name: "上一个文件" })).not.toBeInTheDocument();
+    await user.click(more);
+    expect(screen.getByRole("menuitem", { name: "上一个文件" })).toBeVisible();
+    expect(screen.getByRole("menuitem", { name: "下一个文件" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(more).toHaveFocus();
   });
 
   it("键盘调整树宽并遵守 Home/End 边界", () => {

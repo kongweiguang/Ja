@@ -8,9 +8,10 @@ type ContextUsageTone = "neutral" | "warning" | "danger";
 /** Composer 只消费已经完成身份校验和阈值计算的展示模型，不接触事件或配置原始对象。 */
 export type ContextUsagePresentation =
   | KnownContextUsagePresentation
+  | EstimatedContextUsagePresentation
   | UnknownContextUsagePresentation;
 
-/** 只有真实 Provider 响应的输入计量可渲染百分比环。 */
+/** Provider 完整响应的输入与输出计量可渲染实测占用。 */
 interface KnownContextUsagePresentation {
   certainty: "known";
   usedTokens: number;
@@ -19,6 +20,18 @@ interface KnownContextUsagePresentation {
   ringPercentage: number;
   tone: ContextUsageTone;
   source: "provider";
+  measuredAt: string;
+}
+
+/** 完整 Provider envelope 或成功压缩检查点产生的本地估算，必须与上游实测区分。 */
+interface EstimatedContextUsagePresentation {
+  certainty: "estimated";
+  usedTokens: number;
+  limitTokens: number;
+  percentage: number;
+  ringPercentage: number;
+  tone: ContextUsageTone;
+  source: "local";
   measuredAt: string;
 }
 
@@ -56,10 +69,38 @@ function usageTone(percentage: number): ContextUsageTone {
   return "neutral";
 }
 
+/** Provider 的 totalTokens 包含完整请求输入与输出；压缩时报告本地包络估算。 */
+function measuredPresentation(
+  usedTokens: number,
+  limitTokens: number,
+  measuredAt: string,
+  certainty: "known" | "estimated",
+  source: "provider" | "local",
+): KnownContextUsagePresentation | EstimatedContextUsagePresentation | undefined {
+  if (!Number.isSafeInteger(usedTokens) || usedTokens < 0 || !Number.isFinite(usedTokens))
+    return undefined;
+  const rawPercentage = (usedTokens / limitTokens) * 100;
+  if (!Number.isFinite(rawPercentage)) return undefined;
+  const values = {
+    usedTokens,
+    limitTokens,
+    percentage: Math.round(rawPercentage * 10) / 10,
+    ringPercentage: Math.min(100, Math.max(0, rawPercentage)),
+    tone: usageTone(rawPercentage),
+    measuredAt,
+  };
+  if (certainty === "known" && source === "provider") {
+    return { certainty, source, ...values };
+  }
+  if (certainty === "estimated" && source === "local") {
+    return { certainty, source, ...values };
+  }
+  return undefined;
+}
+
 /**
- * 只按已提交的 Provider 画像计算当前投影阶段的上下文占用；非法窗口保持不可展示，绝不借当前
- * 偏好补造。成功摘要会改变送给模型的历史前缀，因此早于或同刻的 Provider 用量必须失效为未知，
- * 直到新的真实响应重新测量；失败摘要不改变已发送上下文，保留上一笔 KNOWN。
+ * 以完整 Provider totalTokens 表示最近请求的上下文用量，缓存属于输入的一部分，输出也进入对话上下文。
+ * 成功压缩后改用同一完整 envelope 的本地预算并明确标为 estimated；非法窗口和缺失预算保持未知。
  */
 export function resolveContextUsage(
   input: ResolveContextUsageInput,
@@ -72,43 +113,76 @@ export function resolveContextUsage(
     contextWindowTokens === undefined ||
     contextWindowTokens <= 0 ||
     (usage.certainty === "known" &&
-      (!Number.isSafeInteger(usage.inputTokens) || usage.inputTokens < 0))
+      (!Number.isSafeInteger(usage.totalTokens) || usage.totalTokens < 0))
   )
     return undefined;
 
   const providerTimestamp = timestamp(usage.measuredAt);
   if (providerTimestamp === undefined) return undefined;
-  if (usage.certainty === "unknown") {
-    return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
+  if (usage.purpose !== "assistant") return undefined;
+  const snapshotEstimate = usage.contextEstimate;
+  if (snapshotEstimate != null) {
+    const estimateTimestamp = timestamp(snapshotEstimate.measuredAt);
+    if (
+      snapshotEstimate.certainty !== "estimated" ||
+      snapshotEstimate.source !== "local" ||
+      snapshotEstimate.limitTokens !== contextWindowTokens ||
+      estimateTimestamp === undefined ||
+      !Number.isSafeInteger(snapshotEstimate.usedTokens) ||
+      snapshotEstimate.usedTokens < 0
+    ) {
+      return undefined;
+    }
+    return measuredPresentation(
+      snapshotEstimate.usedTokens,
+      contextWindowTokens,
+      snapshotEstimate.measuredAt,
+      "estimated",
+      "local",
+    );
   }
   const compaction = input.compaction;
   const invalidatedAt =
     input.invalidatedAt ?? (compaction?.phase === "compacted" ? compaction.occurredAt : undefined);
   const compactionTimestamp = invalidatedAt === undefined ? undefined : timestamp(invalidatedAt);
-  if (
+  const compactionInvalidatesUsage =
     invalidatedAt !== undefined &&
     compactionTimestamp !== undefined &&
-    compactionTimestamp >= providerTimestamp
-  ) {
+    compactionTimestamp >= providerTimestamp;
+  if (compactionInvalidatesUsage) {
+    if (
+      compaction?.phase === "compacted" &&
+      compaction.inputTokensAfter !== null &&
+      timestamp(compaction.occurredAt) !== undefined
+    ) {
+      return (
+        measuredPresentation(
+          compaction.inputTokensAfter,
+          contextWindowTokens,
+          compaction.occurredAt,
+          "estimated",
+          "local",
+        ) ?? {
+          certainty: "unknown",
+          source: "provider",
+          measuredAt: compaction.occurredAt,
+        }
+      );
+    }
     return {
       certainty: "unknown",
       source: "provider",
       measuredAt: invalidatedAt,
     };
   }
-  const usedTokens = usage.inputTokens;
-  const measuredAt = usage.measuredAt;
-
-  const rawPercentage = (usedTokens / contextWindowTokens) * 100;
-  if (!Number.isFinite(rawPercentage)) return undefined;
-  return {
-    certainty: "known",
-    usedTokens,
-    limitTokens: contextWindowTokens,
-    percentage: Math.round(rawPercentage * 10) / 10,
-    ringPercentage: Math.min(100, Math.max(0, rawPercentage)),
-    tone: usageTone(rawPercentage),
-    source: "provider",
-    measuredAt,
-  };
+  if (usage.certainty === "unknown") {
+    return { certainty: "unknown", source: "provider", measuredAt: usage.measuredAt };
+  }
+  return measuredPresentation(
+    usage.totalTokens,
+    contextWindowTokens,
+    usage.measuredAt,
+    "known",
+    "provider",
+  );
 }

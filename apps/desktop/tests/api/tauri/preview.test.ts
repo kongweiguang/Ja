@@ -265,10 +265,21 @@ describe("TauriPreviewAdapter", () => {
     ]);
     expect(calls[0]?.args).toEqual({ input: { viewport: hiddenViewport } });
     expect(calls[1]?.args).toEqual({
-      input: { target: "页面.html", workspaceId: "ws_fixture", line: 2, column: 4 },
+      input: {
+        target: "页面.html",
+        workspaceId: "ws_fixture",
+        line: 2,
+        column: 4,
+        previewMode: "editor",
+      },
     });
     expect(calls[2]?.args).toEqual({
-      input: { target: "页面.html", workspaceId: "ws_fixture", viewport: hiddenViewport },
+      input: {
+        target: "页面.html",
+        workspaceId: "ws_fixture",
+        viewport: hiddenViewport,
+        previewMode: "browser",
+      },
     });
     expect(calls[3]?.args).toEqual({
       input: {
@@ -276,6 +287,7 @@ describe("TauriPreviewAdapter", () => {
         generation: 1,
         target: "页面.html",
         workspaceId: "ws_fixture",
+        previewMode: "browser",
       },
     });
   });

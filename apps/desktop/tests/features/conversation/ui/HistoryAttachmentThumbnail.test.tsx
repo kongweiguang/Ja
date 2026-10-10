@@ -55,7 +55,7 @@ function revealThumbnail(container: HTMLElement): void {
   });
 }
 
-/** 构造最小预览端口，默认返回一个受管历史缩略图 session。 */
+/** 默认模拟 Host 已签发的 Windows origin，确保 UI 不承担跨 URL 重试；生命周期可由 overrides 控制。 */
 function createPort(
   overrides: Partial<HistoryAttachmentThumbnailPort> = {},
 ): HistoryAttachmentThumbnailPort {
@@ -64,7 +64,7 @@ function createPort(
       previewSessionId: "preview_history_1",
       attachmentId,
       mediaKind: "image" as const,
-      thumbnailUrl: "ja-attachment://localhost/thumbnail/thumb_history_1",
+      thumbnailUrl: "http://ja-attachment.localhost/thumbnail/thumb_history_1",
     })),
     close: vi.fn(async () => undefined),
     ...overrides,
@@ -78,7 +78,7 @@ afterEach(() => {
 });
 
 describe("HistoryAttachmentThumbnail", () => {
-  /** display:none/零尺寸 fallback 不能把虚拟列表的隐藏图片升级为原生 IO。 */
+  /** display:none 或零尺寸回退机制不能把虚拟列表中的隐藏图片升级为原生 IO。 */
   it("does not load a zero-sized thumbnail without IntersectionObserver", async () => {
     vi.stubGlobal("IntersectionObserver", undefined);
     const port = createPort();
@@ -129,8 +129,8 @@ describe("HistoryAttachmentThumbnail", () => {
     expect(port.close).toHaveBeenCalledWith("preview_history_1");
   });
 
-  /** 协议图片加载失败时立即关闭受管 session，并留下可访问的降级状态。 */
-  it("closes the session when the managed thumbnail fails to load", async () => {
+  /** Host 签发的 Windows origin 是首个图片来源；读取失败立即关闭 session 并降级。 */
+  it("uses the issued Windows origin and degrades after its first load failure", async () => {
     installIntersectionObserver();
     const port = createPort();
     const { container } = render(
@@ -147,53 +147,15 @@ describe("HistoryAttachmentThumbnail", () => {
       expect(value).not.toBeNull();
       return value!;
     });
+    expect(image).toHaveAttribute(
+      "src",
+      "http://ja-attachment.localhost/thumbnail/thumb_history_1",
+    );
     fireEvent.error(image);
-    const fallback = await waitFor(() => {
-      const value = container.querySelector<HTMLImageElement>("img");
-      expect(value).not.toBeNull();
-      expect(value).not.toBe(image);
-      return value!;
-    });
-    fireEvent.error(fallback);
 
     expect(port.close).toHaveBeenCalledWith("preview_history_1");
     expect(container.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
       "损坏图.png 缩略图不可用",
-    );
-  });
-
-  /** Windows custom protocol 失败时只重试一次等价 localhost origin，第二次才降级。 */
-  it("falls back from the canonical attachment scheme once", async () => {
-    installIntersectionObserver();
-    const port = createPort();
-    const { container } = render(
-      <HistoryAttachmentThumbnail
-        attachmentId="att_windows"
-        displayName="Windows图.png"
-        authorization={{ kind: "thread", threadId: "thr_one" }}
-        port={port}
-      />,
-    );
-    revealThumbnail(container);
-    const image = await waitFor(() => {
-      const value = container.querySelector<HTMLImageElement>("img");
-      expect(value).not.toBeNull();
-      return value!;
-    });
-    fireEvent.error(image);
-    const fallback = await waitFor(() => {
-      const value = container.querySelector<HTMLImageElement>("img");
-      expect(value).not.toBeNull();
-      expect(value).not.toBe(image);
-      return value!;
-    });
-    expect(fallback).toHaveAttribute(
-      "src",
-      "http://ja-attachment.localhost/thumbnail/thumb_history_1",
-    );
-    fireEvent.error(fallback);
-    expect(container.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
-      "Windows图.png 缩略图不可用",
     );
   });
 

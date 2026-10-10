@@ -225,8 +225,8 @@ function releaseNativeShortcutListener(unlisten: UnlistenFn | undefined): void {
 }
 
 /**
- * 持有 Rust 签发的 renderer epoch/revision 与 ACK 身份；旧 identity 保留到
- * query-and-suspend ACK；新 identity 只在 prepare ACK 后预置，并由 exact activate 开门。
+ * 持有 Rust 签发的渲染层 epoch/revision 与 ACK 身份；旧身份保留到
+ * query-and-suspend ACK；新身份只在 prepare ACK 后预置，并由 exact activate 开门。
  */
 export class TauriNativeShortcutAdapter implements NativeShortcutPort {
   private lease: NativeShortcutLease | undefined;
@@ -273,7 +273,7 @@ export class TauriNativeShortcutAdapter implements NativeShortcutPort {
     );
   }
 
-  /** query 是 Rust 的 query-and-suspend ACK；ready=true 不能作为安全的 rebind 基线。 */
+  /** query 是 Rust 的 query-and-suspend ACK；ready=true 不能作为安全的重新绑定基线。 */
   private async queryAndSuspend(binding: number): Promise<NativeShortcutLease> {
     if (!this.bindingIsUsable(binding)) throw new NativeShortcutAdapterError("command_failed");
     const lease = parseNativeShortcutLease(await invokeNativeShortcutLease(this.bridge));
@@ -284,7 +284,7 @@ export class TauriNativeShortcutAdapter implements NativeShortcutPort {
     return lease;
   }
 
-  /** 最多两次确认 query-and-suspend；没有 ACK 时保留 listener/identity，避免 native 仍 ready 却吞键。 */
+  /** 最多两次确认 query-and-suspend；没有 ACK 时保留 listener/identity，避免原生窗口仍处于 ready 状态却吞掉按键。 */
   private async suspendAfterAcknowledgement(binding: number): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (binding !== this.bindingSequence) return false;
@@ -614,7 +614,7 @@ export async function isCurrentWindowFocused(): Promise<boolean> {
 }
 
 /**
- * 观察原生 focus 与 minimized-to-restored 转换，不依赖 WebView DOM focus；
+ * 观察原生焦点与 minimized-to-restored 状态转换，不依赖 WebView DOM 焦点；
  * Windows 在程序化 restore 时可能不产生后者。
  */
 export function observeWindowFocus(onChange: (focused: boolean) => void): WindowFocusObserver {
@@ -633,7 +633,7 @@ export function observeWindowFocus(onChange: (focused: boolean) => void): Window
         })
         .catch(() => undefined);
     };
-    /** 只检测真实 minimized-to-restored 边沿，并在发布前确认原生 focus。 */
+    /** 只检测真实的 minimized-to-restored 状态边沿，并在发布前确认原生焦点。 */
     const refreshMinimized = (publishRestore: boolean): void => {
       const revision = ++readRevision;
       void appWindow

@@ -168,9 +168,9 @@ fn poisoned_executable_identity_rejects_spawn_verification() {
     );
 }
 
-/// 证明 sidecar 接受完整用户环境，同时仍保留 argv secret 与 Rust generation 参数边界。
+/// 用户参数按 JVM 语义原样传递，诊断仍脱敏；只有 Host 专属策略参数继续禁止调用方覆盖。
 #[test]
-fn runtime_config_accepts_user_environment_and_rejects_reserved_inputs() {
+fn runtime_config_accepts_user_environment_and_normal_args_but_rejects_reserved_inputs() {
     let executable = std::env::current_exe().unwrap();
     let run_dir = std::env::temp_dir();
     let mut java_home = sidecar_config(&executable, &run_dir);
@@ -199,14 +199,13 @@ fn runtime_config_accepts_user_environment_and_rejects_reserved_inputs() {
         .insert(OsString::from("OPENAI_API_KEY"), OsString::from("fixture-value"));
     assert!(secret_env.validate().is_ok());
 
-    let mut secret_arg = sidecar_config(&executable, &run_dir);
-    secret_arg
-        .args
-        .push(OsString::from("api_key=sk-test-secret"));
-    assert_eq!(
-        secret_arg.validate(),
-        Err(AppServerProcessError::InvalidConfig)
-    );
+    let mut tokenizer_arg = sidecar_config(&executable, &run_dir);
+    let ordinary_argument = "-Dja.provider.tokenizer=default";
+    tokenizer_arg.args.push(OsString::from(ordinary_argument));
+    assert!(tokenizer_arg.validate().is_ok());
+    let diagnostics = format!("{tokenizer_arg:?}");
+    assert!(!diagnostics.contains(ordinary_argument));
+    assert!(!diagnostics.contains("tokenizer"));
 
     let mut reserved_generation = sidecar_config(&executable, &run_dir);
     reserved_generation
@@ -214,6 +213,15 @@ fn runtime_config_accepts_user_environment_and_rejects_reserved_inputs() {
         .push(OsString::from("--ja-runtime-generation=99"));
     assert_eq!(
         reserved_generation.validate(),
+        Err(AppServerProcessError::InvalidConfig)
+    );
+
+    let mut reserved_transport = sidecar_config(&executable, &run_dir);
+    reserved_transport
+        .args
+        .push(OsString::from("--ja-transport=stdio"));
+    assert_eq!(
+        reserved_transport.validate(),
         Err(AppServerProcessError::InvalidConfig)
     );
 

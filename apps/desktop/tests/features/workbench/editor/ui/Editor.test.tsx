@@ -5,7 +5,7 @@ import "@testing-library/jest-dom/vitest";
 import { EditorView } from "@codemirror/view";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodeEditor, CodeViewer, DiffViewer } from "@/features/workbench/editor";
 
 const themeMock = vi.hoisted(() => ({
@@ -22,14 +22,6 @@ afterEach(() => {
   cleanup();
   themeMock.resolvedTheme = "light";
   themeMock.palette = "xcode";
-});
-
-/** 为无布局能力的 jsdom Range 提供 CodeMirror 所需最小几何合同，避免异步 Decoration Measurement 产生噪声。 */
-beforeAll(() => {
-  Object.defineProperty(Range.prototype, "getClientRects", {
-    configurable: true,
-    value: () => [] as unknown as DOMRectList,
-  });
 });
 
 /** 同屏挂载三类编辑器，用稳定 DOM identity 验证主题 reconfigure 不触发实例重建。 */
@@ -146,6 +138,25 @@ describe("CodeMirror semantic theme", () => {
 });
 
 describe("CodeMirror read-only viewers", () => {
+  /** 冻结证据的原始起始行变化必须更新 gutter，不保留旧片段的显示坐标。 */
+  it("updates displayed line numbers when the evidence offset changes", () => {
+    const rendered = render(
+      <CodeViewer filePath="src/frozen.rs" content={"first\nsecond"} lineNumberStart={43} />,
+    );
+    const getLineNumbers = (): string[] =>
+      Array.from(
+        rendered.container.querySelectorAll<HTMLElement>(".cm-lineNumbers .cm-gutterElement"),
+      )
+        .filter((element) => element.style.visibility !== "hidden")
+        .map((element) => element.textContent ?? "");
+
+    expect(getLineNumbers()).toEqual(["43", "44"]);
+    rendered.rerender(
+      <CodeViewer filePath="src/frozen.rs" content={"first\nsecond"} lineNumberStart={70} />,
+    );
+    expect(getLineNumbers()).toEqual(["70", "71"]);
+  });
+
   it("updates an external revision and destroys the editor on unmount", () => {
     const rendered = render(
       <CodeViewer filePath="src/App.tsx" content="const before = true;" revision={1} />,

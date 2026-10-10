@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolCallPreviewMapper">
+    <resultMap id="preview"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ToolCallPreviewMapper$ToolCallPreviewRow">
+        <constructor>
+            <arg column="call_id" javaType="string"/>
+            <arg column="ordinal" javaType="_int"/>
+            <arg column="tool_name" javaType="string"/>
+            <arg column="presentation_json" javaType="string"/>
+            <arg column="source_event_id" javaType="string"/>
+            <arg column="source_event_sequence" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <select id="selectBatch" resultMap="preview">
+        SELECT call_id,ordinal,tool_name,presentation_json,source_event_id,source_event_sequence
+        FROM ja_tool_call_preview
+        WHERE thread_id=#{threadId} AND turn_id=#{turnId}
+        AND assistant_message_record_id=#{assistantMessageRecordId}
+        AND source_event_id=#{eventId} AND source_event_sequence&lt;=#{throughEventSequence}
+        ORDER BY ordinal
+    </select>
+    <insert id="insert">
+        INSERT INTO ja_tool_call_preview(thread_id,turn_id,assistant_message_record_id,source_event_id,
+        source_event_sequence,call_id,ordinal,tool_name,presentation_json,created_at_ms)
+        VALUES(#{threadId},#{turnId},#{assistantMessageRecordId},#{eventId},#{eventSequence},
+        #{callId},#{ordinal},#{toolName},#{presentationJson},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+</mapper>

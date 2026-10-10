@@ -139,11 +139,13 @@ export class TauriTaskAdapter implements TaskAdapter {
     return invokeTask(this.bridge, JA_TASK_COMMANDS.seen, "task/seen", input);
   }
 
-  /**
-   * 侧聊关闭必须等待服务端原子清理 ACK；不能用 unobserve 或 treeDelete 伪装临时会话终止。
-   */
-  close(input: TaskCloseInput): Promise<TaskCloseResult> {
-    return invokeTask(this.bridge, JA_TASK_COMMANDS.close, "task/close", input);
+  /** 仅在服务端回执包含本次 root 的完整 purge 身份集合后报告关闭成功。 */
+  async close(input: TaskCloseInput): Promise<TaskCloseResult> {
+    const result = await invokeTask(this.bridge, JA_TASK_COMMANDS.close, "task/close", input);
+    if (!result.closedThreadIds.includes(input.taskThreadId)) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "运行时暂不可用", true);
+    }
+    return result;
   }
 
   /** QueueOnly 消息不会在目标空闲时隐式启动新 Turn。 */

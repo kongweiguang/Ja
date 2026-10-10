@@ -1,7 +1,7 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Regression tests for restoring an already-verified Native Image artifact."""
+"""针对恢复已验证 Native Image 产物的回归测试。"""
 
 from __future__ import annotations
 
@@ -50,11 +50,11 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def make_fixture(parent: Path, platform: str, arch: str) -> dict[str, object]:
-    """创建真实嵌套 download-artifact 目录及与 make-build-report 一致的最小报告。"""
+    """按下载产物保留 ja-agent 前缀，验证恢复器接受真实 Reactor 输出布局。"""
 
     root = parent / "download"
     native_name = "ja-app-server.exe" if platform == "windows" else "ja-app-server"
-    native_path = root / "app-server" / "target" / native_name
+    native_path = root / "ja-agent" / "app-server" / "target" / native_name
     report_path = root / "native-evidence" / "build-report.json"
     sbom_path = root / "native-evidence" / "ja-app-server.json"
     native_path.parent.mkdir(parents=True, exist_ok=True)

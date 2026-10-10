@@ -1,0 +1,81 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.workspace.application.gateway;
+
+import io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceEntryKind;
+
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * 隔离 Workspace application 与 fd 路径检索、NIO 引用复核和预算实现。
+ */
+public interface WorkspacePathPort {
+    /**
+     * 只枚举条目路径；同一 Thread 的新查询可取消已过时的目录进程。
+     */
+    SearchOutcome search(Path workspaceRoot, String query, int limit, CancellationToken cancellationToken);
+
+    /**
+     * 在消息真正接纳或消费前重验引用目标及声明类型。
+     */
+    ValidatedPath validate(Path workspaceRoot, String relativePath, WorkspaceEntryKind kind);
+
+    /**
+     * Adapter 返回已排序的路径候选、fd 输出行数及诚实截断标记。
+     *
+     * @param entries 条目列表
+     * @param truncated 结果是否被截断
+     * @param candidateCount 候选项数量
+     */
+    record SearchOutcome(List<PathEntry> entries,
+                         boolean truncated,
+                         int candidateCount) {
+        /**
+         * 复制结果并保留内部候选行数，计数不进入公开 Wire。
+         */
+        public SearchOutcome {
+            entries = List.copyOf(entries);
+            if (candidateCount < 0) {
+                throw new IllegalArgumentException("candidateCount must not be negative");
+            }
+        }
+    }
+
+    /**
+     * 文件系统适配器只能返回规范相对路径和闭集类型。
+     *
+     * @param relativePath 相对于工作区的路径
+     * @param kind 类型分类
+     */
+    record PathEntry(String relativePath,
+                     WorkspaceEntryKind kind) {
+        /**
+         * 防止错误 adapter 把绝对或空路径带回应用层。
+         */
+        public PathEntry {
+            relativePath = Objects.requireNonNull(relativePath, "relativePath");
+            Objects.requireNonNull(kind, "kind");
+        }
+    }
+
+    /**
+     * 引用准入结果保留标准化相对路径，不泄露底层物理 Path。
+     *
+     * @param relativePath 相对于工作区的路径
+     * @param kind 类型分类
+     */
+    record ValidatedPath(String relativePath,
+                         WorkspaceEntryKind kind) {
+        /**
+         * 冻结已经由 adapter 核验的路径与类型。
+         */
+        public ValidatedPath {
+            relativePath = Objects.requireNonNull(relativePath, "relativePath");
+            Objects.requireNonNull(kind, "kind");
+        }
+    }
+}

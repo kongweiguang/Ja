@@ -1,7 +1,7 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Deterministic tests for fixed search-tool resource staging contracts."""
+"""针对固定搜索工具资源暂存契约的确定性测试。"""
 
 from __future__ import annotations
 

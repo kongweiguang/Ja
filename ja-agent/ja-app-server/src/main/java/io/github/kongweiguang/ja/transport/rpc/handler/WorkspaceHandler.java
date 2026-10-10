@@ -1,0 +1,241 @@
+// @author kongweiguang
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package io.github.kongweiguang.ja.transport.rpc.handler;
+
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
+import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
+import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcException;
+import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
+import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
+import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
+import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
+import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
+import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
+import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceBusyMessage;
+import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceFailure;
+import io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase;
+
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
+/**
+ * 严格映射工作区 Wire DTO，并把全部业务决策交给唯一 WorkspaceUseCase。
+ */
+public final class WorkspaceHandler implements RpcHandler {
+    private final RpcSession session;
+
+    /**
+     * 只绑定连接会话，不保留目录、信任或注册状态。
+     */
+    public WorkspaceHandler(RpcSession session) {
+        this.session = session;
+    }
+
+    /**
+     * 将 Wire 信任值映射到领域闭集，任何未知值都按参数错误拒绝。
+     */
+    private static Workspace.Trust trust(String value) {
+        return switch (value) {
+            case "trusted" -> Workspace.Trust.TRUSTED;
+            case "untrusted" -> Workspace.Trust.UNTRUSTED;
+            default -> throw JaRpcException.invalidParams();
+        };
+    }
+
+    /**
+     * 只允许持久 Workspace 类型闭集，避免未知筛选值被解释为未过滤全量查询。
+     */
+    private static Workspace.Kind kind(String value) {
+        if (value == null) {
+            return null;
+        }
+        return switch (value) {
+            case "project" -> Workspace.Kind.PROJECT;
+            case "session" -> Workspace.Kind.SESSION;
+            default -> throw JaRpcException.invalidParams();
+        };
+    }
+
+    /**
+     * 将有界 cwd 转为 Path；平台语法错误属于用户参数错误，不回显可能包含本机路径的 cause。
+     */
+    @SuppressWarnings("PMD.PreserveStackTrace")
+    private static Path path(String value) {
+        try {
+            return Path.of(value);
+        } catch (InvalidPathException invalid) {
+            throw JaRpcException.invalidParams();
+        }
+    }
+
+    /** 将持久层已脱敏、有界的 busy 摘要沿标准 RPC message 返回，不透传其它领域异常文本。 */
+    static JaRpcException mapFailure(WorkspaceFailure failure) {
+        JaErrorCatalog error = switch (failure.code()) {
+            case DIRECTORY_UNAVAILABLE, WORKSPACE_NOT_OPEN -> JaErrorCatalog.WORKSPACE_NOT_FOUND;
+            case DIRECTORY_CONFINEMENT, IDENTITY_CONFLICT -> JaErrorCatalog.WORKSPACE_CONFINEMENT;
+            case CAPACITY_EXHAUSTED -> JaErrorCatalog.QUEUE_FULL;
+            case TRUST_CONFLICT -> JaErrorCatalog.WORKSPACE_TRUST_REQUIRED;
+            case UPDATE_CONFLICT -> JaErrorCatalog.CONFLICT;
+            case WORKSPACE_BUSY -> JaErrorCatalog.WORKSPACE_BUSY;
+        };
+        String message = failure.code() == WorkspaceFailure.Code.WORKSPACE_BUSY
+                ? WorkspaceBusyMessage.forRpc(failure.getMessage()) : "workspace operation failed";
+        return JaRpcException.of(error, message);
+    }
+
+    /**
+     * 返回冻结的四个工作区方法，不暴露旧 activation alias。
+     */
+    @Override
+    public Set<RpcMethod> methods() {
+        return Set.of(RpcMethod.WORKSPACE_OPEN, RpcMethod.WORKSPACE_LIST, RpcMethod.WORKSPACE_READ,
+                RpcMethod.WORKSPACE_UPDATE, RpcMethod.WORKSPACE_SET_TRUST, RpcMethod.WORKSPACE_UNREGISTER);
+    }
+
+    /**
+     * ready 校验后分派明确命令，并把领域失败映射为脱敏 RPC 错误。
+     */
+    @Override
+    public CompletionStage<ObjectNode> handle(RpcCommand command) {
+        session.requireReady();
+        try {
+            return CompletableFuture.completedFuture(switch (command.method()) {
+                case WORKSPACE_OPEN -> open(command.params());
+                case WORKSPACE_LIST -> list(command.params());
+                case WORKSPACE_READ -> read(command.params());
+                case WORKSPACE_UPDATE -> update(command.params());
+                case WORKSPACE_SET_TRUST -> trust(command.params());
+                case WORKSPACE_UNREGISTER -> unregister(command.params());
+                default -> throw JaRpcException.methodNotFound();
+            });
+        } catch (WorkspaceFailure failure) {
+            throw mapFailure(failure);
+        }
+    }
+
+    /**
+     * 目录身份来自互斥的受控 ID 重开或显式项目路径；浏览器不能把 SESSION 路径冒充项目。
+     */
+    private ObjectNode open(ObjectNode params) {
+        RpcParams.requireOnly(params, "workspaceId", "cwd", "displayName");
+        if (params.has("workspaceId")) {
+            if (params.has("cwd") || params.has("displayName")) {
+                throw JaRpcException.invalidParams();
+            }
+            return RpcResults.workspace(session.mapper(), session.workspaces().openRegisteredWorkspace(
+                    RpcParams.identifier(params, "workspaceId", "ws_", 100)));
+        }
+        if (!params.has("cwd")) {
+            throw JaRpcException.invalidParams();
+        }
+        Path root = path(RpcParams.text(params, "cwd", 4_096, false));
+        // Schema 的可选字段只允许省略；显式 null 不能伪装为省略并改变 Workspace 名称来源。
+        if (params.has("displayName") && params.get("displayName").isNull()) {
+            throw JaRpcException.invalidParams();
+        }
+        String displayName = RpcParams.optionalText(params, "displayName", 1_024);
+        Workspace value = session.workspaces().openWorkspace(
+                new WorkspaceUseCase.OpenWorkspace(root, displayName));
+        return RpcResults.workspace(session.mapper(), value);
+    }
+
+    /**
+     * kind 在 keyset 分页前交给 SQLite 过滤，避免大量会话目录挤掉项目列表首屏。
+     */
+    private ObjectNode list(ObjectNode params) {
+        RpcParams.requireOnly(params, "cursor", "limit", "kind");
+        Workspace.Kind kind = kind(RpcParams.optionalText(params, "kind", 32));
+        CursorPage<Workspace> page = session.workspaces()
+                .listWorkspaces(RpcParams.optionalText(params, "cursor", 512), RpcParams.pageLimit(params), kind);
+        ObjectNode result = session.mapper().createObjectNode();
+        ArrayNode values = result.putArray("items");
+        page.items().forEach(value -> values.add(RpcResults.workspace(session.mapper(), value)));
+        RpcResults.cursor(result, page.nextCursor());
+        return result;
+    }
+
+    /**
+     * 纯读取 SQLite Workspace 投影，使物理根缺失时仍能列出历史并展示修复入口。
+     */
+    private ObjectNode read(ObjectNode params) {
+        RpcParams.requireExact(params, "workspaceId");
+        String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
+        Workspace value = session.workspaces().readWorkspace(workspaceId)
+                .orElseThrow(() -> JaRpcException.of(JaErrorCatalog.WORKSPACE_NOT_FOUND,
+                        "workspace is unavailable"));
+        return RpcResults.workspace(session.mapper(), value);
+    }
+
+    /**
+     * 只接受名称或路径的明确更新；正常路径发布一次提交版本，后置同步失败则回读持久版本通知其它连接，
+     * 同时保留原始更新错误供发起方处理。
+     */
+    private ObjectNode update(ObjectNode params) {
+        RpcParams.requireOnly(params, "workspaceId", "expectedRevision", "displayName", "cwd");
+        if (!params.has("workspaceId") || !params.has("expectedRevision")
+            || (!params.has("displayName") && !params.has("cwd"))) {
+            throw JaRpcException.invalidParams();
+        }
+        if ((params.has("displayName") && params.get("displayName").isNull())
+            || (params.has("cwd") && params.get("cwd").isNull())) {
+            throw JaRpcException.invalidParams();
+        }
+        String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
+        long expectedRevision = RpcParams.revision(params, "expectedRevision");
+        String displayName = RpcParams.optionalText(params, "displayName", 512);
+        Path root = params.has("cwd") ? path(RpcParams.text(params, "cwd", 4_096, false)) : null;
+        Workspace updated;
+        try {
+            updated = session.workspaces().updateWorkspace(
+                    new WorkspaceUseCase.UpdateWorkspace(workspaceId, expectedRevision, displayName, root));
+        } catch (RuntimeException failure) {
+            publishCommittedWorkspaceRevisionAfterFailure(workspaceId, expectedRevision);
+            throw failure;
+        }
+        session.publishWorkspaceMetadataChanged(updated.workspaceId(), updated.revision());
+        return RpcResults.workspace(session.mapper(), updated);
+    }
+
+    /**
+     * Root configuration synchronization can fail after the SQLite CAS committed; reread the single DB owner and
+     * notify only when a newer durable revision exists, while leaving the original operation error authoritative.
+     */
+    private void publishCommittedWorkspaceRevisionAfterFailure(String workspaceId, long expectedRevision) {
+        try {
+            session.workspaces().readWorkspace(workspaceId)
+                    .filter(value -> value.revision() > expectedRevision)
+                    .ifPresent(value -> session.publishWorkspaceMetadataChanged(
+                            value.workspaceId(), value.revision()));
+        } catch (RuntimeException ignored) {
+            // Preserve the update failure; a best-effort reread must not replace its RPC error.
+        }
+    }
+
+    /**
+     * Wire 信任更新保持独立命令；持久化与配置代际同步顺序由应用用例负责。
+     */
+    private ObjectNode trust(ObjectNode params) {
+        RpcParams.requireExact(params, "workspaceId", "trust");
+        String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
+        String trust = RpcParams.text(params, "trust", 32, false);
+        session.workspaces().setWorkspaceTrust(workspaceId, trust(trust));
+        return session.mapper().createObjectNode().put("accepted", true);
+    }
+
+    /**
+     * 只传递 revision CAS，应用用例负责元数据与进程目录绑定的原子顺序。
+     */
+    private ObjectNode unregister(ObjectNode params) {
+        RpcParams.requireExact(params, "workspaceId", "expectedRevision");
+        String workspaceId = RpcParams.identifier(params, "workspaceId", "ws_", 100);
+        session.workspaces().unregisterWorkspace(workspaceId,
+                RpcParams.revision(params, "expectedRevision"));
+        return session.mapper().createObjectNode().put("accepted", true);
+    }
+}

@@ -9,39 +9,39 @@
 use crate::app_runtime::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
     ConfigurationPatchResult, ConfigurationReadResult, ConfigurationReplaceResult,
-    ConfigurationRequest, ConfigurationResetResult, ConfigurationResponse,
-    ConfigurationRestoreResult, CredentialDeleteResult, CredentialRevealProviderResult,
-    CredentialSetResult, EventSink, GoalMethod, GoalPayload, GoalRequest, GoalResponse,
-    HistoryRequest, HistoryResponse, InputQueue, LaunchConfig, McpListResultData,
-    McpTestResultData, McpToolsReadResultData, MessageContentReadResultData,
-    ModelDiscoverResultData, ModelTestResultData, OperationReadResultData, QueuedInput,
-    QueuedInputIssue, RuntimeBridgePort, RuntimeCommandError, RuntimeStatus, RuntimeStatusKind,
-    SettingsRequest, SettingsResponse, SkillListResultData, TaskActivity, TaskCloseInput,
-    TaskCloseResult, TaskContextSeed, TaskCreateInput, TaskCreateResult, TaskFollowupInput,
-    TaskFollowupResult, TaskListInput, TaskListResult, TaskMailboxMessage, TaskMessageInput,
-    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
-    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
-    TaskUnobserveInput, ThreadArchiveResultData, ThreadCompactCancelResultData,
-    ThreadCompactResultData, ThreadCreateResultData, ThreadDeleteResultData,
-    ThreadDiscoverResultData, ThreadListResultData, ThreadMcpReadResultData,
-    ThreadObserveResultData, ThreadPinResultData, ThreadPreferencesUpdateResultData,
-    ThreadReadResultData, ThreadRenameResultData, ThreadRestoreResultData, ThreadSearchResultData,
-    ThreadSeenResultData, ThreadUnobserveResultData, ThreadUsageReadResultData,
-    ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput,
-    TurnAccepted, TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput,
-    TurnChangeSetReadResult, TurnContinueInput, TurnInputDelete, TurnInputEnqueue,
-    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnReaskInput, TurnResumeInput,
-    TurnStartInput, WorkspaceDto, WorkspaceKind, WorkspaceListResultData, WorkspacePathSearchInput,
-    WorkspacePathSearchItem, WorkspacePathSearchResult, emit_frame, emit_status, frame_to_value,
+    ConfigurationRequest, ConfigurationResetResult, ConfigurationResponse, CredentialDeleteResult,
+    CredentialRevealProviderResult, CredentialSetResult, EventSink, HistoryRequest,
+    HistoryResponse, InputQueue, ItemContentReadResultData, LaunchConfig, McpListResultData,
+    McpTestResultData, McpToolsReadResultData, ModelDiscoverResultData, ModelTestResultData,
+    OperationReadResultData, QueuedInput, QueuedInputIssue, RuntimeBridgePort, RuntimeCommandError,
+    RuntimeStatus, RuntimeStatusKind, SettingsRequest, SettingsResponse, SkillListResultData,
+    TaskActivity, TaskCloseInput, TaskCloseResult, TaskContextSeed, TaskCreateInput,
+    TaskCreateResult, TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult,
+    TaskMailboxMessage, TaskMessageInput, TaskMessageResult, TaskMutationInput, TaskObserveInput,
+    TaskObserveResult, TaskReadInput, TaskReadResult, TaskSeenInput, TaskSummary,
+    TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput, ThreadArchiveResultData,
+    ThreadCompactCancelResultData, ThreadCompactResultData, ThreadCreateResultData,
+    ThreadDeleteResultData, ThreadDiscoverResultData, ThreadListResultData,
+    ThreadMcpReadResultData, ThreadObserveResultData, ThreadPinResultData,
+    ThreadPreferencesUpdateResultData, ThreadReadResultData, ThreadRenameResultData,
+    ThreadRestoreResultData, ThreadSearchResultData, ThreadSeenResultData,
+    ThreadUnobserveResultData, ThreadUsageReadResultData, ToolArtifactReadInput,
+    ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput, TurnAccepted,
+    TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput, TurnChangeSetReadResult,
+    TurnContinueInput, TurnInputDelete, TurnInputEnqueue, TurnInputPrioritize, TurnInputResult,
+    TurnInputUpdate, TurnReaskInput, TurnResumeInput, TurnStartInput, WorkflowMethod,
+    WorkflowPayload, WorkflowRequest, WorkflowResponse, WorkspaceDto, WorkspaceKind,
+    WorkspaceListResultData, WorkspacePathSearchInput, WorkspacePathSearchItem,
+    WorkspacePathSearchResult, WorkspaceUpdateInput, emit_frame, emit_status, frame_to_value,
     valid_frozen_turn_id,
 };
 use base64::Engine as _;
 use ja_runtime::app_server_process::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
-    AttachmentPreviewReadParams, AttachmentPreviewReadResult, CodecError, EventPump, RpcFrame,
-    Session, SessionEvent, SharedAppServerClient, ThreadCompactionLease, TurnChangeSetReadLease,
-    TurnChangeSetReadParams, TurnChangeSetReadResult as WireTurnChangeSetReadResult,
-    valid_protocol_timestamp,
+    AttachmentPreviewReadParams, AttachmentPreviewReadResult, CodecError, EventPump,
+    NativeClientIdentity, RpcFrame, Session, SessionEvent, SharedAppServerClient,
+    ThreadCompactionLease, TurnChangeSetReadLease, TurnChangeSetReadParams,
+    TurnChangeSetReadResult as WireTurnChangeSetReadResult, valid_protocol_timestamp,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -73,7 +73,7 @@ pub(crate) enum HistoryMethod {
     ThreadList,
     ThreadSearch,
     ThreadRead,
-    MessageContentRead,
+    ItemContentRead,
     ThreadObserve,
     ThreadUnobserve,
     ThreadUsageRead,
@@ -90,7 +90,7 @@ pub(crate) enum HistoryMethod {
 }
 
 impl HistoryMethod {
-    /// 将内部闭集映射为冻结 JA-RPC v1 拼写，调用方不能传入 method 字符串。
+    /// 将内部闭集映射为冻结 JA-RPC v2 拼写，调用方不能传入 method 字符串。
     const fn wire_name(self) -> &'static str {
         match self {
             Self::OperationRead => "operation/read",
@@ -100,7 +100,7 @@ impl HistoryMethod {
             Self::ThreadList => "thread/list",
             Self::ThreadSearch => "thread/search",
             Self::ThreadRead => "thread/read",
-            Self::MessageContentRead => "thread/message-content/read",
+            Self::ItemContentRead => "thread/item-content/read",
             Self::ThreadObserve => "thread/observe",
             Self::ThreadUnobserve => "thread/unobserve",
             Self::ThreadUsageRead => "thread/usage/read",
@@ -130,7 +130,7 @@ pub(crate) enum SettingsQueryMethod {
 }
 
 impl SettingsQueryMethod {
-    /// 将内部闭集映射为冻结 JA-RPC v1 拼写，避免 method 与 payload 被外部组合。
+    /// 将内部闭集映射为冻结 JA-RPC v2 拼写，避免 method 与 payload 被外部组合。
     const fn wire_name(self) -> &'static str {
         match self {
             Self::SkillList => "skill/list",
@@ -152,7 +152,6 @@ pub(crate) fn is_configuration_request_method(method: &str) -> bool {
             | "configuration/patch"
             | "configuration/replace"
             | "configuration/reset"
-            | "configuration/restore"
             | "credential/set"
             | "credential/delete"
             | "credential/reveal-provider"
@@ -186,9 +185,9 @@ const TERMINAL_SIDECAR_PROTOCOL_INVALID_LIMIT: u8 = 24;
 pub(crate) mod actor;
 pub(crate) mod event_projection;
 pub(crate) mod exit_cleanup;
-pub(crate) mod goal;
 pub(crate) mod lifecycle;
 pub(crate) mod operations;
+pub(crate) mod plans;
 pub(crate) mod runtime_control;
 pub(crate) mod tasks;
 
@@ -196,9 +195,9 @@ pub(crate) use actor::BridgeCommand;
 use actor::*;
 use event_projection::*;
 use exit_cleanup::*;
-use goal::*;
 use lifecycle::*;
 use operations::*;
+use plans::*;
 use runtime_control::{RuntimeControlPhase, RuntimeControlPort};
 use tasks::*;
 /// 可克隆的 Tauri managed state；可变 supervisor 始终只由其 actor 线程持有。
@@ -289,6 +288,8 @@ impl RuntimeBridge {
         runtime_control: Arc<dyn RuntimeControlPort>,
     ) -> Result<Self, RuntimeCommandError> {
         config.validate()?;
+        let native_identity = NativeClientIdentity::new_current_process()
+            .map_err(|error| RuntimeCommandError::from_process(&error))?;
         let (commands, command_receiver) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
         let (shutdown, shutdown_receiver) = mpsc::sync_channel(1);
         let (terminal_wake, terminal_receiver) = mpsc::sync_channel(1);
@@ -319,6 +320,7 @@ impl RuntimeBridge {
                     ActorContext {
                         config,
                         sink,
+                        native_identity,
                         current_generation: actor_epoch,
                         terminal_fault: actor_fault,
                         detached_event_generation: actor_detached_event,
@@ -382,23 +384,33 @@ impl RuntimeBridge {
         })
     }
 
-    /// 向当前 Java generation 注册一个 Rust-owned canonical root，并显式应用 trust；
-    /// 不重放 active Workspace，也不接受 renderer 选择 RPC 方法。
+    /// 向当前 Java generation 登记一个 Rust-owned canonical root；不授信或接受 renderer 选择 RPC 方法。
     pub(crate) fn workspace_open(
         &self,
         root: PathBuf,
         display_name: String,
-        trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
         self.call(|reply| BridgeCommand::WorkspaceOpen {
             root,
             display_name,
+            reply,
+        })
+    }
+
+    /// 授信由固定 actor 命令串行执行，并要求返回 Java 回读投影后才向 Host 确认。
+    pub(crate) fn workspace_set_trust(
+        &self,
+        workspace_id: String,
+        trust: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::WorkspaceSetTrust {
+            workspace_id,
             trust,
             reply,
         })
     }
 
-    /// 通过 Java 持久化 identity 重开 SESSION/LEGACY_SHARED，调用方无法提交根目录或类型。
+    /// 通过 Java 持久化 identity 重开项目或会话；调用方无法提交根目录或类型。
     pub(crate) fn workspace_open_by_id(
         &self,
         workspace_id: String,
@@ -407,6 +419,28 @@ impl RuntimeBridge {
             workspace_id,
             reply,
         })
+    }
+
+    /// 只读权威 Workspace projection，不注册原生目录；missing root 仍可供历史选择与修复 UI 使用。
+    pub(crate) fn workspace_read(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::WorkspaceRead {
+            workspace_id,
+            reply,
+        })
+    }
+
+    /// 固定 CAS 更新经同一 actor 串行发送，不能由调用方拼接 method 或绕开 update 输入闭集。
+    pub(crate) fn workspace_update(
+        &self,
+        input: WorkspaceUpdateInput,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        input
+            .validate()
+            .map_err(|_| RuntimeCommandError::invalid_params())?;
+        self.call(|reply| BridgeCommand::WorkspaceUpdate { input, reply })
     }
 
     /// `@` 路径建议通过固定 actor command 转发，避免把 method 字符串或扫描预算暴露给 WebView。
@@ -421,8 +455,13 @@ impl RuntimeBridge {
     }
 
     /// Host 暴露可用 composition state 前，必须用固定 `runtime/health` 验证当前 generation。
-    pub(crate) fn health_read(&self) -> Result<(), RuntimeCommandError> {
-        self.call(|reply| BridgeCommand::HealthRead { reply })
+    pub(crate) fn health_read(
+        &self,
+    ) -> Result<Option<crate::app_runtime::StorageRecovery>, RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::HealthRead {
+            retry: false,
+            reply,
+        })
     }
 
     /// 通过高优先级控制通道请求应用退出，并等待 actor join 以保留资源 owner。
@@ -710,13 +749,13 @@ impl RuntimeBridge {
         })
     }
 
-    /// Goal/Plan 经过独立 actor variant 发送，renderer 无法借此访问目录外方法。
-    pub(crate) fn goal_request(
+    /// Plan/Interaction 经过独立 actor variant 发送，renderer 无法借此访问目录外方法。
+    pub(crate) fn workflow_request(
         &self,
-        method: GoalMethod,
+        method: WorkflowMethod,
         params: Value,
     ) -> Result<Value, RuntimeCommandError> {
-        self.call(|reply| BridgeCommand::Goal {
+        self.call(|reply| BridgeCommand::Workflow {
             method,
             params,
             reply,
@@ -847,12 +886,6 @@ impl RuntimeBridgePort for RuntimeBridge {
                     decode_params(params.into_bytes())?,
                 )?)?)?,
             )),
-            ConfigurationRequest::Restore(params) => Ok(ConfigurationResponse::Restore(
-                ConfigurationRestoreResult::try_new(encode_result(self.config_request(
-                    "configuration/restore",
-                    decode_params(params.into_bytes())?,
-                )?)?)?,
-            )),
             ConfigurationRequest::CredentialSet(params) => Ok(
                 ConfigurationResponse::CredentialSet(CredentialSetResult::try_new(encode_result(
                     self.config_request("credential/set", decode_params(params.into_bytes())?)?,
@@ -882,17 +915,38 @@ impl RuntimeBridgePort for RuntimeBridge {
         &self,
         root: PathBuf,
         display_name: String,
-        trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
-        RuntimeBridge::workspace_open(self, root, display_name, trust)
+        RuntimeBridge::workspace_open(self, root, display_name)
     }
 
-    /// ID-only lane asks Java to revalidate persisted identity before a session capability is cached.
+    /// 授信与 Java 投影回读由同一个 actor command 完成，Host 不会根据本地 revision 进行推测。
+    fn workspace_set_trust(
+        &self,
+        workspace_id: String,
+        trust: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        RuntimeBridge::workspace_set_trust(self, workspace_id, trust)
+    }
+
+    /// 仅按 ID 查询的通道会要求 Java 重新校验持久身份，然后才缓存 Workspace capability。
     fn workspace_open_by_id(
         &self,
         workspace_id: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
         RuntimeBridge::workspace_open_by_id(self, workspace_id)
+    }
+
+    /// Workspace 元数据读取不副作用于 native handle，供历史层确认项目是否仍登记。
+    fn workspace_read(&self, workspace_id: String) -> Result<WorkspaceDto, RuntimeCommandError> {
+        RuntimeBridge::workspace_read(self, workspace_id)
+    }
+
+    /// Workspace 更新保留 typed CAS 输入，路径准入与资源重绑由 application 编排。
+    fn workspace_update(
+        &self,
+        input: WorkspaceUpdateInput,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        RuntimeBridge::workspace_update(self, input)
     }
 
     /// 路径搜索沿用同一 supervised generation，并对返回栅栏做严格解析。
@@ -905,7 +959,20 @@ impl RuntimeBridgePort for RuntimeBridge {
 
     /// 健康检查使用固定 `runtime/health`，application 无法选择方法名。
     fn health(&self) -> Result<(), RuntimeCommandError> {
+        self.health_read().map(|_| ())
+    }
+
+    /// 复用启动准入时的严格健康投影，不自行推断恢复结果。
+    fn storage_recovery(
+        &self,
+    ) -> Result<Option<crate::app_runtime::StorageRecovery>, RuntimeCommandError> {
         self.health_read()
+    }
+
+    /// 固定恢复命令不接收数据库路径，也不重复任何业务操作。
+    fn retry_storage(&self) -> Result<(), RuntimeCommandError> {
+        self.call(|reply| BridgeCommand::HealthRead { retry: true, reply })
+            .map(|_| ())
     }
 
     /// Turn Start 已是强类型 command，不经过动态 payload。
@@ -1045,14 +1112,14 @@ impl RuntimeBridgePort for RuntimeBridge {
         RuntimeBridge::task_close(self, input)
     }
 
-    /// production Goal lane 只搬运 nominal payload，并保留 request/result method 身份。
-    fn goal(&self, request: GoalRequest) -> Result<GoalResponse, RuntimeCommandError> {
+    /// 业务请求 lane 只搬运 nominal payload，并保留 request/result method 身份。
+    fn workflow(&self, request: WorkflowRequest) -> Result<WorkflowResponse, RuntimeCommandError> {
         let method = request.method;
         let params = decode_params(request.payload.into_bytes())?;
-        let result = self.goal_request(method, params)?;
-        Ok(GoalResponse {
+        let result = self.workflow_request(method, params)?;
+        Ok(WorkflowResponse {
             method,
-            payload: GoalPayload::try_new(encode_result(result)?)?,
+            payload: WorkflowPayload::try_new(encode_result(result)?)?,
         })
     }
 
@@ -1166,11 +1233,11 @@ impl RuntimeBridgePort for RuntimeBridge {
                 HistoryResponse::ThreadRead,
                 ThreadReadResultData
             ),
-            HistoryRequest::MessageContentRead(params) => dispatch_history!(
+            HistoryRequest::ItemContentRead(params) => dispatch_history!(
                 params,
-                HistoryMethod::MessageContentRead,
-                HistoryResponse::MessageContentRead,
-                MessageContentReadResultData
+                HistoryMethod::ItemContentRead,
+                HistoryResponse::ItemContentRead,
+                ItemContentReadResultData
             ),
             HistoryRequest::ThreadObserve(params) => dispatch_history!(
                 params,
@@ -1335,8 +1402,6 @@ pub(crate) fn parse_workspace_projection(
         trust: String,
         revision: u64,
         kind: String,
-        #[serde(deserialize_with = "required_nullable_workspace_id")]
-        legacy_shared_workspace_id: Option<String>,
     }
     let projection: WorkspaceWire =
         serde_json::from_value(value).map_err(|_| RuntimeCommandError::unavailable())?;
@@ -1356,16 +1421,6 @@ pub(crate) fn parse_workspace_projection(
     }
     let kind =
         WorkspaceKind::parse(&projection.kind).ok_or_else(RuntimeCommandError::unavailable)?;
-    if projection
-        .legacy_shared_workspace_id
-        .as_ref()
-        .is_some_and(|workspace_id| !workspace_id.starts_with("ws_") || !valid_id(workspace_id, 99))
-    {
-        return Err(RuntimeCommandError::unavailable());
-    }
-    if projection.legacy_shared_workspace_id.is_some() && kind != WorkspaceKind::Session {
-        return Err(RuntimeCommandError::unavailable());
-    }
     Ok(WorkspaceDto {
         workspace_id: projection.workspace_id,
         root: projection.root,
@@ -1373,16 +1428,7 @@ pub(crate) fn parse_workspace_projection(
         trust: projection.trust,
         revision: projection.revision,
         kind,
-        legacy_shared_workspace_id: projection.legacy_shared_workspace_id,
     })
-}
-
-/// A null legacy association is meaningful and must be present; missing projection fields are protocol drift.
-fn required_nullable_workspace_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)
 }
 
 /// infrastructure 只在固定 operation 分支解码参数；payload 必须是有界 JSON object，且从不写日志。
@@ -1412,7 +1458,7 @@ fn turn_start_params(input: &TurnStartInput) -> Result<Value, RuntimeCommandErro
         .map_err(|_| RuntimeCommandError::invalid_params())?;
     let content = turn_content_value(&input.content);
     Ok(
-        json!({"threadId": input.thread_id, "content": content, "clientOperationId": input.client_operation_id}),
+        json!({"threadId": input.thread_id, "content": content, "operationKey": input.operation_key}),
     )
 }
 
@@ -1426,7 +1472,7 @@ pub(crate) fn turn_continue_params(
     Ok(json!({
         "threadId": input.thread_id,
         "expectedThreadRevision": input.expected_thread_revision,
-        "clientOperationId": input.client_operation_id,
+        "operationKey": input.operation_key,
     }))
 }
 
@@ -1440,7 +1486,7 @@ pub(crate) fn turn_reask_params(input: &TurnReaskInput) -> Result<Value, Runtime
         "expectedThreadRevision": input.expected_thread_revision,
         "sourceMessageId": input.source_message_id,
         "content": turn_content_value(&input.content),
-        "clientOperationId": input.client_operation_id,
+        "operationKey": input.operation_key,
     }))
 }
 
@@ -1479,7 +1525,7 @@ fn turn_recovery_respond_params(
         "expectedThreadRevision": input.expected_thread_revision,
         "expectedRecoveryRevision": input.expected_recovery_revision,
         "decision": input.decision,
-        "idempotencyKey": input.idempotency_key,
+        "operationKey": input.operation_key,
     }))
 }
 
@@ -1526,7 +1572,7 @@ fn turn_input_enqueue_params(input: &TurnInputEnqueue) -> Result<Value, RuntimeC
     }
     Ok(
         json!({"turnId": input.turn_id, "content": content, "kind":"follow_up",
-        "clientOperationId":format!("op_{}", uuid::Uuid::new_v4().simple())}),
+        "operationKey":format!("op_{}", uuid::Uuid::new_v4().simple())}),
     )
 }
 
@@ -1585,6 +1631,6 @@ pub(crate) fn approval_params(input: &ApprovalResponseInput) -> Result<Value, Ru
         "turnId": input.turn_id,
         "decision": input.decision,
         "expectedThreadRevision": input.expected_thread_revision,
-        "clientOperationId": input.client_operation_id,
+        "operationKey": input.operation_key,
     }))
 }

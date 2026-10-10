@@ -5,7 +5,7 @@
 
 use super::*;
 
-/// 锁定桌面宿主真实使用的完整能力面，避免默认握手回退为空数组却仍在带外消费事件。
+/// 锁定桌面宿主实际使用的能力闭集，确保 Workspace 元数据失效通知由协商协议正式承载。
 #[test]
 fn default_initialize_advertises_the_consumed_runtime_surface() {
     let params = default_initialize_params(&Limits::default());
@@ -22,24 +22,28 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "turn/retry-started",
             "turn/messages_received",
             "assistant/model-step-committed",
+            "assistant/context-estimated",
             "assistant/text-delta",
             "assistant/reasoning-summary-delta",
             "tool/started",
             "tool/batch-committed",
+            "tool/recovery-changed",
             "approval/requested",
             "approval/resolved",
+            "approval/closed",
             "context/compaction-started",
             "context/compacted",
             "context/compaction-failed",
             "workspace/dirty",
             "turn/terminal",
+            "turn/resync-required",
             "thread/metadata-changed",
+            "workspace/metadata-changed",
             "configuration/changed",
             "task/activity",
             "task/progress",
             "task/mailbox-changed",
-            "goal/changed",
-            "goal/activity",
+            "task/closed",
             "interaction/changed",
             "plan/changed"
         ]))
@@ -52,7 +56,12 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             .and_then(Value::as_array)
             .is_some_and(|methods| methods.iter().any(|method| method == "turn/start"))
     );
-    for expected_method in ["turn/continue", "turn/reask"] {
+    for expected_method in [
+        "turn/continue",
+        "turn/reask",
+        "workspace/read",
+        "workspace/update",
+    ] {
         assert!(
             capabilities
                 .get("methods")
@@ -104,18 +113,14 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
     );
     assert_eq!(
         capabilities.get("features"),
-        Some(&serde_json::json!([
-            "task_threads_v1",
-            "plan_goal_v1",
-            "interaction_v1"
-        ]))
+        Some(&serde_json::json!(["task_threads", "plan", "interaction"]))
     );
     assert_eq!(
         capabilities.get("collaborationModes"),
         Some(&serde_json::json!(["default", "plan"]))
     );
     let methods = capabilities["methods"].as_array().expect("method catalog");
-    assert_eq!(params["protocolMajor"], 1);
+    assert_eq!(params["protocolMajor"], 2);
     assert_eq!(params["protocolMinor"], 0);
     for method in [
         "task/create",
@@ -154,13 +159,13 @@ fn default_initialize_advertises_turn_input_queue_limits() {
     assert_eq!(params["limits"]["maxTurnQueuedInputBytes"], 524_288);
 }
 
-/// initialize 刻意不包含业务配置；首次启动 home 为空时 v1 握手仍合法，缺少 profile
+/// initialize 刻意不包含业务配置；首次启动 home 为空时 v2 握手仍合法，缺少 profile
 /// 或 credential 只在 Java admission Turn 时报告。
 #[test]
 fn initialize_has_no_business_configuration() {
     let params = default_initialize_params(&Limits::default());
     assert!(params.get("profiles").is_none());
-    validate_initialize_params(&params, &Limits::default()).expect("v1 initialize");
+    validate_initialize_params(&params, &Limits::default()).expect("v2 initialize");
 
     // 首版没有升级窗口，不能将旧 2.1 offer 当作可协商的高版本。
     let mut retired = params;

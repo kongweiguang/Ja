@@ -2,22 +2,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { create, type StoreApi, type UseBoundStore } from "zustand";
-import type { ConversationHostEvent } from "./ports";
+import type { ConversationHostEvent, ConversationItemContentReader } from "./ports";
 import type { TimelineSnapshot, TimelineTaskActivityEntry } from "../domain/timelineContracts";
 import type { InputQueue } from "../domain/timelineContracts";
 import type { TimelineEvent } from "../domain/timelineContracts";
-import type { TimelineItemAdapter } from "../domain/timelineTypes";
+import type {
+  ApprovalDecision,
+  TimelineApproval,
+  TimelineItemAdapter,
+  TimelineItemContentHydration,
+  TimelineTurn,
+} from "../domain/timelineTypes";
 import {
   applyLiveEvent,
+  applyTaskActivity as reduceTaskActivity,
   applyInputQueue,
   applySnapshot,
   applyTurnAccepted,
   applyRuntimeStatus,
+  applyProjectionResync,
   createTimelineState,
   markThreadResync,
   pruneInactiveThreads as pruneInactiveThreadProjection,
+  removeThreadProjection,
   requireActiveTurnResync,
+  type ApplySnapshotOptions,
   type AcceptedTurnProjection,
+  type TimelineTaskActivityInput,
   type TimelineState,
 } from "../domain/timelineReducer";
 
@@ -38,6 +49,12 @@ export interface TimelineRecoveryToken {
   mode: "health" | "recovery";
 }
 
+/** Close 回执的客户端所有者；generation 单独不够区分同一代切换到的新服务实例。 */
+export interface TimelineRuntimeFence {
+  serverInstanceId: string;
+  generation: number;
+}
+
 export type TimelineRecoveryResult =
   | { status: "applied"; replayedEvents: number }
   | {
@@ -50,11 +67,32 @@ export interface TimelineStore extends TimelineState {
   recoveredActiveTurnByThread: Record<string, string>;
   /** 每次重读意图的单调序号；相同 reason 的失败重试也必须重新触发 consumer。 */
   resyncRequestSequenceByThread: Record<string, number>;
+  /** 完整公开正文按 Thread 与 Item identity 缓存，避免虚拟行卸载后重读或混淆同名 Item。 */
+  itemContentByThread: Record<string, Record<string, TimelineItemContentHydration>>;
+  /** 多 Item 的最终答复缓存与真实单 Item 正文分开，避免把聚合结果伪装成某个 Item 的原文。 */
+  answerContentByThread: Record<string, Record<string, TimelineItemContentHydration>>;
+  /** 逐页补齐一个公开 Item；失败保留已经确认的 code-point 游标，重试从该处继续。 */
+  hydrateItemContent: (
+    threadId: string,
+    itemId: string,
+    readPage: ConversationItemContentReader,
+    isCurrent?: () => boolean,
+  ) => Promise<string>;
+  /** 最终答复由多个公开 Item 组成时，聚合结果仍由 TimelineStore 持有。 */
+  hydrateAnswerContent: (
+    threadId: string,
+    finalItemId: string,
+    readAnswer: () => Promise<string>,
+    isCurrent?: () => boolean,
+  ) => Promise<string>;
+  /** 无 request fence 时保持显式快照权威；有 fence 时只约束期间变更后的空 Activity 切片。 @author kongweiguang */
   applySnapshot: (
     snapshot: TimelineSnapshot,
     workspaceId: string,
-    options?: { accumulatedHistory?: true },
+    options?: Pick<ApplySnapshotOptions, "accumulatedHistory" | "taskActivityReadFence">,
   ) => TimelineState["lastOutcome"];
+  /** Task Activity 与 Thread Snapshot 共用唯一 owner-root 实体表，revision/identity 决定覆盖顺序。 @author kongweiguang */
+  applyTaskActivity: (input: TimelineTaskActivityInput) => TimelineState["lastOutcome"];
   applyHostEvent: (event: ConversationHostEvent) => TimelineState["lastOutcome"];
   applyTurnAccepted: (accepted: AcceptedTurnProjection) => TimelineState["lastOutcome"];
   applyInputQueue: (inputQueue: InputQueue) => TimelineState["lastOutcome"];
@@ -68,18 +106,24 @@ export interface TimelineStore extends TimelineState {
     requestEpoch: number,
     mode?: "health" | "recovery",
   ) => TimelineRecoveryToken | undefined;
+  /** Recovery 与普通读取使用同一 Activity fence，不能在提交 baseline 时绕开空切片保护。 @author kongweiguang */
   endRecovery: (
     token: TimelineRecoveryToken,
     snapshot: TimelineSnapshot,
     workspaceId: string,
+    options?: Pick<ApplySnapshotOptions, "taskActivityReadFence">,
   ) => TimelineRecoveryResult;
   cancelRecovery: (token: TimelineRecoveryToken) => void;
   getLastAcceptedLive: (threadId: string) => TimelineLiveActivity | undefined;
   pruneInactiveThreads: (threadIds: readonly string[]) => void;
+  /** 仅权威 close 回执可删除整个 Thread 投影；runtime fence 与 tombstone 阻止迟到事实复活。 */
+  closeThreads: (threadIds: readonly string[], fence: TimelineRuntimeFence) => boolean;
+  /** 检查当前服务实例与 generation 下 Thread 是否已经收到权威关闭回执。 */
+  isThreadClosed: (threadId: string) => boolean;
   reset: () => void;
 }
 
-const TIMELINE_STORE_GLOBAL_KEY = "__JA_TIMELINE_STORE_V1__";
+const TIMELINE_STORE_GLOBAL_KEY = "__JA_TIMELINE_STORE_V2__";
 
 type TimelineStoreRegistry = typeof globalThis & {
   [TIMELINE_STORE_GLOBAL_KEY]?: UseBoundStore<StoreApi<TimelineStore>>;
@@ -91,9 +135,77 @@ const draftItemByProjection = new WeakMap<
 >();
 type RetryStatusProjection = NonNullable<TimelineState["retryingByTurn"][string]>;
 const retryStatusItemByProjection = new WeakMap<RetryStatusProjection, TimelineItemAdapter>();
+type CommittedItemProjection = {
+  bodyHydration: TimelineItemContentHydration | undefined;
+  answerHydration: TimelineItemContentHydration | undefined;
+  item: TimelineItemAdapter;
+};
+const committedItemProjectionBySource = new WeakMap<TimelineItemAdapter, CommittedItemProjection>();
+const EMPTY_THREAD_IDS: readonly string[] = [];
 const EMPTY_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 const MAX_RECOVERY_EVENTS = 256;
 const MAX_RECOVERY_BYTES = 1024 * 1024;
+const ITEM_CONTENT_PAGE_SIZE = 65_536;
+
+/** Java and JA-RPC offsets count Unicode code points, so UTF-16 string length is not a cursor. */
+function codePointLength(value: string): number {
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.codePointAt(index);
+    if (codePoint !== undefined && codePoint > 0xffff) index += 1;
+    length += 1;
+  }
+  return length;
+}
+
+/** Hydration 属于读取开始时的 Runtime；重启后 Thread ID 复用也不能接纳旧正文。@author kongweiguang */
+function sameRuntimeFence(
+  current: TimelineState,
+  requested: TimelineRuntimeFence | undefined,
+): boolean {
+  const currentFence =
+    current.handshake.phase === "ready" && current.serverInstanceId !== undefined
+      ? { serverInstanceId: current.serverInstanceId, generation: current.handshake.generation }
+      : undefined;
+  return (
+    currentFence?.serverInstanceId === requested?.serverInstanceId &&
+    currentFence?.generation === requested?.generation
+  );
+}
+
+/** Tool/approval and transient retry rows are not public persisted body targets. */
+function canReadItemContent(item: TimelineItemAdapter): boolean {
+  return ["user_message", "thread_message", "agent_message", "reasoning"].includes(item.kind);
+}
+
+/** 缓存同一不可变源 Item 的最近 hydration 投影，保证 useShallow 在同一快照上能稳定复用成员引用。 */
+function projectCommittedItem(
+  item: TimelineItemAdapter,
+  bodyHydration: TimelineItemContentHydration | undefined,
+  answerHydration: TimelineItemContentHydration | undefined,
+): TimelineItemAdapter {
+  if (bodyHydration === undefined && answerHydration === undefined) {
+    committedItemProjectionBySource.delete(item);
+    return item;
+  }
+
+  const cached = committedItemProjectionBySource.get(item);
+  if (
+    cached !== undefined &&
+    cached.bodyHydration === bodyHydration &&
+    cached.answerHydration === answerHydration
+  ) {
+    return cached.item;
+  }
+
+  const projected = {
+    ...item,
+    ...(bodyHydration === undefined ? {} : { bodyHydration }),
+    ...(answerHydration === undefined ? {} : { answerHydration }),
+  };
+  committedItemProjectionBySource.set(item, { bodyHydration, answerHydration, item: projected });
+  return projected;
+}
 
 /**
  * 选择恢复后的唯一对账目标；liveStream 的 Turn 是最强证据，否则优先最新 running/queued。
@@ -136,6 +248,7 @@ interface RecoveryBuffer {
 
 /** 只从已校验 Host Event 提取 Thread identity，Recovery buffer 不接受跨 Thread 事件。 */
 function hostEventThreadId(event: ConversationHostEvent): string | undefined {
+  if (event.kind === "resync_required") return event.event.threadId;
   if (event.kind !== "timeline" || !("threadId" in event.event.params)) return undefined;
   return event.event.params.threadId;
 }
@@ -228,6 +341,8 @@ function draftItemForTurn(
     itemId: `draft:${turnId}:${draft.segmentStartSeq}`,
     threadId,
     turnId,
+    // Draft/Reasoning 是本次运行中的临时视图，不会进入冻结的历史前缀。
+    origin: "native",
     // assistant 草稿保留协议身份，使流式 Draft 与持久 commentary 始终共享 WorkProcess 边界。
     kind: draft.kind === "reasoning" ? "reasoning" : "commentary",
     status: "in_progress",
@@ -255,6 +370,8 @@ function retryStatusItemForTurn(
     itemId: `retry:${turnId}`,
     threadId,
     turnId,
+    // Retry projection 描述本会话当前执行的恢复状态，不能继承来源会话的活动态。
+    origin: "native",
     kind: "commentary",
     status: "in_progress",
     text: "连接中断，正在恢复",
@@ -273,13 +390,284 @@ function retryStatusItemForTurn(
 function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
   const recoveryBuffers = new Map<string, RecoveryBuffer>();
   const lastAcceptedLiveByThread = new Map<string, TimelineLiveActivity>();
+  const itemContentReads = new Map<string, Promise<string>>();
+  const answerContentReads = new Map<string, Promise<string>>();
+  const closedThreadIds = new Set<string>();
+  const closedTurnIds = new Set<string>();
+  let closedRuntimeFence: TimelineRuntimeFence | undefined;
+  let storeEpoch = 0;
+  /** 只在 ready runtime 的 (SID,generation) 改变时换 tombstone owner，普通 reset 不开放旧 Thread。@author kongweiguang */
+  const syncClosedRuntimeFence = (state: TimelineState): void => {
+    const current =
+      state.handshake.phase === "ready" &&
+      state.serverInstanceId !== undefined &&
+      state.handshake.generation > 0
+        ? { serverInstanceId: state.serverInstanceId, generation: state.handshake.generation }
+        : undefined;
+    if (current === undefined) return;
+    if (
+      closedRuntimeFence?.serverInstanceId === current.serverInstanceId &&
+      closedRuntimeFence.generation === current.generation
+    )
+      return;
+    closedThreadIds.clear();
+    closedTurnIds.clear();
+    closedRuntimeFence = current;
+  };
+  /** 所有投影写入口共用同一个闭合 ID 集；这只存身份，不缓存第二份 Timeline 实体。@author kongweiguang */
+  const isClosedAtState = (threadId: string, state: TimelineState): boolean => {
+    syncClosedRuntimeFence(state);
+    return closedThreadIds.has(threadId);
+  };
+  /** 清理 close 后的 Store 附属投影；运行时 tombstone 单独保留，普通 reset 不能复活旧 Thread。@author kongweiguang */
+  const clearClosedThreadExtensions = (threadIds: readonly string[]): void => {
+    for (const threadId of threadIds) {
+      recoveryBuffers.delete(threadId);
+      lastAcceptedLiveByThread.delete(threadId);
+      const itemPrefix = `${threadId}\u0000`;
+      const answerPrefix = `${threadId}\u0000`;
+      for (const key of itemContentReads.keys())
+        if (key.startsWith(itemPrefix)) itemContentReads.delete(key);
+      for (const key of answerContentReads.keys())
+        if (key.startsWith(answerPrefix)) answerContentReads.delete(key);
+    }
+  };
   return create<TimelineStore>((set, get) => ({
     ...createTimelineState(),
     recoveredActiveTurnByThread: {},
     resyncRequestSequenceByThread: {},
+    itemContentByThread: {},
+    answerContentByThread: {},
+    hydrateItemContent: (threadId, itemId, readPage, isCurrent = () => true) => {
+      const requestState = get();
+      const requestRuntimeFence =
+        requestState.handshake.phase === "ready" && requestState.serverInstanceId !== undefined
+          ? {
+              serverInstanceId: requestState.serverInstanceId,
+              generation: requestState.handshake.generation,
+            }
+          : undefined;
+      const owner = requestState.itemThreadById[itemId];
+      const item = requestState.items[itemId];
+      const prior = requestState.itemContentByThread[threadId]?.[itemId];
+      if (isClosedAtState(threadId, requestState))
+        return Promise.reject(new Error("The Thread has been closed."));
+      if (owner !== undefined && owner !== threadId)
+        return Promise.reject(new Error("Item does not belong to the requested Thread."));
+      if (item !== undefined && !canReadItemContent(item))
+        return Promise.reject(new Error("This Item does not expose public text content."));
+      if (prior?.status === "complete") return Promise.resolve(prior.text);
+      if (!isCurrent()) return Promise.reject(new Error("The Thread is no longer visible."));
+
+      const requestKey = `${threadId}\u0000${itemId}`;
+      const pending = itemContentReads.get(requestKey);
+      if (pending !== undefined) return pending;
+      const requestEpoch = storeEpoch;
+      const publish = (hydration: TimelineItemContentHydration): void => {
+        set((state) => {
+          if (
+            requestEpoch !== storeEpoch ||
+            !sameRuntimeFence(state, requestRuntimeFence) ||
+            isClosedAtState(threadId, state) ||
+            state.threads[threadId] === undefined ||
+            (state.itemThreadById[itemId] !== undefined &&
+              state.itemThreadById[itemId] !== threadId)
+          )
+            return state;
+          return {
+            itemContentByThread: {
+              ...state.itemContentByThread,
+              [threadId]: {
+                ...(state.itemContentByThread[threadId] ?? {}),
+                [itemId]: hydration,
+              },
+            },
+          };
+        });
+      };
+      const read = async (): Promise<string> => {
+        const initial = get().itemContentByThread[threadId]?.[itemId];
+        publish({
+          status: "loading",
+          text: initial?.text ?? "",
+          offsetCharacters: initial?.offsetCharacters ?? 0,
+          ...(initial?.totalCharacters === undefined
+            ? {}
+            : { totalCharacters: initial.totalCharacters }),
+        });
+        try {
+          for (;;) {
+            if (
+              requestEpoch !== storeEpoch ||
+              !sameRuntimeFence(get(), requestRuntimeFence) ||
+              isClosedAtState(threadId, get()) ||
+              get().threads[threadId] === undefined
+            )
+              throw new Error("The Thread content request is stale.");
+            if (!isCurrent()) {
+              const current = get().itemContentByThread[threadId]?.[itemId];
+              publish({
+                status: "idle",
+                text: current?.text ?? "",
+                offsetCharacters: current?.offsetCharacters ?? 0,
+                ...(current?.totalCharacters === undefined
+                  ? {}
+                  : { totalCharacters: current.totalCharacters }),
+              });
+              throw new Error("The Thread is no longer visible.");
+            }
+            const current = get().itemContentByThread[threadId]?.[itemId];
+            const offsetCharacters = current?.offsetCharacters ?? 0;
+            const page = await readPage({
+              threadId,
+              itemId,
+              offsetCharacters,
+              limitCharacters: ITEM_CONTENT_PAGE_SIZE,
+            });
+            const pageCharacters = codePointLength(page.content);
+            const nextOffset = offsetCharacters + pageCharacters;
+            const pageIsValid =
+              page.itemId === itemId &&
+              page.offsetCharacters === offsetCharacters &&
+              (current?.totalCharacters === undefined ||
+                page.totalCharacters === current.totalCharacters) &&
+              Number.isSafeInteger(page.totalCharacters) &&
+              page.totalCharacters >= nextOffset &&
+              page.truncated === (page.nextOffsetCharacters !== null) &&
+              (page.truncated
+                ? page.nextOffsetCharacters === nextOffset && nextOffset > offsetCharacters
+                : page.nextOffsetCharacters === null && nextOffset === page.totalCharacters);
+            if (!pageIsValid)
+              throw new Error("Item content page identity or offset is inconsistent.");
+
+            const text = (current?.text ?? "") + page.content;
+            const complete: TimelineItemContentHydration = {
+              status: page.truncated ? "loading" : "complete",
+              text,
+              offsetCharacters: nextOffset,
+              totalCharacters: page.totalCharacters,
+            };
+            publish(complete);
+            if (!page.truncated) return text;
+          }
+        } catch (failure) {
+          const current = get().itemContentByThread[threadId]?.[itemId];
+          if (current?.status === "loading") publish({ ...current, status: "error" });
+          throw failure;
+        }
+      };
+      const request = Promise.resolve()
+        .then(read)
+        .finally(() => {
+          if (itemContentReads.get(requestKey) === request) itemContentReads.delete(requestKey);
+        });
+      itemContentReads.set(requestKey, request);
+      return request;
+    },
+    hydrateAnswerContent: (threadId, finalItemId, readAnswer, isCurrent = () => true) => {
+      const requestState = get();
+      const requestRuntimeFence =
+        requestState.handshake.phase === "ready" && requestState.serverInstanceId !== undefined
+          ? {
+              serverInstanceId: requestState.serverInstanceId,
+              generation: requestState.handshake.generation,
+            }
+          : undefined;
+      const owner = requestState.itemThreadById[finalItemId];
+      const prior = requestState.answerContentByThread[threadId]?.[finalItemId];
+      if (isClosedAtState(threadId, requestState))
+        return Promise.reject(new Error("The Thread has been closed."));
+      if (owner !== undefined && owner !== threadId)
+        return Promise.reject(new Error("Final Item does not belong to the requested Thread."));
+      if (prior?.status === "complete") return Promise.resolve(prior.text);
+      if (!isCurrent()) return Promise.reject(new Error("The Thread is no longer visible."));
+
+      const requestKey = `${threadId}\u0000${finalItemId}`;
+      const pending = answerContentReads.get(requestKey);
+      if (pending !== undefined) return pending;
+      const requestEpoch = storeEpoch;
+      const publish = (hydration: TimelineItemContentHydration): void => {
+        set((state) => {
+          if (
+            requestEpoch !== storeEpoch ||
+            !sameRuntimeFence(state, requestRuntimeFence) ||
+            isClosedAtState(threadId, state) ||
+            state.threads[threadId] === undefined ||
+            (state.itemThreadById[finalItemId] !== undefined &&
+              state.itemThreadById[finalItemId] !== threadId)
+          )
+            return state;
+          return {
+            answerContentByThread: {
+              ...state.answerContentByThread,
+              [threadId]: {
+                ...(state.answerContentByThread[threadId] ?? {}),
+                [finalItemId]: hydration,
+              },
+            },
+          };
+        });
+      };
+      const read = async (): Promise<string> => {
+        const initial = get().answerContentByThread[threadId]?.[finalItemId];
+        publish({
+          status: "loading",
+          text: initial?.text ?? "",
+          offsetCharacters: initial?.offsetCharacters ?? 0,
+          ...(initial?.totalCharacters === undefined
+            ? {}
+            : { totalCharacters: initial.totalCharacters }),
+        });
+        try {
+          const text = await readAnswer();
+          if (
+            requestEpoch !== storeEpoch ||
+            !sameRuntimeFence(get(), requestRuntimeFence) ||
+            isClosedAtState(threadId, get()) ||
+            get().threads[threadId] === undefined
+          )
+            throw new Error("The Thread answer request is stale.");
+          if (!isCurrent()) {
+            publish({
+              status: "idle",
+              text: initial?.text ?? "",
+              offsetCharacters: initial?.offsetCharacters ?? 0,
+              ...(initial?.totalCharacters === undefined
+                ? {}
+                : { totalCharacters: initial.totalCharacters }),
+            });
+            throw new Error("The Thread is no longer visible.");
+          }
+          const characterCount = codePointLength(text);
+          const complete: TimelineItemContentHydration = {
+            status: "complete",
+            text,
+            offsetCharacters: characterCount,
+            totalCharacters: characterCount,
+          };
+          publish(complete);
+          return text;
+        } catch (failure) {
+          const current = get().answerContentByThread[threadId]?.[finalItemId];
+          if (current?.status === "loading") publish({ ...current, status: "error" });
+          throw failure;
+        }
+      };
+      const request = Promise.resolve()
+        .then(read)
+        .finally(() => {
+          if (answerContentReads.get(requestKey) === request) answerContentReads.delete(requestKey);
+        });
+      answerContentReads.set(requestKey, request);
+      return request;
+    },
     applySnapshot: (snapshot, workspaceId, options) => {
       let nextOutcome: TimelineState["lastOutcome"] = "invalid";
       set((state) => {
+        if (isClosedAtState(snapshot.threadId, state)) {
+          nextOutcome = "rejected";
+          return { ...state, lastOutcome: nextOutcome };
+        }
         const next = applySnapshot(state, snapshot, workspaceId, options);
         nextOutcome = next.lastOutcome;
         if (next.lastOutcome !== "applied")
@@ -299,12 +687,35 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       });
       return nextOutcome ?? "invalid";
     },
+    /** 事件只推进已有 root slice；同一 Activity 重投为幂等，迟到 revision 不覆盖新事实。 @author kongweiguang */
+    applyTaskActivity: (input) => {
+      let nextOutcome: TimelineState["lastOutcome"] = "rejected";
+      set((state) => {
+        const references = [
+          input.activity.rootThreadId,
+          input.activity.taskThreadId,
+          input.activity.actorThreadId,
+          input.task.taskThreadId,
+          input.task.parentThreadId,
+          input.task.rootThreadId,
+        ];
+        if (references.some((threadId) => isClosedAtState(threadId, state))) {
+          nextOutcome = "rejected";
+          return { ...state, lastOutcome: nextOutcome };
+        }
+        const next = reduceTaskActivity(state, input);
+        nextOutcome = next.lastOutcome;
+        return next;
+      });
+      return nextOutcome ?? "rejected";
+    },
     /**
      * 只接纳类型化 Host Event，并把隔离的原生 Frame 转换为权威 Snapshot 要求；Malformed Payload
      * 不得泄漏到 Store，也不能让 Active Turn 永久停留在 Busy。
      */
     applyHostEvent: (event) => {
       const threadId = hostEventThreadId(event);
+      if (threadId !== undefined && isClosedAtState(threadId, get())) return "rejected";
       if (threadId !== undefined && event.kind === "timeline") {
         const recovery = recoveryBuffers.get(threadId);
         if (recovery !== undefined) {
@@ -323,8 +734,7 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
               recovery.bytes += bytes;
             }
           }
-          // Recovery keeps a replay copy but applies the live event immediately. Terminal and
-          // committed facts therefore remain visible while the authoritative read is in flight.
+          // 恢复时保留一份重放副本，同时立即应用实时事件。终态和已提交事实会在权威读取期间继续显示。
           let nextOutcome: TimelineState["lastOutcome"] = "rejected";
           set((state) => {
             const next = applyLiveEvent(state, event.event);
@@ -355,8 +765,20 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             ? applyRuntimeStatus(state, event.status)
             : event.kind === "timeline"
               ? applyLiveEvent(state, event.event)
-              : requireActiveTurnResync(state, "projection_fault");
+              : event.kind === "resync_required"
+                ? applyProjectionResync(state, event.event)
+                : requireActiveTurnResync(state, "projection_fault");
         nextOutcome = next.lastOutcome;
+        if (event.kind === "resync_required" && nextOutcome === "resync_required") {
+          const threadId = event.event.threadId;
+          return {
+            ...next,
+            resyncRequestSequenceByThread: {
+              ...(state.resyncRequestSequenceByThread ?? {}),
+              [threadId]: ((state.resyncRequestSequenceByThread ?? {})[threadId] ?? 0) + 1,
+            },
+          };
+        }
         if (event.kind === "timeline" && next.lastOutcome === "applied") {
           const activity = liveActivityFromEvent(event.event, next, Date.now());
           if (activity !== undefined) lastAcceptedLiveByThread.set(activity.threadId, activity);
@@ -384,6 +806,7 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
         ) {
           recoveryBuffers.clear();
           lastAcceptedLiveByThread.clear();
+          syncClosedRuntimeFence(next);
           return {
             ...next,
             recoveredActiveTurnByThread: {},
@@ -398,6 +821,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     applyTurnAccepted: (accepted) => {
       let nextOutcome: TimelineState["lastOutcome"] = "rejected";
       set((state) => {
+        if (isClosedAtState(accepted.threadId, state)) {
+          nextOutcome = "rejected";
+          return { ...state, lastOutcome: nextOutcome };
+        }
         const next = applyTurnAccepted(state, accepted);
         nextOutcome = next.lastOutcome;
         if (next.lastOutcome !== "applied") return next;
@@ -411,6 +838,15 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     applyInputQueue: (inputQueue) => {
       let nextOutcome: TimelineState["lastOutcome"] = "rejected";
       set((state) => {
+        if (closedTurnIds.has(inputQueue.turnId)) {
+          nextOutcome = "rejected";
+          return { ...state, lastOutcome: nextOutcome };
+        }
+        const owner = state.turns[inputQueue.turnId]?.threadId;
+        if (owner !== undefined && isClosedAtState(owner, state)) {
+          nextOutcome = "rejected";
+          return { ...state, lastOutcome: nextOutcome };
+        }
         const next = applyInputQueue(state, inputQueue);
         nextOutcome = next.lastOutcome;
         return next;
@@ -428,12 +864,14 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
         ) {
           recoveryBuffers.clear();
           lastAcceptedLiveByThread.clear();
+          syncClosedRuntimeFence(next);
           return {
             ...next,
             recoveredActiveTurnByThread: {},
             resyncRequestSequenceByThread: {},
           };
         }
+        syncClosedRuntimeFence(next);
         return next;
       });
       return nextOutcome;
@@ -444,6 +882,7 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
      */
     recordThreadMetadataRevision: (threadId, revision) =>
       set((state) => {
+        if (isClosedAtState(threadId, state)) return state;
         const current = state.threadRevisionByThread[threadId] ?? -1;
         if (revision <= current) return state;
         return {
@@ -455,15 +894,19 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       }),
     /** 队列 CAS 冲突只建立一次 authoritative read 意图，不在 Renderer 猜测条目现状。 */
     requestThreadResync: (threadId) =>
-      set((state) => ({
-        ...markThreadResync(state, threadId),
-        resyncRequestSequenceByThread: {
-          ...(state.resyncRequestSequenceByThread ?? {}),
-          [threadId]: ((state.resyncRequestSequenceByThread ?? {})[threadId] ?? 0) + 1,
-        },
-      })),
+      set((state) => {
+        if (isClosedAtState(threadId, state)) return state;
+        return {
+          ...markThreadResync(state, threadId),
+          resyncRequestSequenceByThread: {
+            ...(state.resyncRequestSequenceByThread ?? {}),
+            [threadId]: ((state.resyncRequestSequenceByThread ?? {})[threadId] ?? 0) + 1,
+          },
+        };
+      }),
     /** 开始一次有界恢复窗口；窗口内 live event 暂存，避免快照提交时产生半帧 Gap。 */
     beginRecovery: (threadId, requestEpoch, mode = "recovery") => {
+      if (isClosedAtState(threadId, get())) return undefined;
       const current = recoveryBuffers.get(threadId);
       if (current !== undefined && current.requestEpoch >= requestEpoch) return undefined;
       const state = get();
@@ -480,9 +923,14 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     },
     /**
      * 以单个 Zustand commit 应用 authoritative baseline 并重放读取期间的 live event；溢出、空 baseline
-     * 或 replay gap 都只返回需重读结果，不把队列中的残缺正文发布到 UI。
+     * 或 replay gap 都只返回需重读结果，不把队列中的残缺正文发布到 UI。Task Activity 请求围栏只约束迟到空切片。
+     * @author kongweiguang
      */
-    endRecovery: (token, snapshot, workspaceId) => {
+    endRecovery: (token, snapshot, workspaceId, options) => {
+      if (isClosedAtState(token.threadId, get())) {
+        recoveryBuffers.delete(token.threadId);
+        return { status: "stale", replayedEvents: 0 };
+      }
       const recovery = recoveryBuffers.get(token.threadId);
       if (
         recovery === undefined ||
@@ -507,7 +955,10 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       }
       let result: TimelineRecoveryResult = { status: "invalid", replayedEvents: 0 };
       set((state) => {
-        let next = applySnapshot(state, snapshot, workspaceId, { mode: recovery.mode });
+        let next = applySnapshot(state, snapshot, workspaceId, {
+          mode: recovery.mode,
+          ...options,
+        });
         const snapshotNeedsBaseline =
           recovery.mode === "recovery" &&
           snapshot.liveStream === null &&
@@ -548,17 +999,15 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
             if (activity !== undefined) lastAcceptedLiveByThread.set(token.threadId, activity);
           }
         }
-        const hasActiveTurn = Object.values(next.turns).some(
-          (turn) =>
-            turn.threadId === token.threadId &&
-            !["completed", "failed", "cancelled"].includes(turn.status),
+        const threadTurns = (next.turnIdsByThread[token.threadId] ?? EMPTY_THREAD_IDS)
+          .map((turnId) => next.turns[turnId])
+          .filter((turn): turn is TimelineTurn => turn !== undefined);
+        const hasActiveTurn = threadTurns.some(
+          (turn) => !["completed", "failed", "cancelled"].includes(turn.status),
         );
         const recoveredActiveTurnByThread = { ...(state.recoveredActiveTurnByThread ?? {}) };
         if (hasActiveTurn) {
-          const activeTurn = selectRecoveredActiveTurnId(
-            Object.values(next.turns).filter((turn) => turn.threadId === token.threadId),
-            snapshot.liveStream?.turnId,
-          );
+          const activeTurn = selectRecoveredActiveTurnId(threadTurns, snapshot.liveStream?.turnId);
           if (activeTurn !== undefined) recoveredActiveTurnByThread[token.threadId] = activeTurn;
         } else {
           delete recoveredActiveTurnByThread[token.threadId];
@@ -578,6 +1027,7 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
     },
     /** 取消读取时保留当前即时投影，并标记一次非破坏性对账，避免已展示 terminal 静默丢失。 */
     cancelRecovery: (token) => {
+      if (isClosedAtState(token.threadId, get())) return;
       const current = recoveryBuffers.get(token.threadId);
       if (current?.requestEpoch === token.requestEpoch) {
         recoveryBuffers.delete(token.threadId);
@@ -585,7 +1035,8 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
       }
     },
     /** 供 Controller 静默监测读取，不建立 Zustand subscription，也不把 delta 扩散到 Shell。 */
-    getLastAcceptedLive: (threadId) => lastAcceptedLiveByThread.get(threadId),
+    getLastAcceptedLive: (threadId) =>
+      isClosedAtState(threadId, get()) ? undefined : lastAcceptedLiveByThread.get(threadId),
     /** 仅清理控制器淘汰的非活动缓存 Thread；Reducer 会再次保护实时任务与审批投影。 */
     pruneInactiveThreads: (threadIds) => {
       for (const threadId of threadIds) {
@@ -607,16 +1058,84 @@ function createTimelineStore(): UseBoundStore<StoreApi<TimelineStore>> {
               ([threadId]) => !removed.has(threadId),
             ),
           ),
+          itemContentByThread: Object.fromEntries(
+            Object.entries(state.itemContentByThread).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+          answerContentByThread: Object.fromEntries(
+            Object.entries(state.answerContentByThread).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
         };
       });
     },
+    /** 仅匹配当前 ready runtime 的权威 close 可删除内容；先立 ID tombstone，再发布一次 Store 清理。@author kongweiguang */
+    closeThreads: (threadIds, fence) => {
+      const uniqueIds = [...new Set(threadIds.filter((threadId) => threadId.length > 0))];
+      if (uniqueIds.length === 0) return false;
+      const current = get();
+      syncClosedRuntimeFence(current);
+      if (
+        current.handshake.phase !== "ready" ||
+        current.serverInstanceId !== fence.serverInstanceId ||
+        current.handshake.generation !== fence.generation ||
+        closedRuntimeFence?.serverInstanceId !== fence.serverInstanceId ||
+        closedRuntimeFence.generation !== fence.generation
+      )
+        return false;
+      if (uniqueIds.every((threadId) => closedThreadIds.has(threadId))) return true;
+      const closingThreadIds = new Set(uniqueIds);
+      for (const threadId of uniqueIds)
+        for (const turnId of current.turnIdsByThread[threadId] ?? []) closedTurnIds.add(turnId);
+      for (const [turnId, turn] of Object.entries(current.turns))
+        if (closingThreadIds.has(turn.threadId)) closedTurnIds.add(turnId);
+      for (const threadId of uniqueIds) closedThreadIds.add(threadId);
+      clearClosedThreadExtensions(uniqueIds);
+      set((state) => {
+        const next = removeThreadProjection(state, uniqueIds);
+        const removed = new Set(uniqueIds);
+        return {
+          ...next,
+          recoveredActiveTurnByThread: Object.fromEntries(
+            Object.entries(state.recoveredActiveTurnByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+          resyncRequestSequenceByThread: Object.fromEntries(
+            Object.entries(state.resyncRequestSequenceByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+          itemContentByThread: Object.fromEntries(
+            Object.entries(state.itemContentByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+          answerContentByThread: Object.fromEntries(
+            Object.entries(state.answerContentByThread ?? {}).filter(
+              ([threadId]) => !removed.has(threadId),
+            ),
+          ),
+        };
+      });
+      return true;
+    },
+    /** 查询当前 runtime tombstone，供异步 Controller 在完成时阻止旧 Thread 副作用复活。@author kongweiguang */
+    isThreadClosed: (threadId) => isClosedAtState(threadId, get()),
     reset: () => {
+      storeEpoch += 1;
       recoveryBuffers.clear();
       lastAcceptedLiveByThread.clear();
+      itemContentReads.clear();
+      answerContentReads.clear();
       set({
         ...createTimelineState(),
         recoveredActiveTurnByThread: {},
         resyncRequestSequenceByThread: {},
+        itemContentByThread: {},
+        answerContentByThread: {},
       });
     },
   }));
@@ -633,14 +1152,16 @@ export const useTimelineStore =
 
 timelineStoreRegistry[TIMELINE_STORE_GLOBAL_KEY] = useTimelineStore;
 
-/**
- * 只选择已经进入权威 Thread 顺序的条目；页头摘要、文件入口和空态不读取逐段 Draft，
- * 避免高频正文把 Timeline 之外的 Composer 与导航共同父级带入 React commit。
- */
+/** 只选权威 Thread 顺序并附加分页正文；稳定 Item 引用供 useShallow 在重复快照间复用。 */
 export const selectCommittedItemsForThread = (threadId: string) => (state: TimelineStore) =>
   (state.itemIdsByThread[threadId] ?? [])
     .map((itemId) => state.items[itemId])
-    .filter((item) => item !== undefined);
+    .filter((item) => item !== undefined)
+    .map((item) => {
+      const bodyHydration = state.itemContentByThread[threadId]?.[item.itemId];
+      const answerHydration = state.answerContentByThread[threadId]?.[item.itemId];
+      return projectCommittedItem(item, bodyHydration, answerHydration);
+    });
 
 /**
  * 按 Thread 组装持久 Item，并把尚未结算的公开回复/Reasoning segments 附在对应 Turn；Tool 模型步
@@ -653,55 +1174,63 @@ export const selectCommittedItemsForThread = (threadId: string) => (state: Timel
  */
 export const selectItemsForThread = (threadId: string) => (state: TimelineStore) => {
   const committed = selectCommittedItemsForThread(threadId)(state);
-  const drafts = Object.values(state.turns).flatMap((turn) => {
-    const drafts = state.draftByTurn[turn.turnId];
-    if (turn.threadId !== threadId || drafts === undefined) return [];
-    return drafts
+  const threadTurnIds = state.turnIdsByThread[threadId] ?? EMPTY_THREAD_IDS;
+  const drafts = threadTurnIds.flatMap((turnId) => {
+    const turnDrafts = state.draftByTurn[turnId];
+    if (turnDrafts === undefined) return [];
+    return turnDrafts
       .filter((draft) => draft.text.trim() !== "")
-      .map((draft) => draftItemForTurn(threadId, turn.turnId, draft));
+      .map((draft) => draftItemForTurn(threadId, turnId, draft));
   });
-  const retryStatuses = Object.entries(state.retryingByTurn).flatMap(([turnId, retry]) => {
+  const retryStatuses = threadTurnIds.flatMap((turnId) => {
+    const retry = state.retryingByTurn[turnId];
     const turn = state.turns[turnId];
-    if (turn?.threadId !== threadId || turn.status !== "running") return [];
+    if (retry === undefined || turn?.status !== "running") return [];
     return [retryStatusItemForTurn(threadId, turnId, retry)];
   });
   return interleaveDraftsWithCommittedItems(committed, [...drafts, ...retryStatuses]);
 };
 
+/** @author kongweiguang
+ * Turn 只存一份实体并通过 owner 索引隔离会话；按当前 Thread 读取，避免订阅者扫描全局 Turn 表。
+ */
+export const selectTurnsForThread = (threadId: string) => (state: TimelineStore) =>
+  (state.turnIdsByThread[threadId] ?? EMPTY_THREAD_IDS)
+    .map((turnId) => state.turns[turnId])
+    .filter((turn): turn is TimelineTurn => turn !== undefined);
+
 /** 主 Timeline 只读取当前 root 的持久活动切片；稳定空数组避免隐藏视图产生无效重渲染。 */
 export const selectTaskActivitiesForRoot = (rootThreadId: string) => (state: TimelineStore) =>
   state.taskActivitiesByRootThread[rootThreadId] ?? EMPTY_TASK_ACTIVITIES;
 
-const EMPTY_GOAL_ACTIVITIES: readonly import("../domain/timelineContracts").TimelineGoalActivity[] =
-  [];
-
-/** Goal 终态由 thread/read 恢复，稳定空数组避免没有历史目标时触发无效重渲染。 */
-export const selectGoalActivitiesForOwner = (ownerThreadId: string) => (state: TimelineStore) =>
-  state.goalActivitiesByOwnerThread[ownerThreadId] ?? EMPTY_GOAL_ACTIVITIES;
-
-/**
- * Resolution Tombstone 对卡片隐藏但保留在状态中，避免使用同一 approvalId 的迟到请求复活用户任务。
+/** @author kongweiguang
+ * Approval 终态墓碑保留在唯一实体表中，但投影只遍历所属 Thread 索引，避免会话间数据串读。
  */
-export const selectApprovals = (state: TimelineStore) =>
-  Object.values(state.approvalsById)
-    .map((projection) => projection.approval)
-    .filter((approval): approval is NonNullable<typeof approval> => approval !== undefined);
+export const selectApprovalsForThread = (threadId: string) => (state: TimelineStore) =>
+  (state.approvalIdsByThread[threadId] ?? EMPTY_THREAD_IDS)
+    .map((approvalId) => state.approvalsById[approvalId]?.approval)
+    .filter((approval): approval is TimelineApproval => approval !== undefined);
 
-/**
- * 生成现有 Card Adapter 的 Decision Map，但不让 Approval Event 成为第二事实来源，
- * 也不把未解决条目暴露成 Decision。
+/** @author kongweiguang
+ * 决策从同一 Thread 的 Approval 切片派生，不另建全局映射或复制另一份可变状态。
  */
-export const selectApprovalDecisions = (state: TimelineStore) =>
-  Object.fromEntries(
-    Object.entries(state.approvalsById)
-      .filter(([, projection]) => projection.decision !== undefined)
-      .map(([approvalId, projection]) => [approvalId, projection.decision]),
-  );
+export const selectApprovalDecisionsForThread = (threadId: string) => (state: TimelineStore) => {
+  const decisions: Record<string, ApprovalDecision> = {};
+  for (const approvalId of state.approvalIdsByThread[threadId] ?? EMPTY_THREAD_IDS) {
+    const decision = state.approvalsById[approvalId]?.decision;
+    if (decision !== undefined) decisions[approvalId] = decision;
+  }
+  return decisions;
+};
 
-/** 单独暴露 Terminal Closure，使 UI 永远不会伪造 Deny Decision。 */
-export const selectApprovalClosedAt = (state: TimelineStore) =>
-  Object.fromEntries(
-    Object.entries(state.approvalsById)
-      .filter(([, projection]) => projection.closedAt !== undefined)
-      .map(([approvalId, projection]) => [approvalId, projection.closedAt]),
-  );
+/** @author kongweiguang
+ * 关闭时间与用户决策是不同事实，但都限定在 owner Thread 索引内，避免全局归约与身份混淆。
+ */
+export const selectApprovalClosedAtForThread = (threadId: string) => (state: TimelineStore) => {
+  const closedAt: Record<string, string> = {};
+  for (const approvalId of state.approvalIdsByThread[threadId] ?? EMPTY_THREAD_IDS) {
+    const value = state.approvalsById[approvalId]?.closedAt;
+    if (value !== undefined) closedAt[approvalId] = value;
+  }
+  return closedAt;
+};

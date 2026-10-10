@@ -13,9 +13,18 @@ import {
   type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, Copy, LoaderCircle, Paperclip, Pencil } from "lucide-react";
+import {
+  ArrowDown,
+  Copy,
+  GitFork,
+  LoaderCircle,
+  Paperclip,
+  Pencil,
+  TriangleAlert,
+} from "lucide-react";
 import { cn } from "@/shared/ui/primitives/cn";
 import { MenuItem, MenuSeparator, PointerContextMenu } from "@/shared/ui/primitives";
+import { observeElementOffsetWhileActive } from "@/shared/ui/observeElementOffsetWhileActive";
 import type { UserApprovalDecision } from "../approval/ApprovalCard";
 import type {
   ApprovalDecision,
@@ -47,6 +56,7 @@ import {
   type TimelineScrollKey,
 } from "./timelineScroll";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
+import type { ConversationProcessBinding } from "../../application/processSessionTypes";
 import { useFullPublicText } from "./useFullPublicText";
 import { exportPublicText } from "./exportPublicText";
 import "./timeline.css";
@@ -80,6 +90,16 @@ export interface ChatTimelineProps {
   items: readonly TimelineItemAdapter[];
   /** Turn 只用于紧凑的当前工作状态，绝不能充当第二个 Store。 */
   turns?: readonly TimelineTurn[];
+  /** 逐条回复用最后一个持久 FINAL_ANSWER identity 分叉，不能用合并消息的首项 ID。 */
+  onForkReply?: (anchor: { threadId: string; itemId: string }) => Promise<ForkReplyOutcome>;
+  /** 按 Thread/Item identity 持有操作状态，虚拟行卸载后仍能恢复原操作反馈。 */
+  forkingReplies?: readonly { threadId: string; itemId: string }[];
+  /** 已有创建回执但尚未成功打开；再次点击只重开该目标，不会再次创建。 */
+  forkCreatedReplies?: readonly { threadId: string; itemId: string }[];
+  forkOpenFailures?: readonly { threadId: string; itemId: string }[];
+  /** RPC 明确冲突与结果待核实必须跨虚拟行卸载保留各自的安全重试语义。 */
+  forkConflictReplies?: readonly { threadId: string; itemId: string }[];
+  forkUnconfirmedReplies?: readonly { threadId: string; itemId: string }[];
   /** Skill 展示元数据来自当前 catalog；历史 wire 始终只保存稳定 skillId。 */
   skills?: readonly ConversationSkillMetadata[];
   /** Approval 按 Turn 与 callId 关联 Prepared Tool，不能使用已删除的 Wire itemId。 */
@@ -105,11 +125,11 @@ export interface ChatTimelineProps {
   onOpenFile?: (
     target: MarkdownFileTarget,
     source: HTMLElement,
-    mode?: "explorer",
+    mode?: "explorer" | "browser",
   ) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
-  /** 仅在用户查看或复制长答复时读取已提交消息的完整正文。 */
-  onReadMessageContent?: (messageId: string) => Promise<string>;
+  /** 仅在用户查看或复制时按稳定 Thread/Item identity 读取已提交正文。 */
+  onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   /** 终态答复可跨未加载的旧页；生产 Controller 应以最终消息身份查齐整段。 */
   onReadAnswerContent?: (
     finalMessageId: string,
@@ -129,8 +149,9 @@ export interface ChatTimelineProps {
     expectedThreadRevision: number;
     expectedRecoveryRevision: number;
     decision: "retry" | "skip";
-    idempotencyKey: string;
+    operationKey: string;
   }) => Promise<unknown>;
+  processSession?: ConversationProcessBinding;
   /** 每个终态 Turn 的冻结修改由 Workbench 承载；可选路径只定位该 artifact 内的真实文件。 */
   onReviewTurn?: (
     turn: TimelineTurn,
@@ -171,6 +192,7 @@ type TimelineRow = {
   threadMessages: TimelineItemAdapter[];
   work: TimelineItemAdapter[];
   final?: TimelineItemAdapter;
+  forkAnchor?: { threadId: string; itemId: string };
   approvals: ApprovalSummary[];
 };
 
@@ -185,7 +207,7 @@ interface MessageContextMenuSession {
   readonly opener: HTMLElement;
 }
 
-/** DOM role is used only to route a menu event back into the current typed Timeline projection. */
+/** 只使用 DOM 角色将菜单事件路由回当前的类型化 Timeline 投影。 */
 function isMessageMenuRole(role: string | undefined): role is MessageMenuRole {
   return (
     role === "user" ||
@@ -275,6 +297,7 @@ type MutableTurnGroup = {
 
 type AssistantResponseState =
   | "working"
+  | "waiting_input"
   | "waiting"
   | "suspended"
   | "streaming"
@@ -282,11 +305,114 @@ type AssistantResponseState =
   | "failed"
   | "cancelled";
 
+type ForkReplyOutcome = "opened" | "deferred" | "open_failed";
+
+/**
+ * Fork 与复制共用同一圆形操作位；控制器持有请求和可恢复错误语义，局部状态只补充不可恢复的泛化反馈。
+ * @author kongweiguang
+ */
+function ForkReplyButton({
+  anchor,
+  pending = false,
+  created = false,
+  openFailed = false,
+  conflict = false,
+  unconfirmed = false,
+  onForkReply,
+}: {
+  anchor: { threadId: string; itemId: string };
+  pending?: boolean;
+  created?: boolean;
+  openFailed?: boolean;
+  conflict?: boolean;
+  unconfirmed?: boolean;
+  onForkReply: NonNullable<ChatTimelineProps["onForkReply"]>;
+}): ReactElement {
+  const [failed, setFailed] = useState(false);
+  const accessibleLabel = openFailed
+    ? "已创建，打开失败，重试打开会话"
+    : unconfirmed
+      ? "分叉结果待核实；重试将继续使用此回复"
+      : conflict
+        ? "会话已更新；请重试此回复"
+        : created
+          ? "新会话已创建，打开会话"
+          : failed
+            ? "分叉失败，重试"
+            : "从此回复新建会话";
+  const title = pending
+    ? "正在创建会话"
+    : openFailed
+      ? "已创建，打开失败；点击重试打开"
+      : unconfirmed
+        ? "分叉结果待核实；点击后继续使用此回复和原操作身份重试"
+        : conflict
+          ? "会话已更新；刷新后点击重试此回复"
+          : created
+            ? "新会话已创建；点击打开"
+            : failed
+              ? "分叉失败，点击重试"
+              : "从此回复新建会话";
+
+  /** 把创建错误与打开错误分别呈现；open_failed 后下一次操作只重开原回执。 */
+  const fork = async (): Promise<void> => {
+    if (pending) return;
+    setFailed(false);
+    try {
+      const outcome = await onForkReply(anchor);
+      setFailed(outcome === "open_failed");
+    } catch {
+      setFailed(true);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={`ja-copy-text-button${pending ? " is-pending" : ""}`}
+      aria-label={accessibleLabel}
+      aria-busy={pending || undefined}
+      data-testid="fork-reply"
+      data-source-item-id={anchor.itemId}
+      data-fork-state={
+        pending
+          ? "pending"
+          : openFailed
+            ? "open-failed"
+            : unconfirmed
+              ? "unconfirmed"
+              : conflict
+                ? "conflict"
+                : created
+                  ? "created"
+                  : failed
+                    ? "failed"
+                    : "ready"
+      }
+      title={title}
+      disabled={pending}
+      onClick={(event) => {
+        event.stopPropagation();
+        void fork();
+      }}
+    >
+      {pending ? (
+        <LoaderCircle aria-hidden="true" />
+      ) : failed || conflict || unconfirmed ? (
+        <TriangleAlert aria-hidden="true" />
+      ) : (
+        <GitFork aria-hidden="true" />
+      )}
+    </button>
+  );
+}
+
 /**
  * 稳定错误码只提供一条可读原因；恢复动作已由 Composer 的新轮次续答承载，不能在 Timeline
  * 重复展示技术诊断、操作建议或可能重放 Tool 的伪操作。
  */
 function turnFailurePresentation(error: TimelineTurn["error"] | undefined): string {
+  if (error?.message?.trim()) return error.message;
   switch (error?.code) {
     case "BUDGET_EXCEEDED":
       return "已达到本轮资源上限。";
@@ -344,7 +470,7 @@ function isAssistantRetryStatus(item: TimelineItemAdapter): boolean {
 async function readCompleteAnswer(
   final: TimelineItemAdapter,
   work: readonly TimelineItemAdapter[],
-  readMessage: (messageId: string) => Promise<string>,
+  readItem: (threadId: string, itemId: string) => Promise<string>,
 ): Promise<string> {
   let lastToolIndex = -1;
   for (let index = work.length - 1; index >= 0; index -= 1) {
@@ -357,8 +483,8 @@ async function readCompleteAnswer(
     .slice(lastToolIndex + 1)
     .filter((item) => item.kind === "commentary" && item.metadata?.phase === "assistant_progress");
   const parts: string[] = [];
-  for (const item of progress) parts.push(await readMessage(item.itemId));
-  const fullFinal = await readMessage(final.itemId);
+  for (const item of progress) parts.push(await readItem(item.threadId, item.itemId));
+  const fullFinal = await readItem(final.threadId, final.itemId);
   const preceding = parts.join("");
   if (preceding === "" || fullFinal.startsWith(preceding)) return fullFinal;
   if (preceding.endsWith(fullFinal)) return preceding;
@@ -370,8 +496,8 @@ async function readCompleteAnswer(
  * 后续工作与最终答复归入新 exchange，避免把多次用户意图压进同一气泡。
  *
  * Reasoning、assistant Draft 与已经提交的 Tool 模型步正文都归入工作过程；只有 terminal
- * 产生的 agent_message 能进入最终答复，避免运行中的模型正文提前越出 WorkProcess。隐藏 continuation
- * 通过 sourceMessageId 并回原问题，使恢复后的结果沿用同一 exchange，而不伪造可见 USER 消息。
+ * 产生的 agent_message 能进入最终答复，避免运行中的模型正文提前越出 WorkProcess。只有无 USER 的
+ * 跨 Turn continuation 才通过 sourceMessageId 并回原问题；普通 Turn 也有来源 ID，不能据此合并队列输入。
  */
 function buildRows(
   items: readonly TimelineItemAdapter[],
@@ -458,14 +584,20 @@ function buildRows(
     const current = currentByTurn.get(turn.turnId);
     if (current !== undefined) current.turn = turn;
   }
-  // 隐藏 continuation 不创建新的 USER exchange；按 sourceMessageId 把它的运行态和结果归回原问题。
+  // 来源 ID 同时用于普通 Turn；仅无独立 USER 的跨 Turn continuation 归回原问题。
   for (const continuation of turns) {
-    if (continuation.sourceMessageId == null) continue;
+    if (continuation.sourceMessageId == null || userExchangeOrdinals.has(continuation.turnId))
+      continue;
     const source = rows.find(
       (candidate) => candidate.user?.itemId === continuation.sourceMessageId,
     );
     const continuationGroup = currentByTurn.get(continuation.turnId);
-    if (source === undefined || continuationGroup === undefined || source === continuationGroup)
+    if (
+      source === undefined ||
+      continuationGroup === undefined ||
+      source.turnId === continuation.turnId ||
+      source === continuationGroup
+    )
       continue;
     source.threadMessages.push(...continuationGroup.threadMessages);
     source.work.push(...continuationGroup.work);
@@ -512,6 +644,8 @@ function buildRows(
         threadId: submission.threadId,
         turnId: localTurnId,
         kind: "user_message",
+        // 尚未被服务端确认的本地提交属于当前会话草稿，不是继承历史。
+        origin: "native",
         status: submission.status === "failed" ? "failed" : "in_progress",
         text: submission.text,
         contextReferences: [...submission.contextReferences],
@@ -535,9 +669,20 @@ function buildRows(
     work: group.work,
     // 仅 terminal agent_message 拥有最终答复语义；运行中的公开正文始终由 WorkProcess 承载。
     final: mergeMessages(group.final, "agent_message", true),
+    forkAnchor:
+      group.final.at(-1)?.kind === "agent_message" &&
+      group.final.at(-1)?.final === true &&
+      group.final.at(-1)?.status === "completed" &&
+      group.final.at(-1)?.metadata?.failureReply !== true
+        ? { threadId: group.final.at(-1)!.threadId, itemId: group.final.at(-1)!.itemId }
+        : undefined,
     approvals: group.approvals,
   }));
-  /** 本地失败记录可能跨过后续成功 ACK；只在两行都有权威时间时排序，缺失时间继续保持事件顺序。 */
+  /**
+   * 本地失败记录可能跨过后续成功 ACK；只按可解析时间重排且保留同毫秒的权威输入顺序，
+   * 避免格式不同但同一毫秒的时间字符串把 snapshot 因果顺序打乱。
+   * @author kongweiguang
+   */
   return projected.sort((left, right) => {
     const leftTime =
       left.user?.createdAt ??
@@ -551,9 +696,12 @@ function buildRows(
       right.work[0]?.createdAt ??
       right.final?.createdAt ??
       right.turn?.startedAt;
-    return leftTime === undefined || rightTime === undefined
-      ? 0
-      : leftTime.localeCompare(rightTime);
+    if (leftTime === undefined || rightTime === undefined) return 0;
+    const leftMillis = Date.parse(leftTime);
+    const rightMillis = Date.parse(rightTime);
+    return Number.isFinite(leftMillis) && Number.isFinite(rightMillis)
+      ? leftMillis - rightMillis
+      : 0;
   });
 }
 
@@ -567,7 +715,11 @@ function rowOccurredAt(row: TimelineRow): string | undefined {
   );
 }
 
-/** 外部事实与 Conversation exchange 只在视图投影层合流，禁止反向写入父 Thread Store。 */
+/**
+ * 外部事实与 Conversation exchange 只在视图投影层合流，禁止反向写入父 Thread Store；
+ * Conversation 数组顺序来自权威 item 投影，只为同毫秒排序提供因果序，row.key 仍是稳定身份。
+ * @author kongweiguang
+ */
 function orderTimelineRows(
   rows: readonly TimelineRow[],
   externalRows: readonly ChatTimelineExternalRow[],
@@ -576,9 +728,10 @@ function orderTimelineRows(
     | { readonly kind: "conversation"; readonly row: TimelineRow }
     | { readonly kind: "external"; readonly row: ChatTimelineExternalRow }
   >([
-    ...rows.map((row) => ({
+    ...rows.map((row, causalOrder) => ({
       identity: `conversation:${row.key}`,
       occurredAt: rowOccurredAt(row),
+      causalOrder,
       value: { kind: "conversation" as const, row },
     })),
     ...externalRows.map((row) => ({
@@ -814,6 +967,7 @@ function mergeMessages(
   return {
     ...first,
     kind,
+    origin: last.origin,
     status: last.status,
     text: text || undefined,
     final: final || first.final,
@@ -850,6 +1004,7 @@ function UserMessage({
   onOpenLink,
   onOpenFile,
   onCopyText,
+  onReadMessageContent,
   onOpenAttachmentPreview,
   canEdit,
   onEditQuestion,
@@ -865,6 +1020,7 @@ function UserMessage({
   onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
   onOpenFile?: (target: MarkdownFileTarget, source: HTMLElement) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   onOpenAttachmentPreview?: ChatTimelineProps["onOpenAttachmentPreview"];
   canEdit: boolean;
   onEditQuestion?: ChatTimelineProps["onEditQuestion"];
@@ -873,9 +1029,59 @@ function UserMessage({
 }): ReactElement {
   const isPending = item.metadata?.phase === "submission_pending";
   const contextReferences = resolveSkillReferenceMetadata(item.contextReferences ?? [], skills);
-  const messageText = item.text ?? "";
-  const hasMessageBody = contextReferences.length > 0 || messageText.trim() !== "";
-  const hasContextActions = (messageText.trim() !== "" && onCopyText !== undefined) || canEdit;
+  const isTruncated = item.bodyTruncated === true;
+  const {
+    text: fullText,
+    loading: fullTextLoading,
+    error: fullTextError,
+    load: loadFullText,
+  } = useFullPublicText(
+    item,
+    onReadMessageContent === undefined
+      ? undefined
+      : () => onReadMessageContent(item.threadId, item.itemId),
+  );
+  const [showFullQuestion, setShowFullQuestion] = useState(false);
+  const messageText = showFullQuestion && fullText !== undefined ? fullText : (item.text ?? "");
+  const hasMessageBody = contextReferences.length > 0 || messageText.trim() !== "" || isTruncated;
+  const hasContextActions =
+    !isTruncated && ((messageText.trim() !== "" && onCopyText !== undefined) || canEdit);
+
+  /** 展开前才分页读取正文；复制读取过全文时，下一次展开直接复用 TimelineStore。 */
+  const revealFullQuestion = async (): Promise<void> => {
+    if (fullText !== undefined) {
+      setShowFullQuestion((visible) => !visible);
+      return;
+    }
+    try {
+      await loadFullText();
+      setShowFullQuestion(true);
+    } catch {
+      // 错误状态由 TimelineStore 投影，按钮会变为显式重试入口。
+    }
+  };
+
+  /** 编辑被截断的用户输入前先补齐原文，避免用预览内容替换持久问题。 */
+  const editQuestion = async (): Promise<void> => {
+    if (onEditQuestion === undefined) return;
+    try {
+      const text = isTruncated ? await loadFullText() : (fullText ?? item.text ?? "");
+      onEditQuestion({
+        ...item,
+        text,
+        bodyTruncated: false,
+        bodyTotalCharacters: Array.from(text).length,
+        bodyHydration: {
+          status: "complete",
+          text,
+          offsetCharacters: Array.from(text).length,
+          totalCharacters: Array.from(text).length,
+        },
+      });
+    } catch {
+      // 编辑入口不丢失；失败正文留在当前位置，用户可先重试全文读取。
+    }
+  };
   return (
     <article
       aria-label="用户问题"
@@ -913,6 +1119,30 @@ function UserMessage({
               onCopyText={onCopyText}
             />
           ) : null}
+          {isTruncated && onReadMessageContent !== undefined ? (
+            <div className="ja-public-text-actions">
+              <button
+                type="button"
+                className="ja-chat-response__full-action"
+                aria-label={fullTextLoading ? "正在读取完整问题" : undefined}
+                disabled={fullTextLoading}
+                onClick={() => void revealFullQuestion()}
+              >
+                {fullTextLoading
+                  ? "正在读取全文…"
+                  : fullTextError
+                    ? "重试读取全文"
+                    : showFullQuestion && fullText !== undefined
+                      ? "收起完整问题"
+                      : "查看完整问题"}
+              </button>
+              {fullTextError ? (
+                <p className="ja-chat-response__full-error" role="alert">
+                  完整问题暂时无法读取。
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {submissionError === undefined ? null : (
@@ -920,10 +1150,17 @@ function UserMessage({
           {submissionError}
         </p>
       )}
-      {(item.text?.trim() && onCopyText !== undefined) || canEdit ? (
+      {((item.text?.trim() || (isTruncated && onReadMessageContent !== undefined)) &&
+        onCopyText !== undefined) ||
+      canEdit ? (
         <div className="ja-chat-message__actions" role="group" aria-label="用户消息操作">
-          {item.text?.trim() && onCopyText !== undefined ? (
-            <CopyTextButton text={item.text} label="复制消息" onCopyText={onCopyText} />
+          {(item.text?.trim() || (isTruncated && onReadMessageContent !== undefined)) &&
+          onCopyText !== undefined ? (
+            <CopyTextButton
+              text={isTruncated ? () => loadFullText() : (fullText ?? item.text ?? "")}
+              label="复制消息"
+              onCopyText={onCopyText}
+            />
           ) : null}
           {canEdit && onEditQuestion !== undefined ? (
             <button
@@ -933,7 +1170,7 @@ function UserMessage({
               title="编辑问题"
               onClick={(event) => {
                 event.stopPropagation();
-                onEditQuestion(item);
+                void editQuestion();
               }}
             >
               <Pencil aria-hidden="true" />
@@ -952,17 +1189,48 @@ function UserMessage({
 function ThreadMessage({
   item,
   onCopyText,
+  onReadMessageContent,
   onContextMenu,
   onContextMenuKeyDown,
 }: {
   item: TimelineItemAdapter;
   onCopyText?: (text: string) => Promise<void>;
+  onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
   onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
   const sourceTitle = item.sourceTitle ?? "未知会话";
   const sourceThreadId = item.sourceThreadId ?? "未知 Thread";
-  const content = item.text ?? "";
+  const isTruncated = item.bodyTruncated === true;
+  const {
+    text: fullText,
+    loading: fullTextLoading,
+    error: fullTextError,
+    load: loadFullText,
+  } = useFullPublicText(
+    item,
+    onReadMessageContent === undefined
+      ? undefined
+      : () => onReadMessageContent(item.threadId, item.itemId),
+  );
+  const [showFullMessage, setShowFullMessage] = useState(false);
+  const content = showFullMessage && fullText !== undefined ? fullText : (item.text ?? "");
+
+  /** 跨会话正文使用其当前 Thread/Item 身份分页；来源 Thread 只作为展示元数据。 */
+  const revealFullMessage = async (): Promise<void> => {
+    if (fullText !== undefined) {
+      setShowFullMessage((visible) => !visible);
+      return;
+    }
+    try {
+      await loadFullText();
+      setShowFullMessage(true);
+    } catch {
+      // 错误状态由 TimelineStore 投影，按钮会变为显式重试入口。
+    }
+  };
+
+  const hasContextMenu = !isTruncated && content.trim() !== "" && onCopyText !== undefined;
   return (
     <article
       aria-label={`来自会话：${sourceTitle}`}
@@ -970,12 +1238,10 @@ function ThreadMessage({
       data-item-id={item.itemId}
       data-role="thread-message"
       data-source-thread-id={sourceThreadId}
-      tabIndex={content.trim() !== "" && onCopyText !== undefined ? -1 : undefined}
-      aria-keyshortcuts={
-        content.trim() !== "" && onCopyText !== undefined ? "ContextMenu Shift+F10" : undefined
-      }
-      onContextMenu={content.trim() !== "" ? onContextMenu : undefined}
-      onKeyDown={content.trim() !== "" ? onContextMenuKeyDown : undefined}
+      tabIndex={hasContextMenu ? -1 : undefined}
+      aria-keyshortcuts={hasContextMenu ? "ContextMenu Shift+F10" : undefined}
+      onContextMenu={hasContextMenu ? onContextMenu : undefined}
+      onKeyDown={hasContextMenu ? onContextMenuKeyDown : undefined}
     >
       <div className="ja-thread-message__body">
         <header className="ja-thread-message__source">
@@ -983,10 +1249,37 @@ function ThreadMessage({
           <strong title={sourceThreadId}>{sourceTitle}</strong>
         </header>
         <p className="ja-thread-message__content">{content}</p>
+        {isTruncated && onReadMessageContent !== undefined ? (
+          <div className="ja-public-text-actions">
+            <button
+              type="button"
+              className="ja-chat-response__full-action"
+              disabled={fullTextLoading}
+              onClick={() => void revealFullMessage()}
+            >
+              {fullTextLoading
+                ? "正在读取全文…"
+                : fullTextError
+                  ? "重试读取全文"
+                  : showFullMessage && fullText !== undefined
+                    ? "收起完整消息"
+                    : "查看完整消息"}
+            </button>
+            {fullTextError ? (
+              <p className="ja-chat-response__full-error" role="alert">
+                完整消息暂时无法读取。
+              </p>
+            ) : null}
+          </div>
+        ) : null}
       </div>
       {onCopyText === undefined ? null : (
         <div className="ja-chat-message__actions" role="group" aria-label="会话消息操作">
-          <CopyTextButton text={content} label="复制会话消息" onCopyText={onCopyText} />
+          <CopyTextButton
+            text={isTruncated ? () => loadFullText() : (fullText ?? content)}
+            label="复制会话消息"
+            onCopyText={onCopyText}
+          />
         </div>
       )}
     </article>
@@ -1001,6 +1294,13 @@ function assistantResponseState(
   turn: TimelineTurn | undefined,
   item: TimelineItemAdapter | undefined,
 ): AssistantResponseState {
+  // Inherited turns are frozen display history; the source may still be running after the selected answer.
+  if (item?.origin === "inherited" || turn?.origin === "inherited") {
+    if (item?.status === "failed") return "failed";
+    if (item?.status === "cancelled") return "cancelled";
+    return "completed";
+  }
+  if (turn?.status === "waiting_input") return "waiting_input";
   if (turn?.status === "waiting_approval") return "waiting";
   if (turn?.status === "suspended") return "suspended";
   if (turn?.status === "failed" || item?.status === "failed") return "failed";
@@ -1020,6 +1320,7 @@ function assistantResponseState(
  * 都保持直出，避免用户在唯一可读正文尚未落点前看到空折叠栏。
  */
 function workProcessDisplayMode(row: TimelineRow): WorkProcessDisplayMode | undefined {
+  if (row.turn?.origin === "inherited") return "archived";
   const finalReady = row.final?.final === true && row.final.text?.trim() !== "";
   if (row.turn?.status === "completed" && finalReady) return "archived";
   if (row.turn?.status === "failed" || row.turn?.status === "cancelled") return "archived";
@@ -1027,6 +1328,7 @@ function workProcessDisplayMode(row: TimelineRow): WorkProcessDisplayMode | unde
     row.turn === undefined ||
     row.turn.status === "queued" ||
     row.turn.status === "running" ||
+    row.turn.status === "waiting_input" ||
     row.turn.status === "waiting_approval" ||
     row.turn.status === "suspended" ||
     row.turn.status === "completed"
@@ -1049,6 +1351,13 @@ function AssistantResponse({
   onOpenLink,
   onOpenFile,
   onCopyText,
+  forkAnchor,
+  forkPending = false,
+  forkCreated = false,
+  forkOpenFailed = false,
+  forkConflict = false,
+  forkUnconfirmed = false,
+  onForkReply,
   onReadFullText,
   onContextMenu,
   onContextMenuKeyDown,
@@ -1059,12 +1368,23 @@ function AssistantResponse({
   onOpenLink?: (url: string, source?: HTMLElement) => void | Promise<void>;
   onOpenFile?: (target: MarkdownFileTarget, source: HTMLElement) => void | Promise<void>;
   onCopyText?: (text: string) => Promise<void>;
+  forkAnchor?: { threadId: string; itemId: string };
+  forkPending?: boolean;
+  forkCreated?: boolean;
+  forkOpenFailed?: boolean;
+  forkConflict?: boolean;
+  forkUnconfirmed?: boolean;
+  onForkReply?: ChatTimelineProps["onForkReply"];
   onReadFullText?: () => Promise<string>;
   onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
   onContextMenuKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }): ReactElement {
   const state = assistantResponseState(turn, item);
-  const isActive = state === "working" || state === "waiting" || state === "streaming";
+  const isActive =
+    state === "working" ||
+    state === "waiting" ||
+    state === "waiting_input" ||
+    state === "streaming";
   const isFailed = state === "failed";
   const isCancelled = state === "cancelled";
   const workingStatus = retryStatus === undefined ? "正在工作" : `正在工作 · ${retryStatus}`;
@@ -1073,13 +1393,15 @@ function AssistantResponse({
       ? workingStatus
       : state === "waiting"
         ? "等待你的确认"
-        : state === "suspended"
-          ? "已暂停"
-          : state === "streaming"
-            ? workingStatus
-            : state === "cancelled"
-              ? "已取消"
-              : undefined;
+        : state === "waiting_input"
+          ? "等待你的输入"
+          : state === "suspended"
+            ? "已暂停"
+            : state === "streaming"
+              ? workingStatus
+              : state === "cancelled"
+                ? "已取消"
+                : undefined;
   const isFailureReply = isFailed && item?.metadata?.failureReply === true;
   const text = isFailureReply || !item?.text?.trim() ? undefined : item.text;
   const {
@@ -1087,7 +1409,7 @@ function AssistantResponse({
     loading: fullTextLoading,
     error: fullTextError,
     load: loadFullText,
-  } = useFullPublicText(item?.itemId, onReadFullText);
+  } = useFullPublicText(item, onReadFullText);
   const [exportFeedback, setExportFeedback] = useState<{
     itemId: string;
     phase: "saving" | "saved" | "unsupported" | "error";
@@ -1113,11 +1435,14 @@ function AssistantResponse({
     }
   }, [item?.itemId, loadFullText]);
   const longAnswer =
-    state === "completed" && text !== undefined && text.length >= LONG_ANSWER_PREVIEW_THRESHOLD;
+    state === "completed" &&
+    text !== undefined &&
+    (item?.bodyTruncated === true || text.length >= LONG_ANSWER_PREVIEW_THRESHOLD);
   const visibleText = fullText ?? text;
   const plainLongText = visibleText !== undefined && visibleText.length >= 65_535;
   const failure = isFailed ? turnFailurePresentation(turn?.error) : undefined;
   const isFinalAnswer = state === "completed" && text !== undefined;
+  const canForkReply = forkAnchor !== undefined && onForkReply !== undefined;
   const articleLabel = isFinalAnswer
     ? "最终答复"
     : isFailed
@@ -1140,6 +1465,7 @@ function AssistantResponse({
       data-item-id={item?.itemId ?? `response:${turn?.turnId ?? "unknown"}`}
       data-response-state={state}
       data-role={isFinalAnswer ? "final" : isFailed ? "failure" : "response"}
+      data-fork-source-item-id={canForkReply ? forkAnchor.itemId : undefined}
       tabIndex={visibleText !== undefined && onCopyText !== undefined ? -1 : undefined}
       aria-keyshortcuts={
         visibleText !== undefined && onCopyText !== undefined && !longAnswer
@@ -1227,21 +1553,34 @@ function AssistantResponse({
           </div>
         )}
       </div>
-      {visibleText !== undefined && onCopyText !== undefined ? (
+      {(visibleText !== undefined && onCopyText !== undefined) || canForkReply ? (
         <div
           className="ja-chat-message__actions"
           role="group"
           aria-label={isFailed ? "未完成回复操作" : "回复操作"}
         >
-          <CopyTextButton
-            text={visibleText}
-            label={isFailed ? "复制未完成内容" : "复制回复"}
-            onCopyText={
-              longAnswer && onReadFullText !== undefined
-                ? async () => onCopyText(await loadFullText())
-                : onCopyText
-            }
-          />
+          {visibleText !== undefined && onCopyText !== undefined ? (
+            <CopyTextButton
+              text={visibleText}
+              label={isFailed ? "复制未完成内容" : "复制回复"}
+              onCopyText={
+                longAnswer && onReadFullText !== undefined
+                  ? async () => onCopyText(await loadFullText())
+                  : onCopyText
+              }
+            />
+          ) : null}
+          {canForkReply ? (
+            <ForkReplyButton
+              anchor={forkAnchor}
+              pending={forkPending}
+              created={forkCreated}
+              openFailed={forkOpenFailed}
+              conflict={forkConflict}
+              unconfirmed={forkUnconfirmed}
+              onForkReply={onForkReply}
+            />
+          ) : null}
         </div>
       ) : null}
     </article>
@@ -1251,7 +1590,8 @@ function AssistantResponse({
 /**
  * 对长对话做 Virtualization，同时保留 Turn 级分组、本地 Stream 更新以及桌面端共用的
  * Disclosure/Approval 组件。顶部旧页读取入口在请求期间以原位圆圈表达状态，避免加载文字插入时间线造成跳动；
- * 隐藏 continuation 先归并到源问题，避免恢复流程增加一条无意义的用户气泡。
+ * 隐藏 continuation 先归并到源问题，过程时长合计各次尝试而不计等待继续的间隔。
+ * 修改卡共享 Thread/Turn 展开缓存，使独立虚拟行的卸载不改变用户阅读选择。
  */
 export function ChatTimeline({
   threadId,
@@ -1264,6 +1604,12 @@ export function ChatTimeline({
   items,
   skills = [],
   turns = [],
+  onForkReply,
+  forkingReplies = [],
+  forkCreatedReplies = [],
+  forkOpenFailures = [],
+  forkConflictReplies = [],
+  forkUnconfirmedReplies = [],
   approvals = [],
   approvalDecisions = {},
   approvalClosedAt = {},
@@ -1276,6 +1622,7 @@ export function ChatTimeline({
   onReadAnswerContent,
   onReadToolArtifact,
   onResolveToolRecovery,
+  processSession,
   onReviewTurn,
   onOpenAttachmentPreview,
   editableSourceMessageId,
@@ -1309,7 +1656,7 @@ export function ChatTimeline({
         role,
         editableSourceMessageId,
         onCopyText,
-        onEditQuestion,
+        item.origin === "native" ? onEditQuestion : undefined,
       );
       return actions === undefined ? undefined : { item, actions };
     },
@@ -1418,6 +1765,8 @@ export function ChatTimeline({
   const virtualizer = useVirtualizer({
     // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
     useFlushSync: false,
+    // TanStack 默认 debounce 不能取消；dispose 后忽略迟到的滚动 offset 通知。
+    observeElementOffset: observeElementOffsetWhileActive,
     count: orderedRows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 280,
@@ -1614,6 +1963,7 @@ export function ChatTimeline({
                           onOpenLink={onOpenLink}
                           onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
+                          onReadMessageContent={onReadMessageContent}
                           onOpenAttachmentPreview={onOpenAttachmentPreview}
                           canEdit={
                             messageMenuActions(
@@ -1622,7 +1972,7 @@ export function ChatTimeline({
                               "user",
                               editableSourceMessageId,
                               onCopyText,
-                              onEditQuestion,
+                              row.user.origin === "native" ? onEditQuestion : undefined,
                             )?.canEdit ?? false
                           }
                           onEditQuestion={onEditQuestion}
@@ -1636,6 +1986,7 @@ export function ChatTimeline({
                           key={block.key}
                           item={block.item}
                           onCopyText={onCopyText}
+                          onReadMessageContent={onReadMessageContent}
                           onContextMenu={handleMessageContextMenu}
                           onContextMenuKeyDown={handleMessageContextMenuKeyDown}
                         />
@@ -1653,10 +2004,31 @@ export function ChatTimeline({
                             row.work[0]?.threadId
                           }
                           steps={row.work.filter((item) => !isAssistantRetryStatus(item))}
-                          turn={row.turn}
+                          turn={
+                            row.turn?.origin === "inherited"
+                              ? { ...row.turn, status: "completed" }
+                              : row.turn
+                          }
                           displayMode={workDisplayMode}
+                          relatedTurns={
+                            row.turn === undefined
+                              ? undefined
+                              : turns.filter(
+                                  (candidate) =>
+                                    candidate.turnId === row.turnId ||
+                                    candidate.turnId === row.turn?.turnId ||
+                                    (row.user !== undefined &&
+                                      candidate.sourceMessageId === row.user.itemId),
+                                )
+                          }
                           autoCollapse={followingLatest}
-                          approvals={row.approvals}
+                          approvals={row.approvals.filter((approval) =>
+                            turns.some(
+                              (candidate) =>
+                                candidate.turnId === approval.turnId &&
+                                candidate.origin === "native",
+                            ),
+                          )}
                           approvalDecisions={approvalDecisions}
                           approvalClosedAt={approvalClosedAt}
                           onApprovalDecision={onApprovalDecision}
@@ -1666,6 +2038,8 @@ export function ChatTimeline({
                           onReadMessageContent={onReadMessageContent}
                           onReadToolArtifact={onReadToolArtifact}
                           onResolveToolRecovery={onResolveToolRecovery}
+                          onOpenAttachmentPreview={onOpenAttachmentPreview}
+                          processSession={processSession}
                         />
                       );
                     case "assistant":
@@ -1678,6 +2052,33 @@ export function ChatTimeline({
                           onOpenLink={onOpenLink}
                           onOpenFile={onOpenFile}
                           onCopyText={onCopyText}
+                          forkAnchor={row.forkAnchor}
+                          forkPending={forkingReplies.some(
+                            (identity) =>
+                              identity.threadId === row.forkAnchor?.threadId &&
+                              identity.itemId === row.forkAnchor?.itemId,
+                          )}
+                          forkCreated={forkCreatedReplies.some(
+                            (identity) =>
+                              identity.threadId === row.forkAnchor?.threadId &&
+                              identity.itemId === row.forkAnchor?.itemId,
+                          )}
+                          forkOpenFailed={forkOpenFailures.some(
+                            (identity) =>
+                              identity.threadId === row.forkAnchor?.threadId &&
+                              identity.itemId === row.forkAnchor?.itemId,
+                          )}
+                          forkConflict={forkConflictReplies.some(
+                            (identity) =>
+                              identity.threadId === row.forkAnchor?.threadId &&
+                              identity.itemId === row.forkAnchor?.itemId,
+                          )}
+                          forkUnconfirmed={forkUnconfirmedReplies.some(
+                            (identity) =>
+                              identity.threadId === row.forkAnchor?.threadId &&
+                              identity.itemId === row.forkAnchor?.itemId,
+                          )}
+                          onForkReply={onForkReply}
                           onReadFullText={
                             row.final === undefined
                               ? undefined
@@ -1691,18 +2092,26 @@ export function ChatTimeline({
                                 : onReadMessageContent === undefined
                                   ? undefined
                                   : () =>
-                                      readCompleteAnswer(row.final!, row.work, onReadMessageContent)
+                                      readCompleteAnswer(
+                                        row.final!,
+                                        row.work,
+                                        (targetThreadId, itemId) =>
+                                          onReadMessageContent(targetThreadId, itemId),
+                                      )
                           }
                           onContextMenu={handleMessageContextMenu}
                           onContextMenuKeyDown={handleMessageContextMenuKeyDown}
                         />
                       );
                     case "changes":
-                      return row.turn === undefined || visibleChangeSet === undefined ? null : (
+                      return row.turn === undefined ||
+                        row.turn.origin !== "native" ||
+                        visibleChangeSet === undefined ? null : (
                         <TurnChangesCard
                           key={block.key}
                           turn={row.turn}
                           changeSet={visibleChangeSet}
+                          disclosureCache={disclosureCache}
                           onReview={
                             visibleChangeSet.artifactId === undefined || onReviewTurn === undefined
                               ? undefined

@@ -225,8 +225,7 @@ impl NativeDropTargetHost {
             }
             for hwnd in plan.install {
                 let target: IDropTarget = NativeDropTarget::new(hwnd, listener.clone()).into();
-                // Wry may already own this dynamically-created child. Revoke first so Ja becomes
-                // the single target and can guarantee STGMEDIUM release and path redaction.
+                // Wry 可能已拥有这个动态创建的子窗口。先撤销原绑定，使 Ja 成为唯一目标，从而确保释放 STGMEDIUM 并隐藏路径。
                 if revoke_target(hwnd).is_err()
                     || unsafe { RegisterDragDrop(hwnd_from_id(hwnd), &target) }.is_err()
                 {

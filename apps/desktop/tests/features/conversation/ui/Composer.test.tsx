@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -58,7 +58,7 @@ const USAGE_SUMMARY: ConversationUsageSummary = {
   outputRequestCount: 3,
   outputTokens: 2_100,
   totalRequestCount: 3,
-  totalTokens: 14_500,
+  totalTokens: 21_600,
   cacheReadRequestCount: 2,
   cacheReadTokens: 6_200,
   cacheWriteRequestCount: 1,
@@ -71,12 +71,14 @@ const USAGE_SUMMARY: ConversationUsageSummary = {
 interface ControlledComposerHarnessProps extends Omit<ComposerProps, "text" | "onTextChange"> {
   initialText?: string;
   initialContextReferences?: readonly ConversationContextReference[];
+  onDraftCommit?: (text: string, commit: () => void) => void;
 }
 
-/** 模拟真实会话层持有草稿，测试不在 Composer 内重新引入第二份 state。 */
+/** 模拟会话层持有草稿，并允许测试推迟 owner commit 以验证受控值时序边界。 */
 function ControlledComposerHarness({
   initialText = "",
   initialContextReferences = [],
+  onDraftCommit,
   ...composerProps
 }: ControlledComposerHarnessProps): ReactElement {
   const [text, setText] = useState(initialText);
@@ -85,7 +87,12 @@ function ControlledComposerHarness({
     <Composer
       {...composerProps}
       text={text}
-      onTextChange={setText}
+      onTextChange={(nextText) => {
+        /** 保留可延后的 owner commit 闭包，供时序回归显式控制受控文本提交。 */
+        const commit = () => setText(nextText);
+        if (onDraftCommit === undefined) commit();
+        else onDraftCommit(nextText, commit);
+      }}
       contextReferences={composerProps.contextReferences ?? contextReferences}
       onContextReferencesChange={composerProps.onContextReferencesChange ?? setContextReferences}
     />
@@ -134,6 +141,110 @@ async function chooseReasoning(user: ReturnType<typeof userEvent.setup>, option:
 
 describe("Composer", () => {
   afterEach(() => cleanup());
+
+  /** disabled 期间保留一次性请求，ready 使 textarea 可用后才执行并消费。@author kongweiguang */
+  it("keeps a focus token pending until the disabled Composer becomes ready", () => {
+    const { rerender } = render(
+      <ControlledComposerHarness disabled focusRequest={undefined} onSend={vi.fn()} />,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    expect(input).toBeDisabled();
+
+    rerender(<ControlledComposerHarness disabled focusRequest={1} onSend={vi.fn()} />);
+    expect(input).toBeDisabled();
+    expect(input).not.toHaveFocus();
+
+    rerender(<ControlledComposerHarness focusRequest={1} onSend={vi.fn()} />);
+    expect(input).toBeEnabled();
+    expect(input).toHaveFocus();
+  });
+
+  /** 隐藏 Host 收到 token 时不消费，恢复 active 后必须完成创建侧聊的焦点交接。@author kongweiguang */
+  it("waits for an inactive Composer to become active before consuming its focus token", () => {
+    const { rerender } = render(
+      <ControlledComposerHarness active={false} focusRequest={undefined} onSend={vi.fn()} />,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" });
+
+    rerender(<ControlledComposerHarness active={false} focusRequest={1} onSend={vi.fn()} />);
+    expect(input).not.toHaveFocus();
+
+    rerender(<ControlledComposerHarness active focusRequest={1} onSend={vi.fn()} />);
+    expect(input).toHaveFocus();
+  });
+
+  /** 只接受新的 owner token，保持初始快照不抢焦点并允许后续显式请求聚焦。@author kongweiguang */
+  it("focuses only when the owner publishes a new focus token", () => {
+    const { rerender } = render(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness focusRequest={1} onSend={vi.fn()} />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" });
+    const otherAction = screen.getByRole("button", { name: "其他操作" });
+    otherAction.focus();
+    expect(input).not.toHaveFocus();
+
+    rerender(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness focusRequest={2} onSend={vi.fn()} />
+      </>,
+    );
+    expect(input).toHaveFocus();
+  });
+
+  /** 重放相同 token 或切换 active 不得二次聚焦，避免夺走用户随后选择的控件焦点。@author kongweiguang */
+  it("does not let a duplicate focus token steal focus again", () => {
+    const { rerender } = render(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness focusRequest={undefined} onSend={vi.fn()} />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" });
+    const otherAction = screen.getByRole("button", { name: "其他操作" });
+
+    rerender(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness focusRequest={1} onSend={vi.fn()} />
+      </>,
+    );
+    expect(input).toHaveFocus();
+
+    otherAction.focus();
+    rerender(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness active={false} focusRequest={1} onSend={vi.fn()} />
+      </>,
+    );
+    rerender(
+      <>
+        <button type="button">其他操作</button>
+        <ControlledComposerHarness active focusRequest={1} onSend={vi.fn()} />
+      </>,
+    );
+    expect(otherAction).toHaveFocus();
+  });
+
+  /** focus() 未能改变 activeElement 时保留 token，后续 active 边界可重试而不引入轮询。@author kongweiguang */
+  it("keeps a focus token pending until the textarea actually receives focus", () => {
+    const { rerender } = render(
+      <ControlledComposerHarness focusRequest={undefined} onSend={vi.fn()} />,
+    );
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    vi.spyOn(input, "focus").mockImplementationOnce(() => {});
+
+    rerender(<ControlledComposerHarness focusRequest={1} onSend={vi.fn()} />);
+    expect(input).not.toHaveFocus();
+
+    rerender(<ControlledComposerHarness active={false} focusRequest={1} onSend={vi.fn()} />);
+    rerender(<ControlledComposerHarness active focusRequest={1} onSend={vi.fn()} />);
+    expect(input).toHaveFocus();
+  });
 
   it("按 interactionPresentation 在完整与紧凑补充输入之间切换，不遗失同轨提问面板", () => {
     const { rerender } = render(
@@ -186,6 +297,51 @@ describe("Composer", () => {
       "data-interaction-presentation",
       "collapsed",
     );
+  });
+
+  /** 无模型时不接纳无法执行的发送；模型设置入口保留原草稿并可直接跳转。 */
+  it("keeps the draft and opens model settings when no model is configured", async () => {
+    const user = userEvent.setup();
+    const onOpenModelSettings = vi.fn();
+    const onSend = vi.fn();
+    render(
+      <ControlledComposerHarness
+        initialText="保留这段草稿"
+        preferences={PREFERENCES}
+        models={[]}
+        onOpenModelSettings={onOpenModelSettings}
+        onSend={onSend}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "未配置模型，打开模型设置" }));
+
+    expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "消息" })).toHaveValue("保留这段草稿");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  /** 上游或凭据准入失败时把草稿留在输入框，并提供明确的模型设置操作。 */
+  it("offers model settings after a recoverable model admission failure", async () => {
+    const user = userEvent.setup();
+    const onOpenModelSettings = vi.fn();
+    render(
+      <ControlledComposerHarness
+        initialText="连接故障后仍保留"
+        preferences={PREFERENCES}
+        models={MODELS}
+        error="模型连接暂不可用，输入草稿已保留。请检查连接和凭据。"
+        modelSettingsRequired
+        onOpenModelSettings={onOpenModelSettings}
+        onSend={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("输入草稿已保留");
+    await user.click(screen.getByRole("button", { name: "打开模型设置" }));
+    expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "消息" })).toHaveValue("连接故障后仍保留");
   });
 
   it("展开提问时保留附件与取消能力，并将补充内容只入队到当前中断 Turn", async () => {
@@ -398,19 +554,19 @@ describe("Composer", () => {
     expect(accessChange).toHaveBeenCalledWith("full_access");
   });
 
-  it("将计划或目标入口固定在访问权限右侧", () => {
+  it("将计划入口固定在访问权限右侧", () => {
     render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
-        modeStatus={<button type="button">目标</button>}
+        modeStatus={<button type="button">计划</button>}
         onSend={vi.fn()}
       />,
     );
 
     const accessMode = screen.getByRole("combobox", { name: "访问模式" });
-    const goalEntry = screen.getByRole("button", { name: "目标" });
+    const planEntry = screen.getByRole("button", { name: "计划" });
     expect(
-      accessMode.compareDocumentPosition(goalEntry) & Node.DOCUMENT_POSITION_FOLLOWING,
+      accessMode.compareDocumentPosition(planEntry) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
   });
 
@@ -636,8 +792,8 @@ describe("Composer", () => {
     ).toHaveAttribute("data-has-thumbnail", "true");
   });
 
-  /** 直传缩略图也必须经过同一 origin fallback，失败后停在可访问降级态而不留下空白卡片。 */
-  it("直传图片缩略图失败后只切换一次 Windows origin 并降级", async () => {
+  /** 直传缩略图已由 Host 签发平台 origin；真实读取失败直接显示可访问降级态。 */
+  it("直传图片 Windows origin 失败后直接降级", async () => {
     render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
@@ -651,7 +807,7 @@ describe("Composer", () => {
             sizeBytes: 256,
             mediaKind: "image",
             mediaType: "image/png",
-            thumbnailUrl: "ja-attachment://localhost/thumbnail/direct-image",
+            thumbnailUrl: "http://ja-attachment.localhost/thumbnail/direct-image",
           },
         ]}
         onOpenAttachmentPreview={vi.fn()}
@@ -666,15 +822,8 @@ describe("Composer", () => {
     expect(first).not.toBeNull();
     const image = first!.querySelector<HTMLImageElement>("img");
     expect(image).not.toBeNull();
+    expect(image).toHaveAttribute("src", "http://ja-attachment.localhost/thumbnail/direct-image");
     fireEvent.error(image!);
-
-    await waitFor(() => {
-      expect(first!.querySelector("img")).toHaveAttribute(
-        "src",
-        "http://ja-attachment.localhost/thumbnail/direct-image",
-      );
-    });
-    fireEvent.error(first!.querySelector("img")!);
 
     expect(first!.querySelector('[data-state="unavailable"]')).toHaveAccessibleName(
       "直传图片.png 缩略图不可用",
@@ -824,6 +973,93 @@ describe("Composer", () => {
     expect(screen.getAllByRole("button", { name: "移除上下文 main.rs" })).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "移除上下文 main.rs" }));
     expect(screen.queryByText("src/main.rs")).not.toBeInTheDocument();
+  });
+
+  /** 隐藏期间无路径搜索；恢复只查当前 Thread 一次，身份不匹配的旧响应不能回填。 */
+  it("cancels hidden Workspace search and fences a stale scoped response", async () => {
+    type SearchResult = Awaited<ReturnType<NonNullable<ComposerProps["onSearchWorkspacePaths"]>>>;
+    let resolveStale: ((result: SearchResult) => void) | undefined;
+    const staleResult = new Promise<SearchResult>((resolve) => {
+      resolveStale = resolve;
+    });
+    const searchPaths = vi.fn(
+      (query: string): Promise<SearchResult> =>
+        searchPaths.mock.calls.length === 1
+          ? staleResult
+          : Promise.resolve({
+              threadId: "thr_one",
+              workspaceId: "ws_one",
+              generation: 3,
+              query,
+              items: [{ relativePath: "current.ts", kind: "file" }],
+              truncated: false,
+            }),
+    );
+    const { rerender } = render(
+      <ControlledComposerHarness
+        active={false}
+        initialText="@src"
+        threadId="thr_one"
+        workspaceId="ws_one"
+        runtimeGeneration={3}
+        onSearchWorkspacePaths={searchPaths}
+        onSend={vi.fn()}
+      />,
+    );
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 150)));
+    expect(searchPaths).not.toHaveBeenCalled();
+
+    rerender(
+      <ControlledComposerHarness
+        active
+        initialText="@src"
+        threadId="thr_one"
+        workspaceId="ws_one"
+        runtimeGeneration={3}
+        onSearchWorkspacePaths={searchPaths}
+        onSend={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(searchPaths).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <ControlledComposerHarness
+        active={false}
+        initialText="@src"
+        threadId="thr_one"
+        workspaceId="ws_one"
+        runtimeGeneration={3}
+        onSearchWorkspacePaths={searchPaths}
+        onSend={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      resolveStale?.({
+        threadId: "thr_stale",
+        workspaceId: "ws_stale",
+        generation: 2,
+        query: "src",
+        items: [{ relativePath: "stale.ts", kind: "file" }],
+        truncated: false,
+      });
+      await staleResult;
+    });
+    expect(screen.queryByRole("option", { name: /stale\.ts/u })).not.toBeInTheDocument();
+    expect(searchPaths).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ControlledComposerHarness
+        active
+        initialText="@src"
+        threadId="thr_one"
+        workspaceId="ws_one"
+        runtimeGeneration={3}
+        onSearchWorkspacePaths={searchPaths}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(await screen.findByRole("option", { name: /current\.ts/u })).toBeVisible();
+    expect(searchPaths).toHaveBeenCalledTimes(2);
   });
 
   /** Workspace 对象只有在组合层提供真实 Files 处理器时才可点击，移除仍保持独立动作。 */
@@ -1079,11 +1315,10 @@ describe("Composer", () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
-  /** Goal/Plan 命令在“添加”分组展示人性化主标签，必填 Goal 参数仍在主输入框内原位收集。 */
-  it("分组展示 Goal/Plan 命令并用主输入框完成空 Goal 参数", async () => {
+  /** 通过键盘仍可找到 Plan；移除的命令不应留下空白入口。 */
+  it("在添加分组只展示 Plan 命令", async () => {
     const user = userEvent.setup();
     const plan = vi.fn();
-    const goal = vi.fn();
     render(
       <ControlledComposerHarness
         initialText="/"
@@ -1100,18 +1335,6 @@ describe("Composer", () => {
             argument: { mode: "optional", label: "计划模式", placeholder: "输入 on 或 off" },
             execute: plan,
           },
-          {
-            id: "goal",
-            name: "goal",
-            aliases: ["目标"],
-            group: "添加",
-            icon: "goal",
-            label: "目标",
-            description: "设置要持续追求的目标",
-            available: true,
-            argument: { mode: "required", label: "目标", placeholder: "描述目标" },
-            execute: goal,
-          },
         ]}
         onSend={vi.fn()}
       />,
@@ -1119,31 +1342,20 @@ describe("Composer", () => {
     const input = screen.getByRole("textbox", { name: "消息" });
     input.focus();
     const group = screen.getByRole("group", { name: "添加" });
-    expect(within(group).getAllByRole("option")).toHaveLength(2);
+    expect(within(group).getAllByRole("option")).toHaveLength(1);
     expect(
       within(group).getByRole("option", { name: /计划.*先制定计划再决定是否执行/u }),
     ).toBeVisible();
-    expect(
-      within(group).getByRole("option", { name: /目标.*设置要持续追求的目标/u }),
-    ).toBeVisible();
-
-    await user.keyboard("{ArrowDown}{Enter}");
-    const goalInput = screen.getByRole("textbox", { name: "描述目标" });
-    expect(goalInput).toHaveAttribute("placeholder", "描述目标");
-    expect(screen.getByRole("button", { name: "创建目标" })).toBeVisible();
-    await user.type(goalInput, "完成稳定验收");
     await user.keyboard("{Escape}");
-    expect(screen.getByRole("textbox", { name: "消息" })).toHaveValue("完成稳定验收");
     expect(screen.getByRole("textbox", { name: "消息" })).toHaveFocus();
     expect(plan).not.toHaveBeenCalled();
-    expect(goal).not.toHaveBeenCalled();
   });
 
   /** 直接 Slash 调用只把结构化参数交给动作，命令正文不得作为普通消息发送。 */
-  it("直接执行 /plan off 与带目标正文的 /goal", async () => {
+  it("直接执行 /plan off 与必填参数命令", async () => {
     const user = userEvent.setup();
     const plan = vi.fn();
-    const goal = vi.fn();
+    const custom = vi.fn();
     const submit = vi.fn();
     const commands: NonNullable<ComposerProps["slashCommands"]> = [
       {
@@ -1157,14 +1369,14 @@ describe("Composer", () => {
         execute: plan,
       },
       {
-        id: "goal",
-        name: "goal",
-        aliases: ["目标"],
-        label: "创建目标",
-        description: "创建目标",
+        id: "custom",
+        name: "custom",
+        aliases: ["自定义"],
+        label: "自定义命令",
+        description: "测试必填参数",
         available: true,
-        argument: { mode: "required", label: "目标", placeholder: "描述目标" },
-        execute: goal,
+        argument: { mode: "required", label: "内容", placeholder: "填写内容" },
+        execute: custom,
       },
     ];
     const { unmount } = render(
@@ -1183,35 +1395,35 @@ describe("Composer", () => {
 
     render(
       <ControlledComposerHarness
-        initialText="/goal 完成生产验收"
+        initialText="/custom 完成生产验收"
         slashCommands={commands}
         onSend={submit}
       />,
     );
-    const goalInput = screen.getByRole("textbox", { name: "消息" });
-    goalInput.focus();
+    const customInput = screen.getByRole("textbox", { name: "消息" });
+    customInput.focus();
     await user.keyboard("{Enter}");
-    await waitFor(() => expect(goal).toHaveBeenCalledWith({ argument: "完成生产验收" }));
-    expect(goalInput).toHaveValue("");
+    await waitFor(() => expect(custom).toHaveBeenCalledWith({ argument: "完成生产验收" }));
+    expect(customInput).toHaveValue("");
     expect(submit).not.toHaveBeenCalled();
   });
 
-  /** 异步 Goal 创建失败恢复同一内联编辑态、正文与选区，避免用户重新输入目标。 */
-  it("Goal 内联命令失败后恢复正文和输入焦点", async () => {
+  /** 异步命令失败要恢复同一内联编辑态，避免用户重输必填参数。 */
+  it("必填参数命令失败后恢复正文和输入焦点", async () => {
     const user = userEvent.setup();
     render(
       <ControlledComposerHarness
-        initialText="/goal"
+        initialText="/custom"
         slashCommands={[
           {
-            id: "goal",
-            name: "goal",
-            aliases: ["目标"],
-            label: "创建目标",
-            description: "创建目标",
+            id: "custom",
+            name: "custom",
+            aliases: ["自定义"],
+            label: "自定义命令",
+            description: "测试必填参数",
             available: true,
-            argument: { mode: "required", label: "目标", placeholder: "描述目标" },
-            execute: () => Promise.reject(new Error("private goal failure")),
+            argument: { mode: "required", label: "内容", placeholder: "填写内容" },
+            execute: () => Promise.reject(new Error("private command failure")),
           },
         ]}
         onSend={vi.fn()}
@@ -1220,12 +1432,12 @@ describe("Composer", () => {
     const input = screen.getByRole("textbox", { name: "消息" });
     input.focus();
     await user.keyboard("{Enter}");
-    const goalInput = screen.getByRole("textbox", { name: "描述目标" });
-    await user.type(goalInput, "保留这段目标");
+    const customInput = screen.getByRole("textbox", { name: "填写内容" });
+    await user.type(customInput, "保留这段内容");
     await user.keyboard("{Enter}");
 
-    await waitFor(() => expect(screen.getByRole("textbox", { name: "描述目标" })).toHaveFocus());
-    expect(screen.getByRole("textbox", { name: "描述目标" })).toHaveValue("保留这段目标");
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "填写内容" })).toHaveFocus());
+    expect(screen.getByRole("textbox", { name: "填写内容" })).toHaveValue("保留这段内容");
     expect(screen.getByRole("alert")).toHaveTextContent("指令未完成，请重试。");
   });
 
@@ -1268,6 +1480,167 @@ describe("Composer", () => {
       expect((input as HTMLTextAreaElement).selectionStart).toBe(4);
     });
     expect(screen.getByRole("alert")).toHaveTextContent("指令未完成，请重试。");
+  });
+
+  /** 同步异常也必须进入与异步失败相同的草稿/选区恢复路径，且释放忙状态供用户重试。 */
+  it("Slash action 同步抛错后恢复草稿和选区，并允许重试", async () => {
+    const user = userEvent.setup();
+    const originalText = "/settings 后继续";
+    const execute = vi
+      .fn<() => void | Promise<void>>()
+      .mockImplementationOnce(() => {
+        throw new Error("private command failure");
+      })
+      .mockResolvedValue(undefined);
+    render(
+      <ControlledComposerHarness
+        initialText={originalText}
+        slashCommands={[
+          {
+            id: "settings",
+            name: "settings",
+            aliases: ["设置"],
+            label: "设置",
+            description: "打开设置",
+            available: true,
+            execute,
+          },
+        ]}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    input.focus();
+    input.setSelectionRange(4, 7);
+    fireEvent.keyUp(input, { key: "ArrowLeft" });
+    const option = screen.getByRole("option", { name: /\/settings/ });
+    await user.click(option);
+
+    await waitFor(() => expect(input).toHaveValue(originalText));
+    await waitFor(() => {
+      expect(input).toHaveFocus();
+      expect(input.selectionStart).toBe(4);
+      expect(input.selectionEnd).toBe(7);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("指令未完成，请重试。");
+
+    await user.click(screen.getByRole("option", { name: /\/settings/ }));
+    await waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(input).toHaveValue(" 后继续"));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  /** 先执行已经排入的绘制帧，再让外层 owner 提交恢复文本；原生 value 写入不得把 selection 推到末尾。 */
+  it("Slash action 失败后 RAF 先于恢复草稿提交仍保留原选区", async () => {
+    const user = userEvent.setup();
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    const originalText = "/settings 后继续";
+    let commitRecovery: (() => void) | undefined;
+    render(
+      <ControlledComposerHarness
+        initialText={originalText}
+        onDraftCommit={(nextText, commit) => {
+          if (nextText === originalText) commitRecovery = commit;
+          else commit();
+        }}
+        slashCommands={[
+          {
+            id: "settings",
+            name: "settings",
+            aliases: ["设置"],
+            label: "设置",
+            description: "打开设置",
+            available: true,
+            execute: () => Promise.reject(new Error("private command failure")),
+          },
+        ]}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    input.focus();
+    input.setSelectionRange(4, 4);
+    fireEvent.keyUp(input, { key: "ArrowLeft" });
+    const framesBeforeAction = frames.length;
+    await user.click(screen.getByRole("option", { name: /\/settings/ }));
+    await waitFor(() => expect(commitRecovery).toBeDefined());
+    expect(input).toHaveValue(" 后继续");
+
+    const frameBatch = frames.splice(framesBeforeAction);
+    await act(async () => {
+      for (const frame of frameBatch) frame(0);
+    });
+    expect(input).toHaveValue(" 后继续");
+
+    const commit = commitRecovery;
+    expect(commit).toBeDefined();
+    act(() => commit?.());
+    await waitFor(() => expect(input).toHaveValue(originalText));
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(4);
+    expect(screen.getByRole("alert")).toHaveTextContent("指令未完成，请重试。");
+  });
+
+  /** Scope 切换后尚未提交的恢复请求作废，不能让旧命令的 RAF 抢走新会话焦点。 */
+  it("Slash action 失败后 scope 切换会丢弃迟到的恢复焦点", async () => {
+    const user = userEvent.setup();
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+    const originalText = "/settings 后继续";
+    let commitRecovery: (() => void) | undefined;
+    /** 命令失败时暂缓恢复值，让测试在中间绘制帧后切换 scope。 */
+    const interceptDraftCommit = (nextText: string, commit: () => void): void => {
+      if (nextText === originalText) commitRecovery = commit;
+      else commit();
+    };
+    const props = {
+      initialText: originalText,
+      onDraftCommit: interceptDraftCommit,
+      preferences: PREFERENCES,
+      models: MODELS,
+      slashCommands: [
+        {
+          id: "settings",
+          name: "settings",
+          aliases: ["设置"],
+          label: "设置",
+          description: "打开设置",
+          available: true,
+          execute: () => Promise.reject(new Error("private command failure")),
+        },
+      ],
+      onSend: vi.fn(),
+    } satisfies ControlledComposerHarnessProps;
+    const view = render(<ControlledComposerHarness {...props} threadId="thread_old" />);
+    const input = screen.getByRole("textbox", { name: "消息" });
+    input.focus();
+    (input as HTMLTextAreaElement).setSelectionRange(4, 4);
+    fireEvent.keyUp(input, { key: "ArrowLeft" });
+    const framesBeforeAction = frames.length;
+    await user.click(screen.getByRole("option", { name: /\/settings/ }));
+    await waitFor(() => expect(commitRecovery).toBeDefined());
+
+    const modelTrigger = screen.getByRole("button", { name: /当前模型/ });
+    modelTrigger.focus();
+    expect(modelTrigger).toHaveFocus();
+    view.rerender(<ControlledComposerHarness {...props} threadId="thread_new" />);
+    await act(async () => {
+      for (const frame of frames.splice(framesBeforeAction)) frame(0);
+    });
+
+    expect(modelTrigger).toHaveFocus();
+    expect(screen.getByRole("textbox", { name: "消息" })).toHaveValue(" 后继续");
   });
 
   /** Scope/generation 变化立即关闭当前面板，同一草稿必须再次变化才开始新请求。 */
@@ -1839,7 +2212,7 @@ describe("Composer", () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  /** 浮层只在显式展开时读取服务端账本，并把累计值与最近请求窗口分区展示。 */
+  /** 含缓存输入与输出组成总量；缓存只作输入明细，最近请求窗口不参与累计计算。 */
   it("按需展示本会话累计用量、部分数据和最近请求窗口", async () => {
     const user = userEvent.setup();
     const reader = { read: vi.fn().mockResolvedValue(USAGE_SUMMARY) };
@@ -1868,25 +2241,93 @@ describe("Composer", () => {
     expect(indicator).toHaveAttribute("aria-valuenow", "20.2");
     expect(indicator).toHaveAttribute(
       "aria-valuetext",
-      "已使用 20.2%，55k / 272k tokens，最近模型请求",
+      "当前上下文 20.2%，55k / 272k tokens，Provider 完整用量",
     );
     const trigger = screen.getByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
     await waitFor(() => expect(reader.read).toHaveBeenCalledWith({ threadId: "thr_usage" }));
     expect(await screen.findByText("Token · 本会话")).toBeVisible();
-    expect(screen.getByText("12k")).toBeVisible();
+    expect(screen.getByText("输入（含缓存）")).toBeVisible();
+    expect(screen.getByText("20k")).toBeVisible();
     expect(screen.getByText("2.1k")).toBeVisible();
     expect(screen.getByText("6.2k")).toBeVisible();
     expect(screen.getByText("900")).toBeVisible();
-    expect(screen.getByText("15k")).toBeVisible();
+    expect(screen.getByText("总计（输入 + 输出）")).toBeVisible();
+    expect(screen.getByText("22k")).toBeVisible();
+    expect(screen.getByText("缓存已计入输入和总计，不重复累加。")).toBeVisible();
+    expect(screen.getByText("最近请求的占用，估算校正或压缩后可能降低。")).toBeVisible();
     expect(screen.getByText("31.8%")).toBeVisible();
-    expect(screen.getAllByText("部分数据")).toHaveLength(2);
-    expect(screen.getByText("上下文 · 最近请求")).toBeVisible();
+    expect(screen.queryByText("部分数据")).toBeNull();
+    expect(screen.getByText("部分请求未上报全部用量字段")).toBeVisible();
+    expect(screen.getByText("当前上下文 · Provider 实测")).toBeVisible();
     expect(screen.getByText("20.2%")).toBeVisible();
     expect(screen.getByText("55k / 272k")).toBeVisible();
   });
 
-  /** OpenAI input 已包含缓存读取且没有独立写入字段时，仍按完整输入分母显示命中率。 */
+  /** 不到 0.1% 的小占用仍应可读，压缩后的 envelope 预算也要明确标为本地估算。 */
+  it("以小于百分之一显示极小占用并标注压缩后的本地估算", async () => {
+    const user = userEvent.setup();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_estimated"
+        usageReader={{
+          read: vi.fn().mockResolvedValue({ ...USAGE_SUMMARY, threadId: "thr_usage_estimated" }),
+        }}
+        contextUsage={{
+          certainty: "estimated",
+          usedTokens: 143,
+          limitTokens: 1_000_000,
+          percentage: 0,
+          ringPercentage: 0.0143,
+          tone: "neutral",
+          source: "local",
+          measuredAt: "2026-09-26T00:00:00Z",
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("progressbar", { name: "上下文使用量" })).toHaveAttribute(
+      "aria-valuetext",
+      "当前上下文约 <0.1%，143 / 1M tokens，本地估算",
+    );
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    expect(await screen.findByText("当前上下文 · 本地估算")).toBeVisible();
+    expect(screen.getByText("约 <0.1%")).toBeVisible();
+  });
+
+  /** 聚合账本离线时仍展示已收到的当前上下文，不让两种统计互相阻断。 */
+  it("累计用量读取失败时保留当前上下文估算", async () => {
+    const user = userEvent.setup();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_unavailable"
+        usageReader={{ read: vi.fn().mockRejectedValue(new Error("offline")) }}
+        contextUsage={{
+          certainty: "estimated",
+          usedTokens: 18_500,
+          limitTokens: 128_000,
+          percentage: 14.5,
+          ringPercentage: 14.453125,
+          tone: "neutral",
+          source: "local",
+          measuredAt: "2026-09-26T00:00:00Z",
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+
+    expect(await screen.findByText("当前上下文 · 本地估算")).toBeVisible();
+    expect(screen.getByText("19k / 128k")).toBeVisible();
+    expect(await screen.findByText("用量暂不可用")).toBeVisible();
+  });
+
+  /** 缓存写入未报告不阻止完整 total/output 推导含缓存输入，也不把缺失写入伪造成零。 */
   it("按 API 输入与缓存读取计算没有写入字段的命中率", async () => {
     const user = userEvent.setup();
     const reader = {
@@ -1922,11 +2363,80 @@ describe("Composer", () => {
 
     await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
     expect(await screen.findByText("91.1%")).toBeVisible();
-    expect(screen.getByText("227k")).toBeVisible();
+    expect(screen.getByText("2.5M")).toBeVisible();
     expect(screen.getByText("11k")).toBeVisible();
     expect(screen.getByText("2.3M")).toBeVisible();
     expect(screen.getByText("2.6M")).toBeVisible();
-    expect(screen.queryByText("缓存写入")).toBeNull();
+    expect(screen.queryByText("含缓存写入")).toBeNull();
+  });
+
+  /** 部分 total/output 可能来自不同请求；缓存只扣减一次，已报告的零保留输入与写入明细。 */
+  it.each([
+    { name: "完整输入含缓存写入", overrides: {}, expected: "24k" },
+    {
+      name: "未计量请求仅展示已报告小计",
+      overrides: { requestCount: 4 },
+      expected: "24k",
+    },
+    {
+      name: "数量相同但各自部分覆盖",
+      overrides: { totalRequestCount: 2, outputRequestCount: 2 },
+      expected: "—",
+    },
+    { name: "未报告总量", overrides: { totalRequestCount: 0, totalTokens: 0 }, expected: "—" },
+    { name: "总量小于输出", overrides: { totalTokens: 100 }, expected: "—" },
+    {
+      name: "完整报告零用量",
+      overrides: {
+        totalTokens: 0,
+        outputTokens: 0,
+        newInputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheCompleteInputTokens: 0,
+        cacheCompleteReadTokens: 0,
+      },
+      expected: "0",
+    },
+  ])("含缓存累计输入保持可信覆盖：$name", async ({ name, overrides, expected }) => {
+    const user = userEvent.setup();
+    const threadId = "thr_inclusive_" + name;
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId={threadId}
+        usageReader={{
+          read: vi.fn().mockResolvedValue({
+            ...USAGE_SUMMARY,
+            threadId,
+            newInputTokens: 920,
+            outputTokens: 449,
+            totalTokens: 24_449,
+            cacheReadTokens: 22_080,
+            cacheWriteTokens: 1_000,
+            cacheCompleteInputTokens: 24_000,
+            cacheCompleteReadTokens: 22_080,
+            ...overrides,
+          }),
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+    const label = await screen.findByText("输入（含缓存）");
+    expect(within(label.parentElement!).getByText(expected)).toBeVisible();
+    if (name === "完整输入含缓存写入") {
+      const write = screen.getByText("含缓存写入");
+      expect(within(write.parentElement!).getByText("1k")).toBeVisible();
+    }
+    if (name === "完整报告零用量") {
+      const write = screen.getByText("含缓存写入");
+      expect(within(write.parentElement!).getByText("0")).toBeVisible();
+    }
+    if (name === "未计量请求仅展示已报告小计") {
+      expect(screen.getByText("累计仅含已报告用量，仍有请求未上报用量。")).toBeVisible();
+    }
   });
 
   /** Provider 未报告计量时保持未知，账本为空也只引导发送消息，不能伪造成 0 Token。 */
@@ -1967,6 +2477,60 @@ describe("Composer", () => {
     expect(await screen.findByText("发送消息后显示用量")).toBeVisible();
   });
 
+  /** Provider 已有请求账目但尚无任何 Usage 字段时，只说明状态，不把未知项铺成破折号。 */
+  it("用一句状态提示代替尚未报告的累计用量空行", async () => {
+    const user = userEvent.setup();
+    const reader = {
+      read: vi.fn().mockResolvedValue({
+        ...USAGE_SUMMARY,
+        threadId: "thr_usage_unreported",
+        requestCount: 1,
+        measuredRequestCount: 0,
+        newInputRequestCount: 0,
+        newInputTokens: 0,
+        outputRequestCount: 0,
+        outputTokens: 0,
+        totalRequestCount: 0,
+        totalTokens: 0,
+        cacheReadRequestCount: 0,
+        cacheReadTokens: 0,
+        cacheWriteRequestCount: 0,
+        cacheWriteTokens: 0,
+        cacheCompleteRequestCount: 0,
+        cacheCompleteInputTokens: 0,
+        cacheCompleteReadTokens: 0,
+      }),
+    };
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_unreported"
+        usageReader={reader}
+        contextUsage={{
+          certainty: "estimated",
+          usedTokens: 3_785,
+          limitTokens: 128_000,
+          percentage: 3,
+          ringPercentage: 2.95703125,
+          tone: "neutral",
+          source: "local",
+          measuredAt: "2026-09-26T00:00:00Z",
+        }}
+        onSend={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "上下文用量详情" }));
+
+    expect(await screen.findByText("当前上下文 · 本地估算")).toBeVisible();
+    expect(screen.getByText("约 3.0%")).toBeVisible();
+    expect(screen.getByText("3.8k / 128k")).toBeVisible();
+    expect(await screen.findByText("尚无已报告的 Provider 用量")).toBeVisible();
+    expect(screen.queryByText("缓存命中率")).toBeNull();
+    expect(screen.queryByText("输入（含缓存）")).toBeNull();
+  });
+
   /** 已确认快照在刷新失败时保留，避免请求结算中的瞬时故障把用户可读数据闪成空白。 */
   it("刷新失败时保留旧值并提示暂未更新", async () => {
     const user = userEvent.setup();
@@ -1988,7 +2552,7 @@ describe("Composer", () => {
     );
     const trigger = screen.getByRole("button", { name: "上下文用量详情" });
     await user.click(trigger);
-    expect(await screen.findByText("15k")).toBeVisible();
+    expect(await screen.findByText("22k")).toBeVisible();
 
     rerender(
       <ControlledComposerHarness
@@ -2001,41 +2565,216 @@ describe("Composer", () => {
       />,
     );
     expect(await screen.findByText("暂未更新")).toBeVisible();
-    expect(screen.getByText("15k")).toBeVisible();
+    expect(screen.getByText("22k")).toBeVisible();
   });
 
-  /** hover 读取后可点击固定；外部点击与 Escape 都关闭，Escape 必须归还圆环焦点。 */
-  it("支持悬停阅读、固定展开、外部关闭和 Escape 焦点回归", async () => {
+  /** 归还入口焦点不能重开浮层；真实 Radix 卸载与后续帧结束后仍须保持关闭。 */
+  it.each(["入口", "浮层"] as const)(
+    "支持悬停阅读、固定展开、外部关闭和 Escape 焦点回归（焦点在%s）",
+    async (escapeFocus) => {
+      const user = userEvent.setup();
+      const reader = {
+        read: vi
+          .fn()
+          .mockImplementation((input: { threadId: string }) =>
+            Promise.resolve({ ...USAGE_SUMMARY, threadId: input.threadId }),
+          ),
+      };
+      render(
+        <ControlledComposerHarness
+          preferences={PREFERENCES}
+          models={MODELS}
+          threadId="thr_usage_hover"
+          usageReader={reader}
+          onSend={vi.fn()}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+      await user.hover(trigger);
+      expect(await screen.findByText("Token · 本会话")).toBeVisible();
+      await user.click(trigger);
+      await user.click(document.body);
+      await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+
+      await user.click(trigger);
+      expect(await screen.findByText("Token · 本会话")).toBeVisible();
+      if (escapeFocus === "浮层") {
+        const dialog = screen.getByRole("dialog", { name: "上下文用量详情" });
+        act(() => dialog.focus());
+        expect(dialog).toHaveFocus();
+      }
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+      await waitFor(() => expect(trigger).toHaveFocus());
+      await act(async () => {
+        await new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+        });
+      });
+      expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull();
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveFocus();
+
+      act(() => screen.getByRole("textbox", { name: "消息" }).focus());
+      act(() => trigger.focus());
+      expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+
+      await user.unhover(trigger);
+      await user.hover(trigger);
+      expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+      await user.click(trigger);
+      await user.unhover(trigger);
+      expect(screen.getByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+      await user.click(document.body);
+      await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+    },
+  );
+
+  /** 复现真窗原位置被 Portal 覆盖再露出的边界事件；没有新移动就不应把关闭当成新悬停。 */
+  it("Escape 后 Portal 在同一指针位置退出不会重开，真实离开、聚焦和点击仍可展开", async () => {
     const user = userEvent.setup();
-    const reader = {
-      read: vi
-        .fn()
-        .mockImplementation((input: { threadId: string }) =>
-          Promise.resolve({ ...USAGE_SUMMARY, threadId: input.threadId }),
-        ),
-    };
     render(
       <ControlledComposerHarness
         preferences={PREFERENCES}
         models={MODELS}
-        threadId="thr_usage_hover"
-        usageReader={reader}
+        threadId="thr_usage_portal_boundary"
         onSend={vi.fn()}
       />,
     );
     const trigger = screen.getByRole("button", { name: "上下文用量详情" });
-    await user.hover(trigger);
-    expect(await screen.findByText("Token · 本会话")).toBeVisible();
+    const svg = trigger.querySelector("svg")!;
+    const point = { clientX: 885, clientY: 779 };
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(new DOMRect(871, 765, 28, 28));
+    await user.pointer({ target: svg, coords: point });
     await user.click(trigger);
-    await user.click(document.body);
-    await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
-
-    await user.click(trigger);
-    expect(await screen.findByText("Token · 本会话")).toBeVisible();
+    const dialog = await screen.findByRole("dialog", { name: "上下文用量详情" });
+    const section = within(dialog).getByRole("region", { name: "Token 本会话" });
+    const pointerMove = vi.fn();
+    trigger.addEventListener("pointermove", pointerMove);
+    fireEvent(
+      svg,
+      new MouseEvent("pointerout", { bubbles: true, relatedTarget: section, ...point }),
+    );
+    fireEvent(
+      section,
+      new MouseEvent("pointerover", { bubbles: true, relatedTarget: svg, ...point }),
+    );
     await user.keyboard("{Escape}");
-    await waitFor(() => expect(screen.queryByText("Token · 本会话")).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull(),
+    );
+    await waitFor(() => expect(trigger).toHaveFocus());
+    fireEvent(
+      svg,
+      new MouseEvent("pointerover", { bubbles: true, relatedTarget: section, ...point }),
+    );
+    expect(pointerMove).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull();
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(trigger).toHaveFocus();
+
+    const input = screen.getByRole("textbox", { name: "消息" });
+    await user.pointer({ target: input, coords: { clientX: 850, clientY: 779 } });
+    await user.pointer({ target: svg, coords: point });
+    expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull(),
+    );
+    act(() => screen.getByRole("button", { name: /当前模型/ }).focus());
+    await user.tab({ shift: true });
+    expect(trigger).toHaveFocus();
+    expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull(),
+    );
+    await user.click(trigger);
+    expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
   });
+
+  /** 浮层覆盖期间真实移动不再给入口 leave；浮层退出仍须清理已离开的入口区域。 */
+  it("指针从覆盖入口的浮层移到入口区域外后关闭，重新进入仍能展开", async () => {
+    const user = userEvent.setup();
+    render(
+      <ControlledComposerHarness
+        preferences={PREFERENCES}
+        models={MODELS}
+        threadId="thr_usage_portal_exit"
+        onSend={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+    const svg = trigger.querySelector("svg")!;
+    const input = screen.getByRole("textbox", { name: "消息" });
+    const inside = { clientX: 885, clientY: 779 };
+    const outside = { clientX: 850, clientY: 779 };
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(new DOMRect(871, 765, 28, 28));
+    await user.click(input);
+    await user.pointer({ target: svg, coords: inside });
+    const dialog = await screen.findByRole("dialog", { name: "上下文用量详情" });
+    const section = within(dialog).getByRole("region", { name: "Token 本会话" });
+    fireEvent(
+      svg,
+      new MouseEvent("pointerout", { bubbles: true, relatedTarget: section, ...inside }),
+    );
+    fireEvent(
+      section,
+      new MouseEvent("pointerover", { bubbles: true, relatedTarget: svg, ...inside }),
+    );
+    fireEvent(section, new MouseEvent("pointermove", { bubbles: true, ...outside }));
+    fireEvent(
+      section,
+      new MouseEvent("pointerout", { bubbles: true, relatedTarget: input, ...outside }),
+    );
+    fireEvent(
+      input,
+      new MouseEvent("pointerover", { bubbles: true, relatedTarget: section, ...outside }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull(),
+    );
+    expect(input).toHaveFocus();
+    await user.pointer({ target: input, coords: outside });
+    await user.pointer({ target: svg, coords: inside });
+    expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+  });
+
+  /** 仅悬停没有入口 blur 可重置；关闭后首次真实 Tab 必须仍能展开，且关闭不抢原焦点。 */
+  it.each(["离开入口", "外部点击"] as const)(
+    "仅悬停后通过%s关闭，首次键盘聚焦仍展开用量详情",
+    async (dismissal) => {
+      const user = userEvent.setup();
+      render(
+        <ControlledComposerHarness
+          preferences={PREFERENCES}
+          models={MODELS}
+          threadId="thr_usage_first_focus"
+          onSend={vi.fn()}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "上下文用量详情" });
+      const input = screen.getByRole("textbox", { name: "消息" });
+      await user.click(input);
+      await user.hover(trigger);
+      expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+      expect(input).toHaveFocus();
+
+      if (dismissal === "离开入口") await user.unhover(trigger);
+      else await user.click(input);
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog", { name: "上下文用量详情" })).toBeNull(),
+      );
+      expect(input).toHaveFocus();
+
+      act(() => screen.getByRole("button", { name: /当前模型/ }).focus());
+      await user.tab({ shift: true });
+      expect(trigger).toHaveFocus();
+      expect(await screen.findByRole("dialog", { name: "上下文用量详情" })).toBeVisible();
+    },
+  );
 
   /** 新 Thread 打开后拒绝旧账本的迟到返回，避免缓存和视觉摘要串到当前会话。 */
   it("拒绝会话切换后的迟到用量响应", async () => {
@@ -2076,7 +2815,7 @@ describe("Composer", () => {
     expect(await screen.findByText("25k")).toBeVisible();
     resolveFirst({ ...USAGE_SUMMARY, threadId: "thr_usage_a" });
     await waitFor(() => expect(screen.getByText("25k")).toBeVisible());
-    expect(screen.queryByText("15k")).toBeNull();
+    expect(screen.queryByText("22k")).toBeNull();
   });
 
   /** 临近窗口上限时只改变视觉风险级别，仍不升级为打断输入的弹层。 */

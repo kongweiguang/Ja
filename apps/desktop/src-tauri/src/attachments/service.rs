@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const TOKEN_COLLISION_RETRIES: usize = 16;
@@ -148,6 +149,38 @@ impl AttachmentIngress {
         display_name: String,
         bytes: &[u8],
         cancellation: &ItemCancellation,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<IngressAttachment, AttachmentIngressError> {
+        self.stage_bytes_with_check(
+            display_name,
+            bytes,
+            || cancellation.is_cancelled(),
+            progress,
+        )
+    }
+
+    /// 冻结 Review 等单 operation 用例直接使用其 owner token，避免另建附件级取消事实。
+    pub(crate) fn stage_bytes_with_cancellation(
+        &self,
+        display_name: String,
+        bytes: &[u8],
+        cancellation: &CancellationToken,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<IngressAttachment, AttachmentIngressError> {
+        self.stage_bytes_with_check(
+            display_name,
+            bytes,
+            || cancellation.is_cancelled(),
+            progress,
+        )
+    }
+
+    /// 两种取消 owner 共用同一有界 staging 写入，token 生命周期继续由各自上层持有。
+    fn stage_bytes_with_check(
+        &self,
+        display_name: String,
+        bytes: &[u8],
+        is_cancelled: impl Fn() -> bool,
         mut progress: impl FnMut(u64, u64),
     ) -> Result<IngressAttachment, AttachmentIngressError> {
         self.require_open()?;
@@ -164,7 +197,7 @@ impl AttachmentIngress {
         let mut digest = Sha256::new();
         let mut copied = 0_u64;
         for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
-            if cancellation.is_cancelled() {
+            if is_cancelled() {
                 return Err(AttachmentIngressError::new(
                     AttachmentIngressErrorCode::Cancelled,
                 ));
@@ -180,7 +213,7 @@ impl AttachmentIngress {
             copied = copied.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
             progress(copied, total);
         }
-        if cancellation.is_cancelled() {
+        if is_cancelled() {
             return Err(AttachmentIngressError::new(
                 AttachmentIngressErrorCode::Cancelled,
             ));

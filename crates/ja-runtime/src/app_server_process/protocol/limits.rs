@@ -1,15 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! JA-RPC v1 协商资源上限；这里只维护数值不变量与 initialize 投影。
+//! JA-RPC v2 协商资源上限；这里只维护数值不变量与 initialize 投影。
 
 use super::error_policy::CodecError;
 use serde_json::Value;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MIN_MAX_FRAME_BYTES: usize = 1024;
-pub(super) const MAX_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-pub(super) const MAX_REQUEST_ID_BYTES: usize = 98;
+pub(super) const MAX_MAX_FRAME_BYTES: usize = DEFAULT_MAX_FRAME_BYTES;
+pub(super) const MAX_RPC_REQUEST_ID_BYTES: usize = 98;
 pub(super) const MAX_METHOD_BYTES: usize = 128;
 /// 协商后的有界资源，使用协议默认值保持 Java 与 Rust 首次握手一致。
 #[derive(Debug, Clone, PartialEq, Eq)]

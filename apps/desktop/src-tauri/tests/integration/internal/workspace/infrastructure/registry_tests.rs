@@ -27,6 +27,40 @@ fn register_checks_raw_alias_before_canonicalize() {
     let _ = fs::remove_dir_all(base);
 }
 
+/// Rebind freezes new admissions, waits only for existing guarded IO, and revokes every cloned old handle after a root swap.
+#[test]
+fn workspace_handle_freeze_drains_and_revokes_clones() {
+    let base = std::env::temp_dir().join(format!("ja-workspace-rebind-{}", Uuid::new_v4()));
+    fs::create_dir_all(&base).expect("create workspace root");
+    fs::write(base.join("file.txt"), "content").expect("write guarded file");
+    let registry = WorkspaceRegistry::default();
+    let info = registry.register(&base).expect("register root");
+    let handle = registry.get(info.id).expect("get handle");
+    let old_clone = handle.clone();
+
+    let in_flight = handle
+        .resolve_guard("file.txt", Some(false))
+        .expect("guard admitted before freeze");
+    assert!(!handle.freeze_and_drain(std::time::Duration::from_millis(1)));
+    handle.thaw_after_aborted_rebind();
+    drop(in_flight);
+
+    assert!(handle.freeze_and_drain(std::time::Duration::from_millis(20)));
+    assert!(matches!(
+        old_clone.resolve_guard("file.txt", Some(false)),
+        Err(WorkspaceError::WorkspaceNotFound)
+    ));
+    handle.thaw_after_aborted_rebind();
+    assert!(old_clone.resolve_guard("file.txt", Some(false)).is_ok());
+
+    handle.revoke();
+    assert!(matches!(
+        old_clone.resolve_guard("file.txt", Some(false)),
+        Err(WorkspaceError::WorkspaceNotFound)
+    ));
+    let _ = fs::remove_dir_all(base);
+}
+
 /// 为原始路径准入回归创建平台原生别名；不支持的平台只保留普通根目录断言。
 fn create_directory_alias(target: &Path, alias: &Path) -> bool {
     #[cfg(unix)]

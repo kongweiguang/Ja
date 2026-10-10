@@ -5,15 +5,20 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { z } from "zod";
 import { invokeNativeCommand } from "./nativeInvoke";
+import { ToolCallIdSchema } from "../protocol/identifiers";
 // Credential bytes 由 Rust 拥有，永远不能进入 runtime command DTO。
 import {
   assertSafePayload,
   InputQueueMutationResultSchema,
   SafeNameSchema,
+  StorageRecoverySchema,
   TurnContentSchema,
-  ClientOperationIdSchema,
+  OperationKeySchema,
+  OperationReadParamsSchema,
   OperationReadResultSchema,
   ThreadIdSchema,
+  ThreadForkParamsSchema,
+  ThreadForkResultSchema,
   ThreadReadResultSchema,
   parseEvent,
   ServerInstanceIdSchema,
@@ -32,6 +37,7 @@ import {
   type MethodResult,
 } from "../protocol/methods";
 import { READY_TOKEN_PATTERN } from "../protocol/readyToken";
+import { createOperationKey } from "@/shared/operationKey";
 
 /** Rust host 拥有全部生命周期 command，并且只公开一个固定事件。 */
 export const JA_RUNTIME_COMMANDS = {
@@ -39,12 +45,15 @@ export const JA_RUNTIME_COMMANDS = {
   stop: "ja_runtime_stop",
   state: "ja_runtime_state",
   storageInfo: "ja_runtime_storage_info",
+  storageBackupOpen: "ja_runtime_storage_backup_open",
+  storageRetry: "ja_runtime_storage_retry",
   workspaceActivate: "ja_runtime_workspace_activate",
   recoveryState: "ja_runtime_recovery_state",
   acknowledgeRecovery: "ja_runtime_acknowledge_recovery",
   approvalRespond: "ja_approval_respond",
   operationRead: "ja_operation_read",
   threadReadForOperation: "ja_thread_read",
+  threadFork: "ja_thread_fork",
   turnStart: "ja_turn_start",
   turnResume: "ja_turn_resume",
   turnContinue: "ja_turn_continue",
@@ -61,75 +70,196 @@ export const JA_RUNTIME_COMMANDS = {
 
 const PENDING_OPERATION_STORAGE_KEY = "ja.pending-operations.v1";
 const ACKNOWLEDGED_OPERATION_STORAGE_KEY = "ja.acknowledged-unknown-operations.v1";
-const pendingOperationListeners = new Set<(records: readonly PendingClientOperation[]) => void>();
-const PendingClientOperationSchema = z
+const pendingOperationListeners = new Set<
+  (records: readonly RecoverablePendingOperation[]) => void
+>();
+const inFlightOperationKeys = new Set<string>();
+const inFlightForkRequests = new Map<
+  string,
+  { input: ThreadForkInput; promise: Promise<ThreadForkResult> }
+>();
+const PendingOperationSchema = z
   .object({
-    clientOperationId: ClientOperationIdSchema,
-    method: z.enum(["turn/start", "turn/continue", "turn/reask", "approval/respond"]),
+    operationKey: OperationKeySchema,
+    method: z.enum([
+      "turn/start",
+      "turn/continue",
+      "turn/reask",
+      "approval/respond",
+      "thread/fork",
+    ]),
     threadId: ThreadIdSchema.nullable(),
     createdAt: z.iso.datetime(),
+    sourceItemId: ThreadForkParamsSchema.shape.sourceItemId.optional(),
+    expectedThreadRevision: ThreadForkParamsSchema.shape.expectedThreadRevision.optional(),
+    createdResult: ThreadForkResultSchema.optional(),
   })
-  .strict();
-export type PendingClientOperation = z.infer<typeof PendingClientOperationSchema>;
+  .strict()
+  .superRefine((record, context) => {
+    const forkFieldsPresent =
+      record.sourceItemId !== undefined ||
+      record.expectedThreadRevision !== undefined ||
+      record.createdResult !== undefined;
+    if (record.method !== "thread/fork") {
+      if (forkFieldsPresent) context.addIssue({ code: "custom", path: ["method"] });
+      return;
+    }
+    if (
+      record.threadId === null ||
+      record.sourceItemId === undefined ||
+      record.expectedThreadRevision === undefined
+    ) {
+      context.addIssue({ code: "custom", path: ["sourceItemId"] });
+      return;
+    }
+    if (
+      record.createdResult !== undefined &&
+      (record.createdResult.source.threadId !== record.threadId ||
+        record.createdResult.source.itemId !== record.sourceItemId ||
+        record.createdResult.source.threadRevision !== record.expectedThreadRevision)
+    ) {
+      context.addIssue({ code: "custom", path: ["createdResult"] });
+    }
+  });
+export type PendingOperation = z.infer<typeof PendingOperationSchema>;
+export type RecoverablePendingOperation = Pick<
+  PendingOperation,
+  "operationKey" | "threadId" | "createdAt"
+> & {
+  method: Exclude<PendingOperation["method"], "thread/fork">;
+};
+type ThreadForkInput = z.infer<typeof ThreadForkParamsSchema>;
+type ThreadForkResult = z.infer<typeof ThreadForkResultSchema>;
+export type ThreadForkRecovery =
+  | { state: "pending"; input: ThreadForkInput }
+  | { state: "created"; input: ThreadForkInput; result: ThreadForkResult };
 export interface PendingAcknowledgementResult {
   status: "unknown_acknowledged" | "committed";
-  pending: readonly PendingClientOperation[];
+  pending: readonly RecoverablePendingOperation[];
 }
 
 /** 设计原因：跨重载只保留随机关联身份，不持久化 prompt、审批内容或凭据；存储不可用时拒绝新副作用。 */
-function readPendingClientOperations(): PendingClientOperation[] {
+function readPendingOperations(): PendingOperation[] {
   try {
     const stored = globalThis.localStorage?.getItem(PENDING_OPERATION_STORAGE_KEY);
     if (stored === undefined) throw new Error("persistent operation storage unavailable");
-    return stored === null
-      ? []
-      : z.array(PendingClientOperationSchema).max(64).parse(JSON.parse(stored));
+    return stored === null ? [] : z.array(PendingOperationSchema).max(64).parse(JSON.parse(stored));
   } catch {
     throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "待核实记录暂不可用，请稍后重试。", false);
   }
 }
 
-/** 设计原因：提交前必须先写入关联 ID，写入失败时不能让 Java 执行无法回查的副作用。 */
-function writePendingClientOperations(records: readonly PendingClientOperation[]): void {
+/** 在途身份只属于当前 Renderer；重载后它们仍以持久日志进入核查，不会漏掉未知副作用。 */
+function recoverableOperations(
+  records: readonly PendingOperation[],
+): RecoverablePendingOperation[] {
+  return records.flatMap((record) => {
+    if (record.method === "thread/fork" || inFlightOperationKeys.has(record.operationKey))
+      return [];
+    return [
+      {
+        operationKey: record.operationKey,
+        method: record.method as RecoverablePendingOperation["method"],
+        threadId: record.threadId,
+        createdAt: record.createdAt,
+      },
+    ];
+  });
+}
+
+/** 只广播真正需要核查的日志，正常等待 ACK 不产生警告；观察者失败不能改变提交结果。 */
+function publishPendingOperations(records: readonly PendingOperation[]): void {
+  const recoverable = recoverableOperations(records);
+  for (const listener of pendingOperationListeners) {
+    try {
+      listener(recoverable);
+    } catch {
+      /* observer 错误不能改写持久副作用准入结果。 */
+    }
+  }
+}
+
+/** 提交前必须先落盘关联 ID；日志包含在途请求，但 UI 只接收结果未知的核查投影。 */
+function writePendingOperations(records: readonly PendingOperation[]): void {
   try {
     globalThis.localStorage?.setItem(
       PENDING_OPERATION_STORAGE_KEY,
-      JSON.stringify(z.array(PendingClientOperationSchema).max(64).parse(records)),
+      JSON.stringify(z.array(PendingOperationSchema).max(64).parse(records)),
     );
     if (globalThis.localStorage === undefined)
       throw new Error("persistent operation storage unavailable");
-    for (const listener of pendingOperationListeners) {
-      try {
-        listener(records);
-      } catch {
-        /* observer 错误不能改写持久副作用准入结果。 */
-      }
-    }
+    publishPendingOperations(records);
   } catch {
     throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "待核实记录暂不可用，请稍后重试。", false);
   }
 }
 
-/** 设计原因：浏览器安全随机数确保不同窗口的逻辑提交不会复用持久回执身份。 */
-function createClientOperationId(): string {
-  const bytes = new Uint8Array(16);
-  if (globalThis.crypto?.getRandomValues === undefined)
-    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "安全随机数暂不可用。", false);
-  globalThis.crypto.getRandomValues(bytes);
-  return `op_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+/** Fork 日志不含 transcript；只从严格的 source tuple 重建可重复提交的原请求。 */
+function forkInputFromPending(record: PendingOperation): ThreadForkInput {
+  if (
+    record.method !== "thread/fork" ||
+    record.threadId === null ||
+    record.sourceItemId === undefined ||
+    record.expectedThreadRevision === undefined
+  ) {
+    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉恢复记录无效。", false);
+  }
+  return {
+    sourceThreadId: record.threadId,
+    sourceItemId: record.sourceItemId,
+    expectedThreadRevision: record.expectedThreadRevision,
+    operationKey: record.operationKey,
+  };
+}
+
+/** 回执必须复现冻结的来源三元组；不能把服务端返回的相邻 Item 当成用户选择。 */
+function validateThreadForkResult(input: ThreadForkInput, value: unknown): ThreadForkResult {
+  const result = ThreadForkResultSchema.parse(value);
+  if (
+    result.source.threadId !== input.sourceThreadId ||
+    result.source.itemId !== input.sourceItemId ||
+    result.source.threadRevision !== input.expectedThreadRevision
+  ) {
+    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉回执与原始选择不一致。", false);
+  }
+  return result;
+}
+
+/** 创建回执与待核实 tuple 一起持久化，确保打开失败后重载仍能重开同一目标 Thread。 */
+function persistCreatedThreadFork(record: PendingOperation, result: ThreadForkResult): void {
+  const input = forkInputFromPending(record);
+  validateThreadForkResult(input, result);
+  const records = readPendingOperations();
+  const index = records.findIndex((candidate) => candidate.operationKey === record.operationKey);
+  if (index < 0) {
+    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉结果无法安全保存，请恢复后核查。", true);
+  }
+  const current = records[index];
+  if (current === undefined) {
+    throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉结果无法安全保存，请恢复后核查。", true);
+  }
+  const currentInput = forkInputFromPending(current);
+  validateThreadForkResult(currentInput, result);
+  if (current.createdResult !== undefined) {
+    validateThreadForkResult(currentInput, current.createdResult);
+    if (current.createdResult.thread.threadId !== result.thread.threadId) {
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉回执与已创建会话不一致。", false);
+    }
+    return;
+  }
+  records[index] = { ...current, createdResult: result };
+  writePendingOperations(records);
 }
 
 /** 设计原因：成功回执或用户可确认的业务拒绝只移除本次身份，不能抹掉其它待核实提交。 */
-function removePendingClientOperation(clientOperationId: string): void {
-  writePendingClientOperations(
-    readPendingClientOperations().filter(
-      (record) => record.clientOperationId !== clientOperationId,
-    ),
+function removePendingOperation(operationKey: string): void {
+  writePendingOperations(
+    readPendingOperations().filter((record) => record.operationKey !== operationKey),
   );
 }
 
 /** 设计原因：人工解除阻挡不等于提交成功；保留最小本地审计供本次会话追溯该不确定判断。 */
-function recordAcknowledgedUnknownOperation(record: PendingClientOperation): void {
+function recordAcknowledgedUnknownOperation(record: PendingOperation): void {
   try {
     const storage = globalThis.localStorage;
     if (storage === undefined) throw new Error("persistent operation storage unavailable");
@@ -138,7 +268,7 @@ function recordAcknowledgedUnknownOperation(record: PendingClientOperation): voi
       raw === null
         ? []
         : z
-            .array(PendingClientOperationSchema.extend({ acknowledgedAt: z.iso.datetime() }))
+            .array(PendingOperationSchema.extend({ acknowledgedAt: z.iso.datetime() }))
             .max(64)
             .parse(JSON.parse(raw));
     storage.setItem(
@@ -187,7 +317,7 @@ const RuntimeStatusKindSchema = z.enum([
   "faulted",
 ]);
 
-const RuntimeFeatureSchema = z.enum(["task_threads_v1", "plan_goal_v1", "interaction_v1"]);
+const RuntimeFeatureSchema = z.enum(["task_threads", "plan", "interaction"]);
 
 const RuntimeStatusWireKindSchema = z.enum([
   "starting",
@@ -227,6 +357,7 @@ const RuntimeStatusSchema = z
     status: RuntimeStatusKindSchema,
     generation: RuntimeGenerationSchema,
     serverInstanceId: ServerInstanceIdSchema.nullable().optional(),
+    storageRecovery: StorageRecoverySchema.optional(),
     features: z
       .array(RuntimeFeatureSchema)
       .max(3)
@@ -324,14 +455,11 @@ const ToolRecoveryResponseInputSchema = z
       .string()
       .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
       .max(101),
-    callId: z
-      .string()
-      .regex(/^call_[A-Za-z0-9][A-Za-z0-9._-]{0,122}$/)
-      .max(128),
+    callId: ToolCallIdSchema,
     expectedThreadRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     expectedRecoveryRevision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
     decision: z.enum(["retry", "skip"]),
-    idempotencyKey: z
+    operationKey: z
       .string()
       .min(1)
       .max(128)
@@ -349,6 +477,7 @@ const TurnCancelResultSchema = z
     status: z.enum([
       "queued",
       "running",
+      "waiting_input",
       "waiting_approval",
       "suspended",
       "completed",
@@ -477,6 +606,7 @@ const RuntimeStorageInfoSchema = z
     logPath: z.string().min(1).max(4096).nullable(),
     cachePath: z.string().min(1).max(4096).nullable(),
     lastBackup: z.string().min(1).max(256).nullable(),
+    storageRecovery: StorageRecoverySchema.optional(),
   })
   .strict();
 
@@ -488,7 +618,6 @@ const WorkspaceActivationSchema = z
   .object({
     workspaceId: WorkspaceIdSchema,
     kind: WorkspaceKindSchema,
-    legacySharedWorkspaceId: WorkspaceIdSchema.nullable(),
     displayName: SafeNameSchema,
     trust: z.enum(["trusted", "untrusted"]),
     rootPath: z
@@ -504,17 +633,7 @@ const WorkspaceActivationSchema = z
         "workspace path contains control characters",
       ),
   })
-  .strict()
-  // 旧共享目录的关联只可能挂在 session；错误 kind 不得露出菜单或绑定到项目 Host。
-  .superRefine((value, context) => {
-    if (value.kind !== "session" && value.legacySharedWorkspaceId !== null) {
-      context.addIssue({
-        code: "custom",
-        path: ["legacySharedWorkspaceId"],
-        message: "only session workspaces may reference the legacy shared workspace",
-      });
-    }
-  });
+  .strict();
 
 const RuntimeStatusEventSchema = z
   .object({
@@ -617,9 +736,12 @@ export type RuntimeHostEvent =
     }
   | { kind: "timeline"; event: RuntimeTimelineEvent }
   | { kind: "task"; event: RuntimeTaskEvent }
-  | { kind: "goal"; event: RuntimeGoalEvent }
   | { kind: "plan"; event: RuntimePlanEvent }
   | { kind: "interaction"; event: RuntimeInteractionEvent }
+  | {
+      kind: "resync_required";
+      event: Extract<JaEvent, { method: "turn/resync-required" }>["params"];
+    }
   | { kind: "projection_fault"; reason: "invalid_native_event" };
 
 export type RuntimeHostUnsubscribe = () => void | Promise<void>;
@@ -687,6 +809,16 @@ const SAFE_RUNTIME_ERRORS: Record<string, { message: string; retryable: boolean 
   TASK_TREE_DELETE_REQUIRED: { message: "请使用整树删除并再次确认", retryable: false },
   TASK_OBSERVATION_INVALID: { message: "任务观察已失效，请重新打开", retryable: true },
   WORKSPACE_WRITE_LEASE_TIMEOUT: { message: "工作区写入繁忙，请稍后重试", retryable: true },
+  WORKSPACE_BUSY: {
+    message:
+      "该项目仍有正在工作、排队、等待澄清或可恢复的执行。请先结束或取消相关任务，再更改目录。",
+    retryable: true,
+  },
+  WORKSPACE_NOT_FOUND: { message: "项目不存在或已被移除", retryable: false },
+  WORKSPACE_CONFINEMENT: {
+    message: "项目目录不可用，请选择存在且可访问的真实文件夹。",
+    retryable: false,
+  },
   INTERACTION_NOT_FOUND: { message: "交互问题不存在或已被替代", retryable: false },
   INTERACTION_REVISION_CONFLICT: { message: "交互内容已变化，请重新查看后重试", retryable: true },
   INTERACTION_INVALID_STATE: { message: "当前交互状态不允许此操作", retryable: false },
@@ -735,7 +867,7 @@ export class RuntimeHostError extends Error {
   readonly code: string;
   readonly retryable: boolean;
 
-  /** 错误实例只保存 allow-list code、固定文案和重试语义，不保留原始 cause 或跨进程 payload。 */
+  /** 错误实例只保存白名单错误码、固定文案和重试语义，不保留原始 cause 或跨进程载荷。 */
   constructor(code: string, message: string, retryable: boolean) {
     super(message);
     this.name = "RuntimeHostError";
@@ -756,9 +888,26 @@ function parseRuntimeInput<T>(schema: z.ZodType<T>, input: unknown): T {
   }
 }
 
+/** 公开会话摘要沿用传输层的 512 UTF-8 字节边界；其余错误使用固定文案，避免原始诊断穿透。 */
+function publicWorkspaceBusyMessage(code: string, message: unknown): string | undefined {
+  if (
+    code !== "WORKSPACE_BUSY" ||
+    typeof message !== "string" ||
+    !message.startsWith("暂时无法更改项目目录：") ||
+    message.length > 512
+  )
+    return undefined;
+  if (new TextEncoder().encode(message).byteLength > 512) return undefined;
+  for (let index = 0; index < message.length; index += 1) {
+    const characterCode = message.charCodeAt(index);
+    if (characterCode < 32 || (characterCode >= 127 && characterCode <= 159)) return undefined;
+  }
+  return message;
+}
+
 /**
- * 将 invoke rejection 规范化为刻意精简的公开错误；Java/Rust 路径、stack trace、
- * token 与子进程诊断不能进入 React 状态，但 shell 所需的重试判断仍保留。
+ * 将 invoke rejection 规范化为刻意精简的公开错误；仅保留已受限的项目阻塞任务摘要，
+ * 公开摘要可含用户已有会话标题；其余 Java/Rust 原始诊断继续收敛为固定文案。
  */
 export function normalizeRuntimeError(error: unknown): RuntimeHostError {
   if (error instanceof RuntimeHostError) {
@@ -769,14 +918,22 @@ export function normalizeRuntimeError(error: unknown): RuntimeHostError {
           SAFE_RUNTIME_ERRORS["RUNTIME_UNAVAILABLE"]?.message ?? "运行时暂不可用",
           true,
         )
-      : new RuntimeHostError(error.code, safeKnown.message, safeKnown.retryable);
+      : new RuntimeHostError(
+          error.code,
+          publicWorkspaceBusyMessage(error.code, error.message) ?? safeKnown.message,
+          safeKnown.retryable,
+        );
   }
   const candidate =
     error !== null && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
   const code = typeof candidate?.["code"] === "string" ? candidate["code"] : undefined;
   const safe = code === undefined ? undefined : SAFE_RUNTIME_ERRORS[code];
   if (code !== undefined && safe !== undefined) {
-    return new RuntimeHostError(code, safe.message, safe.retryable);
+    return new RuntimeHostError(
+      code,
+      publicWorkspaceBusyMessage(code, candidate?.["message"]) ?? safe.message,
+      safe.retryable,
+    );
   }
   return new RuntimeHostError(
     "RUNTIME_UNAVAILABLE",
@@ -796,10 +953,16 @@ const SAFE_TOKEN_METRIC_KEYS = new Set([
   "usageTotalTokens",
   "inputTokensBefore",
   "inputTokensAfter",
+  "usedTokens",
+  "limitTokens",
   "contextWindowTokens",
   "maxOutputTokens",
 ]);
-const POSITIVE_TOKEN_METRIC_KEYS = new Set(["contextWindowTokens", "maxOutputTokens"]);
+const POSITIVE_TOKEN_METRIC_KEYS = new Set([
+  "limitTokens",
+  "contextWindowTokens",
+  "maxOutputTokens",
+]);
 const NULLABLE_TOKEN_METRIC_KEYS = new Set([
   "inputTokens",
   "outputTokens",
@@ -809,7 +972,7 @@ const NULLABLE_TOKEN_METRIC_KEYS = new Set([
 ]);
 
 /**
- * pre-Zod 安全遍历只放行协议拥有的数值形状：模型容量必须为正，计量允许为零，
+ * pre-Zod 安全遍历只放行协议拥有的数值形状：模型容量和估算窗口必须为正，已用计量允许为零，
  * UNKNOWN Usage 与 Context 未产生的指标允许为 null。known/unknown 的组合约束仍由严格
  * Zod 判别联合负责，避免安全扫描复制业务 Schema 或把合法完整画像误判为凭据泄漏。
  */
@@ -834,14 +997,14 @@ function isSafeCredentialReference(key: string, value: unknown): boolean {
 
 type RuntimeTaskEvent = Extract<
   JaEvent,
-  { method: "task/activity" | "task/progress" | "task/mailbox-changed" }
+  { method: "task/activity" | "task/progress" | "task/mailbox-changed" | "task/closed" }
 >;
-type RuntimeGoalEvent = Extract<JaEvent, { method: "goal/changed" | "goal/activity" }>;
 type RuntimePlanEvent = Extract<JaEvent, { method: "plan/changed" }>;
 type RuntimeInteractionEvent = Extract<JaEvent, { method: "interaction/changed" }>;
+type RuntimeResyncRequiredEvent = Extract<JaEvent, { method: "turn/resync-required" }>;
 type RuntimeTimelineEvent = Exclude<
   JaEvent,
-  RuntimeTaskEvent | RuntimeGoalEvent | RuntimePlanEvent | RuntimeInteractionEvent
+  RuntimeTaskEvent | RuntimePlanEvent | RuntimeInteractionEvent | RuntimeResyncRequiredEvent
 >;
 
 /** Task notification 在 IPC 边缘与主 Timeline 分流，避免 Child 事件被 Conversation reducer 误收。 */
@@ -849,16 +1012,12 @@ function isRuntimeTaskEvent(event: JaEvent): event is RuntimeTaskEvent {
   return (
     event.method === "task/activity" ||
     event.method === "task/progress" ||
-    event.method === "task/mailbox-changed"
+    event.method === "task/mailbox-changed" ||
+    event.method === "task/closed"
   );
 }
 
-/** Goal notification 从 Timeline 独立分流，事件仅唤醒权威查询，不能写入 Conversation reducer。 */
-function isRuntimeGoalEvent(event: JaEvent): event is RuntimeGoalEvent {
-  return event.method === "goal/changed" || event.method === "goal/activity";
-}
-
-/** Plan 事件独立分流，避免把计划进度误归入 Goal 或普通对话时间线。 */
+/** Plan 事件独立分流，避免把计划进度误归入普通对话时间线。 */
 function isRuntimePlanEvent(event: JaEvent): event is RuntimePlanEvent {
   return event.method === "plan/changed";
 }
@@ -866,6 +1025,11 @@ function isRuntimePlanEvent(event: JaEvent): event is RuntimePlanEvent {
 /** Interaction 事件只驱动当前 Thread 的询问卡片，不进入普通 Timeline。 */
 function isRuntimeInteractionEvent(event: JaEvent): event is RuntimeInteractionEvent {
   return event.method === "interaction/changed";
+}
+
+/** 投影失败只触发权威 Thread 回读，不进入普通 Timeline 或终态事件路径。 */
+function isRuntimeResyncRequiredEvent(event: JaEvent): event is RuntimeResyncRequiredEvent {
+  return event.method === "turn/resync-required";
 }
 
 /** Java 只在 ToolPresentation 中发布工作区相对路径；其它 path/cwd 字段仍应拒绝。 */
@@ -966,9 +1130,9 @@ export function parseRuntimeHostEvent(value: unknown): RuntimeHostEvent {
   }
   const event = parseEvent(value);
   if (isRuntimeTaskEvent(event)) return { kind: "task", event };
-  if (isRuntimeGoalEvent(event)) return { kind: "goal", event };
   if (isRuntimePlanEvent(event)) return { kind: "plan", event };
   if (isRuntimeInteractionEvent(event)) return { kind: "interaction", event };
+  if (isRuntimeResyncRequiredEvent(event)) return { kind: "resync_required", event: event.params };
   return { kind: "timeline", event };
 }
 
@@ -981,6 +1145,9 @@ export interface RuntimeHostAdapter {
   state(): Promise<RuntimeStatus>;
   /** 读取原生层拥有的 storage 投影，不暴露进程细节。 */
   storageInfo(): Promise<RuntimeStorageInfo>;
+  /** 可选的原生能力只接收当前恢复身份。 */
+  openStorageBackup?(recoveryId: string): Promise<void>;
+  retryStorage?(): Promise<RuntimeStatus>;
   /** 按 Java 签发的 workspace id 切换 active Host，并返回 canonical native root 投影。 */
   activateWorkspace(workspaceId: string): Promise<WorkspaceActivation>;
   /** 读取恢复门状态；未确认时其他启动操作必须继续 fail closed。 */
@@ -988,12 +1155,18 @@ export interface RuntimeHostAdapter {
   /** 使用 recovery identity 与 revision CAS 确认人工恢复，拒绝陈旧点击。 */
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
   /** 只返回持久化的不透明关联信息；正文与凭据不进入恢复列表。 */
-  pendingOperations(): Promise<readonly PendingClientOperation[]>;
-  recheckPendingOperations(): Promise<readonly PendingClientOperation[]>;
-  acknowledgePendingOperation(clientOperationId: string): Promise<PendingAcknowledgementResult>;
+  pendingOperations(): Promise<readonly RecoverablePendingOperation[]>;
+  recheckPendingOperations(): Promise<readonly RecoverablePendingOperation[]>;
+  acknowledgePendingOperation(operationKey: string): Promise<PendingAcknowledgementResult>;
   subscribePendingOperations(
-    listener: (records: readonly PendingClientOperation[]) => void,
+    listener: (records: readonly RecoverablePendingOperation[]) => void,
   ): () => void;
+  /** 按调用方冻结的身份创建分叉，并在确认打开前持久保留最小回执。 */
+  threadFork(input: ThreadForkInput): Promise<ThreadForkResult>;
+  /** 重载后只核查原 fork 键；创建已确认时返回原目标，不重新创建。 */
+  recoverThreadForks(): Promise<readonly ThreadForkRecovery[]>;
+  /** 只有目标会话成功打开后才删除创建回执，避免打开失败导致二次副作用。 */
+  acknowledgeThreadForkOpened(operationKey: string): Promise<void>;
   /** 通过普通客户端请求发送业务 approval decision，不建立控制面旁路。 */
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   /** 发送一次已校验 Turn 输入；Provider/Model 与权限由 App Server 在每次请求安全点解析。 */
@@ -1027,47 +1200,235 @@ export interface RuntimeHostAdapter {
  * 路径、环境、request id 或 handshake token。
  */
 export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
-  /** bridge 注入仅用于合同测试；生产 adapter 固定连接 RuntimeHost 的 command/event allow-list。 */
+  /** 桥接对象注入仅用于合同测试；生产适配器固定连接 RuntimeHost 的命令与事件白名单。 */
   constructor(private readonly bridge: RuntimeNativeBridge = defaultNativeBridge) {}
 
   /** 状态变更只广播不透明关联元数据，不把原始调用参数引入 React。 */
   subscribePendingOperations(
-    listener: (records: readonly PendingClientOperation[]) => void,
+    listener: (records: readonly RecoverablePendingOperation[]) => void,
   ): () => void {
     pendingOperationListeners.add(listener);
     return () => pendingOperationListeners.delete(listener);
   }
 
-  /** 只读取持久化的 opaque 关联信息，供界面在重载后显示明确的待核实状态。 */
-  async pendingOperations(): Promise<readonly PendingClientOperation[]> {
-    return readPendingClientOperations();
+  /** 固定来源三元组与 operationKey 后再落盘；同键并发点击共享一个请求 Promise。 */
+  threadFork(input: ThreadForkInput): Promise<ThreadForkResult> {
+    const parsed = parseRuntimeInput(ThreadForkParamsSchema, input);
+    const current = inFlightForkRequests.get(parsed.operationKey);
+    if (current !== undefined) {
+      if (
+        current.input.sourceThreadId !== parsed.sourceThreadId ||
+        current.input.sourceItemId !== parsed.sourceItemId ||
+        current.input.expectedThreadRevision !== parsed.expectedThreadRevision
+      ) {
+        throw new RuntimeHostError("CONFLICT", "该分叉操作键已绑定到其他回复。", false);
+      }
+      return current.promise;
+    }
+    const promise = this.submitThreadFork(parsed);
+    inFlightForkRequests.set(parsed.operationKey, { input: parsed, promise });
+    void promise.then(
+      () => {
+        if (inFlightForkRequests.get(parsed.operationKey)?.promise === promise)
+          inFlightForkRequests.delete(parsed.operationKey);
+      },
+      () => {
+        if (inFlightForkRequests.get(parsed.operationKey)?.promise === promise)
+          inFlightForkRequests.delete(parsed.operationKey);
+      },
+    );
+    return promise;
   }
 
-  /** 通过 Java 同事务回执与权威 Thread 页对账；unknown 留在本地，绝不重发原请求。 */
-  async recheckPendingOperations(): Promise<readonly PendingClientOperation[]> {
-    for (const record of readPendingClientOperations()) {
+  /** 对每个未确认键先查 fork receipt；成功结果按原 target 返回，unknown 留给原 tuple 重试。 */
+  async recoverThreadForks(): Promise<readonly ThreadForkRecovery[]> {
+    const records = readPendingOperations().filter((record) => record.method === "thread/fork");
+    const recovered: ThreadForkRecovery[] = [];
+    for (const record of records) {
+      const input = forkInputFromPending(record);
+      if (record.createdResult !== undefined) {
+        recovered.push({
+          state: "created",
+          input,
+          result: validateThreadForkResult(input, record.createdResult),
+        });
+        continue;
+      }
+      if (inFlightOperationKeys.has(record.operationKey)) {
+        recovered.push({ state: "pending", input });
+        continue;
+      }
+      try {
+        await this.confirmCommittedOperation(record);
+      } catch {
+        // 回查或目标基线不可用时保留原 tuple，不能把未知结果改写成新分叉请求。
+      }
+      const refreshed = readPendingOperations().find(
+        (candidate) => candidate.operationKey === record.operationKey,
+      );
+      if (refreshed?.method === "thread/fork" && refreshed.createdResult !== undefined) {
+        recovered.push({
+          state: "created",
+          input,
+          result: validateThreadForkResult(input, refreshed.createdResult),
+        });
+      } else {
+        recovered.push({ state: "pending", input });
+      }
+    }
+    return recovered;
+  }
+
+  /** 打开成功才确认消费 created receipt；缺少成功 receipt 时不允许清除恢复身份。 */
+  async acknowledgeThreadForkOpened(operationKey: string): Promise<void> {
+    const validKey = OperationKeySchema.parse(operationKey);
+    const record = readPendingOperations().find((candidate) => candidate.operationKey === validKey);
+    if (record === undefined) return;
+    if (record.method !== "thread/fork" || record.createdResult === undefined) {
+      throw new RuntimeHostError("OPERATION_UNCONFIRMED", "分叉会话尚未确认创建。", false);
+    }
+    removePendingOperation(validKey);
+  }
+
+  /** 新 fork 不受 Turn/approval 待核实门影响；已有 journal 只有 owner receipt 明确为 unknown 才允许重提。 */
+  private async submitThreadFork(input: ThreadForkInput): Promise<ThreadForkResult> {
+    const records = readPendingOperations();
+    const previous = records.find((record) => record.operationKey === input.operationKey);
+    let record: PendingOperation;
+    if (previous !== undefined) {
+      if (previous.method !== "thread/fork") {
+        throw new RuntimeHostError("CONFLICT", "分叉操作键已用于其他操作。", false);
+      }
+      const frozen = forkInputFromPending(previous);
+      if (
+        frozen.sourceThreadId !== input.sourceThreadId ||
+        frozen.sourceItemId !== input.sourceItemId ||
+        frozen.expectedThreadRevision !== input.expectedThreadRevision
+      ) {
+        throw new RuntimeHostError("CONFLICT", "该分叉操作键已绑定到其他回复。", false);
+      }
+      if (previous.createdResult !== undefined) {
+        return validateThreadForkResult(input, previous.createdResult);
+      }
+      record = previous;
+      let receipt: z.infer<typeof OperationReadResultSchema> | undefined;
+      try {
+        receipt = await this.confirmCommittedOperation(record);
+      } catch {
+        // 无法证明原操作未知时必须保留 journal 并停止，不能以再次提交猜测服务端状态。
+        throw new RuntimeHostError(
+          "OPERATION_UNCONFIRMED",
+          "分叉回执暂时无法核查；原回复和操作身份已保留。",
+          false,
+        );
+      }
+      const recovered = readPendingOperations().find(
+        (candidate) => candidate.operationKey === input.operationKey,
+      );
+      if (recovered?.method === "thread/fork" && recovered.createdResult !== undefined) {
+        return validateThreadForkResult(input, recovered.createdResult);
+      }
+      if (receipt !== undefined) {
+        // committed receipt 不能因本地落盘失败而退化成可重提状态。
+        throw new RuntimeHostError(
+          "OPERATION_UNCONFIRMED",
+          "分叉已创建，回执尚未保存；恢复后会核查原操作。",
+          false,
+        );
+      }
+    } else {
+      record = {
+        operationKey: input.operationKey,
+        method: "thread/fork",
+        threadId: input.sourceThreadId,
+        sourceItemId: input.sourceItemId,
+        expectedThreadRevision: input.expectedThreadRevision,
+        createdAt: new Date().toISOString(),
+      };
+      writePendingOperations([...records, record]);
+    }
+
+    inFlightOperationKeys.add(input.operationKey);
+    try {
+      try {
+        const result = validateThreadForkResult(
+          input,
+          await this.invoke(JA_RUNTIME_COMMANDS.threadFork, { input }, ThreadForkResultSchema),
+        );
+        persistCreatedThreadFork(record, result);
+        return result;
+      } catch (error) {
+        let receipt: z.infer<typeof OperationReadResultSchema> | undefined;
+        try {
+          receipt = await this.confirmCommittedOperation(record);
+        } catch {
+          // 收不到同 owner receipt 时只保留 tuple，不推测创建成功或尝试新键。
+        }
+        const stored = readPendingOperations().find(
+          (candidate) => candidate.operationKey === input.operationKey,
+        );
+        if (stored?.method === "thread/fork" && stored.createdResult !== undefined) {
+          return validateThreadForkResult(input, stored.createdResult);
+        }
+        const normalized = normalizeRuntimeError(error);
+        if (
+          [
+            "INVALID_INPUT",
+            "CONFLICT",
+            "THREAD_NOT_FOUND",
+            "INVALID_STATE",
+            "STORAGE_CONFLICT",
+          ].includes(normalized.code)
+        ) {
+          removePendingOperation(input.operationKey);
+          throw normalized;
+        }
+        throw new RuntimeHostError(
+          "OPERATION_UNCONFIRMED",
+          receipt?.status === "committed"
+            ? "分叉已创建，但回执尚未保存；恢复后会核查原操作。"
+            : "分叉结果待核实；重试将继续使用同一条回复。",
+          false,
+        );
+      }
+    } finally {
+      inFlightOperationKeys.delete(input.operationKey);
+    }
+  }
+
+  /** 当前进程仍在结算的请求不属于未知结果；重载后仅剩持久日志，照常提供核查入口。 */
+  async pendingOperations(): Promise<readonly RecoverablePendingOperation[]> {
+    return recoverableOperations(readPendingOperations());
+  }
+
+  /** 只核查不再由当前请求结算的日志，避免回查或人工确认与正常 ACK 竞争。 */
+  async recheckPendingOperations(): Promise<readonly RecoverablePendingOperation[]> {
+    for (const record of recoverableOperations(readPendingOperations())) {
       try {
         await this.confirmCommittedOperation(record);
       } catch {
         // 连接或 Workspace 暂不可用时保留原关联 ID，下次显式检查仍查同一回执。
       }
     }
-    return readPendingClientOperations();
+    return recoverableOperations(readPendingOperations());
   }
 
   /** 用户已人工核实后再查一次同一 ID；unknown 仍不重发，只解除本机对后续新动作的阻挡。 */
-  async acknowledgePendingOperation(
-    clientOperationId: string,
-  ): Promise<PendingAcknowledgementResult> {
-    const validId = ClientOperationIdSchema.parse(clientOperationId);
-    const record = readPendingClientOperations().find(
-      (candidate) => candidate.clientOperationId === validId,
+  async acknowledgePendingOperation(operationKey: string): Promise<PendingAcknowledgementResult> {
+    const validKey = OperationKeySchema.parse(operationKey);
+    if (inFlightOperationKeys.has(validKey))
+      throw new RuntimeHostError("OPERATION_UNCONFIRMED", "操作仍在提交，请等待回执。", false);
+    const record = readPendingOperations().find(
+      (candidate) => candidate.operationKey === validKey && candidate.method !== "thread/fork",
     );
     if (record === undefined)
-      return { status: "committed", pending: readPendingClientOperations() };
+      return {
+        status: "committed",
+        pending: recoverableOperations(readPendingOperations()),
+      };
     const receipt = await this.invoke(
       JA_RUNTIME_COMMANDS.operationRead,
-      { input: { clientOperationId: validId } },
+      { input: { operationKey: validKey } },
       OperationReadResultSchema,
     );
     if (receipt.status === "committed") {
@@ -1078,99 +1439,142 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
           "原操作已提交，等待权威会话基线确认。",
           false,
         );
-      return { status: "committed", pending: readPendingClientOperations() };
+      return {
+        status: "committed",
+        pending: recoverableOperations(readPendingOperations()),
+      };
     } else {
       recordAcknowledgedUnknownOperation(record);
-      removePendingClientOperation(validId);
-      return { status: "unknown_acknowledged", pending: readPendingClientOperations() };
+      removePendingOperation(validKey);
+      return {
+        status: "unknown_acknowledged",
+        pending: recoverableOperations(readPendingOperations()),
+      };
     }
   }
 
-  /** 确认同一方法、Thread 与 revision 的持久回执后才清除待核实记录。 */
+  /** fork 的原子回执证明创建已完成，打开由调用方负责；普通操作仍等待 Thread revision 基线。 */
   private async confirmCommittedOperation(
-    record: PendingClientOperation,
+    record: PendingOperation,
   ): Promise<z.infer<typeof OperationReadResultSchema> | undefined> {
+    const query =
+      record.method === "thread/fork"
+        ? OperationReadParamsSchema.parse({
+            operationKey: record.operationKey,
+            sourceThreadId: record.threadId,
+          })
+        : OperationReadParamsSchema.parse({ operationKey: record.operationKey });
     const receipt = await this.invoke(
       JA_RUNTIME_COMMANDS.operationRead,
-      { input: { clientOperationId: record.clientOperationId } },
+      { input: query },
       OperationReadResultSchema,
     );
     if (receipt.status === "unknown") return undefined;
+    if (record.method === "thread/fork") {
+      if (
+        receipt.method !== "thread/fork" ||
+        record.threadId === null ||
+        receipt.threadId !== record.threadId
+      ) {
+        throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "分叉回执归属不一致。", false);
+      }
+      const input = forkInputFromPending(record);
+      const result = validateThreadForkResult(input, receipt.result);
+      persistCreatedThreadFork(record, result);
+      return receipt;
+    }
     if (
       receipt.method !== record.method ||
       (record.threadId !== null && receipt.threadId !== record.threadId)
     )
       throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "操作回执身份不一致。", false);
+    const receiptRevision =
+      "threadRevision" in receipt.result ? receipt.result.threadRevision : undefined;
+    if (receiptRevision === undefined)
+      throw new RuntimeHostError("RUNTIME_UNAVAILABLE", "操作回执 revision 缺失。", false);
     const baseline = await this.invoke(
       JA_RUNTIME_COMMANDS.threadReadForOperation,
       { input: { threadId: receipt.threadId, tail: true, limit: 1 } },
       ThreadReadResultSchema,
     );
-    if (baseline.threadId !== receipt.threadId || baseline.revision < receipt.result.threadRevision)
+    if (baseline.threadId !== receipt.threadId || baseline.revision < receiptRevision)
       return undefined;
-    removePendingClientOperation(record.clientOperationId);
+    removePendingOperation(record.operationKey);
     return receipt;
   }
 
-  /** 先落盘随机 ID，再提交副作用；丢响应只查询回执，unknown 保留且拒绝生成第二次请求。 */
-  private async submitClientOperation<R>(
+  /**
+   * 先落盘再提交，完整日志始终约束重复副作用；在途身份只屏蔽误报，不放宽准入。
+   * 原请求及自动回查都无法确认结果后才发布核查警告，重载仍可从日志恢复未知身份。
+   */
+  private async submitOperation<R>(
     command: string,
-    method: PendingClientOperation["method"],
+    method: Exclude<PendingOperation["method"], "thread/fork">,
     threadId: string | null,
     input: Record<string, unknown>,
     schema: z.ZodType<R>,
   ): Promise<R> {
-    const pending = await this.recheckPendingOperations();
+    await this.recheckPendingOperations();
+    const pending = readPendingOperations();
     if (
-      pending.some(
-        (record) => record.threadId === null || threadId === null || record.threadId === threadId,
-      )
+      pending
+        .filter((record) => record.method !== "thread/fork")
+        .some(
+          (record) => record.threadId === null || threadId === null || record.threadId === threadId,
+        )
     )
       throw new RuntimeHostError(
         "OPERATION_UNCONFIRMED",
         "上一次操作结果待核实，请先重新检查当前会话。",
         false,
       );
-    const record: PendingClientOperation = {
-      clientOperationId: createClientOperationId(),
+    const record: PendingOperation = {
+      operationKey: createOperationKey(),
       method,
       threadId,
       createdAt: new Date().toISOString(),
     };
-    writePendingClientOperations([...pending, record]);
+    inFlightOperationKeys.add(record.operationKey);
     try {
-      const result = await this.invoke(
-        command,
-        { input: { ...input, clientOperationId: record.clientOperationId } },
-        schema,
-      );
-      removePendingClientOperation(record.clientOperationId);
-      return result;
-    } catch (error) {
-      let receipt: z.infer<typeof OperationReadResultSchema> | undefined;
+      writePendingOperations([...pending, record]);
       try {
-        receipt = await this.confirmCommittedOperation(record);
-      } catch {
-        // 二次读失败不等于原请求失败；本地关联记录仍为待核实。
+        const result = await this.invoke(
+          command,
+          { input: { ...input, operationKey: record.operationKey } },
+          schema,
+        );
+        removePendingOperation(record.operationKey);
+        return result;
+      } catch (error) {
+        let receipt: z.infer<typeof OperationReadResultSchema> | undefined;
+        try {
+          receipt = await this.confirmCommittedOperation(record);
+        } catch {
+          // 二次读失败不等于原请求失败；本地关联记录仍为待核实。
+        }
+        if (receipt?.status === "committed") {
+          if (method === "approval/respond") return undefined as R;
+          return schema.parse(receipt.result);
+        }
+        const normalized = normalizeRuntimeError(error);
+        if (
+          ["INVALID_INPUT", "CONFLICT", "APPROVAL_ALREADY_RESOLVED", "TURN_NOT_FOUND"].includes(
+            normalized.code,
+          )
+        ) {
+          removePendingOperation(record.operationKey);
+          throw normalized;
+        }
+        inFlightOperationKeys.delete(record.operationKey);
+        publishPendingOperations(readPendingOperations());
+        throw new RuntimeHostError(
+          "OPERATION_UNCONFIRMED",
+          "上一次操作结果待核实，请先重新检查当前会话。",
+          false,
+        );
       }
-      if (receipt?.status === "committed") {
-        if (method === "approval/respond") return undefined as R;
-        return schema.parse(receipt.result);
-      }
-      const normalized = normalizeRuntimeError(error);
-      if (
-        ["INVALID_INPUT", "CONFLICT", "APPROVAL_ALREADY_RESOLVED", "TURN_NOT_FOUND"].includes(
-          normalized.code,
-        )
-      ) {
-        removePendingClientOperation(record.clientOperationId);
-        throw normalized;
-      }
-      throw new RuntimeHostError(
-        "OPERATION_UNCONFIRMED",
-        "上一次操作结果待核实，请先重新检查当前会话。",
-        false,
-      );
+    } finally {
+      inFlightOperationKeys.delete(record.operationKey);
     }
   }
 
@@ -1211,6 +1615,16 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
       }
       throw normalizeRuntimeError(error);
     }
+  }
+
+  /** 备份只按 Java 最近恢复身份打开，Renderer 不能提供文件路径。 */
+  async openStorageBackup(recoveryId: string): Promise<void> {
+    await this.invoke(JA_RUNTIME_COMMANDS.storageBackupOpen, { recoveryId }, z.null());
+  }
+
+  /** 重试固定的 Java 恢复流程，不重新发送结果未知的 Turn。 */
+  async retryStorage(): Promise<RuntimeStatus> {
+    return this.invoke(JA_RUNTIME_COMMANDS.storageRetry, {}, RuntimeStatusSchema);
   }
 
   /**
@@ -1261,7 +1675,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
    */
   async approvalRespond(input: ApprovalResponseInput): Promise<void> {
     const parsed = parseRuntimeInput(ApprovalResponseInputSchema, input);
-    await this.submitClientOperation(
+    await this.submitOperation(
       JA_RUNTIME_COMMANDS.approvalRespond,
       "approval/respond",
       null,
@@ -1275,7 +1689,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
     // 校验阶段拒绝未知字段、畸形 thread id、空输入和无界 deadline。
     const parsed = parseRuntimeInput(TurnStartInputSchema, input);
     // 跨进程和结果阶段复用公共 invoke，accepted identity 与 revision 必须满足严格 Schema。
-    return this.submitClientOperation(
+    return this.submitOperation(
       JA_RUNTIME_COMMANDS.turnStart,
       "turn/start",
       parsed.threadId,
@@ -1301,7 +1715,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
   /** continue 与 start 共用严格 ACK 校验，但保留独立 command 以防 UI 再造用户消息。 */
   async turnContinue(input: z.infer<typeof TurnContinueInputSchema>): Promise<TurnAccepted> {
     const parsed = parseRuntimeInput(TurnContinueInputSchema, input);
-    return this.submitClientOperation(
+    return this.submitOperation(
       JA_RUNTIME_COMMANDS.turnContinue,
       "turn/continue",
       parsed.threadId,
@@ -1313,7 +1727,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
   /** reask 的 sourceMessageId 由历史项取得，结构化 content 在 Renderer 与 Tauri 边界各校验一次。 */
   async turnReask(input: z.infer<typeof TurnReaskInputSchema>): Promise<TurnAccepted> {
     const parsed = parseRuntimeInput(TurnReaskInputSchema, input);
-    return this.submitClientOperation(
+    return this.submitOperation(
       JA_RUNTIME_COMMANDS.turnReask,
       "turn/reask",
       parsed.threadId,
@@ -1410,14 +1824,14 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   /**
-   * 通过 Rust 发送 allow-list Settings 查询，并在 WebView 边界校验方法专用输入与结果。
+   * 通过 Rust 发送白名单设置查询，并在 WebView 边界校验方法专用输入与结果。
    * sidecar 请求始终是产品能力，不能成为调用方选择的 RPC path。
    */
   async query<M extends RuntimeSettingsMethod>(
     method: M,
     params: RuntimeSettingsParams<M>,
   ): Promise<RuntimeSettingsResult<M>> {
-    // 校验阶段按具体 allow-list method 解析 params，application 无法借此访问通用 JA-RPC surface。
+    // 校验阶段按具体白名单方法解析参数，application 层无法借此访问通用 JA-RPC 接口。
     let parsedParams: RuntimeSettingsParams<M>;
     try {
       parsedParams = parseMethodParams(method, params) as RuntimeSettingsParams<M>;
@@ -1477,7 +1891,7 @@ export class TauriRuntimeHostAdapter implements RuntimeHostAdapter {
         listener(event);
       });
     } catch (error) {
-      // 订阅建立失败使用同一 allow-list 错误映射，不传播 Tauri/系统原始异常。
+      // 订阅建立失败时使用相同的白名单错误映射，不传播 Tauri/系统原始异常。
       throw normalizeRuntimeError(error);
     }
   }

@@ -3,20 +3,24 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import ts from "typescript";
 import { checkInitialBaseline, initialBaselineSourceViolation } from "./check-initial-baseline.mjs";
 
-test("首版保留真实协议与业务计数，不把所有版本重置", () => {
+test("0.2 基线只拒绝明确退役的协议与数据兼容实现", () => {
   for (const source of [
     "ja-context-v1",
-    "ja-context-summary-v1",
-    "ja-ui-preferences-v1",
     'jsonrpc: "2.0"',
+    "JA-RPC v2",
     "Tauri 2",
     "mutation_version + 1",
     "UNKNOWN",
+    "// LEGACY_SHARED",
+    "/* JA-RPC v1 */",
+    "<!-- assistant_public_text -->",
+    "-- ja_agent_store_records",
   ]) {
     assert.equal(initialBaselineSourceViolation(source), null);
   }
@@ -29,57 +33,98 @@ test("历史兼容实现不得重新进入生产源码", () => {
     "LEGACY_UNAVAILABLE",
     "legacy_unavailable",
     "profileOrigin",
-    "ja-context-v3",
-    "ja-context-summary-v2",
-    "ja-ui-preferences-v10",
-    "ja-ui-preferences-v2",
-    "__JA_TIMELINE_STORE_V3__",
+    "LegacySessionWorkspaceMigration",
+    "LegacyAgentStoreBackfill",
+    "LEGACY_SHARED",
+    "legacy_shared",
+    "legacySharedWorkspaceId",
+    "assistant_public_text",
+    "ja_agent_store_schema",
+    "JA-RPC v1",
+    "contracts/ja-rpc/v1/schema.json",
+    "contracts/golden/v1/valid/core.jsonl",
   ]) {
-    assert.equal(initialBaselineSourceViolation(source), source);
+    assert.ok(initialBaselineSourceViolation(source) !== null, source);
   }
 });
 
-/** 固定已审定的迁移版本集合，避免把首版检查放宽为任意历史转换均可打包。 */
-test("真实目录检查只允许已审定的会话恢复、Workspace 身份与操作回执迁移", async () => {
+/**
+ * 验证首版基线与 v2 合同，并逐个探测四个 Java extension 源码根确实受兼容规则扫描。
+ * @author kongweiguang
+ */
+test("真实目录检查只允许 0.2 基线并扫描全部四个 Java extension", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "ja-baseline-policy-"));
   try {
+    const extensionRoots = [
+      "ja-agent/extensions/ja-agent-store-local/src/main",
+      "ja-agent/extensions/ja-agent-store-pg/src/main",
+      "ja-agent/extensions/ja-agent-skills-local/src/main",
+      "ja-agent/extensions/ja-agent-skills-pg/src/main",
+    ];
     for (const directory of [
-      "app-server/src/main/resources/db/migration",
+      "ja-agent/ja-app-server/src/main/resources/db/migration",
+      "ja-agent/ja-agent-core/src/main",
+      ...extensionRoots,
       "apps/desktop/src",
       "crates/ja-runtime/src",
       "apps/cli/src",
       "apps/desktop/src-tauri/src",
-      "contracts/ja-rpc/v1",
+      "contracts/ja-rpc/v2",
+      "contracts/golden/v2",
     ]) {
       await mkdir(path.join(root, directory), { recursive: true });
     }
-    const migrations = path.join(root, "app-server/src/main/resources/db/migration");
+    const migrations = path.join(root, "ja-agent/ja-app-server/src/main/resources/db/migration");
     await writeFile(
       path.join(migrations, "V1__kernel.sql"),
       "CREATE TABLE current_state(id TEXT);",
     );
-    assert.equal((await checkInitialBaseline(root)).length, 1);
-    await writeFile(path.join(migrations, "V2__thread_subagent_policies.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V3__subagent_reasoning.sql"), "SELECT 1;");
-    await writeFile(
-      path.join(migrations, "V4__conversation_recovery_usage_projection.sql"),
-      "SELECT 1;",
-    );
-    await writeFile(path.join(migrations, "V6__conversation_current_path_reask.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V7__session_workspace_identity.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V8__client_operation_receipts.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V9__goal_progress_counter.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V10__unbounded_round_counters.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V11__execution_cursor_without_budget.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V12__drop_execution_budgets.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V13__plan_evaluation_attempts.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V14__assistant_public_text_pages.sql"), "SELECT 1;");
-    await writeFile(path.join(migrations, "V15__input_operation_receipts.sql"), "SELECT 1;");
     assert.deepEqual(await checkInitialBaseline(root), []);
-    await writeFile(path.join(migrations, "V8__unreviewed.sql"), "SELECT 1;");
-    await mkdir(path.join(root, "contracts/ja-rpc/v2"));
+    for (const extensionRoot of extensionRoots) {
+      const probe = path.join(root, extensionRoot, "BaselineProbe.java");
+      await writeFile(
+        probe,
+        'final class BaselineProbe { String retired = "LegacyAgentStoreBackfill"; }',
+      );
+      assert.deepEqual(await checkInitialBaseline(root), [
+        `${path.join(extensionRoot, "BaselineProbe.java")}: 首版不得恢复 LegacyAgentStoreBackfill`,
+      ]);
+      await rm(probe);
+    }
+    await writeFile(path.join(migrations, "V2__legacy_import.sql"), "SELECT 1;");
+    await mkdir(path.join(root, "contracts/ja-rpc/v1"));
     assert.equal((await checkInitialBaseline(root)).length, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+/**
+ * 将 Vite 页面中的精确绝对导入解析到现有适配器，同时保持其它 unresolved 诊断有效。
+ * @author kongweiguang
+ */
+test("Knip 将 close behavior 浏览器导入映射到真实 save 导出", async () => {
+  const configText = await readFile(new URL("../knip.jsonc", import.meta.url), "utf8");
+  const parsed = ts.parseConfigFileTextToJson("knip.jsonc", configText);
+  assert.equal(parsed.error, undefined);
+  const config = parsed.config;
+  const browserSpecifier = "/src/api/tauri/closeBehavior.ts";
+
+  assert.ok(config.entry.includes("scripts/e2e/windows-desktop-smoke.mjs"));
+  assert.deepEqual(config.paths?.[browserSpecifier], [
+    "apps/desktop/src/api/tauri/closeBehavior.ts",
+  ]);
+  assert.equal(config.ignoreUnresolved?.includes(browserSpecifier), false);
+
+  const adapter = await readFile(
+    new URL("../apps/desktop/src/api/tauri/closeBehavior.ts", import.meta.url),
+    "utf8",
+  );
+  const runner = await readFile(
+    new URL("./e2e/windows-desktop-smoke.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(adapter, /export async function saveCloseBehavior\s*\(/u);
+  assert.match(runner, /import\(\s*["']\/src\/api\/tauri\/closeBehavior\.ts["']\s*\)/u);
+  assert.match(runner, /await saveCloseBehavior\("exit"\)/u);
 });

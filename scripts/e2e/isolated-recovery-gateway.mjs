@@ -19,7 +19,7 @@ import { randomBytes } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
-  createClientOperationId,
+  createOperationKey,
   createIsolatedDirectories,
   initializeParams,
   JsonlSession,
@@ -30,7 +30,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const readyToken = "0123456789abcdef0123456789abcdef";
 const handshakeHandlerPath = join(
   repoRoot,
-  "app-server",
+  "ja-agent/ja-app-server",
   "src",
   "main",
   "java",
@@ -128,7 +128,7 @@ export function validateUpstreamBaseUrl(value) {
   return url;
 }
 
-/** Mirrors the production OpenAI endpoint rule so the evidence bridge targets the same path. */
+/** 与生产 OpenAI 端点规则保持一致，确保证据桥接访问相同路径。 */
 export function configuredResponsesEndpoint(baseUri) {
   let value = validateUpstreamBaseUrl(baseUri).href;
   while (value.endsWith("/")) value = value.slice(0, -1);
@@ -221,17 +221,17 @@ export function safeGatewayFailure(status, body) {
   return { status: safeStatus, code, param };
 }
 
-/** Removes proxy and JVM option injection from the isolated Java child without changing the parent process. */
+/** 仅从隔离 Java 子进程中移除代理和 JVM 参数注入，不改动父进程。 */
 export function sanitizedJavaEnvironment(environment = process.env) {
   const sanitized = { ...environment };
   for (const name of egressOverrideEnvironmentNames) delete sanitized[name];
   return sanitized;
 }
 
-/** Uses the Java-owned order while checking each advertised capability against the schema's closed enum. */
+/** 沿用 Java 侧的顺序，并按 schema 封闭枚举核对每项声明的能力。 */
 export async function recoveryInitializeParams() {
   const initialize = initializeParams();
-  const schemaPath = join(repoRoot, "contracts", "ja-rpc", "v1", "schema", "ja-rpc-v1.schema.json");
+  const schemaPath = join(repoRoot, "contracts", "ja-rpc", "v2", "schema", "ja-rpc-v2.schema.json");
   const [handlerSource, schemaSource] = await Promise.all([
     readFile(handshakeHandlerPath, "utf8"),
     readFile(schemaPath, "utf8"),
@@ -246,7 +246,7 @@ export async function recoveryInitializeParams() {
   return initialize;
 }
 
-/** Fails before startup if Java's strict handshake source changed after the packaged JAR. */
+/** 打包 JAR 后若 Java 严格握手定义发生变化，则在启动前失败。 */
 export async function assertHandshakeJarFreshness(jarPath, sourcePath = handshakeHandlerPath) {
   const [jarInfo, sourceInfo] = await Promise.all([stat(jarPath), stat(sourcePath)]);
   if (!jarInfo.isFile() || !sourceInfo.isFile() || jarInfo.mtimeMs < sourceInfo.mtimeMs) {
@@ -254,7 +254,7 @@ export async function assertHandshakeJarFreshness(jarPath, sourcePath = handshak
   }
 }
 
-/** Reads string literals only from one fixed Java List.of declaration; source is never evaluated. */
+/** 只读取指定 Java List.of 声明中的字符串字面量，不执行源码。 */
 function javaCapabilityList(source, name) {
   const declaration = new RegExp(
     "static\\s+final\\s+List<String>\\s+" + name + "\\s*=\\s*List\\.of\\(([^;]*?)\\);",
@@ -276,7 +276,7 @@ function javaCapabilityList(source, name) {
   return values;
 }
 
-/** Rejects Java-owned values absent from the JSON Schema enum without reordering either list. */
+/** 若 Java 侧值不在 JSON Schema 枚举中则拒绝，同时保持两侧列表顺序不变。 */
 function assertSchemaMembership(values, allowedValues) {
   if (
     !Array.isArray(allowedValues) ||
@@ -374,7 +374,7 @@ export async function createExchangeBudget(directory, stage) {
   }
   const slotPath = (slot) => join(resolved, "slot-" + slot + ".json");
   return {
-    /** Reserves the stage's only exchange before any socket can be opened. */
+/** 在打开任何套接字前，先占用本阶段唯一的请求名额。 */
     async reserve() {
       const firstPath = slotPath(1);
       const secondPath = slotPath(2);
@@ -501,15 +501,15 @@ export async function startRecoveryGatewayBridge({
     get seedFailureRequests() {
       return seedFailureRequests;
     },
-    /** Keeps preflight continuation bound to the local fixture. */
+/** 确保预检续传仍绑定到本地 fixture。 */
     setLocalContinuation() {
       phase = "local-continuation";
     },
-    /** Enables the one authorized gateway continuation after the fixture history is verified. */
+/** 核实 fixture 历史后，才允许唯一一次经授权的网关续传。 */
     setRealContinuation() {
       phase = "real";
     },
-    /** Closes loopback connections so cleanup cannot leave an active request handler behind. */
+/** 关闭 loopback 连接，避免清理后仍有请求处理器在运行。 */
     async close() {
       server.closeAllConnections();
       await new Promise((resolveClose) => server.close(resolveClose));
@@ -518,8 +518,8 @@ export async function startRecoveryGatewayBridge({
 }
 
 /**
- * Reduces child stderr to Java exception identities and Ja-owned source frames so preflight
- * diagnosis can identify the failing layer without exposing log messages or environment data.
+ * 将子进程 stderr 收敛为 Java 异常标识和 Ja 自有源码栈帧，
+ * 便于预检定位故障层，同时不暴露日志正文或环境数据。
  */
 export function safePreflightDiagnostics(stderr) {
   const source = String(stderr ?? "").slice(-maxErrorBytes);
@@ -560,8 +560,8 @@ export function safePreflightDiagnostics(stderr) {
 }
 
 /**
- * Describes JA-RPC error fields by fixed names and value classes while reducing messages to
- * known categories, allowing local diagnosis without copying an error message into output.
+ * 使用固定字段名和值类型描述 JA-RPC 错误，并把消息归纳为已知类别，
+ * 以便本地诊断而不将错误原文复制到输出中。
  */
 export function safeRpcErrorShape(error) {
   if (error === null || typeof error !== "object" || Array.isArray(error)) {
@@ -683,8 +683,8 @@ export function matchesSeedApproval(approvalEvent, history, expected) {
 }
 
 /**
- * Reads one referenced secret from the protected host auth file only for a local credential/set call,
- * then removes parsed values and zeroes file bytes so credentials never enter copied temp files.
+ * 仅在本地 credential/set 调用时从受保护的宿主 auth 文件读取指定凭据，
+ * 随后移除解析值并清零文件字节，避免凭据进入复制出的临时文件。
  */
 export async function withSelectedCredentialSecret(authPath, credentialId, useSecret) {
   let source;
@@ -781,7 +781,7 @@ export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "pref
     await assertJava25(java);
     const jar = resolve(
       process.env.JA_RECOVERY_GATEWAY_JAR ??
-        join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+        join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar"),
     );
     const jarInfo = await stat(jar).catch(() => undefined);
     if (jarInfo === undefined || !jarInfo.isFile() || jarInfo.size === 0) {
@@ -960,7 +960,7 @@ export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "pref
     const seed = resultOf(
       await session.request("turn/start", {
         threadId: thread.threadId,
-        clientOperationId: createClientOperationId(),
+        operationKey: createOperationKey(),
         content: [
           {
             type: "text",
@@ -1094,7 +1094,7 @@ export async function runIsolatedRecovery({ stage, budgetDirectory, mode = "pref
       await session.request("turn/continue", {
         threadId: thread.threadId,
         expectedThreadRevision: seedHistory.revision,
-        clientOperationId: createClientOperationId(),
+        operationKey: createOperationKey(),
       }),
       "turn/continue",
     );
@@ -1416,8 +1416,8 @@ function responseSse(responseId, output, text) {
 }
 
 /**
- * Sends one direct HTTP(S) request. Native Node clients do not follow redirects or retry;
- * the already-consumed slot therefore bounds raw HTTP request messages at one per stage.
+ * 直接发送一条 HTTP(S) 请求。Node 原生客户端不会跟随重定向或重试；
+ * 因而已消耗的名额可将每阶段原始 HTTP 请求数限制为一条。
  */
 async function forwardExactlyOnce({ request, response, upstreamBase, outboundBody, record }) {
   const remote = configuredResponsesEndpoint(upstreamBase.href);
@@ -1648,8 +1648,8 @@ async function assertJava25(command) {
 }
 
 /**
- * Starts the sidecar with proxy auto-detection and inherited JVM option injection disabled;
- * the helper snapshots process.env synchronously, so values are restored before other work resumes.
+ * 启动 sidecar 时关闭代理自动检测和继承的 JVM 参数注入；
+ * 辅助函数会同步复制 process.env，因此其它工作继续前环境值已恢复。
  */
 function createLoopbackBoundSession({ command, jar, directories }) {
   const priorValues = new Map();

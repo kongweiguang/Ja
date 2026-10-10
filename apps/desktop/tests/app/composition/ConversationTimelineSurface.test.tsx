@@ -5,7 +5,7 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 import { useEffect, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useShallow } from "zustand/react/shallow";
-import { ConversationTimelineSurface } from "@/app/composition/ConversationTimelineSurface";
+import { ConversationTimelineSurface } from "@/features/conversation";
 import {
   selectCommittedItemsForThread,
   useTimelineStore,
@@ -37,7 +37,6 @@ function prepareStreamingTimeline(): void {
         inputQueue: null,
         contextUsage: null,
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -85,6 +84,45 @@ afterEach(async () => {
 });
 
 describe("ConversationTimelineSurface", () => {
+  /** 隐藏保留的 Thread 不渲染 Timeline；重新激活时直接读取最新的权威流事实。 */
+  it("does not render while inactive and catches up to the latest stream on reveal", async () => {
+    prepareStreamingTimeline();
+    const props = {
+      threadId: THREAD_ID,
+      answeredRequest: null,
+      answeredAnswers: {},
+    };
+    const { rerender } = render(<ConversationTimelineSurface {...props} active={false} />);
+    expect(screen.queryByRole("region", { name: "对话时间线" })).toBeNull();
+
+    const delta: TimelineEvent = {
+      jsonrpc: "2.0",
+      method: "assistant/text-delta",
+      params: {
+        serverInstanceId: "srv_stream_surface",
+        eventId: "evt_stream_surface_hidden_delta",
+        sequence: 2,
+        generation: 1,
+        workspaceId: "ws_stream_surface",
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+        threadRevision: 2,
+        occurredAt: "2026-09-20T00:00:03Z",
+        streamSeq: 1,
+        text: "隐藏期间提交的回复",
+      },
+    };
+    act(() => {
+      expect(useTimelineStore.getState().applyHostEvent({ kind: "timeline", event: delta })).toBe(
+        "applied",
+      );
+    });
+    expect(screen.queryByText("隐藏期间提交的回复")).toBeNull();
+
+    rerender(<ConversationTimelineSurface {...props} active />);
+    expect(await screen.findByText("隐藏期间提交的回复")).toBeDefined();
+  });
+
   /** delta 只更新 Timeline owner；相邻回复栏不应跟随高频正文重新渲染。 */
   it("isolates assistant text deltas from the sibling composer surface", async () => {
     prepareStreamingTimeline();
@@ -346,6 +384,7 @@ describe("ConversationTimelineSurface", () => {
             revision: 2,
             turns: [
               {
+                origin: "native" as const,
                 turnId: TURN_ID,
                 status: "running",
                 requestedAt: "2026-09-20T00:00:01Z",
@@ -357,14 +396,18 @@ describe("ConversationTimelineSurface", () => {
             ],
             items: [
               {
+                origin: "native" as const,
                 itemId: "item_persisted_stream_surface",
                 turnId: TURN_ID,
+                truncated: false,
+                totalCharacters: 6,
                 kind: "user_input",
                 content: [{ type: "text", text: "测试流式隔离" }],
                 attachments: [],
                 createdAt: "2026-09-20T00:00:01Z",
               },
               {
+                origin: "native" as const,
                 itemId: "item_tool_stream_surface",
                 turnId: TURN_ID,
                 kind: "tool_call",
@@ -384,7 +427,6 @@ describe("ConversationTimelineSurface", () => {
             inputQueue: null,
             contextUsage: null,
             taskActivities: [],
-            goalActivities: [],
             liveStream: null,
             nextCursor: null,
           },

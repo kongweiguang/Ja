@@ -256,7 +256,11 @@ fn oversized_task_progress_replacement_is_counted_as_overflow() {
             .expect("progress fixture"),
         )
     };
-    queue.push(progress(1, "ok".to_owned()), EventPriority::Data, QueueKind::Data);
+    queue.push(
+        progress(1, "ok".to_owned()),
+        EventPriority::Data,
+        QueueKind::Data,
+    );
     queue.push(
         progress(2, "x".repeat(1_024)),
         EventPriority::Data,
@@ -282,15 +286,18 @@ fn oversized_task_progress_replacement_is_counted_as_overflow() {
     assert_eq!(state.event_data_overflow_dropped_total, 1);
 }
 
-/// shutdown 清空可丢 data 时仍保留 Task/Approval 的持久交互事实，供上层完成快照重读或处理审批。
+/// shutdown 清空可丢 data 时仍保留 Task 关闭、Tool recovery 与 Approval 事实，供上层恢复交互状态。
 #[test]
-fn close_retains_task_and_approval_control_facts() {
+fn close_retains_task_recovery_and_approval_control_facts() {
     let queue = EventQueue::new(8, 4 * 1024 * 1024);
     let methods = [
         "task/activity",
         "task/mailbox-changed",
+        "task/closed",
+        "tool/recovery-changed",
         "approval/requested",
         "approval/resolved",
+        "approval/closed",
     ];
     for method in methods {
         queue.push(

@@ -7,7 +7,7 @@ import { cn } from "./primitives/cn";
 import "./CopyTextButton.css";
 
 export interface CopyTextButtonProps {
-  text: string | (() => string);
+  text: string | (() => string | Promise<string>);
   label: string;
   onCopyText: (text: string) => Promise<void>;
   className?: string;
@@ -15,7 +15,10 @@ export interface CopyTextButtonProps {
 
 type CopyState = "idle" | "copying" | "copied" | "failed";
 
-/** 为消息与 editor 提供一个可访问的真实复制动作；只在点击时解析文本，避免渲染期间复制大型 Diff。 */
+/**
+ * 为消息与 editor 提供一个可访问的真实复制动作；只在点击时解析文本，
+ * 允许长正文先经权威分页读取，避免渲染期间物化大型内容。
+ */
 export function CopyTextButton({
   text,
   label,
@@ -42,7 +45,7 @@ export function CopyTextButton({
     }
     setState("copying");
     try {
-      await onCopyText(typeof text === "function" ? text() : text);
+      await onCopyText(typeof text === "function" ? await text() : text);
       setState("copied");
     } catch {
       setState("failed");

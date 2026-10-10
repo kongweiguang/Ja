@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! 附件预览 JA-RPC v1 的类型化参数与结果投影。
+//! 附件预览 JA-RPC v2 的类型化参数与结果投影。
 //!
 //! 该边界只携带 opaque identity、受限元数据和有界 Base64 分段，不允许路径、hash、
 //! blob key 或任意文件读取参数进入 host 调用面。

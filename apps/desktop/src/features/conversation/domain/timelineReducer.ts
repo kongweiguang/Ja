@@ -6,7 +6,6 @@ import {
   timelineSnapshotFromUnknown,
   type InputQueue,
   type TimelineEvent,
-  type TimelineGoalActivity,
   type TimelineTaskActivityEntry,
   type TimelineSnapshotItem,
   type TimelineLiveStream,
@@ -60,14 +59,30 @@ type InputQueueChangedEvent = Extract<TimelineEvent, { method: "turn/input-queue
 
 const EVENT_DEDUP_WINDOW = 1024;
 const MAX_LIVE_SEGMENT_BYTES = 64 * 1024;
+const MAX_TASK_ACTIVITY_ENTRIES = 128;
+const EMPTY_THREAD_ENTITY_IDS: readonly string[] = [];
+
+/** Keeps normalized entity ownership explicit while adding each identity to its Thread slice once. */
+function addThreadEntityId(
+  index: Record<string, readonly string[]>,
+  threadId: string,
+  entityId: string,
+): Record<string, readonly string[]> {
+  const ids = index[threadId] ?? EMPTY_THREAD_ENTITY_IDS;
+  return ids.includes(entityId) ? index : { ...index, [threadId]: [...ids, entityId] };
+}
 const textEncoder = new TextEncoder();
 
 /**
  * 将权威终态机器码投影为最小重试语义；只有目录中明确可恢复的模型不可用允许提示重试，
  * 其余未知码保持保守，避免 UI 擅自扩大失败契约。
  */
-function turnError(errorCode: string): NonNullable<TimelineTurn["error"]> {
-  return { code: errorCode, retryable: errorCode === "MODEL_UNAVAILABLE" };
+function turnError(errorCode: string, errorMessage?: string): NonNullable<TimelineTurn["error"]> {
+  return {
+    code: errorCode,
+    ...(errorMessage === undefined ? {} : { message: errorMessage }),
+    retryable: errorCode === "MODEL_UNAVAILABLE",
+  };
 }
 
 type ResyncReason =
@@ -186,6 +201,11 @@ export interface ApplySnapshotOptions {
   mode?: "health" | "recovery";
   /** 只对已逐页验证、同 revision 的本地合并历史开放跨页条目数。 */
   accumulatedHistory?: true;
+  /** 请求发起时 owner Thread 的不可变 Activity 切片；只用于识别迟到空快照。 */
+  taskActivityReadFence?: {
+    threadId: string;
+    entries: readonly TimelineTaskActivityEntry[] | undefined;
+  };
 }
 
 /** Zustand 只保存这份状态；Draft 与 Stream Cursor 明确属于瞬态。 */
@@ -194,6 +214,8 @@ export interface TimelineState {
   serverInstanceId: string | undefined;
   threads: Record<string, TimelineThreadProjection>;
   turns: Record<string, TimelineTurn>;
+  /** Ordered turn identity per Thread; selectors never discover ownership by scanning all turns. */
+  turnIdsByThread: Record<string, readonly string[]>;
   items: Record<string, TimelineItemAdapter>;
   itemThreadById: Record<string, string>;
   itemUtf8BytesById: Record<string, number>;
@@ -203,12 +225,13 @@ export interface TimelineState {
   /** 只记录当前 live stream 已接收的 started，不能从 Snapshot 的 running 状态反推。 */
   liveStartedToolCorrelations: Record<string, true>;
   approvalsById: Record<string, TimelineApprovalState>;
+  /** Approval entities remain single-source in approvalsById; this index scopes consumers by Thread. */
+  approvalIdsByThread: Record<string, readonly string[]>;
   contextCompactionByThread: Record<string, ContextCompactionProjection>;
   /** 成功压缩边界独立于瞬态生命周期，后续重试不得恢复旧 Provider 计量。 */
   contextUsageInvalidatedAtByThread: Record<string, string>;
   contextUsageByThread: Record<string, TimelineThreadContextUsage>;
   taskActivitiesByRootThread: Record<string, readonly TimelineTaskActivityEntry[]>;
-  goalActivitiesByOwnerThread: Record<string, readonly TimelineGoalActivity[]>;
   inputQueueByTurn: Record<string, InputQueue>;
   threadRevisionByThread: Record<string, number>;
   /** 最近一次权威 Snapshot 覆盖到的 revision；用于幂等忽略被快照覆盖的迟到 committed event。 */
@@ -227,6 +250,15 @@ export interface TimelineState {
   lastOutcome: ApplyOutcome | undefined;
 }
 
+/** Task Event 在 Timeline 中只保留已校验的公开摘要，并沿用 owner root 索引。 */
+export interface TimelineTaskActivityInput {
+  rootThreadId: string;
+  taskThreadId: string;
+  taskRevision: number;
+  activity: TimelineTaskActivityEntry["activity"];
+  task: TimelineTaskActivityEntry["task"];
+}
+
 /** 创建空投影，使每个 Lifecycle Generation 都从没有陈旧业务状态的边界开始。 */
 export function createTimelineState(): TimelineState {
   return {
@@ -234,6 +266,7 @@ export function createTimelineState(): TimelineState {
     serverInstanceId: undefined,
     threads: {},
     turns: {},
+    turnIdsByThread: {},
     items: {},
     itemThreadById: {},
     itemUtf8BytesById: {},
@@ -242,11 +275,11 @@ export function createTimelineState(): TimelineState {
     pendingToolOrdinalByCallId: {},
     liveStartedToolCorrelations: {},
     approvalsById: {},
+    approvalIdsByThread: {},
     contextCompactionByThread: {},
     contextUsageInvalidatedAtByThread: {},
     contextUsageByThread: {},
     taskActivitiesByRootThread: {},
-    goalActivitiesByOwnerThread: {},
     inputQueueByTurn: {},
     threadRevisionByThread: {},
     snapshotRevisionByThread: {},
@@ -269,6 +302,7 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     serverInstanceId: undefined,
     threads: {},
     turns: {},
+    turnIdsByThread: {},
     items: {},
     itemThreadById: {},
     itemUtf8BytesById: {},
@@ -277,11 +311,11 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
     pendingToolOrdinalByCallId: {},
     liveStartedToolCorrelations: {},
     approvalsById: {},
+    approvalIdsByThread: {},
     contextCompactionByThread: {},
     contextUsageInvalidatedAtByThread: {},
     contextUsageByThread: {},
     taskActivitiesByRootThread: {},
-    goalActivitiesByOwnerThread: {},
     inputQueueByTurn: {},
     threadRevisionByThread: {},
     snapshotRevisionByThread: {},
@@ -295,7 +329,8 @@ function clearBusinessProjection(state: TimelineState): TimelineState {
 
 /**
  * 清理控制器淘汰的非活动 Thread 投影；活跃 Turn、待审批和运行中的 Task 关联必须继续保留，
- * 终态 Goal/Approval 历史则可随缓存淘汰。调用方只应传入自己拥有的缓存候选。
+ * 终态 Approval 历史则可随缓存淘汰。调用方只应传入自己拥有的缓存候选；权威关闭则绕过保护。
+ * @author kongweiguang
  */
 export function pruneInactiveThreads(
   state: TimelineState,
@@ -306,19 +341,21 @@ export function pruneInactiveThreads(
   for (const threadId of candidates) {
     if (state.threads[threadId] === undefined) continue;
     if (
-      Object.values(state.turns).some(
-        (turn) =>
-          turn.threadId === threadId && !["completed", "failed", "cancelled"].includes(turn.status),
-      )
+      (state.turnIdsByThread[threadId] ?? EMPTY_THREAD_ENTITY_IDS).some((turnId) => {
+        const turn = state.turns[turnId];
+        return turn !== undefined && !["completed", "failed", "cancelled"].includes(turn.status);
+      })
     )
       continue;
     if (
-      Object.values(state.approvalsById).some(
-        (projection) =>
-          projection.threadId === threadId &&
+      (state.approvalIdsByThread[threadId] ?? EMPTY_THREAD_ENTITY_IDS).some((approvalId) => {
+        const projection = state.approvalsById[approvalId];
+        return (
+          projection !== undefined &&
           projection.decision === undefined &&
-          projection.closedAt === undefined,
-      )
+          projection.closedAt === undefined
+        );
+      })
     )
       continue;
     if (
@@ -344,24 +381,69 @@ export function pruneInactiveThreads(
   }
   if (removable.size === 0) return state;
 
+  return removeThreadProjection(state, [...removable]);
+}
+
+/**
+ * 从唯一 Timeline 实体表移除指定 Thread 子树，并复用给 LRU 淘汰与权威关闭；关闭调用方
+ * 先以 runtime identity 建立 ID tombstone，避免这里的投影删除被迟到读取或事件重新填回；
+ * 该函数只删唯一实体投影，不推断子树或触碰服务端文件。
+ * @author kongweiguang
+ */
+export function removeThreadProjection(
+  state: TimelineState,
+  threadIds: readonly string[],
+): TimelineState {
+  const removable = new Set(threadIds.filter((threadId) => threadId.length > 0));
+  if (removable.size === 0) return state;
+
   const turnIds = new Set(
-    Object.values(state.turns)
-      .filter((turn) => removable.has(turn.threadId))
-      .map((turn) => turn.turnId),
+    [...removable].flatMap((threadId) => state.turnIdsByThread[threadId] ?? []),
   );
+  for (const [turnId, turn] of Object.entries(state.turns))
+    if (removable.has(turn.threadId)) turnIds.add(turnId);
+  const approvalIds = new Set(
+    [...removable].flatMap((threadId) => state.approvalIdsByThread[threadId] ?? []),
+  );
+  for (const [approvalId, approval] of Object.entries(state.approvalsById))
+    if (removable.has(approval.threadId)) approvalIds.add(approvalId);
+  const turns = { ...state.turns };
+  for (const turnId of turnIds) delete turns[turnId];
+  const approvalsById = { ...state.approvalsById };
+  for (const approvalId of approvalIds) delete approvalsById[approvalId];
   const itemIds = new Set(
     [...removable].flatMap((threadId) => state.itemIdsByThread[threadId] ?? []),
   );
+  for (const [itemId, threadId] of Object.entries(state.itemThreadById))
+    if (removable.has(threadId)) itemIds.add(itemId);
   const threadPrefixes = [...removable].map((threadId) => `${threadId}:`);
   const filterThreadRecord = <T>(record: Record<string, T>): Record<string, T> =>
     Object.fromEntries(Object.entries(record).filter(([threadId]) => !removable.has(threadId)));
+  const taskActivitiesByRootThread = Object.fromEntries(
+    Object.entries(state.taskActivitiesByRootThread).flatMap(([rootThreadId, entries]) => {
+      if (removable.has(rootThreadId)) return [];
+      const retained = entries.filter((entry) => {
+        const references = [
+          entry.activity.rootThreadId,
+          entry.activity.taskThreadId,
+          entry.activity.actorThreadId,
+          entry.task.taskThreadId,
+          entry.task.parentThreadId,
+          entry.task.rootThreadId,
+        ];
+        return !references.some((threadId) => removable.has(threadId));
+      });
+      return retained.length === 0 ? [] : [[rootThreadId, retained] as const];
+    }),
+  );
 
   return outcome(
     {
       ...state,
       threads: filterThreadRecord(state.threads),
-      turns: Object.fromEntries(
-        Object.entries(state.turns).filter(([turnId]) => !turnIds.has(turnId)),
+      turns,
+      turnIdsByThread: Object.fromEntries(
+        Object.entries(state.turnIdsByThread).filter(([threadId]) => !removable.has(threadId)),
       ),
       items: Object.fromEntries(
         Object.entries(state.items).filter(([itemId]) => !itemIds.has(itemId)),
@@ -392,18 +474,16 @@ export function pruneInactiveThreads(
           ([correlation]) => !threadPrefixes.some((prefix) => correlation.startsWith(prefix)),
         ),
       ),
-      approvalsById: Object.fromEntries(
-        Object.entries(state.approvalsById).filter(
-          ([, projection]) => !removable.has(projection.threadId),
-        ),
+      approvalsById,
+      approvalIdsByThread: Object.fromEntries(
+        Object.entries(state.approvalIdsByThread).filter(([threadId]) => !removable.has(threadId)),
       ),
       contextCompactionByThread: filterThreadRecord(state.contextCompactionByThread),
       contextUsageInvalidatedAtByThread: filterThreadRecord(
         state.contextUsageInvalidatedAtByThread,
       ),
       contextUsageByThread: filterThreadRecord(state.contextUsageByThread),
-      taskActivitiesByRootThread: filterThreadRecord(state.taskActivitiesByRootThread),
-      goalActivitiesByOwnerThread: filterThreadRecord(state.goalActivitiesByOwnerThread),
+      taskActivitiesByRootThread,
       inputQueueByTurn: Object.fromEntries(
         Object.entries(state.inputQueueByTurn).filter(([turnId]) => !turnIds.has(turnId)),
       ),
@@ -414,6 +494,12 @@ export function pruneInactiveThreads(
       ),
       draftByTurn: Object.fromEntries(
         Object.entries(state.draftByTurn).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      retryAttemptByTurn: Object.fromEntries(
+        Object.entries(state.retryAttemptByTurn).filter(([turnId]) => !turnIds.has(turnId)),
+      ),
+      retryingByTurn: Object.fromEntries(
+        Object.entries(state.retryingByTurn).filter(([turnId]) => !turnIds.has(turnId)),
       ),
       resyncRequired: filterThreadRecord(state.resyncRequired),
     },
@@ -517,8 +603,8 @@ function resync(
   result: ApplyOutcome = "resync_required",
 ): TimelineState {
   const draftByTurn = { ...state.draftByTurn };
-  for (const turn of Object.values(state.turns))
-    if (turn.threadId === threadId) delete draftByTurn[turn.turnId];
+  for (const turnId of state.turnIdsByThread[threadId] ?? EMPTY_THREAD_ENTITY_IDS)
+    delete draftByTurn[turnId];
   return outcome(
     { ...state, draftByTurn, resyncRequired: { ...state.resyncRequired, [threadId]: reason } },
     result,
@@ -529,18 +615,51 @@ function resync(
  * 仅登记一次后台权威读取意图，保留屏幕上的 Draft 和 Stream Cursor；真实 Gap 仍由 resync 负责清理。
  * 该分离避免健康对账把正在显示的正文误判成失效瞬态，从而触发 Composer/WorkProcess 闪烁。
  */
-export function markThreadResync(state: TimelineState, threadId: string): TimelineState {
+export function markThreadResync(
+  state: TimelineState,
+  threadId: string,
+  reason: ResyncReason = "invalid_event",
+): TimelineState {
   const existing = state.resyncRequired[threadId];
   return outcome(
     {
       ...state,
       resyncRequired: {
         ...state.resyncRequired,
-        [threadId]: existing ?? "invalid_event",
+        [threadId]: existing ?? reason,
       },
     },
     "resync_required",
   );
+}
+
+/**
+ * 投影器失败通知没有持久游标，只能失效当前 Thread 快照并请求一次权威回读；连接 sequence 不参与状态推进。
+ * 实例代际与 Thread/Workspace fence 防止迟到通知污染切换后的会话。
+ */
+export function applyProjectionResync(
+  state: TimelineState,
+  event: {
+    serverInstanceId: string;
+    eventId: string;
+    sequence: number;
+    generation: number;
+    workspaceId: string;
+    threadId: string;
+    reasonCode: "projection_failed";
+  },
+): TimelineState {
+  if (state.handshake.phase !== "ready") return outcome(state, "rejected");
+  if (state.seenEventIds[event.eventId] === true) return outcome(state, "duplicate");
+  if (
+    state.handshake.generation !== event.generation ||
+    state.serverInstanceId !== event.serverInstanceId
+  )
+    return outcome(state, "late");
+  const thread = state.threads[event.threadId];
+  if (thread === undefined || thread.workspaceId !== event.workspaceId)
+    return outcome(state, "invalid");
+  return markThreadResync(rememberEvent(state, event.eventId), event.threadId, "projection_fault");
 }
 
 /** Event Stream 无效时丢弃所有 Live Thread 的瞬态 Draft，避免把推测内容保留到恢复后。 */
@@ -585,7 +704,8 @@ function isTerminalState(status: TimelineTurnState): boolean {
 function isLegalTransition(from: TimelineTurnState, to: TimelineTurnState): boolean {
   const legal: Readonly<Record<TimelineTurnState, readonly TimelineTurnState[]>> = {
     queued: ["running", "suspended", "completed", "failed", "cancelled"],
-    running: ["waiting_approval", "suspended", "completed", "failed", "cancelled"],
+    running: ["waiting_input", "waiting_approval", "suspended", "completed", "failed", "cancelled"],
+    waiting_input: ["running", "suspended", "completed", "failed", "cancelled"],
     waiting_approval: ["running", "suspended", "completed", "failed", "cancelled"],
     suspended: ["queued", "cancelled"],
     completed: [],
@@ -600,16 +720,21 @@ function turnForStream(state: TimelineState, turnId: string): TimelineTurn | und
   return state.turns[turnId];
 }
 
-/** 按 Thread、Turn 与语义 Kind 查找持久 Item，避免依赖展示文本。 */
-function findItem(
+/** 审批卡片按持久 approvalId 定位，避免多次审批事件误改同一 Turn 的其他卡片。 */
+function findApprovalItem(
   state: TimelineState,
   threadId: string,
   turnId: string,
-  kind: TimelineItemKind,
+  approvalId: string,
 ): TimelineItemAdapter | undefined {
   return (state.itemIdsByThread[threadId] ?? [])
     .map((itemId) => state.items[itemId])
-    .find((item) => item?.turnId === turnId && item.kind === kind);
+    .find(
+      (item) =>
+        item?.turnId === turnId &&
+        item.kind === "approval" &&
+        item.metadata?.approvalId === approvalId,
+    );
 }
 
 /** 添加或替换 Item 时同步维护 Thread 顺序与字节计数不变量。 */
@@ -680,6 +805,7 @@ function projectSnapshotItem(
     itemId: item.itemId,
     threadId,
     turnId: item.turnId,
+    origin: item.origin,
     status: "completed" as const,
     createdAt: item.createdAt,
   };
@@ -689,6 +815,8 @@ function projectSnapshotItem(
         ...base,
         kind: "user_message",
         text: textFromUserContent(item.content),
+        bodyTruncated: item.truncated,
+        bodyTotalCharacters: item.totalCharacters,
         contextReferences: contextReferencesFromUserContent(item.content),
         attachments: item.attachments,
       };
@@ -697,6 +825,8 @@ function projectSnapshotItem(
         ...base,
         kind: "thread_message",
         text: item.content,
+        bodyTruncated: item.truncated,
+        bodyTotalCharacters: item.totalCharacters,
         sourceThreadId: item.sourceThreadId,
         sourceTitle: item.sourceTitle,
       };
@@ -705,6 +835,8 @@ function projectSnapshotItem(
         ...base,
         kind: "commentary",
         text: item.text,
+        bodyTruncated: item.truncated,
+        bodyTotalCharacters: item.totalCharacters,
         title: "回复过程",
         metadata: { phase: "assistant_progress", modelRound: item.modelRound },
       };
@@ -713,6 +845,8 @@ function projectSnapshotItem(
         ...base,
         kind: "reasoning",
         text: item.text,
+        bodyTruncated: item.truncated,
+        bodyTotalCharacters: item.totalCharacters,
         title: "思考摘要",
         metadata: { phase: "reasoning_summary", modelRound: item.modelRound },
       };
@@ -721,6 +855,8 @@ function projectSnapshotItem(
         ...base,
         kind: "agent_message",
         text: visibleFinalText ?? item.text,
+        bodyTruncated: item.truncated,
+        bodyTotalCharacters: item.totalCharacters,
         final: true,
         title: "Final",
         ...(failureReply ? { metadata: { failureReply: true } } : {}),
@@ -837,7 +973,7 @@ function matchesLiveStreamBaseline(state: TimelineState, baseline: TimelineLiveS
   return prefixMatches && (baseline.streamSeq < currentStreamSeq || exact);
 }
 
-/** same-revision 健康快照不应替换仍在屏幕上的 live Draft；恢复模式则必须由 baseline 接管。 */
+/** 同一 revision 的健康快照不应替换屏幕上仍在显示的实时 Draft；恢复模式下则必须由基线接管。 */
 function shouldPreserveLiveDraft(
   state: TimelineState,
   threadId: string,
@@ -851,21 +987,165 @@ function shouldPreserveLiveDraft(
   if (mode === "recovery") return false;
   if (currentRevision !== snapshotRevision) return false;
   if (liveStream !== null) return matchesLiveStreamBaseline(state, liveStream);
-  return Object.values(state.turns).some(
-    (turn) =>
-      turn.threadId === threadId &&
+  return (state.turnIdsByThread[threadId] ?? EMPTY_THREAD_ENTITY_IDS).some((turnId) => {
+    const turn = state.turns[turnId];
+    return (
+      turn !== undefined &&
       !isTerminalState(turn.status) &&
-      ((state.draftByTurn[turn.turnId]?.length ?? 0) > 0 ||
-        (state.streamSeqByTurn[turn.turnId] ?? 0) > 0),
+      ((state.draftByTurn[turnId]?.length ?? 0) > 0 || (state.streamSeqByTurn[turnId] ?? 0) > 0)
+    );
+  });
+}
+
+/** Task 摘要的比较只依赖自身 revision 和 Activity 水位，不借用无关的 owner Thread revision。 @author kongweiguang */
+function preferTaskActivitySummary(
+  current: TimelineTaskActivityEntry["task"] | undefined,
+  incoming: TimelineTaskActivityEntry["task"],
+): TimelineTaskActivityEntry["task"] {
+  if (current === undefined) return incoming;
+  const preferred =
+    incoming.revision > current.revision
+      ? incoming
+      : current.revision > incoming.revision
+        ? current
+        : incoming.latestActivitySequence > current.latestActivitySequence
+          ? incoming
+          : current;
+  const latestActivitySequence = Math.max(
+    current.latestActivitySequence,
+    incoming.latestActivitySequence,
+  );
+  const startedAt =
+    current.startedAt === null
+      ? incoming.startedAt
+      : incoming.startedAt === null || current.startedAt <= incoming.startedAt
+        ? current.startedAt
+        : incoming.startedAt;
+  return preferred.latestActivitySequence === latestActivitySequence &&
+    preferred.startedAt === startedAt
+    ? preferred
+    : { ...preferred, latestActivitySequence, startedAt };
+}
+
+/**
+ * Snapshot 与 live event 共用 Activity identity 收敛；每个 Task 的所有历史行携带同一单调摘要，
+ * 但 Activity 正文保持不可变，且有界历史最多保留 128 条公开事实。
+ * @author kongweiguang
+ */
+function mergeTaskActivityEntries(
+  ownerThreadId: string,
+  baseline: readonly TimelineTaskActivityEntry[],
+  incoming: readonly TimelineTaskActivityEntry[],
+): readonly TimelineTaskActivityEntry[] {
+  const byIdentity = new Map<string, TimelineTaskActivityEntry>();
+  const latestTaskById = new Map<string, TimelineTaskActivityEntry["task"]>();
+  const accept = (entry: TimelineTaskActivityEntry): void => {
+    const { activity, task } = entry;
+    if (
+      task.parentThreadId !== ownerThreadId ||
+      task.rootThreadId !== activity.rootThreadId ||
+      activity.taskThreadId !== task.taskThreadId
+    )
+      return;
+    const taskThreadId = task.taskThreadId;
+    latestTaskById.set(
+      taskThreadId,
+      preferTaskActivitySummary(latestTaskById.get(taskThreadId), task),
+    );
+    const identity = `${taskThreadId}\u0000${activity.activityId}`;
+    const existing = byIdentity.get(identity);
+    if (existing === undefined) {
+      byIdentity.set(identity, entry);
+      return;
+    }
+    // Activity 正文是不可变事实；Task 摘要在最终投影时按 Task identity 统一推进。
+    byIdentity.set(identity, existing);
+  };
+  for (const entry of baseline) accept(entry);
+  for (const entry of incoming) accept(entry);
+
+  return [...byIdentity.values()]
+    .map((entry) => ({
+      activity: entry.activity,
+      task: latestTaskById.get(entry.task.taskThreadId) ?? entry.task,
+    }))
+    .sort(
+      (left, right) =>
+        left.activity.createdAt.localeCompare(right.activity.createdAt) ||
+        left.activity.taskThreadId.localeCompare(right.activity.taskThreadId) ||
+        left.activity.activitySequence - right.activity.activitySequence,
+    )
+    .slice(-MAX_TASK_ACTIVITY_ENTRIES);
+}
+
+/** 按 Activity identity 去重并单调选择 Task 摘要；迟到事件可补历史，但不能回退高 revision 状态。 @author kongweiguang */
+export function applyTaskActivity(
+  state: TimelineState,
+  input: TimelineTaskActivityInput,
+): TimelineState {
+  const { rootThreadId, taskThreadId, taskRevision, activity, task } = input;
+  const ownerThreadId = task.parentThreadId;
+  if (
+    rootThreadId.trim() === "" ||
+    taskThreadId.trim() === "" ||
+    task.taskThreadId !== taskThreadId ||
+    task.rootThreadId !== rootThreadId ||
+    activity.taskThreadId !== taskThreadId ||
+    activity.rootThreadId !== rootThreadId ||
+    ownerThreadId.trim() === "" ||
+    !Number.isSafeInteger(taskRevision) ||
+    taskRevision < 0 ||
+    task.revision !== taskRevision ||
+    !Number.isSafeInteger(activity.activitySequence) ||
+    activity.activitySequence < 1 ||
+    task.latestActivitySequence < activity.activitySequence
+  )
+    return outcome(state, "invalid");
+
+  const current = state.taskActivitiesByRootThread[ownerThreadId] ?? [];
+  const taskEntries = current.filter((entry) => entry.task.taskThreadId === taskThreadId);
+  const duplicate = taskEntries.find((entry) => entry.activity.activityId === activity.activityId);
+  if (duplicate !== undefined) {
+    if (duplicate.activity.activitySequence !== activity.activitySequence)
+      return outcome(state, "invalid");
+    const latestTaskRevision = taskEntries.reduce(
+      (revision, entry) => Math.max(revision, entry.task.revision),
+      -1,
+    );
+    if (taskRevision <= latestTaskRevision) return outcome(state, "duplicate");
+    return outcome(
+      {
+        ...state,
+        taskActivitiesByRootThread: {
+          ...state.taskActivitiesByRootThread,
+          [ownerThreadId]: mergeTaskActivityEntries(ownerThreadId, current, [{ activity, task }]),
+        },
+      },
+      "applied",
+    );
+  }
+
+  if (taskEntries.some((entry) => entry.activity.activitySequence === activity.activitySequence))
+    return outcome(state, "invalid");
+
+  return outcome(
+    {
+      ...state,
+      taskActivitiesByRootThread: {
+        ...state.taskActivitiesByRootThread,
+        [ownerThreadId]: mergeTaskActivityEntries(ownerThreadId, current, [{ activity, task }]),
+      },
+    },
+    "applied",
   );
 }
 
 /**
- * 应用完整且未分页的 Thread Snapshot，并丢弃无法由快照继续确认的 In-flight 投影。
- * Workspace 由 History 调用方提供，因为 Wire Snapshot 明确省略其所有权；已提交的 live 修改摘要
- * 只有在同一 runtime 身份且 Turn 仍可持有 tracker 时保留，避免恢复读取让摘要在 Tool 间歇消失。
- * 健康快照还保留同一 active Turn 已知重试次数，避免瞬时通知因对账丢失后产生 attempt gap。
- * 仅调用方已逐页校验同 revision 时允许合并快照超过单页 200 条，不放松 wire 边界。
+ * 完整未分页 Snapshot 丢弃无法确认的瞬态投影；Workspace ownership 由 History 调用方补齐。
+ * 健康读取保留同身份的 live draft/retry，恢复以权威 baseline 重建；Task Activity 按自身 revision/identity 合并。
+ * 只有逐页校验同 revision 后才允许超页合并；无读取围栏的空 Task Activity 列表仍代表权威清空。
+ * 有围栏时若 owner 切片已变更，只阻止迟到空列表抹除并发事件，不影响快照其余事实归约。
+ * @author kongweiguang
  */
 export function applySnapshot(
   state: TimelineState,
@@ -894,10 +1174,37 @@ export function applySnapshot(
     // thread/read 可能早于随后到达的 committed event 发起；晚到快照不能让 Turn 状态和消息归属倒退。
     return outcome(state, "late");
   }
+  if (
+    currentRevision === snapshot.revision &&
+    snapshot.turns.some((incoming) => {
+      const current = state.turns[incoming.turnId];
+      return (
+        current?.threadId === snapshot.threadId &&
+        isTerminalState(current.status) &&
+        !isTerminalState(incoming.status)
+      );
+    })
+  ) {
+    // Same-revision reads cannot undo a terminal Turn; a new runtime clears the old projection first.
+    return outcome(state, "late");
+  }
   if (liveStream !== null) {
     const owner = snapshot.turns.find((turn) => turn.turnId === liveStream.turnId);
-    if (owner === undefined || isTerminalState(owner.status)) return outcome(state, "invalid");
+    if (
+      owner === undefined ||
+      owner.origin === "inherited" ||
+      isTerminalState(owner.status)
+    )
+      return outcome(state, "invalid");
   }
+  if (
+    snapshot.turns.some(
+      (turn) =>
+        state.turns[turn.turnId]?.threadId !== undefined &&
+        state.turns[turn.turnId]?.threadId !== snapshot.threadId,
+    )
+  )
+    return outcome(state, "invalid");
   const preserveLiveDraft = shouldPreserveLiveDraft(
     state,
     snapshot.threadId,
@@ -908,20 +1215,17 @@ export function applySnapshot(
   );
   const preservedLiveTurnId = preserveLiveDraft
     ? (liveStream?.turnId ??
-      Object.values(state.turns).find(
-        (turn) =>
-          turn.threadId === snapshot.threadId &&
+      (state.turnIdsByThread[snapshot.threadId] ?? EMPTY_THREAD_ENTITY_IDS).find((turnId) => {
+        const turn = state.turns[turnId];
+        return (
+          turn !== undefined &&
           !isTerminalState(turn.status) &&
-          ((state.draftByTurn[turn.turnId]?.length ?? 0) > 0 ||
-            (state.streamSeqByTurn[turn.turnId] ?? 0) > 0),
-      )?.turnId)
+          ((state.draftByTurn[turnId]?.length ?? 0) > 0 || (state.streamSeqByTurn[turnId] ?? 0) > 0)
+        );
+      }))
     : undefined;
   let next = state;
-  const threadTurnIds = new Set(
-    Object.values(next.turns)
-      .filter((turn) => turn.threadId === snapshot.threadId)
-      .map((turn) => turn.turnId),
-  );
+  const threadTurnIds = new Set(next.turnIdsByThread[snapshot.threadId] ?? EMPTY_THREAD_ENTITY_IDS);
   const oldItemIds = next.itemIdsByThread[snapshot.threadId] ?? [];
   const items = { ...next.items };
   const itemThreadById = { ...next.itemThreadById };
@@ -957,15 +1261,21 @@ export function applySnapshot(
       delete draftByTurn[threadTurnId];
     }
   }
-  const approvalsById: TimelineState["approvalsById"] = Object.fromEntries(
-    Object.entries(next.approvalsById).filter(
-      ([, projection]) => projection.threadId !== snapshot.threadId,
-    ),
-  );
+  const approvalsById: TimelineState["approvalsById"] = { ...next.approvalsById };
+  for (const approvalId of next.approvalIdsByThread[snapshot.threadId] ?? EMPTY_THREAD_ENTITY_IDS)
+    delete approvalsById[approvalId];
+  const approvalIds: string[] = [];
+  const seenApprovalIds = new Set<string>();
   for (const item of snapshot.items) {
     if (item.kind !== "approval") continue;
+    if (item.origin === "inherited") continue;
     const owner = snapshot.turns.find((turn) => turn.turnId === item.turnId);
-    if (owner === undefined) return outcome(state, "invalid");
+    if (
+      owner === undefined ||
+      (approvalsById[item.approvalId] !== undefined &&
+        approvalsById[item.approvalId]?.threadId !== snapshot.threadId)
+    )
+      return outcome(state, "invalid");
     approvalsById[item.approvalId] = {
       threadId: snapshot.threadId,
       approval: {
@@ -983,6 +1293,10 @@ export function applySnapshot(
         ? { closedAt: owner.completedAt }
         : {}),
     };
+    if (!seenApprovalIds.has(item.approvalId)) {
+      seenApprovalIds.add(item.approvalId);
+      approvalIds.push(item.approvalId);
+    }
   }
   const toolItemIdByCallId = Object.fromEntries(
     Object.entries(next.toolItemIdByCallId).filter(
@@ -1019,7 +1333,7 @@ export function applySnapshot(
     delete contextCompactionByThread[snapshot.threadId];
   const contextUsageByThread = { ...next.contextUsageByThread };
   if (snapshot.contextUsage !== null) {
-    const incoming = usageAfterCompaction(snapshot.contextUsage);
+    const incoming = snapshot.contextUsage;
     const currentUsage = contextUsageByThread[snapshot.threadId];
     const currentTurnStartedAt =
       currentUsage === undefined ? undefined : next.turns[currentUsage.turnId]?.startedAt;
@@ -1040,7 +1354,11 @@ export function applySnapshot(
   );
   if (snapshot.inputQueue !== null) {
     const queueTurn = snapshot.turns.find((turn) => turn.turnId === snapshot.inputQueue?.turnId);
-    if (queueTurn === undefined || isTerminalState(queueTurn.status))
+    if (
+      queueTurn === undefined ||
+      queueTurn.origin === "inherited" ||
+      isTerminalState(queueTurn.status)
+    )
       return outcome(state, "invalid");
     const currentQueue = next.inputQueueByTurn[snapshot.inputQueue.turnId];
     if (
@@ -1119,6 +1437,11 @@ export function applySnapshot(
       projectedItemIds.push(projected.itemId);
     }
   }
+  const currentTaskActivities = next.taskActivitiesByRootThread[snapshot.threadId];
+  const preserveTaskActivitiesAfterRead =
+    snapshot.taskActivities.length === 0 &&
+    options.taskActivityReadFence?.threadId === snapshot.threadId &&
+    currentTaskActivities !== options.taskActivityReadFence.entries;
   next = {
     ...next,
     items,
@@ -1133,6 +1456,7 @@ export function applySnapshot(
           {
             turnId: turn.turnId,
             threadId: snapshot.threadId,
+            origin: turn.origin,
             sourceMessageId: turn.sourceMessageId,
             status: turn.status,
             startedAt: turn.requestedAt,
@@ -1144,8 +1468,13 @@ export function applySnapshot(
         ]),
       ),
     },
+    turnIdsByThread: {
+      ...next.turnIdsByThread,
+      [snapshot.threadId]: [...new Set(snapshot.turns.map((turn) => turn.turnId))],
+    },
     threads: { ...next.threads, [snapshot.threadId]: snapshotThread },
     approvalsById,
+    approvalIdsByThread: { ...next.approvalIdsByThread, [snapshot.threadId]: approvalIds },
     toolItemIdByCallId,
     pendingToolOrdinalByCallId,
     liveStartedToolCorrelations,
@@ -1153,11 +1482,16 @@ export function applySnapshot(
     contextUsageByThread,
     taskActivitiesByRootThread: {
       ...next.taskActivitiesByRootThread,
-      [snapshot.threadId]: snapshot.taskActivities,
-    },
-    goalActivitiesByOwnerThread: {
-      ...next.goalActivitiesByOwnerThread,
-      [snapshot.threadId]: snapshot.goalActivities,
+      [snapshot.threadId]:
+        snapshot.taskActivities.length === 0
+          ? preserveTaskActivitiesAfterRead
+            ? (currentTaskActivities ?? snapshot.taskActivities)
+            : snapshot.taskActivities
+          : mergeTaskActivityEntries(
+              snapshot.threadId,
+              next.taskActivitiesByRootThread[snapshot.threadId] ?? [],
+              snapshot.taskActivities,
+            ),
     },
     inputQueueByTurn,
     threadRevisionByThread: {
@@ -1213,15 +1547,17 @@ export function applyTurnAccepted(
   if (accepted.threadRevision !== currentRevision + 1 && !metadataPrecededAdmissionAck)
     return resync(state, accepted.threadId, "gap", "gap");
   if (
-    Object.values(state.turns).some(
-      (turn) => turn.threadId === accepted.threadId && !isTerminalState(turn.status),
-    )
+    (state.turnIdsByThread[accepted.threadId] ?? EMPTY_THREAD_ENTITY_IDS).some((turnId) => {
+      const turn = state.turns[turnId];
+      return turn !== undefined && !isTerminalState(turn.status);
+    })
   ) {
     return resync(state, accepted.threadId, "invalid_event");
   }
   const turn: TimelineTurn = {
     turnId: accepted.turnId,
     threadId: accepted.threadId,
+    origin: "native",
     sourceMessageId: accepted.sourceMessageId ?? null,
     status: "queued",
     startedAt: accepted.submittedAt,
@@ -1230,6 +1566,7 @@ export function applyTurnAccepted(
   let next: TimelineState = {
     ...state,
     turns: { ...state.turns, [accepted.turnId]: turn },
+    turnIdsByThread: addThreadEntityId(state.turnIdsByThread, accepted.threadId, accepted.turnId),
     threads: {
       ...state.threads,
       [accepted.threadId]: {
@@ -1253,6 +1590,7 @@ export function applyTurnAccepted(
       itemId: `item_local_${accepted.turnId.slice("turn_".length)}`,
       threadId: accepted.threadId,
       turnId: accepted.turnId,
+      origin: "native",
       kind: "user_message",
       status: "completed",
       text: accepted.submittedText,
@@ -1363,23 +1701,82 @@ function toolCorrelation(threadId: string, turnId: string, callId: string): stri
   return `${threadId}:${turnId}:${callId}`;
 }
 
-/** 审批事件只携带关联 identity；Reducer 更新既有安全 presentation，不重建 Tool 内容。 */
+/**
+ * 解析完整 Thread/Turn/Call 身份对应的既有 Tool 行；拒绝错位关联，避免审批事件覆盖其它步骤。
+ */
+function toolItemForCall(
+  state: TimelineState,
+  threadId: string,
+  turnId: string,
+  callId: string,
+): TimelineItemAdapter | undefined {
+  const itemId = state.toolItemIdByCallId[toolCorrelation(threadId, turnId, callId)];
+  const item = itemId === undefined ? undefined : state.items[itemId];
+  if (
+    itemId === undefined ||
+    item === undefined ||
+    item.kind !== "tool_call" ||
+    item.threadId !== threadId ||
+    item.turnId !== turnId ||
+    item.metadata?.callId !== callId ||
+    item.metadata?.presentation === undefined
+  )
+    return undefined;
+  return item;
+}
+
+/**
+ * 原位替换权威 Tool 展示；调用方先校验目标状态，避免以生命周期更新隐式接纳非法事件。
+ */
 function updateToolPresentationStatus(
   state: TimelineState,
   threadId: string,
   turnId: string,
   callId: string,
   status: ToolPresentation["status"],
+  replacement?: ToolPresentation,
 ): TimelineState | undefined {
-  const itemId = state.toolItemIdByCallId[toolCorrelation(threadId, turnId, callId)];
+  const item = toolItemForCall(state, threadId, turnId, callId);
+  const presentation = item?.metadata?.presentation;
+  if (item === undefined || presentation === undefined) return undefined;
+  if (replacement !== undefined && replacement.status !== "pending") return undefined;
+  return updateItem(state, item.itemId, {
+    metadata: {
+      ...item.metadata,
+      presentation: { ...(replacement ?? presentation), status },
+      requiresUserAction: status === "waiting_approval",
+    },
+  });
+}
+
+/** 只更新未知副作用的恢复 CAS；工具状态和结果仍以独立 ToolCompleted 事实为准。 */
+function updateToolRecovery(
+  state: TimelineState,
+  threadId: string,
+  turnId: string,
+  callId: string,
+  revision: number,
+  requiresUserAction: boolean,
+): TimelineState | undefined {
+  const correlation = toolCorrelation(threadId, turnId, callId);
+  const itemId = state.toolItemIdByCallId[correlation];
   const item = itemId === undefined ? undefined : state.items[itemId];
   const presentation = item?.metadata?.presentation;
-  if (itemId === undefined || item === undefined || presentation === undefined) return undefined;
+  if (
+    itemId === undefined ||
+    item === undefined ||
+    presentation === undefined ||
+    revision <= (presentation.recovery?.revision ?? 0)
+  )
+    return undefined;
+  const basePresentation = { ...presentation };
+  delete basePresentation.recovery;
   return updateItem(state, itemId, {
     metadata: {
       ...item.metadata,
-      presentation: { ...presentation, status },
-      requiresUserAction: status === "waiting_approval",
+      presentation: requiresUserAction
+        ? { ...basePresentation, recovery: { revision } }
+        : basePresentation,
     },
   });
 }
@@ -1395,11 +1792,6 @@ function usageMetadata(usage: TimelineContextUsage | undefined): ItemMetadata | 
       };
 }
 
-/** 压缩只记录服务端边界；展示层继续保留最近一次可信 Usage，直到新 KNOWN 到达。 */
-function usageAfterCompaction(usage: TimelineContextUsage): TimelineContextUsage {
-  return usage;
-}
-
 /** 对协议时间做有限比较；无法解析时返回 undefined，让调用方采取保守的保留策略。 */
 function compareUsageTimestamp(
   left: string | undefined,
@@ -1413,13 +1805,13 @@ function compareUsageTimestamp(
   return leftMs < rightMs ? -1 : 1;
 }
 
-/** 请求序号相同才允许使用 requestId/Profile 校验；跨 Turn 的 ordinal 会重新计数。 */
+/** 模型请求序号相同才允许使用 modelRequestId/Profile 校验；跨 Turn 的 ordinal 会重新计数。 */
 function sameUsageRequestIdentity(
   left: TimelineContextUsage,
   right: TimelineContextUsage,
 ): boolean {
   return (
-    left.requestId === right.requestId &&
+    left.modelRequestId === right.modelRequestId &&
     JSON.stringify(left.profile) === JSON.stringify(right.profile)
   );
 }
@@ -1437,8 +1829,9 @@ function sameUsageMeasurement(
 }
 
 /**
- * 快照可能比事件晚到但携带更旧的请求级计量；只有能证明 incoming 更新时才替换，
- * UNKNOWN 永远不能把已知环清空，无法判断先后时保留当前事实。
+ * 检查点估算可替代其之前的实测；较新请求的 UNKNOWN 清除旧占用，同一请求的 UNKNOWN 不降级已结算计量。
+ * 快照可能没有压缩 lifecycle；同请求以估算自身的时间比较，不能沿用压缩前的 Provider 计量时间。
+ * 无法判断跨 Turn 顺序时保留现有事实，等待后续权威快照。
  */
 function retainKnownContextUsage(
   current: TimelineThreadContextUsage | undefined,
@@ -1451,25 +1844,29 @@ function retainKnownContextUsage(
   const next = (): TimelineThreadContextUsage => ({ ...incoming, turnId });
   if (current === undefined) return next();
 
-  const currentKnown = current.certainty === "known";
-  const incomingKnown = incoming.certainty === "known";
+  const currentKnown = current.certainty === "known" || current.contextEstimate != null;
+  const incomingKnown = incoming.certainty === "known" || incoming.contextEstimate != null;
+  const incomingMeasuredAt = incoming.contextEstimate?.measuredAt ?? incoming.measuredAt;
+  const currentMeasuredAt = current.contextEstimate?.measuredAt ?? current.measuredAt;
+  const incomingCompactionOrder = compareUsageTimestamp(incomingMeasuredAt, contextInvalidatedAt);
+  const currentCompactionOrder = compareUsageTimestamp(currentMeasuredAt, contextInvalidatedAt);
   const incomingAfterCompaction =
-    incomingKnown && compareUsageTimestamp(incoming.measuredAt, contextInvalidatedAt) === 1;
+    incomingKnown && incomingCompactionOrder !== undefined && incomingCompactionOrder >= 0;
   const currentAfterCompaction =
-    compareUsageTimestamp(current.measuredAt, contextInvalidatedAt) === 1;
+    currentCompactionOrder !== undefined && currentCompactionOrder >= 0;
   if (current.turnId === turnId) {
-    if (incoming.requestOrdinal < current.requestOrdinal) return current;
-    if (incoming.requestOrdinal > current.requestOrdinal) return incomingKnown ? next() : current;
+    if (incoming.modelRequestOrdinal < current.modelRequestOrdinal) return current;
+    if (incoming.modelRequestOrdinal > current.modelRequestOrdinal) return next();
     if (!sameUsageRequestIdentity(current, incoming)) return current;
     if (!incomingKnown) return current;
     if (!currentKnown) return next();
     if (incomingAfterCompaction && !currentAfterCompaction) return next();
-    return compareUsageTimestamp(incoming.measuredAt, current.measuredAt) === 1 ? next() : current;
+    return compareUsageTimestamp(incomingMeasuredAt, currentMeasuredAt) === 1 ? next() : current;
   }
 
   const turnOrder = compareUsageTimestamp(incomingTurnStartedAt, currentTurnStartedAt);
   if (turnOrder === -1) return current;
-  if (turnOrder === 1) return incomingKnown ? next() : current;
+  if (turnOrder === 1) return next();
   if (incomingKnown && !currentKnown) return next();
   const measuredOrder = compareUsageTimestamp(incoming.measuredAt, current.measuredAt);
   if (measuredOrder === -1) return current;
@@ -1478,9 +1875,9 @@ function retainKnownContextUsage(
 }
 
 /**
- * 仅在同 Turn 内比较 requestOrdinal；跨 Turn 先检查已确认的开始时间，等时按已接纳的事件顺序推进。
- * 同一 requestId 只允许 UNKNOWN 原位升级为相同画像的 KNOWN。
- * 迟到低序请求不覆盖，身份或画像冲突则拒绝事件，避免 UI 展示混合代际事实。
+ * 摘要请求不代表用户对话上下文；普通请求按 turn 和 ordinal 推进。新请求 UNKNOWN 清除旧占用，
+ * 同一 modelRequestId 只允许在相同画像下从 UNKNOWN 原位升级；若终态仍无 Provider 用量，保留本请求已有的
+ * 本地上下文估算，避免估算与未知结算字段不同就把合法终态误判为冲突事件。
  */
 function recordContextUsage(
   state: TimelineState,
@@ -1488,6 +1885,8 @@ function recordContextUsage(
   turnId: string,
   usage: TimelineContextUsage,
 ): TimelineState | undefined {
+  /** 摘要请求的独立预算不能覆盖用户会话最近一次有效上下文。 */
+  if (usage.purpose !== "assistant") return state;
   const current = state.contextUsageByThread[threadId];
   if (current !== undefined && current.turnId !== turnId) {
     const previousStartedAt = state.turns[current.turnId]?.startedAt;
@@ -1495,36 +1894,32 @@ function recordContextUsage(
     const turnOrder = compareUsageTimestamp(incomingStartedAt, previousStartedAt);
     if (turnOrder === undefined) return undefined;
     if (turnOrder === -1) return state;
-    // 新请求的 UNKNOWN 只能让排序边界前进，不能让 UI 暂时降级为空。
-    if (current.certainty === "known" && usage.certainty === "unknown") return state;
     return {
       ...state,
       contextUsageByThread: {
         ...state.contextUsageByThread,
-        [threadId]: { ...usageAfterCompaction(usage), turnId },
+        [threadId]: { ...usage, turnId },
       },
     };
   }
   if (current !== undefined && current.turnId === turnId) {
-    if (usage.requestOrdinal < current.requestOrdinal) return state;
-    if (usage.requestOrdinal === current.requestOrdinal) {
+    if (usage.modelRequestOrdinal < current.modelRequestOrdinal) return state;
+    if (usage.modelRequestOrdinal === current.modelRequestOrdinal) {
       if (!sameUsageRequestIdentity(current, usage)) return undefined;
       if (usage.certainty === "unknown") {
-        if (current.certainty === "known") return state;
+        if (current.certainty === "known" || current.contextEstimate != null) return state;
         return sameUsageMeasurement(current, usage) ? state : undefined;
       }
       if (current.certainty === "known")
         return sameUsageMeasurement(current, usage) ? state : undefined;
     }
-    // 只有确认了请求身份和顺序之后，才允许 UNKNOWN 保留旧 KNOWN。
-    if (current.certainty === "known" && usage.certainty === "unknown") return state;
   }
   return {
     ...state,
     contextUsageByThread: {
       ...state.contextUsageByThread,
       [threadId]: {
-        ...usageAfterCompaction(usage),
+        ...usage,
         turnId,
       },
     },
@@ -1770,6 +2165,7 @@ function contextCompactionPresentation(
  * 投影统一 Context lifecycle。started/failed 不推进 durable revision，只有 compacted receipt
  * 在 Checkpoint CAS 后推进一次；手动事件没有 Turn，因此不会制造虚假 Timeline Turn。自动事件
  * 以 compactionId 原位更新为 context Tool Step，确保它留在产生它的回复阅读区而不挤入右侧操作区。
+ * Core 摘要过程可能多次提交；来源水位较旧但完成水位较新时必须补读快照，不能丢弃新的检查点。
  */
 function applyContextCompactionEvent(
   state: TimelineState,
@@ -1785,7 +2181,7 @@ function applyContextCompactionEvent(
   )
     return resync(state, params.threadId, "server_instance_changed");
   if (params.sourceRevision !== currentRevision) {
-    return params.sourceRevision < currentRevision
+    return params.threadRevision <= currentRevision
       ? outcome(state, "late")
       : resync(state, params.threadId, "gap", "gap");
   }
@@ -1844,6 +2240,8 @@ function applyContextCompactionEvent(
       threadId: params.threadId,
       turnId: params.turnId,
       kind: "tool_call",
+      // 实时压缩事件只描述本会话执行，不属于读取到的冻结前缀。
+      origin: "native",
       status: phase === "started" ? "in_progress" : phase === "compacted" ? "completed" : "failed",
       title: "上下文自动压缩",
       metadata: {
@@ -1907,7 +2305,8 @@ function applyInputConsumed(
 ): TimelineState | undefined {
   const params = event.params;
   const turn = state.turns[params.turnId];
-  if (turn === undefined || isTerminalState(turn.status)) return undefined;
+  if (turn === undefined || turn.origin === "inherited" || isTerminalState(turn.status))
+    return undefined;
   let next = clearDraft(state, params.turnId);
   const settlement = params.assistantSettlement;
   if (settlement !== undefined) {
@@ -1922,6 +2321,8 @@ function applyInputConsumed(
         threadId: params.threadId,
         turnId: params.turnId,
         kind: "reasoning",
+        // 消费事件在当前本地 Turn 内提交的公开摘要才标记为 native。
+        origin: "native",
         status: "completed",
         text: settlement.reasoningSummary,
         title: "思考摘要",
@@ -1934,6 +2335,8 @@ function applyInputConsumed(
         threadId: params.threadId,
         turnId: params.turnId,
         kind: "agent_message",
+        // 精确结算的最终答复是本会话的真实持久 Item，可作为 fork anchor。
+        origin: "native",
         status: "completed",
         text: settlement.text,
         title: "Final",
@@ -1950,6 +2353,8 @@ function applyInputConsumed(
     threadId: params.threadId,
     turnId: params.turnId,
     kind: "user_message",
+    // 被消费的排队输入属于本会话执行后缀，而非继承上下文。
+    origin: "native",
     status: "completed",
     text: textFromUserContent(params.userItem.content),
     contextReferences: contextReferencesFromUserContent(params.userItem.content),
@@ -1979,7 +2384,7 @@ function applyMessagesReceived(
   for (const item of params.items) {
     if (itemIds.has(item.itemId) || next.items[item.itemId] !== undefined) return undefined;
     itemIds.add(item.itemId);
-    next = putItem(next, projectSnapshotItem(item, params.threadId));
+    next = putItem(next, projectSnapshotItem({ ...item, origin: "native" }, params.threadId));
   }
   return next;
 }
@@ -2005,6 +2410,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
   if (admitted === undefined) return resync(state, event.params.threadId, "gap", "gap");
   let next = admitted;
   const turn = next.turns[event.params.turnId];
+  if (turn?.origin === "inherited") return resync(state, event.params.threadId, "invalid_event");
   switch (event.method) {
     case "turn/state-changed": {
       const params = event.params;
@@ -2012,14 +2418,26 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       if (previous !== params.from || !isLegalTransition(previous, params.to))
         return resync(state, params.threadId, "invalid_event");
       const nextTurn: TimelineTurn = {
-        ...(turn ?? { turnId: params.turnId, threadId: params.threadId, sourceMessageId: null }),
+        ...(turn ?? {
+          turnId: params.turnId,
+          threadId: params.threadId,
+          origin: "native",
+          sourceMessageId: null,
+        }),
         turnId: params.turnId,
         threadId: params.threadId,
         status: params.to,
         threadRevision: params.threadRevision,
         ...(turn?.startedAt === undefined ? { startedAt: params.occurredAt } : {}),
       };
-      next = { ...next, turns: { ...next.turns, [params.turnId]: nextTurn } };
+      const turnIds = next.turnIdsByThread[params.threadId] ?? EMPTY_THREAD_ENTITY_IDS;
+      next = {
+        ...next,
+        turns: { ...next.turns, [params.turnId]: nextTurn },
+        turnIdsByThread: turnIds.includes(params.turnId)
+          ? next.turnIdsByThread
+          : addThreadEntityId(next.turnIdsByThread, params.threadId, params.turnId),
+      };
       const thread = next.threads[params.threadId];
       if (thread !== undefined)
         next = {
@@ -2071,6 +2489,18 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       next = projected;
       break;
     }
+    case "assistant/context-estimated": {
+      if (turn?.status !== "running") return resync(state, event.params.threadId, "invalid_event");
+      const projected = recordContextUsage(
+        next,
+        event.params.threadId,
+        event.params.turnId,
+        event.params.usage,
+      );
+      if (projected === undefined) return resync(state, event.params.threadId, "invalid_event");
+      next = projected;
+      break;
+    }
     case "tool/started": {
       const projected = applyToolStarted(next, event);
       if (projected === undefined) return resync(state, event.params.threadId, "missing_item");
@@ -2080,6 +2510,26 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
     case "tool/batch-committed": {
       const projected = applyToolBatchCommitted(next, event);
       if (projected === undefined) return resync(state, event.params.threadId, "missing_item");
+      next = projected;
+      break;
+    }
+    case "tool/recovery-changed": {
+      const params = event.params;
+      if (turn === undefined || !["running", "suspended"].includes(turn.status))
+        return resync(state, params.threadId, "invalid_event");
+      const pendingAction = params.status === "pending" && params.disposition === undefined;
+      const expectedAction = pendingAction;
+      if (params.requiresUserAction !== expectedAction)
+        return resync(state, params.threadId, "invalid_event");
+      const projected = updateToolRecovery(
+        next,
+        params.threadId,
+        params.turnId,
+        params.callId,
+        params.revision,
+        params.requiresUserAction,
+      );
+      if (projected === undefined) return resync(state, params.threadId, "missing_item");
       next = projected;
       break;
     }
@@ -2099,6 +2549,14 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       const params = event.params;
       if (turn?.status !== params.from || !isLegalTransition(params.from, params.to))
         return resync(state, params.threadId, "invalid_event");
+      if (params.presentation.status !== "pending" || (params.presentation.media?.length ?? 0) > 0)
+        return resync(state, params.threadId, "invalid_event");
+      const preparedTool = toolItemForCall(next, params.threadId, params.turnId, params.callId);
+      if (
+        preparedTool?.metadata?.presentation?.status !== "pending" ||
+        (preparedTool.status !== "started" && preparedTool.status !== "in_progress")
+      )
+        return resync(state, params.threadId, "missing_item");
       const approval: TimelineApproval = {
         approvalId: params.approvalId,
         threadId: params.threadId,
@@ -2115,8 +2573,17 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         JSON.stringify(existing.approval) !== JSON.stringify(approval)
       )
         return resync(state, params.threadId, "invalid_event");
+      const waitingTool = updateToolPresentationStatus(
+        next,
+        params.threadId,
+        params.turnId,
+        params.callId,
+        "waiting_approval",
+        params.presentation,
+      );
+      if (waitingTool === undefined) return resync(state, params.threadId, "missing_item");
       next = {
-        ...next,
+        ...waitingTool,
         turns: {
           ...next.turns,
           [params.turnId]: { ...turn, status: params.to, threadRevision: params.threadRevision },
@@ -2129,16 +2596,12 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
             ...(existing?.decision === undefined ? {} : { decision: existing.decision }),
           },
         },
+        approvalIdsByThread: addThreadEntityId(
+          next.approvalIdsByThread,
+          params.threadId,
+          approval.approvalId,
+        ),
       };
-      const waitingTool = updateToolPresentationStatus(
-        next,
-        params.threadId,
-        params.turnId,
-        params.callId,
-        "waiting_approval",
-      );
-      if (waitingTool === undefined) return resync(state, params.threadId, "missing_item");
-      next = waitingTool;
       next = putItem(
         next,
         projectItem(
@@ -2152,6 +2615,7 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
           {
             title: `确认 ${params.toolName}`,
             metadata: {
+              approvalId: params.approvalId,
               callId: params.callId,
               toolName: params.toolName,
               requiresUserAction: existing?.decision === undefined,
@@ -2193,7 +2657,47 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
       );
       if (resumedTool === undefined) return resync(state, params.threadId, "missing_item");
       next = resumedTool;
-      const approvalItem = findItem(next, params.threadId, params.turnId, "approval");
+      const approvalItem = findApprovalItem(
+        next,
+        params.threadId,
+        params.turnId,
+        params.approvalId,
+      );
+      if (approvalItem !== undefined)
+        next = putItem(next, {
+          ...approvalItem,
+          status: "completed",
+          metadata: { ...approvalItem.metadata, requiresUserAction: false },
+        });
+      break;
+    }
+    case "approval/closed": {
+      const params = event.params;
+      const existing = next.approvalsById[params.approvalId];
+      if (
+        turn === undefined ||
+        existing?.approval?.turnId !== params.turnId ||
+        existing.decision !== undefined ||
+        existing.closedAt !== undefined
+      )
+        return resync(state, params.threadId, "missing_item");
+      next = {
+        ...next,
+        approvalsById: {
+          ...next.approvalsById,
+          [params.approvalId]: {
+            ...existing,
+            approval: { ...existing.approval, closedReason: params.reason },
+            closedAt: params.occurredAt,
+          },
+        },
+      };
+      const approvalItem = findApprovalItem(
+        next,
+        params.threadId,
+        params.turnId,
+        params.approvalId,
+      );
       if (approvalItem !== undefined)
         next = putItem(next, {
           ...approvalItem,
@@ -2226,18 +2730,37 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
         if (recorded === undefined) return resync(state, params.threadId, "invalid_event");
         next = recorded;
       }
-      const terminalText = params.finalMessage?.text;
+      const finalMessage = params.finalMessage;
+      const terminalText = finalMessage?.text;
+      const terminalTextCharacters =
+        terminalText === undefined ? 0 : Array.from(terminalText).length;
+      const liveAnswerCharacters = Array.from(liveAnswer).length;
       // 输出额度耗尽的前段已经作为独立模型步提交；健康 live 草稿含完整可见答复，
       // 终态只带最后一轮，或单轮公开文本的受限前缀；仅在与草稿边界一致时沿用完整可见文本。
-      const visibleTerminalText =
+      const mergedLiveAnswer =
         params.state === "completed" &&
         terminalText !== undefined &&
-        liveAnswer.length > terminalText.length &&
-        (liveAnswer.endsWith(terminalText) || liveAnswer.startsWith(terminalText))
-          ? liveAnswer
-          : terminalText;
+        liveAnswerCharacters > terminalTextCharacters &&
+        (liveAnswer.endsWith(terminalText) || liveAnswer.startsWith(terminalText));
+      const visibleTerminalText = mergedLiveAnswer ? liveAnswer : terminalText;
+      const visibleTerminalCharacters =
+        visibleTerminalText === undefined ? undefined : Array.from(visibleTerminalText).length;
+      const bodyTotalCharacters =
+        finalMessage === undefined || visibleTerminalCharacters === undefined
+          ? undefined
+          : mergedLiveAnswer
+            ? finalMessage.truncated
+              ? Math.max(visibleTerminalCharacters, finalMessage.totalCharacters)
+              : visibleTerminalCharacters
+            : finalMessage.totalCharacters;
+      const bodyTruncated =
+        finalMessage === undefined || visibleTerminalCharacters === undefined
+          ? undefined
+          : mergedLiveAnswer
+            ? finalMessage.truncated && visibleTerminalCharacters < finalMessage.totalCharacters
+            : finalMessage.truncated;
       const terminalItemId =
-        params.finalMessage?.messageId ?? `item_${params.eventId.slice("evt_".length)}`;
+        finalMessage?.messageId ?? `item_${params.eventId.slice("evt_".length)}`;
       const terminalItem =
         visibleTerminalText === undefined || visibleTerminalText.trim() === ""
           ? undefined
@@ -2252,6 +2775,8 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
                 visibleTerminalText,
                 {
                   final: true,
+                  ...(bodyTruncated === undefined ? {} : { bodyTruncated }),
+                  ...(bodyTotalCharacters === undefined ? {} : { bodyTotalCharacters }),
                   title: "Final",
                   metadata: {
                     ...usageMetadata(params.usage),
@@ -2269,10 +2794,15 @@ function applyThreadEvent(state: TimelineState, event: ThreadSemanticEvent): Tim
           [params.turnId]: {
             ...turn,
             status: params.state,
+            summary: params.summary,
+            summaryTotalCharacters: params.summaryTotalCharacters,
+            summaryTruncated: params.summaryTruncated,
             completedAt: params.occurredAt,
             threadRevision: params.threadRevision,
             changeSet: params.changeSet,
-            ...(params.errorCode === undefined ? {} : { error: turnError(params.errorCode) }),
+            ...(params.errorCode === undefined
+              ? {}
+              : { error: turnError(params.errorCode, params.errorMessage) }),
           },
         },
       };
@@ -2314,6 +2844,7 @@ function projectItem(
     itemId,
     threadId,
     turnId,
+    origin: "native",
     kind,
     status,
     ...(text === undefined ? {} : { text }),
@@ -2413,12 +2944,10 @@ function closePendingApprovals(
   closedAt: string,
 ): TimelineState {
   const approvalsById = { ...state.approvalsById };
-  for (const [approvalId, projection] of Object.entries(approvalsById)) {
-    if (
-      projection.threadId === threadId &&
-      projection.approval?.turnId === turnId &&
-      projection.decision === undefined
-    )
+  for (const approvalId of state.approvalIdsByThread[threadId] ?? EMPTY_THREAD_ENTITY_IDS) {
+    const projection = approvalsById[approvalId];
+    if (projection === undefined) continue;
+    if (projection.approval?.turnId === turnId && projection.decision === undefined)
       approvalsById[approvalId] = { ...projection, closedAt };
   }
   return { ...state, approvalsById };
@@ -2501,7 +3030,11 @@ function applyDelta(
 /** 应用已校验 JA-RPC Notification；Malformed、Late 与 Gapped 输入统一通过 thread/read 恢复。 */
 export function applyLiveEvent(state: TimelineState, event: TimelineEvent): TimelineState {
   if (state.handshake.phase !== "ready") return outcome(state, "rejected");
-  if (event.method === "runtime/status-changed" || event.method === "thread/metadata-changed")
+  if (
+    event.method === "runtime/status-changed" ||
+    event.method === "thread/metadata-changed" ||
+    event.method === "workspace/metadata-changed"
+  )
     return outcome(state, "rejected");
   if (
     event.method === "assistant/text-delta" ||

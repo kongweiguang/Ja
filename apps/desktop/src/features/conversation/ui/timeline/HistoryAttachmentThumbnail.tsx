@@ -3,7 +3,6 @@
 
 import { ImageIcon, ImageOff } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactElement, type RefObject } from "react";
-import { alternateAttachmentResourceUrl } from "@/features/workbench/preview";
 
 export type HistoryAttachmentAuthorization =
   | { readonly kind: "draft" }
@@ -225,20 +224,15 @@ export function HistoryAttachmentThumbnail({
     );
   }, []);
 
-  /** 图片协议读取失败只释放事件所属 target 的 session，并留下明确降级图标。 */
+  /** Host 已选择当前平台可读取的 origin；图片读取失败释放其 session 并降级，不猜测第二个 URL。 */
   const reportImageFailure = useCallback(
     (target: ThumbnailImageProjection): void => {
       if (!isCurrentImage(target)) return;
-      const fallback = alternateAttachmentResourceUrl(target.url);
-      if (fallback !== undefined) {
-        installImage(fallback, target.owned);
-        return;
-      }
       currentImageRef.current = undefined;
       releaseOwnedSession(target.owned);
       setProjection({ status: "unavailable" });
     },
-    [installImage, isCurrentImage, releaseOwnedSession],
+    [isCurrentImage, releaseOwnedSession],
   );
 
   /** 图片成功事件同样受 target fence 保护，旧 load 不得把新来源提前标记为 ready。 */

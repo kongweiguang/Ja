@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import errorCatalog from "../../../../../contracts/ja-rpc/v1/error-catalog.json";
+import errorCatalog from "../../../../../contracts/ja-rpc/v2/error-catalog.json";
 import {
   JA_ERROR_CODES,
   JaError,
@@ -12,7 +12,7 @@ import {
   mapValidationError,
 } from "@/api/protocol/errors";
 
-describe("JA-RPC v1 error boundary", () => {
+describe("JA-RPC v2 error boundary", () => {
   /** 将生产 mapper 锁定到仓库内唯一的 code/errorCode/category/retryable 目录。 */
   it("matches every frozen typed error tuple", () => {
     expect(errorCatalog.schemaVersion).toBe(2);

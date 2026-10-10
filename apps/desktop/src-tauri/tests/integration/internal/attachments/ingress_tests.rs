@@ -9,6 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct TestRun {
@@ -419,6 +420,35 @@ fn cooperative_cancel_during_copy_removes_partial_staging() {
             }
         })
         .expect_err("copy cancelled");
+
+    assert_eq!(error.code, AttachmentIngressErrorCode::Cancelled);
+    assert_eq!(
+        fs::read_dir(run.root.join("attachment-ingress"))
+            .expect("staging")
+            .count(),
+        0
+    );
+}
+
+/// Review capture's shared operation token must stop byte staging at the same chunk boundary as ingress cancellation.
+#[test]
+fn shared_cancellation_token_removes_partial_generated_attachment() {
+    let run = TestRun::new("shared-cancel");
+    let ingress = ingress(&run, 10, 256 * 1024, 256 * 1024);
+    let cancellation = CancellationToken::new();
+
+    let error = ingress
+        .stage_bytes_with_cancellation(
+            "review-snapshot.json".to_owned(),
+            &vec![b'x'; 192 * 1024],
+            &cancellation,
+            |copied, _| {
+                if copied >= 64 * 1024 {
+                    cancellation.cancel();
+                }
+            },
+        )
+        .expect_err("shared cancellation stops staging");
 
     assert_eq!(error.code, AttachmentIngressErrorCode::Cancelled);
     assert_eq!(

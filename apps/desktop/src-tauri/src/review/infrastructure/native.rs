@@ -10,8 +10,8 @@
 use super::git::{CancellationToken, GitError, GitReadOnly};
 use crate::review::application::{ReviewError, ReviewNativePort};
 use crate::review::domain::{
-    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewFileId, ReviewRevision,
-    ReviewSnapshot, ReviewSource, ReviewTarget,
+    ReviewAction, ReviewCatalog, ReviewCatalogLimit, ReviewFile, ReviewFileId, ReviewFileStatus,
+    ReviewRevision, ReviewSnapshot, ReviewSource, ReviewTarget,
 };
 use crate::workspace::{MutationInfrastructureError, WorkspaceError, WorkspaceHandle};
 
@@ -102,7 +102,7 @@ impl ReviewNativePort for NativeReviewAdapter {
         super::snapshot_cache::file(self.workspace.id(), source, revision, file_id)
     }
 
-    /// 补读目标 diff 后用缓存证据复核 revision；每条 Git 命令保持独立仓库安全校验。
+    /// 补读目标 diff 后复核 revision；conflict 的 parser 限制也须先过 freshness 检查，不能误报 stale。
     fn load_file_at_revision(
         &self,
         source: &ReviewSource,
@@ -120,22 +120,44 @@ impl ReviewNativePort for NativeReviewAdapter {
         }
         let Some(cached) = super::snapshot_cache::snapshot(self.workspace.id(), source, expected)
         else {
-            let loaded = if file.requires_diff_load() {
-                self.materialize_one_file(source, file, cancellation)?
+            let materialized = if file.requires_diff_load() {
+                self.materialize_one_file(source, file, cancellation)
             } else {
-                file.clone()
+                Ok(file.clone())
             };
+            if file.status == ReviewFileStatus::Conflict
+                && matches!(&materialized, Err(ReviewError::Parse))
+            {
+                if self.probe_revision(source, cancellation)? != expected.as_str() {
+                    return Err(ReviewError::ReviewStale);
+                }
+                return materialized;
+            }
+            let loaded = materialized?;
             if self.probe_revision(source, cancellation)? != expected.as_str() {
                 return Err(ReviewError::ReviewStale);
             }
             return Ok(loaded);
         };
+        let mut conflict_diff_unsupported = false;
         let loaded = (|| {
-            let loaded = if file.requires_diff_load() {
-                self.materialize_one_file(source, file, cancellation)?
+            let materialized = if file.requires_diff_load() {
+                self.materialize_one_file(source, file, cancellation)
             } else {
-                file.clone()
+                Ok(file.clone())
             };
+            if file.status == ReviewFileStatus::Conflict
+                && matches!(&materialized, Err(ReviewError::Parse))
+            {
+                let current =
+                    self.probe_cached_revision(source, &cached, &file.file_id, cancellation)?;
+                if current != expected.as_str() {
+                    return Err(ReviewError::ReviewStale);
+                }
+                conflict_diff_unsupported = true;
+                return materialized;
+            }
+            let loaded = materialized?;
             let current =
                 self.probe_cached_revision(source, &cached, &file.file_id, cancellation)?;
             if current != expected.as_str() {
@@ -143,7 +165,7 @@ impl ReviewNativePort for NativeReviewAdapter {
             }
             Ok(loaded)
         })();
-        if loaded.is_err() {
+        if loaded.is_err() && !conflict_diff_unsupported {
             super::snapshot_cache::invalidate(self.workspace.id(), source);
         }
         loaded

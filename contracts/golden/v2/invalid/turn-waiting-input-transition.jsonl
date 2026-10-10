@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","method":"turn/state-changed","params":{"serverInstanceId":"srv_demo","eventId":"evt_invalid_waiting_input_transition","sequence":43,"occurredAt":"2026-09-26T00:00:03Z","generation":1,"workspaceId":"ws_demo","threadId":"thr_demo","turnId":"turn_demo","threadRevision":43,"from":"waiting_approval","to":"waiting_input"}}
+

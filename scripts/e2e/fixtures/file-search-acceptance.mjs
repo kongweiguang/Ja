@@ -25,6 +25,26 @@ const CALLS = Object.freeze([
 
 const FINAL_MARKER = "JA_FILE_SEARCH_ACCEPTANCE_FINAL_OK";
 const USER_MARKER = "JA_FILE_SEARCH_ACCEPTANCE_USER";
+const AGENT_LOOP_MARKERS = Object.freeze({
+  clarification: Object.freeze({
+    user: "JA_CLARIFICATION_ACCEPTANCE_USER",
+    answer: "cerulean",
+    final: "JA_CLARIFICATION_ACCEPTANCE_FINAL_OK",
+    callId: "call_clarification_acceptance",
+  }),
+  approval: Object.freeze({
+    user: "JA_APPROVAL_ACCEPTANCE_USER",
+    callId: "call_approval_acceptance",
+    command: "Start-Sleep -Seconds 30",
+  }),
+  mailbox: Object.freeze({
+    user: "JA_MAILBOX_ACCEPTANCE_TURN_START",
+    idle: "JA_MAILBOX_ACCEPTANCE_IDLE_MESSAGE",
+    active: "JA_MAILBOX_ACCEPTANCE_ACTIVE_MESSAGE",
+    callId: "call_mailbox_acceptance_ls",
+    final: "JA_MAILBOX_ACCEPTANCE_FINAL_OK",
+  }),
+});
 
 /** 将一个 Responses SSE 事件编码为 Java OpenAI Responses adapter 可解析的帧。 */
 function event(type, sequenceNumber, payload) {
@@ -60,6 +80,15 @@ function responseEnvelope(responseId, status, output, includeUsage = true) {
   return response;
 }
 
+/** 构造一条延迟的 fixture 响应，让 runner 能在 Provider 调用尚未结束时排入新消息。 */
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 /** 从当前 Provider 请求中取出工具名，保持 fixture 对 JA Responses wire 形状的严格约束。 */
 function exposedToolNames(payload) {
   return (Array.isArray(payload?.tools) ? payload.tools : [])
@@ -77,6 +106,77 @@ async function readBoundedJson(request) {
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+/** 只按最后一条 user 输入分流，避免持久历史 marker 抢占后续 Agent Loop 请求。 */
+function latestUserText(input) {
+  if (!Array.isArray(input)) return typeof input === "string" ? input : undefined;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const message = input[index];
+    if (message === null || typeof message !== "object" || message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) continue;
+    return message.content
+      .filter(
+        (block) => block !== null && typeof block === "object" && typeof block.text === "string",
+      )
+      .map((block) => block.text)
+      .join("\n");
+  }
+  return undefined;
+}
+
+/** 即使队列消息排在最后，也按唯一 mailbox 主 Turn marker 识别当前 Provider user 历史。 */
+function hasUserMarker(input, marker) {
+  if (!Array.isArray(input)) return typeof input === "string" && input.includes(marker);
+  return input.some((message) => {
+    if (message === null || typeof message !== "object" || message.role !== "user") return false;
+    if (typeof message.content === "string") return message.content.includes(marker);
+    return (
+      Array.isArray(message.content) &&
+      message.content.some(
+        (block) =>
+          block !== null &&
+          typeof block === "object" &&
+          typeof block.text === "string" &&
+          block.text.includes(marker),
+      )
+    );
+  });
+}
+
+/** 只统计 Provider 输入中 mailbox marker 的位置布尔值，诊断时不保存任何正文。 */
+function mailboxMarkerFacts(payload) {
+  const input = payload?.input;
+  const entries = Array.isArray(input) ? input : [];
+  const users = entries.filter((item) => item !== null && typeof item === "object" && item.role === "user");
+  const systemEntries = entries.filter(
+    (item) => item !== null && typeof item === "object" && ["system", "developer"].includes(item.role),
+  );
+  const nonUserEntries = entries.filter(
+    (item) =>
+      item !== null &&
+      typeof item === "object" &&
+      !["user", "system", "developer"].includes(item.role),
+  );
+  const latest = latestUserText(input) ?? "";
+  const anyUserText = JSON.stringify(users);
+  const systemText = [payload?.instructions, payload?.system, ...systemEntries]
+    .map((value) => (typeof value === "string" ? value : JSON.stringify(value ?? "")))
+    .join("\n");
+  const nonUserText = JSON.stringify(nonUserEntries);
+  const markers = AGENT_LOOP_MARKERS.mailbox;
+  const factsFor = (marker) => ({
+    latestUser: latest.includes(marker),
+    anyUser: anyUserText.includes(marker) || (typeof input === "string" && input.includes(marker)),
+    system: systemText.includes(marker),
+    nonUser: nonUserText.includes(marker),
+  });
+  return {
+    user: factsFor(markers.user),
+    idle: factsFor(markers.idle),
+    active: factsFor(markers.active),
+  };
 }
 
 /** 从 continuation 读取所有 function_call_output，并拒绝缺失或重复的 Tool 结果。 */
@@ -222,6 +322,75 @@ function finalStream() {
   ].join("");
 }
 
+/** 返回带稳定标记的最终答复，供运行时门禁核实具体恢复场景。 */
+function markedFinalStream(responseId, messageId, text) {
+  const message = {
+    id: messageId,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [], logprobs: [] }],
+  };
+  return [
+    event("response.created", 0, {
+      response: responseEnvelope(responseId, "in_progress", [], false),
+    }),
+    event("response.output_text.delta", 1, {
+      content_index: 0,
+      delta: text,
+      item_id: messageId,
+      output_index: 0,
+      logprobs: [],
+    }),
+    event("response.output_text.done", 2, {
+      content_index: 0,
+      item_id: messageId,
+      output_index: 0,
+      text,
+    }),
+    event("response.completed", 3, {
+      response: responseEnvelope(responseId, "completed", [message]),
+    }),
+  ].join("");
+}
+
+/** 使用生产适配器相同的 Responses 生命周期编码一次 fixture Tool 调用。 */
+function singleToolStream(responseId, callId, toolName, argumentsValue) {
+  const itemId = `item_${callId}`;
+  const argumentsText = JSON.stringify(argumentsValue);
+  const item = {
+    id: itemId,
+    type: "function_call",
+    call_id: callId,
+    name: toolName,
+    arguments: argumentsText,
+  };
+  return [
+    event("response.created", 0, {
+      response: responseEnvelope(responseId, "in_progress", [], false),
+    }),
+    event("response.output_item.added", 1, {
+      output_index: 0,
+      item: { ...item, arguments: "" },
+    }),
+    event("response.function_call_arguments.delta", 2, {
+      item_id: itemId,
+      delta: argumentsText,
+      output_index: 0,
+    }),
+    event("response.function_call_arguments.done", 3, {
+      item_id: itemId,
+      name: toolName,
+      arguments: argumentsText,
+      output_index: 0,
+    }),
+    event("response.output_item.done", 4, { output_index: 0, item }),
+    event("response.completed", 5, {
+      response: responseEnvelope(responseId, "completed", [item]),
+    }),
+  ].join("");
+}
+
 /** 生成自动标题的普通文本响应，避免后台标题请求污染文件 Tool continuation。 */
 function titleStream() {
   const messageId = "message_file_search_title";
@@ -266,10 +435,16 @@ function sendStream(response, stream) {
   response.end(stream);
 }
 
-/** 启动仅监听 loopback 的确定性 Provider，严格要求四个 Tool 结果全部续传后才给最终答复。 */
+/** 以 loopback 固定 Provider 响应覆盖真实请求分支，并用可控挂起确定运行中 Mailbox 的投递时序。 */
 export async function startFileSearchFixture() {
   const attempts = [];
+  const requestRoutingFacts = [];
   let failure = null;
+  const mailboxRequestSeen = deferred();
+  const fixtureRequestFailed = deferred();
+  const mailboxResponseGate = deferred();
+  let mailboxResponseReleased = false;
+  let mailboxResponseAborted = false;
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/responses") {
       response.writeHead(404, { "content-type": "application/json" });
@@ -282,6 +457,17 @@ export async function startFileSearchFixture() {
       const outputs = (Array.isArray(payload?.input) ? payload.input : []).filter(
         (item) => item?.type === "function_call_output",
       );
+      const currentUserText = latestUserText(payload?.input) ?? "";
+      const hasFileSearchCall = (Array.isArray(payload?.input) ? payload.input : []).some(
+        (item) =>
+          item?.type === "function_call" && CALLS.some((call) => call.callId === item.call_id),
+      );
+      requestRoutingFacts.push({
+        currentUserHasFileSearchMarker: currentUserText.includes(USER_MARKER),
+        hasFileSearchCall,
+        mailbox: mailboxMarkerFacts(payload),
+      });
+      if (requestRoutingFacts.length > 32) requestRoutingFacts.shift();
       const toolNames = exposedToolNames(payload);
       const isTitle = serializedInput.includes("<user_request>") && serializedInput.includes("<assistant_reply>");
       if (isTitle) {
@@ -289,33 +475,199 @@ export async function startFileSearchFixture() {
         sendStream(response, titleStream());
         return;
       }
-      if (outputs.length === 0) {
-        if (!serializedInput.includes(USER_MARKER)) {
-          throw new Error("unexpected Provider request without file search acceptance marker");
+      if (currentUserText.includes(AGENT_LOOP_MARKERS.clarification.user)) {
+        const answerOutputs = outputs.filter(
+          (item) => item.call_id === AGENT_LOOP_MARKERS.clarification.callId,
+        );
+        if (answerOutputs.length === 0) {
+          assert.ok(
+            toolNames.includes("request_user_input"),
+            "clarification Tool is missing from the Provider tool catalog",
+          );
+          attempts.push({ kind: "clarification_request", toolNames: [...toolNames] });
+          sendStream(
+            response,
+            singleToolStream(
+              "resp_clarification_question",
+              AGENT_LOOP_MARKERS.clarification.callId,
+              "request_user_input",
+              {
+                questions: [
+                  {
+                    questionId: "question_color",
+                    prompt: "Which color?",
+                    type: "text",
+                    options: [],
+                    required: true,
+                    allowFreeText: true,
+                  },
+                ],
+              },
+            ),
+          );
+          return;
         }
-        if (attempts.some((attempt) => attempt.kind === "initial")) {
-          throw new Error("file search fixture received a second initial request");
+        if (
+          answerOutputs.length !== 1 ||
+          typeof answerOutputs[0].output !== "string" ||
+          answerOutputs[0].output.length === 0
+        ) {
+          throw new Error("clarification continuation did not return its one answer result");
         }
-        for (const name of ["find", "ls"]) {
-          assert.ok(toolNames.includes(name), `${name} is missing from the Provider tool catalog`);
-        }
-        attempts.push({ kind: "initial", toolNames: [...toolNames], callIds: CALLS.map((call) => call.callId) });
-        sendStream(response, searchToolStream());
+        const answerSeen = serializedInput.includes(AGENT_LOOP_MARKERS.clarification.answer);
+        if (!answerSeen) throw new Error("clarification answer was missing from the resumed Provider request");
+        attempts.push({
+          kind: "clarification_resumption",
+          answerSeen: true,
+          outputCount: answerOutputs.length,
+        });
+        sendStream(
+          response,
+          markedFinalStream(
+            "resp_clarification_final",
+            "message_clarification_final",
+            `Clarification applied. ${AGENT_LOOP_MARKERS.clarification.final}`,
+          ),
+        );
         return;
       }
-      if (attempts.some((attempt) => attempt.kind === "continuation")) {
-        throw new Error("file search fixture received a second continuation request");
+      if (currentUserText.includes(AGENT_LOOP_MARKERS.approval.user)) {
+        const approvalOutputs = outputs.filter(
+          (item) => item.call_id === AGENT_LOOP_MARKERS.approval.callId,
+        );
+        if (approvalOutputs.length === 0) {
+          assert.ok(toolNames.includes("exec_command"), "shell Tool is missing from the Provider tool catalog");
+          attempts.push({ kind: "approval_request", toolNames: [...toolNames] });
+          sendStream(
+            response,
+            singleToolStream(
+              "resp_approval_request",
+              AGENT_LOOP_MARKERS.approval.callId,
+              "exec_command",
+              { cmd: AGENT_LOOP_MARKERS.approval.command },
+            ),
+          );
+          return;
+        }
+        if (
+          approvalOutputs.length !== 1 ||
+          typeof approvalOutputs[0].output !== "string" ||
+          approvalOutputs[0].output.length === 0
+        ) {
+          throw new Error("approval continuation did not return its one shell result");
+        }
+        attempts.push({ kind: "approval_continuation", outputCount: approvalOutputs.length });
+        sendStream(
+          response,
+          markedFinalStream(
+            "resp_approval_final",
+            "message_approval_final",
+            "Shell tool returned.",
+          ),
+        );
+        return;
       }
-      const parsed = parseFileSearchOutputs(payload);
-      const facts = assertFileSearchOutputs(parsed);
-      attempts.push({
-        kind: "continuation",
-        outputCount: parsed.size,
-        outputCharacters: facts.outputCharacters,
-      });
-      sendStream(response, finalStream());
+      if (hasUserMarker(payload?.input, AGENT_LOOP_MARKERS.mailbox.user)) {
+        const mailboxOutputs = outputs.filter(
+          (item) => item.call_id === AGENT_LOOP_MARKERS.mailbox.callId,
+        );
+        const isMailboxContinuation = mailboxOutputs.length > 0;
+        if (!isMailboxContinuation) {
+          assert.ok(
+            serializedInput.includes(AGENT_LOOP_MARKERS.mailbox.idle),
+            "message queued while idle was missing from the first model request",
+          );
+          assert.ok(toolNames.includes("ls"), "ls Tool is missing from the mailbox Provider request");
+          if (attempts.some((attempt) => attempt.kind === "mailbox_initial")) {
+            throw new Error("mailbox fixture received a second initial request");
+          }
+          const attempt = { kind: "mailbox_initial", responseAborted: false };
+          attempts.push(attempt);
+          response.on("close", () => {
+            if (!response.writableEnded) {
+              attempt.responseAborted = true;
+              mailboxResponseAborted = true;
+            }
+          });
+          mailboxRequestSeen.resolve();
+          await mailboxResponseGate.promise;
+          if (response.destroyed) return;
+          sendStream(
+            response,
+            singleToolStream(
+              "resp_mailbox_tool",
+              AGENT_LOOP_MARKERS.mailbox.callId,
+              "ls",
+              { path: ".", maxEntries: 20 },
+            ),
+          );
+          return;
+        }
+        if (
+          mailboxOutputs.length !== 1 ||
+          typeof mailboxOutputs[0].output !== "string" ||
+          mailboxOutputs[0].output.length === 0
+        ) {
+          throw new Error("mailbox Tool continuation did not return its one ls result");
+        }
+        const activeMessageSeen = serializedInput.includes(AGENT_LOOP_MARKERS.mailbox.active);
+        if (!activeMessageSeen) {
+          throw new Error("message sent to the running Thread was missing from the next Provider request");
+        }
+        attempts.push({
+          kind: "mailbox_next_request",
+          activeMessageSeen: true,
+          outputCount: mailboxOutputs.length,
+        });
+        sendStream(
+          response,
+          markedFinalStream(
+            "resp_mailbox_final",
+            "message_mailbox_final",
+            `Mailbox message received. ${AGENT_LOOP_MARKERS.mailbox.final}`,
+          ),
+        );
+        return;
+      }
+      if (currentUserText.includes(USER_MARKER) || hasFileSearchCall) {
+        const fileSearchOutputs = outputs.filter((item) =>
+          CALLS.some((call) => call.callId === item.call_id),
+        );
+        if (fileSearchOutputs.length === 0) {
+          if (attempts.some((attempt) => attempt.kind === "initial")) {
+            throw new Error("file search fixture received a second initial request");
+          }
+          for (const name of ["find", "ls"]) {
+            assert.ok(toolNames.includes(name), `${name} is missing from the Provider tool catalog`);
+          }
+          attempts.push({ kind: "initial", toolNames: [...toolNames], callIds: CALLS.map((call) => call.callId) });
+          sendStream(response, searchToolStream());
+          return;
+        }
+        if (attempts.some((attempt) => attempt.kind === "continuation")) {
+          throw new Error("file search fixture received a second continuation request");
+        }
+        const parsed = parseFileSearchOutputs({ input: fileSearchOutputs });
+        const facts = assertFileSearchOutputs(parsed);
+        attempts.push({
+          kind: "continuation",
+          outputCount: parsed.size,
+          outputCharacters: facts.outputCharacters,
+        });
+        sendStream(response, finalStream());
+        return;
+      }
+      if (outputs.length === 0) {
+        throw new Error("unexpected Provider request without a file search or Agent Loop acceptance marker");
+      }
+      throw new Error("Provider continuation did not match a supported fixture scenario");
     } catch (error) {
-      failure = { category: "fixture", message: String(error?.message ?? error).slice(0, 240) };
+      failure = {
+        category: "fixture",
+        message: String(error?.message ?? error).slice(0, 240),
+        requestRoutingFacts: requestRoutingFacts.at(-1) ?? null,
+      };
+      fixtureRequestFailed.resolve(failure);
       if (!response.headersSent) response.writeHead(400, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "file_search_fixture_failure" }));
     }
@@ -337,9 +689,65 @@ export async function startFileSearchFixture() {
           callIds: attempt.callIds === undefined ? undefined : [...attempt.callIds],
           outputCount: attempt.outputCount,
           outputCharacters: attempt.outputCharacters,
+          answerSeen: attempt.answerSeen,
+          activeMessageSeen: attempt.activeMessageSeen,
+          responseAborted: attempt.responseAborted,
         })),
-        failure: failure === null ? null : { ...failure },
+        requestRoutingFacts: requestRoutingFacts.map((route) => ({
+          currentUserHasFileSearchMarker: route.currentUserHasFileSearchMarker,
+          hasFileSearchCall: route.hasFileSearchCall,
+          mailbox: Object.fromEntries(
+            Object.entries(route.mailbox).map(([marker, facts]) => [marker, { ...facts }]),
+          ),
+        })),
+        failure:
+          failure === null
+            ? null
+            : {
+                category: failure.category,
+                message: failure.message,
+                requestRoutingFacts:
+                  failure.requestRoutingFacts === null
+                    ? null
+                    : {
+                        currentUserHasFileSearchMarker:
+                          failure.requestRoutingFacts.currentUserHasFileSearchMarker,
+                        hasFileSearchCall: failure.requestRoutingFacts.hasFileSearchCall,
+                        mailbox: Object.fromEntries(
+                          Object.entries(failure.requestRoutingFacts.mailbox).map(([marker, facts]) => [
+                            marker,
+                            { ...facts },
+                          ]),
+                        ),
+                      },
+              },
+        mailboxResponseAborted,
       };
+    },
+/** fixture 首次拒绝请求时立即失败，避免邮箱等待直到超时才暴露路由错误。 */
+    async waitForMailboxRequest(timeoutMs = 30_000) {
+      let timer;
+      try {
+        const outcome = await Promise.race([
+          mailboxRequestSeen.promise.then(() => ({ kind: "opened" })),
+          fixtureRequestFailed.promise.then((reason) => ({ kind: "failed", reason })),
+          new Promise((resolvePromise) => {
+            timer = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs);
+          }),
+        ]);
+        if (outcome.kind === "failed") {
+          throw new Error(`mailbox Provider request failed in fixture: ${outcome.reason.message}`);
+        }
+        if (outcome.kind === "timeout") throw new Error("mailbox Provider request was not observed");
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+/** runner 排入实时消息后，释放邮箱中唯一挂起的 Provider 响应。 */
+    releaseMailboxResponse() {
+      if (mailboxResponseReleased) throw new Error("mailbox Provider response was already released");
+      mailboxResponseReleased = true;
+      mailboxResponseGate.resolve();
     },
     /** 关闭本轮唯一 loopback listener，避免 fixture 生命周期越过 runner 清理边界。 */
     async close() {
@@ -358,3 +766,5 @@ export const fileSearchFixtureMarkers = Object.freeze({
     arguments: { ...call.arguments },
   })),
 });
+
+export const agentLoopFixtureMarkers = AGENT_LOOP_MARKERS;

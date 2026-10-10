@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:plan-events-budget","method":"plan/events/read","params":{"threadId":"thr_root","planId":"plan_demo"}}
+{"jsonrpc":"2.0","id":"c:plan-events-budget","result":{"planId":"plan_demo","planRevision":6,"eventSequence":1,"items":[{"eventSequence":1,"kind":"plan_budget_exhausted","summary":"legacy event must be rejected","occurredAt":"2026-10-02T00:00:00Z"}],"nextCursor":null}}

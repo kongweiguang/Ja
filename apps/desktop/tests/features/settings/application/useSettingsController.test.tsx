@@ -44,6 +44,7 @@ const DOCUMENT: SettingsDocument = {
           capabilities: {
             contextWindowTokens: 256_000,
             maxOutputTokens: 32_000,
+            supportsOutputSchema: false,
           },
           reasoningLevelMap: { low: "low", high: "high" },
           defaultReasoningLevel: "high",
@@ -64,6 +65,25 @@ function QueryWrapper({ children }: PropsWithChildren): React.ReactElement {
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
+/** 恢复回归沿用生产的显式读取策略，防止自动重新挂载或重连掩盖准入缺陷。 */
+function RecoveryQueryWrapper({ children }: PropsWithChildren): React.ReactElement {
+  const [client] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: {
+            retry: false,
+            staleTime: Infinity,
+            refetchOnMount: false,
+            refetchOnWindowFocus: false,
+            refetchOnReconnect: false,
+          },
+        },
+      }),
+  );
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
 /** 构造动态 scope 回归共用的窄依赖，测试只改写配置读取与 workspace/event 输入。 */
 function controllerOptions(
   snapshot: SettingsAdapter["snapshot"],
@@ -77,7 +97,7 @@ function controllerOptions(
       saveProjectMcpServers: vi.fn(async () => "cfg_project"),
       patch: vi.fn(async () => ({ version: "cfg_project" })),
       reset: vi.fn(async () => ({ version: "cfg_project" })),
-      restoreLastKnownGood: vi.fn(async () => "cfg_user"),
+      repairConfiguration: vi.fn(async () => ({ version: "cfg_user" })),
       setCredential: vi.fn(async () => "cfg_auth"),
       deleteCredential: vi.fn(async () => "cfg_auth"),
       revealProviderCredential: vi.fn(async () => null),
@@ -189,6 +209,87 @@ function loadedSettings(providerName: string): LoadedSettings {
 }
 
 describe("useSettingsController v1", () => {
+  /** 同项目换目录后 config/Skills/MCP 必须换查询身份，旧目录迟到结果不能恢复旧配置。 */
+  it("reloads project projections on root rebinding while keeping equal binding reads stable", async () => {
+    const snapshot = vi.fn(async () => loadedSettings("initial"));
+    const options = controllerOptions(snapshot);
+    const { result, rerender } = renderHook(
+      ({ bindingKey }) =>
+        useSettingsController({
+          ...options,
+          workspaceScope: { workspaceId: "ws_project", kind: "project", bindingKey },
+        }),
+      { initialProps: { bindingKey: "C:\\old" }, wrapper: RecoveryQueryWrapper },
+    );
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+    const initialReads = snapshot.mock.calls.length;
+    const skillsReads = vi.mocked(options.runtimePort.listSkills).mock.calls.length;
+    const mcpReads = vi.mocked(options.runtimePort.listMcpServers).mock.calls.length;
+    rerender({ bindingKey: "C:\\old" });
+    await act(async () => undefined);
+    expect(snapshot).toHaveBeenCalledTimes(initialReads);
+    snapshot.mockImplementation(async () => loadedSettings("new-root"));
+    rerender({ bindingKey: "D:\\new" });
+    await waitFor(() => expect(result.current.snapshot.providers[0]?.name).toBe("new-root"));
+    expect(snapshot).toHaveBeenCalledTimes(initialReads + 1);
+    await waitFor(() =>
+      expect(vi.mocked(options.runtimePort.listSkills).mock.calls.length).toBeGreaterThan(
+        skillsReads,
+      ),
+    );
+    expect(vi.mocked(options.runtimePort.listMcpServers).mock.calls.length).toBeGreaterThan(
+      mcpReads,
+    );
+  });
+  /** 同一连接恢复不会改变 Query 身份；存储与启动准入重新开放时只读取一次权威配置。 */
+  it("waits for storage and boot readiness before reading settings and catalogs", async () => {
+    const snapshot = vi.fn(async () => loadedSettings("Recovered Provider"));
+    const options = controllerOptions(snapshot);
+    const runtimeState = {
+      status: "ready" as const,
+      generation: 1,
+      serverInstanceId: "server",
+      storageRecovery: {
+        id: "storage_recovery_fixture",
+        phase: "blocked" as const,
+        reason: "CORRUPT_DATABASE" as const,
+        historyAvailable: false,
+        backupAvailable: true,
+        rebuilt: false,
+      },
+    };
+    const initialProps: Parameters<typeof useSettingsController>[0] = { ...options, runtimeState };
+    const { result, rerender } = renderHook(useSettingsController, {
+      initialProps,
+      wrapper: RecoveryQueryWrapper,
+    });
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(options.runtimePort.listSkills).not.toHaveBeenCalled();
+    expect(options.runtimePort.listMcpServers).not.toHaveBeenCalled();
+    expect(result.current.scopeReady).toBe(false);
+
+    const recovered = {
+      ...runtimeState,
+      storageRecovery: { ...runtimeState.storageRecovery, phase: "ready" as const, rebuilt: true },
+    };
+    rerender({ ...options, runtimeState: recovered, boot: { status: "connecting" } });
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(options.runtimePort.listSkills).not.toHaveBeenCalled();
+    expect(options.runtimePort.listMcpServers).not.toHaveBeenCalled();
+
+    rerender({ ...options, runtimeState: recovered, boot: { status: "ready" } });
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+    expect(result.current.globalSnapshot.providers[0]?.name).toBe("Recovered Provider");
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(options.runtimePort.listSkills).toHaveBeenCalledOnce();
+    expect(options.runtimePort.listMcpServers).toHaveBeenCalledOnce();
+
+    rerender({ ...options, runtimeState: { ...recovered }, boot: { status: "ready" } });
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(options.runtimePort.listSkills).toHaveBeenCalledOnce();
+    expect(options.runtimePort.listMcpServers).toHaveBeenCalledOnce();
+  });
+
   /** 配置 CAS 冲突时必须丢弃本地草稿并展示权威回读，避免用户继续基于旧版本编辑。 */
   it("reloads the authoritative Provider document after a revision conflict", async () => {
     let authoritativeName = "OpenAI";
@@ -220,17 +321,24 @@ describe("useSettingsController v1", () => {
     );
   });
 
-  it("reloads authoritative credential CAS once and only projects configured after success", async () => {
+  /** CAS 冲突可能来自未知回执后的重试；刷新版本但仅在调用方再次确认时才提交 Secret。 @author kongweiguang */
+  it("does not replay a credential after conflict and exposes the refreshed CAS for explicit retry", async () => {
     let credentialVersion = "cfg_stale";
     let configured = false;
     const snapshot = vi.fn(async () => credentialSnapshot(configured, credentialVersion));
+    const conflict = Object.assign(new Error("redacted"), { code: "revision_conflict" });
+    let attempts = 0;
     const setCredential = vi.fn(
       async (_credentialId: string, _secret: string, expected: string) => {
-        if (expected === "cfg_stale") {
+        attempts += 1;
+        if (attempts === 1) {
+          // The first write reached storage but its acknowledgement was lost; the Query snapshot stays stale.
+          configured = true;
           credentialVersion = "cfg_fresh";
-          throw Object.assign(new Error("redacted"), { code: "revision_conflict" });
+          throw new Error("redacted");
         }
-        configured = true;
+        if (expected === "cfg_stale") throw conflict;
+        expect(expected).toBe("cfg_fresh");
         credentialVersion = "cfg_written";
         return credentialVersion;
       },
@@ -242,12 +350,45 @@ describe("useSettingsController v1", () => {
     await waitFor(() =>
       expect(result.current.globalSnapshot.providers[0]?.credentialConfigured).toBe(false),
     );
+    const secretDraft = "test-secret";
     await act(async () => {
-      await result.current.ports.onReplaceCredential("cred_one", "test-secret");
+      await expect(
+        result.current.ports.onReplaceCredential("cred_one", secretDraft),
+      ).rejects.toMatchObject({ message: "redacted" });
+    });
+    expect(setCredential).toHaveBeenCalledOnce();
+    expect(setCredential).toHaveBeenCalledWith("cred_one", secretDraft, "cfg_stale");
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(result.current.loaded?.cas.credentialVersion).toBe("cfg_stale");
+
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await result.current.ports.onReplaceCredential("cred_one", secretDraft);
+      } catch (error) {
+        failure = error;
+      }
+    });
+    expect(failure).toBe(conflict);
+    expect(setCredential).toHaveBeenCalledTimes(2);
+    expect(setCredential).toHaveBeenNthCalledWith(2, "cred_one", secretDraft, "cfg_stale");
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.providers[0]?.credentialConfigured).toBe(true),
+    );
+    expect(result.current.loaded?.cas.credentialVersion).toBe("cfg_fresh");
+    expect(result.current.loaded?.userDocument.providers).toHaveLength(1);
+    expect(result.current.loaded?.userDocument.providers[0]).toMatchObject({
+      providerId: "provider_one",
+      name: "OpenAI",
+      models: [expect.objectContaining({ modelId: "model_one" })],
     });
 
-    expect(setCredential).toHaveBeenNthCalledWith(1, "cred_one", "test-secret", "cfg_stale");
-    expect(setCredential).toHaveBeenNthCalledWith(2, "cred_one", "test-secret", "cfg_fresh");
+    await act(async () => {
+      await result.current.ports.onReplaceCredential("cred_one", secretDraft);
+    });
+    expect(setCredential).toHaveBeenCalledTimes(3);
+    expect(setCredential).toHaveBeenNthCalledWith(3, "cred_one", secretDraft, "cfg_fresh");
     expect(snapshot).toHaveBeenCalledTimes(3);
     await waitFor(() =>
       expect(result.current.globalSnapshot.providers[0]?.credentialConfigured).toBe(true),
@@ -658,7 +799,7 @@ describe("useSettingsController v1", () => {
             saveProjectMcpServers: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
-            restoreLastKnownGood: vi.fn(async () => "cfg_user"),
+            repairConfiguration: vi.fn(async () => ({ version: "cfg_user" })),
             setCredential: vi.fn(async () => "cfg_auth2"),
             deleteCredential: vi.fn(async () => "cfg_auth3"),
             revealProviderCredential: vi.fn(async () => null),
@@ -707,6 +848,7 @@ describe("useSettingsController v1", () => {
         capabilities: {
           contextWindowTokens: 128_000,
           maxOutputTokens: 8_192,
+          supportsOutputSchema: false,
         },
         reasoningLevelMap: {},
         defaultReasoningLevel: null,
@@ -725,6 +867,296 @@ describe("useSettingsController v1", () => {
     expect(document.defaultSelection?.modelId).toBe("model_two");
     expect(document.defaultAccessMode).toBe("approval_required");
     expect(save).toHaveBeenCalledTimes(3);
+  });
+
+  /** 项目 Provider 只提交稳定 ID 下被修改的叶字段，不回写运行快照或覆盖其它项目参数。 */
+  it("patches project Provider connection and runtime leaves by stable identity", async () => {
+    const loaded = loadedSettings("Project provider patch");
+    loaded.projectOverrides.providerRuntime = [
+      {
+        providerId: "provider_one",
+        connection: {
+          api: "anthropic_messages",
+          baseUrl: "https://project.example/v1",
+          credentialId: "cred_one",
+        },
+        networkTimeouts: { requestTimeoutMs: 60_000 },
+        autoCompact: false,
+      },
+    ];
+    const snapshot = vi.fn(async () => loaded);
+    const options = controllerOptions(snapshot);
+    const patch = vi.fn(async () => ({ version: "cfg_project_2" }));
+    options.adapter.patch = patch;
+    const { result } = renderHook(
+      () =>
+        useSettingsController({
+          ...options,
+          workspaceScope: { workspaceId: "ws_project", kind: "project" },
+        }),
+      { wrapper: QueryWrapper },
+    );
+
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+    await act(async () =>
+      result.current.ports.onProjectProviderRuntimeChange?.("provider_one", {
+        connectTimeoutMs: 2_000,
+        requestTimeoutMs: 60_000,
+        autoCompact: false,
+      }),
+    );
+    expect(patch).toHaveBeenNthCalledWith(1, {
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project provider patch",
+      patch: {
+        providers: {
+          provider_one: {
+            network_timeouts: { connect_timeout_ms: 2_000, request_timeout_ms: 60_000 },
+            agent_defaults: { context: { auto_compact: false } },
+          },
+        },
+      },
+    });
+
+    await act(async () =>
+      result.current.ports.onInheritProjectProviderConnection?.("provider_one"),
+    );
+    expect(patch).toHaveBeenNthCalledWith(2, {
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project provider patch",
+      patch: {
+        providers: {
+          provider_one: { api: null, base_url: null, credential_id: null },
+        },
+      },
+    });
+  });
+
+  /** 项目模型采用 Provider/Model 双稳定 ID 补丁，保存后可单独恢复全局模型。 */
+  it("patches and inherits project model overrides by stable identity", async () => {
+    const snapshot = vi.fn(async () => loadedSettings("Project model patch"));
+    const options = controllerOptions(snapshot);
+    const patch = vi.fn(async () => ({ version: "cfg_project_2" }));
+    options.adapter.patch = patch;
+    const { result } = renderHook(
+      () =>
+        useSettingsController({
+          ...options,
+          workspaceScope: { workspaceId: "ws_project", kind: "project" },
+        }),
+      { wrapper: QueryWrapper },
+    );
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+
+    const provider = structuredClone(DOCUMENT.providers[0]!);
+    provider.models[0]!.model = "project-model-one";
+    provider.models[0]!.capabilities.supportsOutputSchema = true;
+    provider.models[0]!.defaultReasoningLevel = null;
+    await act(async () => result.current.ports.onSaveProjectProviderModels?.(provider));
+    expect(patch).toHaveBeenNthCalledWith(1, {
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project model patch",
+      patch: {
+        providers: {
+          provider_one: {
+            models: {
+              model_one: {
+                name: "GPT",
+                model: "project-model-one",
+                capabilities: {
+                  context_window_tokens: 256_000,
+                  max_output_tokens: 32_000,
+                  supports_output_schema: true,
+                },
+                reasoning_level_map: { low: "low", high: "high" },
+                default_reasoning_level: { __ja_null: true },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await act(async () =>
+      result.current.ports.onInheritProjectModelOverride?.("provider_one", "model_one"),
+    );
+    expect(patch).toHaveBeenNthCalledWith(2, {
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project model patch",
+      patch: { providers: { provider_one: { models: { model_one: null } } } },
+    });
+
+    await act(async () => result.current.ports.onHideProjectModel?.("provider_one", "model_one"));
+    expect(patch).toHaveBeenNthCalledWith(3, {
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project model patch",
+      patch: {
+        providers: {
+          provider_one: {
+            models: { model_one: null },
+            removed_model_ids: ["model_one"],
+          },
+        },
+      },
+    });
+  });
+
+  /** 项目 controller 的运行时读取维持 workspace 身份，全局与项目编辑分别使用各自 CAS。 */
+  it("keeps project runtime scope while global actions use user CAS and project actions use project CAS", async () => {
+    let userDocument = structuredClone(DOCUMENT);
+    let userVersion = "cfg_user_owner";
+    let projectVersion = "cfg_project_owner";
+    const snapshot = vi.fn(async (input?: { workspaceId?: string }): Promise<LoadedSettings> => {
+      expect(input).toEqual({ workspaceId: "ws_project" });
+      const effective = structuredClone(userDocument);
+      effective.defaultAccessMode = "approval_required";
+      effective.defaultSelection = {
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: "high",
+      };
+      return {
+        document: effective,
+        userDocument: structuredClone(userDocument),
+        projectOverrides: {
+          ...structuredClone(NO_PROJECT_OVERRIDES),
+          defaultSelection: true,
+          accessMode: true,
+        },
+        cas: {
+          userVersion,
+          projectVersion,
+          credentialVersion: "cfg_auth_owner",
+        },
+        issues: [],
+      };
+    });
+    const save = vi.fn(async (next: SettingsDocument, expectedVersion: string): Promise<string> => {
+      expect(expectedVersion).toBe(userVersion);
+      userDocument = structuredClone(next);
+      userVersion = `cfg_user_${userVersion === "cfg_user_owner" ? "next" : "latest"}`;
+      return userVersion;
+    });
+    const patch = vi.fn(async (input: Parameters<SettingsAdapter["patch"]>[0]) => {
+      expect(input.expectedVersion).toBe(projectVersion);
+      projectVersion = "cfg_project_next";
+      return { version: projectVersion };
+    });
+    const options = controllerOptions(snapshot, save);
+    options.adapter.patch = patch;
+    const { result } = renderHook(
+      () =>
+        useSettingsController({
+          ...options,
+          workspaceScope: { workspaceId: "ws_project", kind: "project" },
+        }),
+      { wrapper: QueryWrapper },
+    );
+
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+    expect(snapshot).toHaveBeenCalledWith({ workspaceId: "ws_project" });
+    expect(result.current.snapshot.defaultAccessMode).toBe("approval_required");
+    expect(result.current.globalSnapshot.defaultAccessMode).toBe("full_access");
+
+    await act(async () =>
+      result.current.userConfigurationPorts.onAccessModeChange("approval_required"),
+    );
+    await act(async () =>
+      result.current.userConfigurationPorts.onDefaultSelectionChange({
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.globalSnapshot.defaultAccessMode).toBe("approval_required"),
+    );
+
+    expect(save).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ defaultAccessMode: "approval_required" }),
+      "cfg_user_owner",
+      expect.objectContaining({ defaultAccessMode: "full_access" }),
+    );
+    expect(save).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        defaultSelection: {
+          providerId: "provider_one",
+          modelId: "model_one",
+          reasoningLevel: null,
+        },
+      }),
+      "cfg_user_next",
+      expect.objectContaining({
+        defaultSelection: {
+          providerId: "provider_one",
+          modelId: "model_one",
+          reasoningLevel: "high",
+        },
+      }),
+    );
+    expect(result.current.globalSnapshot.defaultAccessMode).toBe("approval_required");
+    expect(result.current.snapshot.defaultSelection?.reasoningLevel).toBe("high");
+
+    await act(async () =>
+      result.current.ports.onDefaultSelectionChange({
+        providerId: "provider_one",
+        modelId: "model_one",
+        reasoningLevel: "high",
+      }),
+    );
+
+    expect(patch).toHaveBeenCalledExactlyOnceWith({
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_owner",
+      patch: {
+        default_provider_id: "provider_one",
+        default_model_id: "model_one",
+        default_reasoning_level: "high",
+      },
+    });
+    expect(snapshot.mock.calls.every(([input]) => input?.workspaceId === "ws_project")).toBe(true);
+    expect(result.current.scopeReady).toBe(true);
+    expect(result.current.scopeWorkspaceId).toBe("ws_project");
+  });
+
+  /** 逐项恢复项目排除的全局模型并保留同 Provider 的其它排除项。 */
+  it("restores one hidden global model while preserving the remaining exclusions", async () => {
+    const loaded = loadedSettings("Project hidden models");
+    loaded.projectOverrides.providerRuntime = [
+      { providerId: "provider_one", removedModelIds: ["model_one", "model_two"] },
+    ];
+    const options = controllerOptions(vi.fn(async () => loaded));
+    const patch = vi.fn(async () => ({ version: "cfg_project_2" }));
+    options.adapter.patch = patch;
+    const { result } = renderHook(
+      () =>
+        useSettingsController({
+          ...options,
+          workspaceScope: { workspaceId: "ws_project", kind: "project" },
+        }),
+      { wrapper: QueryWrapper },
+    );
+    await waitFor(() => expect(result.current.scopeReady).toBe(true));
+
+    await act(async () =>
+      result.current.ports.onRestoreProjectModel?.("provider_one", "model_one"),
+    );
+    expect(patch).toHaveBeenCalledWith({
+      scope: "project",
+      workspaceId: "ws_project",
+      expectedVersion: "cfg_project_Project hidden models",
+      patch: {
+        providers: { provider_one: { removed_model_ids: ["model_two"] } },
+      },
+    });
   });
 
   /** 目录查询只准许用户层已保存 Provider 身份，阻止 controller 被调用方当作任意连接代理。 */
@@ -875,6 +1307,7 @@ describe("useSettingsController v1", () => {
                 projectVersion: "cfg_missing",
                 credentialVersion: "cfg_auth",
               },
+              sources: {},
               issues: [],
             })),
             save,
@@ -882,7 +1315,7 @@ describe("useSettingsController v1", () => {
             saveProjectMcpServers: vi.fn(async () => "cfg_project"),
             patch: vi.fn(async () => ({ version: "cfg_project" })),
             reset: vi.fn(async () => ({ version: "cfg_project" })),
-            restoreLastKnownGood: vi.fn(async () => "cfg_user"),
+            repairConfiguration: vi.fn(async () => ({ version: "cfg_user" })),
             setCredential: vi.fn(async () => "cfg_auth"),
             deleteCredential: vi.fn(async () => "cfg_auth"),
             revealProviderCredential: vi.fn(async () => null),
@@ -1064,6 +1497,7 @@ describe("useSettingsController v1", () => {
       disabledSkills: ["project:review"],
     };
     loaded.projectOverrides.disabledSkillReferences = ["project:review"];
+    loaded.projectOverrides.disabledSkillList = true;
     const save = vi.fn(async (document: SettingsDocument) => {
       loaded = { ...loaded, userDocument: structuredClone(document) };
       return "cfg_user_next";
@@ -1101,7 +1535,9 @@ describe("useSettingsController v1", () => {
 
     await waitFor(() => expect(result.current.skillSettings.projectAvailable).toBe(true));
     expect(result.current.skillSettings.global[0]?.enabled).toBe(true);
-    expect(result.current.skillSettings.project?.[0]?.enabled).toBe(false);
+    expect(
+      result.current.skillSettings.project?.find((skill) => skill.id === "project:review")?.enabled,
+    ).toBe(false);
 
     await act(async () => result.current.ports.onToggleSkill("project:review", true, "project"));
     expect(saveProjectSkills).toHaveBeenCalledWith(

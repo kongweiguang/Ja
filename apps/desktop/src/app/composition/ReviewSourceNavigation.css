@@ -10,7 +10,7 @@
   padding: 0 8px;
   border: 1px solid transparent;
   border-radius: 8px;
-  background: transparent;
+  background: var(--ja-window-surface-muted);
   color: var(--ja-foreground);
   font: inherit;
   font-size: 13px;
@@ -48,6 +48,14 @@
 .ja-review-source-menu {
   min-width: 184px;
   max-width: min(320px, calc(100vw - 16px));
+}
+
+.ja-review-source-status {
+  padding: 8px 12px;
+  color: var(--ja-foreground-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .ja-review-source-menu .ja-menu-item {

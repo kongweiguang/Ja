@@ -3065,7 +3065,15 @@ async function main() {
     "apps/desktop/src-tauri/src",
     "apps/cli/src",
     "crates/ja-runtime/src",
-    "app-server/pom.xml",
+    "ja-agent/pom.xml",
+    "ja-agent/ja-agent-core/pom.xml",
+    "ja-agent/extensions/ja-agent-store-local/pom.xml",
+    "ja-agent/extensions/ja-agent-store-pg/pom.xml",
+    "ja-agent/extensions/ja-agent-skills-local/pom.xml",
+    "ja-agent/extensions/ja-agent-skills-pg/pom.xml",
+    "ja-agent/ja-app-server/pom.xml",
+    "ja-agent/example/pom.xml",
+    "ja-agent/example/ja-agent-example-springboot/pom.xml",
   ]) {
     await requirePath(requiredPath);
   }
@@ -3077,7 +3085,7 @@ async function main() {
     "vite.config.ts",
     "playwright.config.ts",
     "agent",
-    "app-server/agent",
+    "ja-agent/ja-app-server/agent",
     "apps/desktop/src-tauri/Cargo.lock",
     "apps/desktop/src-tauri/src/agent_process",
     "apps/desktop/src-tauri/src/workspace_read",

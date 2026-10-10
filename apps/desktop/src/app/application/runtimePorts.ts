@@ -6,6 +6,7 @@ import type {
   ConversationHostEvent,
   UserContentBlock,
 } from "@/features/conversation";
+import type { StorageRecovery } from "@/shared/runtime/storageRecovery";
 
 type RuntimeStatusKind =
   | "starting"
@@ -23,7 +24,8 @@ export interface RuntimeStatus {
   status: RuntimeStatusKind;
   generation: number;
   serverInstanceId?: string | null;
-  features: readonly ("task_threads_v1" | "plan_goal_v1" | "interaction_v1")[];
+  storageRecovery?: StorageRecovery;
+  features: readonly ("task_threads" | "plan" | "interaction")[];
 }
 
 /** 恢复投影携带人工确认所需 CAS，不暴露 recovery 文件或原生诊断。 */
@@ -50,13 +52,13 @@ export interface RuntimeStorageInfo {
   logPath: string | null;
   cachePath: string | null;
   lastBackup: string | null;
+  storageRecovery?: StorageRecovery;
 }
 
 /** Activation 只接受 Java workspace identity；rootPath 是 native canonical 输出，不是输入。 */
 export interface RuntimeWorkspaceActivation {
   workspaceId: string;
-  kind: "project" | "session" | "legacy_shared";
-  legacySharedWorkspaceId: string | null;
+  kind: "project" | "session";
   displayName: string;
   trust: "trusted" | "untrusted";
   rootPath: string;
@@ -104,7 +106,7 @@ export interface ToolRecoveryResponseInput {
   expectedThreadRevision: number;
   expectedRecoveryRevision: number;
   decision: "retry" | "skip";
-  idempotencyKey: string;
+  operationKey: string;
 }
 
 /** 裁决 ACK 不声称 Tool 已成功，后续执行和最终状态仍必须等待权威事件。 */
@@ -126,6 +128,7 @@ export interface TurnCancelResult {
   status:
     | "queued"
     | "running"
+    | "waiting_input"
     | "waiting_approval"
     | "suspended"
     | "completed"
@@ -282,12 +285,14 @@ export type RuntimeQuery = <M extends RuntimeSettingsMethod>(
 ) => Promise<RuntimeSettingsResult<M>>;
 
 type RuntimeTimelineEvent = Extract<ConversationHostEvent, { kind: "timeline" }>;
+type RuntimeResyncRequiredEvent = Extract<ConversationHostEvent, { kind: "resync_required" }>;
 type RuntimeProjectionFaultEvent = Extract<ConversationHostEvent, { kind: "projection_fault" }>;
 
 /** Adapter 已解析事件后，application 只接收 status、timeline 与恢复信号的封闭联合。 */
 export type RuntimeHostEvent =
   | { kind: "status"; status: RuntimeStatus; eventId: string; occurredAt: string; reason?: string }
   | RuntimeTimelineEvent
+  | RuntimeResyncRequiredEvent
   | RuntimeProjectionFaultEvent;
 
 type RuntimeHostUnsubscribe = () => void | Promise<void>;
@@ -335,16 +340,16 @@ export interface RuntimeHostPort {
   stop(): Promise<RuntimeStatus>;
   state(): Promise<RuntimeStatus>;
   storageInfo(): Promise<RuntimeStorageInfo>;
+  openStorageBackup?(recoveryId: string): Promise<void>;
+  retryStorage?(): Promise<RuntimeStatus>;
   activateWorkspace(workspaceId: string): Promise<RuntimeWorkspaceActivation>;
   recoveryState(): Promise<RuntimeRecoveryState>;
   acknowledgeRecovery(confirmation: ManualRecoveryConfirmation): Promise<RuntimeRecoveryState>;
-  pendingOperations(): Promise<readonly RuntimePendingClientOperation[]>;
-  recheckPendingOperations(): Promise<readonly RuntimePendingClientOperation[]>;
-  acknowledgePendingOperation(
-    clientOperationId: string,
-  ): Promise<RuntimePendingAcknowledgementResult>;
+  pendingOperations(): Promise<readonly RuntimePendingOperation[]>;
+  recheckPendingOperations(): Promise<readonly RuntimePendingOperation[]>;
+  acknowledgePendingOperation(operationKey: string): Promise<RuntimePendingAcknowledgementResult>;
   subscribePendingOperations(
-    listener: (records: readonly RuntimePendingClientOperation[]) => void,
+    listener: (records: readonly RuntimePendingOperation[]) => void,
   ): () => void;
   approvalRespond(input: ApprovalResponseInput): Promise<void>;
   turnStart(input: TurnStartInput): Promise<TurnAccepted>;
@@ -362,15 +367,15 @@ export interface RuntimeHostPort {
 }
 
 /** 恢复 UI 只接收不透明关联元数据；业务结果始终由 Java 回执和 thread/read 拥有。 */
-export interface RuntimePendingClientOperation {
-  clientOperationId: string;
+export interface RuntimePendingOperation {
+  operationKey: string;
   method: "turn/start" | "turn/continue" | "turn/reask" | "approval/respond";
   threadId: string | null;
   createdAt: string;
 }
 export interface RuntimePendingAcknowledgementResult {
   status: "unknown_acknowledged" | "committed";
-  pending: readonly RuntimePendingClientOperation[];
+  pending: readonly RuntimePendingOperation[];
 }
 
 export type RuntimeApplicationErrorCode =
@@ -419,8 +424,8 @@ export class RuntimeApplicationError extends Error {
 }
 
 /**
- * 将任意 adapter rejection 映射到本地 allow-list；只读取稳定 code，不信任 message、stack
- * 或 Tauri error shape，防止原生诊断进入 React 状态。
+ * 将任意适配器异常映射到本地白名单；只读取稳定错误码，不信任 message、stack
+ * 或 Tauri 错误结构，防止原生诊断进入 React 状态。
  */
 export function normalizeRuntimeApplicationError(error: unknown): RuntimeApplicationError {
   if (error instanceof RuntimeApplicationError) return error;

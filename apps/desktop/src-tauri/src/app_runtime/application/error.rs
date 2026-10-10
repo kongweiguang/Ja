@@ -3,31 +3,33 @@
 
 // Runtime application 的稳定脱敏错误。
 
+use std::borrow::Cow;
+
 use serde::Serialize;
 
-use crate::app_runtime::GoalPayloadError;
+use crate::app_runtime::WorkflowPayloadError;
 
 /// 稳定且脱敏的命令错误；内部进程错误仅保留在日志中，WebView 不得接收路径、token、stack 或 child command。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCommandError {
     pub code: &'static str,
-    pub message: &'static str,
+    pub message: Cow<'static, str>,
     pub retryable: bool,
 }
 
 impl std::fmt::Display for RuntimeCommandError {
     /// 保持 setup 与 invoke 错误转换稳定，同时不暴露内部诊断信息。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(self.message.as_ref())
     }
 }
 
 impl std::error::Error for RuntimeCommandError {}
 
-impl From<GoalPayloadError> for RuntimeCommandError {
+impl From<WorkflowPayloadError> for RuntimeCommandError {
     /// 领域层只表达 payload 不可接纳，application 在唯一边界收敛为稳定参数错误。
-    fn from(_: GoalPayloadError) -> Self {
+    fn from(_: WorkflowPayloadError) -> Self {
         Self::invalid_params()
     }
 }
@@ -37,7 +39,7 @@ impl RuntimeCommandError {
     pub(crate) const fn configuration() -> Self {
         Self {
             code: "RUNTIME_CONFIG_INVALID",
-            message: "runtime configuration is invalid",
+            message: Cow::Borrowed("runtime configuration is invalid"),
             retryable: false,
         }
     }
@@ -46,7 +48,7 @@ impl RuntimeCommandError {
     pub(crate) const fn invalid_params() -> Self {
         Self {
             code: "INVALID_PARAMS",
-            message: "runtime request parameters are invalid",
+            message: Cow::Borrowed("runtime request parameters are invalid"),
             retryable: false,
         }
     }
@@ -55,7 +57,7 @@ impl RuntimeCommandError {
     pub(crate) const fn unavailable() -> Self {
         Self {
             code: "RUNTIME_UNAVAILABLE",
-            message: "runtime bridge is unavailable",
+            message: Cow::Borrowed("runtime bridge is unavailable"),
             retryable: true,
         }
     }
@@ -64,7 +66,7 @@ impl RuntimeCommandError {
     pub(crate) const fn queue_full() -> Self {
         Self {
             code: "RUNTIME_QUEUE_FULL",
-            message: "runtime bridge queue is full",
+            message: Cow::Borrowed("runtime bridge queue is full"),
             retryable: true,
         }
     }
@@ -73,7 +75,16 @@ impl RuntimeCommandError {
     pub(crate) const fn deadline() -> Self {
         Self {
             code: "RUNTIME_COMMAND_DEADLINE",
-            message: "runtime request deadline exceeded",
+            message: Cow::Borrowed("runtime request deadline exceeded"),
+            retryable: true,
+        }
+    }
+
+    /// 本地旧 root IO 尚未排空时保持其被冻结状态，调用方可在关闭残留资源后安全重试。
+    pub(crate) const fn workspace_busy() -> Self {
+        Self {
+            code: "WORKSPACE_BUSY",
+            message: Cow::Borrowed("workspace has active operations"),
             retryable: true,
         }
     }
@@ -82,7 +93,7 @@ impl RuntimeCommandError {
     pub(crate) const fn event_delivery() -> Self {
         Self {
             code: "RUNTIME_EVENT_DELIVERY_FAILED",
-            message: "runtime event delivery failed",
+            message: Cow::Borrowed("runtime event delivery failed"),
             retryable: true,
         }
     }
@@ -91,7 +102,16 @@ impl RuntimeCommandError {
     pub(crate) const fn shutdown_timeout() -> Self {
         Self {
             code: "RUNTIME_SHUTDOWN_TIMEOUT",
-            message: "runtime shutdown timed out",
+            message: Cow::Borrowed("runtime shutdown timed out"),
+            retryable: true,
+        }
+    }
+
+    /// 将 JA-RPC 的安全重绑摘要作为拥有数据带回 Tauri，同时让所有固定错误继续借用静态文案。
+    pub(crate) fn workspace_busy_with_summary(summary: String) -> Self {
+        Self {
+            code: "WORKSPACE_BUSY",
+            message: Cow::Owned(summary),
             retryable: true,
         }
     }

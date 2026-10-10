@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import type { InputQueue, QueuedInput } from "../domain/timelineContracts";
 import type { AttachmentSummary } from "../domain/timelineContracts";
 import type { TimelineApproval, TimelineItemAdapter, TimelineTurn } from "../domain/timelineTypes";
@@ -11,7 +12,7 @@ import {
   type ConversationContextReference,
   type UserContentBlock,
 } from "../domain/userContent";
-import { useTimelineStore } from "./timelineStore";
+import { selectTurnsForThread, useTimelineStore, type TimelineRuntimeFence } from "./timelineStore";
 import type {
   ConversationAcceptedTurn,
   ConversationAccessMode,
@@ -118,6 +119,7 @@ export interface ConversationInteractionController {
   cancelling: boolean;
   resuming: boolean;
   error: string | undefined;
+  modelSettingsRequired: boolean;
   clipboardNotice: string | undefined;
   inputQueue: InputQueue | undefined;
   queuedInputs: readonly ConversationQueuedInputView[];
@@ -152,6 +154,8 @@ export interface ConversationInteractionController {
   resume(): Promise<void>;
   cancel(): Promise<void>;
   approve(approval: TimelineApproval, decision: "approve" | "deny"): Promise<void>;
+  /** 权威关闭 ACK 后清理精确 Thread 集合的本地交互草稿与附件 attempt。 */
+  clearClosedThreads(threadIds: readonly string[], fence: TimelineRuntimeFence): boolean;
 }
 
 interface ComposerDraftSnapshot {
@@ -191,14 +195,19 @@ function isAcceptedTurnTerminal(threadId: string, accepted: ConversationAccepted
 
 /**
  * 只允许对当前路径最后一个已停止且从未形成成功最终答复的问题继续或重问；按钮渲染不是权限，
- * 因此每次动作都重新从唯一 Timeline Store 校验来源、最新 Turn 和成功答复事实。
+ * 因此每次动作都重新从唯一 Timeline Store 校验来源、最新 Turn 和成功答复事实；Turn 身份仅在所属
+ * Thread 索引中查找，避免当前会话动作遍历其它会话的持久实体。
  */
 function reaskableQuestionSource(
   threadId: string,
   stoppedTurn: TimelineTurn | undefined,
   requireSingleUserInput = true,
 ): TimelineItemAdapter | undefined {
-  if (stoppedTurn === undefined || !["failed", "cancelled"].includes(stoppedTurn.status))
+  if (
+    stoppedTurn === undefined ||
+    stoppedTurn.origin !== "native" ||
+    !["failed", "cancelled"].includes(stoppedTurn.status)
+  )
     return undefined;
   const timeline = useTimelineStore.getState();
   if (timeline.threads[threadId]?.latestTurnId !== stoppedTurn.turnId) return undefined;
@@ -212,7 +221,7 @@ function reaskableQuestionSource(
     currentItems
       .filter((item) => item.kind === "user_message" && item.turnId === stoppedTurn.turnId)
       .at(-1);
-  if (source?.kind !== "user_message") return undefined;
+  if (source?.kind !== "user_message" || source.origin !== "native") return undefined;
   // 同一 Turn 含多个队列问题时重问会截断整条 Turn，界面应隐藏入口并由服务端再次复验。
   if (
     requireSingleUserInput &&
@@ -221,10 +230,12 @@ function reaskableQuestionSource(
   )
     return undefined;
   const relatedTurnIds = new Set(
-    Object.values(timeline.turns)
+    (timeline.turnIdsByThread[threadId] ?? [])
+      .map((turnId) => timeline.turns[turnId])
       .filter(
-        (turn) =>
-          turn.threadId === threadId &&
+        (turn): turn is TimelineTurn =>
+          turn !== undefined &&
+          turn.origin === "native" &&
           (turn.turnId === source.turnId || turn.sourceMessageId === source.itemId),
       )
       .map((turn) => turn.turnId),
@@ -232,6 +243,7 @@ function reaskableQuestionSource(
   return currentItems.some(
     (item) =>
       item.kind === "agent_message" &&
+      item.origin === "native" &&
       item.final === true &&
       item.metadata?.failureReply !== true &&
       relatedTurnIds.has(item.turnId),
@@ -419,6 +431,42 @@ interface PendingQueuedInput {
   createdAt: string;
 }
 
+interface ThreadTurnOperationOwner {
+  readonly key: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly fence: TimelineRuntimeFence;
+  readonly token: symbol;
+}
+
+/** 异步返回前再询问唯一 Store tombstone，避免 ACK、失败恢复或附件事件重写已关闭 Thread。@author kongweiguang */
+function timelineThreadIsClosed(threadId: string): boolean {
+  return useTimelineStore.getState().isThreadClosed(threadId);
+}
+
+/** 延续旧 Runtime 的异步请求必须同时匹配服务实例与 generation，不能在同 ID 新实例复活。@author kongweiguang */
+function captureTimelineRuntimeFence(): TimelineRuntimeFence | undefined {
+  const state = useTimelineStore.getState();
+  return state.handshake.phase === "ready" && state.serverInstanceId !== undefined
+    ? { serverInstanceId: state.serverInstanceId, generation: state.handshake.generation }
+    : undefined;
+}
+
+/** 异步回调写入前验证原 Thread 仍属于发起请求的 Runtime，且未收到精确 close ACK。@author kongweiguang */
+function timelineRequestIsCurrent(
+  threadId: string,
+  fence: TimelineRuntimeFence | undefined,
+): boolean {
+  if (fence === undefined) return false;
+  const state = useTimelineStore.getState();
+  return (
+    state.handshake.phase === "ready" &&
+    state.serverInstanceId === fence.serverInstanceId &&
+    state.handshake.generation === fence.generation &&
+    !state.isThreadClosed(threadId)
+  );
+}
+
 /** 同一 Thread 内顺序执行 mutation；调用方不等待 lane 即可继续编辑和追加下一条草稿。 */
 function enqueueThreadMutation<T>(
   lanes: Map<string, Promise<void>>,
@@ -438,9 +486,24 @@ function enqueueThreadMutation<T>(
   return execution;
 }
 
+/** Mutation lane 同时隔离 Thread 与 Runtime，旧服务实例的慢请求不应阻塞同 ID 新会话。@author kongweiguang */
+function threadMutationLaneKey(threadId: string, fence: TimelineRuntimeFence | undefined): string {
+  return `${fence?.serverInstanceId ?? ""}\u0000${fence?.generation ?? 0}\u0000${threadId}`;
+}
+
+/** 本地 single-flight 按 Runtime、Thread 和资源三重身份隔离，旧 finally 不能释放同名新请求。@author kongweiguang */
+function threadRuntimeOperationKey(
+  threadId: string,
+  fence: TimelineRuntimeFence,
+  operationId: string,
+): string {
+  return JSON.stringify([fence.serverInstanceId, fence.generation, threadId, operationId]);
+}
+
 /**
  * Conversation application 独占 Draft、Turn single-flight、pending、取消、追加输入、审批和
  * 模型切换编排；所有状态按 Thread identity 隔离，外部 owner 只通过窄端口注入能力。
+ * @author kongweiguang
  */
 export function useConversationInteractionController({
   threadId,
@@ -479,6 +542,9 @@ export function useConversationInteractionController({
   const [cancellingTurnIds, setCancellingTurnIds] = useState<Record<string, true>>({});
   const [resumingTurnIds, setResumingTurnIds] = useState<Record<string, true>>({});
   const [errorsByThread, setErrorsByThread] = useState<Record<string, string>>({});
+  const [modelSettingsRequiredByThread, setModelSettingsRequiredByThread] = useState<
+    Record<string, true>
+  >({});
   const [clipboardNoticesByThread, setClipboardNoticesByThread] = useState<Record<string, string>>(
     {},
   );
@@ -495,12 +561,24 @@ export function useConversationInteractionController({
   );
   const mountedRef = useRef(false);
   const submitGuardsRef = useRef(new Set<string>());
+  const submitOwnerByThreadRef = useRef(
+    new Map<string, { readonly token: symbol; readonly fence: TimelineRuntimeFence | undefined }>(),
+  );
   const queueMutationLanesRef = useRef(new Map<string, Promise<void>>());
+  const queueInputOwnerByIdRef = useRef(new Map<string, string>());
+  const queueActionOwnerByInputIdRef = useRef(new Map<string, symbol>());
   const failedQueuedTextsRef = useRef<Record<string, string[]>>({});
-  const cancelGuardsRef = useRef(new Set<string>());
-  const cancelThreadByTurnRef = useRef(new Map<string, string>());
+  const cancelGuardsRef = useRef(new Map<string, ThreadTurnOperationOwner>());
+  const cancelThreadByTurnRef = useRef(new Map<string, ThreadTurnOperationOwner>());
   const cancelReconciliationRef = useRef(
-    new Map<string, { threadId: string; delayMs: number; timer: ReturnType<typeof setTimeout> }>(),
+    new Map<
+      string,
+      {
+        owner: ThreadTurnOperationOwner;
+        delayMs: number;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    >(),
   );
   const recoveredTurnReconciliationRef = useRef(
     new Map<
@@ -508,24 +586,64 @@ export function useConversationInteractionController({
       {
         threadId: string;
         generation: number;
+        serverInstanceId: string;
         delayMs: number;
         timer: ReturnType<typeof setTimeout>;
       }
     >(),
   );
   const recoveredTurnReconciliationKeyRef = useRef<string | undefined>(undefined);
-  const resumeGuardsRef = useRef(new Set<string>());
-  const approvalGuardsRef = useRef(new Set<string>());
-  const preferenceGuardsRef = useRef(new Set<string>());
-  const attachmentOperationGuardsRef = useRef(new Set<string>());
-  const attachmentDiscardGuardsRef = useRef(new Set<string>());
-  const overflowDiscardGuardsRef = useRef(new Set<string>());
+  const resumeGuardsRef = useRef(new Map<string, ThreadTurnOperationOwner>());
+  const approvalGuardsRef = useRef(new Map<string, ThreadTurnOperationOwner>());
+  const preferenceGuardsRef = useRef(new Map<string, symbol>());
+  const attachmentOperationGuardsRef = useRef(new Map<string, symbol>());
+  const attachmentDiscardGuardsRef = useRef(new Map<string, symbol>());
+  const overflowDiscardGuardsRef = useRef(new Map<string, symbol>());
   const readyAttachmentSizesRef = useRef<Record<string, Map<string, number>>>({});
   const pendingTurnsRef = useRef<Record<string, ConversationAcceptedTurn>>({});
   const currentThreadIdRef = useRef(threadId);
   currentThreadIdRef.current = threadId;
-  const currentTurns = useTimelineStore((state) => state.turns);
-  const currentThreads = useTimelineStore((state) => state.threads);
+  /** 只阻塞当前 Runtime 的同 Thread 提交；旧 pair 的 ACK 不得释放新 pair 的 single-flight。@author kongweiguang */
+  const hasCurrentSubmitGuard = useCallback((requestThreadId: string): boolean => {
+    const owner = submitOwnerByThreadRef.current.get(requestThreadId);
+    if (owner === undefined) return submitGuardsRef.current.has(requestThreadId);
+    if (timelineRequestIsCurrent(requestThreadId, owner.fence)) return true;
+    submitOwnerByThreadRef.current.delete(requestThreadId);
+    submitGuardsRef.current.delete(requestThreadId);
+    return false;
+  }, []);
+  /** 当前订阅只覆盖可见 Thread 与显式 pending Turn，避免无关会话高频流触发交互重渲染。@author kongweiguang */
+  const currentThreadTurns = useTimelineStore(useShallow(selectTurnsForThread(threadId ?? "")));
+  const watchedTurnIds = new Set([
+    ...currentThreadTurns.map((turn) => turn.turnId),
+    ...Object.values(pendingTurns).map((turn) => turn.turnId),
+    ...Object.keys(cancellingTurnIds),
+    ...Object.keys(resumingTurnIds),
+  ]);
+  const currentTurns = useTimelineStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        [...watchedTurnIds].flatMap((turnId) => {
+          const turn = state.turns[turnId];
+          return turn === undefined ? [] : [[turnId, turn] as const];
+        }),
+      ),
+    ),
+  );
+  const watchedThreadIds = new Set([
+    ...(threadId === undefined ? [] : [threadId]),
+    ...Object.keys(pendingTurns),
+  ]);
+  const currentThreads = useTimelineStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        [...watchedThreadIds].flatMap((watchedThreadId) => {
+          const thread = state.threads[watchedThreadId];
+          return thread === undefined ? [] : [[watchedThreadId, thread] as const];
+        }),
+      ),
+    ),
+  );
   const recoveredActiveTurnId = useTimelineStore((state) =>
     threadId === undefined ? undefined : state.recoveredActiveTurnByThread?.[threadId],
   );
@@ -538,8 +656,9 @@ export function useConversationInteractionController({
   const blockingTurn =
     threadId === undefined
       ? undefined
-      : Object.values(currentTurns)
-          .filter((turn) => turn.threadId === threadId && !TERMINAL_TURN_STATES.has(turn.status))
+      : currentThreadTurns
+          .filter((turn) => !TERMINAL_TURN_STATES.has(turn.status))
+          .filter((turn) => turn.origin === "native")
           .sort(
             (left, right) =>
               (left.startedAt ?? "").localeCompare(right.startedAt ?? "") ||
@@ -554,7 +673,7 @@ export function useConversationInteractionController({
       : (() => {
           const latestTurnId = currentThreads[threadId]?.latestTurnId;
           const latestTurn = latestTurnId === undefined ? undefined : currentTurns[latestTurnId];
-          return latestTurn !== undefined && ["failed", "cancelled"].includes(latestTurn.status)
+          return latestTurn !== undefined && latestTurn.origin === "native" && ["failed", "cancelled"].includes(latestTurn.status)
             ? latestTurn
             : undefined;
         })();
@@ -575,17 +694,22 @@ export function useConversationInteractionController({
   /**
    * 取消 guard 的释放必须同时清理 reconciliation timer；集中处理可避免失败、终态事件、
    * 目标消失和超时四条路径互相遗漏，尤其不能让旧 Thread 的 timer 写入当前会话状态。
+   * @author kongweiguang
    */
-  const releaseCancellation = useCallback((turnId: string): void => {
+  const releaseCancellation = useCallback((owner: ThreadTurnOperationOwner): void => {
+    if (cancelGuardsRef.current.get(owner.key) !== owner) return;
+    const { turnId } = owner;
     const reconciliation = cancelReconciliationRef.current.get(turnId);
-    if (reconciliation !== undefined) {
+    if (reconciliation?.owner === owner) {
       clearTimeout(reconciliation.timer);
       cancelReconciliationRef.current.delete(turnId);
     }
-    cancelGuardsRef.current.delete(turnId);
-    cancelThreadByTurnRef.current.delete(turnId);
-    if (mountedRef.current) {
+    cancelGuardsRef.current.delete(owner.key);
+    if (cancelThreadByTurnRef.current.get(turnId) === owner)
+      cancelThreadByTurnRef.current.delete(turnId);
+    if (mountedRef.current && timelineRequestIsCurrent(owner.threadId, owner.fence)) {
       setCancellingTurnIds((current) => {
+        if (!timelineRequestIsCurrent(owner.threadId, owner.fence)) return current;
         if (current[turnId] === undefined) return current;
         const next = { ...current };
         delete next[turnId];
@@ -596,41 +720,49 @@ export function useConversationInteractionController({
 
   /**
    * ACK 后持续观察 authoritative read；每次读回仍为非终态时继续请求 resync，直到权威
-   * terminal/目标消失或会话被卸载，绝不把本地 projection 改写成 cancelled。
+   * terminal/目标消失或会话被卸载，绝不把本地 projection 改写成 cancelled；每条 timer
+   * 都属于请求起点 Runtime 与操作 token，旧回调不能删除同 ID 新实例的对账链。
+   * @author kongweiguang
    */
   const scheduleCancelReconciliation = useCallback(
-    (
-      requestThreadId: string,
-      requestTurnId: string,
-      delayMs = RECONCILIATION_INITIAL_DELAY_MS,
-    ): void => {
-      if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+    (owner: ThreadTurnOperationOwner, delayMs = RECONCILIATION_INITIAL_DELAY_MS): void => {
+      const { threadId: requestThreadId, turnId: requestTurnId } = owner;
+      if (
+        !mountedRef.current ||
+        currentThreadIdRef.current !== requestThreadId ||
+        cancelGuardsRef.current.get(owner.key) !== owner ||
+        !timelineRequestIsCurrent(requestThreadId, owner.fence)
+      )
+        return;
       const current = useTimelineStore.getState().turns[requestTurnId];
       if (current === undefined || TERMINAL_TURN_STATES.has(current.status)) {
-        releaseCancellation(requestTurnId);
+        releaseCancellation(owner);
         return;
       }
-      const timer = setTimeout(() => {
-        cancelReconciliationRef.current.delete(requestTurnId);
-        if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
-        const latest = useTimelineStore.getState().turns[requestTurnId];
-        if (latest === undefined || TERMINAL_TURN_STATES.has(latest.status)) {
-          releaseCancellation(requestTurnId);
-          return;
-        }
-        if (useTimelineStore.getState().resyncRequired[requestThreadId] === undefined)
-          useTimelineStore.getState().requestThreadResync(requestThreadId);
-        scheduleCancelReconciliation(
-          requestThreadId,
-          requestTurnId,
-          nextReconciliationDelay(delayMs),
-        );
-      }, delayMs);
-      cancelReconciliationRef.current.set(requestTurnId, {
-        threadId: requestThreadId,
+      const entry = {
+        owner,
         delayMs,
-        timer,
-      });
+        timer: setTimeout(() => {
+          if (cancelReconciliationRef.current.get(requestTurnId) !== entry) return;
+          cancelReconciliationRef.current.delete(requestTurnId);
+          if (
+            !mountedRef.current ||
+            currentThreadIdRef.current !== requestThreadId ||
+            cancelGuardsRef.current.get(owner.key) !== owner ||
+            !timelineRequestIsCurrent(requestThreadId, owner.fence)
+          )
+            return;
+          const latest = useTimelineStore.getState().turns[requestTurnId];
+          if (latest === undefined || TERMINAL_TURN_STATES.has(latest.status)) {
+            releaseCancellation(owner);
+            return;
+          }
+          if (useTimelineStore.getState().resyncRequired[requestThreadId] === undefined)
+            useTimelineStore.getState().requestThreadResync(requestThreadId);
+          scheduleCancelReconciliation(owner, nextReconciliationDelay(delayMs));
+        }, delayMs),
+      };
+      cancelReconciliationRef.current.set(requestTurnId, entry);
     },
     [releaseCancellation],
   );
@@ -654,6 +786,7 @@ export function useConversationInteractionController({
    * 对恢复快照中仍为 active 的 Turn 持续做 authoritative read；terminal/消失或 Thread
    * 切换立即停止；健康状态只保留一个 5 秒静默 timer，不在已有 resync pending 时叠加
    * read，异常退避由 Conversation controller 的单一恢复链负责。
+   * @author kongweiguang
    */
   const scheduleRecoveredTurnReconciliation = useCallback(
     (
@@ -661,7 +794,16 @@ export function useConversationInteractionController({
       requestTurnId: string,
       delayMs = RECOVERED_RECONCILIATION_SILENCE_MS,
     ): void => {
-      if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+      const stateAtStart = useTimelineStore.getState();
+      if (
+        !mountedRef.current ||
+        currentThreadIdRef.current !== requestThreadId ||
+        !timelineRequestIsCurrent(requestThreadId, {
+          serverInstanceId: stateAtStart.serverInstanceId ?? "",
+          generation: stateAtStart.handshake.generation,
+        })
+      )
+        return;
       const current = useTimelineStore.getState().turns[requestTurnId];
       if (
         current === undefined ||
@@ -671,48 +813,57 @@ export function useConversationInteractionController({
         releaseRecoveredTurnReconciliation(requestTurnId);
         return;
       }
-      const generation = useTimelineStore.getState().handshake.generation;
-      const timer = setTimeout(() => {
-        recoveredTurnReconciliationRef.current.delete(requestTurnId);
-        recoveredTurnReconciliationKeyRef.current = undefined;
-        if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
-        const latest = useTimelineStore.getState().turns[requestTurnId];
-        if (
-          latest === undefined ||
-          TERMINAL_TURN_STATES.has(latest.status) ||
-          !shouldReconcileRecoveredTurn(latest.status)
-        ) {
-          releaseRecoveredTurnReconciliation(requestTurnId);
-          return;
-        }
-        const state = useTimelineStore.getState();
-        if (state.handshake.generation !== generation) return;
-        const lastAcceptedLive = state.getLastAcceptedLive(requestThreadId);
-        const silenceElapsed =
-          lastAcceptedLive === undefined
-            ? RECOVERED_RECONCILIATION_SILENCE_MS
-            : Date.now() - lastAcceptedLive.receivedAt;
-        if (silenceElapsed < RECOVERED_RECONCILIATION_SILENCE_MS) {
-          // 不订阅每个 delta，避免 Composer/导航跟随正文高频重渲染；timer 到点时读取本地
-          // 接收时钟即可把健康事件后的剩余静默窗口顺延，正常输出不制造读取请求。
-          scheduleRecoveredTurnReconciliation(
-            requestThreadId,
-            requestTurnId,
-            Math.max(50, RECOVERED_RECONCILIATION_SILENCE_MS - silenceElapsed),
-          );
-          return;
-        }
-        // 当前没有待处理 resync 时，5 秒静默才触发一次健康对账；读失败的异常退避由
-        // Conversation controller 负责，避免这里再叠加第二套 0.5/1/2/5 轮询。
-        if (state.resyncRequired[requestThreadId] === undefined)
-          state.requestThreadResync(requestThreadId);
-      }, delayMs);
-      recoveredTurnReconciliationRef.current.set(requestTurnId, {
+      if (stateAtStart.serverInstanceId === undefined) return;
+      const generation = stateAtStart.handshake.generation;
+      const serverInstanceId = stateAtStart.serverInstanceId;
+      const entry = {
         threadId: requestThreadId,
         generation,
+        serverInstanceId,
         delayMs,
-        timer,
-      });
+        timer: setTimeout(() => {
+          if (recoveredTurnReconciliationRef.current.get(requestTurnId) !== entry) return;
+          recoveredTurnReconciliationRef.current.delete(requestTurnId);
+          recoveredTurnReconciliationKeyRef.current = undefined;
+          if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
+          if (!timelineRequestIsCurrent(requestThreadId, { serverInstanceId, generation })) return;
+          const latest = useTimelineStore.getState().turns[requestTurnId];
+          if (
+            latest === undefined ||
+            TERMINAL_TURN_STATES.has(latest.status) ||
+            !shouldReconcileRecoveredTurn(latest.status)
+          ) {
+            releaseRecoveredTurnReconciliation(requestTurnId);
+            return;
+          }
+          const state = useTimelineStore.getState();
+          if (
+            state.handshake.generation !== generation ||
+            state.serverInstanceId !== serverInstanceId
+          )
+            return;
+          const lastAcceptedLive = state.getLastAcceptedLive(requestThreadId);
+          const silenceElapsed =
+            lastAcceptedLive === undefined
+              ? RECOVERED_RECONCILIATION_SILENCE_MS
+              : Date.now() - lastAcceptedLive.receivedAt;
+          if (silenceElapsed < RECOVERED_RECONCILIATION_SILENCE_MS) {
+            // 不订阅每个 delta，避免 Composer/导航跟随正文高频重渲染；timer 到点时读取本地
+            // 接收时钟即可把健康事件后的剩余静默窗口顺延，正常输出不制造读取请求。
+            scheduleRecoveredTurnReconciliation(
+              requestThreadId,
+              requestTurnId,
+              Math.max(50, RECOVERED_RECONCILIATION_SILENCE_MS - silenceElapsed),
+            );
+            return;
+          }
+          // 当前没有待处理 resync 时，5 秒静默才触发一次健康对账；读失败的异常退避由
+          // Conversation controller 负责，避免这里再叠加第二套 0.5/1/2/5 轮询。
+          if (state.resyncRequired[requestThreadId] === undefined)
+            state.requestThreadResync(requestThreadId);
+        }, delayMs),
+      };
+      recoveredTurnReconciliationRef.current.set(requestTurnId, entry);
     },
     [releaseRecoveredTurnReconciliation],
   );
@@ -764,20 +915,29 @@ export function useConversationInteractionController({
     });
   }, [currentThreads, currentTurns]);
 
-  /** 权威状态离开 suspended 后释放 Resume single-flight；同一 Turn 日后再次中断仍可重新授权。 */
+  /**
+   * 权威状态离开 suspended 后释放当前 Runtime/Thread 的 Resume single-flight；按请求 pair
+   * 计算 key，旧 SID 同名 Turn 的收尾不能释放新服务实例的 guard。@author kongweiguang
+   */
   useEffect(() => {
+    const fence = captureTimelineRuntimeFence();
+    const currentTurnOperationKey =
+      threadId !== undefined && fence !== undefined
+        ? (turnId: string) => threadRuntimeOperationKey(threadId, fence, turnId)
+        : undefined;
     setResumingTurnIds((current) => {
       let changed = false;
       const next = { ...current };
       for (const turnId of Object.keys(current)) {
         if (currentTurns[turnId]?.status === "suspended") continue;
-        resumeGuardsRef.current.delete(turnId);
+        const key = currentTurnOperationKey?.(turnId);
+        if (key !== undefined) resumeGuardsRef.current.delete(key);
         delete next[turnId];
         changed = true;
       }
       return changed ? next : current;
     });
-  }, [currentTurns]);
+  }, [currentTurns, threadId]);
 
   /**
    * Cancel ACK 只是接纳事实；只有 Timeline 权威终态或 Turn 从权威投影消失后，才能释放
@@ -789,7 +949,10 @@ export function useConversationInteractionController({
       const turn = currentTurns[turnId];
       return turn === undefined || TERMINAL_TURN_STATES.has(turn.status);
     });
-    for (const turnId of completedTurnIds) releaseCancellation(turnId);
+    for (const turnId of completedTurnIds) {
+      const owner = cancelThreadByTurnRef.current.get(turnId);
+      if (owner !== undefined) releaseCancellation(owner);
+    }
   }, [cancellingTurnIds, currentTurns, releaseCancellation]);
 
   /**
@@ -798,17 +961,23 @@ export function useConversationInteractionController({
    */
   useEffect(() => {
     for (const [turnId, reconciliation] of cancelReconciliationRef.current) {
-      if (reconciliation.threadId !== threadId) {
+      if (reconciliation.owner.threadId !== threadId) {
         clearTimeout(reconciliation.timer);
-        cancelReconciliationRef.current.delete(turnId);
+        if (cancelReconciliationRef.current.get(turnId) === reconciliation)
+          cancelReconciliationRef.current.delete(turnId);
       }
     }
     if (threadId === undefined) return;
-    for (const [turnId, requestThreadId] of cancelThreadByTurnRef.current) {
-      if (requestThreadId !== threadId || cancelReconciliationRef.current.has(turnId)) continue;
+    for (const [turnId, owner] of cancelThreadByTurnRef.current) {
+      if (
+        owner.threadId !== threadId ||
+        !timelineRequestIsCurrent(owner.threadId, owner.fence) ||
+        cancelReconciliationRef.current.has(turnId)
+      )
+        continue;
       const turn = currentTurns[turnId];
       if (turn === undefined || TERMINAL_TURN_STATES.has(turn.status)) continue;
-      scheduleCancelReconciliation(requestThreadId, turnId);
+      scheduleCancelReconciliation(owner);
     }
   }, [currentTurns, scheduleCancelReconciliation, threadId]);
 
@@ -817,14 +986,21 @@ export function useConversationInteractionController({
    * 意图由 Conversation controller 单独消费，避免 interaction 再造第二条 read 链。
    */
   useEffect(() => {
+    const fence = captureTimelineRuntimeFence();
+    const currentTurnOperationKey =
+      threadId !== undefined && fence !== undefined
+        ? (turnId: string) => threadRuntimeOperationKey(threadId, fence, turnId)
+        : undefined;
     for (const [turnId, reconciliation] of recoveredTurnReconciliationRef.current) {
       const turn = currentTurns[turnId];
+      const cancelKey = currentTurnOperationKey?.(turnId);
       const keepTimer =
         reconciliation.threadId === threadId &&
         recoveredActiveTurnId === turnId &&
         reconciliation.generation === useTimelineStore.getState().handshake.generation &&
+        reconciliation.serverInstanceId === useTimelineStore.getState().serverInstanceId &&
         recoveredResyncReason === undefined &&
-        !cancelGuardsRef.current.has(turnId) &&
+        !(cancelKey !== undefined && cancelGuardsRef.current.has(cancelKey)) &&
         turn !== undefined &&
         !TERMINAL_TURN_STATES.has(turn.status) &&
         shouldReconcileRecoveredTurn(turn.status);
@@ -832,10 +1008,14 @@ export function useConversationInteractionController({
         releaseRecoveredTurnReconciliation(turnId);
       }
     }
+    const activeCancelKey =
+      recoveredActiveTurnId === undefined
+        ? undefined
+        : currentTurnOperationKey?.(recoveredActiveTurnId);
     if (
       threadId === undefined ||
       recoveredActiveTurnId === undefined ||
-      cancelGuardsRef.current.has(recoveredActiveTurnId) ||
+      (activeCancelKey !== undefined && cancelGuardsRef.current.has(activeCancelKey)) ||
       recoveredResyncReason !== undefined
     ) {
       if (recoveredActiveTurnId === undefined)
@@ -872,12 +1052,18 @@ export function useConversationInteractionController({
     threadId,
   ]);
 
-  /** Draft 只写入当前有效 Thread，并在用户继续编辑时清除该 Thread 的旧反馈。 */
+  /** Draft 只写入当前 Runtime 中尚未关闭的 Thread；延迟 updater 再验一次，拒绝 close 后迟到输入。@author kongweiguang */
   const updateDraft = useCallback(
     (text: string): void => {
-      if (threadId === undefined) return;
-      setDraftsByThread((current) => ({ ...current, [threadId]: text }));
+      const requestFence = captureTimelineRuntimeFence();
+      if (threadId === undefined || !timelineRequestIsCurrent(threadId, requestFence)) return;
+      setDraftsByThread((current) =>
+        timelineRequestIsCurrent(threadId, requestFence)
+          ? { ...current, [threadId]: text }
+          : current,
+      );
       setErrorsByThread((current) => {
+        if (!timelineRequestIsCurrent(threadId, requestFence)) return current;
         if (current[threadId] === undefined) return current;
         const next = { ...current };
         delete next[threadId];
@@ -890,10 +1076,11 @@ export function useConversationInteractionController({
     [threadId],
   );
 
-  /** Context Chip 与文本共享 Thread 隔离，但独立更新避免 textarea 编辑覆盖已选引用。 */
+  /** Context Chip 与文本共享 Runtime/Thread 隔离，独立更新但不允许已关闭 Thread 复活。@author kongweiguang */
   const updateContextReferences = useCallback(
     (references: readonly ConversationContextReference[]): void => {
-      if (threadId === undefined) return;
+      const requestFence = captureTimelineRuntimeFence();
+      if (threadId === undefined || !timelineRequestIsCurrent(threadId, requestFence)) return;
       const seen = new Set<string>();
       const unique = references.filter((reference) => {
         const identity = contextReferenceIdentity(reference);
@@ -901,8 +1088,13 @@ export function useConversationInteractionController({
         seen.add(identity);
         return true;
       });
-      setContextDraftsByThread((current) => ({ ...current, [threadId]: unique }));
+      setContextDraftsByThread((current) =>
+        timelineRequestIsCurrent(threadId, requestFence)
+          ? { ...current, [threadId]: unique }
+          : current,
+      );
       setErrorsByThread((current) => {
+        if (!timelineRequestIsCurrent(threadId, requestFence)) return current;
         if (current[threadId] === undefined) return current;
         const next = { ...current };
         delete next[threadId];
@@ -919,6 +1111,7 @@ export function useConversationInteractionController({
       const source = reaskableQuestionSource(requestThreadId ?? "", latestStoppedTurn);
       if (
         requestThreadId === undefined ||
+        timelineThreadIsClosed(requestThreadId) ||
         latestStoppedTurn === undefined ||
         source === undefined ||
         source.itemId !== item.itemId ||
@@ -963,6 +1156,11 @@ export function useConversationInteractionController({
         [requestThreadId]: sourceAttachments,
       }));
       setErrorsByThread((current) => {
+        const next = { ...current };
+        delete next[requestThreadId];
+        return next;
+      });
+      setModelSettingsRequiredByThread((current) => {
         const next = { ...current };
         delete next[requestThreadId];
         return next;
@@ -1020,6 +1218,7 @@ export function useConversationInteractionController({
   const send = useCallback(
     async ({ text, attachmentIds, contextReferences }: ConversationSubmit): Promise<void> => {
       const requestThreadId = threadId;
+      const requestFence = captureTimelineRuntimeFence();
       const editing =
         requestThreadId === undefined ? undefined : editingQuestionByThread[requestThreadId];
       const submittedText = text.trim();
@@ -1040,6 +1239,8 @@ export function useConversationInteractionController({
           : reaskableQuestionSource(requestThreadId, latestStoppedTurn);
       if (
         requestThreadId === undefined ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+        timelineThreadIsClosed(requestThreadId) ||
         workspaceId === undefined ||
         preferences === undefined ||
         (submittedText.length === 0 &&
@@ -1053,7 +1254,7 @@ export function useConversationInteractionController({
         (editing !== undefined &&
           (latestStoppedTurn?.turnId !== editing.stoppedTurnId ||
             sourceStillReaskable === undefined)) ||
-        submitGuardsRef.current.has(requestThreadId) ||
+        hasCurrentSubmitGuard(requestThreadId) ||
         pendingTurnsRef.current[requestThreadId] !== undefined
       )
         return;
@@ -1063,6 +1264,11 @@ export function useConversationInteractionController({
       const submittedAttachmentItems = availableAttachments.filter((attachment) =>
         submittedAttachmentSet.has(attachment.attachmentId),
       );
+      const submitToken = Symbol("conversation-submit");
+      submitOwnerByThreadRef.current.set(requestThreadId, {
+        token: submitToken,
+        fence: requestFence,
+      });
       submitGuardsRef.current.add(requestThreadId);
       setSendingThreadIds((current) => ({ ...current, [requestThreadId]: true }));
       setLocalSubmissionsByThread((current) => ({
@@ -1115,13 +1321,16 @@ export function useConversationInteractionController({
       try {
         if (editing === undefined && preferences.collaborationMode === "plan") {
           const expectedThreadRevision = currentThreads[requestThreadId]?.revision;
-          if (
-            expectedThreadRevision === undefined ||
-            planCreationPort === undefined ||
-            !(await planCreationPort.create(requestThreadId, submittedText, expectedThreadRevision))
-          ) {
+          if (expectedThreadRevision === undefined || planCreationPort === undefined) {
             throw new Error("plan artifact was not acknowledged");
           }
+          const planCreated = await planCreationPort.create(
+            requestThreadId,
+            submittedText,
+            expectedThreadRevision,
+          );
+          if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return;
+          if (!planCreated) throw new Error("plan artifact was not acknowledged");
         }
         // Runtime port 负责真正接纳；即时 UI 反馈不伪造 Turn identity 或持久 Timeline 事实。
         const projectionAttachments = submittedAttachmentItems.map((attachment) => ({
@@ -1160,7 +1369,12 @@ export function useConversationInteractionController({
                     ...(projectionAttachments.length === 0 ? {} : { projectionAttachments }),
                   }),
               });
-        if (!mountedRef.current) return;
+        if (
+          !mountedRef.current ||
+          !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+          timelineThreadIsClosed(requestThreadId)
+        )
+          return;
         const newlyBoundAttachments = submittedAttachmentItems.filter(
           (attachment) => attachment.historyBound !== true,
         );
@@ -1210,13 +1424,23 @@ export function useConversationInteractionController({
           useTimelineStore.getState().requestThreadResync(requestThreadId);
         }
       } catch (error) {
-        if (mountedRef.current) {
+        if (
+          mountedRef.current &&
+          timelineRequestIsCurrent(requestThreadId, requestFence) &&
+          !timelineThreadIsClosed(requestThreadId)
+        ) {
           const code =
             typeof error === "object" && error !== null && "code" in error
               ? String((error as { code: unknown }).code)
               : undefined;
+          const modelSettingsRequired = new Set([
+            "PROVIDER_OR_MODEL_NOT_FOUND",
+            "CREDENTIAL_MISSING",
+            "MODEL_UNAVAILABLE",
+          ]).has(code ?? "");
           const preserveDraft =
             editing !== undefined ||
+            modelSettingsRequired ||
             new Set([
               "WORKSPACE_REFERENCE_INVALID",
               "SKILL_UNAVAILABLE",
@@ -1279,16 +1503,28 @@ export function useConversationInteractionController({
             setErrorsByThread((current) => ({
               ...current,
               [requestThreadId]:
-                code === "TURN_NOT_REASKABLE"
-                  ? "当前问题已无法编辑，请刷新对话。"
-                  : code === "CONFLICT"
-                    ? "对话已更新，请刷新后重试。"
-                    : code === "CONTENT_TOO_LARGE"
-                      ? "消息内容过大，请精简后重试。"
-                      : editing !== undefined
-                        ? "编辑后的问题未能提交，请重试。"
-                        : "引用已变化，请调整后重试。",
+                code === "PROVIDER_OR_MODEL_NOT_FOUND"
+                  ? "当前会话模型已不可用，输入草稿已保留。请配置模型后重试。"
+                  : code === "CREDENTIAL_MISSING"
+                    ? "当前模型缺少凭据，输入草稿已保留。请检查模型设置中的凭据。"
+                    : code === "MODEL_UNAVAILABLE"
+                      ? "模型连接暂不可用，输入草稿已保留。请检查连接和凭据。"
+                      : code === "TURN_NOT_REASKABLE"
+                        ? "当前问题已无法编辑，请刷新对话。"
+                        : code === "CONFLICT"
+                          ? "对话已更新，请刷新后重试。"
+                          : code === "CONTENT_TOO_LARGE"
+                            ? "消息内容过大，请精简后重试。"
+                            : editing !== undefined
+                              ? "编辑后的问题未能提交，请重试。"
+                              : "引用已变化，请调整后重试。",
             }));
+            if (modelSettingsRequired) {
+              setModelSettingsRequiredByThread((current) => ({
+                ...current,
+                [requestThreadId]: true,
+              }));
+            }
             setDraftRecoveryRevisionsByThread((current) => ({
               ...current,
               [requestThreadId]: (current[requestThreadId] ?? 0) + 1,
@@ -1296,8 +1532,15 @@ export function useConversationInteractionController({
           }
         }
       } finally {
-        submitGuardsRef.current.delete(requestThreadId);
-        if (mountedRef.current) {
+        if (submitOwnerByThreadRef.current.get(requestThreadId)?.token === submitToken) {
+          submitOwnerByThreadRef.current.delete(requestThreadId);
+          submitGuardsRef.current.delete(requestThreadId);
+        }
+        if (
+          mountedRef.current &&
+          timelineRequestIsCurrent(requestThreadId, requestFence) &&
+          !timelineThreadIsClosed(requestThreadId)
+        ) {
           setSendingThreadIds((current) => {
             const next = { ...current };
             delete next[requestThreadId];
@@ -1323,12 +1566,14 @@ export function useConversationInteractionController({
       threadId,
       turnPort,
       workspaceId,
+      hasCurrentSubmitGuard,
     ],
   );
 
-  /** 无可见 USER 的继续使用当前 Thread CAS；后台会从有效历史重试，不重放已提交 Tool。 */
+  /** 关闭或 Runtime 切换期间的迟到 ACK 不得复活旧 pending，也不能清掉新 Runtime 的提交 guard。@author kongweiguang */
   const continueReply = useCallback(async (): Promise<void> => {
     const requestThreadId = threadId;
+    const requestFence = captureTimelineRuntimeFence();
     const hasDraftIntent =
       (requestThreadId === undefined ? "" : (draftsByThread[requestThreadId] ?? "")).trim() !==
         "" ||
@@ -1338,11 +1583,13 @@ export function useConversationInteractionController({
         .length > 0;
     if (
       requestThreadId === undefined ||
+      !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+      timelineThreadIsClosed(requestThreadId) ||
       latestStoppedTurn === undefined ||
       continuationSource === undefined ||
       hasDraftIntent ||
       editingQuestionByThread[requestThreadId] !== undefined ||
-      submitGuardsRef.current.has(requestThreadId) ||
+      hasCurrentSubmitGuard(requestThreadId) ||
       pendingTurnsRef.current[requestThreadId] !== undefined ||
       blockingTurn !== undefined ||
       !ready ||
@@ -1357,6 +1604,11 @@ export function useConversationInteractionController({
         ?.itemId !== continuationSource.itemId
     )
       return;
+    const submitToken = Symbol("conversation-continue");
+    submitOwnerByThreadRef.current.set(requestThreadId, {
+      token: submitToken,
+      fence: requestFence,
+    });
     submitGuardsRef.current.add(requestThreadId);
     setSendingThreadIds((current) => ({ ...current, [requestThreadId]: true }));
     setErrorsByThread((current) => {
@@ -1377,14 +1629,23 @@ export function useConversationInteractionController({
             sourceMessageId,
           }),
       });
-      if (!mountedRef.current) return;
+      if (
+        !mountedRef.current ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+        timelineThreadIsClosed(requestThreadId)
+      )
+        return;
       if (!isAcceptedTurnTerminal(requestThreadId, accepted)) {
         const nextPending = { ...pendingTurnsRef.current, [requestThreadId]: accepted };
         pendingTurnsRef.current = nextPending;
         setPendingTurns(nextPending);
       }
     } catch (error) {
-      if (mountedRef.current) {
+      if (
+        mountedRef.current &&
+        timelineRequestIsCurrent(requestThreadId, requestFence) &&
+        !timelineThreadIsClosed(requestThreadId)
+      ) {
         const code = interactionErrorCode(error);
         setErrorsByThread((current) => ({
           ...current,
@@ -1397,8 +1658,15 @@ export function useConversationInteractionController({
         }));
       }
     } finally {
-      submitGuardsRef.current.delete(requestThreadId);
-      if (mountedRef.current)
+      if (submitOwnerByThreadRef.current.get(requestThreadId)?.token === submitToken) {
+        submitOwnerByThreadRef.current.delete(requestThreadId);
+        submitGuardsRef.current.delete(requestThreadId);
+      }
+      if (
+        mountedRef.current &&
+        timelineRequestIsCurrent(requestThreadId, requestFence) &&
+        !timelineThreadIsClosed(requestThreadId)
+      )
         setSendingThreadIds((current) => {
           const next = { ...current };
           delete next[requestThreadId];
@@ -1418,6 +1686,7 @@ export function useConversationInteractionController({
     continuationSource,
     threadId,
     turnPort,
+    hasCurrentSubmitGuard,
   ]);
 
   /**
@@ -1427,6 +1696,7 @@ export function useConversationInteractionController({
   const enqueue = useCallback(
     async ({ text, attachmentIds, contextReferences = [] }: ConversationSubmit): Promise<void> => {
       const requestThreadId = threadId;
+      const requestFence = captureTimelineRuntimeFence();
       const requestTurnId = blockingTurnId;
       const submittedText = text.trim();
       const submittedReferences = [...contextReferences];
@@ -1452,6 +1722,8 @@ export function useConversationInteractionController({
       ];
       if (
         requestThreadId === undefined ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+        timelineThreadIsClosed(requestThreadId) ||
         requestTurnId === undefined ||
         (submittedText.length === 0 &&
           submittedReferences.length === 0 &&
@@ -1504,9 +1776,14 @@ export function useConversationInteractionController({
       try {
         const result = await enqueueThreadMutation(
           queueMutationLanesRef.current,
-          requestThreadId,
+          threadMutationLaneKey(requestThreadId, requestFence),
           () => turnPort.enqueueTurnInput({ turnId: requestTurnId, content }),
         );
+        if (
+          !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+          timelineThreadIsClosed(requestThreadId)
+        )
+          return;
         // Runtime projection 通常已先写入；这里复用同一幂等 reducer，保证窄端口 fake/替代实现也收敛。
         useTimelineStore.getState().applyInputQueue(result.inputQueue);
         if (submittedAttachmentIds.length > 0) {
@@ -1515,7 +1792,11 @@ export function useConversationInteractionController({
           onAttachmentsBound?.(requestThreadId, submittedAttachmentIds);
         }
       } catch {
-        if (mountedRef.current) {
+        if (
+          mountedRef.current &&
+          timelineRequestIsCurrent(requestThreadId, requestFence) &&
+          !timelineThreadIsClosed(requestThreadId)
+        ) {
           setDraftsByThread((current) => ({
             ...current,
             [requestThreadId]: (() => {
@@ -1568,7 +1849,11 @@ export function useConversationInteractionController({
           }));
         }
       } finally {
-        if (mountedRef.current) {
+        if (
+          mountedRef.current &&
+          timelineRequestIsCurrent(requestThreadId, requestFence) &&
+          !timelineThreadIsClosed(requestThreadId)
+        ) {
           setPendingQueuedInputsByThread((current) => {
             const observed = current[requestThreadId] ?? [];
             const nextItems = observed.filter((item) => item.inputId !== pendingInput.inputId);
@@ -1602,13 +1887,19 @@ export function useConversationInteractionController({
       content?: readonly UserContentBlock[],
     ): Promise<void> => {
       const requestThreadId = threadId;
+      const requestFence = captureTimelineRuntimeFence();
       const requestTurnId = blockingTurnId;
       if (
         requestThreadId === undefined ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+        timelineThreadIsClosed(requestThreadId) ||
         requestTurnId === undefined ||
         queueActionsByInputId[inputId] !== undefined
       )
         return;
+      const actionToken = Symbol("queued-input-action");
+      queueInputOwnerByIdRef.current.set(inputId, requestThreadId);
+      queueActionOwnerByInputIdRef.current.set(inputId, actionToken);
       setQueueActionsByInputId((current) => ({ ...current, [inputId]: action }));
       setQueueErrorsByInputId((current) => {
         if (current[inputId] === undefined) return current;
@@ -1619,7 +1910,7 @@ export function useConversationInteractionController({
       try {
         const result = await enqueueThreadMutation(
           queueMutationLanesRef.current,
-          requestThreadId,
+          threadMutationLaneKey(requestThreadId, requestFence),
           () => {
             const identity = { turnId: requestTurnId, inputId, expectedInputRevision };
             if (action === "prioritize") return turnPort.prioritizeTurnInput(identity);
@@ -1627,9 +1918,22 @@ export function useConversationInteractionController({
             return turnPort.updateTurnInput({ ...identity, content: [...(content ?? [])] });
           },
         );
+        if (
+          !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+          timelineThreadIsClosed(requestThreadId)
+        )
+          return;
         useTimelineStore.getState().applyInputQueue(result.inputQueue);
+        if (!result.inputQueue.items.some((item) => item.inputId === inputId))
+          if (queueActionOwnerByInputIdRef.current.get(inputId) === actionToken)
+            queueInputOwnerByIdRef.current.delete(inputId);
       } catch (error) {
-        if (!mountedRef.current) return;
+        if (
+          !mountedRef.current ||
+          !timelineRequestIsCurrent(requestThreadId, requestFence) ||
+          timelineThreadIsClosed(requestThreadId)
+        )
+          return;
         const code =
           typeof error === "object" && error !== null && "code" in error
             ? String((error as { code: unknown }).code)
@@ -1646,13 +1950,16 @@ export function useConversationInteractionController({
                 : "操作失败，请重试",
         }));
       } finally {
-        if (mountedRef.current)
-          setQueueActionsByInputId((current) => {
-            if (current[inputId] === undefined) return current;
-            const next = { ...current };
-            delete next[inputId];
-            return next;
-          });
+        if (queueActionOwnerByInputIdRef.current.get(inputId) === actionToken) {
+          queueActionOwnerByInputIdRef.current.delete(inputId);
+          if (mountedRef.current)
+            setQueueActionsByInputId((current) => {
+              if (current[inputId] === undefined) return current;
+              const next = { ...current };
+              delete next[inputId];
+              return next;
+            });
+        }
       }
     },
     [blockingTurnId, queueActionsByInputId, threadId, turnPort],
@@ -1674,23 +1981,39 @@ export function useConversationInteractionController({
 
   /**
    * Resume 冻结 Suspended Turn 与 revision CAS，并保留 busy 状态直到权威事件离开 suspended；
-   * ACK 本身不被当作状态转换，避免用户重复点击产生第二次恢复授权。
+   * 请求 pair 不再当前或 Thread 已关闭时，迟到失败不得恢复 busy/error 草稿。@author kongweiguang
    */
   const resume = useCallback(async (): Promise<void> => {
     const requestThreadId = threadId;
     const requestTurnId = suspendedTurn?.turnId;
     const requestRevision = suspendedTurn?.threadRevision;
+    const requestFence = captureTimelineRuntimeFence();
     if (
       requestThreadId === undefined ||
       requestTurnId === undefined ||
       requestRevision === undefined ||
-      cancelGuardsRef.current.has(requestTurnId) ||
-      resumeGuardsRef.current.has(requestTurnId)
+      requestFence === undefined ||
+      !timelineRequestIsCurrent(requestThreadId, requestFence)
     )
       return;
-    resumeGuardsRef.current.add(requestTurnId);
-    setResumingTurnIds((current) => ({ ...current, [requestTurnId]: true }));
+    const operationKey = threadRuntimeOperationKey(requestThreadId, requestFence, requestTurnId);
+    if (cancelGuardsRef.current.has(operationKey) || resumeGuardsRef.current.has(operationKey))
+      return;
+    const owner: ThreadTurnOperationOwner = {
+      key: operationKey,
+      threadId: requestThreadId,
+      turnId: requestTurnId,
+      fence: requestFence,
+      token: Symbol("turn-resume"),
+    };
+    resumeGuardsRef.current.set(operationKey, owner);
+    setResumingTurnIds((current) =>
+      timelineRequestIsCurrent(requestThreadId, requestFence)
+        ? { ...current, [requestTurnId]: true }
+        : current,
+    );
     setErrorsByThread((current) => {
+      if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
       const next = { ...current };
       delete next[requestThreadId];
       return next;
@@ -1700,10 +2023,19 @@ export function useConversationInteractionController({
         turnId: requestTurnId,
         expectedThreadRevision: requestRevision,
       });
+      if (
+        resumeGuardsRef.current.get(operationKey) !== owner ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
+      ) {
+        if (resumeGuardsRef.current.get(operationKey) === owner)
+          resumeGuardsRef.current.delete(operationKey);
+      }
     } catch (error) {
-      resumeGuardsRef.current.delete(requestTurnId);
-      if (mountedRef.current) {
+      if (resumeGuardsRef.current.get(operationKey) !== owner) return;
+      resumeGuardsRef.current.delete(operationKey);
+      if (mountedRef.current && timelineRequestIsCurrent(requestThreadId, requestFence)) {
         setResumingTurnIds((current) => {
+          if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
           const next = { ...current };
           delete next[requestTurnId];
           return next;
@@ -1718,30 +2050,50 @@ export function useConversationInteractionController({
             : code === "TURN_NOT_RESUMABLE"
               ? "当前运行已无法继续，请取消后重新发起。"
               : "继续失败，请确认运行时状态后重试。";
-        setErrorsByThread((current) => ({ ...current, [requestThreadId]: message }));
+        setErrorsByThread((current) =>
+          timelineRequestIsCurrent(requestThreadId, requestFence)
+            ? { ...current, [requestThreadId]: message }
+            : current,
+        );
       }
     }
   }, [suspendedTurn, threadId, turnPort]);
 
   /**
-   * 取消操作冻结点击时的 Turn identity 并按 Turn single-flight；ACK 后保持 guard，直到
-   * Timeline 给出权威终态或目标消失，controller 始终不做 optimistic completion。
+   * 取消操作冻结点击时的 Turn identity 与 Runtime pair 并按 owner token single-flight；ACK
+   * 后保持 guard 直到权威终态或目标消失，close tombstone 会阻止迟到结果重写错误/队列。@author kongweiguang
    */
   const cancel = useCallback(async (): Promise<void> => {
     const requestThreadId = threadId;
     const requestTurnId = blockingTurnId;
+    const requestFence = captureTimelineRuntimeFence();
     if (
       requestThreadId === undefined ||
       requestTurnId === undefined ||
-      resumeGuardsRef.current.has(requestTurnId) ||
-      cancelGuardsRef.current.has(requestTurnId)
+      requestFence === undefined ||
+      !timelineRequestIsCurrent(requestThreadId, requestFence)
     )
       return;
-    cancelGuardsRef.current.add(requestTurnId);
-    cancelThreadByTurnRef.current.set(requestTurnId, requestThreadId);
+    const operationKey = threadRuntimeOperationKey(requestThreadId, requestFence, requestTurnId);
+    if (resumeGuardsRef.current.has(operationKey) || cancelGuardsRef.current.has(operationKey))
+      return;
+    const owner: ThreadTurnOperationOwner = {
+      key: operationKey,
+      threadId: requestThreadId,
+      turnId: requestTurnId,
+      fence: requestFence,
+      token: Symbol("turn-cancel"),
+    };
+    cancelGuardsRef.current.set(operationKey, owner);
+    cancelThreadByTurnRef.current.set(requestTurnId, owner);
     releaseRecoveredTurnReconciliation(requestTurnId);
-    setCancellingTurnIds((current) => ({ ...current, [requestTurnId]: true }));
+    setCancellingTurnIds((current) =>
+      timelineRequestIsCurrent(requestThreadId, requestFence)
+        ? { ...current, [requestTurnId]: true }
+        : current,
+    );
     setErrorsByThread((current) => {
+      if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
       const next = { ...current };
       delete next[requestThreadId];
       return next;
@@ -1750,21 +2102,35 @@ export function useConversationInteractionController({
       await turnPort.cancelTurn({
         turnId: requestTurnId,
       });
+      if (
+        cancelGuardsRef.current.get(operationKey) !== owner ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
+      ) {
+        releaseCancellation(owner);
+        return;
+      }
       if (!mountedRef.current || currentThreadIdRef.current !== requestThreadId) return;
       // ACK 只代表服务端接纳；无论 ACK status 是否终态都重读一次，覆盖 terminal event 丢失。
       useTimelineStore.getState().requestThreadResync(requestThreadId);
-      scheduleCancelReconciliation(requestThreadId, requestTurnId);
+      scheduleCancelReconciliation(owner);
     } catch (error: unknown) {
-      if (!mountedRef.current) return;
+      if (
+        !mountedRef.current ||
+        cancelGuardsRef.current.get(operationKey) !== owner ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
+      ) {
+        releaseCancellation(owner);
+        return;
+      }
       const errorCode = cancellationErrorCode(error);
       if (currentThreadIdRef.current !== requestThreadId) {
-        releaseCancellation(requestTurnId);
+        releaseCancellation(owner);
         return;
       }
       if (cancellationNeedsThreadResync(errorCode)) {
         useTimelineStore.getState().requestThreadResync(requestThreadId);
       }
-      releaseCancellation(requestTurnId);
+      releaseCancellation(owner);
       if (mountedRef.current) {
         const message = cancellationFailureMessage(errorCode);
         if (onTransientError === undefined) {
@@ -1784,12 +2150,31 @@ export function useConversationInteractionController({
     turnPort,
   ]);
 
-  /** Approval 使用请求携带的 revision CAS，视图不能改写 identity，也不能重复提交同一审批。 */
+  /**
+   * Approval 使用请求携带的 revision CAS；失败反馈和 single-flight 释放都受 Thread、Runtime
+   * 与 approval owner 约束，避免关闭后旧响应污染同名新实例。@author kongweiguang
+   */
   const approve = useCallback(
     async (approval: TimelineApproval, decision: "approve" | "deny"): Promise<void> => {
-      if (approvalGuardsRef.current.has(approval.approvalId)) return;
-      approvalGuardsRef.current.add(approval.approvalId);
+      const requestFence = captureTimelineRuntimeFence();
+      if (!timelineRequestIsCurrent(approval.threadId, requestFence) || requestFence === undefined)
+        return;
+      const operationKey = threadRuntimeOperationKey(
+        approval.threadId,
+        requestFence,
+        approval.approvalId,
+      );
+      if (approvalGuardsRef.current.has(operationKey)) return;
+      const owner: ThreadTurnOperationOwner = {
+        key: operationKey,
+        threadId: approval.threadId,
+        turnId: approval.turnId,
+        fence: requestFence,
+        token: Symbol("approval-response"),
+      };
+      approvalGuardsRef.current.set(operationKey, owner);
       setErrorsByThread((current) => {
+        if (!timelineRequestIsCurrent(approval.threadId, requestFence)) return current;
         const next = { ...current };
         delete next[approval.threadId];
         return next;
@@ -1802,14 +2187,20 @@ export function useConversationInteractionController({
           expectedThreadRevision: approval.threadRevision,
         });
       } catch {
-        if (mountedRef.current) {
-          setErrorsByThread((current) => ({
-            ...current,
-            [approval.threadId]: "审批响应失败，请确认 Turn 状态后重试。",
-          }));
+        if (
+          mountedRef.current &&
+          approvalGuardsRef.current.get(operationKey) === owner &&
+          timelineRequestIsCurrent(approval.threadId, requestFence)
+        ) {
+          setErrorsByThread((current) =>
+            timelineRequestIsCurrent(approval.threadId, requestFence)
+              ? { ...current, [approval.threadId]: "审批响应失败，请确认 Turn 状态后重试。" }
+              : current,
+          );
         }
       } finally {
-        approvalGuardsRef.current.delete(approval.approvalId);
+        if (approvalGuardsRef.current.get(operationKey) === owner)
+          approvalGuardsRef.current.delete(operationKey);
       }
     },
     [turnPort],
@@ -1817,7 +2208,8 @@ export function useConversationInteractionController({
 
   /**
    * Thread 偏好更新保持 single-flight，并只调用 CAS 窄端口；active Turn 期间也允许变更，
-   * App Server 会在下一次 Provider 请求安全点解析新偏好，已发出的请求不受影响。
+   * App Server 会在下一次 Provider 请求安全点解析新偏好，已发出的请求不受影响；异步结果
+   * 只释放自己的 Runtime owner，旧完成不能清除同 ID 新会话的 busy/error 状态。@author kongweiguang
    */
   const updatePreference = useCallback(
     async (next: {
@@ -1828,10 +2220,12 @@ export function useConversationInteractionController({
       collaborationMode: ConversationCollaborationMode;
     }): Promise<void> => {
       const requestThreadId = threadId;
+      const requestFence = captureTimelineRuntimeFence();
       if (
         requestThreadId === undefined ||
         preferences === undefined ||
-        preferenceGuardsRef.current.has(requestThreadId)
+        requestFence === undefined ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
       )
         return;
       if (
@@ -1842,9 +2236,17 @@ export function useConversationInteractionController({
         preferences.collaborationMode === next.collaborationMode
       )
         return;
-      preferenceGuardsRef.current.add(requestThreadId);
-      setPreferenceBusyByThread((current) => ({ ...current, [requestThreadId]: true }));
+      const operationKey = threadRuntimeOperationKey(requestThreadId, requestFence, "preferences");
+      if (preferenceGuardsRef.current.has(operationKey)) return;
+      const operationToken = Symbol("thread-preferences");
+      preferenceGuardsRef.current.set(operationKey, operationToken);
+      setPreferenceBusyByThread((current) =>
+        timelineRequestIsCurrent(requestThreadId, requestFence)
+          ? { ...current, [requestThreadId]: true }
+          : current,
+      );
       setPreferenceErrorsByThread((current) => {
+        if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
         if (current[requestThreadId] === undefined) return current;
         const updated = { ...current };
         delete updated[requestThreadId];
@@ -1853,16 +2255,23 @@ export function useConversationInteractionController({
       try {
         await preferencesPort.updatePreferences(next);
       } catch {
-        if (mountedRef.current) {
-          setPreferenceErrorsByThread((current) => ({
-            ...current,
-            [requestThreadId]: "会话偏好更新失败，请刷新会话状态后重试。",
-          }));
+        if (
+          mountedRef.current &&
+          preferenceGuardsRef.current.get(operationKey) === operationToken &&
+          timelineRequestIsCurrent(requestThreadId, requestFence)
+        ) {
+          setPreferenceErrorsByThread((current) =>
+            timelineRequestIsCurrent(requestThreadId, requestFence)
+              ? { ...current, [requestThreadId]: "会话偏好更新失败，请刷新会话状态后重试。" }
+              : current,
+          );
         }
       } finally {
-        preferenceGuardsRef.current.delete(requestThreadId);
-        if (mountedRef.current) {
+        if (preferenceGuardsRef.current.get(operationKey) === operationToken)
+          preferenceGuardsRef.current.delete(operationKey);
+        if (mountedRef.current && timelineRequestIsCurrent(requestThreadId, requestFence)) {
           setPreferenceBusyByThread((current) => {
+            if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
             if (current[requestThreadId] === undefined) return current;
             const updated = { ...current };
             delete updated[requestThreadId];
@@ -1970,26 +2379,48 @@ export function useConversationInteractionController({
   /**
    * 启动一个 caller-owned Channel operation；事件始终写回点击时的 Thread，切换会话不会把
    * 晚到进度投影到当前草稿，command-level 失败则只写脱敏的可恢复反馈。
+   * @author kongweiguang
    */
   const runAttachmentImport = useCallback(
     async (
       invoke: (
         operationId: string,
         onEvent: (event: ConversationAttachmentImportEvent) => void,
+        requestFence: TimelineRuntimeFence,
       ) => Promise<unknown>,
-      onResult?: (result: unknown, requestThreadId: string) => void,
+      onResult?: (
+        result: unknown,
+        requestThreadId: string,
+        requestFence: TimelineRuntimeFence,
+      ) => void,
     ): Promise<void> => {
       const requestThreadId = threadId;
-      if (requestThreadId === undefined || attachmentPort === undefined) return;
+      const requestFence = captureTimelineRuntimeFence();
+      if (
+        requestThreadId === undefined ||
+        requestFence === undefined ||
+        attachmentPort === undefined ||
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
+      )
+        return;
       const operationId = createAttachmentOperationId();
-      attachmentOperationGuardsRef.current.add(operationId);
+      const operationKey = threadRuntimeOperationKey(requestThreadId, requestFence, operationId);
+      const operationToken = Symbol("attachment-import");
+      attachmentOperationGuardsRef.current.set(operationKey, operationToken);
       setErrorsByThread((current) => {
+        if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
         const next = { ...current };
         delete next[requestThreadId];
         return next;
       });
       const onEvent = (event: ConversationAttachmentImportEvent): void => {
-        if (!mountedRef.current || event.operationId !== operationId) return;
+        if (
+          !mountedRef.current ||
+          event.operationId !== operationId ||
+          attachmentOperationGuardsRef.current.get(operationKey) !== operationToken ||
+          !timelineRequestIsCurrent(requestThreadId, requestFence)
+        )
+          return;
         if (event.kind === "completed") {
           const sizes =
             readyAttachmentSizesRef.current[requestThreadId] ??
@@ -2001,36 +2432,55 @@ export function useConversationInteractionController({
             (sizes.size >= MAX_DRAFT_ATTACHMENTS ||
               totalBytes + event.attachment.sizeBytes > MAX_DRAFT_ATTACHMENT_BYTES)
           ) {
-            setAttachmentDraftsByThread((current) => ({
-              ...current,
-              [requestThreadId]: (current[requestThreadId] ?? []).filter(
-                (item) => item.itemId !== event.itemId,
-              ),
-            }));
-            setErrorsByThread((current) => ({
-              ...current,
-              [requestThreadId]: "每轮最多添加 10 个附件，总大小不能超过 250 MiB。",
-            }));
-            if (!overflowDiscardGuardsRef.current.has(event.attachment.attachmentId)) {
-              overflowDiscardGuardsRef.current.add(event.attachment.attachmentId);
+            setAttachmentDraftsByThread((current) => {
+              if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
+              return {
+                ...current,
+                [requestThreadId]: (current[requestThreadId] ?? []).filter(
+                  (item) => item.itemId !== event.itemId,
+                ),
+              };
+            });
+            setErrorsByThread((current) =>
+              timelineRequestIsCurrent(requestThreadId, requestFence)
+                ? {
+                    ...current,
+                    [requestThreadId]: "每轮最多添加 10 个附件，总大小不能超过 250 MiB。",
+                  }
+                : current,
+            );
+            const overflowKey = threadRuntimeOperationKey(
+              requestThreadId,
+              requestFence,
+              event.attachment.attachmentId,
+            );
+            if (!overflowDiscardGuardsRef.current.has(overflowKey)) {
+              const overflowToken = Symbol("attachment-overflow-discard");
+              overflowDiscardGuardsRef.current.set(overflowKey, overflowToken);
               void attachmentPort
                 .discardAttachment({ attachmentId: event.attachment.attachmentId })
                 .catch(() => {
-                  if (mountedRef.current)
-                    setErrorsByThread((current) => ({
-                      ...current,
-                      [requestThreadId]: "超出限制的附件暂时无法清理，将由附件回收机制处理。",
-                    }));
+                  if (mountedRef.current && timelineRequestIsCurrent(requestThreadId, requestFence))
+                    setErrorsByThread((current) =>
+                      timelineRequestIsCurrent(requestThreadId, requestFence)
+                        ? {
+                            ...current,
+                            [requestThreadId]: "超出限制的附件暂时无法清理，将由附件回收机制处理。",
+                          }
+                        : current,
+                    );
                 })
-                .finally(() =>
-                  overflowDiscardGuardsRef.current.delete(event.attachment.attachmentId),
-                );
+                .finally(() => {
+                  if (overflowDiscardGuardsRef.current.get(overflowKey) === overflowToken)
+                    overflowDiscardGuardsRef.current.delete(overflowKey);
+                });
             }
             return;
           }
           sizes.set(event.attachment.attachmentId, event.attachment.sizeBytes);
         }
         setAttachmentDraftsByThread((current) => {
+          if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
           const observed = current[requestThreadId] ?? [];
           const updated = applyAttachmentImportEvent(observed, event);
           if (updated === observed) return current;
@@ -2046,45 +2496,68 @@ export function useConversationInteractionController({
             }),
           };
         });
+        if (event.kind === "completed" || event.kind === "failed" || event.kind === "cancelled")
+          if (attachmentOperationGuardsRef.current.get(operationKey) === operationToken)
+            attachmentOperationGuardsRef.current.delete(operationKey);
       };
       try {
-        const result = await invoke(operationId, onEvent);
-        if (mountedRef.current) onResult?.(result, requestThreadId);
+        const result = await invoke(operationId, onEvent, requestFence);
+        if (
+          mountedRef.current &&
+          attachmentOperationGuardsRef.current.get(operationKey) === operationToken &&
+          timelineRequestIsCurrent(requestThreadId, requestFence)
+        )
+          onResult?.(result, requestThreadId, requestFence);
+        const outcome = (result as { outcome?: unknown } | undefined)?.outcome;
+        if (
+          onResult !== undefined &&
+          (outcome === "busy" || outcome === "nothing_importable") &&
+          attachmentOperationGuardsRef.current.get(operationKey) === operationToken
+        )
+          attachmentOperationGuardsRef.current.delete(operationKey);
       } catch {
-        if (mountedRef.current) {
-          setAttachmentDraftsByThread((current) => ({
-            ...current,
-            [requestThreadId]: (current[requestThreadId] ?? []).map((item) =>
-              item.state === "importing" && item.operationId === operationId
-                ? {
-                    state: "failed",
-                    operationId,
-                    attemptId: item.attemptId,
-                    itemId: item.itemId,
-                    fileName: item.fileName,
-                    sizeBytes: item.sizeBytes,
-                    mediaKind: item.mediaKind,
-                    mediaType: item.mediaType,
-                    code: "IMPORT_COMMAND_FAILED",
-                    message: "附件导入中断，请重试。",
-                    retryable: true,
-                  }
-                : item,
-            ),
-          }));
-          setErrorsByThread((current) => ({
-            ...current,
-            [requestThreadId]: "附件导入失败，请检查文件后重试。",
-          }));
+        if (
+          mountedRef.current &&
+          attachmentOperationGuardsRef.current.get(operationKey) === operationToken &&
+          timelineRequestIsCurrent(requestThreadId, requestFence)
+        ) {
+          setAttachmentDraftsByThread((current) => {
+            if (!timelineRequestIsCurrent(requestThreadId, requestFence)) return current;
+            return {
+              ...current,
+              [requestThreadId]: (current[requestThreadId] ?? []).map((item) =>
+                item.state === "importing" && item.operationId === operationId
+                  ? {
+                      state: "failed",
+                      operationId,
+                      attemptId: item.attemptId,
+                      itemId: item.itemId,
+                      fileName: item.fileName,
+                      sizeBytes: item.sizeBytes,
+                      mediaKind: item.mediaKind,
+                      mediaType: item.mediaType,
+                      code: "IMPORT_COMMAND_FAILED",
+                      message: "附件导入中断，请重试。",
+                      retryable: true,
+                    }
+                  : item,
+              ),
+            };
+          });
+          setErrorsByThread((current) =>
+            timelineRequestIsCurrent(requestThreadId, requestFence)
+              ? { ...current, [requestThreadId]: "附件导入失败，请检查文件后重试。" }
+              : current,
+          );
         }
-      } finally {
-        attachmentOperationGuardsRef.current.delete(operationId);
+        if (attachmentOperationGuardsRef.current.get(operationKey) === operationToken)
+          attachmentOperationGuardsRef.current.delete(operationKey);
       }
     },
     [attachmentPort, threadId],
   );
 
-  /** Picker、drop 和 clipboard 仅决定来源，状态收敛完全复用同一 Channel reducer。 */
+  /** Picker、drop 和 clipboard 仅决定来源，状态收敛完全复用同一 Channel reducer。@author kongweiguang */
   const importAttachments = useCallback(
     () =>
       runAttachmentImport(
@@ -2107,7 +2580,7 @@ export function useConversationInteractionController({
         (operationId, onEvent) =>
           attachmentPort?.clipboardImport({ operationId, onEvent }) ??
           Promise.resolve({ outcome: "nothing_importable" as const }),
-        (result, requestThreadId) => {
+        (result, requestThreadId, requestFence) => {
           const outcome = (result as { outcome?: unknown }).outcome;
           const notice =
             outcome === "busy"
@@ -2115,16 +2588,17 @@ export function useConversationInteractionController({
               : outcome === "nothing_importable"
                 ? "剪贴板中没有可导入的文件或图片。"
                 : "已从剪贴板添加附件。";
-          setClipboardNoticesByThread((current) => ({
-            ...current,
-            [requestThreadId]: notice,
-          }));
+          setClipboardNoticesByThread((current) =>
+            timelineRequestIsCurrent(requestThreadId, requestFence)
+              ? { ...current, [requestThreadId]: notice }
+              : current,
+          );
         },
       ),
     [attachmentPort, runAttachmentImport],
   );
 
-  /** Retry 保留 itemId 的视觉位置并换用新 operation，Rust attempt 仍是唯一源能力。 */
+  /** Retry 保留 itemId 的视觉位置并换用新 operation，Rust attempt 仍是唯一源能力。@author kongweiguang */
   const retryAttachment = useCallback(
     async (itemId: string): Promise<void> => {
       const requestThreadId = threadId;
@@ -2136,27 +2610,30 @@ export function useConversationInteractionController({
                 item.itemId === itemId && item.state === "failed",
             );
       if (failed === undefined || !failed.retryable || attachmentPort === undefined) return;
-      await runAttachmentImport(async (operationId, onEvent) => {
-        setAttachmentDraftsByThread((current) => ({
-          ...current,
-          [requestThreadId!]: (current[requestThreadId!] ?? []).map((item) =>
-            item.itemId === itemId
-              ? {
-                  state: "importing",
-                  operationId,
-                  attemptId: failed.attemptId,
-                  itemId,
-                  fileName: failed.fileName,
-                  sizeBytes: failed.sizeBytes,
-                  mediaKind: failed.mediaKind,
-                  mediaType: failed.mediaType,
-                  phase: "copying",
-                  bytesCopied: 0,
-                  totalBytes: failed.sizeBytes,
-                }
-              : item,
-          ),
-        }));
+      await runAttachmentImport(async (operationId, onEvent, requestFence) => {
+        setAttachmentDraftsByThread((current) => {
+          if (!timelineRequestIsCurrent(requestThreadId!, requestFence)) return current;
+          return {
+            ...current,
+            [requestThreadId!]: (current[requestThreadId!] ?? []).map((item) =>
+              item.itemId === itemId
+                ? {
+                    state: "importing",
+                    operationId,
+                    attemptId: failed.attemptId,
+                    itemId,
+                    fileName: failed.fileName,
+                    sizeBytes: failed.sizeBytes,
+                    mediaKind: failed.mediaKind,
+                    mediaType: failed.mediaType,
+                    phase: "copying",
+                    bytesCopied: 0,
+                    totalBytes: failed.sizeBytes,
+                  }
+                : item,
+            ),
+          };
+        });
         await attachmentPort.retryImport({ operationId, attemptId: failed.attemptId, onEvent });
       });
     },
@@ -2165,11 +2642,14 @@ export function useConversationInteractionController({
 
   /**
    * X 的语义按状态区分：importing 协作取消、failed 释放短期 attempt、ready 先进入 removing
-   * 再丢弃 App Server 草稿；任何失败都保留可见对象供用户恢复。
+   * 再丢弃 App Server 草稿；任何失败都保留可见对象供用户恢复。await 返回只能写入仍拥有请求的
+   * SID+generation+Thread+token，close tombstone 先于附件清理生效，旧结果不得复活 projection。
+   * @author kongweiguang
    */
   const removeAttachment = useCallback(
     async (itemId: string): Promise<void> => {
       const requestThreadId = threadId;
+      const requestFence = captureTimelineRuntimeFence();
       const item =
         requestThreadId === undefined
           ? undefined
@@ -2180,21 +2660,33 @@ export function useConversationInteractionController({
         requestThreadId === undefined ||
         item === undefined ||
         item.state === "removing" ||
+        requestFence === undefined ||
         attachmentPort === undefined ||
-        attachmentDiscardGuardsRef.current.has(itemId)
+        !timelineRequestIsCurrent(requestThreadId, requestFence)
       )
         return;
-      attachmentDiscardGuardsRef.current.add(itemId);
+      const operationKey = threadRuntimeOperationKey(requestThreadId, requestFence, itemId);
+      if (attachmentDiscardGuardsRef.current.has(operationKey)) return;
+      const operationToken = Symbol("attachment-remove");
+      attachmentDiscardGuardsRef.current.set(operationKey, operationToken);
+      /** React updater 可能晚于 close ACK 调度，故每次实际写入都重新验证同一请求 owner。@author kongweiguang */
+      const ownsRemoval = (): boolean =>
+        mountedRef.current &&
+        attachmentDiscardGuardsRef.current.get(operationKey) === operationToken &&
+        timelineRequestIsCurrent(requestThreadId, requestFence);
       try {
         if (item.state === "importing") {
-          setAttachmentDraftsByThread((current) => ({
-            ...current,
-            [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
-              candidate.itemId === itemId && candidate.state === "importing"
-                ? { ...candidate, cancelRequested: true }
-                : candidate,
-            ),
-          }));
+          setAttachmentDraftsByThread((current) => {
+            if (!ownsRemoval()) return current;
+            return {
+              ...current,
+              [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
+                candidate.itemId === itemId && candidate.state === "importing"
+                  ? { ...candidate, cancelRequested: true }
+                  : candidate,
+              ),
+            };
+          });
           await attachmentPort.cancelImport({
             operationId: item.operationId,
             itemId: item.itemId,
@@ -2205,61 +2697,271 @@ export function useConversationInteractionController({
           await attachmentPort.discardAttempt({ attemptId: item.attemptId });
         } else if (item.historyBound !== true) {
           const ready = item;
-          setAttachmentDraftsByThread((current) => ({
-            ...current,
-            [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
-              candidate.itemId === itemId
-                ? {
-                    state: "removing",
-                    itemId,
-                    fileName: ready.fileName,
-                    sizeBytes: ready.sizeBytes,
-                    mediaKind: ready.mediaKind,
-                    mediaType: ready.mediaType,
-                    thumbnailUrl: ready.thumbnailUrl,
-                  }
-                : candidate,
-            ),
-          }));
+          setAttachmentDraftsByThread((current) => {
+            if (!ownsRemoval()) return current;
+            return {
+              ...current,
+              [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
+                candidate.itemId === itemId
+                  ? {
+                      state: "removing",
+                      itemId,
+                      fileName: ready.fileName,
+                      sizeBytes: ready.sizeBytes,
+                      mediaKind: ready.mediaKind,
+                      mediaType: ready.mediaType,
+                      thumbnailUrl: ready.thumbnailUrl,
+                    }
+                  : candidate,
+              ),
+            };
+          });
           await attachmentPort.discardAttachment({ attachmentId: ready.attachmentId });
+          if (!ownsRemoval()) return;
           readyAttachmentSizesRef.current[requestThreadId]?.delete(ready.attachmentId);
           onAttachmentRemoved?.(ready.attachmentId);
         }
-        if (!mountedRef.current) return;
-        setAttachmentDraftsByThread((current) => ({
-          ...current,
-          [requestThreadId]: (current[requestThreadId] ?? []).filter(
-            (candidate) => candidate.itemId !== itemId,
-          ),
-        }));
-      } catch {
-        if (mountedRef.current) {
-          if (item.state === "ready")
-            setAttachmentDraftsByThread((current) => ({
-              ...current,
-              [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
-                candidate.itemId === itemId ? item : candidate,
-              ),
-            }));
-          else if (item.state === "importing")
-            setAttachmentDraftsByThread((current) => ({
-              ...current,
-              [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
-                candidate.itemId === itemId && candidate.state === "importing"
-                  ? { ...candidate, cancelRequested: false }
-                  : candidate,
-              ),
-            }));
-          setErrorsByThread((current) => ({
+        if (!ownsRemoval()) return;
+        setAttachmentDraftsByThread((current) => {
+          if (!ownsRemoval()) return current;
+          return {
             ...current,
-            [requestThreadId]: "附件暂时无法移除，请重试。",
-          }));
+            [requestThreadId]: (current[requestThreadId] ?? []).filter(
+              (candidate) => candidate.itemId !== itemId,
+            ),
+          };
+        });
+      } catch {
+        if (ownsRemoval()) {
+          if (item.state === "ready")
+            setAttachmentDraftsByThread((current) => {
+              if (!ownsRemoval()) return current;
+              return {
+                ...current,
+                [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
+                  candidate.itemId === itemId ? item : candidate,
+                ),
+              };
+            });
+          else if (item.state === "importing")
+            setAttachmentDraftsByThread((current) => {
+              if (!ownsRemoval()) return current;
+              return {
+                ...current,
+                [requestThreadId]: (current[requestThreadId] ?? []).map((candidate) =>
+                  candidate.itemId === itemId && candidate.state === "importing"
+                    ? { ...candidate, cancelRequested: false }
+                    : candidate,
+                ),
+              };
+            });
+          setErrorsByThread((current) =>
+            ownsRemoval()
+              ? { ...current, [requestThreadId]: "附件暂时无法移除，请重试。" }
+              : current,
+          );
         }
       } finally {
-        attachmentDiscardGuardsRef.current.delete(itemId);
+        if (attachmentDiscardGuardsRef.current.get(operationKey) === operationToken)
+          attachmentDiscardGuardsRef.current.delete(operationKey);
       }
     },
     [attachmentDraftsByThread, attachmentPort, onAttachmentRemoved, threadId],
+  );
+
+  /**
+   * 仅当前 Runtime 的服务端 close ACK 可清理草稿；索引缺项时按实体 owner 补全 Turn/审批，
+   * 并在延迟 React updater 中复核 tombstone，避免旧 ACK 擦除新 SID 的同名 Thread 状态。
+   * 已绑定历史附件不属于 Renderer 回收范围。@author kongweiguang
+   */
+  const clearClosedThreads = useCallback(
+    (threadIds: readonly string[], fence: TimelineRuntimeFence): boolean => {
+      const ids = [...new Set(threadIds.filter((id) => id.length > 0))];
+      const before = useTimelineStore.getState();
+      if (ids.length === 0 || !before.closeThreads(ids, fence)) return false;
+      const closed = new Set(ids);
+      const turnIds = new Set([
+        ...ids.flatMap((id) => before.turnIdsByThread[id] ?? []),
+        ...Object.values(before.turns)
+          .filter((turn) => closed.has(turn.threadId))
+          .map((turn) => turn.turnId),
+      ]);
+      const threadByTurnId = new Map<string, string>();
+      for (const id of ids)
+        for (const turnId of before.turnIdsByThread[id] ?? []) threadByTurnId.set(turnId, id);
+      for (const turn of Object.values(before.turns))
+        if (closed.has(turn.threadId)) threadByTurnId.set(turn.turnId, turn.threadId);
+      const approvalIds = new Set([
+        ...ids.flatMap((id) => before.approvalIdsByThread[id] ?? []),
+        ...Object.entries(before.approvalsById)
+          .filter(([, entry]) => closed.has(entry.threadId))
+          .map(([approvalId]) => approvalId),
+      ]);
+      const threadByApprovalId = new Map<string, string>();
+      for (const id of ids)
+        for (const approvalId of before.approvalIdsByThread[id] ?? [])
+          threadByApprovalId.set(approvalId, id);
+      for (const [approvalId, entry] of Object.entries(before.approvalsById))
+        if (closed.has(entry.threadId)) threadByApprovalId.set(approvalId, entry.threadId);
+      const inputIds = new Set([
+        ...[...turnIds].flatMap(
+          (turnId) => before.inputQueueByTurn[turnId]?.items.map((item) => item.inputId) ?? [],
+        ),
+        ...Object.entries(pendingQueuedInputsByThread)
+          .filter(([threadId]) => closed.has(threadId))
+          .flatMap(([, items]) => items.map((item) => item.inputId)),
+        ...[...queueInputOwnerByIdRef.current]
+          .filter(([, threadId]) => closed.has(threadId))
+          .map(([inputId]) => inputId),
+      ]);
+      const closedAttachmentItems = ids.flatMap((id) =>
+        (attachmentDraftsByThread[id] ?? []).map((item) => ({ threadId: id, item })),
+      );
+      const closedTurnSet = new Set(turnIds);
+      const clearTurnMap = <T>(record: Record<string, T>): Record<string, T> =>
+        Object.fromEntries(Object.entries(record).filter(([id]) => !closedTurnSet.has(id)));
+      /** 交错 React updater 只在这次精确 close 仍属于原 Runtime 时清理本地映射。@author kongweiguang */
+      const closeStillCurrent = (): boolean => {
+        const state = useTimelineStore.getState();
+        return (
+          state.handshake.phase === "ready" &&
+          state.handshake.generation === fence.generation &&
+          state.serverInstanceId === fence.serverInstanceId &&
+          ids.every((id) => state.isThreadClosed(id))
+        );
+      };
+      for (const id of ids) {
+        const submitOwner = submitOwnerByThreadRef.current.get(id);
+        if (
+          submitOwner !== undefined &&
+          submitOwner.fence?.generation === fence.generation &&
+          submitOwner.fence.serverInstanceId === fence.serverInstanceId
+        ) {
+          submitOwnerByThreadRef.current.delete(id);
+          submitGuardsRef.current.delete(id);
+        }
+        readyAttachmentSizesRef.current[id]?.clear();
+        delete readyAttachmentSizesRef.current[id];
+        delete failedQueuedTextsRef.current[id];
+        preferenceGuardsRef.current.delete(threadRuntimeOperationKey(id, fence, "preferences"));
+        for (const [turnId, owner] of cancelThreadByTurnRef.current)
+          if (
+            owner.threadId === id &&
+            owner.fence.serverInstanceId === fence.serverInstanceId &&
+            owner.fence.generation === fence.generation
+          ) {
+            cancelThreadByTurnRef.current.delete(turnId);
+            cancelGuardsRef.current.delete(owner.key);
+          }
+        for (const [turnId, pending] of recoveredTurnReconciliationRef.current)
+          if (
+            pending.threadId === id &&
+            pending.serverInstanceId === fence.serverInstanceId &&
+            pending.generation === fence.generation
+          ) {
+            clearTimeout(pending.timer);
+            recoveredTurnReconciliationRef.current.delete(turnId);
+          }
+        queueMutationLanesRef.current.delete(threadMutationLaneKey(id, fence));
+      }
+      for (const approvalId of approvalIds) {
+        const approvalThreadId = threadByApprovalId.get(approvalId);
+        if (approvalThreadId !== undefined)
+          approvalGuardsRef.current.delete(
+            threadRuntimeOperationKey(approvalThreadId, fence, approvalId),
+          );
+      }
+      for (const turnId of turnIds) {
+        const turnThreadId = threadByTurnId.get(turnId);
+        if (turnThreadId !== undefined) {
+          const operationKey = threadRuntimeOperationKey(turnThreadId, fence, turnId);
+          cancelGuardsRef.current.delete(operationKey);
+          resumeGuardsRef.current.delete(operationKey);
+          const cancelOwner = cancelThreadByTurnRef.current.get(turnId);
+          if (
+            cancelOwner?.key === operationKey &&
+            cancelOwner.fence.serverInstanceId === fence.serverInstanceId &&
+            cancelOwner.fence.generation === fence.generation
+          )
+            cancelThreadByTurnRef.current.delete(turnId);
+        }
+        const timer = cancelReconciliationRef.current.get(turnId);
+        if (
+          timer !== undefined &&
+          closed.has(timer.owner.threadId) &&
+          timer.owner.fence.serverInstanceId === fence.serverInstanceId &&
+          timer.owner.fence.generation === fence.generation
+        ) {
+          clearTimeout(timer.timer);
+          cancelReconciliationRef.current.delete(turnId);
+        }
+      }
+      for (const inputId of inputIds) queueInputOwnerByIdRef.current.delete(inputId);
+      for (const inputId of inputIds) queueActionOwnerByInputIdRef.current.delete(inputId);
+      if (threadId !== undefined && closed.has(threadId))
+        recoveredTurnReconciliationKeyRef.current = undefined;
+      const removeThreads = <T>(record: Record<string, T>): Record<string, T> =>
+        closeStillCurrent()
+          ? Object.fromEntries(Object.entries(record).filter(([id]) => !closed.has(id)))
+          : record;
+      setDraftsByThread(removeThreads);
+      setContextDraftsByThread(removeThreads);
+      setAttachmentDraftsByThread(removeThreads);
+      setEditingQuestionByThread(removeThreads);
+      setPendingTurns((current) => {
+        if (!closeStillCurrent()) return current;
+        const next = removeThreads(current);
+        pendingTurnsRef.current = next;
+        return next;
+      });
+      setLocalSubmissionsByThread(removeThreads);
+      setSendingThreadIds(removeThreads);
+      setDraftRecoveryRevisionsByThread(removeThreads);
+      setCancellingTurnIds((current) => (closeStillCurrent() ? clearTurnMap(current) : current));
+      setResumingTurnIds((current) => (closeStillCurrent() ? clearTurnMap(current) : current));
+      setErrorsByThread(removeThreads);
+      setModelSettingsRequiredByThread(removeThreads);
+      setClipboardNoticesByThread(removeThreads);
+      setPendingQueuedInputsByThread(removeThreads);
+      setPreferenceBusyByThread(removeThreads);
+      setPreferenceErrorsByThread(removeThreads);
+      setQueueActionsByInputId((current) =>
+        closeStillCurrent()
+          ? Object.fromEntries(Object.entries(current).filter(([id]) => !inputIds.has(id)))
+          : current,
+      );
+      setQueueErrorsByInputId((current) =>
+        closeStillCurrent()
+          ? Object.fromEntries(Object.entries(current).filter(([id]) => !inputIds.has(id)))
+          : current,
+      );
+      for (const { threadId: closedThreadId, item } of closedAttachmentItems) {
+        if (!closeStillCurrent()) break;
+        const discardKey = threadRuntimeOperationKey(closedThreadId, fence, item.itemId);
+        attachmentDiscardGuardsRef.current.delete(discardKey);
+        if (item.state === "importing") {
+          const operationKey = threadRuntimeOperationKey(closedThreadId, fence, item.operationId);
+          attachmentOperationGuardsRef.current.delete(operationKey);
+        }
+        if (item.state === "ready")
+          overflowDiscardGuardsRef.current.delete(
+            threadRuntimeOperationKey(closedThreadId, fence, item.attachmentId),
+          );
+        if (attachmentPort !== undefined) {
+          const cleanup =
+            item.state === "importing"
+              ? attachmentPort.cancelImport({ operationId: item.operationId, itemId: item.itemId })
+              : item.state === "failed"
+                ? attachmentPort.discardAttempt({ attemptId: item.attemptId })
+                : item.state === "ready" && item.historyBound !== true
+                  ? attachmentPort.discardAttachment({ attachmentId: item.attachmentId })
+                  : undefined;
+          if (cleanup !== undefined) void cleanup.catch(() => undefined);
+        }
+      }
+      return true;
+    },
+    [attachmentDraftsByThread, attachmentPort, pendingQueuedInputsByThread, threadId],
   );
 
   const hasActiveTurn = executingTurn !== undefined || pendingTurn !== undefined;
@@ -2314,6 +3016,8 @@ export function useConversationInteractionController({
     localSubmissions: threadId === undefined ? [] : (localSubmissionsByThread[threadId] ?? []),
     cancelling,
     resuming,
+    modelSettingsRequired:
+      threadId === undefined ? false : modelSettingsRequiredByThread[threadId] === true,
     error:
       threadId === undefined
         ? undefined
@@ -2345,5 +3049,6 @@ export function useConversationInteractionController({
     resume,
     cancel,
     approve,
+    clearClosedThreads,
   };
 }

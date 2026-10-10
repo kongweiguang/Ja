@@ -86,13 +86,15 @@ export function PermissionsSection({
   const choices: ReadonlyArray<{ value: AccessMode; label: string; description: string }> = [
     {
       value: "full_access",
-      label: "全部执行（默认）",
-      description: "所有内置 Tool 和 MCP Tool 直接执行，不逐次确认。",
+      label: "完全访问（默认）",
+      description:
+        "内置工具和 MCP 工具直接执行，不逐次请求审批。Shell 沿用当前 Windows 用户权限与环境。",
     },
     {
       value: "approval_required",
-      label: "需要确认",
-      description: "所有内置 Tool 和 MCP Tool 每次执行都请求批准。",
+      label: "需要审批",
+      description:
+        "有副作用的工具调用前逐次请求审批。Shell 的文件和网络访问仍由宿主权限决定，不是系统沙箱。",
     },
   ];
 
@@ -119,7 +121,7 @@ export function PermissionsSection({
     <div
       className="ja-settings-section"
       data-setting-id="permission-mode"
-      data-setting-search="执行确认 需要确认 全部执行"
+      data-setting-search="执行确认 需要审批 完全访问"
       tabIndex={-1}
     >
       <SectionHeader title="执行确认" />

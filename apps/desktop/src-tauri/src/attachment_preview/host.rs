@@ -6,11 +6,13 @@
 use super::cache::{AttachmentPreviewCache, CachedResourceKey};
 use super::error::{AttachmentPreviewError, AttachmentPreviewErrorCode};
 use super::image_pipeline::AttachmentImageDerivatives;
+#[cfg(not(target_os = "windows"))]
+use super::model::{ATTACHMENT_PREVIEW_HOST, ATTACHMENT_PREVIEW_SCHEME};
 use super::model::{
-    ATTACHMENT_PREVIEW_HOST, ATTACHMENT_PREVIEW_MAIN_WINDOW, ATTACHMENT_PREVIEW_SCHEME,
-    AttachmentPreviewClock, AttachmentPreviewDescriptor, AttachmentPreviewKind,
-    AttachmentPreviewLimits, AttachmentPreviewOpenResult, AttachmentPreviewSessionId,
-    AttachmentResourceToken, AttachmentResourceVariant, MonotonicAttachmentPreviewClock,
+    ATTACHMENT_PREVIEW_MAIN_WINDOW, AttachmentPreviewClock, AttachmentPreviewDescriptor,
+    AttachmentPreviewKind, AttachmentPreviewLimits, AttachmentPreviewOpenResult,
+    AttachmentPreviewSessionId, AttachmentResourceToken, AttachmentResourceVariant,
+    MonotonicAttachmentPreviewClock,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -369,10 +371,20 @@ fn validate_descriptor(
     Ok(())
 }
 
-/// URL 字符串由 native host 完整构造；React 无需也不能取得 token 单字段。
+/// 按平台签发 WebView 可直接读取的 origin，避免 UI 在失败后猜测候选地址；token 仍只由 native host 构造。
 fn resource_url(variant: AttachmentResourceVariant, token: AttachmentResourceToken) -> String {
-    format!(
-        "{ATTACHMENT_PREVIEW_SCHEME}://{ATTACHMENT_PREVIEW_HOST}/{}/{token}",
-        variant.as_path()
-    )
+    #[cfg(target_os = "windows")]
+    {
+        format!(
+            "http://ja-attachment.localhost/{}/{token}",
+            variant.as_path()
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!(
+            "{ATTACHMENT_PREVIEW_SCHEME}://{ATTACHMENT_PREVIEW_HOST}/{}/{token}",
+            variant.as_path()
+        )
+    }
 }

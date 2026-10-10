@@ -3,10 +3,11 @@
 
 // Runtime bridge 的内部原生控制端口。
 //
-// 生产端使用无操作实现；Harness 在 `app_runtime::test_support` 中实现同步栅栏和
-// 故障注入。actor/lifecycle 只依赖这个端口，因此测试 feature 不会散落到生产状态机。
+// 生产端使用无操作实现；外置 `int_internal` 测试 target 在 `tests/support/app_runtime.rs`
+// 实现同步栅栏和故障注入。actor/lifecycle 只依赖这个端口，生产状态机不携带 Harness 状态。
 
 use super::{EXIT_DEADLINE, LaunchConfig, RuntimeCommandError, SharedAppServerClient};
+use ja_runtime::app_server_process::NativeClientIdentity;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,8 +37,9 @@ pub(crate) trait RuntimeControlPort: Send + Sync {
         &self,
         config: &LaunchConfig,
         host_generation: u64,
+        identity: &NativeClientIdentity,
     ) -> Result<SharedAppServerClient, RuntimeCommandError> {
-        SharedAppServerClient::connect_or_start(config.sidecar.clone(), host_generation)
+        SharedAppServerClient::connect_or_start(config.sidecar.clone(), host_generation, identity)
             .map_err(|error| RuntimeCommandError::from_process(&error))
     }
 
@@ -50,6 +52,18 @@ pub(crate) trait RuntimeControlPort: Send + Sync {
     ) -> Result<(), RuntimeCommandError> {
         client
             .disconnect_until(deadline)
+            .map_err(|error| RuntimeCommandError::from_process(&error))
+    }
+
+    /// 先确认当前 Native Owner 清理，再执行本地 disconnect；未知 ACK 由 actor 保留 client 重试。
+    fn close_native_client_until(
+        &self,
+        config: &LaunchConfig,
+        client: &mut SharedAppServerClient,
+        deadline: Instant,
+    ) -> Result<bool, RuntimeCommandError> {
+        client
+            .close_native_client_until(&config.sidecar, deadline)
             .map_err(|error| RuntimeCommandError::from_process(&error))
     }
 

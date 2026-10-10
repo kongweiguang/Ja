@@ -31,7 +31,12 @@ pub async fn ja_runtime_start(
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<RuntimeStatusDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.start().map(Into::into)).await
+    run_blocking(move || {
+        let mut status: RuntimeStatusDto = host.start()?.into();
+        status.storage_recovery = host.storage_info()?.storage_recovery.map(Into::into);
+        Ok(status)
+    })
+    .await
 }
 
 /// 请求有界停止；进程树清理由 Host/bridge owner 完成，command 不复制生命周期判断。
@@ -49,13 +54,45 @@ pub async fn ja_runtime_state(
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<RuntimeStatusDto, RuntimeCommandError> {
     let host = state.inner().clone();
-    run_blocking(move || host.state().map(Into::into)).await
+    run_blocking(move || {
+        let mut status: RuntimeStatusDto = host.state()?.into();
+        status.storage_recovery = host.storage_info()?.storage_recovery.map(Into::into);
+        Ok(status)
+    })
+    .await
 }
 
-/// 返回稳定存储投影；该读操作不会隐式启动或重新配置 sidecar。
+/// 存储修复由 Java 执行，完整服务就绪后 Host 才重新开放真实工作区。
 #[tauri::command]
-pub fn ja_runtime_storage_info(state: tauri::State<'_, RuntimeHost>) -> RuntimeStorageInfoDto {
-    state.storage_info().into()
+pub async fn ja_runtime_storage_retry(
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<RuntimeStatusDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || {
+        let mut status: RuntimeStatusDto = host.retry_storage()?.into();
+        status.storage_recovery = host.storage_info()?.storage_recovery.map(Into::into);
+        Ok(status)
+    })
+    .await
+}
+
+/// Java 健康读取在阻塞线程执行，不占用界面线程，也不隐式启动后端。
+#[tauri::command]
+pub async fn ja_runtime_storage_info(
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<RuntimeStorageInfoDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.storage_info().map(Into::into)).await
+}
+
+/// 仅接收不透明恢复身份，授权和路径推导保持在原生所有者内部。
+#[tauri::command]
+pub async fn ja_runtime_storage_backup_open(
+    recovery_id: String,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<(), RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.open_storage_backup(&recovery_id)).await
 }
 
 /// 按 Java workspace identity 激活已登记 session；调用方不能提供或派生 root 路径。
@@ -210,7 +247,7 @@ pub async fn ja_runtime_acknowledge_recovery(
     run_blocking(move || host.acknowledge_recovery(&confirmation).map(Into::into)).await
 }
 
-/// 通过单个 application 用例确保 Java owner Ready 并注册受信 native cwd，command 不复制生命周期编排。
+/// 按互斥的 cwd 或 workspaceId 意图打开 Workspace；路径新开与 ID 重绑共用 Ready 和原生资源收尾边界。
 #[tauri::command]
 pub async fn ja_runtime_workspace_open(
     input: WorkspaceOpenInputDto,
@@ -231,10 +268,51 @@ pub async fn ja_runtime_workspace_open(
         )
         .map_err(|error| RuntimeCommandError {
             code: "ATTACHMENT_PREVIEW_CLOSE_FAILED",
-            message: "attachment previews could not be closed",
+            message: "attachment previews could not be closed".into(),
             retryable: error.retryable,
         })?;
-        host.start_and_open_workspace(input.into()).map(Into::into)
+        match input {
+            WorkspaceOpenInputDto::ByPath(input) => {
+                host.start_and_open_workspace(input.into()).map(Into::into)
+            }
+            WorkspaceOpenInputDto::ById(input) => host
+                .start_and_open_workspace_by_id(input.workspace_id)
+                .map(Into::into),
+        }
+    })
+    .await
+}
+
+/// 只读取已登记 Workspace 的 Java projection；root 已失效时也保留其 ID 与对话历史可读性。
+#[tauri::command]
+pub async fn ja_runtime_workspace_read(
+    input: WorkspaceReadInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<WorkspaceWireDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.read_workspace(input.workspace_id).map(Into::into)).await
+}
+
+/// 由 Host 冻结并替换 native binding 后向 Java 提交 revision CAS；前端先完成保存与资源关闭确认。
+#[tauri::command]
+pub async fn ja_runtime_workspace_update(
+    input: WorkspaceUpdateInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<WorkspaceWireDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || host.update_workspace(input.into()).map(Into::into)).await
+}
+
+/// 只通过独立命令修改 Java 持久化的项目 trust；Host 回读完整权威投影后才确认成功。
+#[tauri::command]
+pub async fn ja_workspace_set_trust(
+    input: WorkspaceTrustInputDto,
+    state: tauri::State<'_, RuntimeHost>,
+) -> Result<WorkspaceTrustAcceptedDto, RuntimeCommandError> {
+    let host = state.inner().clone();
+    run_blocking(move || {
+        host.set_workspace_trust(input.workspace_id, input.trust)?;
+        Ok(WorkspaceTrustAcceptedDto { accepted: true })
     })
     .await
 }

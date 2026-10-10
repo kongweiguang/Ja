@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SubagentPolicyMapper">
+    <resultMap id="policyRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SubagentPolicyRow">
+        <constructor>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="is_enabled" javaType="_boolean"/>
+            <arg column="provider_id" javaType="string"/>
+            <arg column="model_id" javaType="string"/>
+            <arg column="reasoning_level" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <select id="select" resultMap="policyRow">
+        SELECT thread_id,is_enabled,provider_id,model_id,reasoning_level,created_at_ms
+        FROM ja_conversation_subagent_policy WHERE thread_id=#{threadId}
+    </select>
+    <insert id="insert">
+        INSERT INTO ja_conversation_subagent_policy(thread_id,is_enabled,provider_id,model_id,reasoning_level,created_at_ms)
+        VALUES(#{threadId},#{enabled},#{providerId},#{modelId},#{reasoningLevel},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+</mapper>

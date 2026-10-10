@@ -1,0 +1,883 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatPurgeMapper">
+    <!-- 下方每个 Mapper 方法都只包含一条 SQL 语句。Java 调用方会在首次删除前快照全部 ID，避免删除开始后重新展开 ja_conversation_lineage。 -->
+    <!-- OGNL 的 size 属性由 ListPropertyAccessor 直接调用 List 接口；使用 size() 会反射
+         冻结集合的 JDK 内部实现，在 Native Image 闭世界中引入不必要的反射依赖。 -->
+
+    <resultMap id="sideChatCloseReceiptRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SideChatCloseReceiptRow">
+        <constructor>
+            <idArg column="root_thread_id" javaType="string"/>
+            <arg column="workspace_id" javaType="string"/>
+            <arg column="owner_root_thread_id" javaType="string"/>
+            <arg column="closed_thread_count" javaType="int"/>
+            <arg column="closed_at_ms" javaType="long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="sideChatCloseMemberRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SideChatCloseMemberRow">
+        <constructor>
+            <idArg column="member_ordinal" javaType="int"/>
+            <arg column="thread_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <select id="countClosingRoot" resultType="int">
+        SELECT COUNT(*)
+        FROM ja_conversation_thread c
+        JOIN ja_conversation_thread t ON t.thread_id=c.thread_id
+        WHERE c.thread_id=#{rootThreadId}
+        AND c.temporary_lifecycle_state='CLOSING'
+        AND t.deleted_at_ms IS NULL
+        AND EXISTS (
+        SELECT 1 FROM ja_conversation_lineage l
+        WHERE l.child_thread_id=c.thread_id
+        AND l.task_kind='SIDE_TASK' AND l.lifecycle='INDEPENDENT'
+        )
+    </select>
+
+    <select id="selectCloseReceipt" resultMap="sideChatCloseReceiptRow">
+        SELECT root_thread_id,workspace_id,owner_root_thread_id,closed_thread_count,closed_at_ms
+        FROM ja_task_side_chat_close_receipt WHERE root_thread_id=#{rootThreadId}
+    </select>
+    <select id="selectCloseReceiptMembers" resultMap="sideChatCloseMemberRow">
+        SELECT member_ordinal,thread_id FROM ja_task_side_chat_close_member
+        WHERE root_thread_id=#{rootThreadId} ORDER BY member_ordinal
+    </select>
+    <select id="selectPurgeWorkspaceId" resultType="string">
+        SELECT workspace_id FROM ja_conversation_thread
+        WHERE thread_id=#{rootThreadId} AND temporary_lifecycle_state='CLOSING'
+    </select>
+    <select id="countPurgeThreadsOutsideWorkspace" resultType="int">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT thread_id FROM ja_conversation_thread
+        WHERE thread_id=#{rootThreadId} AND temporary_lifecycle_state='CLOSING'
+        UNION ALL
+        SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        SELECT COUNT(*) FROM tree AS t1
+        JOIN ja_conversation_thread AS t2 ON t2.thread_id=t1.thread_id
+        WHERE t2.workspace_id&lt;&gt;#{workspaceId}
+    </select>
+    <insert id="insertCloseReceipt">
+        INSERT INTO ja_task_side_chat_close_receipt(
+            root_thread_id,workspace_id,owner_root_thread_id,closed_thread_count,closed_at_ms
+        ) VALUES (
+            #{receipt.rootThreadId},#{receipt.workspaceId},#{receipt.ownerRootThreadId},
+            #{receipt.closedThreadCount},#{receipt.closedAtMs}
+        )
+    </insert>
+    <insert id="insertCloseReceiptMembers">
+        INSERT INTO ja_task_side_chat_close_member(root_thread_id,member_ordinal,thread_id)
+        VALUES
+        <foreach item="member" collection="members" separator=",">
+            (#{member.rootThreadId},#{member.memberOrdinal},#{member.threadId})
+        </foreach>
+    </insert>
+    <delete id="deleteWorkspaceCloseReceiptMembers">
+        DELETE FROM ja_task_side_chat_close_member
+        WHERE root_thread_id IN (
+            SELECT root_thread_id FROM ja_task_side_chat_close_receipt WHERE workspace_id=#{workspaceId}
+        )
+    </delete>
+    <delete id="deleteWorkspaceCloseReceipts">
+        DELETE FROM ja_task_side_chat_close_receipt WHERE workspace_id=#{workspaceId}
+    </delete>
+
+    <select id="selectPurgeThreadIds" resultType="string">
+        WITH RECURSIVE tree(thread_id,depth) AS (
+        SELECT thread_id,0
+        FROM ja_conversation_thread
+        WHERE thread_id=#{rootThreadId} AND temporary_lifecycle_state='CLOSING'
+        UNION ALL
+        SELECT l.child_thread_id,t.depth+1
+        FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id
+        )
+        SELECT thread_id FROM tree ORDER BY depth,thread_id
+    </select>
+
+    <update id="markPurgeThreadsClosing">
+        UPDATE ja_conversation_thread SET temporary_lifecycle_state='CLOSING' WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </update>
+    <select id="countNonTerminalTurns" resultType="int">
+        SELECT (SELECT COUNT(*) FROM ja_conversation_turn WHERE state NOT IN('COMPLETED','FAILED','CANCELLED')
+        AND thread_id IN <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>)
+        +(SELECT COUNT(*) FROM agent_execution WHERE tenant_id='ja.local' AND user_id='user_local'
+        AND state NOT IN('COMPLETED','FAILED','CANCELLED') AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>)
+    </select>
+    <select id="selectPurgeTurnIds" resultType="string">
+        SELECT turn_id FROM ja_conversation_turn
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY turn_sequence
+    </select>
+
+    <select id="selectPurgePlanIds" resultType="string">
+        SELECT plan_id FROM ja_plan
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR owner_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY plan_id
+    </select>
+
+    <select id="selectPurgeRunIds" resultType="string">
+        SELECT run_id FROM ja_plan_execution
+        <where>
+            0
+            <if test="planIds != null and planIds.size > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+        </where>
+        ORDER BY run_id
+    </select>
+
+    <select id="selectPurgeSeedIds" resultType="string">
+        SELECT context_seed_id FROM ja_conversation_lineage
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR child_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY context_seed_id
+    </select>
+
+    <select id="selectPurgePlanRevisionIds" resultType="string">
+        SELECT plan_revision_id FROM ja_plan_revision
+        WHERE 0
+        <if test="planIds != null and planIds.size > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+        ORDER BY plan_revision_id
+    </select>
+
+    <delete id="deleteMessageAttachments">
+        DELETE FROM ja_message_attachment
+        WHERE message_id IN (
+        SELECT message_id FROM ja_conversation_message
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        )
+    </delete>
+
+    <delete id="deleteToolResultAttachments">
+        DELETE FROM ja_tool_result_attachment
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        <if test="turnIds != null and turnIds.size > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePendingInputAttachments">
+        DELETE FROM ja_turn_input_attachment
+        WHERE input_id IN (
+        SELECT input_id FROM ja_turn_input
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+        )
+    </delete>
+
+    <select id="selectPurgeAttachmentIds" resultType="string">
+        SELECT attachment_id FROM ja_message_attachment
+        WHERE message_id IN (
+        SELECT message_id FROM ja_conversation_message
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+        </where>
+        )
+        UNION
+        SELECT attachment_id FROM ja_turn_input_attachment
+        WHERE input_id IN (
+        SELECT input_id FROM ja_turn_input
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+        )
+        UNION
+        SELECT attachment_id FROM ja_tool_result_attachment
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        <if test="turnIds != null and turnIds.size > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+        UNION
+        SELECT attachment_id FROM ja_thread_fork_attachment
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        ORDER BY attachment_id
+    </select>
+
+    <update id="discardPurgeAttachments">
+        UPDATE ja_attachment
+        SET status='DISCARDED', discarded_at_ms=#{discardedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}, blob_sha256=NULL, bound_at_ms=NULL
+        WHERE 0
+        <if test="attachmentIds != null and attachmentIds.size > 0">
+            OR (
+            status IN ('DRAFT','BOUND')
+            AND attachment_id IN
+            <foreach item="attachmentId" collection="attachmentIds" open="(" separator="," close=")">#{attachmentId}
+            </foreach>
+            AND NOT EXISTS (
+            SELECT 1 FROM ja_message_attachment ma WHERE ma.attachment_id=ja_attachment.attachment_id
+            )
+            AND NOT EXISTS (
+            SELECT 1 FROM ja_turn_input_attachment pia WHERE pia.attachment_id=ja_attachment.attachment_id
+            )
+            AND NOT EXISTS (
+            SELECT 1 FROM ja_tool_result_attachment tra WHERE tra.attachment_id=ja_attachment.attachment_id
+            )
+            AND NOT EXISTS (
+            SELECT 1
+            FROM ja_task_context_seed s, json_each(s.references_json) ref
+            WHERE json_extract(ref.value,'$.kind')='attachment'
+            AND json_extract(ref.value,'$.attachmentId')=ja_attachment.attachment_id
+            )
+            )
+        </if>
+    </update>
+
+    <delete id="deleteInteractionDrafts">
+        DELETE FROM ja_interaction_draft
+        WHERE interaction_id IN (
+        SELECT interaction_id FROM ja_interaction_request
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+        )
+    </delete>
+
+    <delete id="deleteInteractionEvents">
+        DELETE FROM ja_interaction_event
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            OR interaction_id IN (
+            SELECT interaction_id FROM ja_interaction_request
+            <where>
+                0
+                <if test="threadIds != null and threadIds.size > 0">
+                    OR thread_id IN
+                    <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}
+                    </foreach>
+                </if>
+                <if test="turnIds != null and turnIds.size > 0">
+                    OR turn_id IN
+                    <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+                </if>
+                <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                    OR plan_revision_id IN
+                    <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                        #{planRevisionId}
+                    </foreach>
+                </if>
+                <if test="runIds != null and runIds.size > 0">
+                    OR run_id IN
+                    <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+                </if>
+            </where>
+            )
+        </where>
+    </delete>
+
+    <delete id="deleteInteractionRequests">
+        DELETE FROM ja_interaction_request
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanEvaluationRequests">
+        DELETE FROM ja_plan_evaluation_attempt
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR owner_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="planIds != null and planIds.size > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanToolAttempts">
+        DELETE FROM ja_plan_tool_attempt
+        <where>
+            0
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteAcceptanceEvidence">
+        DELETE FROM ja_plan_acceptance_evidence
+        <where>
+            0
+            <if test="planIds != null and planIds.size > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanStepExecutions">
+        DELETE FROM ja_plan_step_execution
+        <where>
+            0
+            <if test="runIds != null and runIds.size > 0">
+                OR run_id IN
+                <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deletePlanTurnClaims">
+        DELETE FROM ja_plan_turn_claim
+        WHERE 0
+        <if test="runIds != null and runIds.size > 0">
+            OR run_id IN
+            <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanEvents">
+        DELETE FROM ja_plan_event
+        WHERE 0
+        <if test="planIds != null and planIds.size > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanApprovals">
+        DELETE FROM ja_plan_approval
+        <where>
+            0
+            <if test="planIds != null and planIds.size > 0">
+                OR plan_id IN
+                <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+            </if>
+            <if test="planRevisionIds != null and planRevisionIds.size > 0">
+                OR plan_revision_id IN
+                <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                    #{planRevisionId}
+                </foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteExecutionRuns">
+        DELETE FROM ja_plan_execution
+        WHERE 0
+        <if test="runIds != null and runIds.size > 0">
+            OR run_id IN
+            <foreach item="runId" collection="runIds" open="(" separator="," close=")">#{runId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanSteps">
+        DELETE FROM ja_plan_step
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                #{planRevisionId}
+            </foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteAcceptanceCriteria">
+        DELETE FROM ja_plan_acceptance_criterion
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                #{planRevisionId}
+            </foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanDrafts">
+        DELETE FROM ja_plan_draft
+        WHERE 0
+        <if test="planIds != null and planIds.size > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlanRevisions">
+        DELETE FROM ja_plan_revision
+        WHERE 0
+        <if test="planRevisionIds != null and planRevisionIds.size > 0">
+            OR plan_revision_id IN
+            <foreach item="planRevisionId" collection="planRevisionIds" open="(" separator="," close=")">
+                #{planRevisionId}
+            </foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePlans">
+        DELETE FROM ja_plan
+        WHERE 0
+        <if test="planIds != null and planIds.size > 0">
+            OR plan_id IN
+            <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteMessages">
+        DELETE FROM ja_conversation_message
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteContextCheckpoints">
+        DELETE FROM ja_context_checkpoint
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteUsage">
+        DELETE FROM ja_turn_usage
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteToolBindings">
+        DELETE FROM ja_tool_binding
+        WHERE 0
+        <if test="turnIds != null and turnIds.size > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteApprovals">
+        DELETE FROM ja_approval
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteToolArtifacts">
+        DELETE FROM ja_tool_artifact
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteTurnChangeSets">
+        DELETE FROM ja_turn_change_set
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteChangeSetArtifacts">
+        DELETE FROM ja_change_set_artifact
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteTimelineMessages">
+        DELETE FROM ja_conversation_timeline_entry
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteThreadTitleGenerations">
+        DELETE FROM ja_conversation_title_generation
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteAgentConversations">
+        DELETE FROM agent_conversation
+        WHERE tenant_id='ja.local' AND (0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+        )
+    </delete>
+
+    <delete id="deleteTurnInternalContext">
+        DELETE FROM ja_turn_internal_context
+        WHERE 0
+        <if test="turnIds != null and turnIds.size > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTools">
+        DELETE FROM ja_tool_call
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteToolCallPreviews">
+        DELETE FROM ja_tool_call_preview
+        WHERE 0
+        <if test="turnIds != null and turnIds.size > 0">
+            OR turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deletePendingInputs">
+        DELETE FROM ja_turn_input
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteLeafTurns">
+        DELETE FROM ja_conversation_turn
+        WHERE 0
+        <if test="turnIds != null and turnIds.size > 0">
+            OR (turn_id IN
+            <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            AND NOT EXISTS (
+            SELECT 1 FROM ja_conversation_turn child
+            WHERE child.turn_id&lt;&gt;ja_conversation_turn.turn_id
+            AND (child.parent_turn_id=ja_conversation_turn.turn_id OR child.root_turn_id=ja_conversation_turn.turn_id)
+            ))
+        </if>
+    </delete>
+
+    <delete id="deleteWorkspaceWriteClaims">
+        DELETE FROM ja_workspace_write_claim
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteInboundMailbox">
+        DELETE FROM ja_task_mailbox_message
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR to_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTaskProjections">
+        DELETE FROM ja_task_projection
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR task_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            OR root_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteTaskActivities">
+        DELETE FROM ja_task_activity
+        <where>
+            0
+            <if test="threadIds != null and threadIds.size > 0">
+                OR root_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                OR task_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+                OR actor_thread_id IN
+                <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+            </if>
+            <if test="turnIds != null and turnIds.size > 0">
+                OR causal_turn_id IN
+                <foreach item="turnId" collection="turnIds" open="(" separator="," close=")">#{turnId}</foreach>
+            </if>
+        </where>
+    </delete>
+
+    <delete id="deleteThreadInstructionScopes">
+        DELETE FROM ja_conversation_instruction_scope
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteSubagentPolicies">
+        DELETE FROM ja_conversation_subagent_policy
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteLineage">
+        DELETE FROM ja_conversation_lineage
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR child_thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteContextSeeds">
+        DELETE FROM ja_task_context_seed
+        WHERE 0
+        <if test="seedIds != null and seedIds.size > 0">
+            OR context_seed_id IN
+            <foreach item="seedId" collection="seedIds" open="(" separator="," close=")">#{seedId}</foreach>
+        </if>
+    </delete>
+
+    <delete id="deleteThreads">
+        DELETE FROM ja_conversation_thread
+        WHERE 0
+        <if test="threadIds != null and threadIds.size > 0">
+            OR thread_id IN
+            <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>
+        </if>
+    </delete>
+
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteToolRecoveryAttempts">DELETE FROM ja_tool_recovery_attempt WHERE recovery_id IN (SELECT recovery_id FROM ja_tool_recovery WHERE thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach>)</delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteToolRecoveries">DELETE FROM ja_tool_recovery WHERE thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteClientOperations">DELETE FROM ja_client_operation WHERE thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteInputOperations">DELETE FROM ja_input_operation_receipt WHERE thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentRecords">DELETE FROM agent_record WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentEvents">DELETE FROM agent_event WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentOperationReceipts">DELETE FROM agent_operation_receipt WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentCommitReceipts">DELETE FROM agent_commit_receipt WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentLeases">DELETE FROM agent_lease WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- Fixed Thread ownership is the only physical cleanup boundary. -->
+    <delete id="deleteAgentExecutions">DELETE FROM agent_execution WHERE tenant_id='ja.local' AND user_id='user_local' AND thread_id IN
+        <foreach item="threadId" collection="threadIds" open="(" separator="," close=")">#{threadId}</foreach></delete>
+    <!-- 删除图前必须同时结束执行态，保留 CHECK 对 active pointers 的约束，不能临时写入非法 Plan。 -->
+    <update id="clearPlanHeads">UPDATE ja_plan SET status='STOPPED',active_run_id=NULL,active_plan_revision_id=NULL WHERE plan_id IN
+        <foreach item="planId" collection="planIds" open="(" separator="," close=")">#{planId}</foreach></update>
+</mapper>

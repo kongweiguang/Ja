@@ -3,7 +3,11 @@
 
 //! 共享 Java App Server 的本地连接与按需启动边界。
 //!
-//! TCP 连接只拥有当前客户端的 Session；后台进程独立于客户端的 Drop 和退出清理。
+//! WebSocket 连接只拥有当前客户端的 Session；后台进程独立于客户端的 Drop 和退出清理。
+
+pub(crate) mod websocket;
+#[cfg(windows)]
+pub(crate) mod windows_spawn;
 
 use crate::app_server_process::client::{EventPump, Session, SessionEvent};
 use crate::app_server_process::error::AppServerProcessError;
@@ -16,20 +20,23 @@ use crate::app_server_process::lifecycle::{
 use crate::app_server_process::process::SidecarConfig;
 use crate::app_server_process::protocol::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewReadParams,
-    RpcFrame, V1_CLIENT_METHODS, default_initialize_params, error_is_incompatible,
+    CLIENT_METHODS, RpcFrame, default_initialize_params, error_is_incompatible,
     generate_ready_token, is_ready_notification, is_runtime_ready_notification, valid_schema_id,
 };
 use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpStream};
 use std::path::Path;
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tungstenite::{Message, protocol::WebSocketConfig};
 
 const ENDPOINT_FILE: &str = "app-server.endpoint.json";
 const START_LOCK_FILE: &str = "app-server.start.lock";
@@ -37,6 +44,8 @@ const MAX_ENDPOINT_BYTES: u64 = 1_024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_SAFE_RPC_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Java 原子发布的唯一端点形状；令牌只留在连接建立栈上，不进入公开状态或诊断。
 #[derive(Deserialize)]
@@ -44,10 +53,44 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 struct Endpoint {
     protocol_major: u32,
     protocol_minor: u32,
+    host: Ipv4Addr,
     port: u16,
     server_instance_id: String,
     runtime_generation: u64,
     token: String,
+}
+
+/// 同一 Native Host 的普通连接重建共享身份；显式关闭 ACK 后由宿主换发新生命周期 token。
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeClientIdentity {
+    process_id: u64,
+    lifetime_token: String,
+}
+
+impl NativeClientIdentity {
+    /// 为当前逻辑 Host 生成随机 epoch；重连复用该值，不能由 WebSocket generation 推导。
+    pub fn new_current_process() -> Result<Self, AppServerProcessError> {
+        let process_id = u64::from(std::process::id());
+        if process_id == 0 || process_id > MAX_SAFE_RPC_INTEGER {
+            return Err(AppServerProcessError::InvalidConfig);
+        }
+        let lifetime_token = format!("native_{}", generate_ready_token()?);
+        Ok(Self {
+            process_id,
+            lifetime_token,
+        })
+    }
+}
+
+impl std::fmt::Debug for NativeClientIdentity {
+    /// Identity token 是 Native 私有 capability，不允许随 Host 或配置的 Debug 诊断泄漏。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeClientIdentity")
+            .field("process_id", &self.process_id)
+            .field("lifetime_token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// 一个已认证并完成 JA-RPC initialize 的客户端连接。
@@ -57,14 +100,17 @@ pub struct SharedAppServerClient {
     session: Session,
     event_pump: Option<EventPump>,
     socket: TcpStream,
+    identity: NativeClientIdentity,
+    close_retry_client: Option<Box<SharedAppServerClient>>,
     server_instance_id: String,
     runtime_generation: u64,
     ready_token_echo: String,
     stopping: Arc<Mutex<bool>>,
+    owner_close_acknowledged: bool,
 }
 
-/// 握手失败时必须主动 shutdown 原始 TCP 句柄；仅 drop reader clone 会让
-/// Session 的读取线程继续阻塞在已失去调用方的连接上。
+/// 握手失败时必须主动 shutdown 底层连接；仅 drop Session 无法保证
+/// WebSocket actor 立即结束，可能留下阻塞的读取线程。
 struct PendingSocket(Option<TcpStream>);
 
 impl PendingSocket {
@@ -89,6 +135,7 @@ impl SharedAppServerClient {
     pub fn connect_or_start(
         config: SidecarConfig,
         host_generation: u64,
+        identity: &NativeClientIdentity,
     ) -> Result<Self, AppServerProcessError> {
         config.validate()?;
         if !(1..=9_007_199_254_740_991).contains(&host_generation) {
@@ -97,23 +144,26 @@ impl SharedAppServerClient {
         let deadline = Instant::now()
             .checked_add(config.ready_timeout)
             .ok_or(AppServerProcessError::InvalidTimeout)?;
-        match Self::connect_existing_until(&config, deadline) {
+        match Self::connect_existing_until(&config, identity, deadline) {
             Ok(client) => return Ok(client),
             Err(AppServerProcessError::NotReady) => {}
             Err(error) => return Err(error),
         }
         let lock = acquire_start_lock(&config.run_dir, deadline)?;
-        match Self::connect_existing_until(&config, deadline) {
+        match Self::connect_existing_until(&config, identity, deadline) {
             Ok(client) => return Ok(client),
             Err(AppServerProcessError::NotReady) => {}
             Err(error) => return Err(error),
         }
-        spawn_detached(&config, host_generation)?;
+        let process_exit = spawn_detached(&config, host_generation)?;
         loop {
-            match Self::connect_existing_until(&config, deadline) {
+            match Self::connect_existing_until(&config, identity, deadline) {
                 Ok(client) => {
                     drop(lock);
                     return Ok(client);
+                }
+                Err(AppServerProcessError::NotReady) if process_exit.try_recv().is_ok() => {
+                    return Err(AppServerProcessError::ProcessExited);
                 }
                 Err(AppServerProcessError::NotReady) if Instant::now() < deadline => {
                     thread::sleep(START_POLL_INTERVAL);
@@ -130,29 +180,31 @@ impl SharedAppServerClient {
     pub fn connect_existing(
         config: &SidecarConfig,
         _host_generation: u64,
+        identity: &NativeClientIdentity,
     ) -> Result<Self, AppServerProcessError> {
         config.validate()?;
         let deadline = Instant::now()
             .checked_add(config.ready_timeout)
             .ok_or(AppServerProcessError::InvalidTimeout)?;
-        Self::connect_existing_until(config, deadline)
+        Self::connect_existing_until(config, identity, deadline)
     }
 
     /// 从服务端权威端点读取实例与 generation 后再建立会话，避免重连时沿用
     /// 本地新分配的 generation 误拒绝旧后台的合法事件。
     fn connect_existing_until(
         config: &SidecarConfig,
+        identity: &NativeClientIdentity,
         deadline: Instant,
     ) -> Result<Self, AppServerProcessError> {
         let endpoint = read_endpoint(&config.run_dir)?;
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port);
+        let address = SocketAddrV4::new(endpoint.host, endpoint.port);
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(CONNECT_TIMEOUT);
         if timeout.is_zero() {
             return Err(AppServerProcessError::DeadlineExceeded);
         }
-        let mut socket = TcpStream::connect_timeout(&address.into(), timeout).map_err(|error| {
+        let socket = TcpStream::connect_timeout(&address.into(), timeout).map_err(|error| {
             match error.kind() {
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
                     AppServerProcessError::NotReady
@@ -161,33 +213,32 @@ impl SharedAppServerClient {
             }
         })?;
         socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| AppServerProcessError::HandshakeFailed)?;
+        socket
             .set_write_timeout(Some(timeout))
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
-        let auth = serde_json::to_vec(&serde_json::json!({ "token": endpoint.token }))
+        let url = format!("ws://{}:{}/ja-rpc", endpoint.host, endpoint.port);
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(config.limits.max_frame_bytes))
+            .max_frame_size(Some(config.limits.max_frame_bytes));
+        let (mut connection, _) =
+            tungstenite::client::client_with_config(url, socket, Some(ws_config))
+                .map_err(|_| AppServerProcessError::HandshakeFailed)?;
+        let auth = serde_json::to_string(&serde_json::json!({ "token": endpoint.token }))
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
-        if auth.len() + 1 > 256 {
+        if auth.len() > 256 {
             return Err(AppServerProcessError::HandshakeFailed);
         }
-        socket
-            .write_all(&auth)
-            .and_then(|_| socket.write_all(b"\n"))
-            .and_then(|_| socket.flush())
+        connection
+            .send(Message::Text(auth.into()))
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
-        socket
-            .set_write_timeout(None)
+        let socket = connection
+            .get_ref()
+            .try_clone()
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
         let mut pending_socket = PendingSocket(Some(socket));
-        let reader = pending_socket
-            .0
-            .as_ref()
-            .ok_or(AppServerProcessError::InvalidState)?
-            .try_clone()
-            .map_err(|_| AppServerProcessError::HandshakeFailed)?;
-        let writer = pending_socket
-            .0
-            .as_ref()
-            .ok_or(AppServerProcessError::InvalidState)?
-            .try_clone()
+        let (reader, writer) = websocket::attach(connection, config.limits.max_frame_bytes)
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
         let session = Session::from_io_with_terminal(
             reader,
@@ -245,15 +296,19 @@ impl SharedAppServerClient {
                         return Err(AppServerProcessError::HandshakeFailed);
                     }
                     session.with_ready_promotion(&frame, || Ok(()))?;
-                    register_native_context(&session, &config.env, deadline)?;
+                    register_native_context(&session, &config.env, identity, deadline)?;
+                    let stopping = session.admission_gate();
                     return Ok(Self {
                         session,
                         event_pump: Some(event_pump),
                         socket: pending_socket.take()?,
+                        identity: identity.clone(),
+                        close_retry_client: None,
                         server_instance_id: instance,
                         runtime_generation: endpoint.runtime_generation,
                         ready_token_echo: ready_token,
-                        stopping: Arc::new(Mutex::new(false)),
+                        stopping,
+                        owner_close_acknowledged: false,
                     });
                 }
                 Some(SessionEvent::Eof | SessionEvent::HandshakeFailed) => {
@@ -302,14 +357,17 @@ impl SharedAppServerClient {
         &self.ready_token_echo
     }
 
-    /// 复用冻结方法闭集与 Turn 身份准入，避免 TCP 路径比原 sidecar 放宽本地授权。
+    /// 复用冻结方法闭集与 Turn 身份准入，避免 WS 路径比原 sidecar 放宽本地授权。
     pub fn request(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<RpcFrame, AppServerProcessError> {
-        if !V1_CLIENT_METHODS.contains(&method) || method == "runtime/initialize" {
+        if !CLIENT_METHODS.contains(&method)
+            || method == "runtime/initialize"
+            || method == "runtime/client/close"
+        {
             return Err(AppServerProcessError::ProtocolFault);
         }
         validate_turn_identity(method, &params)?;
@@ -360,17 +418,117 @@ impl SharedAppServerClient {
             .ok_or(AppServerProcessError::InvalidState)
     }
 
-    /// 长请求取消只拿当前 TCP Session 的共享 handle，不涉及后台进程树。
+    /// 长请求取消只拿当前 WS Session 的共享 handle，不涉及后台进程树。
     pub fn session_for_cancellation(&self) -> Option<Session> {
         (self.state() == LifecycleState::Ready).then(|| self.session.clone())
     }
 
     /// 退出门禁拿到的 Session 仅执行有界本地 close，不发送服务级 shutdown。
-    pub fn close_session_until(
+    pub fn prepare_native_client_close_until(
         session: &Session,
         deadline: Instant,
     ) -> Result<(), AppServerProcessError> {
-        session.close_until(deadline)
+        session.begin_client_close_until(deadline)
+    }
+
+    /// 先封闭本地请求并取消旧 waiter，再等待服务端当前 Native owner 的严格 ACK。
+    pub fn close_native_client_until(
+        &mut self,
+        config: &SidecarConfig,
+        deadline: Instant,
+    ) -> Result<bool, AppServerProcessError> {
+        if self.owner_close_acknowledged {
+            return Ok(false);
+        }
+        if let Some(mut retry) = self.close_retry_client.take() {
+            match retry.close_native_client_on_session_until(deadline) {
+                Ok(true) => {
+                    self.owner_close_acknowledged = true;
+                    self.close_retry_client = Some(retry);
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    self.close_retry_client = Some(retry);
+                    return Err(AppServerProcessError::InvalidState);
+                }
+                Err(error) if retry.state() == LifecycleState::Exited => {
+                    if let Err(cleanup_error) = retry.disconnect_until(deadline) {
+                        tracing::warn!(
+                            ?cleanup_error,
+                            "closed close-only retry socket remains pending"
+                        );
+                        self.close_retry_client = Some(retry);
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    self.close_retry_client = Some(retry);
+                    return Err(error);
+                }
+            }
+        }
+        match self.close_native_client_on_session_until(deadline) {
+            Ok(acknowledged) => Ok(acknowledged),
+            Err(_error) if self.state() == LifecycleState::Exited && Instant::now() < deadline => {
+                tracing::debug!("native owner close will retry over a fresh existing connection");
+                let mut retry = Self::connect_existing_until(config, &self.identity, deadline)?;
+                match retry.close_native_client_on_session_until(deadline) {
+                    Ok(true) => {
+                        self.owner_close_acknowledged = true;
+                        self.close_retry_client = Some(Box::new(retry));
+                        Ok(true)
+                    }
+                    Ok(false) => {
+                        self.close_retry_client = Some(Box::new(retry));
+                        Err(AppServerProcessError::InvalidState)
+                    }
+                    Err(retry_error) => {
+                        self.close_retry_client = Some(Box::new(retry));
+                        Err(retry_error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 在一个已认证 Session 上执行 scoped close；不接触其它 client 或服务进程。
+    fn close_native_client_on_session_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<bool, AppServerProcessError> {
+        if self.owner_close_acknowledged {
+            return Ok(false);
+        }
+        self.session.begin_client_close_until(deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AppServerProcessError::ShutdownTimeout);
+        }
+        let timeout = remaining
+            .min(MAX_NATIVE_CLOSE_TIMEOUT)
+            .min(self.session.request_timeout_limit());
+        let timeout_ms = timeout
+            .as_millis()
+            .min(MAX_NATIVE_CLOSE_TIMEOUT.as_millis()) as u64;
+        if timeout_ms == 0 {
+            return Err(AppServerProcessError::ShutdownTimeout);
+        }
+        let response = self
+            .session
+            .request_client_close(timeout_ms, Duration::from_millis(timeout_ms))?;
+        let accepted = response
+            .result()
+            .value()
+            .and_then(Value::as_object)
+            .is_some_and(|result| {
+                result.len() == 1 && result.get("accepted").and_then(Value::as_bool) == Some(true)
+            });
+        if response.error().is_some() || !accepted {
+            return Err(AppServerProcessError::InvalidState);
+        }
+        self.owner_close_acknowledged = true;
+        Ok(true)
     }
 
     /// 只读 ChangeSet 工作线程使用当前连接与服务端 generation，不与 actor 争用请求等待。
@@ -413,7 +571,7 @@ impl SharedAppServerClient {
         Ok(())
     }
 
-    /// 关闭 socket 先唤醒 reader，再让 Session 的 writer 有界 join；后台本身继续运行。
+    /// 关闭底层 socket 先唤醒 WebSocket actor，再让 Session 的 writer 有界 join；后台继续运行。
     pub fn disconnect_until(&mut self, deadline: Instant) -> Result<(), AppServerProcessError> {
         let mut stopping = self
             .stopping
@@ -422,7 +580,14 @@ impl SharedAppServerClient {
         *stopping = true;
         drop(stopping);
         let _ = self.socket.shutdown(Shutdown::Both);
-        self.session.close_until(deadline)
+        let mut result = self.session.close_until(deadline);
+        if let Some(retry) = self.close_retry_client.as_mut()
+            && let Err(error) = retry.disconnect_until(deadline)
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        result
     }
 }
 
@@ -431,6 +596,7 @@ impl SharedAppServerClient {
 fn register_native_context(
     session: &Session,
     environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    identity: &NativeClientIdentity,
     deadline: Instant,
 ) -> Result<(), AppServerProcessError> {
     let mut encoded = serde_json::Map::new();
@@ -445,7 +611,12 @@ fn register_native_context(
     }
     let response = session.request(
         "runtime/context/register",
-        serde_json::json!({ "environment": encoded, "shell": null }),
+        serde_json::json!({
+            "environment": encoded,
+            "shell": null,
+            "clientProcessId": identity.process_id,
+            "clientLifetimeId": identity.lifetime_token,
+        }),
         remaining,
     )?;
     if response.error().is_some() {
@@ -545,8 +716,10 @@ fn read_endpoint(run_dir: &Path) -> Result<Endpoint, AppServerProcessError> {
     }
     let endpoint: Endpoint =
         serde_json::from_slice(&bytes).map_err(|_| AppServerProcessError::ProtocolFault)?;
-    if endpoint.protocol_major != 1
+    if endpoint.protocol_major != 2
         || endpoint.protocol_minor != 0
+        || endpoint.host.is_unspecified()
+        || endpoint.host.is_multicast()
         || endpoint.port == 0
         || !(1..=9_007_199_254_740_991).contains(&endpoint.runtime_generation)
         || !valid_schema_id(&endpoint.server_instance_id, "srv_", 101)
@@ -728,26 +901,16 @@ fn acquire_start_lock(run_dir: &Path, deadline: Instant) -> Result<File, AppServ
     }
 }
 
-/// Java 直接作为后台 owner 启动；受限 Windows Job 拒绝脱离时退回同 Job，避免整个桌面不可用。
-/// 启动告警使用固定 target 标识阶段，原生日志丢弃自由字段时仍可区分失败位置且不泄漏路径。
+/// Java 直接作为后台 owner 启动；Windows 只继承三个本次创建的 NUL 标准句柄，
+/// 避免后台生命周期延长 CLI 的输出管道；环境仍按 Command.envs 的继承式覆盖语义传递。
+/// 受限 Windows Job 拒绝脱离时仅重试一次同 Job；退出通知只供本次启动等待使用。
 fn spawn_detached(
     config: &SidecarConfig,
     host_generation: u64,
-) -> Result<(), AppServerProcessError> {
+) -> Result<Receiver<()>, AppServerProcessError> {
     config.verify_executable_identity()?;
-    let mut command = Command::new(config.canonical_executable());
-    command
-        .args(&config.args)
-        .arg(format!("--ja-runtime-generation={host_generation}"))
-        .arg("--ja-transport=tcp")
-        .current_dir(config.canonical_run_dir())
-        .envs(config.env.iter())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     #[cfg(windows)]
-    let in_job = {
-        use std::os::windows::process::CommandExt;
+    let mut child = {
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let in_job = current_process_in_job()?;
@@ -756,44 +919,68 @@ fn spawn_detached(
         } else {
             CREATE_NO_WINDOW
         };
-        command.creation_flags(flags);
-        in_job
-    };
-    #[cfg(windows)]
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if in_job && error.raw_os_error() == Some(5) => {
-            use std::os::windows::process::CommandExt;
-            // ERROR_ACCESS_DENIED 表示宿主不允许 Job breakaway；首次 spawn 明确未创建进程，
-            // 因而仅此一次可安全退回同 Job。退出时由宿主 Job 终止子进程，重启再按游标恢复。
-            tracing::warn!(
-                target: "ja.runtime.spawn.breakaway_denied",
-                os_code = 5,
-                "shared daemon breakaway denied; using host job"
-            );
-            command.creation_flags(0x0800_0000);
-            command.spawn().map_err(|fallback| {
-                tracing::warn!(target: "ja.runtime.spawn.fallback_failed", os_code = ?fallback.raw_os_error(), "shared daemon spawn failed");
-                AppServerProcessError::Spawn
-            })?
-        }
-        Err(error) => {
-            tracing::warn!(target: "ja.runtime.spawn.detached_failed", os_code = ?error.raw_os_error(), "shared daemon detached spawn failed");
-            return Err(AppServerProcessError::Spawn);
+        let mut args = config.args.clone();
+        args.push(format!("--ja-runtime-generation={host_generation}").into());
+        args.push("--ja-transport=websocket".into());
+        match windows_spawn::spawn_detached(
+            config.canonical_executable().as_os_str(),
+            &args,
+            config.canonical_run_dir(),
+            &config.env,
+            flags,
+        ) {
+            Ok(child) => child,
+            Err(error) if in_job && error.raw_os_error() == Some(5) => {
+                // ERROR_ACCESS_DENIED 表示宿主不允许 Job breakaway；首次 spawn 明确未创建进程，
+                // 因而仅此一次可安全退回同 Job。退出时由宿主 Job 终止子进程，重启再按游标恢复。
+                tracing::warn!(
+                    target: "ja.runtime.spawn.breakaway_denied",
+                    os_code = 5,
+                    "shared daemon breakaway denied; using host job"
+                );
+                windows_spawn::spawn_detached(
+                    config.canonical_executable().as_os_str(),
+                    &args,
+                    config.canonical_run_dir(),
+                    &config.env,
+                    CREATE_NO_WINDOW,
+                )
+                .map_err(|fallback| {
+                    tracing::warn!(target: "ja.runtime.spawn.fallback_failed", os_code = ?fallback.raw_os_error(), "shared daemon spawn failed");
+                    AppServerProcessError::Spawn
+                })?
+            }
+            Err(error) => {
+                tracing::warn!(target: "ja.runtime.spawn.detached_failed", os_code = ?error.raw_os_error(), "shared daemon detached spawn failed");
+                return Err(AppServerProcessError::Spawn);
+            }
         }
     };
     #[cfg(not(windows))]
-    let child = command.spawn().map_err(|error| {
-        // 只记录 OS 错误码，不记录 executable、argv、环境或 endpoint；
-        // 非 Windows 失败也只保留错误类别，不能把启动参数写入普通日志。
-        tracing::warn!(os_code = ?error.raw_os_error(), "shared daemon detached spawn failed");
-        AppServerProcessError::Spawn
-    })?;
-    let mut child = child;
+    let mut child = {
+        let mut command = Command::new(config.canonical_executable());
+        command
+            .args(&config.args)
+            .arg(format!("--ja-runtime-generation={host_generation}"))
+            .arg("--ja-transport=websocket")
+            .current_dir(config.canonical_run_dir())
+            .envs(config.env.iter())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.spawn().map_err(|error| {
+            // 只记录 OS 错误码，不记录 executable、argv、环境或 endpoint；
+            // 非 Windows 失败也只保留错误类别，不能把启动参数写入普通日志。
+            tracing::warn!(os_code = ?error.raw_os_error(), "shared daemon detached spawn failed");
+            AppServerProcessError::Spawn
+        })?
+    };
+    let (exit_sender, exit_receiver) = mpsc::channel();
     if thread::Builder::new()
         .name("ja-daemon-reaper".to_owned())
         .spawn(move || {
             let _ = child.wait();
+            let _ = exit_sender.send(());
         })
         .is_err()
     {
@@ -801,7 +988,7 @@ fn spawn_detached(
         // 再创建第二个 owner。Windows 句柄由 Child Drop 释放，Java 仍继续服务。
         tracing::warn!(target: "ja.runtime.spawn.reaper_failed", "shared daemon reaper could not start");
     }
-    Ok(())
+    Ok(exit_receiver)
 }
 
 /// 仅在当前进程确实属于 Job 时要求 breakaway；无 Job 时添加该 flag

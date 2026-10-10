@@ -9,8 +9,8 @@
 use super::error::{PreviewError, PreviewErrorCode};
 use super::load_watchdog::{LoadTimeoutRuntime, LoadTimeoutTask, PreviewLoadWatchdog};
 use super::local_file::{
-    PreviewFileResolution, PreviewResolveFileInput, resolve_browser_target, resolve_file,
-    resolve_reveal_file_path,
+    PreviewFileResolution, PreviewMode, PreviewResolveFileInput, is_local_media_preview_url,
+    resolve_browser_target, resolve_file, resolve_reveal_target,
 };
 use super::model::{
     NavigationSource, PreviewBlockedAction, PreviewEvent, PreviewId, PreviewLoadStatus,
@@ -18,9 +18,10 @@ use super::model::{
 };
 use super::session::{PreviewCloseTicket, PreviewManager};
 use crate::app_runtime::RuntimeHost;
+use crate::diagnostics::PREVIEW_NAVIGATION_DIAGNOSTIC_TARGET;
 #[cfg(windows)]
 use crate::native_shortcuts::{NativeShortcutHost, install_preview_webview};
-use crate::workspace::infrastructure::open_with::reveal_absolute_file;
+use crate::workspace::infrastructure::open_with::reveal_absolute_target;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,11 +34,14 @@ use tauri::{
 use url::Url;
 #[cfg(windows)]
 use webview2_com::{
-    HistoryChangedEventHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    ExecuteScriptCompletedHandler, HistoryChangedEventHandler,
+    Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS,
+    Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED,
+    Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler,
 };
 #[cfg(windows)]
-use windows_core::BOOL;
+use windows_core::{BOOL, PCWSTR};
 
 /// Preview window 与主 UI 共用的事件名，禁止调用方选择任意 channel。
 pub const PREVIEW_EVENT: &str = "ja://preview";
@@ -45,6 +49,12 @@ pub const PREVIEW_EVENT: &str = "ja://preview";
 /// Wry 0.55 只公开 start/finish，不公开 WebView2 navigation error status；
 /// 因此超过有界时间仍无终态 callback 时必须报告失败。
 const PREVIEW_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// WebView2 may report a local media document as aborted after its metadata is ready; keep that proof bounded.
+#[cfg(windows)]
+const PREVIEW_MEDIA_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 尚未遇到媒体终态时复查频率保持低频，并受同一个绝对 deadline 限制。
+#[cfg(windows)]
+const PREVIEW_MEDIA_METADATA_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Back/Forward 的 file history 许可只覆盖紧随受控原生动作的一次 engine callback。
 const PREVIEW_HISTORY_FILE_GRANT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 未归属的回滚记录独立设限，不限制用户管理的打开页数。
@@ -63,8 +73,18 @@ const PREVIEW_NAVIGATION_BLOCKED_MESSAGE: &str = "preview navigation was blocked
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct PreviewNavigationCompletionTracker {
-    pending: Option<(u64, u64)>,
+    pending: Option<PreviewNavigationIdentity>,
+    current: Option<PreviewNavigationIdentity>,
+    revision: u64,
     allow_unmapped_initial: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreviewNavigationIdentity {
+    pub(crate) navigation_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
 }
 
 #[cfg(windows)]
@@ -74,35 +94,58 @@ impl PreviewNavigationCompletionTracker {
     pub(crate) fn new() -> Self {
         Self {
             pending: None,
+            current: None,
+            revision: 0,
             allow_unmapped_initial: true,
         }
     }
 
     /// Wry 的策略 handler 先推进模型 generation；同一 UI thread 上随后记录 NavigationId，
-    /// 让旧页面的晚到 completion 无法完成较新的用户导航。
+    /// revision 继续区分同一 generation 内的文档跳转，避免异步媒体探测误收口。
+    /// @author kongweiguang
     pub(crate) fn started(&mut self, navigation_id: u64, generation: u64) {
-        self.pending = Some((navigation_id, generation));
+        self.revision = self.revision.wrapping_add(1);
+        let identity = PreviewNavigationIdentity {
+            navigation_id,
+            generation,
+            revision: self.revision,
+        };
+        self.pending = Some(identity);
+        self.current = Some(identity);
         self.allow_unmapped_initial = false;
     }
 
-    /// 只领取与最近 Starting 匹配的 completion；不匹配时保留当前映射，等待真正的终态到达。
+    /// 只领取与最近 Starting 匹配的 completion；当前 ticket 保留到异步探测结束以拒绝迟到结果。
+    /// @author kongweiguang
     pub(crate) fn completed(
         &mut self,
         navigation_id: u64,
         fallback_generation: u64,
-    ) -> Option<u64> {
+    ) -> Option<PreviewNavigationIdentity> {
         match self.pending {
-            Some((expected_id, generation)) if expected_id == navigation_id => {
+            Some(identity) if identity.navigation_id == navigation_id => {
                 self.pending = None;
-                Some(generation)
+                Some(identity)
             }
             Some(_) => None,
             None if self.allow_unmapped_initial => {
                 self.allow_unmapped_initial = false;
-                Some(fallback_generation)
+                self.revision = self.revision.wrapping_add(1);
+                let identity = PreviewNavigationIdentity {
+                    navigation_id,
+                    generation: fallback_generation,
+                    revision: self.revision,
+                };
+                self.current = Some(identity);
+                Some(identity)
             }
             None => None,
         }
+    }
+
+    /// 保留完成身份直到媒体探测收口，使同代际的新原生导航也能使旧异步结果失效。
+    pub(crate) fn is_current(&self, identity: PreviewNavigationIdentity) -> bool {
+        self.current == Some(identity)
     }
 }
 
@@ -909,7 +952,7 @@ pub async fn ja_preview_resolve_file(
         .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))?
 }
 
-/// 主 UI 的显式 Ctrl+点击先按现有路径规则核验，再以固定 Explorer 目标定位文件。
+/// 主 UI 的显式 Ctrl+点击先按原生路径规则核验，再固定 Explorer 参数定位文件或打开目录。
 #[tauri::command]
 pub async fn ja_preview_reveal_file(
     webview: tauri::Webview,
@@ -919,8 +962,8 @@ pub async fn ja_preview_reveal_file(
     ensure_main_webview(webview.label())?;
     let runtime = runtime.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let path = resolve_reveal_file_path(&runtime, &input)?;
-        reveal_absolute_file(&path)
+        let target = resolve_reveal_target(&runtime, &input)?;
+        reveal_absolute_target(&target.path, target.kind)
             .map_err(|_| PreviewError::new(PreviewErrorCode::FileRevealFailed))
     })
     .await
@@ -942,12 +985,17 @@ pub async fn ja_preview_open_file(
     let runtime = runtime.inner().clone();
     let target = input.target;
     let workspace_id = input.workspace_id;
+    let preview_mode = input.preview_mode;
     let resolved = tauri::async_runtime::spawn_blocking(move || {
-        resolve_browser_target(&runtime, &target, workspace_id.as_deref())
+        resolve_browser_target(&runtime, &target, workspace_id.as_deref(), preview_mode)
     })
     .await
     .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))??;
-    let opened = state.manager.open_local_file(&resolved.file_url)?;
+    let file_url = resolved
+        .file_url
+        .as_deref()
+        .ok_or(PreviewError::new(PreviewErrorCode::FileTargetInvalid))?;
+    let opened = state.manager.open_local_file(file_url)?;
     open_native_preview(opened, input.viewport, app, &state).await
 }
 
@@ -965,15 +1013,19 @@ pub async fn ja_preview_navigate_file(
     let runtime = runtime.inner().clone();
     let target = input.target;
     let workspace_id = input.workspace_id;
+    let preview_mode = input.preview_mode;
     let resolved = tauri::async_runtime::spawn_blocking(move || {
-        resolve_browser_target(&runtime, &target, workspace_id.as_deref())
+        resolve_browser_target(&runtime, &target, workspace_id.as_deref(), preview_mode)
     })
     .await
     .map_err(|_| PreviewError::new(PreviewErrorCode::DependencyRequest))??;
     let request = state.manager.local_file_navigation_request(
         input.session_id,
         input.generation,
-        &resolved.file_url,
+        resolved
+            .file_url
+            .as_deref()
+            .ok_or(PreviewError::new(PreviewErrorCode::FileTargetInvalid))?,
     )?;
     let result: Result<PreviewSessionSnapshot, PreviewError> = (|| {
         let snapshot = state.manager.snapshot(input.session_id)?;
@@ -1387,6 +1439,8 @@ pub struct PreviewOpenBlankInput {
 pub struct PreviewOpenFileInput {
     pub target: String,
     pub workspace_id: Option<String>,
+    #[serde(default = "browser_preview_mode")]
+    pub preview_mode: PreviewMode,
     pub viewport: PreviewViewportInput,
 }
 
@@ -1398,6 +1452,13 @@ pub struct PreviewNavigateFileInput {
     pub generation: u64,
     pub target: String,
     pub workspace_id: Option<String>,
+    #[serde(default = "browser_preview_mode")]
+    pub preview_mode: PreviewMode,
+}
+
+/// 这两个 command 已经是显式 browser 操作，缺省模式保留地址栏/媒体预览的既有语义。
+fn browser_preview_mode() -> PreviewMode {
+    PreviewMode::Browser
 }
 
 /// 浏览器历史命令绑定到精确的页面 generation。
@@ -1532,7 +1593,8 @@ fn emit_preview_load_failure(
 #[cfg(windows)]
 /// 在子 UI thread 安装单个 WebView2 completion observer，并且只等待 registration ACK。
 /// handler 不捕获 controller/WebView，因此 controller destruction 仍是原生生命周期 owner，
-/// 不形成 COM cycle。
+/// 不形成 COM cycle。诊断只记录导航号、generation、成功位和原生错误枚举，不记录路径或正文。
+/// @author kongweiguang
 async fn install_preview_navigation_completed(
     webview: tauri::Webview,
     app: tauri::AppHandle,
@@ -1542,6 +1604,7 @@ async fn install_preview_navigation_completed(
     generation: Arc<AtomicU64>,
 ) -> Result<(), PreviewError> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let probe_webview = webview.clone();
     webview
         .with_webview(move |platform_webview| {
             let result = (|| {
@@ -1578,6 +1641,7 @@ async fn install_preview_navigation_completed(
                 let completion_manager = manager.clone();
                 let completion_app = app.clone();
                 let completion_generation = generation.clone();
+                let completion_webview = probe_webview.clone();
                 let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
                     let Some(args) = args else {
                         return Ok(());
@@ -1587,7 +1651,7 @@ async fn install_preview_navigation_completed(
                         tracing::debug!("preview navigation completion identity was unavailable");
                         return Ok(());
                     }
-                    let completion_generation = {
+                    let identity = {
                         let Ok(mut tracker) = completed_tracker.lock() else {
                             tracing::debug!("preview navigation identity tracker was unavailable");
                             return Ok(());
@@ -1595,7 +1659,7 @@ async fn install_preview_navigation_completed(
                         tracker
                             .completed(navigation_id, completion_generation.load(Ordering::Acquire))
                     };
-                    let Some(completion_generation) = completion_generation else {
+                    let Some(identity) = identity else {
                         return Ok(());
                     };
                     let mut succeeded = BOOL::default();
@@ -1603,12 +1667,38 @@ async fn install_preview_navigation_completed(
                         tracing::debug!("preview navigation completion status was unavailable");
                         return Ok(());
                     }
+                    let mut web_error_status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+                    let web_error_status_available =
+                        unsafe { args.WebErrorStatus(&mut web_error_status) }.is_ok();
+                    tracing::info!(
+                        target: PREVIEW_NAVIGATION_DIAGNOSTIC_TARGET,
+                        navigation_id,
+                        generation = identity.generation,
+                        succeeded = succeeded.as_bool(),
+                        web_error_status_available,
+                        web_error_status = web_error_status.0,
+                        "preview native navigation completed"
+                    );
+                    if should_probe_media_after_navigation_abort(
+                        succeeded.as_bool(),
+                        web_error_status_available.then_some(web_error_status),
+                    ) && start_local_media_metadata_probe(
+                        completion_webview.clone(),
+                        completion_manager.clone(),
+                        completed_tracker.clone(),
+                        watchdog.clone(),
+                        completion_app.clone(),
+                        session_id,
+                        identity,
+                    ) {
+                        return Ok(());
+                    }
                     handle_preview_navigation_completed(
                         &completion_manager,
                         &watchdog,
                         &completion_app,
                         session_id,
-                        completion_generation,
+                        identity.generation,
                         succeeded.as_bool(),
                     );
                     Ok(())
@@ -1656,7 +1746,378 @@ async fn install_preview_navigation_completed(
 }
 
 #[cfg(windows)]
-/// Read the actual WebView2 history stack and publish changes without retaining a COM controller reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaMetadataProbeState {
+    Ready,
+    Pending,
+    Failed,
+}
+
+#[cfg(windows)]
+/// 仅针对 WebView2 明确报告的 CONNECTION_ABORTED 尝试媒体元数据探测；其它失败维持原行为。
+/// @author kongweiguang
+pub(crate) fn should_probe_media_after_navigation_abort(
+    succeeded: bool,
+    status: Option<COREWEBVIEW2_WEB_ERROR_STATUS>,
+) -> bool {
+    !succeeded && status == Some(COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED)
+}
+
+#[cfg(windows)]
+/// 只接受同步探测表达式约定的单个数值状态，拒绝 Promise、JSON 文本及未知返回值。
+/// @author kongweiguang
+pub(crate) fn parse_media_metadata_probe_result(
+    script_succeeded: bool,
+    result: &str,
+) -> MediaMetadataProbeState {
+    if !script_succeeded {
+        return MediaMetadataProbeState::Failed;
+    }
+    match result.trim() {
+        "1" => MediaMetadataProbeState::Ready,
+        "2" => MediaMetadataProbeState::Pending,
+        _ => MediaMetadataProbeState::Failed,
+    }
+}
+
+#[cfg(windows)]
+/// 对浏览器回显 URL 做 JSON 编码，并固定同步探测语义，防止脚本注入或无穷 duration 被视为有效媒体。
+/// @author kongweiguang
+pub(crate) fn build_local_media_metadata_probe_script(
+    expected_url: &str,
+) -> Result<String, serde_json::Error> {
+    let expected_url_json = serde_json::to_string(expected_url)?;
+    Ok(format!(
+        "(()=>{{if(location.protocol!=='file:'||location.href!=={expected_url_json})return 0;const media=document.querySelector('audio,video');if(!media)return 3;if(media.error)return 3;const duration=media.duration;if(media.readyState>=HTMLMediaElement.HAVE_METADATA&&Number.isFinite(duration)&&duration>=0)return 1;return 2;}})()"
+    ))
+}
+
+#[cfg(windows)]
+/// 对迟到的媒体脚本结果同时核对原生 navigation revision、模型 generation、URL 和 loading 状态。
+/// @author kongweiguang
+fn media_probe_is_current(
+    manager: &PreviewManager,
+    tracker: &Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: &str,
+) -> bool {
+    let tracker_is_current = tracker
+        .lock()
+        .map(|tracker| tracker.is_current(identity))
+        .unwrap_or(false);
+    if !tracker_is_current || !is_local_media_preview_url(expected_url) {
+        return false;
+    }
+    manager.snapshot(session_id).is_ok_and(|snapshot| {
+        snapshot.generation == identity.generation
+            && snapshot.url.as_str() == expected_url
+            && snapshot.status == PreviewSessionStatus::Open
+            && snapshot.load_status == PreviewLoadStatus::Loading
+    })
+}
+
+#[cfg(windows)]
+/// 在原生 WebView UI thread 执行纯同步媒体状态表达式，只回传闭集数值状态，不返回 DOM 或正文。
+/// @author kongweiguang
+async fn execute_local_media_metadata_probe(
+    webview: tauri::Webview,
+    manager: PreviewManager,
+    tracker: Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: String,
+    remaining: Duration,
+) -> Option<MediaMetadataProbeState> {
+    // 同步 IIFE 刻意不返回 Promise，避免 ExecuteScript 把 Promise 对象误读为成功。
+    let script = build_local_media_metadata_probe_script(&expected_url).ok()?;
+    let script_utf16 = script
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<MediaMetadataProbeState>();
+    let dispatch_sender = sender.clone();
+    let dispatch_manager = manager.clone();
+    let dispatch_tracker = tracker.clone();
+    let callback_expected_url = expected_url.clone();
+    let dispatch_result = webview.with_webview(move |platform_webview| {
+        let native_webview: ICoreWebView2 =
+            match unsafe { platform_webview.controller().CoreWebView2() } {
+                Ok(native_webview) => native_webview,
+                Err(_) => {
+                    let _ = dispatch_sender.send(MediaMetadataProbeState::Failed);
+                    return;
+                }
+            };
+        if !media_probe_is_current(
+            &dispatch_manager,
+            &dispatch_tracker,
+            session_id,
+            identity,
+            &callback_expected_url,
+        ) {
+            let _ = dispatch_sender.send(MediaMetadataProbeState::Failed);
+            return;
+        }
+        let callback_manager = dispatch_manager.clone();
+        let callback_tracker = dispatch_tracker.clone();
+        let callback_url = callback_expected_url.clone();
+        let callback_sender = dispatch_sender.clone();
+        let callback = ExecuteScriptCompletedHandler::create(Box::new(move |status, result| {
+            let probe_state = if !media_probe_is_current(
+                &callback_manager,
+                &callback_tracker,
+                session_id,
+                identity,
+                &callback_url,
+            ) {
+                MediaMetadataProbeState::Failed
+            } else {
+                parse_media_metadata_probe_result(status.is_ok(), &result)
+            };
+            let _ = callback_sender.send(probe_state);
+            Ok(())
+        }));
+        if unsafe { native_webview.ExecuteScript(PCWSTR(script_utf16.as_ptr()), &callback) }
+            .is_err()
+        {
+            let _ = dispatch_sender.send(MediaMetadataProbeState::Failed);
+        }
+    });
+    if dispatch_result.is_err() {
+        let _ = sender.send(MediaMetadataProbeState::Failed);
+    }
+    match tokio::time::timeout(remaining, receiver.recv()).await {
+        Ok(Some(state)) => Some(state),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+#[cfg(windows)]
+/// 在一个固定绝对 deadline 内低频复查媒体元数据；导航、代际或 URL 改变会立即丢弃旧结果。
+/// @author kongweiguang
+async fn wait_for_local_media_metadata(
+    webview: tauri::Webview,
+    manager: PreviewManager,
+    tracker: Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: String,
+) -> Option<bool> {
+    let deadline = Instant::now() + PREVIEW_MEDIA_METADATA_PROBE_TIMEOUT;
+    loop {
+        if !media_probe_is_current(&manager, &tracker, session_id, identity, &expected_url) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Some(false);
+        }
+        match execute_local_media_metadata_probe(
+            webview.clone(),
+            manager.clone(),
+            tracker.clone(),
+            session_id,
+            identity,
+            expected_url.clone(),
+            remaining,
+        )
+        .await
+        {
+            Some(MediaMetadataProbeState::Ready) => {
+                return media_probe_is_current(
+                    &manager,
+                    &tracker,
+                    session_id,
+                    identity,
+                    &expected_url,
+                )
+                .then_some(true);
+            }
+            Some(MediaMetadataProbeState::Failed) | None => {
+                return media_probe_is_current(
+                    &manager,
+                    &tracker,
+                    session_id,
+                    identity,
+                    &expected_url,
+                )
+                .then_some(false);
+            }
+            Some(MediaMetadataProbeState::Pending) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Some(false);
+                }
+                tokio::time::sleep(PREVIEW_MEDIA_METADATA_PROBE_INTERVAL.min(remaining)).await;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+/// 只在原生 WebView UI thread 最终校验并提交媒体结果，串行化 NavigationStarting；错误只完成匹配代际的 watchdog。
+/// @author kongweiguang
+fn finalize_local_media_metadata_probe_on_ui_thread(
+    manager: &PreviewManager,
+    tracker: &Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    watchdog: &PreviewLoadWatchdog,
+    app: &tauri::AppHandle,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: &str,
+    verified: bool,
+) -> bool {
+    // `with_webview` 串行运行所有同 WebView 的原生 navigation callbacks；读取 tracker 后释放锁，
+    // 再读模型并提交。其它线程的导航仍由 manager generation/URL CAS 拒绝，不形成 tracker→manager 锁环。
+    let tracker_is_current = tracker
+        .lock()
+        .map(|tracker| tracker.is_current(identity))
+        .unwrap_or(false);
+    if !tracker_is_current || !is_local_media_preview_url(expected_url) {
+        return false;
+    }
+    let Ok(snapshot) = manager.snapshot(session_id) else {
+        return false;
+    };
+    if snapshot.generation != identity.generation
+        || snapshot.url.as_str() != expected_url
+        || snapshot.status != PreviewSessionStatus::Open
+        || snapshot.load_status != PreviewLoadStatus::Loading
+    {
+        return false;
+    }
+
+    if verified {
+        match manager.callback_load_finished(session_id, identity.generation, expected_url) {
+            Ok(Some(event)) => {
+                let _ = watchdog.complete(session_id, identity.generation);
+                emit_preview_event(app, event);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::debug!(
+                    code = ?error.code(),
+                    "verified media completion became stale before model commit"
+                );
+                false
+            }
+        }
+    } else {
+        // generation-scoped completion cannot remove a replacement load's watchdog.
+        let _ = watchdog.complete(session_id, identity.generation);
+        match manager.callback_load_error(
+            session_id,
+            identity.generation,
+            PREVIEW_NAVIGATION_FAILED_MESSAGE,
+        ) {
+            Ok(event) => {
+                emit_preview_event(app, event);
+                true
+            }
+            Err(error) => {
+                tracing::debug!(
+                    code = ?error.code(),
+                    "media metadata probe failure became stale before model commit"
+                );
+                false
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+/// 将最终结果派回所属 WebView thread，使 native NavigationStarting 无法夹在校验与状态提交之间。
+/// @author kongweiguang
+async fn finalize_local_media_metadata_probe(
+    webview: tauri::Webview,
+    manager: PreviewManager,
+    tracker: Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    watchdog: PreviewLoadWatchdog,
+    app: tauri::AppHandle,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: String,
+    verified: bool,
+) -> bool {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let dispatch_manager = manager.clone();
+    let dispatch_tracker = tracker.clone();
+    let dispatch_watchdog = watchdog.clone();
+    let dispatch_url = expected_url.clone();
+    let dispatch_result = webview.with_webview(move |_| {
+        let committed = finalize_local_media_metadata_probe_on_ui_thread(
+            &dispatch_manager,
+            &dispatch_tracker,
+            &dispatch_watchdog,
+            &app,
+            session_id,
+            identity,
+            &dispatch_url,
+            verified,
+        );
+        let _ = sender.send(committed);
+    });
+    if dispatch_result.is_err() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(PREVIEW_NATIVE_HANDLER_INSTALL_TIMEOUT, receiver).await,
+        Ok(Ok(true))
+    )
+}
+
+#[cfg(windows)]
+/// 从 native completion 启动固定 deadline 的媒体探测任务；只有当前本地音视频目标才拦截原失败事件。
+/// @author kongweiguang
+fn start_local_media_metadata_probe(
+    webview: tauri::Webview,
+    manager: PreviewManager,
+    tracker: Arc<Mutex<PreviewNavigationCompletionTracker>>,
+    watchdog: PreviewLoadWatchdog,
+    app: tauri::AppHandle,
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+) -> bool {
+    let Ok(snapshot) = manager.snapshot(session_id) else {
+        return false;
+    };
+    let expected_url = snapshot.url.as_str().to_owned();
+    if !media_probe_is_current(&manager, &tracker, session_id, identity, &expected_url) {
+        return false;
+    }
+    tauri::async_runtime::spawn(async move {
+        let verified = wait_for_local_media_metadata(
+            webview.clone(),
+            manager.clone(),
+            tracker.clone(),
+            session_id,
+            identity,
+            expected_url.clone(),
+        )
+        .await;
+        let Some(verified) = verified else {
+            return;
+        };
+        let _ = finalize_local_media_metadata_probe(
+            webview,
+            manager,
+            tracker,
+            watchdog,
+            app,
+            session_id,
+            identity,
+            expected_url,
+            verified,
+        )
+        .await;
+    });
+    true
+}
+
+#[cfg(windows)]
+/// 读取 WebView2 实际历史栈并发布变更，不保留 COM 控制器引用。
 fn emit_preview_history_state(
     manager: &PreviewManager,
     app: &tauri::AppHandle,

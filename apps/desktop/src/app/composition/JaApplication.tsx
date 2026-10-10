@@ -12,12 +12,15 @@ import {
   type ReactElement,
 } from "react";
 import { toast } from "sonner";
+import { ArrowLeft, Database } from "lucide-react";
 import { useRuntimeLifecycle, useRuntimeState } from "../RuntimeProvider";
 import type { JaWorkbenchAdapters } from "../useJaWorkbench";
 import { Button } from "@/shared/ui/primitives/Button";
 import {
+  DataStorageSection,
   useSettingsController,
   type DesktopNotificationPreference,
+  type DataStorageProps,
   type SettingsAdapter,
   type SettingsAppearancePort,
   type SettingsRuntimePort,
@@ -29,11 +32,17 @@ import {
 } from "@/features/command";
 import {
   useConversationController,
-  readFullMessageContent,
   readFullAnswerContent,
+  conversationMarkdownFilename,
+  exportConversationMarkdown,
+  downloadPublicMarkdown,
+  exportPublicMarkdown,
+  useTimelineStore,
   type ConversationArtifactPort,
   type ConversationAttachmentPort,
   type ConversationMcpReader,
+  type ConversationProcessBinding,
+  type ConversationProcessPort,
   type ComposerSlashCommand,
   type ConversationSummary,
 } from "@/features/conversation";
@@ -47,6 +56,8 @@ import {
   ConversationSearchDialog,
   NavigationResizeHandle,
   NavigationSidebar,
+  ProjectEditDialog,
+  type ProjectEditInput,
   detectDesktopPlatform,
   navigationShortcut,
   useWindowFrameController,
@@ -59,6 +70,7 @@ import {
   type WorkbenchTabKey,
 } from "@/features/workbench";
 import { createTaskAdapter, type TaskAdapter } from "@/api/tauri/tasks";
+import { createProcessSessionAdapter, type ProcessSessionAdapter } from "@/api/tauri/process";
 import type {
   TaskComposerSkillSuggestion,
   TaskSummary,
@@ -68,7 +80,7 @@ import type {
 } from "@/features/tasks";
 import type { AttachmentPreviewPort, AttachmentPreviewTarget } from "@/features/workbench/preview";
 import type { TurnReviewPort, TurnReviewTarget } from "@/features/workbench/review";
-import { useGoalController, type GoalPort } from "@/features/goals";
+import { usePlanController, type PlanPort } from "@/features/plans";
 import type { HistoryAdapter } from "@/api/tauri/history";
 import {
   SIDEBAR_RATIO_MAX,
@@ -103,7 +115,12 @@ import {
 } from "../application/useComposerNativeDropRouter";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { SettingsView } from "./SettingsView";
-import { ThreadWorkbenchSessions } from "./ThreadWorkbenchSessions";
+import {
+  ThreadWorkbenchSessions,
+  type FilesCapabilityCloseFocusCapture,
+  type RetainedWorkspaceRebindLifecycle,
+} from "./ThreadWorkbenchSessions";
+import { ProjectRebindDialog, type ProjectRebindConfirmation } from "./ProjectRebindDialog";
 import { useThreadWorkbenchState } from "../application/useThreadWorkbenchState";
 import {
   ConversationWorkspace,
@@ -119,7 +136,7 @@ import {
   DEFAULT_ATTACHMENT_PREVIEW_PORT,
   DEFAULT_CONVERSATION_ARTIFACT_PORT,
   DEFAULT_HISTORY_ADAPTER,
-  DEFAULT_GOAL_PORT,
+  DEFAULT_PLAN_PORT,
   DEFAULT_INTERACTION_PORT,
   DEFAULT_SETTINGS_ADAPTER,
   DEFAULT_TURN_REVIEW_PORT,
@@ -133,6 +150,8 @@ import {
   type NavigationNativeAdapters,
 } from "./navigationAdapters";
 import "../App.css";
+import type { RuntimeStorageInfo } from "../application/runtimePorts";
+import { canRetryStorageRecovery, storageRecoveryMessage } from "@/shared/runtime/storageRecovery";
 
 /** 保持连接文案简短，壳层不暴露 native 诊断。 */
 function runtimeLabel(status: ReturnType<typeof useRuntimeState>["boot"]["status"]): string {
@@ -177,14 +196,59 @@ function runtimeTone(
   }
 }
 
+/** 只定位主正文 Composer，避免保留的侧聊 Composer 接管返回焦点。 */
+function currentConversationComposer(): HTMLTextAreaElement | null {
+  return document.querySelector<HTMLTextAreaElement>('#conversation [aria-label="消息"]');
+}
+
+/** 只允许精确 aria-controls 配对的当前菜单穿过 Radix modal 对应用根添加的 aria-hidden。 */
+function activeWorkbenchPortalTrigger(): HTMLButtonElement | null {
+  const workbench = document.querySelector<HTMLElement>("#workbench");
+  const activeElement = document.activeElement;
+  if (
+    workbench === null ||
+    workbench.closest<HTMLElement>("[hidden], [inert]") !== null ||
+    !(activeElement instanceof HTMLElement)
+  )
+    return null;
+
+  const menu = activeElement.closest<HTMLElement>(".ja-workbench-add-menu[role='menu']");
+  if (
+    menu?.id === undefined ||
+    menu.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') !== null
+  )
+    return null;
+
+  return (
+    Array.from(workbench.querySelectorAll<HTMLButtonElement>("button[aria-controls]")).find(
+      (trigger) =>
+        trigger.getAttribute("aria-controls") === menu.id &&
+        trigger.closest<HTMLElement>("[hidden], [inert]") === null,
+    ) ?? null
+  );
+}
+
 /**
- * 在会话导航状态提交后查询当前 Composer 并聚焦；查询延后到下一帧，避免侧栏/Dialog 的
- * 焦点归还或 Thread keyed remount 把光标重新移走。
+ * 在会话导航提交后查询当前主正文 Composer；关闭 Workbench 时仅接受 body、预迁出的标题栏
+ * 节点或与当前 portal 菜单配对的触发器，避免迟到回调接管用户后来选择的控件。
  */
-function focusConversationComposerAfterNavigation(): void {
+function focusConversationComposerAfterNavigation(
+  expectedFocus?: HTMLElement,
+  isCurrentScope: () => boolean = () => true,
+  allowedRestoreFocus?: HTMLElement,
+): void {
   /** 查询执行时的当前节点，避免 Thread 切换后把焦点交给已经卸载的旧 Composer。 */
   const focusComposer = (): void => {
-    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="消息"]');
+    if (!isCurrentScope()) return;
+    const activeElement = document.activeElement;
+    if (
+      (expectedFocus !== undefined || allowedRestoreFocus !== undefined) &&
+      activeElement !== expectedFocus &&
+      activeElement !== allowedRestoreFocus &&
+      activeElement !== document.body
+    )
+      return;
+    const composer = currentConversationComposer();
     if (composer?.isConnected && !composer.disabled) composer.focus();
   };
   if (typeof window.requestAnimationFrame === "function")
@@ -192,15 +256,68 @@ function focusConversationComposerAfterNavigation(): void {
   else focusComposer();
 }
 
-/** 从 Workbench 返回时优先恢复对象来源；对象已卸载则回到当前 Composer，避免焦点丢进 body。 */
-function restoreConversationObjectFocus(source: HTMLElement | null): void {
+/** 隐藏可见 Workbench 前迁出其焦点；只有精确配对的 portal 菜单可越过 modal aria-hidden。 */
+function moveVisibleWorkbenchFocusToTitlebar(): HTMLElement | null {
+  const workbench = document.querySelector<HTMLElement>("#workbench");
+  const activeElement = document.activeElement;
+  const portalTrigger = activeWorkbenchPortalTrigger();
+  if (
+    !(activeElement instanceof HTMLElement) ||
+    workbench === null ||
+    (!workbench.contains(activeElement) && portalTrigger === null) ||
+    activeElement.closest<HTMLElement>("[hidden], [inert]") !== null ||
+    (portalTrigger === null && activeElement.closest<HTMLElement>('[aria-hidden="true"]') !== null)
+  )
+    return null;
+
+  const target = document.querySelector<HTMLButtonElement>(
+    ".ja-titlebar button.ja-titlebar-button:not(:disabled)",
+  );
+  if (
+    target === null ||
+    workbench.contains(target) ||
+    target.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') !== null
+  ) {
+    activeElement.blur();
+    return document.activeElement === document.body ? document.body : null;
+  }
+  target.focus({ preventScroll: true });
+  if (document.activeElement === target) return target;
+  activeElement.blur();
+  return document.activeElement === document.body ? document.body : null;
+}
+
+/** 从 Workbench 返回时优先恢复当前正文中的对象来源；来源失效则回到主 Composer。 */
+function restoreConversationObjectFocus(
+  source: HTMLElement | null,
+  expectedFocus?: HTMLElement,
+  isCurrentScope: () => boolean = () => true,
+  allowedRestoreFocus?: HTMLElement,
+): void {
   const restoreFocus = (): void => {
-    if (source?.isConnected) {
+    if (!isCurrentScope()) return;
+    const activeElement = document.activeElement;
+    if (
+      (expectedFocus !== undefined || allowedRestoreFocus !== undefined) &&
+      activeElement !== expectedFocus &&
+      activeElement !== allowedRestoreFocus &&
+      activeElement !== document.body
+    )
+      return;
+    if (
+      source?.isConnected &&
+      source.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null
+    ) {
       source.focus();
       return;
     }
-    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="消息"]');
-    if (composer?.isConnected && !composer.disabled) composer.focus();
+    const composer = currentConversationComposer();
+    if (
+      composer?.isConnected &&
+      !composer.disabled &&
+      composer.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null
+    )
+      composer.focus();
   };
   if (typeof window.requestAnimationFrame === "function")
     window.requestAnimationFrame(restoreFocus);
@@ -220,18 +337,20 @@ export interface JaApplicationProps {
   readonly desktopAdapters?: DesktopIntegrationAdapters;
   readonly navigationAdapters?: NavigationNativeAdapters;
   readonly taskAdapter?: TaskAdapter;
-  readonly goalPort?: GoalPort;
+  readonly planPort?: PlanPort;
+  readonly processAdapter?: ProcessSessionAdapter;
 }
 
 const APP_EXIT_OBSERVER = { observe: observeAppExitRequested };
 const DEFAULT_TASK_ADAPTER = createTaskAdapter();
+const DEFAULT_PROCESS_SESSION_ADAPTER = createProcessSessionAdapter();
 
 /**
- * 在 composition root 组合 native adapter 与 Files/Terminal 生命周期，不把资源状态提升到壳层；
- * 设置页只隐藏并暂停工作区而不卸载其子树，使配色热切换可保留 Editor/xterm 实例与 PTY 所有权。
- * 右栏目标和回调按 Thread 隔离，同项目切换保留各会话工作面，不将项目身份当作会话身份。
- * runtimeState 的正 generation 是 Review 事件的 admission fence，缺失时 Review 只读且不接受失效刷新。
- * 首屏始终挂载对话；运行时启动与故障只投影到侧栏，不改变发送准入或人工恢复门禁。
+ * Composition root 组合 native adapter 与 Files/Terminal 生命周期，不提升资源状态；设置页只隐藏并暂停工作区，保留 Editor/xterm 与 PTY 所有权。
+ * 右栏目标按 Thread 隔离；Review 缺少 Runtime generation 时只读。首屏保留对话，项目操作等待配置 scope，运行时故障提供重连和人工恢复。
+ * 数据恢复不依赖配置读取；Settings trust 写入服务端 Workspace，不切换 Thread 或重建 Turn。
+ * 历史读取失败只向导航传递空态门控，提示与重试仍由当前 Conversation 的 scoped Notification 持有。
+ * @author kongweiguang
  */
 export function JaApplication({
   settingsAdapter,
@@ -246,7 +365,8 @@ export function JaApplication({
   desktopAdapters = DEFAULT_DESKTOP_INTEGRATIONS,
   navigationAdapters = DEFAULT_NAVIGATION_NATIVE_ADAPTERS,
   taskAdapter = DEFAULT_TASK_ADAPTER,
-  goalPort = DEFAULT_GOAL_PORT,
+  planPort = DEFAULT_PLAN_PORT,
+  processAdapter = DEFAULT_PROCESS_SESSION_ADAPTER,
 }: JaApplicationProps): ReactElement {
   const workspaceReferenceTargetRef = useRef<
     ((reference: ComposerWorkspaceReferenceTarget) => void) | undefined
@@ -272,24 +392,141 @@ export function JaApplication({
     turnAdmissionReady,
     lastConfigurationEvent,
     lastThreadMetadataEvent,
+    lastWorkspaceMetadataEvent,
   } = useRuntimeState();
-  const { activateWorkspace, queryRuntime } = useRuntimeLifecycle();
+  const {
+    startRuntime,
+    activateWorkspace,
+    queryRuntime,
+    readRuntimeStorage,
+    openStorageBackup,
+    retryStorage,
+  } = useRuntimeLifecycle();
+  const [reconnectPending, setReconnectPending] = useState(false);
+  const reconnectInFlightRef = useRef(false);
+  const reconnectAvailable =
+    ["stopped", "failed", "degraded"].includes(boot.status) &&
+    runtimeState?.status !== "busy" &&
+    runtimeState?.status !== "incompatible" &&
+    runtimeState?.status !== "recovery_required" &&
+    (runtimeState?.storageRecovery === undefined || runtimeState.storageRecovery.phase === "ready");
+  /**
+   * 重连只推进既有生命周期 lane；ref 在状态提交前去重，存储与人工恢复仍保留各自入口。
+   * 成功后只在原按钮失去焦点时归还当前页面的焦点，不能夺走等待期间用户选择的新目标。
+   */
+  const reconnectRuntime = useCallback(async (): Promise<void> => {
+    if (reconnectInFlightRef.current || !reconnectAvailable) return;
+    reconnectInFlightRef.current = true;
+    setReconnectPending(true);
+    const trigger = document.activeElement;
+    try {
+      const status = await startRuntime();
+      toast.dismiss("ja-runtime-reconnect");
+      if (status.storageRecovery !== undefined && status.storageRecovery.phase !== "ready") return;
+      /** 查询已提交的当前页面，避免等待期间导航后聚焦隐藏的 Composer 或旧设置分类。 */
+      const restoreFocus = (): void => {
+        if (document.activeElement !== document.body && document.activeElement !== trigger) return;
+        const selectedTab = document.querySelector<HTMLButtonElement>(
+          '.ja-settings-view [role="tab"][aria-selected="true"]',
+        );
+        const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="消息"]');
+        const target =
+          selectedTab ??
+          (composer?.isConnected && !composer.disabled ? composer : undefined) ??
+          document.querySelector<HTMLButtonElement>(".ja-titlebar button:not(:disabled)");
+        target?.focus();
+      };
+      if (typeof window.requestAnimationFrame === "function")
+        window.requestAnimationFrame(restoreFocus);
+      else queueMicrotask(restoreFocus);
+    } catch {
+      toast.error("重新连接失败，请稍后重试。", { id: "ja-runtime-reconnect" });
+    } finally {
+      reconnectInFlightRef.current = false;
+      setReconnectPending(false);
+    }
+  }, [reconnectAvailable, startRuntime]);
+  const [runtimeStorage, setRuntimeStorage] = useState<RuntimeStorageInfo>();
+  const [storageReadError, setStorageReadError] = useState<string>();
+  /** 快速打开时延迟显示短暂提醒，避免闪烁；会话和草稿保持挂载状态。 */
+  useEffect(() => {
+    if (boot.status !== "connecting") {
+      toast.dismiss("ja-storage-opening");
+      return;
+    }
+    const timer = setTimeout(() => {
+      const recovery = runtimeState?.storageRecovery;
+      toast.loading(
+        recovery?.phase === "rebuilding" ? storageRecoveryMessage(recovery) : "正在准备本地数据…",
+        { id: "ja-storage-opening" },
+      );
+    }, 600);
+    return () => {
+      clearTimeout(timer);
+      toast.dismiss("ja-storage-opening");
+    };
+  }, [boot.status, runtimeState?.storageRecovery]);
+  const storageGeneration = useRef(runtimeState?.generation);
+  storageGeneration.current = runtimeState?.generation;
+  /** Runtime 被替换后丢弃迟到的存储读取结果，与会话投影采用相同处理。 */
+  const reloadStorage = useCallback(async (): Promise<void> => {
+    const generation = runtimeState?.generation;
+    try {
+      const info = await readRuntimeStorage();
+      if (storageGeneration.current !== generation) return;
+      setRuntimeStorage(info);
+      setStorageReadError(undefined);
+    } catch (error) {
+      if (storageGeneration.current === generation) setStorageReadError("存储信息读取失败，请重试");
+      throw error;
+    }
+  }, [readRuntimeStorage, runtimeState?.generation]);
+  /** 阻断状态仍可由 native 读取目录投影；恢复身份优先取本代运行时事实。 */
+  useEffect(() => {
+    if (runtimeState?.storageRecovery !== undefined) {
+      setRuntimeStorage((previous) =>
+        previous === undefined
+          ? previous
+          : { ...previous, storageRecovery: runtimeState.storageRecovery },
+      );
+    }
+    if (runtimeState?.status === "ready" || runtimeState?.storageRecovery?.phase === "blocked")
+      void reloadStorage().catch(() => undefined);
+  }, [runtimeState?.status, runtimeState?.storageRecovery, reloadStorage]);
+  /** 即使重试失败，也要读取最新的恢复决策，确保显示的下一步操作准确。 */
+  const retryLocalStorage = useCallback(async (): Promise<void> => {
+    try {
+      await retryStorage?.();
+    } finally {
+      await reloadStorage();
+    }
+  }, [retryStorage, reloadStorage]);
   const resolvedWorkbenchAdapters = workbenchAdapters ?? DEFAULT_WORKBENCH_ADAPTERS;
   const resolvedHistoryAdapter = historyAdapter ?? DEFAULT_HISTORY_ADAPTER;
+  /** 持续进程使用独立的固定 command adapter；列表返回的 registry generation 由面板传回后续动作。 */
+  const processSessionPort = useMemo<ConversationProcessPort>(
+    () => ({
+      list: (input) => processAdapter.list(input),
+      read: (input) => processAdapter.read(input),
+      write: (input) => processAdapter.write(input),
+      stop: (input) => processAdapter.stop(input),
+    }),
+    [processAdapter],
+  );
   /**
-   * 将 History owner 的单一只读方法收窄给 Composer，避免界面获得完整历史 adapter 或 raw IPC。
-   * TauriHistoryAdapter 的实现依赖 `this.bridge`，因此必须在组合边界绑定 owner，不能把 class
-   * method 解构为裸函数后交给浮层调用。
+   * 将 History 所属者的单一只读方法收窄给 Composer，避免界面获得完整历史适配器或原始 IPC。
+   * TauriHistoryAdapter 的实现依赖 `this.bridge`，因此必须在组合边界绑定所属实例，不能把类方法
+   * 方法解构为裸函数后交给浮层调用。
    */
   const conversationUsageReader = useMemo<ConversationUsageReader | undefined>(() => {
     const read = resolvedHistoryAdapter.threadUsageRead;
     return read === undefined ? undefined : { read: read.bind(resolvedHistoryAdapter) };
   }, [resolvedHistoryAdapter]);
-  /** MCP status reader is thread-scoped and memoized so streaming renders cannot retrigger a visible popover read. */
+  /** MCP 状态读取器按 Thread 隔离并缓存，避免流式渲染期间重复读取已打开的弹出层。 */
   const conversationMcpReader = useMemo<ConversationMcpReader | undefined>(() => {
     const read = resolvedHistoryAdapter.threadMcpRead;
     if (read === undefined) return undefined;
-    /** Bind through the owning adapter because production history methods use its native bridge. */
+    /** 通过所属适配器绑定方法，因为生产环境的历史读取方法使用其原生桥接对象。 */
     const readThreadMcp = (threadId: string) => read.call(resolvedHistoryAdapter, { threadId });
     return { read: readThreadMcp };
   }, [resolvedHistoryAdapter]);
@@ -315,35 +552,52 @@ export function JaApplication({
     }),
     [resolvedHistoryAdapter],
   );
-  /** 子任务正文沿用同一分页合同，UI 只在用户查看或复制时物化选中消息。 */
+  /** 子任务正文进入共享 TimelineStore，按 Thread/Item identity 缓存并校验分页边界。 */
   const readTaskMessageContent = useCallback(
-    (threadId: string, messageId: string): Promise<string> => {
-      const readPage = resolvedHistoryAdapter.messageContentRead;
-      if (readPage === undefined) return Promise.reject(new Error("完整内容暂时不可用。"));
-      return readFullMessageContent(
-        (input) => readPage.call(resolvedHistoryAdapter, input),
+    (threadId: string, itemId: string): Promise<string> =>
+      useTimelineStore.getState().hydrateItemContent(
         threadId,
-        messageId,
-      );
-    },
+        itemId,
+        (input) => resolvedHistoryAdapter.itemContentRead(input),
+        () => useTimelineStore.getState().threads[threadId] !== undefined,
+      ),
     [resolvedHistoryAdapter],
   );
-  /** 子任务最终答复可能跨历史页；按受管 Thread 身份按需读齐，保持侧聊与主会话一致。 */
+  /** 子任务最终答复跨多个公开 Item 时，片段和组合结果都由共享 TimelineStore 缓存。 */
   const readTaskAnswerContent = useCallback(
     (
       threadId: string,
-      finalMessageId: string,
+      finalItemId: string,
       minimumRevision?: number,
       turnId?: string,
-    ): Promise<string> =>
-      readFullAnswerContent(
-        resolvedHistoryAdapter,
-        threadId,
-        finalMessageId,
-        () => true,
-        minimumRevision,
-        turnId,
-      ),
+    ): Promise<string> => {
+      const isCurrent = () => useTimelineStore.getState().threads[threadId] !== undefined;
+      return useTimelineStore
+        .getState()
+        .hydrateAnswerContent(
+          threadId,
+          finalItemId,
+          () =>
+            readFullAnswerContent(
+              resolvedHistoryAdapter,
+              threadId,
+              finalItemId,
+              isCurrent,
+              minimumRevision,
+              turnId,
+              (itemThreadId, itemId, current) =>
+                useTimelineStore
+                  .getState()
+                  .hydrateItemContent(
+                    itemThreadId,
+                    itemId,
+                    (input) => resolvedHistoryAdapter.itemContentRead(input),
+                    current,
+                  ),
+            ),
+          isCurrent,
+        );
+    },
     [resolvedHistoryAdapter],
   );
   const taskPreferencesPort = useMemo<TaskPreferencesPort>(
@@ -383,14 +637,14 @@ export function JaApplication({
   >(undefined);
   const attachmentPreviewSourceRef = useRef<HTMLButtonElement | null>(null);
   const [settingsWorkspaceScope, setSettingsWorkspaceScope] = useState<
-    { workspaceId: string; kind: "project" } | undefined
+    { workspaceId: string; kind: "project"; bindingKey: string } | undefined
   >();
   /** Settings v3 接收的 workspace scope 只表示项目覆盖；session 目录不携带项目配置。 */
   const publishSettingsWorkspaceScope = useCallback(
     (selected: WorkspaceProjection | undefined): void => {
       setSettingsWorkspaceScope(
         selected?.kind === "project"
-          ? { workspaceId: selected.workspaceId, kind: "project" }
+          ? { workspaceId: selected.workspaceId, kind: "project", bindingKey: selected.rootPath }
           : undefined,
       );
     },
@@ -415,6 +669,54 @@ export function JaApplication({
   const workspaceChange = useWorkspaceChangeController(
     filesCapability.current,
     resolvedWorkbenchAdapters.terminal,
+  );
+  const rebindLifecycleRef = useRef<RetainedWorkspaceRebindLifecycle | undefined>(undefined);
+  const [rebindConfirmation, setRebindConfirmation] = useState<ProjectRebindConfirmation>();
+  const rebindChoiceRef = useRef<((choice: "save" | "discard" | "cancel") => void) | undefined>(
+    undefined,
+  );
+  const [editingProject, setEditingProject] = useState<WorkspaceProjection>();
+  const projectEditIntentRef = useRef(0);
+  const projectEditFocusRef = useRef<(() => void) | undefined>(undefined);
+  const projectEditWorkspaceIdRef = useRef<string | undefined>(undefined);
+  /** 每个保留 Thread 的生命周期由宿主注册，编辑另一个项目也不能清理当前项目资源。 */
+  const registerRebindLifecycle = useCallback(
+    (lifecycle: RetainedWorkspaceRebindLifecycle | undefined): void => {
+      rebindLifecycleRef.current = lifecycle;
+    },
+    [],
+  );
+  /** 同一待决确认只结算一次；取消通过 AbortError 留住原编辑弹窗的输入。 */
+  const chooseRebindDisposition = useCallback((choice: "save" | "discard" | "cancel"): void => {
+    const settle = rebindChoiceRef.current;
+    rebindChoiceRef.current = undefined;
+    setRebindConfirmation(undefined);
+    settle?.(choice);
+  }, []);
+  /** 项目更新的资源事务独立于页面切换，必须在 Java 写入前处理所有保留会话的草稿。 */
+  const beforeProjectRebind = useCallback(async (workspaceId: string) => {
+    const lifecycle = rebindLifecycleRef.current;
+    if (lifecycle === undefined) return undefined;
+    const documents = lifecycle.listUnsavedDocuments(workspaceId);
+    let disposition: "save" | "discard" = "save";
+    if (documents.length > 0) {
+      if (rebindChoiceRef.current !== undefined)
+        throw new Error("另一个项目正在等待文件处理，请先完成。");
+      const choice = await new Promise<"save" | "discard" | "cancel">((resolve) => {
+        rebindChoiceRef.current = resolve;
+        setRebindConfirmation({ workspaceId, documents });
+      });
+      if (choice === "cancel") throw new DOMException("用户取消更改目录", "AbortError");
+      disposition = choice;
+    }
+    return lifecycle.prepareWorkspaceRebind(workspaceId, disposition);
+  }, []);
+  useEffect(
+    () => () => {
+      rebindChoiceRef.current?.("cancel");
+      rebindChoiceRef.current = undefined;
+    },
+    [],
   );
   /** 托盘退出失败只发布稳定反馈，具体 Files 冲突仍由 Files feature 展示。 */
   const reportAppExitFailure = useCallback((): void => {
@@ -490,16 +792,6 @@ export function JaApplication({
     configurationChange: projectSettingsConfigurationChange(lastConfigurationEvent),
     runtimePort: settingsRuntimePort,
   });
-  /** 从 v4 默认选择派生当前模型；缺失或悬空选择必须让应用进入设置门禁。 */
-  const activeModel = useMemo(() => {
-    const selection = settings.snapshot.defaultSelection;
-    if (selection === null) return undefined;
-    const provider = settings.snapshot.providers.find(
-      (candidate) => candidate.providerId === selection.providerId,
-    );
-    const model = provider?.models.find((candidate) => candidate.modelId === selection.modelId);
-    return provider === undefined || model === undefined ? undefined : { provider, model };
-  }, [settings.snapshot.defaultSelection, settings.snapshot.providers]);
   const taskModels = useMemo<readonly ConversationModelOption[]>(
     () =>
       settings.snapshot.providers.flatMap((provider) =>
@@ -517,15 +809,165 @@ export function JaApplication({
       ),
     [settings.snapshot.providers],
   );
+  /** 先复用原生目录解析核实物理目标，避免等价路径或无效输入提前关闭当前项目资源。 */
+  const resolveProjectDirectory = useCallback(
+    async (cwd: string): Promise<string> => {
+      const target = await resolvedWorkbenchAdapters.preview.resolveFile(cwd);
+      if (target.kind !== "directory") throw new Error("项目目录必须是一个现有文件夹。");
+      return target.canonicalPath;
+    },
+    [resolvedWorkbenchAdapters.preview],
+  );
   const workspace = useWorkspaceController({
     history: resolvedHistoryAdapter,
     picker: projectPicker ?? DEFAULT_WORKSPACE_PICKER,
     activateWorkspace,
     runtimeState,
-    configurationReady: activeModel !== undefined && settings.scopeReady,
+    configurationReady: settings.scopeReady,
     beforeWorkspaceChange: workspaceChange.beforeChange,
+    beforeWorkspaceRebind: beforeProjectRebind,
+    resolveProjectDirectory,
     onWorkspaceCommitted: publishSettingsWorkspaceScope,
   });
+  const workspaceReadProject = workspace.readProject;
+  const workspaceUpdateProject = workspace.updateProject;
+  const workspaceRecheckProjectBinding = workspace.recheckProjectBinding;
+  const workspaceRefreshProjectMetadata = workspace.refreshProjectMetadata;
+  /** 项目通知只携带版本，客户端回读权威资料；Thread Timeline 不接收项目元数据。 */
+  useEffect(() => {
+    if (lastWorkspaceMetadataEvent === undefined) return;
+    const { workspaceId, revision } = lastWorkspaceMetadataEvent.params;
+    void workspaceRefreshProjectMetadata(workspaceId, revision).catch(() => {
+      toast.error("项目资料未能同步，请重新检查项目。", {
+        id: `ja-workspace-metadata:${workspaceId}`,
+      });
+    });
+  }, [lastWorkspaceMetadataEvent, workspaceRefreshProjectMetadata]);
+  /** 菜单打开前读取数据库当前版本；另存 workspaceId 以便响应式重建后仍回到同一项目行。 @author kongweiguang */
+  const editProject = useCallback(
+    async (workspaceId: string, restoreFocus?: () => void): Promise<void> => {
+      const intent = ++projectEditIntentRef.current;
+      const source = document.activeElement;
+      try {
+        const project = await workspaceReadProject(workspaceId);
+        if (intent !== projectEditIntentRef.current) return;
+        projectEditFocusRef.current =
+          restoreFocus ??
+          (() => {
+            if (source instanceof HTMLElement && source.isConnected) source.focus();
+          });
+        projectEditWorkspaceIdRef.current = workspaceId;
+        setEditingProject(project);
+      } catch {
+        if (intent === projectEditIntentRef.current) toast.error("项目资料未能读取，请重试。");
+      }
+    },
+    [workspaceReadProject],
+  );
+  /** 关闭时作废迟到的项目读取，焦点在 Dialog 卸载后的 autofocus 阶段恢复。 */
+  const closeProjectEditor = useCallback((): void => {
+    projectEditIntentRef.current += 1;
+    setEditingProject(undefined);
+  }, []);
+  /** 优先恢复原入口；其卸载后按稳定项目身份查当前侧栏行，最后退回可见全局操作点。 @author kongweiguang */
+  const restoreProjectEditorFocus = useCallback((): void => {
+    projectEditFocusRef.current?.();
+    const workspaceId = projectEditWorkspaceIdRef.current;
+    projectEditWorkspaceIdRef.current = undefined;
+    /** 仅把连通、可见且可用的控件视作已恢复，避免对响应式卸载或禁用节点误判成功。 @author kongweiguang */
+    const canReceiveFocus = (target: Element | null): target is HTMLElement => {
+      if (
+        !(target instanceof HTMLElement) ||
+        target === document.body ||
+        !target.isConnected ||
+        target.closest<HTMLElement>("[hidden], [inert]") !== null
+      )
+        return false;
+      if (
+        (target instanceof HTMLButtonElement || target instanceof HTMLTextAreaElement) &&
+        target.disabled
+      )
+        return false;
+      return typeof target.checkVisibility !== "function" || target.checkVisibility();
+    };
+    if (canReceiveFocus(document.activeElement)) return;
+
+    /** workspaceId 是项目身份；在当前侧栏容器内查找可见实例，避免索引变化或同名项目误聚焦。 @author kongweiguang */
+    const projectRow =
+      workspaceId === undefined
+        ? null
+        : (Array.from(
+            document.querySelectorAll<HTMLElement>(
+              ".ja-navigation-project-list [data-workspace-id]",
+            ),
+          ).find((row) => row.dataset["workspaceId"] === workspaceId) ?? null);
+    const currentProjectButton =
+      projectRow?.querySelector<HTMLButtonElement>('button[data-scope-kind="project"]') ?? null;
+    if (canReceiveFocus(currentProjectButton)) {
+      currentProjectButton.focus({ preventScroll: true });
+      if (document.activeElement === currentProjectButton) return;
+    }
+
+    const sidebarToggle = document.querySelector<HTMLButtonElement>(
+      '.ja-titlebar button.ja-titlebar-button[aria-label="显示侧边栏"], .ja-titlebar button.ja-titlebar-button[aria-label="隐藏侧边栏"]',
+    );
+    const composer = currentConversationComposer();
+    const fallback = canReceiveFocus(sidebarToggle)
+      ? sidebarToggle
+      : canReceiveFocus(composer)
+        ? composer
+        : undefined;
+    fallback?.focus({ preventScroll: true });
+  }, []);
+  /** 保存结果交回发起它的 Dialog session；由其确认仍挂载后关闭，避免旧保存关掉后来打开的编辑器。 */
+  const saveProject = useCallback(
+    async (input: ProjectEditInput): Promise<void> => {
+      await workspaceUpdateProject(input);
+    },
+    [workspaceUpdateProject],
+  );
+  /** 显式复核使用权威项目资料和绑定恢复；只更新仍属于本次编辑意图的 projection，草稿由 Dialog 保留。 */
+  const recheckEditedProject = useCallback(
+    async (workspaceId: string): Promise<WorkspaceProjection> => {
+      const intent = projectEditIntentRef.current;
+      const project = await workspaceRecheckProjectBinding(workspaceId);
+      if (
+        intent === projectEditIntentRef.current &&
+        projectEditWorkspaceIdRef.current === workspaceId
+      )
+        setEditingProject(project);
+      return project;
+    },
+    [workspaceRecheckProjectBinding],
+  );
+  /** 复制服务端登记的真实目录，不依赖该目录当前是否存在。 */
+  const copyProjectPath = useCallback(
+    async (workspaceId: string): Promise<void> => {
+      const project = await workspaceReadProject(workspaceId);
+      await desktopAdapters.writeText(project.rootPath);
+    },
+    [workspaceReadProject, desktopAdapters],
+  );
+  /** 原生会话入口须同时绑定当前 Runtime 与已恢复 Workspace；命令层仍执行服务端 fencing。 */
+  const processSessionBinding = useMemo<ConversationProcessBinding | undefined>(() => {
+    const workspaceId = workspace.workspace?.workspaceId;
+    const generation = runtimeState?.generation;
+    const status = runtimeState?.status;
+    if (
+      !workspace.bindingReady ||
+      workspaceId === undefined ||
+      generation === undefined ||
+      (status !== "ready" && status !== "busy")
+    )
+      return undefined;
+    return { workspaceId, generation, port: processSessionPort };
+  }, [
+    processSessionPort,
+    workspace.bindingReady,
+    runtimeState?.generation,
+    runtimeState?.status,
+    workspace.workspace?.workspaceId,
+  ]);
   /** 暂时清空活动 Workspace 时保留最后一份服务端投影，供隐藏 Thread Host 完成资源清理。 */
   const [retainedWorkbenchWorkspace, setRetainedWorkbenchWorkspace] =
     useState<WorkspaceProjection>();
@@ -537,8 +979,7 @@ export function JaApplication({
       retainedWorkbenchWorkspace.kind !== nextWorkbenchWorkspace.kind ||
       retainedWorkbenchWorkspace.displayName !== nextWorkbenchWorkspace.displayName ||
       retainedWorkbenchWorkspace.trust !== nextWorkbenchWorkspace.trust ||
-      retainedWorkbenchWorkspace.legacySharedWorkspaceId !==
-        nextWorkbenchWorkspace.legacySharedWorkspaceId)
+      retainedWorkbenchWorkspace.revision !== nextWorkbenchWorkspace.revision)
   ) {
     setRetainedWorkbenchWorkspace(nextWorkbenchWorkspace);
   }
@@ -559,16 +1000,13 @@ export function JaApplication({
     metadataEvent: lastThreadMetadataEvent,
     activateWorkspace: workspace.activateForConversation,
   });
-  /** 项目行只把已选中的稳定 Workspace ID 交给原生 Explorer adapter，不切换当前项目。 */
+  /** Explorer 从数据库登记目录解析，不需要选择项目或激活另一个项目的文件句柄。 */
   const openProjectFolder = useCallback(
     async (workspaceId: string): Promise<void> => {
-      await resolvedWorkbenchAdapters.workspace.open({
-        workspaceId,
-        target: "file_explorer",
-        relativePath: "",
-      });
+      const project = await workspaceReadProject(workspaceId);
+      await resolvedWorkbenchAdapters.preview.revealFile(project.rootPath);
     },
-    [resolvedWorkbenchAdapters.workspace],
+    [resolvedWorkbenchAdapters.preview, workspaceReadProject],
   );
   /** 文件夹菜单按 Thread 的服务端 workspace identity 打开 Explorer，不更改当前选中会话。 */
   const openThreadWorkspaceFolder = useCallback(
@@ -577,19 +1015,6 @@ export function JaApplication({
       if (thread === undefined) return;
       await resolvedWorkbenchAdapters.workspace.open({
         workspaceId: thread.workspaceId,
-        target: "file_explorer",
-        relativePath: "",
-      });
-    },
-    [conversation.threads, resolvedWorkbenchAdapters.workspace],
-  );
-  /** 旧共享根只从服务端关联字段读取并通过 ID-only Explorer IPC 打开，不绑定 active Host。 */
-  const openLegacySharedFolder = useCallback(
-    async (threadId: string): Promise<void> => {
-      const thread = conversation.threads.find((candidate) => candidate.threadId === threadId);
-      if (thread?.legacySharedWorkspaceId == null) return;
-      await resolvedWorkbenchAdapters.workspace.open({
-        workspaceId: thread.legacySharedWorkspaceId,
         target: "file_explorer",
         relativePath: "",
       });
@@ -609,6 +1034,36 @@ export function JaApplication({
   const currentThread = conversation.threads.find(
     (thread) => thread.threadId === conversation.currentThreadId,
   );
+  const exportScopeRef = useRef({
+    threadId: conversation.currentThreadId,
+    workspaceId: currentThread?.workspaceId,
+  });
+  exportScopeRef.current = {
+    threadId: conversation.currentThreadId,
+    workspaceId: currentThread?.workspaceId,
+  };
+  /** 导出按点击时身份分页读取；切换 Thread/Workspace 后中止交付，避免把旧会话保存成当前会话。 */
+  const exportCurrentConversation = useCallback(async (): Promise<
+    "saved" | "cancelled" | "downloaded"
+  > => {
+    const threadId = conversation.currentThreadId;
+    const thread = conversation.threads.find((candidate) => candidate.threadId === threadId);
+    if (threadId === undefined || thread === undefined) throw new Error("当前对话暂不可导出。");
+    const isCurrent = (): boolean => {
+      const current = exportScopeRef.current;
+      return current.threadId === threadId && current.workspaceId === thread.workspaceId;
+    };
+    const { markdown } = await exportConversationMarkdown(resolvedHistoryAdapter, {
+      threadId,
+      title: thread.title,
+      isCurrent,
+    });
+    if (!isCurrent()) throw new Error("当前对话已切换，请重新开始导出。");
+    const filename = conversationMarkdownFilename(thread.title);
+    const outcome = await exportPublicMarkdown(markdown, filename);
+    if (outcome === "unsupported") return downloadPublicMarkdown(markdown, filename);
+    return outcome;
+  }, [conversation.currentThreadId, conversation.threads, resolvedHistoryAdapter]);
   const currentParentThreadRevision = currentThread?.revision;
   // Workspace 和 Thread 目录可能分两次提交，不允许旧 Thread 在新项目短暂挂载工作面。
   const workbenchThreadId =
@@ -682,10 +1137,10 @@ export function JaApplication({
     openTargetSourceRef.current = undefined;
     attachmentPreviewSourceRef.current = null;
   }, [turnReviewScopeIdentity]);
-  const planGoalAvailable =
+  const planAvailable =
     runtimeState !== undefined &&
     (runtimeState.status === "ready" || runtimeState.status === "busy") &&
-    runtimeState.features.includes("plan_goal_v1");
+    runtimeState.features.includes("plan");
   /** Task Composer 只接收当前代际启用且健康的 Skill 摘要，激活时仍由 App Server 校验。 */
   const taskComposerSkills = useMemo<TaskComposerSkillSuggestion[]>(
     () =>
@@ -736,10 +1191,83 @@ export function JaApplication({
     void retryWorkspaceCatalog();
   }, [conversation.currentThreadId, retryWorkspaceCatalog, workspace.workspace]);
 
-  const required = settings.scopeReady && activeModel === undefined;
+  const required = false;
   const pageNavigation = usePageNavigationController(required);
   const { settingsVisible, settingsSection, setSettingsSection, navigate, goBack, goForward } =
     pageNavigation;
+  /** 设置页会隐藏整个 Workspace 布局；先把当前 Workbench 焦点移到仍可见的标题栏。 */
+  const navigateToSettings = useCallback((): void => {
+    moveVisibleWorkbenchFocusToTitlebar();
+    navigate("settings");
+  }, [navigate]);
+  /** 恢复后的存储只提示一次；关闭浮动提示后仍可查看详情。 */
+  useEffect(() => {
+    const recovery = runtimeState?.storageRecovery ?? runtimeStorage?.storageRecovery;
+    if (recovery?.phase === "blocked") {
+      toast.error(storageRecoveryMessage(recovery), {
+        id: "ja-storage-blocked",
+        duration: Infinity,
+        action: {
+          label: "查看详情",
+          onClick: () => {
+            setSettingsSection("storage");
+            navigateToSettings();
+          },
+        },
+        cancel:
+          retryStorage === undefined || !canRetryStorageRecovery(recovery)
+            ? undefined
+            : {
+                label: "重试",
+                onClick: () => {
+                  toast.loading("正在恢复本地数据…", { id: "ja-storage-blocked" });
+                  void retryLocalStorage().catch(() =>
+                    toast.error("仍未恢复，请查看数据与存储", { id: "ja-storage-blocked" }),
+                  );
+                },
+              },
+      });
+      return;
+    }
+    toast.dismiss("ja-storage-blocked");
+    if (recovery?.phase !== "ready" || !recovery.rebuilt) return;
+    const key = "ja.storage-recovery-notice";
+    try {
+      if (localStorage.getItem(key) === recovery.id) return;
+      localStorage.setItem(key, recovery.id);
+    } catch {
+      /* 提示状态的持久化是可选能力，失败不能阻断应用。 */
+    }
+    toast(storageRecoveryMessage(recovery), {
+      id: "ja-storage-recovery",
+      duration: Infinity,
+      closeButton: true,
+      action: {
+        label: "查看详情",
+        onClick: () => {
+          setSettingsSection("storage");
+          navigateToSettings();
+        },
+      },
+      cancel:
+        recovery.backupAvailable && openStorageBackup !== undefined
+          ? {
+              label: "打开备份",
+              onClick: () => {
+                void openStorageBackup(recovery.id).catch(() => toast.error("未能打开备份目录"));
+              },
+            }
+          : undefined,
+    });
+  }, [
+    runtimeState?.storageRecovery,
+    runtimeStorage?.storageRecovery,
+    navigateToSettings,
+    setSettingsSection,
+    openStorageBackup,
+    retryStorage,
+    retryLocalStorage,
+  ]);
   const [settingsSelection, setSettingsSelection] = useState<{
     visible: boolean;
     projectId?: string;
@@ -755,6 +1283,8 @@ export function JaApplication({
   const settingsTargetProjectId =
     (settingsSelection.visible === settingsVisible ? settingsSelection.projectId : undefined) ??
     (settingsVisible ? settingsWorkspaceScope?.workspaceId : undefined);
+  const settingsTargetProjectIdRef = useRef(settingsTargetProjectId);
+  settingsTargetProjectIdRef.current = settingsTargetProjectId;
   /** 设置编辑面独立读取所选项目；对话继续使用当前工作区的 settings 快照。 */
   const settingsEditor = useSettingsController({
     adapter: settingsAdapter ?? DEFAULT_SETTINGS_ADAPTER,
@@ -771,6 +1301,29 @@ export function JaApplication({
     catalogSection:
       settingsSection === "skills" || settingsSection === "mcp" ? settingsSection : "none",
   });
+  const reloadSettingsEditor = settingsEditor.reload;
+  const setWorkspaceProjectTrust = workspace.setProjectTrust;
+  /** 固定 Settings 所选项目；失败也回读同一配置 scope，保留原 mutation 错误供确认层重试。 */
+  const setSettingsProjectTrust = useCallback(
+    async (workspaceId: string, trust: "trusted" | "untrusted"): Promise<void> => {
+      if (settingsTargetProjectId !== workspaceId)
+        throw new Error("settings project selection changed");
+      try {
+        await setWorkspaceProjectTrust(workspaceId, trust);
+      } catch (mutationFailure: unknown) {
+        if (settingsTargetProjectIdRef.current === workspaceId) {
+          try {
+            await reloadSettingsEditor();
+          } catch {
+            // 保留 mutation 原错误；确认层继续打开，避免误示为成功。
+          }
+        }
+        throw mutationFailure;
+      }
+      if (settingsTargetProjectIdRef.current === workspaceId) await reloadSettingsEditor();
+    },
+    [reloadSettingsEditor, setWorkspaceProjectTrust, settingsTargetProjectId],
+  );
   const isProjectScope = workspace.workspace?.kind === "project";
   // native general scope 与已选项目都是有效 conversation scope。Navigation action 与
   // Composer 等待相同 lifecycle/history gate，启动期不能在 Thread/runtime admission
@@ -781,6 +1334,7 @@ export function JaApplication({
       (workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined);
   const conversationScopeReady =
     settingsScopeReady &&
+    (workspace.workspace === undefined || workspace.bindingReady) &&
     turnAdmissionReady &&
     (boot.status === "ready" || boot.status === "busy") &&
     !workspace.busy &&
@@ -812,13 +1366,11 @@ export function JaApplication({
     toggleSidebar,
     closeSidebar,
   } = responsiveShell;
-  const goal = useGoalController({
-    goalId: planGoalAvailable ? (currentThread?.activeGoalId ?? undefined) : undefined,
+  const plan = usePlanController({
     ownerThreadId: conversation.currentThreadId,
-    visible: planGoalAvailable,
-    detailsVisible:
-      planGoalAvailable && inspectorOpen && workbenchVisible && workbenchTab === "plan",
-    port: goalPort,
+    visible: planAvailable,
+    detailsVisible: planAvailable && inspectorOpen && workbenchVisible && workbenchTab === "plan",
+    port: planPort,
   });
   const composerNativeDrop = useComposerNativeDropRouter(
     nativeDropPort,
@@ -837,23 +1389,37 @@ export function JaApplication({
         restoreConversationObjectFocus(source ?? null);
         return;
       }
+      if (!workspace.bindingReady && target.kind !== "url" && target.kind !== "explorer") {
+        toast.warning("项目目录不可用，请修改目录或重新检查后打开文件。", {
+          id: "ja-open-target:directory-unavailable",
+          action: {
+            label: "修改目录",
+            onClick: () => {
+              void editProject(workspaceId);
+            },
+          },
+        });
+        restoreConversationObjectFocus(source ?? null);
+        return;
+      }
       const requestId = ++openTargetRequestSequenceRef.current;
       openTargetSourceRef.current = { requestId, workspaceId, threadId, source: source ?? null };
-      setOpenTargetRequest({ requestId, workspaceId, threadId, target });
-      if (target.kind !== "explorer") {
-        if (!workbenchTabs.includes("preview")) setWorkbenchTabs([...workbenchTabs, "preview"]);
-        setWorkbenchTab("preview");
-        setInspectorOpen(true);
-      }
+      setOpenTargetRequest({
+        requestId,
+        workspaceId,
+        threadId,
+        bindingRevision: `${workspace.workspace?.rootPath ?? ""}:${workspace.workspace?.revision ?? 0}`,
+        target,
+      });
     },
     [
-      setInspectorOpen,
       setOpenTargetRequest,
-      setWorkbenchTab,
-      setWorkbenchTabs,
-      workbenchTabs,
       workbenchThreadId,
       workspace.workspace?.workspaceId,
+      workspace.workspace?.rootPath,
+      workspace.workspace?.revision,
+      workspace.bindingReady,
+      editProject,
     ],
   );
 
@@ -870,10 +1436,14 @@ export function JaApplication({
     (
       target: { path: string; line?: number; column?: number },
       source: HTMLElement,
-      mode?: "explorer",
+      mode?: "explorer" | "browser",
     ): void => {
       requestConversationOpenTarget(
-        mode === "explorer" ? { kind: "explorer", path: target.path } : { kind: "file", ...target },
+        mode === "explorer"
+          ? { kind: "explorer", path: target.path }
+          : mode === "browser"
+            ? { kind: "preview", ...target }
+            : { kind: "file", ...target },
         source,
       );
     },
@@ -936,21 +1506,30 @@ export function JaApplication({
     ],
   );
 
-  /** 只结算当前 request；失败关闭 Files 并归还来源焦点，成功则保留来源供显式关闭时返回。 */
+  /** 只结算当前 Thread 的 request；打开后保留来源，失败或关闭时消费来源并恢复焦点。 */
   const settleWorkspaceReferencePreview = useCallback(
     (requestId: number, outcome: WorkspaceReferencePreviewOutcome): void => {
+      if (activeWorkbenchScopeRef.current !== turnReviewScopeIdentity) return;
       if (workspaceReferencePreviewRequest?.requestId !== requestId) return;
       if (outcome === "opened") return;
+      if (outcome !== "failed" && outcome !== "closed") return;
+      const allowedRestoreFocus = activeWorkbenchPortalTrigger() ?? undefined;
+      const expectedFocus =
+        moveVisibleWorkbenchFocusToTitlebar() ??
+        (document.activeElement === document.body ? document.body : null);
       setWorkspaceReferencePreviewRequest(undefined);
       setInspectorOpen(false);
-      if (activeWorkbenchScopeRef.current !== turnReviewScopeIdentity) return;
       const source = workspaceReferencePreviewSourceRef.current;
       workspaceReferencePreviewSourceRef.current = undefined;
-      restoreConversationObjectFocus(
-        source?.requestId === requestId && source.workspaceId === workspace.workspace?.workspaceId
-          ? source.source
-          : null,
-      );
+      if (expectedFocus !== null)
+        restoreConversationObjectFocus(
+          source?.requestId === requestId && source.workspaceId === workspace.workspace?.workspaceId
+            ? source.source
+            : null,
+          expectedFocus,
+          () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+          allowedRestoreFocus,
+        );
     },
     [
       setInspectorOpen,
@@ -1179,7 +1758,7 @@ export function JaApplication({
    */
   const returnToConversation = useCallback((): boolean => {
     if (!conversationShortcutFocusEnabled || inspectorOpen) return false;
-    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="消息"]');
+    const composer = currentConversationComposer();
     if (composer === null || composer.disabled) return false;
     /** 延后一帧避开当前快捷键事件的焦点回写，并核对同一 Composer 仍在文档中。 */
     const focusComposer = (): void => {
@@ -1194,56 +1773,178 @@ export function JaApplication({
   /** `/chat` 明确拥有关闭 Workbench 的意图；延迟聚焦避免 React 布局提交覆盖 textarea 焦点。 */
   const closeWorkbenchAndReturnToConversation = useCallback((): boolean => {
     if (!conversationShortcutFocusEnabled || !inspectorOpen) return false;
-    const composer = document.querySelector<HTMLTextAreaElement>('[aria-label="消息"]');
+    const composer = currentConversationComposer();
     if (composer === null || composer.disabled) return false;
+    const currentScope = activeWorkbenchScopeRef.current === turnReviewScopeIdentity;
+    if (!currentScope) return false;
+    const allowedRestoreFocus = activeWorkbenchPortalTrigger() ?? undefined;
+    const expectedFocus =
+      moveVisibleWorkbenchFocusToTitlebar() ??
+      (document.activeElement === document.body ? document.body : null);
     setInspectorOpen(false);
-    const focusComposer = (): void => {
-      if (composer.isConnected && !composer.disabled) composer.focus();
-    };
-    if (typeof window.requestAnimationFrame === "function")
-      window.requestAnimationFrame(focusComposer);
-    else focusComposer();
+    if (expectedFocus !== null)
+      focusConversationComposerAfterNavigation(
+        expectedFocus ?? undefined,
+        () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+        allowedRestoreFocus,
+      );
     return true;
-  }, [conversationShortcutFocusEnabled, inspectorOpen, setInspectorOpen]);
+  }, [conversationShortcutFocusEnabled, inspectorOpen, setInspectorOpen, turnReviewScopeIdentity]);
 
-  /** 会话 Host 已完成自己的 flush；这里只归还焦点，不再重复冻结同项目其它会话。 */
+  /** 在 Files flush 前只捕获当前焦点 owner；失败时 token 随关闭调用丢弃，不提前改界面状态。 */
+  const captureFilesCapabilityCloseFocus = useCallback(
+    (workspaceId: string): FilesCapabilityCloseFocusCapture | null => {
+      if (
+        activeWorkbenchScopeRef.current !== turnReviewScopeIdentity ||
+        workspace.workspace?.workspaceId !== workspaceId
+      )
+        return null;
+      const source = workspaceReferencePreviewSourceRef.current;
+      if (source === undefined || source.workspaceId !== workspaceId) return null;
+
+      const activeElement = document.activeElement;
+      const allowedRestoreFocus = activeWorkbenchPortalTrigger();
+      const workbench = document.querySelector<HTMLElement>("#workbench");
+      const focusBelongsToCurrentWorkbench =
+        activeElement instanceof HTMLElement &&
+        (workbench?.contains(activeElement) === true || allowedRestoreFocus !== null) &&
+        activeElement.closest<HTMLElement>("[hidden], [inert]") === null &&
+        (allowedRestoreFocus !== null ||
+          activeElement.closest<HTMLElement>('[aria-hidden="true"]') === null);
+      const expectedFocus =
+        activeElement === document.body || focusBelongsToCurrentWorkbench
+          ? (activeElement as HTMLElement)
+          : null;
+      return {
+        workspaceId,
+        scopeIdentity: turnReviewScopeIdentity,
+        requestId: source.requestId,
+        expectedFocus,
+        allowedRestoreFocus,
+      };
+    },
+    [turnReviewScopeIdentity, workspace.workspace?.workspaceId],
+  );
+
+  /** 只消费同一 Workspace、Thread 与来源请求的 flush ACK；失败时不会调用此处或恢复焦点。 */
   const closeFilesCapability = useCallback(
-    async (workspaceId: string): Promise<void> => {
-      if (activeWorkbenchScopeRef.current !== turnReviewScopeIdentity) return;
+    (workspaceId: string, focusCapture: FilesCapabilityCloseFocusCapture | null): void => {
+      if (
+        activeWorkbenchScopeRef.current !== turnReviewScopeIdentity ||
+        focusCapture === null ||
+        focusCapture.workspaceId !== workspaceId ||
+        focusCapture.scopeIdentity !== turnReviewScopeIdentity ||
+        workspace.workspace?.workspaceId !== workspaceId
+      )
+        return;
       const source = workspaceReferencePreviewSourceRef.current;
       if (
         source === undefined ||
         source.workspaceId !== workspaceId ||
-        workspaceReferencePreviewSourceRef.current?.requestId !== source.requestId
+        source.requestId !== focusCapture.requestId
       )
         return;
+      /** 最后一个 Files Tab 的 ACK 随后会进入 changeWorkbenchTabs，由它统一恢复来源或 Composer。 */
+      if (workbenchTabs.length === 1 && workbenchTabs[0] === "files") return;
       setWorkspaceReferencePreviewRequest((current) =>
         current?.requestId === source.requestId ? undefined : current,
       );
       workspaceReferencePreviewSourceRef.current = undefined;
-      restoreConversationObjectFocus(source.source);
+      if (focusCapture.expectedFocus !== null)
+        restoreConversationObjectFocus(
+          source.source,
+          focusCapture.expectedFocus,
+          () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+          focusCapture.allowedRestoreFocus ?? undefined,
+        );
     },
-    [setWorkspaceReferencePreviewRequest, turnReviewScopeIdentity],
+    [
+      setWorkspaceReferencePreviewRequest,
+      turnReviewScopeIdentity,
+      workbenchTabs,
+      workspace.workspace?.workspaceId,
+    ],
   );
 
-  /** Workbench 抽屉关闭时，只有由引用进入的 Files 视图恢复对象焦点，其余能力保持原行为。 */
+  /** scope 门禁先保护共享来源；关闭当前 Files 时恢复引用对象，portal 菜单归焦只认配对触发器。 */
   const closeWorkbench = useCallback((): void => {
+    const currentScope = activeWorkbenchScopeRef.current === turnReviewScopeIdentity;
+    if (!currentScope) return;
+    const allowedRestoreFocus = activeWorkbenchPortalTrigger() ?? undefined;
+    const expectedFocus =
+      moveVisibleWorkbenchFocusToTitlebar() ??
+      (document.activeElement === document.body ? document.body : null);
     setInspectorOpen(false);
-    if (workbenchTab !== "files") return;
     const source = workspaceReferencePreviewSourceRef.current;
     setWorkspaceReferencePreviewRequest(undefined);
     workspaceReferencePreviewSourceRef.current = undefined;
+    if (expectedFocus === null) return;
+    if (workbenchTab !== "files") {
+      focusConversationComposerAfterNavigation(
+        expectedFocus,
+        () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+      );
+      return;
+    }
     restoreConversationObjectFocus(
       source !== undefined && source.workspaceId === workspace.workspace?.workspaceId
         ? source.source
         : null,
+      expectedFocus,
+      () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+      allowedRestoreFocus,
     );
   }, [
     setInspectorOpen,
     setWorkspaceReferencePreviewRequest,
+    turnReviewScopeIdentity,
     workbenchTab,
     workspace.workspace?.workspaceId,
   ]);
+
+  /** 空 Tab 列表会自动收起面板；Files 来源先消费并恢复，无来源的最后 Tab 返回主 Composer。 */
+  const changeWorkbenchTabs = useCallback(
+    (tabs: typeof workbenchTabs): void => {
+      const collapsingVisibleWorkbench = tabs.length === 0 && workbenchVisible;
+      const currentScope = activeWorkbenchScopeRef.current === turnReviewScopeIdentity;
+      const expectedFocus =
+        collapsingVisibleWorkbench && currentScope
+          ? (moveVisibleWorkbenchFocusToTitlebar() ??
+            (document.activeElement === document.body ? document.body : null))
+          : null;
+      const source =
+        collapsingVisibleWorkbench && currentScope && workbenchTab === "files"
+          ? workspaceReferencePreviewSourceRef.current
+          : undefined;
+      setWorkbenchTabs(tabs);
+      if (source !== undefined && source.workspaceId === workspace.workspace?.workspaceId) {
+        setWorkspaceReferencePreviewRequest((current) =>
+          current?.requestId === source.requestId ? undefined : current,
+        );
+        workspaceReferencePreviewSourceRef.current = undefined;
+        if (expectedFocus !== null)
+          restoreConversationObjectFocus(
+            source.source,
+            expectedFocus,
+            () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+          );
+        return;
+      }
+      if (expectedFocus !== null)
+        focusConversationComposerAfterNavigation(
+          expectedFocus,
+          () => activeWorkbenchScopeRef.current === turnReviewScopeIdentity,
+        );
+    },
+    [
+      setWorkbenchTabs,
+      setWorkspaceReferencePreviewRequest,
+      turnReviewScopeIdentity,
+      workbenchTab,
+      workbenchVisible,
+      workspace.workspace?.workspaceId,
+    ],
+  );
 
   useDesktopNotifications({
     enabled: desktopNotificationsEnabled,
@@ -1339,6 +2040,19 @@ export function JaApplication({
     navigate("workspace");
     focusConversationComposerAfterNavigation();
   }, [conversationCreate, navigate]);
+  /** 右键新建先按项目身份选中并检查绑定，目录不可用时保留历史入口并给出修复提示。 */
+  const createProjectConversation = useCallback(
+    async (workspaceId: string): Promise<void> => {
+      try {
+        await conversationCreate({ workspaceId });
+        navigate("workspace");
+        focusConversationComposerAfterNavigation();
+      } catch {
+        toast.error("项目目录不可用，请修改目录或重新检查后新建对话。");
+      }
+    },
+    [conversationCreate, navigate],
+  );
 
   /** Picker 取消由 Session 拥有；只有项目真实打开后才切换页面。 */
   const chooseProject = useCallback(async (): Promise<void> => {
@@ -1431,13 +2145,18 @@ export function JaApplication({
   }, []);
   /** 设置导航保持稳定 identity；实际历史栈仍由 page navigation controller 唯一持有。 */
   const openSettings = useCallback((): void => {
-    navigate("settings");
-  }, [navigate]);
-  /** Header management enters Settings on the MCP category without changing the active conversation. */
+    navigateToSettings();
+  }, [navigateToSettings]);
+  /** 标题栏管理入口跳转到设置中的 MCP 分类，不切换当前会话。 */
   const openMcpSettings = useCallback((): void => {
     setSettingsSection("mcp");
-    navigate("settings");
-  }, [navigate, setSettingsSection]);
+    navigateToSettings();
+  }, [navigateToSettings, setSettingsSection]);
+  /** 无可用模型或连接时直接进入模型配置，保留当前 Thread 与 Composer 草稿。 */
+  const openModelSettings = useCallback((): void => {
+    setSettingsSection("models");
+    navigateToSettings();
+  }, [navigateToSettings, setSettingsSection]);
   /** 设置层关闭后复用统一会话焦点终点，避免键盘用户返回到已卸载的设置按钮。 */
   const returnFromSettings = useCallback((): void => {
     pendingSettingsReturnFocusRef.current = true;
@@ -1446,7 +2165,7 @@ export function JaApplication({
 
   /**
    * DOM 与 native 快捷键共用的唯一动作入口。返回 true 只表示当前状态确实接纳
-   * 了动作；不可用命令保持 false，调用方不得据此吞键或伪装成功。
+   * 了动作；历史导航先迁出 Workbench 焦点，避免目标页面隐藏持焦点的布局。
    */
   const dispatchNavigationCommand = useCallback(
     (command: NavigationCommand): boolean => {
@@ -1478,14 +2197,16 @@ export function JaApplication({
           return returnToConversation();
         case "open-settings":
           if (settingsVisible) return false;
-          navigate("settings");
+          navigateToSettings();
           return true;
         case "go-back":
           if (!pageNavigation.canGoBack) return false;
+          moveVisibleWorkbenchFocusToTitlebar();
           goBack();
           return true;
         case "go-forward":
           if (!pageNavigation.canGoForward) return false;
+          moveVisibleWorkbenchFocusToTitlebar();
           goForward();
           return true;
       }
@@ -1495,7 +2216,7 @@ export function JaApplication({
       createConversation,
       goBack,
       goForward,
-      navigate,
+      navigateToSettings,
       openWorkbenchCapability,
       pageNavigation.canGoBack,
       pageNavigation.canGoForward,
@@ -1562,7 +2283,7 @@ export function JaApplication({
               shortcut: navigationShortcut("open-settings", platform).display,
               availability: true,
               icon: "settings" as const,
-              invoke: () => navigate("settings"),
+              invoke: () => navigateToSettings(),
             },
           ]),
     ],
@@ -1572,6 +2293,7 @@ export function JaApplication({
       createConversation,
       isProjectScope,
       navigate,
+      navigateToSettings,
       platform,
       required,
       settingsVisible,
@@ -1694,7 +2416,7 @@ export function JaApplication({
         shortcut: navigationShortcut("open-settings", platform).display,
         available: !settingsVisible,
         unavailableReason: "当前已在设置",
-        execute: () => navigate("settings"),
+        execute: () => navigateToSettings(),
       },
       {
         id: "sidebar",
@@ -1753,7 +2475,7 @@ export function JaApplication({
       inspectorOpen,
       isProjectScope,
       latestTurnReviewAvailable,
-      navigate,
+      navigateToSettings,
       openLatestTurnReview,
       pageNavigation.canGoBack,
       pageNavigation.canGoForward,
@@ -1783,52 +2505,109 @@ export function JaApplication({
     nativeShortcutContext,
   );
 
-  const settingsMainView = settings.loading ? (
-    <section className="ja-loading-state" role="status">
-      正在读取本地设置…
-    </section>
-  ) : settings.error !== undefined ? (
-    <section className="ja-error-state" role="alert">
-      <h1>设置暂时不可用</h1>
-      <p>{settings.error}</p>
-      <Button type="button" variant="secondary" onClick={() => void settings.reload()}>
-        重新读取
-      </Button>
-    </section>
-  ) : (
-    <SettingsView
-      settings={settings}
-      projectSettings={settingsEditor}
-      projects={workspace.projects}
-      selectedProjectId={settingsTargetProjectId}
-      onSelectProject={setSettingsProjectId}
-      interfacePreferences={interfacePreferences}
-      executionScope={{
-        scopedDefault: settings.snapshot.defaultAccessMode,
-        projectOverride: settings.loaded?.projectOverrides.accessMode ?? false,
-        scopeReady: settingsScopeReady,
-        workspaceKind: workspace.workspace?.kind === "project" ? "project" : "general",
-        threadAccessMode:
-          currentThread?.workspaceId === workspace.workspace?.workspaceId
-            ? currentThread?.preferences?.accessMode
-            : undefined,
-      }}
-      required={required}
-      section={settingsSection}
-      onSectionChange={setSettingsSection}
-      onReturnToApp={returnFromSettings}
-      desktopNotifications={desktopNotificationPreference}
-      desktop={desktopAdapters}
-    />
-  );
+  const dataStorage: DataStorageProps = {
+    info: runtimeStorage,
+    recovery: runtimeState?.storageRecovery,
+    error: storageReadError,
+    onReload: reloadStorage,
+    onOpenBackup: openStorageBackup,
+    onRetry: retryStorage === undefined ? undefined : retryLocalStorage,
+  };
+  const settingsMainView =
+    runtimeState?.storageRecovery?.phase === "blocked" ||
+    (settingsSection === "storage" && (settings.loading || settings.error !== undefined)) ? (
+      <section className="ja-settings-view" aria-label="设置页面">
+        <div className="ja-settings">
+          <div className="ja-settings-tabs">
+            <aside className="ja-settings-sidebar">
+              <Button className="ja-settings-return" variant="ghost" onClick={returnFromSettings}>
+                <ArrowLeft aria-hidden="true" />
+                返回应用
+              </Button>
+              <div className="ja-settings-nav" role="tablist" aria-label="设置分类">
+                <button
+                  type="button"
+                  className="ja-settings-nav-item"
+                  role="tab"
+                  id="ja-storage-recovery-tab"
+                  aria-controls="ja-storage-recovery-panel"
+                  aria-selected="true"
+                  data-state="active"
+                >
+                  <Database aria-hidden="true" />
+                  <span>数据与存储</span>
+                </button>
+              </div>
+            </aside>
+            <div className="ja-settings-main">
+              <header className="ja-settings-toolbar">
+                <strong>设置</strong>
+              </header>
+              <div className="ja-settings-content">
+                <div
+                  className="ja-settings-panel"
+                  role="tabpanel"
+                  id="ja-storage-recovery-panel"
+                  aria-labelledby="ja-storage-recovery-tab"
+                >
+                  <DataStorageSection {...dataStorage} />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    ) : settings.loading ? (
+      <section className="ja-loading-state" role="status">
+        正在读取本地设置…
+      </section>
+    ) : settings.error !== undefined ? (
+      <section className="ja-error-state" role="alert">
+        <h1>设置暂时不可用</h1>
+        <p>{settings.error}</p>
+        <Button type="button" variant="secondary" onClick={() => void settings.reload()}>
+          重新读取
+        </Button>
+      </section>
+    ) : (
+      <SettingsView
+        dataStorage={dataStorage}
+        settings={settings}
+        projectSettings={settingsEditor}
+        projects={workspace.projects}
+        selectedProjectId={settingsTargetProjectId}
+        onSelectProject={setSettingsProjectId}
+        onSetProjectTrust={setSettingsProjectTrust}
+        interfacePreferences={interfacePreferences}
+        executionScope={{
+          scopedDefault: settings.snapshot.defaultAccessMode,
+          projectOverride: settings.loaded?.projectOverrides.accessMode ?? false,
+          scopeReady: settingsScopeReady,
+          workspaceKind: workspace.workspace?.kind === "project" ? "project" : "general",
+          threadAccessMode:
+            currentThread?.workspaceId === workspace.workspace?.workspaceId
+              ? currentThread?.preferences?.accessMode
+              : undefined,
+        }}
+        required={required}
+        section={settingsSection}
+        onSectionChange={setSettingsSection}
+        onReturnToApp={returnFromSettings}
+        desktopNotifications={desktopNotificationPreference}
+        desktop={desktopAdapters}
+      />
+    );
   const workspaceMainView = (
     <ConversationWorkspace
+      active={!settingsVisible && !(singlePaneWorkbench && workbenchVisible)}
+      projectEditorOpen={editingProject !== undefined}
       interactionPort={DEFAULT_INTERACTION_PORT}
       workspace={workspace}
       conversation={conversation}
       usageReader={conversationUsageReader}
       mcpReader={conversationMcpReader}
       onOpenMcpSettings={openMcpSettings}
+      onOpenModelSettings={openModelSettings}
       settings={settings}
       inspectorOpen={inspectorOpen}
       onToggleInspector={toggleInspector}
@@ -1836,6 +2615,7 @@ export function JaApplication({
       workspaceAdapter={resolvedWorkbenchAdapters.workspace}
       onOpenLink={openConversationWebLink}
       onOpenFile={openConversationFileLink}
+      onEditProject={editProject}
       onCopyText={desktopAdapters.writeText}
       onConversationFocusAvailabilityChange={setConversationFocusAvailable}
       onRegisterWorkspaceReferenceTarget={registerWorkspaceReferenceTarget}
@@ -1843,6 +2623,8 @@ export function JaApplication({
       attachmentPort={attachmentPort}
       attachmentPreviewPort={attachmentPreviewPort}
       artifactPort={conversationArtifactPort}
+      onExportConversation={exportCurrentConversation}
+      processSession={processSessionBinding}
       nativeDropEvent={composerNativeDrop.event}
       onRegisterComposerDropZone={composerNativeDrop.registerDropZone}
       onOpenAttachmentPreview={openAttachmentPreview}
@@ -1852,9 +2634,9 @@ export function JaApplication({
       onAttachmentsBound={bindAttachmentPreview}
       slashCommands={composerSlashCommands}
       onOpenTask={openTaskFromTimeline}
-      planGoalAvailable={planGoalAvailable}
-      goal={goal}
-      onOpenGoal={() => showWorkbenchCapability("plan")}
+      planAvailable={planAvailable}
+      plan={plan}
+      onOpenPlan={() => showWorkbenchCapability("plan")}
     />
   );
   const inspectorContent =
@@ -1864,7 +2646,7 @@ export function JaApplication({
         workspace={workbenchHostWorkspace}
         generation={runtimeState?.generation}
         adapters={resolvedWorkbenchAdapters}
-        active={workbenchVisible && workbenchThreadId !== undefined}
+        active={workbenchVisible && workbenchThreadId !== undefined && workspace.bindingReady}
         rootThreadId={workbenchThreadId}
         parentThreadRevision={currentParentThreadRevision}
         onRegisterSideChatLauncher={registerSideChatLauncher}
@@ -1875,7 +2657,7 @@ export function JaApplication({
         taskThreadRenamePort={taskThreadRenamePort}
         taskNativeDropPort={nativeDropPort}
         taskPreferencesPort={taskPreferencesPort}
-        taskGoalPort={goalPort}
+        taskPlanPort={planPort}
         taskInteractionPort={DEFAULT_INTERACTION_PORT}
         taskModels={taskModels}
         taskParentPreferences={
@@ -1895,16 +2677,18 @@ export function JaApplication({
         taskComposerSkills={taskComposerSkills}
         selectedTab={workbenchTab}
         onTabChange={changeWorkbenchTab}
+        onShowCapability={showWorkbenchCapability}
         openTabs={workbenchTabs}
-        onOpenTabsChange={setWorkbenchTabs}
+        onOpenTabsChange={changeWorkbenchTabs}
         capabilityShortcuts={workbenchCapabilityShortcuts}
         onCopyText={desktopAdapters.writeText}
         onOpenExternalUrl={desktopAdapters.openExternalUrl}
         onClose={closeWorkbench}
         onRegisterFilesLifecycle={filesCapability.register}
+        onRegisterRebindLifecycle={registerRebindLifecycle}
         onRegisterTerminalLifecycle={workspaceChange.registerTerminal}
         onRegisterPreviewLifecycle={workspaceChange.registerPreview}
-        onCloseFilesCapability={closeFilesCapability}
+        onCloseFilesCapability={captureFilesCapabilityCloseFocus}
         onFilesCapabilityClosed={closeFilesCapability}
         onAddWorkspaceReference={addWorkspaceReference}
         openTargetRequest={openTargetRequest}
@@ -1931,8 +2715,8 @@ export function JaApplication({
           openLatestTurnReview();
         }}
         onDismissTurnReview={dismissTurnReview}
-        planGoalAvailable={planGoalAvailable}
-        goal={goal}
+        planAvailable={planAvailable}
+        plan={plan}
       />
     );
 
@@ -1952,6 +2736,10 @@ export function JaApplication({
         canGoForward={pageNavigation.canGoForward}
         onBack={goBack}
         onForward={goForward}
+        onReconnect={reconnectAvailable || reconnectPending ? reconnectRuntime : undefined}
+        reconnectPending={
+          reconnectPending || boot.status === "connecting" || boot.status === "busy"
+        }
         windowFrame={windowFrame.frame}
         windowActionPending={windowFrame.pendingAction}
         onWindowAction={windowFrame.invoke}
@@ -1986,12 +2774,13 @@ export function JaApplication({
                 // 两者都只投影到“最近对话”标题行，避免旧列表被临时占位替换或因空列表闪现。
                 workspace.busy || conversation.busy
               }
-              // 历史栏只展示前台目录错误；后台恢复诊断留在当前 Conversation 正文，避免双重 alert
-              // 和侧栏布局插入，同时不影响 historyBusy/newConversationDisabled。
-              historyError={conversation.error}
+              // 历史错误正文与重试统一在 Conversation 通知中；侧栏只隐藏错误时的空历史文案。
+              historyHasError={conversation.error?.source === "history-load"}
               newConversationDisabled={!conversationScopeReady}
               projectBusy={
-                workspace.busy || settings.synchronizing || boot.status === "recovery_required"
+                workspace.busy ||
+                settings.synchronizing ||
+                (boot.status !== "ready" && boot.status !== "busy")
               }
               compact={compactNavigation}
               platform={platform}
@@ -2000,8 +2789,10 @@ export function JaApplication({
               onNewConversation={createConversation}
               onSelectConversation={selectConversation}
               onOpenProjectFolder={openProjectFolder}
+              onNewConversationForProject={createProjectConversation}
+              onEditProject={editProject}
+              onCopyProjectPath={copyProjectPath}
               onOpenWorkspaceFolder={openThreadWorkspaceFolder}
-              onOpenLegacySharedFolder={openLegacySharedFolder}
               onOpenConversationSearch={openConversationSearch}
               onRenameConversation={conversationRename}
               onPinConversation={pinConversation}
@@ -2086,6 +2877,16 @@ export function JaApplication({
         viewModel={commandPalette.viewModel}
         actions={commandPalette.actions}
       />
+      <ProjectEditDialog
+        project={editingProject}
+        busy={workspace.busy}
+        onClose={closeProjectEditor}
+        onRestoreFocus={restoreProjectEditorFocus}
+        onSave={saveProject}
+        onRecheck={recheckEditedProject}
+        onChooseDirectory={workspace.pickDirectory}
+      />
+      <ProjectRebindDialog confirmation={rebindConfirmation} onChoose={chooseRebindDisposition} />
       <ConversationSearchDialog
         open={conversationSearchOpen}
         shortcutLabel={navigationShortcut("search-conversations", platform).display}

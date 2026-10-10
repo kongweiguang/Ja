@@ -29,7 +29,11 @@ const PROVIDERS: SettingsSnapshot["providers"] = [
         modelId: "model_gpt",
         name: "GPT 5.6",
         model: "gpt-5.6-sol",
-        capabilities: { contextWindowTokens: 256_000, maxOutputTokens: 32_000 },
+        capabilities: {
+          contextWindowTokens: 256_000,
+          maxOutputTokens: 32_000,
+          supportsOutputSchema: false,
+        },
         reasoningLevelMap: { high: "high" },
         defaultReasoningLevel: "high",
       },

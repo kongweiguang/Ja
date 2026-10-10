@@ -1,7 +1,7 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/** Unit gates for the real-provider smoke's loopback, evidence, and secret boundaries. */
+/** 覆盖真实 Provider smoke 的 loopback、证据和凭据边界。 */
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -14,27 +14,38 @@ import {
   assertWindowsPowerShellSelection,
   collectToolEvidence,
   committedTerminalReply,
-  createClientOperationId,
+  createOperationKey,
   initializeParams,
   JsonlSession,
   providerConfigurationDocument,
   providerFailingToolTurnInput,
   providerToolTurnInput,
+  readCompleteItemContent,
   userInputContainsText,
   validatedLoopbackBaseUrl,
 } from "./real-provider-smoke.mjs";
 
 /**
- * Smoke 必须提交服务端完整且有序的 v1 词汇表；直接比对 Java 握手 owner 可避免只维护
- * 被当前场景使用的子集，导致后续集成验收在开始前被 stale capability 拒绝。
+ * Smoke 必须同时匹配 Java 的严格接收表、Rust 的 initialize 声明表和共享 schema，
+ * 否则任一生产端会在握手前拒绝本次连接或丢弃新恢复/审批事件。
  */
-test("direct capabilities match the server handshake vocabulary", () => {
+test("direct capabilities match Java, Rust, and schema handshake vocabulary", () => {
   const capabilities = initializeParams().capabilities;
   const handshakeSource = readFileSync(
     new URL(
-      "../../app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/HandshakeHandler.java",
+      "../../ja-agent/ja-app-server/src/main/java/io/github/kongweiguang/ja/transport/rpc/handler/HandshakeHandler.java",
       import.meta.url,
     ),
+    "utf8",
+  );
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../../contracts/ja-rpc/v2/schema/ja-rpc-v2.schema.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const rustCatalogSource = readFileSync(
+    new URL("../../crates/ja-runtime/src/app_server_process/protocol/catalog.rs", import.meta.url),
     "utf8",
   );
   for (const name of ["METHODS", "EVENTS"]) {
@@ -44,22 +55,46 @@ test("direct capabilities match the server handshake vocabulary", () => {
     assert.ok(match, `server ${name} vocabulary is present`);
     const serverItems = [...match[1].matchAll(/"([^"]+)"/gu)].map((entry) => entry[1]);
     assert.deepEqual(capabilities[name.toLowerCase()], serverItems);
+    const schemaName = name === "METHODS" ? "methodName" : "eventName";
+    const schemaValues = schema?.$defs?.[schemaName]?.enum;
+    assert.ok(Array.isArray(schemaValues), `schema ${schemaName} enum is present`);
+    for (const capability of serverItems) {
+      assert.ok(schemaValues.includes(capability), `${capability} belongs to schema ${schemaName}`);
+    }
+    const rustName = name === "METHODS" ? "CLIENT_METHODS" : "EVENT_METHODS";
+    const rustMatch = rustCatalogSource.match(
+      new RegExp(`const ${rustName}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`, "u"),
+    );
+    assert.ok(rustMatch, `Rust ${rustName} vocabulary is present`);
+    const rustItems = [...rustMatch[1].matchAll(/"([^"]+)"/gu)].map((entry) => entry[1]);
+    assert.deepEqual(capabilities[name.toLowerCase()], rustItems);
   }
   assert.deepEqual(capabilities.accessModes, ["approval_required", "full_access"]);
   assert.deepEqual(capabilities.collaborationModes, ["default", "plan"]);
-  assert.deepEqual(capabilities.features, ["task_threads_v1", "plan_goal_v1", "interaction_v1"]);
+  assert.deepEqual(capabilities.features, ["task_threads", "plan", "interaction"]);
   assert.equal(capabilities.events.includes("tool/started"), true);
+  assert.equal(capabilities.events.includes("tool/recovery-changed"), true);
+  assert.equal(capabilities.events.includes("approval/closed"), true);
   assert.equal(capabilities.events.includes("turn/retry-started"), true);
   assert.equal(capabilities.events.includes("turn/messages_received"), true);
+  assert.equal(capabilities.events.includes("task/closed"), true);
   assert.equal(capabilities.methods.includes("plan/current/read"), true);
-  assert.equal(capabilities.methods.includes("goal/plan/attach"), true);
+  assert.equal(
+    capabilities.methods.some((method) => method.startsWith("goal/")),
+    false,
+  );
+  assert.equal(
+    capabilities.events.some((event) => event.startsWith("goal/")),
+    false,
+  );
+  assert.equal(capabilities.methods.filter((method) => method.startsWith("plan/")).length, 16);
   assert.equal(capabilities.methods.includes("task/close"), true);
   assert.equal(capabilities.methods.includes("thread/usage/read"), true);
   assert.equal(capabilities.methods.includes("thread/mcp/read"), true);
   assert.equal(capabilities.methods.includes("turn/continue"), true);
   assert.equal(capabilities.methods.includes("turn/reask"), true);
   assert.equal(capabilities.methods.includes("turn/recovery/respond"), true);
-  assert.equal(capabilities.methods.includes("configuration/restore"), true);
+  assert.equal(capabilities.methods.includes("configuration/restore"), false);
 
   assert.throws(
     () => assertDirectProviderCapabilities({ ...capabilities, unexpectedCapability: {} }),
@@ -71,7 +106,7 @@ test("direct capabilities match the server handshake vocabulary", () => {
         ...capabilities,
         methods: [...capabilities.methods, "unknown/list"],
       }),
-    /do not match JA-RPC v1/u,
+    /do not match JA-RPC v2/u,
   );
   assert.throws(
     () =>
@@ -79,13 +114,13 @@ test("direct capabilities match the server handshake vocabulary", () => {
         ...capabilities,
         events: [...capabilities.events, "unknown/updated"],
       }),
-    /do not match JA-RPC v1/u,
+    /do not match JA-RPC v2/u,
   );
 });
 
 test("initialize envelope contains only the current configuration-free contract", () => {
   const params = initializeParams();
-  assert.equal(params.protocolMajor, 1);
+  assert.equal(params.protocolMajor, 2);
   assert.equal(params.protocolMinor, 0);
   assert.deepEqual(Object.keys(params).sort(), [
     "capabilities",
@@ -99,16 +134,16 @@ test("initialize envelope contains only the current configuration-free contract"
   }
 });
 
-/** Mutating requests carry a fresh opaque operation key; format is part of the strict JA-RPC contract. */
-test("client operation identities use the frozen v1 format", () => {
-  const first = createClientOperationId();
-  const second = createClientOperationId();
+/** 修改请求携带新的不透明操作键，其格式属于严格 JA-RPC 合同的一部分。 */
+test("operation keys use the frozen v2 format", () => {
+  const first = createOperationKey();
+  const second = createOperationKey();
   assert.match(first, /^op_[0-9a-f]{32}$/u);
   assert.match(second, /^op_[0-9a-f]{32}$/u);
   assert.notEqual(first, second);
 });
 
-/** A normal shutdown may retry the server's side-effect-free busy refusal, but never other errors. */
+/** 正常关闭时可重试服务端无副作用的 busy 拒绝，但不能重试其它错误。 */
 test("graceful shutdown waits for pending Turn work within its bounded drain", async () => {
   const session = Object.create(JsonlSession.prototype);
   const responses = [
@@ -138,10 +173,13 @@ test("graceful shutdown waits for pending Turn work within its bounded drain", a
   const exit = await session.shutdown();
 
   assert.equal(requests.length, 2);
-  assert.deepEqual(requests.map(([method, params]) => [method, params]), [
-    ["runtime/shutdown", {}],
-    ["runtime/shutdown", {}],
-  ]);
+  assert.deepEqual(
+    requests.map(([method, params]) => [method, params]),
+    [
+      ["runtime/shutdown", {}],
+      ["runtime/shutdown", {}],
+    ],
+  );
   assert.equal(stdinClosed, true);
   assert.deepEqual(exit, { code: 0, signal: null });
 });
@@ -153,7 +191,7 @@ test("terminal reply evidence does not depend on streaming delta boundaries", ()
     params: {
       turnId: "turn_test",
       state: "completed",
-      finalMessage: { messageId: "msg_test", text: "The result is FINAL_MARKER." },
+      finalMessage: { messageId: "item_test", text: "The result is FINAL_MARKER." },
     },
   };
   assert.equal(committedTerminalReply(terminal, "turn_test"), "The result is FINAL_MARKER.");
@@ -169,12 +207,84 @@ test("terminal reply evidence does not depend on streaming delta boundaries", ()
     committedTerminalReply(
       {
         ...terminal,
-        params: { ...terminal.params, finalMessage: { messageId: "msg_test", text: "  " } },
+        params: { ...terminal.params, finalMessage: { messageId: "item_test", text: "  " } },
       },
       "turn_test",
     ),
     null,
   );
+});
+
+/** 以 code point 而非 UTF-16 code unit 分页，并拒绝停滞游标以避免隐藏的无限请求。 */
+test("item content pagination preserves Unicode boundaries and requires cursor progress", async () => {
+  const content = `开始\n${"中😀".repeat(32_769)}\n结束`;
+  const codePoints = Array.from(content);
+  const calls = [];
+  const session = {
+    async request(method, params) {
+      assert.equal(method, "thread/item-content/read");
+      assert.equal(params.threadId, "thr_fixture");
+      assert.equal(params.itemId, "item_fixture");
+      assert.equal(params.limitCharacters, 65_536);
+      calls.push(params.offsetCharacters);
+      const offset = params.offsetCharacters;
+      const next = Math.min(offset + params.limitCharacters, codePoints.length);
+      return {
+        result: {
+          itemId: params.itemId,
+          offsetCharacters: offset,
+          nextOffsetCharacters: next < codePoints.length ? next : null,
+          totalCharacters: codePoints.length,
+          truncated: next < codePoints.length,
+          content: codePoints.slice(offset, next).join(""),
+        },
+      };
+    },
+  };
+
+  assert.equal(await readCompleteItemContent(session, "thr_fixture", "item_fixture"), content);
+  assert.deepEqual(calls, [0, 65_536]);
+
+  const stalled = {
+    async request() {
+      return {
+        result: {
+          itemId: "item_fixture",
+          offsetCharacters: 0,
+          nextOffsetCharacters: 0,
+          totalCharacters: 1,
+          truncated: true,
+          content: "",
+        },
+      };
+    },
+  };
+  await assert.rejects(
+    readCompleteItemContent(stalled, "thr_fixture", "item_fixture"),
+    /cursor is invalid/u,
+  );
+});
+
+/** 最坏 JSON 转义页也必须低于 JA-RPC 的 4 MiB 帧预算。 */
+test("maximum item content page remains within the negotiated frame limit", async () => {
+  const content = "\u0001".repeat(65_536);
+  const session = {
+    async request(_method, params) {
+      const result = {
+        itemId: params.itemId,
+        offsetCharacters: 0,
+        nextOffsetCharacters: null,
+        totalCharacters: 65_536,
+        truncated: false,
+        content,
+      };
+      const frame = { jsonrpc: "2.0", id: "s:item-content", result };
+      assert.ok(Buffer.byteLength(JSON.stringify(frame), "utf8") <= 4_194_304);
+      return { result };
+    },
+  };
+
+  assert.equal(await readCompleteItemContent(session, "thr_fixture", "item_fixture"), content);
 });
 
 /** 历史恢复只接受当前结构化 content；旧扁平 text 即使含标记也不能让 smoke 假通过。 */
@@ -318,7 +428,7 @@ test("Tool evidence requires the exact read then approved shell sequence", () =>
         turnId: "turn_test",
         toolCalls: [
           { callId: "call_read", toolName: "read" },
-          { callId: "call_shell", toolName: "shell" },
+          { callId: "call_shell", toolName: "exec_command" },
         ],
       },
     },
@@ -328,14 +438,14 @@ test("Tool evidence requires the exact read then approved shell sequence", () =>
         turnId: "turn_test",
         results: [
           { callId: "call_read", toolName: "read", outcome: "succeeded" },
-          { callId: "call_shell", toolName: "shell", outcome: "succeeded" },
+          { callId: "call_shell", toolName: "exec_command", outcome: "succeeded" },
         ],
       },
     },
   ];
   assert.deepEqual(
     collectToolEvidence(events, "turn_test").map((entry) => entry.toolName),
-    ["read", "shell"],
+    ["read", "exec_command"],
   );
   assert.throws(
     () =>
@@ -345,7 +455,7 @@ test("Tool evidence requires the exact read then approved shell sequence", () =>
             method: "tool/batch-committed",
             params: {
               turnId: "turn_test",
-              results: [{ callId: "missing-prefix", toolName: "shell", outcome: "succeeded" }],
+              results: [{ callId: "missing-prefix", toolName: "exec_command", outcome: "succeeded" }],
             },
           },
         ],
@@ -383,7 +493,7 @@ test("PowerShell selection rejects cross-shell and POSIX commands", () => {
       {
         kind: "tool_call",
         turnId: "turn_test",
-        toolName: "shell",
+        toolName: "exec_command",
         presentation: { kind: "shell", command },
       },
     ],
@@ -431,7 +541,7 @@ test("durable Tool history rejects an unresolved approval", () => {
             {
               kind: "tool_call",
               turnId: "turn_test",
-              toolName: "shell",
+              toolName: "exec_command",
               callId: "call_shell",
               presentation: { status: "success" },
             },
@@ -462,7 +572,7 @@ test("durable Tool history isolates Turns and accepts one persisted failed shell
       {
         kind: "tool_call",
         turnId: "turn_success",
-        toolName: "shell",
+        toolName: "exec_command",
         callId: "call_shell_ok",
         presentation: { status: "success", exitCode: 0 },
       },
@@ -471,14 +581,14 @@ test("durable Tool history isolates Turns and accepts one persisted failed shell
         approvalId: "appr_success",
         turnId: "turn_success",
         callId: "call_shell_ok",
-        toolName: "shell",
+        toolName: "exec_command",
         decision: "approve",
       },
       { kind: "final_answer", turnId: "turn_success", text: "SUCCESS_FINAL" },
       {
         kind: "tool_call",
         turnId: "turn_failed",
-        toolName: "shell",
+        toolName: "exec_command",
         callId: "call_shell_failed",
         presentation: { status: "error", exitCode: 23 },
       },
@@ -487,7 +597,7 @@ test("durable Tool history isolates Turns and accepts one persisted failed shell
         approvalId: "appr_failed",
         turnId: "turn_failed",
         callId: "call_shell_failed",
-        toolName: "shell",
+        toolName: "exec_command",
         decision: "approve",
       },
       {
@@ -499,7 +609,7 @@ test("durable Tool history isolates Turns and accepts one persisted failed shell
   };
   assert.deepEqual(
     assertDurableToolHistory(history, "thr_test", "turn_failed", "appr_failed", {
-      calls: [{ toolName: "shell", status: "error", exitCode: 23 }],
+      calls: [{ toolName: "exec_command", status: "error", exitCode: 23 }],
       finalText: "The command failed with exit code 23.",
     }),
     { items: 7, toolCalls: 1, successfulTools: 0, failedTools: 1 },
@@ -507,7 +617,7 @@ test("durable Tool history isolates Turns and accepts one persisted failed shell
   assert.throws(
     () =>
       assertDurableToolHistory(history, "thr_test", "turn_failed", "appr_failed", {
-        calls: [{ toolName: "shell", status: "error", exitCode: 0 }],
+        calls: [{ toolName: "exec_command", status: "error", exitCode: 0 }],
         finalText: "The command failed with exit code 23.",
       }),
     /Turn-scoped Tool presentations/u,

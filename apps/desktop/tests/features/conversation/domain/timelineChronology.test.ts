@@ -4,9 +4,17 @@
 import { describe, expect, it } from "vitest";
 import { projectTimelineChronology } from "@/features/conversation/domain/timelineChronology";
 
-/** 以最小候选构造 chronology fixture，避免测试把 UI 字段误当成排序输入。 */
-function candidate(identity: string, occurredAt: string | undefined, value = identity) {
-  return { identity, occurredAt, value };
+/**
+ * 以最小候选构造 chronology fixture；因果序只作为同毫秒排序依据，身份仍必须由稳定 identity 提供。
+ * @author kongweiguang
+ */
+function candidate(
+  identity: string,
+  occurredAt: string | undefined,
+  value = identity,
+  causalOrder?: number,
+) {
+  return { identity, occurredAt, ...(causalOrder === undefined ? {} : { causalOrder }), value };
 }
 
 describe("projectTimelineChronology", () => {
@@ -37,6 +45,24 @@ describe("projectTimelineChronology", () => {
     expect(projected.map((entry) => [entry.identity, entry.value])).toEqual([
       ["task:a", "A"],
       ["task:b", "新 B"],
+    ]);
+  });
+
+  /** 固定组序避免交叉比较不传递；Conversation 依因果输入序，external 继续依稳定 identity。 */
+  it("keeps same-millisecond conversation causality before external identity ordering", () => {
+    const timestamp = "2026-09-04T08:00:00.000Z";
+    const projected = projectTimelineChronology([
+      candidate("conversation:turn_z", timestamp, undefined, 0),
+      candidate("external:task_b", timestamp),
+      candidate("conversation:turn_a", timestamp, undefined, 1),
+      candidate("external:task_a", timestamp),
+    ]);
+
+    expect(projected.map((entry) => entry.identity)).toEqual([
+      "conversation:turn_z",
+      "conversation:turn_a",
+      "external:task_a",
+      "external:task_b",
     ]);
   });
 

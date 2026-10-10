@@ -11,6 +11,9 @@ pub(crate) use production::app_server_process;
 use crate::app_server_process::protocol::{decode_frame, valid_protocol_timestamp};
 use crate::app_server_process::{
     AttachmentPreviewCloseResult, AttachmentPreviewOpenResult, AttachmentPreviewReadResult, Limits,
+    ProcessSessionListParams, ProcessSessionListResult, ProcessSessionReadParams,
+    ProcessSessionSnapshot, ProcessSessionStopParams, ProcessSessionWriteParams, ReviewReadParams,
+    ReviewReadResult, ReviewStartParams, ReviewStartResult, ThreadForkParams, ThreadForkResult,
     TurnChangeSetReadResult,
 };
 use serde_json::Value;
@@ -19,22 +22,60 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const PUBLIC_TEXT_PREVIEW_CODE_POINTS: usize = 512;
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const PLAN_EVENT_KINDS: &[&str] = &[
+    "created",
+    "plan_draft_saved",
+    "plan_proposed",
+    "plan_approved",
+    "plan_rejected",
+    "plan_execution_started",
+    "plan_execution_incomplete",
+    "plan_verifying",
+    "plan_completed",
+    "plan_verification_failed",
+    "plan_verification_inconclusive",
+    "plan_paused",
+    "plan_resumed",
+    "plan_stopped",
+    "plan_recovery_required",
+    "plan_execution_recovered",
+    "step_changed",
+    "evidence_added",
+    "continuation_no_progress",
+    "tool_approval_requested",
+    "tool_approval_resolved",
+    "evaluation_started",
+    "evaluation_completed",
+    "paused",
+    "resumed",
+    "stopped",
+    "achieved",
+    "recovery_required",
+];
+
 const REQUEST_METHODS: &[&str] = &[
     "runtime/initialize",
     "runtime/health",
+    "runtime/storage/retry",
     "runtime/shutdown",
     "runtime/context/register",
+    "runtime/client/close",
     "operation/read",
     "workspace/open",
+    "workspace/read",
+    "workspace/update",
     "workspace/list",
     "workspace/path/search",
     "workspace/set-trust",
     "workspace/unregister",
     "thread/create",
+    "thread/fork",
     "thread/list",
     "thread/search",
     "thread/read",
-    "thread/message-content/read",
+    "thread/item-content/read",
     "history/input/search",
     "thread/observe",
     "thread/unobserve",
@@ -55,10 +96,6 @@ const REQUEST_METHODS: &[&str] = &[
     "interaction/draft/save",
     "interaction/respond",
     "interaction/cancel",
-    "goal/read",
-    "goal/events/read",
-    "goal/observe",
-    "goal/unobserve",
     "plan/read",
     "plan/revisions/list",
     "plan/current/read",
@@ -66,13 +103,6 @@ const REQUEST_METHODS: &[&str] = &[
     "plan/observe",
     "plan/unobserve",
     "plan/evidence/list",
-    "goal/evidence/list",
-    "goal/create",
-    "goal/plan/attach",
-    "goal/plan/detach",
-    "goal/pause",
-    "goal/resume",
-    "goal/stop",
     "plan/create",
     "plan/draft/save",
     "plan/draft/discard",
@@ -114,7 +144,6 @@ const REQUEST_METHODS: &[&str] = &[
     "configuration/patch",
     "configuration/replace",
     "configuration/reset",
-    "configuration/restore",
     "credential/set",
     "credential/delete",
     "credential/reveal-provider",
@@ -125,6 +154,12 @@ const REQUEST_METHODS: &[&str] = &[
     "model/discover",
     "mcp/list-tools",
     "tool/artifact/read",
+    "process/list",
+    "process/read",
+    "process/write",
+    "process/stop",
+    "review/start",
+    "review/read",
 ];
 const EVENT_METHODS: &[&str] = &[
     "runtime/status-changed",
@@ -135,24 +170,28 @@ const EVENT_METHODS: &[&str] = &[
     "turn/retry-started",
     "turn/messages_received",
     "assistant/model-step-committed",
+    "assistant/context-estimated",
     "assistant/text-delta",
     "assistant/reasoning-summary-delta",
     "tool/started",
     "tool/batch-committed",
+    "tool/recovery-changed",
     "approval/requested",
     "approval/resolved",
+    "approval/closed",
     "context/compaction-started",
     "context/compacted",
     "context/compaction-failed",
     "workspace/dirty",
+    "workspace/metadata-changed",
     "turn/terminal",
+    "turn/resync-required",
     "thread/metadata-changed",
     "configuration/changed",
     "task/activity",
     "task/progress",
     "task/mailbox-changed",
-    "goal/changed",
-    "goal/activity",
+    "task/closed",
     "interaction/changed",
     "plan/changed",
 ];
@@ -164,24 +203,28 @@ const CAPABILITY_EVENT_METHODS: &[&str] = &[
     "turn/retry-started",
     "turn/messages_received",
     "assistant/model-step-committed",
+    "assistant/context-estimated",
     "assistant/text-delta",
     "assistant/reasoning-summary-delta",
     "tool/started",
     "tool/batch-committed",
+    "tool/recovery-changed",
     "approval/requested",
     "approval/resolved",
+    "approval/closed",
     "context/compaction-started",
     "context/compacted",
     "context/compaction-failed",
     "workspace/dirty",
+    "workspace/metadata-changed",
     "turn/terminal",
+    "turn/resync-required",
     "thread/metadata-changed",
     "configuration/changed",
     "task/activity",
     "task/progress",
     "task/mailbox-changed",
-    "goal/changed",
-    "goal/activity",
+    "task/closed",
     "interaction/changed",
     "plan/changed",
 ];
@@ -212,7 +255,7 @@ fn consumes_every_positive_frame_and_pins_kernel_identity() {
             });
             validate_correlated_contract(&value, &mut pending_methods).unwrap_or_else(|error| {
                 panic!(
-                    "positive frame must satisfy the v1 boundary: {}:{}: {error}",
+                    "positive frame must satisfy the v2 boundary: {}:{}: {error}",
                     file.display(),
                     document_index + 1
                 )
@@ -282,8 +325,134 @@ fn rejects_every_negative_frame() {
     );
 }
 
-/// 动态消费机器错误目录，证明每个 tuple 可解码且任一 code/errorCode/category/retryable
-/// 漂移都会被 production codec 拒绝；测试不复制条目数或 digest。
+/// 相关语料的通用门禁只要求每个文件至少含一个失败帧；此门禁逐对校验 close 请求合法而三种错误 ACK 均失败。
+#[test]
+fn rejects_each_invalid_native_client_close_result() {
+    let file = golden_root()
+        .join("invalid")
+        .join("correlated")
+        .join("native-client-close-results.jsonl");
+    let source = fs::read(&file).expect("native client close corpus must be readable");
+    let frames = documents(&file, &source);
+    let (pairs, remainder) = frames.as_chunks::<2>();
+    assert!(!pairs.is_empty() && remainder.is_empty());
+
+    let mut pending_methods = HashMap::new();
+    for (pair_index, pair) in pairs.iter().enumerate() {
+        let request: Value = serde_json::from_slice(&pair[0]).expect("close request must be JSON");
+        decode_frame(&transport_frame(&pair[0]), max_frame_bytes())
+            .expect("close request must pass production framing");
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("runtime/client/close")
+        );
+        validate_correlated_contract(&request, &mut pending_methods)
+            .expect("negative result fixture must start with a valid close request");
+
+        let response: Value =
+            serde_json::from_slice(&pair[1]).expect("close response must be JSON");
+        decode_frame(&transport_frame(&pair[1]), max_frame_bytes())
+            .expect("close response must pass production framing");
+        assert_eq!(response.get("id"), request.get("id"));
+        assert!(
+            validate_correlated_contract(&response, &mut pending_methods).is_err(),
+            "non-canonical close ACK pair {} reached the Rust consumer",
+            pair_index + 1
+        );
+    }
+    assert!(pending_methods.is_empty());
+}
+
+/// 逐页关联 thread/item 身份并计算 Unicode code point 长度，锁定共享合同中的分页总量和终止状态。
+#[test]
+fn thread_item_content_pages_are_stable_by_code_point() {
+    let file = golden_root()
+        .join("valid")
+        .join("thread-item-content.jsonl");
+    let source = fs::read(&file).expect("item content corpus must be readable");
+    let mut pending_methods = HashMap::new();
+    let mut pending_requests = HashMap::new();
+    let mut pages = Vec::new();
+
+    for (document_index, document) in documents(&file, &source).into_iter().enumerate() {
+        let value: Value =
+            serde_json::from_slice(&document).expect("item content frame must be strict JSON");
+        decode_frame(&transport_frame(&document), max_frame_bytes())
+            .expect("item content frame must pass the production codec");
+        validate_correlated_contract(&value, &mut pending_methods).unwrap_or_else(|error| {
+            panic!("item content frame {} failed: {error}", document_index + 1)
+        });
+
+        if value.get("method").and_then(Value::as_str) == Some("thread/item-content/read") {
+            let id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("item content request id");
+            pending_requests.insert(id.to_owned(), value["params"].clone());
+            continue;
+        }
+
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("item content response id");
+        let params = pending_requests
+            .remove(id)
+            .expect("item content response must match a prior request");
+        let result = &value["result"];
+        assert_eq!(result["itemId"], params["itemId"]);
+        assert_eq!(result["offsetCharacters"], params["offsetCharacters"]);
+        pages.push((
+            params["offsetCharacters"]
+                .as_u64()
+                .expect("item content request offset"),
+            params,
+            result.clone(),
+        ));
+    }
+
+    assert!(pending_requests.is_empty());
+    assert!(pending_methods.is_empty());
+    assert!(
+        pages.len() >= 2,
+        "corpus must demonstrate multi-page content"
+    );
+    pages.sort_by_key(|(offset, _, _)| *offset);
+    let first_params = &pages[0].1;
+    let total = pages[0].2["totalCharacters"]
+        .as_u64()
+        .expect("item content total");
+    let mut cursor = 0u64;
+    let mut terminal_pages = 0usize;
+    let mut contains_non_bmp = false;
+    for (offset, params, result) in &pages {
+        validate_item_content_result(result).expect("item content result projection");
+        assert_eq!(params["threadId"], first_params["threadId"]);
+        assert_eq!(params["itemId"], first_params["itemId"]);
+        assert_eq!(*offset, cursor, "pages must be contiguous");
+        assert_eq!(result["totalCharacters"].as_u64(), Some(total));
+
+        let content = result["content"].as_str().expect("item content text");
+        contains_non_bmp |= content
+            .chars()
+            .any(|character| u32::from(character) > 0xffff);
+        let end = cursor + content.chars().count() as u64;
+        match result["nextOffsetCharacters"].as_u64() {
+            Some(next) => assert_eq!(Some(next), Some(end)),
+            None => {
+                assert!(result["nextOffsetCharacters"].is_null());
+                assert_eq!(end, total);
+                terminal_pages += 1;
+            }
+        }
+        cursor = end;
+    }
+    assert_eq!(terminal_pages, 1);
+    assert_eq!(cursor, total);
+    assert!(contains_non_bmp, "corpus must include a non-BMP code point");
+}
+
+/// 动态消费机器错误目录并核对 schema 闭集，证明每个 tuple 可解码且字段漂移会失败关闭。
 #[test]
 fn consumes_frozen_error_catalog_without_aliases() {
     let catalog_path = golden_root()
@@ -292,7 +461,7 @@ fn consumes_frozen_error_catalog_without_aliases() {
         .parent()
         .expect("repository contracts directory")
         .join("ja-rpc")
-        .join("v1")
+        .join("v2")
         .join("error-catalog.json");
     let catalog: Value =
         serde_json::from_slice(&fs::read(&catalog_path).expect("error catalog must be readable"))
@@ -302,6 +471,32 @@ fn consumes_frozen_error_catalog_without_aliases() {
         .and_then(Value::as_array)
         .filter(|entries| !entries.is_empty())
         .expect("error catalog must contain entries");
+    let schema_path = catalog_path
+        .parent()
+        .expect("JA-RPC v2 directory")
+        .join("schema")
+        .join("ja-rpc-v2.schema.json");
+    let schema: Value =
+        serde_json::from_slice(&fs::read(&schema_path).expect("JA-RPC schema must be readable"))
+            .expect("JA-RPC schema must be JSON");
+    let schema_error_codes = schema
+        .pointer("/$defs/rpcErrorData/properties/errorCode/enum")
+        .and_then(Value::as_array)
+        .expect("schema must close the stable RPC error codes");
+    let catalog_error_codes = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("errorCode")
+                .and_then(Value::as_str)
+                .expect("errorCode")
+        })
+        .collect::<Vec<_>>();
+    let schema_error_codes = schema_error_codes
+        .iter()
+        .map(|entry| entry.as_str().expect("schema errorCode must be text"))
+        .collect::<Vec<_>>();
+    assert_eq!(schema_error_codes, catalog_error_codes);
     let mut codes = HashSet::with_capacity(entries.len());
     let mut error_codes = HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -379,19 +574,19 @@ fn transport_frame(document: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// 优先从 Gate 环境定位 v1 共享 Corpus，否则从 Crate 目录向上查找，避免测试依赖当前工作目录。
+/// 优先从 Gate 环境定位 v2 共享 Corpus，否则从当前目录向上查找，避免依赖启动工作目录。
 fn golden_root() -> PathBuf {
     if let Some(configured) = env::var_os("JA_GOLDEN_PATH") {
         let configured = PathBuf::from(configured);
-        return if configured.join("v1").is_dir() {
-            configured.join("v1")
+        return if configured.join("v2").is_dir() {
+            configured.join("v2")
         } else {
             configured
         };
     }
     let mut current = env::current_dir().expect("current directory must be available");
     loop {
-        let candidate = current.join("contracts").join("golden").join("v1");
+        let candidate = current.join("contracts").join("golden").join("v2");
         if candidate.is_dir() {
             return candidate;
         }
@@ -434,10 +629,12 @@ fn corpus_files(invalid: bool) -> Vec<PathBuf> {
     output
 }
 
-/// 除 Transport 行终止符外保留每个 JSONL Document 的原始字节序列，避免 Fixture 被重新序列化改写。
+/// 单 JSON fixture 去掉文件终止符；JSONL 仅剥逐行 CRLF，避免 transport 尾标重复或改写内容。
 fn documents(path: &Path, source: &[u8]) -> Vec<Vec<u8>> {
     if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        return vec![source.to_vec()];
+        let document = source.strip_suffix(b"\n").unwrap_or(source);
+        let document = document.strip_suffix(b"\r").unwrap_or(document);
+        return vec![document.to_vec()];
     }
     source
         .split(|byte| *byte == b'\n')
@@ -448,7 +645,7 @@ fn documents(path: &Path, source: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// 补充通用 framing codec 有意不承担的 v1 方法、事件与响应方向闭集。
+/// 补充通用 framing codec 有意不承担的 v2 方法、事件与响应方向闭集。
 fn validate_contract(value: &Value) -> Result<(), &'static str> {
     let method = value.get("method").and_then(Value::as_str);
     let allow_credential_secret = method == Some("credential/set")
@@ -466,6 +663,7 @@ fn validate_contract(value: &Value) -> Result<(), &'static str> {
             value,
             allow_credential_secret,
             allow_preview_authorization,
+            method == Some("turn/start"),
         )
     {
         return Err("secret-shaped field crossed the Rust consumer boundary");
@@ -521,17 +719,23 @@ fn validate_contract(value: &Value) -> Result<(), &'static str> {
 /// 关联同一 fixture 文件中的 client request/response，使 Resume 的 queued 常量和方法专属结果可验证。
 fn validate_correlated_contract(
     value: &Value,
-    pending_methods: &mut HashMap<String, String>,
+    pending_methods: &mut HashMap<String, (String, Value)>,
 ) -> Result<(), &'static str> {
     validate_contract(value)?;
     let Some(id) = value.get("id").and_then(Value::as_str) else {
         return Ok(());
     };
     if let Some(method) = value.get("method").and_then(Value::as_str) {
-        pending_methods.insert(id.to_owned(), method.to_owned());
+        pending_methods.insert(
+            id.to_owned(),
+            (
+                method.to_owned(),
+                value.get("params").cloned().unwrap_or(Value::Null),
+            ),
+        );
         return Ok(());
     }
-    let Some(method) = pending_methods.remove(id) else {
+    let Some((method, request_params)) = pending_methods.remove(id) else {
         return Ok(());
     };
     if method == "turn/resume"
@@ -547,10 +751,26 @@ fn validate_correlated_contract(
     if let Some(result) = value.get("result") {
         if method == "credential/reveal-provider" {
             validate_revealed_provider_credential_result(result)?;
-        } else if contains_forbidden_secret_key(result, false, false) {
+        } else if contains_forbidden_secret_key(result, false, false, false) {
             return Err("response result leaked a secret-shaped field");
         }
+        if method == "operation/read" {
+            validate_operation_read_correlation(&request_params, result)?;
+        }
         match method.as_str() {
+            "runtime/client/close" => {
+                ensure_object_keys(result, &["accepted"])?;
+                if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+                    return Err("native client close result is not an exact accepted ACK");
+                }
+            }
+            "runtime/health" | "runtime/storage/retry" => {
+                validate_runtime_health_result(result)?;
+            }
+            "workspace/open" | "workspace/read" | "workspace/update" => {
+                validate_workspace_result(result)?
+            }
+            "workspace/list" => validate_workspace_page_result(result)?,
             "thread/list" => validate_thread_list_result(result)?,
             "thread/search" => validate_thread_page_result(result)?,
             "thread/create"
@@ -567,6 +787,14 @@ fn validate_correlated_contract(
                     return Err("thread seen result did not advance the durable boundary");
                 }
             }
+            "thread/fork" => {
+                let request: ThreadForkParams = serde_json::from_value(request_params)
+                    .map_err(|_| "thread fork request DTO is invalid")?;
+                let fork: ThreadForkResult = serde_json::from_value(result.clone())
+                    .map_err(|_| "thread fork result DTO is invalid")?;
+                fork.validate_for(&request)?;
+            }
+            "thread/item-content/read" => validate_item_content_result(result)?,
             "workspace/path/search" => validate_workspace_path_search_result(result)?,
             "thread/mcp/read" => validate_thread_mcp_status_result(result)?,
             "mcp/list" => validate_mcp_page_result(result)?,
@@ -582,10 +810,6 @@ fn validate_correlated_contract(
             | "task/cancel"
             | "task/tree/delete"
             | "task/close" => validate_task_result(&method, result)?,
-            "goal/read" | "goal/create" | "goal/plan/attach" | "goal/plan/detach"
-            | "goal/pause" | "goal/resume" | "goal/stop" => {
-                validate_goal_projection_result(result)?
-            }
             "plan/read" | "plan/create" | "plan/draft/save" | "plan/draft/discard"
             | "plan/propose" | "plan/execute" | "plan/reject" | "plan/pause" | "plan/resume"
             | "plan/stop" => validate_plan_projection_result(result)?,
@@ -600,8 +824,193 @@ fn validate_correlated_contract(
             "plan/current/read" => validate_current_plan_result(result)?,
             "plan/events/read" => validate_plan_events_result(result)?,
             "plan/evidence/list" => validate_plan_evidence_result(result)?,
+            "process/list" => {
+                let request: ProcessSessionListParams = serde_json::from_value(request_params)
+                    .map_err(|_| "process list request DTO is invalid")?;
+                let page: ProcessSessionListResult = serde_json::from_value(result.clone())
+                    .map_err(|_| "process list result DTO is invalid")?;
+                page.validate_for(&request)?;
+            }
+            "process/read" => {
+                let request: ProcessSessionReadParams = serde_json::from_value(request_params)
+                    .map_err(|_| "process read request DTO is invalid")?;
+                let snapshot: ProcessSessionSnapshot = serde_json::from_value(result.clone())
+                    .map_err(|_| "process read result DTO is invalid")?;
+                snapshot.validate_for_read(&request)?;
+            }
+            "process/write" => {
+                let request: ProcessSessionWriteParams = serde_json::from_value(request_params)
+                    .map_err(|_| "process write request DTO is invalid")?;
+                let snapshot: ProcessSessionSnapshot = serde_json::from_value(result.clone())
+                    .map_err(|_| "process write result DTO is invalid")?;
+                snapshot.validate_for_write(&request)?;
+            }
+            "process/stop" => {
+                let request: ProcessSessionStopParams = serde_json::from_value(request_params)
+                    .map_err(|_| "process stop request DTO is invalid")?;
+                let snapshot: ProcessSessionSnapshot = serde_json::from_value(result.clone())
+                    .map_err(|_| "process stop result DTO is invalid")?;
+                snapshot.validate_for_stop(&request)?;
+            }
+            "review/start" => {
+                let request: ReviewStartParams = serde_json::from_value(request_params)
+                    .map_err(|_| "review start request DTO is invalid")?;
+                let response: ReviewStartResult = serde_json::from_value(result.clone())
+                    .map_err(|_| "review start result DTO is invalid")?;
+                response.validate_for(&request)?;
+            }
+            "review/read" => {
+                let request: ReviewReadParams = serde_json::from_value(request_params)
+                    .map_err(|_| "review read request DTO is invalid")?;
+                let response: ReviewReadResult = serde_json::from_value(result.clone())
+                    .map_err(|_| "review read result DTO is invalid")?;
+                response.validate_for(&request)?;
+            }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Fork receipt 回查必须同时命中请求声明的来源 owner，避免同键回执跨 Thread 被误认。
+fn validate_operation_read_correlation(
+    request: &Value,
+    result: &Value,
+) -> Result<(), &'static str> {
+    if result.get("status").and_then(Value::as_str) == Some("unknown") {
+        return Ok(());
+    }
+    let is_fork = result.get("method").and_then(Value::as_str) == Some("thread/fork");
+    let expected_source = request.get("sourceThreadId").and_then(Value::as_str);
+    match (expected_source, is_fork) {
+        (Some(expected), true) => {
+            let outer_owner = result
+                .get("threadId")
+                .and_then(Value::as_str)
+                .ok_or("fork receipt owner is missing")?;
+            let fork_value = result
+                .get("result")
+                .cloned()
+                .ok_or("fork receipt result is missing")?;
+            let fork: ThreadForkResult = serde_json::from_value(fork_value)
+                .map_err(|_| "fork receipt projection is invalid")?;
+            if outer_owner != expected
+                || fork.source.thread_id != expected
+                || fork.validate_projection().is_err()
+            {
+                return Err("fork receipt does not match its requested owner");
+            }
+            Ok(())
+        }
+        (None, false) => Ok(()),
+        (Some(_), false) => Err("fork owner query returned another receipt kind"),
+        (None, true) => Err("fork receipt lookup omitted its source owner"),
+    }
+}
+
+/// Workspace 页面统一投影目录实体；精确字段集让已删除的恢复关联不能借分页回流。
+fn validate_workspace_page_result(result: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(result, &["items", "nextCursor"])?;
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 200)
+        .ok_or("workspace page items are invalid")?;
+    items.iter().try_for_each(validate_workspace_result)?;
+    if !result
+        .get("nextCursor")
+        .is_some_and(|cursor| cursor.is_null() || bounded_string(Some(cursor), 1, 512))
+    {
+        return Err("workspace page cursor is invalid");
+    }
+    Ok(())
+}
+
+/// Workspace 响应只暴露 Java 所有的身份和类型，不泄漏存储细节或已删除字段。
+fn validate_workspace_result(result: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        result,
+        &[
+            "workspaceId",
+            "root",
+            "displayName",
+            "trust",
+            "kind",
+            "revision",
+        ],
+    )?;
+    if !valid_prefixed_id(result.get("workspaceId"), "ws_")
+        || !bounded_string(result.get("root"), 1, 4_096)
+        || result
+            .get("root")
+            .and_then(Value::as_str)
+            .is_some_and(|root| root.chars().any(char::is_control))
+        || !bounded_string(result.get("displayName"), 1, 1_024)
+        || !matches!(
+            result.get("trust").and_then(Value::as_str),
+            Some("trusted" | "untrusted")
+        )
+        || !matches!(
+            result.get("kind").and_then(Value::as_str),
+            Some("project" | "session")
+        )
+        || !integer_in_bounds(result.get("revision"), 0, 9_007_199_254_740_991)
+    {
+        return Err("workspace result metadata is invalid");
+    }
+    Ok(())
+}
+
+/// item 内容页按 Unicode code point 校验；`nextOffsetCharacters` 与 `truncated` 必须表达同一边界。
+fn validate_item_content_result(result: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        result,
+        &[
+            "itemId",
+            "offsetCharacters",
+            "nextOffsetCharacters",
+            "totalCharacters",
+            "truncated",
+            "content",
+        ],
+    )?;
+    let offset = result
+        .get("offsetCharacters")
+        .and_then(Value::as_u64)
+        .ok_or("item content offset is invalid")?;
+    let total = result
+        .get("totalCharacters")
+        .and_then(Value::as_u64)
+        .ok_or("item content total is invalid")?;
+    if !integer_in_bounds(result.get("offsetCharacters"), 0, 9_007_199_254_740_991)
+        || !integer_in_bounds(result.get("totalCharacters"), 0, 9_007_199_254_740_991)
+        || !bounded_string(result.get("content"), 0, 65_536)
+    {
+        return Err("item content page is outside its bounds");
+    }
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("item content text is invalid")?;
+    let end = offset
+        .checked_add(content.chars().count() as u64)
+        .filter(|end| *end <= total)
+        .ok_or("item content span exceeds its total")?;
+    let next = match result.get("nextOffsetCharacters") {
+        Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or("item content next offset is invalid")?,
+        ),
+        None => return Err("item content next offset is missing"),
+    };
+    if !valid_prefixed_id(result.get("itemId"), "item_")
+        || result.get("truncated").and_then(Value::as_bool) != Some(next.is_some())
+        || next.is_some_and(|next| next != end || next >= total)
+        || next.is_none() && end != total
+    {
+        return Err("item content page boundary is inconsistent");
     }
     Ok(())
 }
@@ -629,7 +1038,7 @@ fn validate_mcp_test_result(result: &Value) -> Result<(), &'static str> {
     validate_mcp_descriptor(result, &["healthy", "available", "degraded", "unavailable"])
 }
 
-/// Golden Consumer allows only the thread-safe, redacted MCP summary fields and its frozen state vocabulary.
+/// Golden Consumer 只允许暴露线程安全的 MCP 脱敏摘要字段及其固定状态词汇。
 fn validate_thread_mcp_status_result(result: &Value) -> Result<(), &'static str> {
     ensure_object_keys(
         result,
@@ -788,44 +1197,6 @@ fn validate_mcp_projection(result: &Value) -> Result<(), &'static str> {
     )
 }
 
-/// Goal 投影独立校验 evaluator 绑定，防止不存在的 criterion 被客户端误认为有效验收结论。
-fn validate_goal_projection_result(result: &Value) -> Result<(), &'static str> {
-    ensure_object_keys(result, &["goal", "eventSequence"])?;
-    let goal = result.get("goal").ok_or("goal projection is missing")?;
-    let goal_id = goal
-        .get("goalId")
-        .and_then(Value::as_str)
-        .ok_or("goal identity is missing")?;
-    let criterion_ids = goal
-        .get("acceptanceCriteria")
-        .and_then(Value::as_array)
-        .ok_or("goal criteria are missing")?
-        .iter()
-        .filter_map(|criterion| criterion.get("criterionId").and_then(Value::as_str))
-        .collect::<HashSet<_>>();
-    if let Some(evaluation) = goal
-        .get("latestEvaluation")
-        .filter(|value| !value.is_null())
-    {
-        if evaluation.get("goalId").and_then(Value::as_str) != Some(goal_id) {
-            return Err("goal evaluation owner is invalid");
-        }
-        let criteria = evaluation
-            .get("criteria")
-            .and_then(Value::as_array)
-            .ok_or("goal evaluation criteria are missing")?;
-        if criteria.iter().any(|criterion| {
-            criterion
-                .get("criterionId")
-                .and_then(Value::as_str)
-                .is_none_or(|id| !criterion_ids.contains(id))
-        }) {
-            return Err("goal evaluation criterion is dangling");
-        }
-    }
-    Ok(())
-}
-
 /// Plan 投影要求 active revision、冻结 revision 与 approval 三方绑定，避免批准状态指向不可见版本。
 fn validate_plan_projection_result(result: &Value) -> Result<(), &'static str> {
     let mut allowed = vec![
@@ -937,15 +1308,14 @@ fn validate_interaction_request(
     ensure_object_keys(
         value,
         &[
-            "requestId",
+            "interactionId",
             "threadId",
             "turnId",
             "toolCallId",
             "planRevisionId",
             "runId",
-            "goalId",
             "status",
-            "revision",
+            "interactionRevision",
             "questions",
             "answers",
             "createdAt",
@@ -953,27 +1323,24 @@ fn validate_interaction_request(
         ],
     )?;
     if value.get("threadId") != expected_thread_id
-        || !valid_prefixed_id(value.get("requestId"), "interaction_")
+        || !valid_prefixed_id(value.get("interactionId"), "interaction_")
         || !value
             .get("turnId")
             .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "turn_"))
         || !value
             .get("toolCallId")
-            .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "call_"))
+            .is_some_and(|id| id.is_null() || valid_call_id(Some(id)))
         || !value
             .get("planRevisionId")
             .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "planrev_"))
         || !value
             .get("runId")
             .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "run_"))
-        || !value
-            .get("goalId")
-            .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "goal_"))
         || !matches!(
             value.get("status").and_then(Value::as_str),
             Some("pending" | "answered" | "cancelled" | "superseded")
         )
-        || !integer_in_bounds(value.get("revision"), 0, 9_007_199_254_740_991)
+        || !integer_in_bounds(value.get("interactionRevision"), 0, 9_007_199_254_740_991)
         || !bounded_string(value.get("createdAt"), 1, 64)
         || !bounded_string(value.get("updatedAt"), 1, 64)
     {
@@ -1102,19 +1469,19 @@ fn validate_interaction_draft(
         value,
         &[
             "threadId",
-            "requestId",
+            "interactionId",
             "answers",
             "page",
             "collapsed",
-            "revision",
+            "draftRevision",
             "updatedAt",
         ],
     )?;
     if value.get("threadId") != expected_thread_id
-        || !valid_prefixed_id(value.get("requestId"), "interaction_")
+        || !valid_prefixed_id(value.get("interactionId"), "interaction_")
         || !integer_in_bounds(value.get("page"), 0, 2)
         || value.get("collapsed").and_then(Value::as_bool).is_none()
-        || !integer_in_bounds(value.get("revision"), 0, 9_007_199_254_740_991)
+        || !integer_in_bounds(value.get("draftRevision"), 0, 9_007_199_254_740_991)
         || !bounded_string(value.get("updatedAt"), 1, 64)
     {
         return Err("interaction draft is invalid");
@@ -1157,7 +1524,10 @@ fn validate_plan_events_result(result: &Value) -> Result<(), &'static str> {
     for item in items {
         ensure_object_keys(item, &["eventSequence", "kind", "summary", "occurredAt"])?;
         if !integer_in_bounds(item.get("eventSequence"), 1, 9_007_199_254_740_991)
-            || !bounded_string(item.get("kind"), 1, 128)
+            || !item
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| PLAN_EVENT_KINDS.contains(&kind))
             || !bounded_string(item.get("summary"), 0, 32_768)
             || !bounded_string(item.get("occurredAt"), 1, 64)
         {
@@ -1196,7 +1566,7 @@ fn validate_plan_evidence_result(result: &Value) -> Result<(), &'static str> {
     validate_plan_cursor(result.get("nextCursor"))
 }
 
-/// Plan 与 Goal 共用 opaque 游标编码，但页验证仍要求显式 null 或有界字符串。
+/// Plan cursor 必须显式为 null 或有界字符串，避免分页状态被静默放宽。
 fn validate_plan_cursor(value: Option<&Value>) -> Result<(), &'static str> {
     if value.is_some_and(|cursor| cursor.is_null() || bounded_string(Some(cursor), 1, 512)) {
         Ok(())
@@ -1222,9 +1592,7 @@ fn validate_evidence_item(value: &Value) -> Result<(), &'static str> {
         value,
         &[
             "evidenceId",
-            "goalId",
             "planId",
-            "goalDefinitionRevision",
             "runId",
             "planRevisionId",
             "criterionId",
@@ -1238,15 +1606,7 @@ fn validate_evidence_item(value: &Value) -> Result<(), &'static str> {
         ],
     )?;
     if !valid_prefixed_id(value.get("evidenceId"), "evidence_")
-        || !value
-            .get("goalId")
-            .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "goal_"))
-        || !value
-            .get("planId")
-            .is_some_and(|id| id.is_null() || valid_prefixed_id(Some(id), "plan_"))
-        || !value.get("goalDefinitionRevision").is_some_and(|revision| {
-            revision.is_null() || integer_in_bounds(Some(revision), 1, 9_007_199_254_740_991)
-        })
+        || !valid_prefixed_id(value.get("planId"), "plan_")
         || !valid_prefixed_id(value.get("runId"), "run_")
         || !value
             .get("planRevisionId")
@@ -1330,6 +1690,7 @@ fn validate_thread_discovery_item(value: &Value) -> Result<(), &'static str> {
                 "idle"
                     | "queued"
                     | "running"
+                    | "waiting_input"
                     | "waiting_approval"
                     | "suspended"
                     | "completed"
@@ -1361,7 +1722,7 @@ fn validate_thread_page_result(result: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 锁定完整 Thread wire shape；seen 与最新状态保持正交，但无 Turn 时不能伪造未读提醒。
+/// 锁定完整 Thread wire shape；不再携带旧 Workspace 关联字段，无 Turn 时也不能伪造未读提醒。
 fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
     ensure_object_keys(
         result,
@@ -1369,14 +1730,12 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
             "threadId",
             "workspaceId",
             "workspaceKind",
-            "legacySharedWorkspaceId",
             "preferences",
             "title",
             "status",
             "pinned",
             "latestTurnStatus",
             "latestTurnSeen",
-            "activeGoalId",
             "revision",
             "createdAt",
             "updatedAt",
@@ -1384,16 +1743,9 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
     )?;
     let latest_status = result.get("latestTurnStatus");
     let workspace_kind = result.get("workspaceKind").and_then(Value::as_str);
-    let legacy_workspace_id = result.get("legacySharedWorkspaceId");
     if !valid_prefixed_id(result.get("threadId"), "thr_")
         || !valid_prefixed_id(result.get("workspaceId"), "ws_")
-        || !matches!(
-            workspace_kind,
-            Some("project" | "session" | "legacy_shared")
-        )
-        || !legacy_workspace_id
-            .is_some_and(|value| value.is_null() || valid_prefixed_id(Some(value), "ws_"))
-        || workspace_kind != Some("session") && !legacy_workspace_id.is_some_and(Value::is_null)
+        || !matches!(workspace_kind, Some("project" | "session"))
         || !bounded_string(result.get("title"), 1, 512)
         || !matches!(
             result.get("status").and_then(Value::as_str),
@@ -1407,6 +1759,7 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
                     Some(
                         "queued"
                             | "running"
+                            | "waiting_input"
                             | "waiting_approval"
                             | "suspended"
                             | "completed"
@@ -1421,9 +1774,6 @@ fn validate_thread_result(result: &Value) -> Result<(), &'static str> {
             .is_none()
         || latest_status.is_some_and(Value::is_null)
             && result.get("latestTurnSeen").and_then(Value::as_bool) != Some(true)
-        || !result
-            .get("activeGoalId")
-            .is_some_and(|goal_id| goal_id.is_null() || valid_prefixed_id(Some(goal_id), "goal_"))
         || !integer_in_bounds(result.get("revision"), 0, 9_007_199_254_740_991)
         || !bounded_string(result.get("createdAt"), 1, 64)
         || !bounded_string(result.get("updatedAt"), 1, 64)
@@ -1521,9 +1871,18 @@ fn validate_task_result(method: &str, result: &Value) -> Result<(), &'static str
             }
         }
         "task/close" => {
-            ensure_object_keys(result, &["closed"])?;
-            if result.get("closed").and_then(Value::as_bool) != Some(true) {
-                return Err("task close result was not closed");
+            ensure_object_keys(result, &["closedThreadIds"])?;
+            let thread_ids = result
+                .get("closedThreadIds")
+                .and_then(Value::as_array)
+                .filter(|thread_ids| !thread_ids.is_empty())
+                .ok_or("task close result has no closed Thread identities")?;
+            let mut unique_ids = std::collections::HashSet::with_capacity(thread_ids.len());
+            if thread_ids.iter().any(|thread_id| {
+                !valid_prefixed_id(Some(thread_id), "thr_")
+                    || !unique_ids.insert(thread_id.as_str().unwrap_or_default())
+            }) {
+                return Err("task close result contains duplicate or invalid Thread identities");
             }
         }
         "task/followup" => {
@@ -1612,6 +1971,7 @@ fn validate_task_summary(value: &Value) -> Result<(), &'static str> {
                     | "idle"
                     | "running"
                     | "waiting_approval"
+                    | "waiting_input"
                     | "suspended"
                     | "completed"
                     | "failed"
@@ -1904,6 +2264,7 @@ fn validate_task_activity(value: &Value) -> Result<(), &'static str> {
                     | "follow_up_queued"
                     | "progress"
                     | "waiting_approval"
+                    | "waiting_input"
                     | "resumed"
                     | "completed"
                     | "failed"
@@ -2123,6 +2484,7 @@ fn validate_response_result(result: &Value) -> Result<(), &'static str> {
                 Some(
                     "queued"
                         | "running"
+                        | "waiting_input"
                         | "waiting_approval"
                         | "suspended"
                         | "completed"
@@ -2137,6 +2499,138 @@ fn validate_response_result(result: &Value) -> Result<(), &'static str> {
     }
     if result.get("artifactId").is_some() && result.get("content").is_some() {
         validate_artifact_page_result(result)?;
+    }
+    Ok(())
+}
+
+/// StorageRecovery has one shared lifecycle; ready may have no failure cause, blocked states may not.
+fn validate_runtime_health_result(result: &Value) -> Result<(), &'static str> {
+    let object = result
+        .as_object()
+        .filter(|object| {
+            matches!(object.len(), 2 | 3)
+                && object.contains_key("status")
+                && object.contains_key("components")
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "status" | "components" | "storageRecovery"))
+        })
+        .ok_or("runtime health result fields are invalid")?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "ready" | "blocked"))
+        .ok_or("runtime health status is invalid")?;
+    let components = object
+        .get("components")
+        .and_then(Value::as_array)
+        .filter(|components| components.len() == 4)
+        .ok_or("runtime health components are invalid")?;
+    let mut names = HashSet::new();
+    for component in components {
+        let item = component
+            .as_object()
+            .ok_or("runtime health component is invalid")?;
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| matches!(*name, "sidecar" | "sqlite" | "kernel" | "configuration"))
+            .ok_or("runtime health component name is invalid")?;
+        if !names.insert(name)
+            || !matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("healthy" | "degraded" | "unavailable" | "stopped")
+            )
+            || item
+                .keys()
+                .any(|key| !matches!(key.as_str(), "name" | "status" | "diagnostics"))
+        {
+            return Err("runtime health component fields are invalid");
+        }
+        match item.get("diagnostics") {
+            None if name != "configuration" => {}
+            None => {}
+            Some(values) if name == "configuration" => {
+                let diagnostics = values
+                    .as_array()
+                    .filter(|values| values.len() <= 16)
+                    .ok_or("runtime health diagnostics are invalid")?;
+                if diagnostics.iter().any(|value| {
+                    !value.as_str().is_some_and(|code| {
+                        let mut bytes = code.bytes();
+                        bytes.next().is_some_and(|first| first.is_ascii_uppercase())
+                            && bytes.all(|byte| {
+                                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                            })
+                            && code.len() <= 64
+                    })
+                }) {
+                    return Err("runtime health diagnostic code is invalid");
+                }
+            }
+            Some(_) => return Err("runtime health diagnostics are only valid for configuration"),
+        }
+    }
+    if names.len() != 4 {
+        return Err("runtime health component names are incomplete");
+    }
+
+    let recovery_blocked = if let Some(value) = object.get("storageRecovery") {
+        ensure_object_keys(
+            value,
+            &[
+                "id",
+                "phase",
+                "reason",
+                "historyAvailable",
+                "backupAvailable",
+                "rebuilt",
+            ],
+        )?;
+        let recovery = value.as_object().ok_or("storage recovery is invalid")?;
+        let id = recovery
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("storage recovery id is invalid")?;
+        if id.len() != 36
+            || !id.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+        {
+            return Err("storage recovery id is invalid");
+        }
+        let phase = recovery
+            .get("phase")
+            .and_then(Value::as_str)
+            .filter(|phase| matches!(*phase, "rebuilding" | "ready" | "blocked"))
+            .ok_or("storage recovery phase is invalid")?;
+        for key in ["historyAvailable", "backupAvailable", "rebuilt"] {
+            if recovery.get(key).and_then(Value::as_bool).is_none() {
+                return Err("storage recovery availability is invalid");
+            }
+        }
+        match recovery.get("reason") {
+            Some(Value::Null) if phase == "ready" => {}
+            Some(Value::String(reason))
+                if matches!(
+                    reason.as_str(),
+                    "SCHEMA_VALIDATION_FAILED"
+                        | "INITIALIZATION_FAILED"
+                        | "CORRUPT_DATABASE"
+                        | "DISK_FULL"
+                        | "PERMISSION_DENIED"
+                        | "INSTANCE_LOCKED"
+                        | "IO_ERROR"
+                ) => {}
+            _ => return Err("storage recovery reason is invalid"),
+        }
+        matches!(phase, "rebuilding" | "blocked")
+    } else {
+        false
+    };
+    if (status == "blocked") != recovery_blocked {
+        return Err("runtime health and storage recovery state disagree");
     }
     Ok(())
 }
@@ -2156,6 +2650,7 @@ fn validate_attachment_result(result: &Value) -> Result<(), &'static str> {
             "createdAt",
             "expiresAt",
             "boundMessageId",
+            "boundThreadId",
         ],
     )?;
     if !valid_prefixed_id(result.get("attachmentId"), "att_")
@@ -2173,18 +2668,78 @@ fn validate_attachment_result(result: &Value) -> Result<(), &'static str> {
         return Err("attachment result metadata is invalid");
     }
     let state = require_text(result, "state")?;
-    let bound = result
+    let message_bound = result
         .get("boundMessageId")
-        .is_some_and(|value| !value.is_null() && valid_prefixed_id(Some(value), "item_"));
+        .is_some_and(|value| !value.is_null());
+    let thread_bound = result
+        .get("boundThreadId")
+        .is_some_and(|value| !value.is_null());
+    let message_owner_valid = result
+        .get("boundMessageId")
+        .is_some_and(|value| value.is_null() || valid_prefixed_id(Some(value), "item_"));
+    let thread_owner_valid = result
+        .get("boundThreadId")
+        .is_some_and(|value| value.is_null() || valid_prefixed_id(Some(value), "thr_"));
     match state {
-        "bound" if bound => Ok(()),
+        "bound" if message_owner_valid && thread_owner_valid && message_bound != thread_bound => {
+            Ok(())
+        }
         "draft" | "discarded" | "expired"
-            if result.get("boundMessageId").is_some_and(Value::is_null) =>
+            if message_owner_valid && thread_owner_valid && !message_bound && !thread_bound =>
         {
             Ok(())
         }
         _ => Err("attachment result state is invalid"),
     }
+}
+
+/// 两种附件 owner 都必须显式且互斥，避免 fork Thread 被伪装成消息绑定。
+#[test]
+fn attachment_result_requires_exactly_one_owner_when_bound() {
+    let base = serde_json::json!({
+        "attachmentId": "att_demo",
+        "workspaceId": "ws_demo",
+        "displayName": "notes.txt",
+        "sizeBytes": 24,
+        "mediaKind": "text",
+        "mediaType": "text/plain",
+        "state": "bound",
+        "createdAt": "2026-08-30T00:00:00Z",
+        "expiresAt": "2026-08-31T00:00:00Z",
+        "boundMessageId": "item_user",
+        "boundThreadId": null
+    });
+    assert!(validate_attachment_result(&base).is_ok());
+
+    let fork_bound = serde_json::json!({
+        "attachmentId": "att_demo",
+        "workspaceId": "ws_demo",
+        "displayName": "notes.txt",
+        "sizeBytes": 24,
+        "mediaKind": "text",
+        "mediaType": "text/plain",
+        "state": "bound",
+        "createdAt": "2026-08-30T00:00:00Z",
+        "expiresAt": "2026-08-31T00:00:00Z",
+        "boundMessageId": null,
+        "boundThreadId": "thr_fork"
+    });
+    assert!(validate_attachment_result(&fork_bound).is_ok());
+
+    let conflicting_owners = serde_json::json!({
+        "attachmentId": "att_demo",
+        "workspaceId": "ws_demo",
+        "displayName": "notes.txt",
+        "sizeBytes": 24,
+        "mediaKind": "text",
+        "mediaType": "text/plain",
+        "state": "bound",
+        "createdAt": "2026-08-30T00:00:00Z",
+        "expiresAt": "2026-08-31T00:00:00Z",
+        "boundMessageId": "item_user",
+        "boundThreadId": "thr_fork"
+    });
+    assert!(validate_attachment_result(&conflicting_owners).is_err());
 }
 
 /// 校验平坦历史必须携带真实 Turn 归属与来源身份，并锁定附件不泄露 workspace/hash/path。
@@ -2197,7 +2752,6 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             "turns",
             "items",
             "taskActivities",
-            "goalActivities",
             "inputQueue",
             "contextUsage",
             "liveStream",
@@ -2219,6 +2773,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             turn,
             &[
                 "turnId",
+                "origin",
                 "sourceMessageId",
                 "status",
                 "requestedAt",
@@ -2229,6 +2784,10 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             ],
         )?;
         if !valid_prefixed_id(turn.get("turnId"), "turn_")
+            || !matches!(
+                turn.get("origin").and_then(Value::as_str),
+                Some("native" | "inherited")
+            )
             || !turn
                 .get("sourceMessageId")
                 .is_some_and(|source| source.is_null() || valid_prefixed_id(Some(source), "item_"))
@@ -2240,6 +2799,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             Some(
                 "queued"
                     | "running"
+                    | "waiting_input"
                     | "waiting_approval"
                     | "suspended"
                     | "completed"
@@ -2256,14 +2816,21 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
         }
     }
     validate_thread_task_activities(result)?;
-    validate_thread_goal_activities(result)?;
     let queue_valid = result.get("inputQueue").is_some_and(|queue| {
         queue.is_null()
             || turns.iter().any(|turn| {
-                matches!(
-                    turn.get("status").and_then(Value::as_str),
-                    Some("queued" | "running" | "waiting_approval" | "suspended")
-                ) && valid_input_queue(Some(queue), turn.get("turnId"))
+                turn.get("origin").and_then(Value::as_str) == Some("native")
+                    && matches!(
+                        turn.get("status").and_then(Value::as_str),
+                        Some(
+                            "queued"
+                                | "running"
+                                | "waiting_input"
+                                | "waiting_approval"
+                                | "suspended"
+                        )
+                    )
+                    && valid_input_queue(Some(queue), turn.get("turnId"))
             })
     });
     if !queue_valid {
@@ -2277,7 +2844,12 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
         .filter(|items| items.len() <= 200)
         .ok_or("thread items are invalid")?;
     for item in items {
-        if !valid_prefixed_id(item.get("turnId"), "turn_") {
+        if !valid_prefixed_id(item.get("turnId"), "turn_")
+            || !matches!(
+                item.get("origin").and_then(Value::as_str),
+                Some("native" | "inherited")
+            )
+        {
             return Err("thread item turn identity is invalid");
         }
         match item.get("kind").and_then(Value::as_str) {
@@ -2288,17 +2860,41 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                         "itemId",
                         "createdAt",
                         "turnId",
+                        "origin",
                         "kind",
                         "content",
                         "attachments",
+                        "totalCharacters",
+                        "truncated",
                     ],
                 )?;
+                if !valid_user_content_preview(
+                    item.get("content"),
+                    item.get("totalCharacters"),
+                    item.get("truncated"),
+                ) {
+                    return Err("thread user preview is invalid");
+                }
                 validate_turn_content(item.get("content"))?;
                 validate_attachment_summaries(item.get("content"), item.get("attachments"))?;
             }
             Some("final_answer") => {
-                ensure_object_keys(item, &["itemId", "createdAt", "turnId", "kind", "text"])?;
-                require_text(item, "text")?;
+                ensure_object_keys(
+                    item,
+                    &[
+                        "itemId",
+                        "createdAt",
+                        "turnId",
+                        "origin",
+                        "kind",
+                        "text",
+                        "totalCharacters",
+                        "truncated",
+                    ],
+                )?;
+                if !valid_public_text_preview(item, "text", "totalCharacters", "truncated") {
+                    return Err("thread final preview is invalid");
+                }
             }
             Some("thread_message") => {
                 ensure_object_keys(
@@ -2307,16 +2903,19 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                         "itemId",
                         "createdAt",
                         "turnId",
+                        "origin",
                         "kind",
                         "sourceThreadId",
                         "sourceTitle",
                         "content",
+                        "totalCharacters",
+                        "truncated",
                     ],
                 )?;
                 if !valid_prefixed_id(item.get("itemId"), "item_")
                     || !valid_prefixed_id(item.get("sourceThreadId"), "thr_")
                     || !bounded_string(item.get("sourceTitle"), 1, 512)
-                    || !bounded_string(item.get("content"), 0, 1_048_576)
+                    || !valid_public_text_preview(item, "content", "totalCharacters", "truncated")
                 {
                     return Err("thread message item is invalid");
                 }
@@ -2328,13 +2927,17 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                         "itemId",
                         "createdAt",
                         "turnId",
+                        "origin",
                         "kind",
                         "text",
                         "modelRound",
+                        "totalCharacters",
+                        "truncated",
                     ],
                 )?;
-                require_text(item, "text")?;
-                if !integer_in_bounds(item.get("modelRound"), 1, i32::MAX as u64) {
+                if !valid_public_text_preview(item, "text", "totalCharacters", "truncated")
+                    || !integer_in_bounds(item.get("modelRound"), 1, i32::MAX as u64)
+                {
                     return Err("thread model round is invalid");
                 }
             }
@@ -2345,6 +2948,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                         "itemId",
                         "createdAt",
                         "turnId",
+                        "origin",
                         "kind",
                         "callId",
                         "toolName",
@@ -2352,7 +2956,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                         "presentation",
                     ],
                 )?;
-                if !valid_prefixed_id(item.get("callId"), "call_")
+                if !valid_call_id(item.get("callId"))
                     || !integer_in_bounds(item.get("ordinal"), 0, 1023)
                 {
                     return Err("thread tool identity is invalid");
@@ -2368,6 +2972,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
                     "itemId",
                     "createdAt",
                     "turnId",
+                    "origin",
                     "kind",
                     "approvalId",
                     "expiresAt",
@@ -2402,9 +3007,10 @@ fn validate_thread_live_stream(value: Option<&Value>, turns: &Value) -> Result<(
     let active_turn = turns.as_array().is_some_and(|turns| {
         turns.iter().any(|turn| {
             turn.get("turnId").and_then(Value::as_str) == Some(turn_id)
+                && turn.get("origin").and_then(Value::as_str) == Some("native")
                 && matches!(
                     turn.get("status").and_then(Value::as_str),
-                    Some("queued" | "running" | "waiting_approval" | "suspended")
+                    Some("queued" | "running" | "waiting_input" | "waiting_approval" | "suspended")
                 )
         })
     });
@@ -2522,48 +3128,7 @@ fn validate_thread_task_activities(result: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Goal 终态按全局事件序号升序且 identity 唯一；完整计划不允许混入 thread/read。
-fn validate_thread_goal_activities(result: &Value) -> Result<(), &'static str> {
-    let entries = result
-        .get("goalActivities")
-        .and_then(Value::as_array)
-        .filter(|entries| entries.len() <= 128)
-        .ok_or("thread goal activities are invalid")?;
-    let mut previous_sequence = None;
-    let mut goal_ids = HashSet::with_capacity(entries.len());
-    for entry in entries {
-        ensure_object_keys(
-            entry,
-            &[
-                "goalId",
-                "objective",
-                "status",
-                "goalRevision",
-                "eventSequence",
-                "occurredAt",
-            ],
-        )?;
-        let goal_id = require_text(entry, "goalId")?;
-        let objective = require_text(entry, "objective")?;
-        let status = require_text(entry, "status")?;
-        let goal_revision = entry.get("goalRevision").and_then(Value::as_u64);
-        let sequence = entry.get("eventSequence").and_then(Value::as_u64);
-        if !goal_id.starts_with("goal_")
-            || objective.len() > 32_768
-            || !matches!(status, "achieved" | "stopped")
-            || !goal_revision.is_some_and(|value| value > 0 && value <= 9_007_199_254_740_991)
-            || !sequence.is_some_and(|value| value > 0 && value <= 9_007_199_254_740_991)
-            || previous_sequence.is_some_and(|previous| sequence.unwrap_or(0) <= previous)
-            || !goal_ids.insert(goal_id)
-        {
-            return Err("thread goal activity relationship is invalid");
-        }
-        previous_sequence = sequence;
-    }
-    Ok(())
-}
-
-/// 最近 Usage 绑定唯一请求与必填画像；UNKNOWN 只表示 Token 计量不可得。
+/// 最近普通请求 Usage 与可选检查点估算绑定同一窗口；UNKNOWN 不能恢复旧的压缩前占用。
 fn validate_thread_context_usage(usage: Option<&Value>) -> Result<(), &'static str> {
     let Some(usage) = usage else {
         return Err("thread context usage is missing");
@@ -2575,8 +3140,8 @@ fn validate_thread_context_usage(usage: Option<&Value>) -> Result<(), &'static s
         usage,
         &[
             "turnId",
-            "requestId",
-            "requestOrdinal",
+            "modelRequestId",
+            "modelRequestOrdinal",
             "modelRound",
             "purpose",
             "certainty",
@@ -2585,6 +3150,7 @@ fn validate_thread_context_usage(usage: Option<&Value>) -> Result<(), &'static s
             "outputTokens",
             "totalTokens",
             "measuredAt",
+            "contextEstimate",
         ],
     )?;
     let certainty = require_text(usage, "certainty")?;
@@ -2613,19 +3179,110 @@ fn validate_thread_context_usage(usage: Option<&Value>) -> Result<(), &'static s
     let profile_valid = usage
         .get("profile")
         .is_some_and(valid_provider_request_profile);
+    let estimate_valid = match usage.get("contextEstimate") {
+        Some(Value::Null) => true,
+        Some(estimate) => {
+            ensure_object_keys(
+                estimate,
+                &[
+                    "certainty",
+                    "source",
+                    "usedTokens",
+                    "limitTokens",
+                    "measuredAt",
+                ],
+            )?;
+            estimate.get("certainty").and_then(Value::as_str) == Some("estimated")
+                && estimate.get("source").and_then(Value::as_str) == Some("local")
+                && integer_in_bounds(estimate.get("usedTokens"), 0, 9_007_199_254_740_991)
+                && integer_in_bounds(estimate.get("limitTokens"), 1, 9_007_199_254_740_991)
+                && usage
+                    .get("profile")
+                    .and_then(|profile| profile.get("contextWindowTokens"))
+                    == estimate.get("limitTokens")
+                && estimate
+                    .get("measuredAt")
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_protocol_timestamp)
+        }
+        None => false,
+    };
     if !valid_prefixed_id(usage.get("turnId"), "turn_")
-        || !valid_prefixed_id(usage.get("requestId"), "request_")
-        || !integer_in_bounds(usage.get("requestOrdinal"), 1, 9_007_199_254_740_991)
+        || !valid_prefixed_id(usage.get("modelRequestId"), "modelreq_")
+        || !integer_in_bounds(usage.get("modelRequestOrdinal"), 1, 9_007_199_254_740_991)
         || !integer_in_bounds(usage.get("modelRound"), 1, i32::MAX as u64)
         || !matches!(
             usage.get("purpose").and_then(Value::as_str),
             Some("assistant" | "summary")
         )
         || !profile_valid
+        || !estimate_valid
         || !tokens_valid
         || !bounded_string(usage.get("measuredAt"), 1, 64)
     {
         return Err("thread context usage is invalid");
+    }
+    Ok(())
+}
+
+/// Dispatch 估算必须是 UNKNOWN Assistant 请求的独立本地事实，不能被 Rust 消费者解释为实测 Usage。
+fn validate_context_estimate_usage(usage: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        usage,
+        &[
+            "modelRequestId",
+            "modelRequestOrdinal",
+            "modelRound",
+            "purpose",
+            "certainty",
+            "profile",
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "measuredAt",
+            "contextEstimate",
+        ],
+    )?;
+    let profile = usage.get("profile");
+    let estimate = usage.get("contextEstimate");
+    let profile_valid = profile.is_some_and(valid_provider_request_profile);
+    let estimate_valid = estimate.is_some_and(|value| {
+        ensure_object_keys(
+            value,
+            &[
+                "certainty",
+                "source",
+                "usedTokens",
+                "limitTokens",
+                "measuredAt",
+            ],
+        )
+        .is_ok()
+            && value.get("certainty").and_then(Value::as_str) == Some("estimated")
+            && value.get("source").and_then(Value::as_str) == Some("local")
+            && integer_in_bounds(value.get("usedTokens"), 0, 9_007_199_254_740_991)
+            && integer_in_bounds(value.get("limitTokens"), 1, 9_007_199_254_740_991)
+            && profile.and_then(|value| value.get("contextWindowTokens"))
+                == value.get("limitTokens")
+            && value
+                .get("measuredAt")
+                .and_then(Value::as_str)
+                .is_some_and(valid_protocol_timestamp)
+    });
+    let usage_timestamp = usage.get("measuredAt").and_then(Value::as_str);
+    if !valid_prefixed_id(usage.get("modelRequestId"), "modelreq_")
+        || !integer_in_bounds(usage.get("modelRequestOrdinal"), 1, 9_007_199_254_740_991)
+        || !integer_in_bounds(usage.get("modelRound"), 1, i32::MAX as u64)
+        || usage.get("purpose").and_then(Value::as_str) != Some("assistant")
+        || usage.get("certainty").and_then(Value::as_str) != Some("unknown")
+        || !["inputTokens", "outputTokens", "totalTokens"]
+            .iter()
+            .all(|field| usage.get(*field).is_some_and(Value::is_null))
+        || !profile_valid
+        || !estimate_valid
+        || !usage_timestamp.is_some_and(valid_protocol_timestamp)
+    {
+        return Err("context estimate usage is invalid");
     }
     Ok(())
 }
@@ -2748,6 +3405,7 @@ fn validate_config_read_result(result: &Value) -> Result<(), &'static str> {
             "effective",
             "user",
             "project",
+            "sources",
             "credentials",
             "cas",
             "diagnostics",
@@ -2764,6 +3422,21 @@ fn validate_config_read_result(result: &Value) -> Result<(), &'static str> {
     }
     validate_config_layer(result.get("user"))?;
     validate_config_layer(result.get("project"))?;
+    let sources = result
+        .get("sources")
+        .and_then(Value::as_object)
+        .ok_or("configuration sources are invalid")?;
+    for (field, source) in sources {
+        if field.is_empty()
+            || field.len() > 256
+            || field.chars().any(char::is_control)
+            || !source
+                .as_str()
+                .is_some_and(|value| matches!(value, "default" | "user" | "project"))
+        {
+            return Err("configuration source entry is invalid");
+        }
+    }
     validate_config_credentials(result.get("credentials"))?;
     let cas = result.get("cas").ok_or("configuration cas is missing")?;
     ensure_object_keys(cas, &["userVersion", "projectVersion", "credentialVersion"])?;
@@ -2800,7 +3473,7 @@ fn validate_config_layer(value: Option<&Value>) -> Result<(), &'static str> {
         || layer.get("trusted").and_then(Value::as_bool).is_none()
         || !matches!(
             layer.get("status").and_then(Value::as_str),
-            Some("missing" | "valid" | "untrusted" | "corrupt" | "io_error")
+            Some("missing" | "valid" | "partial" | "untrusted" | "corrupt" | "io_error")
         )
         || !layer
             .get("document")
@@ -2832,7 +3505,7 @@ fn validate_config_credentials(value: Option<&Value>) -> Result<(), &'static str
     Ok(())
 }
 
-/// 拒绝已删除 Request，并校验 v1 Corpus 覆盖的高风险 Parameter Shape，确保旧协议入口不会回流。
+/// 拒绝已删除 Request，并校验 v2 Corpus 覆盖的高风险 Parameter Shape，确保旧协议入口不会回流。
 fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
     if !REQUEST_METHODS.contains(&method) {
         return Err("request method is unknown");
@@ -2846,11 +3519,20 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "limits",
         ]
         .as_slice(),
-        "runtime/health" => [].as_slice(),
+        "runtime/health" | "runtime/storage/retry" => [].as_slice(),
         "runtime/shutdown" => ["force"].as_slice(),
-        "runtime/context/register" => ["environment", "shell"].as_slice(),
-        "operation/read" => ["clientOperationId"].as_slice(),
+        "runtime/context/register" => [
+            "environment",
+            "shell",
+            "clientProcessId",
+            "clientLifetimeId",
+        ]
+        .as_slice(),
+        "runtime/client/close" => ["timeoutMs"].as_slice(),
+        "operation/read" => ["operationKey", "sourceThreadId"].as_slice(),
         "workspace/open" => ["workspaceId", "cwd", "displayName"].as_slice(),
+        "workspace/read" => ["workspaceId"].as_slice(),
+        "workspace/update" => ["workspaceId", "expectedRevision", "displayName", "cwd"].as_slice(),
         "workspace/list" => ["kind", "cursor", "limit"].as_slice(),
         "mcp/list" => ["workspaceId", "cursor", "limit"].as_slice(),
         "workspace/path/search" => ["threadId", "workspaceId", "query", "limit"].as_slice(),
@@ -2878,6 +3560,13 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "collaborationMode",
         ]
         .as_slice(),
+        "thread/fork" => [
+            "sourceThreadId",
+            "sourceItemId",
+            "expectedThreadRevision",
+            "operationKey",
+        ]
+        .as_slice(),
         "thread/read" => ["threadId", "cursor", "limit", "tail"].as_slice(),
         "thread/observe" | "thread/unobserve" => ["threadId"].as_slice(),
         "thread/usage/read" => ["threadId"].as_slice(),
@@ -2896,14 +3585,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         .as_slice(),
         "thread/compact" => ["threadId", "expectedThreadRevision"].as_slice(),
         "thread/compact/cancel" => ["threadId"].as_slice(),
-        "interaction/read" => ["threadId", "requestId"].as_slice(),
+        "interaction/read" => ["threadId", "interactionId"].as_slice(),
         "interaction/observe" => ["threadId"].as_slice(),
         "interaction/unobserve" => ["observationId"].as_slice(),
         "interaction/draft/save" => [
             "threadId",
-            "requestId",
+            "interactionId",
             "expectedDraftRevision",
-            "idempotencyKey",
+            "operationKey",
             "answers",
             "page",
             "collapsed",
@@ -2911,81 +3600,46 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         .as_slice(),
         "interaction/respond" => [
             "threadId",
-            "requestId",
-            "expectedRevision",
-            "idempotencyKey",
+            "interactionId",
+            "expectedInteractionRevision",
+            "operationKey",
             "answers",
         ]
         .as_slice(),
         "interaction/cancel" => [
             "threadId",
-            "requestId",
-            "expectedRevision",
-            "idempotencyKey",
+            "interactionId",
+            "expectedInteractionRevision",
+            "operationKey",
         ]
         .as_slice(),
-        "goal/read" | "goal/observe" => ["goalId"].as_slice(),
         "plan/read" | "plan/revisions/list" | "plan/events/read" => {
             ["threadId", "planId", "cursor", "limit"].as_slice()
         }
         "plan/current/read" => ["threadId"].as_slice(),
-        "goal/events/read" => ["goalId", "cursor", "limit"].as_slice(),
-        "goal/unobserve" => ["observationId"].as_slice(),
-        "goal/evidence/list" => [
-            "goalId",
-            "goalDefinitionRevision",
-            "planRevisionId",
-            "cursor",
-            "limit",
-        ]
-        .as_slice(),
-        "goal/create" => [
-            "owner",
-            "objective",
-            "acceptanceCriteria",
-            "expectedGoalRevision",
-            "idempotencyKey",
-        ]
-        .as_slice(),
-        "goal/plan/attach" => [
-            "goalId",
-            "expectedGoalRevision",
-            "idempotencyKey",
-            "planId",
-            "planRevisionId",
-            "planHash",
-        ]
-        .as_slice(),
-        "goal/plan/detach" | "goal/pause" | "goal/resume" | "goal/stop" => {
-            ["goalId", "expectedGoalRevision", "idempotencyKey"].as_slice()
-        }
         "plan/create" => [
             "owner",
             "objective",
             "expectedThreadRevision",
-            "idempotencyKey",
+            "operationKey",
         ]
         .as_slice(),
         "plan/draft/save" => [
             "threadId",
             "planId",
             "expectedPlanRevision",
-            "idempotencyKey",
+            "operationKey",
             "draft",
         ]
         .as_slice(),
-        "plan/draft/discard" | "plan/propose" => [
-            "threadId",
-            "planId",
-            "expectedPlanRevision",
-            "idempotencyKey",
-        ]
-        .as_slice(),
+        "plan/draft/discard" | "plan/propose" => {
+            ["threadId", "planId", "expectedPlanRevision", "operationKey"].as_slice()
+        }
         "plan/execute" => [
             "threadId",
             "planId",
             "expectedPlanRevision",
-            "idempotencyKey",
+            "operationKey",
             "planRevisionId",
             "planHash",
         ]
@@ -3006,14 +3660,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "planId",
             "expectedPlanRevision",
             "runId",
-            "idempotencyKey",
+            "operationKey",
         ]
         .as_slice(),
         "plan/reject" => [
             "threadId",
             "planId",
             "expectedPlanRevision",
-            "idempotencyKey",
+            "operationKey",
             "reason",
         ]
         .as_slice(),
@@ -3039,7 +3693,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "senderThreadId",
             "targetThreadId",
             "content",
-            "idempotencyKey",
+            "operationKey",
         ]
         .as_slice(),
         "task/close" => ["taskThreadId"].as_slice(),
@@ -3047,7 +3701,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "senderThreadId",
             "targetThreadId",
             "content",
-            "idempotencyKey",
+            "operationKey",
             "expectedTaskRevision",
         ]
         .as_slice(),
@@ -3073,14 +3727,14 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "attachment/preview/open" => ["attachmentId", "authorization"].as_slice(),
         "attachment/preview/read" => ["previewSessionId", "offsetBytes", "limitBytes"].as_slice(),
         "attachment/preview/close" => ["previewSessionId"].as_slice(),
-        "turn/start" => ["threadId", "content", "clientOperationId"].as_slice(),
-        "turn/continue" => ["threadId", "expectedThreadRevision", "clientOperationId"].as_slice(),
+        "turn/start" => ["threadId", "content", "operationKey", "runtimeOverrides"].as_slice(),
+        "turn/continue" => ["threadId", "expectedThreadRevision", "operationKey"].as_slice(),
         "turn/reask" => [
             "threadId",
             "expectedThreadRevision",
             "sourceMessageId",
             "content",
-            "clientOperationId",
+            "operationKey",
         ]
         .as_slice(),
         "turn/resume" => ["turnId", "expectedThreadRevision"].as_slice(),
@@ -3090,11 +3744,11 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "expectedThreadRevision",
             "expectedRecoveryRevision",
             "decision",
-            "idempotencyKey",
+            "operationKey",
         ]
         .as_slice(),
         "turn/cancel" => ["turnId"].as_slice(),
-        "turn/input/enqueue" => ["turnId", "content", "kind", "clientOperationId"].as_slice(),
+        "turn/input/enqueue" => ["turnId", "content", "kind", "operationKey"].as_slice(),
         "turn/input/prioritize" | "turn/input/delete" => {
             ["turnId", "inputId", "expectedInputRevision"].as_slice()
         }
@@ -3109,19 +3763,52 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             "limitCharacters",
         ]
         .as_slice(),
-        "thread/message-content/read" => [
+        "process/list" => [
+            "workspaceId",
             "threadId",
-            "messageId",
-            "offsetCharacters",
-            "limitCharacters",
+            "limit",
+            "cursor",
+            "startedCallId",
         ]
         .as_slice(),
+        "process/read" => [
+            "workspaceId",
+            "threadId",
+            "generation",
+            "sessionId",
+            "afterSequence",
+            "maxBytes",
+        ]
+        .as_slice(),
+        "process/write" => [
+            "workspaceId",
+            "threadId",
+            "generation",
+            "sessionId",
+            "afterSequence",
+            "input",
+            "closeInput",
+            "operationKey",
+        ]
+        .as_slice(),
+        "process/stop" => ["workspaceId", "threadId", "generation", "sessionId"].as_slice(),
+        "review/start" => [
+            "threadId",
+            "expectedThreadRevision",
+            "operationKey",
+            "snapshotAttachmentId",
+        ]
+        .as_slice(),
+        "review/read" => ["threadId", "turnId"].as_slice(),
+        "thread/item-content/read" => {
+            ["threadId", "itemId", "offsetCharacters", "limitCharacters"].as_slice()
+        }
         "approval/respond" => [
             "approvalId",
             "turnId",
             "decision",
             "expectedThreadRevision",
-            "clientOperationId",
+            "operationKey",
         ]
         .as_slice(),
         "configuration/read" => ["workspaceId"].as_slice(),
@@ -3130,7 +3817,6 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             ["scope", "workspaceId", "document", "expectedVersion"].as_slice()
         }
         "configuration/reset" => ["scope", "workspaceId", "expectedVersion"].as_slice(),
-        "configuration/restore" => ["expectedVersion"].as_slice(),
         "credential/set" => ["credentialId", "secret", "expectedVersion"].as_slice(),
         "credential/delete" => ["credentialId", "expectedVersion"].as_slice(),
         "credential/reveal-provider" => ["providerId"].as_slice(),
@@ -3141,6 +3827,37 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         _ => return Err("request method is unknown"),
     };
     ensure_object_keys(params, allowed)?;
+    match method {
+        "runtime/context/register" => {
+            if params.as_object().is_none_or(|object| object.len() != 4) {
+                return Err("native context registration fields are incomplete");
+            }
+            let environment = params
+                .get("environment")
+                .and_then(Value::as_object)
+                .ok_or("native context environment is invalid")?;
+            if environment.len() > 4_096 || environment.values().any(|value| !value.is_string()) {
+                return Err("native context environment is invalid");
+            }
+            if !params.get("shell").is_some_and(|shell| {
+                shell.is_null()
+                    || shell
+                        .as_str()
+                        .is_some_and(|value| value.chars().count() <= 8_192)
+            }) || !integer_in_bounds(params.get("clientProcessId"), 1, MAX_SAFE_INTEGER)
+                || !valid_native_client_lifetime_id(params.get("clientLifetimeId"))
+            {
+                return Err("native client identity is invalid");
+            }
+        }
+        "runtime/client/close"
+            if params.as_object().is_none_or(|object| object.len() != 1)
+                || !integer_in_bounds(params.get("timeoutMs"), 1, 20_000) =>
+        {
+            return Err("native client close budget is invalid");
+        }
+        _ => {}
+    }
     if matches!(
         method,
         "operation/read"
@@ -3150,7 +3867,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             | "approval/respond"
             | "turn/input/enqueue"
     ) && !params
-        .get("clientOperationId")
+        .get("operationKey")
         .and_then(Value::as_str)
         .is_some_and(|value| {
             value.len() == 35
@@ -3161,6 +3878,11 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         })
     {
         return Err("client operation identity is invalid");
+    }
+    if params.get("sourceThreadId").is_some()
+        && !valid_prefixed_id(params.get("sourceThreadId"), "thr_")
+    {
+        return Err("operation/read source owner is invalid");
     }
     for field in ["limit"] {
         if let Some(limit) = params.get(field)
@@ -3173,7 +3895,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
     }
     match method {
         "runtime/initialize" => {
-            if params.get("protocolMajor").and_then(Value::as_u64) != Some(1)
+            if params.get("protocolMajor").and_then(Value::as_u64) != Some(2)
                 || params.get("protocolMinor").and_then(Value::as_u64) != Some(0)
             {
                 return Err("protocol version is invalid");
@@ -3191,23 +3913,19 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 .and_then(Value::as_array)
                 .ok_or("method capability catalog is missing")?;
             if !string_array_equals(methods, REQUEST_METHODS) {
-                return Err("method capability catalog is not the v1 closure");
+                return Err("method capability catalog is not the v2 closure");
             }
             let events = params
                 .pointer("/capabilities/events")
                 .and_then(Value::as_array)
                 .ok_or("event capability catalog is missing")?;
             if !string_array_equals(events, CAPABILITY_EVENT_METHODS) {
-                return Err("event capability catalog is not the v1 closure");
+                return Err("event capability catalog is not the v2 closure");
             }
             if params.pointer("/capabilities/features")
-                != Some(&serde_json::json!([
-                    "task_threads_v1",
-                    "plan_goal_v1",
-                    "interaction_v1"
-                ]))
+                != Some(&serde_json::json!(["task_threads", "plan", "interaction"]))
             {
-                return Err("task feature capability is not the v1 closure");
+                return Err("task feature capability is not the v2 closure");
             }
         }
         "thread/read" => {
@@ -3240,12 +3958,35 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 }
             }
         }
+        "workspace/read" => {
+            if !valid_prefixed_id(params.get("workspaceId"), "ws_") {
+                return Err("workspace identity is invalid");
+            }
+        }
+        "workspace/update" => {
+            if !valid_prefixed_id(params.get("workspaceId"), "ws_")
+                || !integer_in_bounds(params.get("expectedRevision"), 0, MAX_SAFE_INTEGER)
+                || (params.get("displayName").is_none() && params.get("cwd").is_none())
+                || params.get("displayName").is_some_and(|name| {
+                    !bounded_string(Some(name), 1, 1_024)
+                        || name.as_str().is_some_and(|name| {
+                            name.trim().is_empty() || name.chars().any(char::is_control)
+                        })
+                })
+            {
+                return Err("workspace update params are invalid");
+            }
+            if params.get("cwd").is_some() {
+                validate_cwd(params.get("cwd"))?;
+            }
+        }
         "workspace/list" => {
-            if params.get("kind").is_some_and(|kind| {
-                !matches!(kind.as_str(), Some("project" | "session" | "legacy_shared"))
-            }) || params
-                .get("cursor")
-                .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
+            if params
+                .get("kind")
+                .is_some_and(|kind| !matches!(kind.as_str(), Some("project" | "session")))
+                || params
+                    .get("cursor")
+                    .is_some_and(|cursor| !bounded_string(Some(cursor), 1, 512))
             {
                 return Err("workspace list params are invalid");
             }
@@ -3285,6 +4026,41 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             {
                 return Err("thread runtime preferences are invalid");
             }
+        }
+        "thread/fork" => {
+            let request: ThreadForkParams = serde_json::from_value(params.clone())
+                .map_err(|_| "thread fork parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "process/list" => {
+            let request: ProcessSessionListParams = serde_json::from_value(params.clone())
+                .map_err(|_| "process list parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "process/read" => {
+            let request: ProcessSessionReadParams = serde_json::from_value(params.clone())
+                .map_err(|_| "process read parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "process/write" => {
+            let request: ProcessSessionWriteParams = serde_json::from_value(params.clone())
+                .map_err(|_| "process write parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "process/stop" => {
+            let request: ProcessSessionStopParams = serde_json::from_value(params.clone())
+                .map_err(|_| "process stop parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "review/start" => {
+            let request: ReviewStartParams = serde_json::from_value(params.clone())
+                .map_err(|_| "review start parameter DTO is invalid")?;
+            request.validate()?;
+        }
+        "review/read" => {
+            let request: ReviewReadParams = serde_json::from_value(params.clone())
+                .map_err(|_| "review read parameter DTO is invalid")?;
+            request.validate()?;
         }
         "thread/list" => {
             if params.get("scope").is_some() {
@@ -3363,11 +4139,6 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "thread/mcp/read" if !valid_prefixed_id(params.get("threadId"), "thr_") => {
             return Err("thread MCP read identity is invalid");
         }
-        "goal/read" | "goal/observe" | "goal/events/read"
-            if !valid_prefixed_id(params.get("goalId"), "goal_") =>
-        {
-            return Err("goal query identity is invalid");
-        }
         "plan/read" | "plan/revisions/list"
             if !valid_prefixed_id(params.get("threadId"), "thr_")
                 || !valid_prefixed_id(params.get("planId"), "plan_") =>
@@ -3395,50 +4166,6 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         {
             return Err("interaction answer identity is invalid");
         }
-        "goal/evidence/list"
-            if !valid_prefixed_id(params.get("goalId"), "goal_")
-                || !integer_in_bounds(
-                    params.get("goalDefinitionRevision"),
-                    1,
-                    9_007_199_254_740_991,
-                )
-                || params
-                    .get("planRevisionId")
-                    .is_some_and(|value| !valid_prefixed_id(Some(value), "planrev_")) =>
-        {
-            return Err("goal evidence query identity is invalid");
-        }
-        "goal/unobserve" if !valid_prefixed_id(params.get("observationId"), "observe_") => {
-            return Err("goal observation identity is invalid");
-        }
-        "goal/create" => {
-            let owner = params.get("owner").ok_or("goal owner is missing")?;
-            let owner_valid = match owner.get("kind").and_then(Value::as_str) {
-                Some("thread") => valid_prefixed_id(owner.get("threadId"), "thr_"),
-                Some("independent_task") => valid_prefixed_id(owner.get("taskThreadId"), "thr_"),
-                _ => false,
-            };
-            if !owner_valid
-                || !valid_bounded_text(params.get("objective"), 1, 4_096)
-                || !params
-                    .get("acceptanceCriteria")
-                    .is_some_and(Value::is_array)
-                || !integer_in_bounds(params.get("expectedGoalRevision"), 0, 9_007_199_254_740_991)
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
-            {
-                return Err("goal create payload is invalid");
-            }
-        }
-        "goal/plan/attach" => {
-            validate_goal_mutation(params)?;
-            validate_plan_binding(params)?;
-            if !valid_prefixed_id(params.get("planId"), "plan_") {
-                return Err("goal plan attachment is invalid");
-            }
-        }
-        "goal/plan/detach" | "goal/pause" | "goal/resume" | "goal/stop" => {
-            validate_goal_mutation(params)?
-        }
         "plan/create" => {
             let owner = params.get("owner").ok_or("plan owner is missing")?;
             if owner.get("kind").and_then(Value::as_str) != Some("thread")
@@ -3449,7 +4176,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                     0,
                     9_007_199_254_740_991,
                 )
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
+                || !valid_bounded_text(params.get("operationKey"), 1, 128)
             {
                 return Err("plan create payload is invalid");
             }
@@ -3467,9 +4194,9 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "interaction/read"
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || params
-                    .get("requestId")
-                    .is_some_and(|request| !valid_prefixed_id(Some(request), "interaction_")) =>
+                || params.get("interactionId").is_some_and(|interaction| {
+                    !valid_prefixed_id(Some(interaction), "interaction_")
+                }) =>
         {
             return Err("interaction read identity is invalid");
         }
@@ -3481,13 +4208,13 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "interaction/draft/save" => {
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || !valid_prefixed_id(params.get("requestId"), "interaction_")
+                || !valid_prefixed_id(params.get("interactionId"), "interaction_")
                 || !integer_in_bounds(
                     params.get("expectedDraftRevision"),
                     0,
                     9_007_199_254_740_991,
                 )
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
+                || !valid_bounded_text(params.get("operationKey"), 1, 128)
                 || !integer_in_bounds(params.get("page"), 0, 2)
                 || params.get("collapsed").and_then(Value::as_bool).is_none()
             {
@@ -3497,9 +4224,13 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "interaction/respond" => {
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || !valid_prefixed_id(params.get("requestId"), "interaction_")
-                || !integer_in_bounds(params.get("expectedRevision"), 0, 9_007_199_254_740_991)
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
+                || !valid_prefixed_id(params.get("interactionId"), "interaction_")
+                || !integer_in_bounds(
+                    params.get("expectedInteractionRevision"),
+                    0,
+                    9_007_199_254_740_991,
+                )
+                || !valid_bounded_text(params.get("operationKey"), 1, 128)
             {
                 return Err("interaction response boundary is invalid");
             }
@@ -3507,14 +4238,19 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "interaction/cancel"
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || !valid_prefixed_id(params.get("requestId"), "interaction_")
-                || !integer_in_bounds(params.get("expectedRevision"), 0, 9_007_199_254_740_991)
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128) =>
+                || !valid_prefixed_id(params.get("interactionId"), "interaction_")
+                || !integer_in_bounds(
+                    params.get("expectedInteractionRevision"),
+                    0,
+                    9_007_199_254_740_991,
+                )
+                || !valid_bounded_text(params.get("operationKey"), 1, 128) =>
         {
             return Err("interaction cancellation boundary is invalid");
         }
         "turn/start" => {
             require_text(params, "threadId")?;
+            validate_turn_runtime_overrides(params.get("runtimeOverrides"))?;
             validate_turn_content(params.get("content"))?;
         }
         "turn/continue" => {
@@ -3604,7 +4340,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         "thread/message/send" | "task/followup" => {
             if !valid_prefixed_id(params.get("senderThreadId"), "thr_")
                 || !valid_prefixed_id(params.get("targetThreadId"), "thr_")
-                || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
+                || !valid_bounded_text(params.get("operationKey"), 1, 128)
                 || method == "task/followup"
                     && !integer_in_bounds(
                         params.get("expectedTaskRevision"),
@@ -3683,7 +4419,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "turn/recovery/respond" => {
             if !valid_prefixed_id(params.get("turnId"), "turn_")
-                || !valid_prefixed_id(params.get("callId"), "call_")
+                || !valid_call_id(params.get("callId"))
                 || !integer_in_bounds(
                     params.get("expectedThreadRevision"),
                     0,
@@ -3698,7 +4434,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                     params.get("decision").and_then(Value::as_str),
                     Some("retry" | "skip")
                 )
-                || !bounded_string(params.get("idempotencyKey"), 1, 128)
+                || !valid_ascii_operation_key(params.get("operationKey"))
             {
                 return Err("turn recovery response is invalid");
             }
@@ -3761,13 +4497,13 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
                 return Err("tool artifact page is invalid");
             }
         }
-        "thread/message-content/read" => {
+        "thread/item-content/read" => {
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || !valid_prefixed_id(params.get("messageId"), "item_")
+                || !valid_prefixed_id(params.get("itemId"), "item_")
                 || !integer_in_bounds(params.get("offsetCharacters"), 0, 9_007_199_254_740_991)
                 || !integer_in_bounds(params.get("limitCharacters"), 1, 65_536)
             {
-                return Err("message content page is invalid");
+                return Err("item content page is invalid");
             }
         }
         "thread/compact"
@@ -3810,12 +4546,7 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
         }
         "configuration/read" => {}
         "configuration/patch" => {
-            validate_config_scope(params)?;
-            validate_version(params.get("expectedVersion"))?;
-            if !params.get("patch").is_some_and(Value::is_object) {
-                return Err("configuration patch is invalid");
-            }
-            validate_config_value(params.get("patch"))?;
+            validate_configuration_patch(params)?;
         }
         "configuration/replace" => {
             validate_config_scope(params)?;
@@ -3830,7 +4561,6 @@ fn validate_request(method: &str, params: &Value) -> Result<(), &'static str> {
             validate_config_scope(params)?;
             validate_version(params.get("expectedVersion"))?;
         }
-        "configuration/restore" => validate_version(params.get("expectedVersion"))?,
         "credential/set" => {
             if !valid_prefixed_id(params.get("credentialId"), "cred_")
                 || !params
@@ -3979,6 +4709,27 @@ fn validate_turn_content(value: Option<&Value>) -> Result<(), &'static str> {
     }
 }
 
+/// One Turn may override only its model, access mode, and output contract; Java owns JSON Schema semantics.
+fn validate_turn_runtime_overrides(value: Option<&Value>) -> Result<(), &'static str> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    ensure_object_keys(value, &["modelId", "accessMode", "outputSchema"])?;
+    if value
+        .get("modelId")
+        .is_some_and(|model| !valid_prefixed_id(Some(model), "model_"))
+        || value
+            .get("accessMode")
+            .is_some_and(|mode| !matches!(mode.as_str(), Some("approval_required" | "full_access")))
+        || value
+            .get("outputSchema")
+            .is_some_and(|schema| !schema.is_object())
+    {
+        return Err("turn runtime override is invalid");
+    }
+    Ok(())
+}
+
 /// 队列内容以紧凑 JSON 实际字节计费，避免多字节路径和结构开销绕过 512 KiB 上限。
 fn queued_content_within_budget(value: Option<&Value>) -> bool {
     value.is_some_and(|content| {
@@ -4028,6 +4779,165 @@ fn validate_config_scope(params: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// 校验配置 patch 的公共边界；用户 Provider/Model 必须按稳定 ID 稀疏操作，不能用脱敏数组替换原文。
+fn validate_configuration_patch(params: &Value) -> Result<(), &'static str> {
+    validate_config_scope(params)?;
+    validate_version(params.get("expectedVersion"))?;
+    let patch = params
+        .get("patch")
+        .and_then(Value::as_object)
+        .ok_or("configuration patch is invalid")?;
+    validate_config_value(params.get("patch"))?;
+    if params.get("scope").and_then(Value::as_str) != Some("user") {
+        return Ok(());
+    }
+    for (field, prefix) in [
+        ("default_provider_id", Some("provider_")),
+        ("default_model_id", Some("model_")),
+        ("default_reasoning_level", None),
+    ] {
+        if let Some(value) = patch.get(field) {
+            validate_nullable_configuration_patch_value(value, prefix)?;
+        }
+    }
+    if let Some(subagents) = patch.get("subagents") {
+        let subagents = subagents.as_object().ok_or("subagents patch is invalid")?;
+        for (field, value) in subagents {
+            match field.as_str() {
+                "enabled" if value.is_boolean() => {}
+                "provider_id" => {
+                    validate_nullable_configuration_patch_value(value, Some("provider_"))?
+                }
+                "model_id" => validate_nullable_configuration_patch_value(value, Some("model_"))?,
+                "reasoning_level" => validate_nullable_configuration_patch_value(value, None)?,
+                _ => return Err("subagents patch is invalid"),
+            }
+        }
+    }
+    if let Some(order) = patch.get("provider_order") {
+        validate_configuration_order(order, "provider_")?;
+    }
+    let Some(providers) = patch.get("providers") else {
+        return Ok(());
+    };
+    let providers = providers
+        .as_object()
+        .ok_or("user providers patch must use ID operations")?;
+    for (provider_id, operation) in providers {
+        if !valid_configuration_identity(provider_id, "provider_") {
+            return Err("provider patch identity is invalid");
+        }
+        let Some(provider) = operation.as_object() else {
+            if operation.is_null() {
+                continue;
+            }
+            return Err("provider patch is invalid");
+        };
+        if provider.contains_key("provider_id") {
+            return Err("provider identity must be supplied by the operation key");
+        }
+        if let Some(order) = provider.get("model_order") {
+            validate_configuration_order(order, "model_")?;
+        }
+        let Some(models) = provider.get("models") else {
+            continue;
+        };
+        let models = models
+            .as_object()
+            .ok_or("provider models patch must use ID operations")?;
+        for (model_id, model_operation) in models {
+            if !valid_configuration_identity(model_id, "model_") {
+                return Err("model patch identity is invalid");
+            }
+            let Some(model) = model_operation.as_object() else {
+                if model_operation.is_null() {
+                    continue;
+                }
+                return Err("model patch is invalid");
+            };
+            if model.contains_key("model_id") {
+                return Err("model identity must be supplied by the operation key");
+            }
+            if let Some(reasoning) = model.get("default_reasoning_level") {
+                validate_nullable_configuration_patch_value(reasoning, None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 配置字段原生 null 表示 Merge Patch 删除，精确哨兵表示持久化可空值；拒绝含糊的哨兵对象。
+fn validate_nullable_configuration_patch_value(
+    value: &Value,
+    identity_prefix: Option<&str>,
+) -> Result<(), &'static str> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if let Some(object) = value.as_object() {
+        if object.contains_key("__ja_null") {
+            return if object.len() == 1
+                && object.get("__ja_null").and_then(Value::as_bool) == Some(true)
+            {
+                Ok(())
+            } else {
+                Err("configuration null sentinel is invalid")
+            };
+        }
+        return Err("configuration nullable value is invalid");
+    }
+    if let Some(prefix) = identity_prefix {
+        return value
+            .as_str()
+            .filter(|id| valid_configuration_identity(id, prefix))
+            .map(|_| ())
+            .ok_or("configuration nullable identity is invalid");
+    }
+    value
+        .as_str()
+        .filter(|reasoning| {
+            matches!(
+                *reasoning,
+                "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        })
+        .map(|_| ())
+        .ok_or("configuration nullable reasoning level is invalid")
+}
+
+/// 排序控制只接受有界、去重且语法有效的 ID 列表；是否存在于当前目录由 Java CAS 写入端校验。
+fn validate_configuration_order(value: &Value, prefix: &str) -> Result<(), &'static str> {
+    let order = value
+        .as_array()
+        .filter(|items| items.len() <= 512)
+        .ok_or("configuration order is invalid")?;
+    let mut seen = HashSet::new();
+    for item in order {
+        let Some(id) = item.as_str() else {
+            return Err("configuration order identity is invalid");
+        };
+        if !valid_configuration_identity(id, prefix) || !seen.insert(id) {
+            return Err("configuration order identity is invalid");
+        }
+    }
+    Ok(())
+}
+
+/// 复用 ID 前缀的 ASCII 字符和长度边界，不接受可视化混淆字符或空后缀。
+fn valid_configuration_identity(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 95
+            && suffix
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
+}
+
 /// 递归应用非 Secret 配置值边界，同时允许有界 Frame 内的普通 Scalar、Array 与 Object。
 fn validate_config_value(value: Option<&Value>) -> Result<(), &'static str> {
     let value = value.ok_or("config value is missing")?;
@@ -4035,7 +4945,7 @@ fn validate_config_value(value: Option<&Value>) -> Result<(), &'static str> {
         .map_err(|_| "config value is not serializable")?
         .len()
         > 1_048_576
-        || contains_forbidden_secret_key(value, false, false)
+        || contains_forbidden_secret_key(value, false, false, false)
     {
         return Err("config value is invalid");
     }
@@ -4131,7 +5041,7 @@ fn validate_config_document(value: Option<&Value>) -> Result<(), &'static str> {
     validate_config_value(Some(document))
 }
 
-/// 项目层只停用自身来源的 Skill；全局授权仍由用户文档持有，项目不能扩大其权限。
+/// Project 层可覆盖普通运行参数和完整 Provider route 引用，实际 Secret 仍由用户凭据库持有。
 fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &'static str> {
     let document = value.ok_or("project skill document is missing")?;
     let object = document
@@ -4142,6 +5052,13 @@ fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &
         &[
             "schema_version",
             "config_revision",
+            "default_access_mode",
+            "default_provider_id",
+            "default_model_id",
+            "default_reasoning_level",
+            "interaction",
+            "subagents",
+            "providers",
             "disabled_skills",
             "mcp_servers",
         ],
@@ -4154,16 +5071,192 @@ fn validate_config_project_skill_document(value: Option<&Value>) -> Result<(), &
     {
         return Err("project skill document header is invalid");
     }
-    let skills = object
-        .get("disabled_skills")
-        .and_then(Value::as_array)
-        .filter(|skills| skills.len() <= 512)
-        .ok_or("disabled project skills are invalid")?;
+    if object.get("default_access_mode").is_some_and(|value| {
+        !value
+            .as_str()
+            .is_some_and(|mode| matches!(mode, "approval_required" | "full_access"))
+    }) {
+        return Err("project access mode is invalid");
+    }
+    for (field, prefix) in [
+        ("default_provider_id", "provider_"),
+        ("default_model_id", "model_"),
+    ] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !valid_prefixed_id(Some(value), prefix))
+        {
+            return Err("project model reference is invalid");
+        }
+    }
+    if object.get("default_reasoning_level").is_some_and(|value| {
+        !value.is_null()
+            && !value.as_str().is_some_and(|level| {
+                matches!(
+                    level,
+                    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+            })
+    }) {
+        return Err("project reasoning level is invalid");
+    }
+    if let Some(interaction) = object.get("interaction") {
+        ensure_object_keys(interaction, &["clarification_enabled"])?;
+        if interaction.as_object().is_none()
+            || interaction
+                .get("clarification_enabled")
+                .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("project clarification setting is invalid");
+        }
+    }
+    if let Some(subagents) = object.get("subagents") {
+        ensure_object_keys(
+            subagents,
+            &["enabled", "provider_id", "model_id", "reasoning_level"],
+        )?;
+        if subagents.as_object().is_none()
+            || subagents
+                .get("enabled")
+                .is_some_and(|value| !value.is_boolean())
+            || ["provider_id", "model_id", "reasoning_level"]
+                .iter()
+                .any(|field| {
+                    subagents
+                        .get(field)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                })
+        {
+            return Err("project subagent policy is invalid");
+        }
+    }
+    if let Some(providers) = object.get("providers") {
+        let providers = providers
+            .as_array()
+            .filter(|values| values.len() <= 512)
+            .ok_or("project provider overrides are invalid")?;
+        let mut identities = HashSet::with_capacity(providers.len());
+        for provider in providers {
+            ensure_object_keys(
+                provider,
+                &[
+                    "provider_id",
+                    "api",
+                    "base_url",
+                    "credential_id",
+                    "network_timeouts",
+                    "agent_defaults",
+                    "models",
+                    "removed_model_ids",
+                ],
+            )?;
+            let id = provider
+                .get("provider_id")
+                .ok_or("project provider identity is missing")?;
+            if !valid_prefixed_id(Some(id), "provider_")
+                || !identities.insert(id.as_str().unwrap_or_default())
+            {
+                return Err("project provider identity is invalid");
+            }
+            let route_fields = [
+                provider.get("api"),
+                provider.get("base_url"),
+                provider.get("credential_id"),
+            ];
+            if route_fields.iter().any(|field| field.is_some())
+                && route_fields.iter().any(|field| field.is_none())
+            {
+                return Err("project provider route must be complete");
+            }
+            if route_fields.iter().all(|field| field.is_some())
+                && (!matches!(
+                    provider.get("api").and_then(Value::as_str),
+                    Some("openai_responses" | "anthropic_messages" | "openai_chat_completions")
+                ) || !provider
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 2048)
+                    || !valid_prefixed_id(provider.get("credential_id"), "cred_"))
+            {
+                return Err("project provider route is invalid");
+            }
+            if let Some(timeouts) = provider.get("network_timeouts") {
+                ensure_object_keys(timeouts, &["connect_timeout_ms", "request_timeout_ms"])?;
+                for (field, minimum, maximum) in [
+                    ("connect_timeout_ms", 100_u64, 120_000_u64),
+                    ("request_timeout_ms", 1_000_u64, 3_600_000_u64),
+                ] {
+                    if timeouts.get(field).is_some_and(|value| {
+                        value
+                            .as_u64()
+                            .is_none_or(|number| !(minimum..=maximum).contains(&number))
+                    }) {
+                        return Err("project timeout is outside bounds");
+                    }
+                }
+            }
+            if let Some(defaults) = provider.get("agent_defaults") {
+                ensure_object_keys(defaults, &["context"])?;
+                if let Some(context) = defaults.get("context") {
+                    ensure_object_keys(context, &["auto_compact"])?;
+                    if context
+                        .get("auto_compact")
+                        .is_some_and(|value| !value.is_boolean())
+                    {
+                        return Err("project context policy is invalid");
+                    }
+                }
+            }
+            if let Some(models) = provider.get("models") {
+                let models = models
+                    .as_array()
+                    .filter(|values| values.len() <= 512)
+                    .ok_or("project model overrides are invalid")?;
+                if !models.is_empty() {
+                    validate_config_models(Some(&Value::Array(models.clone())))?;
+                }
+            }
+            if let Some(removed) = provider.get("removed_model_ids") {
+                let removed = removed
+                    .as_array()
+                    .filter(|values| values.len() <= 512)
+                    .ok_or("project removed model identities are invalid")?;
+                let mut removed_ids = HashSet::with_capacity(removed.len());
+                if removed.iter().any(|id| {
+                    !valid_prefixed_id(Some(id), "model_")
+                        || !removed_ids.insert(id.as_str().unwrap_or_default())
+                }) {
+                    return Err("project removed model identities are invalid");
+                }
+                if provider
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .is_some_and(|models| {
+                        models.iter().any(|model| {
+                            model
+                                .get("model_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| removed_ids.contains(id))
+                        })
+                    })
+                {
+                    return Err("project model cannot be overridden and removed together");
+                }
+            }
+        }
+    }
+    let skills: &[Value] = match object.get("disabled_skills") {
+        Some(value) => value
+            .as_array()
+            .filter(|skills| skills.len() <= 512)
+            .map(Vec::as_slice)
+            .ok_or("disabled project skills are invalid")?,
+        None => &[],
+    };
     let mut skill_ids = HashSet::with_capacity(skills.len());
     for skill in skills {
-        if !skill.as_str().is_some_and(|reference| {
-            reference.starts_with("project:") && valid_skill_reference(Some(skill))
-        }) || !skill_ids.insert(skill.as_str().unwrap_or_default())
+        if !valid_skill_reference(Some(skill))
+            || !skill_ids.insert(skill.as_str().unwrap_or_default())
         {
             return Err("disabled project skill reference is invalid");
         }
@@ -4247,7 +5340,7 @@ fn validate_config_issues(value: Option<&Value>) -> Result<(), &'static str> {
                 })
             || actions.iter().any(|action| {
                 !action.as_str().is_some_and(|action| {
-                    matches!(action, "edit" | "retry" | "restore") && action_names.insert(action)
+                    matches!(action, "edit" | "retry" | "repair") && action_names.insert(action)
                 })
             })
         {
@@ -4420,17 +5513,24 @@ fn validate_config_models(value: Option<&Value>) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// 校验 Provider 声明的模型容量，使 Rust consumer 与 v1 schema 使用同一当前字段闭集。
+/// 校验 Provider 声明的模型能力；省略结构化输出能力表示 false。
 fn validate_config_capabilities(value: Option<&Value>) -> Result<(), &'static str> {
     let object = value
         .and_then(Value::as_object)
         .ok_or("model capabilities are invalid")?;
     ensure_object_keys(
         value.ok_or("model capabilities are missing")?,
-        &["context_window_tokens", "max_output_tokens"],
+        &[
+            "context_window_tokens",
+            "max_output_tokens",
+            "supports_output_schema",
+        ],
     )?;
     if !integer_in_bounds(object.get("context_window_tokens"), 4_096, 4_000_000)
         || !integer_in_bounds(object.get("max_output_tokens"), 1, 1_000_000)
+        || object
+            .get("supports_output_schema")
+            .is_some_and(|value| !value.is_boolean())
     {
         return Err("model capabilities value is invalid");
     }
@@ -4708,6 +5808,20 @@ fn integer_in_bounds(value: Option<&Value>, minimum: u64, maximum: u64) -> bool 
         .is_some_and(|number| (minimum..=maximum).contains(&number))
 }
 
+/// 校验 Provider 原生 Tool callId；仅接受 JA-RPC 安全字符并以 128 ASCII 字节为上限。
+fn valid_call_id(value: Option<&Value>) -> bool {
+    let Some(id) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    let mut bytes = id.bytes();
+    bytes.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
 /// 校验 v1 Wire Schema 使用的 Prefixed Identifier，保持各身份命名空间隔离；Turn 的五字符
 /// 前缀对应合同总长 101，因此其 suffix 比通用 95 字符上限多保留一个字符。
 fn valid_prefixed_id(value: Option<&Value>, prefix: &str) -> bool {
@@ -4725,7 +5839,18 @@ fn valid_prefixed_id(value: Option<&Value>, prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-/// Skill 引用以来源和名称共同限定身份，名称禁止冒号与控制字符以保持三端解析一致。
+/// 仅接受当前 Native identity token 语法，拒绝旧 namespace、大小写漂移与多余字符。
+fn valid_native_client_lifetime_id(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|id| {
+        id.len() == 39
+            && id.starts_with("native_")
+            && id.as_bytes()[7..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    })
+}
+
+/// Golden 校验独立复核公开 Skill 引用的 ASCII kebab 语法和 256 字符名称上限。
 fn valid_skill_reference(value: Option<&Value>) -> bool {
     let Some(reference) = value.and_then(Value::as_str) else {
         return false;
@@ -4734,10 +5859,15 @@ fn valid_skill_reference(value: Option<&Value>) -> bool {
         return false;
     };
     matches!(source, "user" | "ja" | "project")
+        && reference.len() <= 264
         && !name.is_empty()
-        && name.len() <= 512
-        && !name.contains(':')
-        && name.chars().all(|character| !character.is_control())
+        && name.len() <= 256
+        && name.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 /// 用户层只能登记可跨工作区使用的来源，项目来源必须留在受信任项目的独立文档。
@@ -4761,30 +5891,33 @@ fn validate_event_metadata(params: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Goal mutation 必须携带同一套 CAS 与幂等边界，避免任一快捷命令绕过版本批准。
-fn validate_goal_mutation(params: &Value) -> Result<(), &'static str> {
-    if !valid_prefixed_id(params.get("goalId"), "goal_")
-        || !integer_in_bounds(params.get("expectedGoalRevision"), 0, 9_007_199_254_740_991)
-        || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
-    {
-        return Err("goal mutation boundary is invalid");
-    }
-    Ok(())
+/// Recovery key follows its published safe-ASCII grammar; it intentionally differs from op_ admission keys.
+fn valid_ascii_operation_key(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|key| {
+        (1..=128).contains(&key.len())
+            && key
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && key.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+    })
 }
 
-/// Standalone Plan 使用 Thread owner 与独立 CAS，不能复用 Goal revision 字段形成隐式归属。
+/// Standalone Plan 使用 Thread owner 与自身 CAS，mutation 不依赖其他聚合的版本。
 fn validate_plan_mutation(params: &Value) -> Result<(), &'static str> {
     if !valid_prefixed_id(params.get("threadId"), "thr_")
         || !valid_prefixed_id(params.get("planId"), "plan_")
         || !integer_in_bounds(params.get("expectedPlanRevision"), 0, 9_007_199_254_740_991)
-        || !valid_bounded_text(params.get("idempotencyKey"), 1, 128)
+        || !valid_bounded_text(params.get("operationKey"), 1, 128)
     {
         return Err("plan mutation identity is invalid");
     }
     Ok(())
 }
 
-/// 批准、执行和 Goal attach 都绑定同一冻结 revision/hash，缺任一字段均不得进入执行路径。
+/// 批准和执行都绑定同一冻结 revision/hash，缺任一字段均不得进入执行路径。
 fn validate_plan_binding(params: &Value) -> Result<(), &'static str> {
     if !valid_prefixed_id(params.get("planRevisionId"), "planrev_")
         || !params
@@ -4802,66 +5935,6 @@ fn validate_plan_binding(params: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Goal 事件共享 revision/sequence fence，并对状态投影使用严格字段闭集。
-fn validate_goal_notification(method: &str, params: &Value) -> Result<(), &'static str> {
-    let mut allowed = vec![
-        "serverInstanceId",
-        "eventId",
-        "sequence",
-        "generation",
-        "occurredAt",
-        "goalId",
-        "goalRevision",
-        "eventSequence",
-    ];
-    match method {
-        "goal/changed" => allowed.push("goal"),
-        "goal/activity" => allowed.push("activity"),
-        _ => return Err("goal notification method is invalid"),
-    }
-    ensure_object_keys(params, &allowed)?;
-    validate_event_metadata(params)?;
-    if !valid_prefixed_id(params.get("goalId"), "goal_")
-        || !integer_in_bounds(params.get("goalRevision"), 1, 9_007_199_254_740_991)
-        || !integer_in_bounds(params.get("eventSequence"), 1, 9_007_199_254_740_991)
-    {
-        return Err("goal notification fence is invalid");
-    }
-    if method == "goal/changed" {
-        let goal = params.get("goal").ok_or("goal projection is missing")?;
-        ensure_object_keys(
-            goal,
-            &[
-                "goalId",
-                "owner",
-                "objective",
-                "goalDefinitionRevision",
-                "acceptanceCriteria",
-                "status",
-                "phase",
-                "revision",
-                "planLink",
-                "currentRunId",
-                "currentStepId",
-                "completedRequiredSteps",
-                "totalRequiredSteps",
-                "attentionReason",
-                "latestEvaluation",
-                "createdAt",
-                "updatedAt",
-                "achievedAt",
-                "stoppedAt",
-            ],
-        )?;
-        if goal.get("goalId") != params.get("goalId")
-            || goal.get("revision") != params.get("goalRevision")
-        {
-            return Err("goal changed projection is inconsistent");
-        }
-    }
-    Ok(())
-}
-
 /// Interaction 通知只携带对账水位和请求身份，答案正文必须通过 interaction/read 获取。
 fn validate_interaction_notification(params: &Value) -> Result<(), &'static str> {
     ensure_object_keys(
@@ -4873,16 +5946,16 @@ fn validate_interaction_notification(params: &Value) -> Result<(), &'static str>
             "occurredAt",
             "generation",
             "threadId",
-            "requestId",
-            "requestRevision",
+            "interactionId",
+            "interactionRevision",
             "eventSequence",
             "kind",
         ],
     )?;
     validate_event_metadata(params)?;
     if !valid_prefixed_id(params.get("threadId"), "thr_")
-        || !valid_prefixed_id(params.get("requestId"), "interaction_")
-        || !integer_in_bounds(params.get("requestRevision"), 0, 9_007_199_254_740_991)
+        || !valid_prefixed_id(params.get("interactionId"), "interaction_")
+        || !integer_in_bounds(params.get("interactionRevision"), 0, 9_007_199_254_740_991)
         || !integer_in_bounds(params.get("eventSequence"), 0, 9_007_199_254_740_991)
         || !matches!(
             params.get("kind").and_then(Value::as_str),
@@ -5240,7 +6313,7 @@ fn validate_context_notification(method: &str, params: &Value) -> Result<(), &'s
     Ok(())
 }
 
-/// 校验运行时字段、终态词汇和封闭的通知集合；标题来源包含 admission 持有的 placeholder。
+/// 校验服务端通知闭集；恢复与审批关闭使用专用状态规则，避免把业务事实当成普通事件字段。
 fn validate_notification(method: &str, params: &Value) -> Result<(), &'static str> {
     if method == "runtime/initialized" {
         ensure_object_keys(params, &["readyToken"])?;
@@ -5272,13 +6345,9 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
             .filter(|number| *number >= 1);
         let ready_token = params.get("readyToken").and_then(Value::as_str);
         if params.get("features")
-            != Some(&serde_json::json!([
-                "task_threads_v1",
-                "plan_goal_v1",
-                "interaction_v1"
-            ]))
+            != Some(&serde_json::json!(["task_threads", "plan", "interaction"]))
         {
-            return Err("runtime feature capability is not the v1 closure");
+            return Err("runtime feature capability is not the v2 closure");
         }
         let valid_ready_token = ready_token.is_some_and(|token| {
             token.len() == 32
@@ -5304,8 +6373,29 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         }
         return Ok(());
     }
-    if matches!(method, "goal/changed" | "goal/activity") {
-        return validate_goal_notification(method, params);
+    if method == "assistant/context-estimated" {
+        ensure_object_keys(
+            params,
+            &[
+                "serverInstanceId",
+                "eventId",
+                "sequence",
+                "occurredAt",
+                "generation",
+                "workspaceId",
+                "threadId",
+                "turnId",
+                "threadRevision",
+                "usage",
+            ],
+        )?;
+        validate_turn_event_metadata(params)?;
+        validate_context_estimate_usage(
+            params
+                .get("usage")
+                .ok_or("context estimate usage is missing")?,
+        )?;
+        return Ok(());
     }
     if method == "interaction/changed" {
         return validate_interaction_notification(params);
@@ -5345,6 +6435,27 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         validate_version(params.get("version"))?;
         return Ok(());
     }
+    if method == "workspace/metadata-changed" {
+        ensure_object_keys(
+            params,
+            &[
+                "serverInstanceId",
+                "eventId",
+                "sequence",
+                "occurredAt",
+                "generation",
+                "workspaceId",
+                "revision",
+            ],
+        )?;
+        validate_event_metadata(params)?;
+        if !valid_prefixed_id(params.get("workspaceId"), "ws_")
+            || !integer_in_bounds(params.get("revision"), 0, MAX_SAFE_INTEGER)
+        {
+            return Err("workspace metadata change is invalid");
+        }
+        return Ok(());
+    }
     if method == "thread/metadata-changed" {
         ensure_object_keys(
             params,
@@ -5381,6 +6492,31 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     if !EVENT_METHODS.contains(&method) {
         return Err("notification method is unknown");
     }
+    if method == "turn/resync-required" {
+        ensure_object_keys(
+            params,
+            &[
+                "serverInstanceId",
+                "eventId",
+                "sequence",
+                "occurredAt",
+                "generation",
+                "workspaceId",
+                "threadId",
+                "turnId",
+                "reasonCode",
+            ],
+        )?;
+        validate_event_metadata(params)?;
+        if !valid_prefixed_id(params.get("workspaceId"), "ws_")
+            || !valid_prefixed_id(params.get("threadId"), "thr_")
+            || !valid_prefixed_id(params.get("turnId"), "turn_")
+            || params.get("reasonCode").and_then(Value::as_str) != Some("projection_failed")
+        {
+            return Err("turn resynchronization boundary is invalid");
+        }
+        return Ok(());
+    }
     if matches!(
         method,
         "context/compaction-started" | "context/compacted" | "context/compaction-failed"
@@ -5392,6 +6528,9 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         "task/activity" | "task/progress" | "task/mailbox-changed"
     ) {
         return validate_task_notification(method, params);
+    }
+    if method == "task/closed" {
+        return validate_task_closed_notification(params);
     }
     if method == "turn/input-queue-changed" {
         ensure_object_keys(
@@ -5469,7 +6608,7 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
             .as_slice(),
         )?;
         validate_turn_event_metadata(params)?;
-        if !valid_prefixed_id(params.get("callId"), "call_")
+        if !valid_call_id(params.get("callId"))
             || params
                 .get("ordinal")
                 .and_then(Value::as_u64)
@@ -5502,6 +6641,12 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         }
         return Ok(());
     }
+    if method == "tool/recovery-changed" {
+        return validate_tool_recovery_notification(params);
+    }
+    if method == "approval/closed" {
+        return validate_approval_closed_notification(params);
+    }
     let mut allowed = vec![
         "serverInstanceId",
         "eventId",
@@ -5519,8 +6664,12 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         "assistant/model-step-committed" => allowed.extend([
             "messageId",
             "text",
+            "totalCharacters",
+            "truncated",
             "modelRound",
             "reasoningSummary",
+            "reasoningSummaryTotalCharacters",
+            "reasoningSummaryTruncated",
             "usage",
             "toolCalls",
         ]),
@@ -5528,6 +6677,7 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
             "approvalId",
             "callId",
             "toolName",
+            "presentation",
             "reason",
             "expiresAt",
             "from",
@@ -5541,6 +6691,8 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         "turn/terminal" => allowed.extend([
             "state",
             "summary",
+            "summaryTotalCharacters",
+            "summaryTruncated",
             "finalMessage",
             "usage",
             "errorCode",
@@ -5575,21 +6727,33 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
                             "kind",
                             "content",
                             "attachments",
+                            "totalCharacters",
+                            "truncated",
                         ],
                     )
                     .is_ok()
+                    && valid_user_content_preview(
+                        item.get("content"),
+                        item.get("totalCharacters"),
+                        item.get("truncated"),
+                    )
                     && validate_turn_content(item.get("content")).is_ok()
                     && validate_attachment_summaries(item.get("content"), item.get("attachments"))
                         .is_ok()
             })
-            || params.get("input").and_then(|input| input.get("content"))
-                != params.get("userItem").and_then(|item| item.get("content"))
+            || !user_item_content_matches_input(
+                params.get("input").and_then(|input| input.get("content")),
+                params.get("userItem").and_then(|item| item.get("content")),
+            )
             || params
                 .get("input")
                 .and_then(|input| input.get("attachments"))
                 != params
                     .get("userItem")
-                    .and_then(|item| item.get("attachments")))
+                    .and_then(|item| item.get("attachments"))
+            || params
+                .get("assistantSettlement")
+                .is_some_and(|settlement| !valid_assistant_settlement(settlement)))
     {
         return Err("consumed input is invalid");
     }
@@ -5606,7 +6770,15 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
                 "running" | "suspended" | "completed" | "failed" | "cancelled"
             ) | (
                 "running",
-                "waiting_approval" | "suspended" | "completed" | "failed" | "cancelled"
+                "waiting_input"
+                    | "waiting_approval"
+                    | "suspended"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+            ) | (
+                "waiting_input",
+                "running" | "suspended" | "completed" | "failed" | "cancelled"
             ) | (
                 "waiting_approval",
                 "running" | "suspended" | "completed" | "failed" | "cancelled"
@@ -5621,11 +6793,26 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
     if method == "tool/batch-committed" && !valid_tool_batch(params)? {
         return Err("tool batch is invalid");
     }
-    if method == "approval/requested"
-        && (require_text(params, "from")? != "running"
-            || require_text(params, "to")? != "waiting_approval")
-    {
-        return Err("approval request transition is invalid");
+    if method == "approval/requested" {
+        if require_text(params, "from")? != "running"
+            || require_text(params, "to")? != "waiting_approval"
+        {
+            return Err("approval request transition is invalid");
+        }
+        let presentation = params
+            .get("presentation")
+            .ok_or("approval presentation is missing")?;
+        validate_tool_presentation(presentation)?;
+        if presentation.get("status").and_then(Value::as_str) != Some("pending") {
+            return Err("approval presentation must describe a pending Tool");
+        }
+        if presentation
+            .get("media")
+            .and_then(Value::as_array)
+            .is_some_and(|media| !media.is_empty())
+        {
+            return Err("approval presentation must not contain media");
+        }
     }
     if method == "approval/resolved"
         && (require_text(params, "from")? != "waiting_approval"
@@ -5634,6 +6821,106 @@ fn validate_notification(method: &str, params: &Value) -> Result<(), &'static st
         return Err("approval resolution transition is invalid");
     }
     Ok(())
+}
+
+/// 严格核验 Tool recovery 的 ID、版本和状态决定式，不能把未知副作用结果折叠成普通 Tool 状态。
+fn validate_tool_recovery_notification(params: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        params,
+        &[
+            "serverInstanceId",
+            "eventId",
+            "sequence",
+            "occurredAt",
+            "generation",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "threadRevision",
+            "recoveryId",
+            "callId",
+            "revision",
+            "status",
+            "disposition",
+            "requiresUserAction",
+        ],
+    )?;
+    validate_turn_event_metadata(params)?;
+    if !integer_in_bounds(params.get("threadRevision"), 0, 9_007_199_254_740_991)
+        || !valid_pattern_id(params.get("recoveryId"), "", 128)
+        || !valid_call_id(params.get("callId"))
+        || !integer_in_bounds(params.get("revision"), 1, 9_007_199_254_740_991)
+    {
+        return Err("tool recovery identity or revision is invalid");
+    }
+    let status = require_text(params, "status")?;
+    let requires_user_action = params
+        .get("requiresUserAction")
+        .and_then(Value::as_bool)
+        .ok_or("tool recovery action flag is invalid")?;
+    let disposition = match params.get("disposition") {
+        None => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err("tool recovery disposition is invalid"),
+    };
+    match (status, disposition, requires_user_action) {
+        ("pending", None, true)
+        | ("pending", Some("retry"), false)
+        | ("verified", Some("verified"), false)
+        | ("retried", Some("retry"), false)
+        | ("skipped", Some("skip"), false) => Ok(()),
+        _ => Err("tool recovery state is invalid"),
+    }
+}
+
+/// 关闭审批只表达取消、替代或过期；用户拒绝仍属于 approval/resolved 的独立决定。
+fn validate_approval_closed_notification(params: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        params,
+        &[
+            "serverInstanceId",
+            "eventId",
+            "sequence",
+            "occurredAt",
+            "generation",
+            "workspaceId",
+            "threadId",
+            "turnId",
+            "threadRevision",
+            "approvalId",
+            "reason",
+        ],
+    )?;
+    validate_turn_event_metadata(params)?;
+    if !integer_in_bounds(params.get("threadRevision"), 0, 9_007_199_254_740_991)
+        || !valid_pattern_id(params.get("approvalId"), "appr_", 96)
+    {
+        return Err("approval close identity is invalid");
+    }
+    if !matches!(
+        require_text(params, "reason")?,
+        "cancelled" | "superseded" | "expired"
+    ) {
+        return Err("approval close reason is invalid");
+    }
+    Ok(())
+}
+
+/// 匹配 schema 的 ASCII idString 语法，空 prefix 用于 recoveryId，非空 prefix 用于 approvalId。
+fn valid_pattern_id(value: Option<&Value>, prefix: &str, maximum_suffix_bytes: usize) -> bool {
+    let Some(identifier) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(suffix) = identifier.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut bytes = suffix.bytes();
+    !suffix.is_empty()
+        && suffix.len() <= maximum_suffix_bytes
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// 交互与 Plan 事件共享服务端序号，但各自的资源身份和公开投影保持隔离，避免事件串线。
@@ -5653,15 +6940,15 @@ fn validate_plan_interaction_notification(
                     "occurredAt",
                     "generation",
                     "threadId",
-                    "requestId",
-                    "requestRevision",
+                    "interactionId",
+                    "interactionRevision",
                     "eventSequence",
                     "kind",
                 ],
             )?;
             if !valid_prefixed_id(params.get("threadId"), "thr_")
-                || !valid_prefixed_id(params.get("requestId"), "interaction_")
-                || !integer_in_bounds(params.get("requestRevision"), 0, 9_007_199_254_740_991)
+                || !valid_prefixed_id(params.get("interactionId"), "interaction_")
+                || !integer_in_bounds(params.get("interactionRevision"), 0, 9_007_199_254_740_991)
                 || !integer_in_bounds(params.get("eventSequence"), 0, 9_007_199_254_740_991)
                 || !matches!(
                     params.get("kind").and_then(Value::as_str),
@@ -5853,6 +7140,56 @@ fn validate_task_notification(method: &str, params: &Value) -> Result<(), &'stat
     Ok(())
 }
 
+/// Close 通知绑定存活顶层 root 和本次删除 root，不能引用已删除实体的 revision。
+fn validate_task_closed_notification(params: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(
+        params,
+        &[
+            "serverInstanceId",
+            "eventId",
+            "sequence",
+            "occurredAt",
+            "generation",
+            "rootThreadId",
+            "taskThreadId",
+            "closedThreadIds",
+        ],
+    )?;
+    validate_event_metadata(params)?;
+    let root_thread_id = params
+        .get("rootThreadId")
+        .and_then(Value::as_str)
+        .ok_or("task close root is invalid")?;
+    let task_thread_id = params
+        .get("taskThreadId")
+        .and_then(Value::as_str)
+        .ok_or("task close target is invalid")?;
+    if !valid_prefixed_id(params.get("rootThreadId"), "thr_")
+        || !valid_prefixed_id(params.get("taskThreadId"), "thr_")
+    {
+        return Err("task close identity is invalid");
+    }
+    let thread_ids = params
+        .get("closedThreadIds")
+        .and_then(Value::as_array)
+        .filter(|thread_ids| !thread_ids.is_empty())
+        .ok_or("task close identity set is empty")?;
+    let mut unique_ids = std::collections::HashSet::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
+        if !valid_prefixed_id(Some(thread_id), "thr_") {
+            return Err("task close identity is invalid");
+        }
+        let thread_id = thread_id.as_str().ok_or("task close identity is invalid")?;
+        if !unique_ids.insert(thread_id) {
+            return Err("task close identities are duplicated");
+        }
+    }
+    if !unique_ids.contains(task_thread_id) || root_thread_id == task_thread_id {
+        return Err("task close root routing is invalid");
+    }
+    Ok(())
+}
+
 /// 跨会话消息只携带冻结的来源身份和纯文本；批次必须绑定同一 Turn，避免通信内容
 /// 伪装成当前用户输入或在重试时以重复 item 进入 Timeline。
 fn validate_thread_message_notification(params: &Value) -> Result<(), &'static str> {
@@ -5904,6 +7241,8 @@ fn validate_thread_message_notification(params: &Value) -> Result<(), &'static s
                 "sourceThreadId",
                 "sourceTitle",
                 "content",
+                "totalCharacters",
+                "truncated",
             ],
         )?;
         if item.get("kind").and_then(Value::as_str) != Some("thread_message")
@@ -5924,12 +7263,7 @@ fn validate_thread_message_notification(params: &Value) -> Result<(), &'static s
                             .chars()
                             .any(|character| matches!(character, '\0' | '\r' | '\n'))
                 })
-            || !item
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| {
-                    content.chars().count() <= 1_048_576 && !content.contains('\0')
-                })
+            || !valid_public_text_preview(item, "content", "totalCharacters", "truncated")
         {
             return Err("thread message item is invalid");
         }
@@ -5946,11 +7280,17 @@ fn validate_thread_message_notification(params: &Value) -> Result<(), &'static s
 
 /// 校验 Corpus 表示的复合 Committed Model Step，确保相关事实作为单一事务闭环。
 fn valid_model_step(params: &Value) -> Result<bool, &'static str> {
-    require_text(params, "messageId")?;
-    params
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or("model text")?;
+    if !valid_prefixed_id(params.get("messageId"), "item_")
+        || !valid_public_text_preview(params, "text", "totalCharacters", "truncated")
+        || !optional_public_text_preview(
+            params,
+            "reasoningSummary",
+            "reasoningSummaryTotalCharacters",
+            "reasoningSummaryTruncated",
+        )
+    {
+        return Ok(false);
+    }
     let round = params
         .get("modelRound")
         .and_then(Value::as_u64)
@@ -5964,9 +7304,7 @@ fn valid_model_step(params: &Value) -> Result<bool, &'static str> {
     }
     for call in calls {
         ensure_object_keys(call, &["callId", "toolName", "ordinal", "presentation"])?;
-        if !valid_prefixed_id(call.get("callId"), "call_")
-            || !integer_in_bounds(call.get("ordinal"), 0, 1023)
-        {
+        if !valid_call_id(call.get("callId")) || !integer_in_bounds(call.get("ordinal"), 0, 1023) {
             return Ok(false);
         }
         validate_tool_presentation(
@@ -5975,6 +7313,37 @@ fn valid_model_step(params: &Value) -> Result<bool, &'static str> {
         )?;
     }
     Ok(true)
+}
+
+/// Input 消费事件中的上一条结算只能携带闭合正文预览，不把 Tool calls 混入该原子事件。
+fn valid_assistant_settlement(value: &Value) -> bool {
+    if ensure_object_keys(
+        value,
+        &[
+            "messageId",
+            "text",
+            "totalCharacters",
+            "truncated",
+            "modelRound",
+            "usage",
+            "reasoningSummary",
+            "reasoningSummaryTotalCharacters",
+            "reasoningSummaryTruncated",
+        ],
+    )
+    .is_err()
+    {
+        return false;
+    }
+    valid_prefixed_id(value.get("messageId"), "item_")
+        && valid_public_text_preview(value, "text", "totalCharacters", "truncated")
+        && integer_in_bounds(value.get("modelRound"), 1, 128)
+        && optional_public_text_preview(
+            value,
+            "reasoningSummary",
+            "reasoningSummaryTotalCharacters",
+            "reasoningSummaryTruncated",
+        )
 }
 
 /// 校验 Tool Result Batch 仅携带安全展示事实；文件变化由独立 TurnChangeSet 拥有。
@@ -5991,7 +7360,7 @@ fn valid_tool_batch(params: &Value) -> Result<bool, &'static str> {
             result,
             &["callId", "outcome", "ordinal", "errorCode", "presentation"],
         )?;
-        if !valid_prefixed_id(result.get("callId"), "call_")
+        if !valid_call_id(result.get("callId"))
             || !integer_in_bounds(result.get("ordinal"), 0, 1023)
             || !matches!(
                 result.get("outcome").and_then(Value::as_str),
@@ -6020,6 +7389,8 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
             "inputPreview",
             "outputPreview",
             "summary",
+            "interactionAnswers",
+            "media",
             "relativePaths",
             "command",
             "relativeCwd",
@@ -6029,6 +7400,7 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
             "durationMs",
             "truncated",
             "artifactId",
+            "recovery",
         ],
     )?;
     if !matches!(
@@ -6057,9 +7429,20 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
         }
     }
     if let Some(summary) = value.get("summary")
-        && !bounded_string(Some(summary), 1, 1_024)
+        && !summary
+            .as_str()
+            .is_some_and(|text| text.chars().count() <= 1_024 && !text.contains('\0'))
     {
         return Err("tool presentation summary is invalid");
+    }
+    if let Some(answers) = value.get("interactionAnswers") {
+        validate_tool_interaction_answers(answers)?;
+    }
+    if let Some(media) = value.get("media") {
+        validate_tool_media(media)?;
+    }
+    if let Some(recovery) = value.get("recovery") {
+        validate_tool_recovery(recovery)?;
     }
     let paths = value
         .get("relativePaths")
@@ -6086,11 +7469,337 @@ fn validate_tool_presentation(value: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// 图片媒体只保留可按归属重新校验的附件引用，拒绝原始字节、路径和未知扩展字段。
+fn validate_tool_media(value: &Value) -> Result<(), &'static str> {
+    let media = value
+        .as_array()
+        .filter(|media| media.len() <= 10)
+        .ok_or("tool media list is invalid")?;
+    let mut attachment_ids = HashSet::new();
+    for item in media {
+        ensure_object_keys(
+            item,
+            &["attachmentId", "displayName", "mediaType", "sizeBytes"],
+        )?;
+        let attachment_id = item
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .filter(|_| valid_prefixed_id(item.get("attachmentId"), "att_"))
+            .ok_or("tool media attachment identity is invalid")?;
+        if !attachment_ids.insert(attachment_id) {
+            return Err("tool media attachment identity is duplicated");
+        }
+        let display_name = item.get("displayName").and_then(Value::as_str);
+        let media_type = item.get("mediaType").and_then(Value::as_str);
+        if !bounded_string(item.get("displayName"), 1, 512)
+            || display_name.is_none_or(|value| {
+                value
+                    .chars()
+                    .any(|character| matches!(character, '\0' | '\r' | '\n'))
+            })
+            || !matches!(
+                media_type,
+                Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+            )
+            || !integer_in_bounds(item.get("sizeBytes"), 1, 50 * 1024 * 1024)
+        {
+            return Err("tool media reference is invalid");
+        }
+    }
+    Ok(())
+}
+
+/// Tool 澄清摘要只允许已投影的问题和答案，不把客户端扩展或 raw 数据带入展示合同。
+fn validate_tool_interaction_answers(value: &Value) -> Result<(), &'static str> {
+    let answers = value
+        .as_array()
+        .filter(|answers| answers.len() <= 3)
+        .ok_or("tool interaction answers are invalid")?;
+    for answer in answers {
+        ensure_object_keys(answer, &["question", "answers", "skipped"])?;
+        let question = answer.get("question").and_then(Value::as_str);
+        let labels = answer
+            .get("answers")
+            .and_then(Value::as_array)
+            .filter(|labels| labels.len() <= 64)
+            .ok_or("tool interaction answer labels are invalid")?;
+        let skipped = answer
+            .get("skipped")
+            .and_then(Value::as_bool)
+            .ok_or("tool interaction skipped state is invalid")?;
+        if !valid_tool_interaction_text(question)
+            || labels
+                .iter()
+                .any(|label| !valid_tool_interaction_text(label.as_str()))
+            || skipped && !labels.is_empty()
+        {
+            return Err("tool interaction answer content is invalid");
+        }
+    }
+    Ok(())
+}
+
+/// 与 Schema 的 PreviewText 长度及非空语义一致，同时拒绝 NUL，避免跨端展示差异。
+fn valid_tool_interaction_text(value: Option<&str>) -> bool {
+    value.is_some_and(|text| {
+        (1..=4_096).contains(&text.chars().count())
+            && !text.trim().is_empty()
+            && !text.contains('\0')
+    })
+}
+
+/// Tool recovery 只暴露正数安全 revision；物理路径、结果正文和未知字段均不属于提示。
+fn validate_tool_recovery(value: &Value) -> Result<(), &'static str> {
+    ensure_object_keys(value, &["revision"])?;
+    if !integer_in_bounds(value.get("revision"), 1, 9_007_199_254_740_991) {
+        return Err("tool recovery revision is invalid");
+    }
+    Ok(())
+}
+
+/// Schema 声明的可选摘要、交互回答和恢复版本均可通过 Rust Golden Consumer。
+#[test]
+fn tool_presentation_accepts_declared_optional_fields() {
+    let value = serde_json::json!({
+        "kind": "mcp",
+        "title": "回答问题",
+        "status": "success",
+        "summary": "",
+        "interactionAnswers": [
+            {
+                "question": "使用哪个数据库？",
+                "answers": ["SQLite"],
+                "skipped": false
+            },
+            {
+                "question": "是否补充说明？",
+                "answers": [],
+                "skipped": true
+            }
+        ],
+        "media": [{
+            "attachmentId": "att_0123456789abcdef0123456789abcdef",
+            "displayName": "截图.png",
+            "mediaType": "image/png",
+            "sizeBytes": 2048
+        }],
+        "relativePaths": [],
+        "truncated": false,
+        "recovery": {"revision": 9_007_199_254_740_991_u64}
+    });
+
+    assert!(validate_tool_presentation(&value).is_ok());
+}
+
+/// 新增字段只放行 Schema 的闭集与约束，拒绝 raw 扩展和不一致的跳过/恢复状态。
+#[test]
+fn tool_presentation_rejects_invalid_optional_fields() {
+    let base = serde_json::json!({
+        "kind": "mcp",
+        "title": "回答问题",
+        "status": "success",
+        "interactionAnswers": [{
+            "question": "使用哪个数据库？",
+            "answers": ["SQLite"],
+            "skipped": false
+        }],
+        "relativePaths": [],
+        "truncated": false,
+        "recovery": {"revision": 1}
+    });
+
+    let mut unknown_answer_field = base.clone();
+    unknown_answer_field["interactionAnswers"][0]["arguments"] = serde_json::json!({});
+    assert!(validate_tool_presentation(&unknown_answer_field).is_err());
+
+    let mut blank_question = base.clone();
+    blank_question["interactionAnswers"][0]["question"] = serde_json::json!(" \t");
+    assert!(validate_tool_presentation(&blank_question).is_err());
+
+    let mut nul_summary = base.clone();
+    nul_summary["summary"] = serde_json::json!("invalid\0summary");
+    assert!(validate_tool_presentation(&nul_summary).is_err());
+
+    let mut long_summary = base.clone();
+    long_summary["summary"] = Value::String("x".repeat(1_025));
+    assert!(validate_tool_presentation(&long_summary).is_err());
+
+    let mut skipped_with_answer = base.clone();
+    skipped_with_answer["interactionAnswers"][0]["skipped"] = serde_json::json!(true);
+    assert!(validate_tool_presentation(&skipped_with_answer).is_err());
+
+    let mut recovery_with_path = base.clone();
+    recovery_with_path["recovery"]["path"] = serde_json::json!("C:/private/result");
+    assert!(validate_tool_presentation(&recovery_with_path).is_err());
+
+    let mut invalid_revision = base.clone();
+    invalid_revision["recovery"]["revision"] = serde_json::json!(0);
+    assert!(validate_tool_presentation(&invalid_revision).is_err());
+
+    let mut unsafe_revision = base.clone();
+    unsafe_revision["recovery"]["revision"] = serde_json::json!(9_007_199_254_740_992_u64);
+    assert!(validate_tool_presentation(&unsafe_revision).is_err());
+
+    let mut raw_arguments = base;
+    raw_arguments["arguments"] = serde_json::json!({"secret": "not allowed"});
+    assert!(validate_tool_presentation(&raw_arguments).is_err());
+
+    let media_kind = serde_json::json!({
+        "kind": "mcp",
+        "title": "媒体",
+        "status": "success",
+        "media": [{
+            "attachmentId": "att_0123456789abcdef0123456789abcdef",
+            "displayName": "截图.png",
+            "mediaType": "image/png",
+            "sizeBytes": 2048,
+            "kind": "image"
+        }],
+        "relativePaths": [],
+        "truncated": false
+    });
+    assert!(validate_tool_presentation(&media_kind).is_err());
+
+    let mut invalid_media_type = media_kind.clone();
+    invalid_media_type["media"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("kind");
+    invalid_media_type["media"][0]["mediaType"] = serde_json::json!("text/plain");
+    assert!(validate_tool_presentation(&invalid_media_type).is_err());
+
+    let mut duplicate_media = media_kind.clone();
+    duplicate_media["media"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("kind");
+    duplicate_media["media"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "attachmentId": "att_0123456789abcdef0123456789abcdef",
+            "displayName": "副本.png",
+            "mediaType": "image/png",
+            "sizeBytes": 1024
+        }));
+    assert!(validate_tool_presentation(&duplicate_media).is_err());
+
+    let mut oversized_media = media_kind.clone();
+    oversized_media["media"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("kind");
+    oversized_media["media"][0]["sizeBytes"] = serde_json::json!(50 * 1024 * 1024 + 1);
+    assert!(validate_tool_presentation(&oversized_media).is_err());
+}
+
 /// 验证安全预览的 NUL 与 32 KiB 边界；控制字符清理的权威实现仍在 Java projector。
 fn valid_preview_text(value: &Value) -> bool {
     value
         .as_str()
         .is_some_and(|text| text.len() <= 32_768 && !text.contains('\0'))
+}
+
+/// 公共正文预览固定为前 512 个 Unicode code point，并与原文长度及截断标志闭合。
+fn valid_public_text_preview(
+    value: &Value,
+    text_field: &str,
+    total_field: &str,
+    truncated_field: &str,
+) -> bool {
+    let Some(text) = value.get(text_field).and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(total) = value.get(total_field).and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(truncated) = value.get(truncated_field).and_then(Value::as_bool) else {
+        return false;
+    };
+    let visible = text.chars().count() as u64;
+    total <= MAX_SAFE_INTEGER
+        && !text.contains('\0')
+        && visible == total.min(PUBLIC_TEXT_PREVIEW_CODE_POINTS as u64)
+        && truncated == (visible < total)
+}
+
+/// USER 文本块共享唯一预览预算；附件、workspace 与 skill 引用不参与字符计数。
+fn valid_user_content_preview(
+    content: Option<&Value>,
+    total: Option<&Value>,
+    truncated: Option<&Value>,
+) -> bool {
+    let Some(parts) = content.and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(total) = total.and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(truncated) = truncated.and_then(Value::as_bool) else {
+        return false;
+    };
+    let mut visible = 0_u64;
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            return false;
+        };
+        if text.contains('\0') {
+            return false;
+        }
+        let Some(next) = visible.checked_add(text.chars().count() as u64) else {
+            return false;
+        };
+        visible = next;
+    }
+    total <= MAX_SAFE_INTEGER
+        && visible == total.min(PUBLIC_TEXT_PREVIEW_CODE_POINTS as u64)
+        && truncated == (visible < total)
+}
+
+/// 消费事件的 item 必须等于原始输入按 code point 前 512 字符投影后的结构。
+fn user_item_content_matches_input(input: Option<&Value>, item: Option<&Value>) -> bool {
+    let Some(mut expected) = input.cloned() else {
+        return false;
+    };
+    let Some(parts) = expected.as_array_mut() else {
+        return false;
+    };
+    let mut remaining = PUBLIC_TEXT_PREVIEW_CODE_POINTS;
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            return false;
+        };
+        let visible = text.chars().take(remaining).collect::<String>();
+        remaining = remaining.saturating_sub(text.chars().count());
+        part["text"] = Value::String(visible);
+    }
+    item == Some(&expected)
+}
+
+/// 可选预览的正文、总量和截断标记必须同时存在，防止半更新事件伪装成旧形状。
+fn optional_public_text_preview(
+    value: &Value,
+    text_field: &str,
+    total_field: &str,
+    truncated_field: &str,
+) -> bool {
+    match (
+        value.get(text_field).is_some(),
+        value.get(total_field).is_some(),
+        value.get(truncated_field).is_some(),
+    ) {
+        (false, false, false) => true,
+        (true, true, true) => {
+            valid_public_text_preview(value, text_field, total_field, truncated_field)
+        }
+        _ => false,
+    }
 }
 
 /// 镜像协议的工作区相对路径约束，禁止盘符、反斜线和父目录逃逸进入 renderer。
@@ -6263,25 +7972,42 @@ fn validate_artifact_read_identity(value: &Value, tool: bool) -> Result<(), &'st
     if !valid_prefixed_id(value.get("threadId"), "thr_")
         || !valid_prefixed_id(value.get("turnId"), "turn_")
         || !valid_prefixed_id(value.get("artifactId"), "artifact_")
-        || (tool && !valid_prefixed_id(value.get("callId"), "call_"))
+        || (tool && !valid_call_id(value.get("callId")))
     {
         return Err("artifact reader identity is invalid");
     }
     Ok(())
 }
 
-/// 强制 Completed/Failed/Cancelled 的 Terminal Field 闭集，拒绝跨终态残留字段。
+/// 完成态必须有 ChangeSet；失败或取消只有在持久事实缺失时允许显式 null。
 fn valid_terminal(params: &Value) -> Result<bool, &'static str> {
     let state = require_text(params, "state")?;
-    params
-        .get("summary")
-        .and_then(Value::as_str)
-        .ok_or("terminal summary")?;
-    validate_turn_change_set(
-        params
-            .get("changeSet")
-            .ok_or("terminal change set is missing")?,
-    )?;
+    if !valid_public_text_preview(
+        params,
+        "summary",
+        "summaryTotalCharacters",
+        "summaryTruncated",
+    ) {
+        return Ok(false);
+    }
+    let change_set = params
+        .get("changeSet")
+        .ok_or("terminal change set is missing")?;
+    let change_set_valid = match (state, change_set) {
+        ("completed", change_set) => {
+            validate_turn_change_set(change_set)?;
+            true
+        }
+        ("failed" | "cancelled", Value::Null) => true,
+        ("failed" | "cancelled", change_set) => {
+            validate_turn_change_set(change_set)?;
+            true
+        }
+        _ => false,
+    };
+    if !change_set_valid {
+        return Ok(false);
+    }
     Ok(match state {
         "completed" => {
             valid_terminal_message(params.get("finalMessage"))?
@@ -6289,7 +8015,7 @@ fn valid_terminal(params: &Value) -> Result<bool, &'static str> {
                 && params.get("errorMessage").is_none()
         }
         "failed" => {
-            valid_terminal_message(params.get("finalMessage"))?
+            optional_terminal_message(params)?
                 && params.get("errorCode").and_then(Value::as_str).is_some()
                 && params.get("errorMessage").and_then(Value::as_str).is_some()
         }
@@ -6302,18 +8028,25 @@ fn valid_terminal(params: &Value) -> Result<bool, &'static str> {
     })
 }
 
+/// 失败可没有助手终答；若携带终答，仍按同一严格 item/text 结构校验。
+fn optional_terminal_message(params: &Value) -> Result<bool, &'static str> {
+    match params.get("finalMessage") {
+        None => Ok(true),
+        Some(message) => valid_terminal_message(Some(message)),
+    }
+}
+
 /// 最终消息只允许稳定 item 身份与有界公开正文，避免 Consumer 接受空壳或扩展字段。
 fn valid_terminal_message(value: Option<&Value>) -> Result<bool, &'static str> {
     let Some(message) = value else {
         return Ok(false);
     };
-    ensure_object_keys(message, &["messageId", "text"])?;
+    ensure_object_keys(
+        message,
+        &["messageId", "text", "totalCharacters", "truncated"],
+    )?;
     Ok(valid_prefixed_id(message.get("messageId"), "item_")
-        && bounded_string(message.get("text"), 0, 1_048_576)
-        && !message
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.contains('\0')))
+        && valid_public_text_preview(message, "text", "totalCharacters", "truncated"))
 }
 
 /// 在 Rust Golden Consumer 边界拒绝 Unknown Field，防止类型化 Parser 把负向 Fixture
@@ -6335,56 +8068,139 @@ fn string_array_equals(values: &[Value], expected: &[&str]) -> bool {
             .all(|(value, expected)| value.as_str() == Some(*expected))
 }
 
-/// 仅允许 credential/set 的 secret 与 preview/open 的判别式 authorization；关联验证中的
-/// credential/reveal-provider 另以精确 `{secret}` 结果处理，其它 Result 与 Notification 仍拒绝。
+/// 只放行明确获准的凭据字段，并仅将 turn/start.outputSchema 内的 Schema Map 键视为属性名。
+struct SecretKeyScanContext {
+    allow_secret: bool,
+    allow_authorization: bool,
+    allow_output_schema: bool,
+    in_params: bool,
+    path: Vec<String>,
+    schema_node: bool,
+    schema_map: bool,
+    schema_list: bool,
+}
+
+impl SecretKeyScanContext {
+    /// 原地推进递归状态；每个子节点返回后恢复父状态，避免权限或 Schema 范围泄漏到兄弟节点。
+    fn visit(&mut self, value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    let lower = key.to_ascii_lowercase();
+                    let is_secret = matches!(
+                        lower.as_str(),
+                        "secret"
+                            | "secretvalue"
+                            | "credentialvalue"
+                            | "tokenvalue"
+                            | "apikey"
+                            | "api_key"
+                            | "authorization"
+                            | "password"
+                    );
+                    let permitted = (self.allow_secret && self.in_params && key == "secret")
+                        || (self.allow_authorization && self.in_params && key == "authorization");
+                    let output_schema_root = self.allow_output_schema
+                        && self.path.len() == 2
+                        && self.path[0] == "params"
+                        && self.path[1] == "runtimeOverrides"
+                        && key == "outputSchema";
+                    let is_schema_map = self.schema_node
+                        && matches!(
+                            key.as_str(),
+                            "$defs"
+                                | "definitions"
+                                | "properties"
+                                | "patternProperties"
+                                | "dependentSchemas"
+                        );
+                    let is_schema_list = self.schema_node
+                        && matches!(key.as_str(), "allOf" | "anyOf" | "oneOf" | "prefixItems")
+                        && child.is_array();
+                    let allowed_schema_name = self.schema_map
+                        && self.allow_output_schema
+                        && self.path.len() >= 3
+                        && self.path[0] == "params"
+                        && self.path[1] == "runtimeOverrides"
+                        && self.path[2] == "outputSchema";
+                    let child_is_schema_object = output_schema_root
+                        || self.schema_map
+                        || self.schema_list
+                        || (self.schema_node
+                            && matches!(
+                                key.as_str(),
+                                "additionalProperties"
+                                    | "unevaluatedProperties"
+                                    | "propertyNames"
+                                    | "items"
+                                    | "contains"
+                                    | "unevaluatedItems"
+                                    | "not"
+                                    | "if"
+                                    | "then"
+                                    | "else"
+                                    | "contentSchema"
+                            ));
+                    if is_secret && !permitted && !allowed_schema_name {
+                        return true;
+                    }
+                    self.path.push(key.clone());
+                    let previous_state = (
+                        self.in_params,
+                        self.schema_node,
+                        self.schema_map,
+                        self.schema_list,
+                    );
+                    self.in_params |= key == "params";
+                    self.schema_node = child_is_schema_object;
+                    self.schema_map = is_schema_map;
+                    self.schema_list = is_schema_list;
+                    let blocked = self.visit(child);
+                    self.path.pop();
+                    (
+                        self.in_params,
+                        self.schema_node,
+                        self.schema_map,
+                        self.schema_list,
+                    ) = previous_state;
+                    if blocked {
+                        return true;
+                    }
+                }
+                false
+            }
+            Value::Array(values) => {
+                let previous_schema_state = (self.schema_node, self.schema_map, self.schema_list);
+                self.schema_node = self.schema_list;
+                self.schema_map = false;
+                self.schema_list = false;
+                let blocked = values.iter().any(|child| self.visit(child));
+                (self.schema_node, self.schema_map, self.schema_list) = previous_schema_state;
+                blocked
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 调用端只配置例外权限，遍历状态由上下文在递归过程中独占维护。
 fn contains_forbidden_secret_key(
     value: &Value,
     allow_credential_secret: bool,
     allow_preview_authorization: bool,
+    allow_output_schema_property_names: bool,
 ) -> bool {
-    fn visit(
-        value: &Value,
-        allow_secret: bool,
-        allow_authorization: bool,
-        in_params: bool,
-    ) -> bool {
-        match value {
-            Value::Object(object) => object.iter().any(|(key, child)| {
-                let lower = key.to_ascii_lowercase();
-                let is_secret = matches!(
-                    lower.as_str(),
-                    "secret"
-                        | "secretvalue"
-                        | "credentialvalue"
-                        | "tokenvalue"
-                        | "apikey"
-                        | "api_key"
-                        | "authorization"
-                        | "password"
-                );
-                let permitted = (allow_secret && in_params && key == "secret")
-                    || (allow_authorization && in_params && key == "authorization");
-                (is_secret && !permitted)
-                    || visit(
-                        child,
-                        allow_secret,
-                        allow_authorization,
-                        in_params || key == "params",
-                    )
-            }),
-            Value::Array(values) => values
-                .iter()
-                .any(|child| visit(child, allow_secret, allow_authorization, in_params)),
-            _ => false,
-        }
+    SecretKeyScanContext {
+        allow_secret: allow_credential_secret,
+        allow_authorization: allow_preview_authorization,
+        allow_output_schema: allow_output_schema_property_names,
+        in_params: false,
+        path: Vec::new(),
+        schema_node: false,
+        schema_map: false,
+        schema_list: false,
     }
-
-    visit(
-        value,
-        allow_credential_secret,
-        allow_preview_authorization,
-        false,
-    )
+    .visit(value)
 }
 
 /// Provider API Key 回显必须保持单字段、nullable、有界形状，防止该显式例外扩展为通用凭据投影。
@@ -6438,6 +8254,53 @@ fn thread_read_tail_is_an_explicit_opt_in() {
     assert!(validate_request("thread/read", &null_tail).is_err());
 }
 
+/// Frozen history keeps explicit inherited provenance while only native turns may own live controls.
+#[test]
+fn thread_read_requires_native_or_inherited_origins() {
+    let result = serde_json::json!({
+        "threadId":"thr_forked",
+        "revision":0,
+        "turns":[{
+            "turnId":"turn_inherited",
+            "origin":"inherited",
+            "sourceMessageId":null,
+            "status":"completed",
+            "requestedAt":"2026-10-01T00:00:00Z",
+            "updatedAt":"2026-10-01T00:00:01Z",
+            "completedAt":"2026-10-01T00:00:01Z",
+            "errorCode":null,
+            "changeSet":null
+        }],
+        "items":[{
+            "itemId":"item_inherited",
+            "createdAt":"2026-10-01T00:00:01Z",
+            "turnId":"turn_inherited",
+            "origin":"inherited",
+            "kind":"final_answer",
+            "text":"done",
+            "totalCharacters":4,
+            "truncated":false
+        }],
+        "taskActivities":[],
+        "inputQueue":null,
+        "contextUsage":null,
+        "liveStream":null,
+        "nextCursor":null
+    });
+    assert!(validate_thread_read_result(&result).is_ok());
+
+    let mut missing_turn_origin = result.clone();
+    missing_turn_origin["turns"][0]
+        .as_object_mut()
+        .expect("turn object")
+        .remove("origin");
+    assert!(validate_thread_read_result(&missing_turn_origin).is_err());
+
+    let mut invalid_item_origin = result;
+    invalid_item_origin["items"][0]["origin"] = serde_json::json!("unknown");
+    assert!(validate_thread_read_result(&invalid_item_origin).is_err());
+}
+
 /// 外部恢复次数来自 Java 权威策略，wire 只携带当前尝试序号；超过旧固定六次
 /// 仍是合法事件，删除的 maxAttempts 字段不能重新进入 JA-RPC。
 #[test]
@@ -6457,7 +8320,7 @@ fn retry_started_accepts_large_attempt_without_removed_ceiling() {
     assert!(validate_notification("turn/retry-started", &params).is_err());
 }
 
-/// ID-only reopen and project open are disjoint; displayName stays optional for Java-owned project identity.
+/// 仅按 ID 重开与打开项目是互斥流程；Java 签发的项目身份允许 displayName 缺省。
 #[test]
 fn workspace_open_accepts_registered_and_project_forms() {
     assert!(

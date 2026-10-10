@@ -9,6 +9,7 @@ use crate::review::domain::{
     ReviewAction, ReviewCommitId, ReviewFileId, ReviewFileLayer, ReviewFileStatus, ReviewHunkId,
     ReviewRefId, ReviewSource, ReviewTarget,
 };
+use ja_review::{ReviewSnapshotSource, SnapshotCoverage};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 /// 仅含 metadata 的 invalidation event；消费者必须 refetch，不能把 hint 当事务结果。
@@ -30,6 +31,7 @@ pub enum ReviewErrorCodeDto {
     ReviewStale,
     ReviewReadOnly,
     ReviewConflict,
+    ReviewCaptureUnknown,
     GitUnavailable,
     NotGitRepository,
     GitFailed,
@@ -83,6 +85,13 @@ impl ReviewCommandError {
             code: ReviewErrorCodeDto::InvalidInput,
         }
     }
+
+    /// Retryable attachment RPC failure may have committed a draft, so the UI must stop for reconciliation.
+    pub(super) const fn capture_unknown() -> Self {
+        Self {
+            code: ReviewErrorCodeDto::ReviewCaptureUnknown,
+        }
+    }
 }
 
 impl Display for ReviewCommandError {
@@ -95,6 +104,9 @@ impl Display for ReviewCommandError {
             ReviewErrorCodeDto::ReviewStale => "Review changed; reload before applying",
             ReviewErrorCodeDto::ReviewReadOnly => "this Review source is read-only",
             ReviewErrorCodeDto::ReviewConflict => "Review mutation conflicts with newer changes",
+            ReviewErrorCodeDto::ReviewCaptureUnknown => {
+                "Review capture outcome is unknown; reconcile before retrying"
+            }
             ReviewErrorCodeDto::GitUnavailable => "Git is unavailable",
             ReviewErrorCodeDto::NotGitRepository => "workspace is not a Git repository",
             ReviewErrorCodeDto::GitFailed => "Git operation failed",
@@ -287,6 +299,16 @@ pub struct ReviewSnapshotInput {
     pub source: ReviewSourceDto,
 }
 
+/// 请求冻结当前 Review source，并将唯一规范快照导入原 Workspace 的 Java 附件 owner。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewCaptureInput {
+    pub workspace_id: String,
+    pub source: ReviewSourceDto,
+    pub expected_snapshot_revision: String,
+    pub operation_id: String,
+}
+
 /// 通过 opaque file id 与 revision 请求 lazy file diff。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -415,6 +437,19 @@ pub struct ReviewSnapshotDto {
     pub files: Vec<ReviewFileDto>,
     pub stats: ReviewStatsDto,
     pub capabilities: ReviewCapabilitiesDto,
+}
+
+/// Capture 只回传冻结身份和实际覆盖率；快照正文留在 Java 管理的附件中。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCaptureResultDto {
+    pub workspace_id: String,
+    pub source: ReviewSnapshotSource,
+    pub snapshot_id: String,
+    pub snapshot_hash: String,
+    pub revision: String,
+    pub attachment_id: String,
+    pub coverage: SnapshotCoverage,
 }
 
 /// 带 old/new 坐标的 rendered diff line，供 CodeMirror projection 使用。

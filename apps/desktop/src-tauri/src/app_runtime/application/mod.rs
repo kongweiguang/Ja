@@ -8,22 +8,21 @@ pub(crate) mod host;
 pub(crate) mod ports;
 
 pub use error::RuntimeCommandError;
-pub use host::RuntimeHost;
 pub(crate) use host::WorkspaceLookup;
+pub use host::{RuntimeHost, WorkspaceMetadataEventRouter};
 pub use ports::EventEmitError;
 pub(crate) use ports::{
     ConfigurationPatchParams, ConfigurationPatchResult, ConfigurationReadParams,
     ConfigurationReadResult, ConfigurationReplaceParams, ConfigurationReplaceResult,
     ConfigurationRequest, ConfigurationResetParams, ConfigurationResetResult,
-    ConfigurationResponse, ConfigurationRestoreParams, ConfigurationRestoreResult,
-    CredentialDeleteParams, CredentialDeleteResult, CredentialRevealProviderParams,
-    CredentialRevealProviderResult, CredentialSetParams, CredentialSetResult, HistoryRequest,
-    HistoryResponse, McpListParams, McpListResultData, McpTestParams, McpTestResultData,
-    McpToolsReadParams, McpToolsReadResultData, MessageContentReadParams,
-    MessageContentReadResultData, ModelDiscoverParams, ModelDiscoverResultData, ModelTestParams,
-    ModelTestResultData, OperationReadParams, OperationReadResultData, RuntimeBridgePort,
-    RuntimePlatformPort, SettingsRequest, SettingsResponse, SkillListParams, SkillListResultData,
-    ThreadArchiveParams, ThreadArchiveResultData, ThreadCompactCancelParams,
+    ConfigurationResponse, CredentialDeleteParams, CredentialDeleteResult,
+    CredentialRevealProviderParams, CredentialRevealProviderResult, CredentialSetParams,
+    CredentialSetResult, HistoryRequest, HistoryResponse, ItemContentReadParams,
+    ItemContentReadResultData, McpListParams, McpListResultData, McpTestParams, McpTestResultData,
+    McpToolsReadParams, McpToolsReadResultData, ModelDiscoverParams, ModelDiscoverResultData,
+    ModelTestParams, ModelTestResultData, OperationReadParams, OperationReadResultData,
+    RuntimeBridgePort, RuntimePlatformPort, SettingsRequest, SettingsResponse, SkillListParams,
+    SkillListResultData, ThreadArchiveParams, ThreadArchiveResultData, ThreadCompactCancelParams,
     ThreadCompactCancelResultData, ThreadCompactParams, ThreadCompactResultData,
     ThreadCreateParams, ThreadCreateResultData, ThreadDeleteParams, ThreadDeleteResultData,
     ThreadDiscoverParams, ThreadDiscoverResultData, ThreadListParams, ThreadListResultData,

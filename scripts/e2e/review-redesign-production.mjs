@@ -14,12 +14,14 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import process from "node:process";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "@playwright/test";
 import {
+  REVIEW_DRIVER_STAGES,
   runReviewRedesignWebView2,
+  sanitizeReviewThreadFailureDiagnostic,
   validateReviewRedesignReport,
 } from "./review-redesign-webview2-driver.mjs";
 
@@ -29,6 +31,9 @@ const DEFAULT_JAVA_HOME = "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const DEFAULT_IGNORED_FILES = 4_500;
 const DEFAULT_UNTRACKED_FILES = 1_800;
 const STABLE_PORT_RANGE = Object.freeze({ start: 41_000, size: 8_000 });
+const TAURI_DESKTOP_EXECUTABLE = "ja-desktop.exe";
+const MAX_PROCESS_SNAPSHOT_INVENTORY = 16_384;
+const MAX_OWNED_PROCESS_SNAPSHOT_DESCENDANTS = 4_096;
 
 /** 只接受命名参数，scope 必须显式声明，避免 Git-only 被误认为完整验收。 */
 export function parseArguments(argv) {
@@ -36,6 +41,8 @@ export function parseArguments(argv) {
     evidenceDirectory: undefined,
     javaHome: DEFAULT_JAVA_HOME,
     jar: undefined,
+    nativeExecutable: undefined,
+    expectedNativeSha256: undefined,
     cargoTargetDirectory: join(repoRoot, "target", "codex-review-redesign"),
     scope: undefined,
     fixture: "full",
@@ -65,6 +72,9 @@ export function parseArguments(argv) {
     if (argument === "--evidence-directory") parsed.evidenceDirectory = resolve(value);
     else if (argument === "--java-home") parsed.javaHome = resolve(value);
     else if (argument === "--jar") parsed.jar = resolve(value);
+    else if (argument === "--native-executable") parsed.nativeExecutable = resolve(value);
+    else if (argument === "--expected-native-sha256")
+      parsed.expectedNativeSha256 = value.toLowerCase();
     else if (argument === "--cargo-target-directory") parsed.cargoTargetDirectory = resolve(value);
     else if (argument === "--scope") parsed.scope = value;
     else if (argument === "--fixture") parsed.fixture = value;
@@ -92,6 +102,21 @@ export function parseArguments(argv) {
     }
   }
   const attaching = parsed.cdpEndpoint !== undefined;
+  if (parsed.jar !== undefined && parsed.nativeExecutable !== undefined) {
+    throw new Error("--jar and --native-executable are mutually exclusive");
+  }
+  if (
+    parsed.expectedNativeSha256 !== undefined &&
+    !/^[0-9a-f]{64}$/u.test(parsed.expectedNativeSha256)
+  ) {
+    throw new Error("--expected-native-sha256 must be a 64-character SHA-256 digest");
+  }
+  if (parsed.nativeExecutable === undefined && parsed.expectedNativeSha256 !== undefined) {
+    throw new Error("--expected-native-sha256 requires --native-executable");
+  }
+  if (parsed.nativeExecutable !== undefined && parsed.expectedNativeSha256 === undefined) {
+    throw new Error("--native-executable requires --expected-native-sha256");
+  }
   if (attaching) {
     if (
       parsed.workspaceRoot === undefined ||
@@ -106,8 +131,11 @@ export function parseArguments(argv) {
     }
     if (parsed.edgeDriver !== undefined)
       throw new Error("attach mode does not accept --edge-driver");
-  } else if (parsed.jar === undefined) {
-    throw new Error("launch mode requires --jar");
+    if (parsed.jar !== undefined || parsed.nativeExecutable !== undefined) {
+      throw new Error("attach mode does not accept --jar or --native-executable");
+    }
+  } else if (parsed.jar === undefined && parsed.nativeExecutable === undefined) {
+    throw new Error("launch mode requires --jar or --native-executable");
   }
   return parsed;
 }
@@ -285,10 +313,7 @@ export async function createReviewGitFixture(
 }
 
 /** 写入隔离 runtime 的最小合法配置，并将 Provider endpoint 固定到 runner 的 loopback fixture。 */
-export async function writeIsolatedSettings(
-  home,
-  providerBaseUrl = "http://127.0.0.1:9/v1",
-) {
+export async function writeIsolatedSettings(home, providerBaseUrl = "http://127.0.0.1:9/v1") {
   if (
     typeof providerBaseUrl !== "string" ||
     !/^https?:\/\/(?:127\.0\.0\.1|localhost):[1-9]\d{0,4}\/v1$/u.test(providerBaseUrl)
@@ -371,8 +396,13 @@ async function reservePort(excludedPorts = new Set()) {
 /** 读取 Tauri 基础与 Windows 覆盖后的主窗口，避免验收悄悄启动另一套窗口配置。 */
 async function readProductionMainWindowConfig() {
   const [baseConfig, windowsConfig] = await Promise.all([
-    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(JSON.parse),
-    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"), "utf8").then(JSON.parse),
+    readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(
+      JSON.parse,
+    ),
+    readFile(
+      join(repoRoot, "apps", "desktop", "src-tauri", "tauri.windows.conf.json"),
+      "utf8",
+    ).then(JSON.parse),
   ]);
   const baseWindow = baseConfig?.app?.windows?.find((window) => window?.label === "main");
   const windowsWindow = windowsConfig?.app?.windows?.find((window) => window?.label === "main");
@@ -383,10 +413,17 @@ async function readProductionMainWindowConfig() {
 }
 
 /**
- * 生成唯一 identifier、生产窗口和 dev origin 的私有 overlay，不修改仓库配置；隐藏窗口只在
- * 显式验收选项开启时注入，保留默认 runner 的可见行为。
+ * @author kongweiguang 生成唯一 identifier、生产窗口和 dev origin 的私有 overlay，不修改仓库配置。
+ * Native 模式只把已选 sidecar 映射到固定资源名；CDP 隐藏窗口保留可见渲染但移到屏幕外，
+ * 防止宿主鼠标覆盖合成输入，同时不取得用户前台焦点。
  */
-async function writeTauriOverlay(directories, frontendPort, useEdgeDriver, hiddenWindow = false) {
+export async function writeTauriOverlay(
+  directories,
+  frontendPort,
+  useEdgeDriver,
+  hiddenWindow = false,
+  nativeExecutable,
+) {
   const origin = `http://localhost:${frontendPort}`;
   const websocket = `ws://localhost:${frontendPort}`;
   const path = join(directories.runtime, "tauri.review-redesign.conf.json");
@@ -403,38 +440,71 @@ async function writeTauriOverlay(directories, frontendPort, useEdgeDriver, hidde
       windows: [
         {
           ...mainWindow,
-          ...(hiddenWindow ? { visible: true, focus: false, skipTaskbar: true } : {}),
+          ...(hiddenWindow
+            ? {
+                visible: true,
+                focus: false,
+                skipTaskbar: true,
+                center: false,
+                x: -10_000,
+                y: -10_000,
+              }
+            : {}),
         },
       ],
       security: {
         devCsp: `default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ${origin} ${websocket}; img-src 'self' data: blob: ja-attachment: http://ja-attachment.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
       },
     },
+    ...(nativeExecutable === undefined
+      ? {}
+      : {
+          bundle: {
+            resources: {
+              [resolve(nativeExecutable)]: "sidecars/ja-app-server-x86_64-pc-windows-msvc.exe",
+            },
+          },
+        }),
   };
   await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, "utf8");
   return path;
 }
 
-/** 验证 JDK/Node/pnpm 与 debug JAR，防止从默认 JDK 21 或旧构建启动。 */
-export async function validateToolchain({ javaHome, jar }) {
-  const java = join(javaHome, "bin", "java.exe");
+/** 验证本次选择的唯一运行产物与 Node 工具链；Native 模式不探测或借用 JDK/JAR。 */
+export async function validateToolchain({ javaHome, jar, nativeExecutable, expectedNativeSha256 }) {
+  const java = nativeExecutable === undefined ? join(javaHome, "bin", "java.exe") : undefined;
   const [javaResult, nodeResult, pnpmResult, jarStat] = await Promise.all([
-    execFileAsync(java, ["-version"], { windowsHide: true, timeout: 15_000 }),
+    java === undefined
+      ? Promise.resolve(undefined)
+      : execFileAsync(java, ["-version"], { windowsHide: true, timeout: 15_000 }),
     execFileAsync("node.exe", ["--version"], { windowsHide: true, timeout: 15_000 }),
     execFileAsync("pwsh.exe", ["-NoProfile", "-Command", "& pnpm.cmd --version"], {
       windowsHide: true,
       timeout: 15_000,
     }),
-    stat(jar),
+    stat(nativeExecutable ?? jar),
   ]);
-  const javaVersion = `${javaResult.stdout}\n${javaResult.stderr}`;
-  if (!/version "25(?:\.|"|\s)/u.test(javaVersion))
+  const javaVersion = javaResult === undefined ? "" : `${javaResult.stdout}\n${javaResult.stderr}`;
+  if (javaResult !== undefined && !/version "25(?:\.|"|\s)/u.test(javaVersion))
     throw new Error("Review runner requires JDK 25");
   if (!/^v24\./u.test(nodeResult.stdout.trim())) throw new Error("Review runner requires Node 24");
   if (pnpmResult.stdout.trim() !== "10.33.0")
     throw new Error("Review runner requires pnpm 10.33.0");
-  if (!jarStat.isFile() || jarStat.size < 1) throw new Error("Review runner JAR is empty");
-  return { java, jarSize: jarStat.size };
+  if (!jarStat.isFile() || jarStat.size < 1) {
+    throw new Error(
+      nativeExecutable === undefined ? "Review runner JAR is empty" : "Native executable is empty",
+    );
+  }
+  const nativeSha256 = nativeExecutable === undefined ? undefined : await sha256(nativeExecutable);
+  if (nativeSha256 !== undefined && nativeSha256 !== expectedNativeSha256?.toLowerCase()) {
+    throw new Error("Native executable SHA-256 does not match --expected-native-sha256");
+  }
+  return {
+    java,
+    jarSize: nativeExecutable === undefined ? jarStat.size : undefined,
+    nativeExecutableSize: nativeExecutable === undefined ? undefined : jarStat.size,
+    nativeSha256,
+  };
 }
 
 /** 验证调用方显式选择的 Microsoft EdgeDriver，并返回版本与文件身份。 */
@@ -465,7 +535,7 @@ async function locateCargoCommand() {
   return cargo;
 }
 
-/** 流式计算 JAR 身份，报告只保留 SHA-256 与大小。 */
+/** 流式计算运行产物身份，报告只保留 SHA-256 与大小，避免读取大 Native 文件到内存。 */
 async function sha256(path) {
   const digest = createHash("sha256");
   await new Promise((resolvePromise, rejectPromise) => {
@@ -477,11 +547,264 @@ async function sha256(path) {
   return digest.digest("hex");
 }
 
-/** 构造隔离 dev 进程环境；真实用户 Ja home、AppData 与 WebView UDF 均不可见。 */
+/**
+ * @author kongweiguang 单次读取最小 CIM 属性，再仅输出 launcher 后代闭包；减少逐层 WMI 往返，
+ * 不把全机 inventory 交给身份选择器或报告，Desktop 根及其并列分支仍由同一闭包判定。
+ * 显式使用 UTF-8 输出，避免 Windows 宿主代码页把中文路径损坏后误判产物不可读。
+ */
+export async function readOwnedProcessSnapshot(launcherPid) {
+  if (!Number.isSafeInteger(launcherPid) || launcherPid < 1) {
+    throw new Error("owned_tauri_launcher_pid_invalid");
+  }
+  const command =
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ` +
+    `$ErrorActionPreference = 'Stop'; ` +
+    `$inventory = [System.Collections.Generic.List[object]]::new(); ` +
+    `$inventoryCount = 0; ` +
+    `try { ` +
+    `Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,ExecutablePath ` +
+    `-ErrorAction Stop | ForEach-Object { ` +
+    `$inventoryCount += 1; ` +
+    `if ($inventoryCount -gt ${MAX_PROCESS_SNAPSHOT_INVENTORY}) { ` +
+    `throw 'JA_PROCESS_SNAPSHOT:PROCESS_INVENTORY_LIMIT' }; ` +
+    `$processPid = [long]$_.ProcessId; ` +
+    `if ($processPid -gt 0) { [void]$inventory.Add([pscustomobject]@{ ` +
+    `ProcessId = $processPid; ParentProcessId = [long]$_.ParentProcessId; ` +
+    `ExecutablePath = $_.ExecutablePath }) } ` +
+    `}; ` +
+    `} catch { ` +
+    `if ($_.Exception.Message -eq 'JA_PROCESS_SNAPSHOT:PROCESS_INVENTORY_LIMIT') { ` +
+    `[Console]::Error.WriteLine('JA_PROCESS_SNAPSHOT:PROCESS_INVENTORY_LIMIT'); exit 34 }; ` +
+    `[Console]::Error.WriteLine('JA_PROCESS_SNAPSHOT:CIM_QUERY_FAILED'); exit 31 }; ` +
+    `$childrenByParent = @{}; ` +
+    `foreach ($process in $inventory) { $parentKey = [string]$process.ParentProcessId; ` +
+    `if (-not $childrenByParent.Contains($parentKey)) { ` +
+    `$childrenByParent[$parentKey] = [System.Collections.Generic.List[object]]::new() }; ` +
+    `[void]$childrenByParent[$parentKey].Add($process) }; ` +
+    `$pending = [System.Collections.Generic.Queue[long]]::new(); ` +
+    `$pending.Enqueue([long]${launcherPid}); ` +
+    `$visited = [System.Collections.Generic.HashSet[long]]::new(); ` +
+    `[void]$visited.Add([long]${launcherPid}); ` +
+    `$descendants = [System.Collections.Generic.List[object]]::new(); ` +
+    `while ($pending.Count -gt 0) { $parentPid = $pending.Dequeue(); ` +
+    `$parentKey = [string]$parentPid; ` +
+    `if (-not $childrenByParent.Contains($parentKey)) { continue }; ` +
+    `foreach ($child in $childrenByParent[$parentKey]) { $childPid = [long]$child.ProcessId; ` +
+    `if (-not $visited.Add($childPid)) { ` +
+    `[Console]::Error.WriteLine('JA_PROCESS_SNAPSHOT:PROCESS_TREE_INVALID'); exit 35 }; ` +
+    `[void]$descendants.Add($child); ` +
+    `$desktopRoot = -not [string]::IsNullOrWhiteSpace($child.ExecutablePath) -and ` +
+    `[string]::Equals([System.IO.Path]::GetFileName($child.ExecutablePath), 'ja-desktop.exe', ` +
+    `[System.StringComparison]::OrdinalIgnoreCase); ` +
+    `if (-not $desktopRoot) { $pending.Enqueue($childPid) }; ` +
+    `if ($descendants.Count -gt ${MAX_OWNED_PROCESS_SNAPSHOT_DESCENDANTS}) { ` +
+    `[Console]::Error.WriteLine('JA_PROCESS_SNAPSHOT:PROCESS_TREE_LIMIT'); exit 32 } } }; ` +
+    `try { ConvertTo-Json -InputObject @($descendants) -Depth 2 -Compress } ` +
+    `catch { [Console]::Error.WriteLine('JA_PROCESS_SNAPSHOT:SERIALIZATION_FAILED'); exit 33 }`;
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(
+      "pwsh.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 4 * 1024 * 1024 },
+    ));
+  } catch (error) {
+    throw new Error(`owned_tauri_process_snapshot_${classifyOwnedProcessSnapshotFailure(error)}`);
+  }
+  let rows;
+  try {
+    rows = JSON.parse(stdout);
+  } catch {
+    throw new Error("owned_tauri_process_snapshot_invalid");
+  }
+  if (!Array.isArray(rows) || rows.length > 4_096) {
+    throw new Error("owned_tauri_process_snapshot_invalid");
+  }
+  return projectOwnedProcessSnapshot(rows, launcherPid);
+}
+
+/** @author kongweiguang 只把超时、输出上限、受控错误标记和退出码映射为闭集诊断，绝不回传 PowerShell 原始错误。 */
+export function classifyOwnedProcessSnapshotFailure(error) {
+  if (error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return "max_buffer";
+  if (error?.killed === true || error?.code === "ETIMEDOUT") return "timeout";
+  if (error?.code === "ENOENT") return "powershell_unavailable";
+  const stderr = typeof error?.stderr === "string" ? error.stderr : "";
+  if (stderr.includes("JA_PROCESS_SNAPSHOT:CIM_QUERY_FAILED")) return "query_failed";
+  if (stderr.includes("JA_PROCESS_SNAPSHOT:PROCESS_INVENTORY_LIMIT")) return "inventory_limit";
+  if (stderr.includes("JA_PROCESS_SNAPSHOT:PROCESS_TREE_LIMIT")) return "tree_limit";
+  if (stderr.includes("JA_PROCESS_SNAPSHOT:PROCESS_TREE_INVALID")) return "tree_invalid";
+  if (stderr.includes("JA_PROCESS_SNAPSHOT:SERIALIZATION_FAILED")) return "serialization_failed";
+  if (Number.isSafeInteger(error?.code) && error.code >= 0 && error.code <= 255) {
+    return `exit_${error.code}`;
+  }
+  return "exec_failed";
+}
+
+/**
+ * @author kongweiguang 仅投影并校验 launcher 的后代闭包；外部 inventory 允许 PID 0 的系统行，
+ * 但该行不能成为后代，最外层 Desktop 以下剪枝且任何闭包重复都失败关闭。
+ */
+export function projectOwnedProcessSnapshot(processes, launcherPid) {
+  if (!Number.isSafeInteger(launcherPid) || launcherPid < 1 || !Array.isArray(processes)) {
+    throw new Error("owned_tauri_process_snapshot_invalid");
+  }
+  if (processes.length > MAX_PROCESS_SNAPSHOT_INVENTORY) {
+    throw new Error("owned_tauri_process_inventory_limit");
+  }
+  const children = new Map();
+  const processIds = new Set();
+  for (const row of processes) {
+    const pid = row?.ProcessId;
+    const parentPid = row?.ParentProcessId;
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid < 0 ||
+      !Number.isSafeInteger(parentPid) ||
+      parentPid < 0 ||
+      (pid === 0 && parentPid !== 0) ||
+      processIds.has(pid) ||
+      (row.ExecutablePath !== null && typeof row.ExecutablePath !== "string")
+    ) {
+      throw new Error("owned_tauri_process_snapshot_invalid");
+    }
+    processIds.add(pid);
+    const siblings = children.get(parentPid) ?? [];
+    siblings.push(row);
+    children.set(parentPid, siblings);
+  }
+
+  const descendants = [];
+  const pending = [launcherPid];
+  const visited = new Set([launcherPid]);
+  for (let cursor = 0; cursor < pending.length; cursor += 1) {
+    const parentPid = pending[cursor];
+    for (const child of children.get(parentPid) ?? []) {
+      if (child.ProcessId < 1 || visited.has(child.ProcessId)) {
+        throw new Error("owned_tauri_process_tree_invalid");
+      }
+      visited.add(child.ProcessId);
+      descendants.push(child);
+      if (descendants.length > MAX_OWNED_PROCESS_SNAPSHOT_DESCENDANTS) {
+        throw new Error("owned_tauri_process_tree_limit");
+      }
+      if (
+        typeof child.ExecutablePath !== "string" ||
+        basename(child.ExecutablePath).toLowerCase() !== TAURI_DESKTOP_EXECUTABLE
+      ) {
+        pending.push(child.ProcessId);
+      }
+    }
+  }
+  return descendants;
+}
+
+/** @author kongweiguang 校验所有输入行后只沿非桌面分支找最外层候选，保留并列根歧义而不把应用子树算作主窗。 */
+export function selectOwnedTauriProcess(processes, launcherPid) {
+  const descendants = projectOwnedProcessSnapshot(processes, launcherPid);
+
+  const matches = descendants.filter(
+    ({ ExecutablePath }) =>
+      typeof ExecutablePath === "string" &&
+      basename(ExecutablePath).toLowerCase() === TAURI_DESKTOP_EXECUTABLE,
+  );
+  if (matches.length === 0) throw new Error("owned_tauri_process_missing");
+  if (matches.length !== 1) throw new Error("owned_tauri_process_ambiguous");
+  return matches[0];
+}
+
+/** @author kongweiguang 物化身份前解析 target 与 exe 的真实路径，防止构建目录外同名进程冒充本轮桌面。 */
+async function readTauriExecutableFileIdentity(executablePath, cargoTargetDirectory) {
+  if (typeof executablePath !== "string" || !isAbsolute(executablePath)) {
+    throw new Error("owned_tauri_executable_path_invalid");
+  }
+  let targetRoot;
+  let actualPath;
+  try {
+    [targetRoot, actualPath] = await Promise.all([
+      realpath(cargoTargetDirectory),
+      realpath(executablePath),
+    ]);
+  } catch {
+    throw new Error("owned_tauri_executable_unreadable");
+  }
+  const relation = relative(targetRoot, actualPath);
+  if (
+    relation === "" ||
+    relation === ".." ||
+    relation.startsWith(`..${sep}`) ||
+    isAbsolute(relation)
+  ) {
+    throw new Error("owned_tauri_executable_outside_target");
+  }
+  if (basename(actualPath).toLowerCase() !== TAURI_DESKTOP_EXECUTABLE) {
+    throw new Error("owned_tauri_executable_path_invalid");
+  }
+  let before;
+  let after;
+  let digest;
+  try {
+    before = await stat(actualPath);
+    if (!before.isFile() || before.size < 1) throw new Error("not_a_file");
+    digest = await sha256(actualPath);
+    after = await stat(actualPath);
+  } catch {
+    throw new Error("owned_tauri_executable_unreadable");
+  }
+  if (!after.isFile() || after.size !== before.size) {
+    throw new Error("owned_tauri_executable_changed_during_read");
+  }
+  return { executablePath: actualPath, sha256: digest, sizeBytes: after.size };
+}
+
+/** @author kongweiguang 记录本轮 launcher 的真实桌面后代及其磁盘指纹，不以 target 文件名推算运行身份。 */
+export async function readOwnedTauriExecutableIdentity(
+  processes,
+  launcherPid,
+  cargoTargetDirectory,
+) {
+  const app = selectOwnedTauriProcess(processes, launcherPid);
+  const fileIdentity = await readTauriExecutableFileIdentity(
+    app.ExecutablePath,
+    cargoTargetDirectory,
+  );
+  return {
+    pid: app.ProcessId,
+    launcherPid,
+    ...fileIdentity,
+  };
+}
+
+/** @author kongweiguang driver 结束后复核同一绝对路径、大小与哈希，防止报告身份被运行期间的产物漂移污染。 */
+export async function verifyOwnedTauriExecutableIdentity(identity, cargoTargetDirectory) {
+  if (
+    !Number.isSafeInteger(identity?.pid) ||
+    identity.pid < 1 ||
+    !Number.isSafeInteger(identity?.launcherPid) ||
+    identity.launcherPid < 1 ||
+    identity.pid === identity.launcherPid
+  ) {
+    throw new Error("owned_tauri_process_identity_invalid");
+  }
+  const current = await readTauriExecutableFileIdentity(
+    identity.executablePath,
+    cargoTargetDirectory,
+  );
+  assert.equal(
+    current.executablePath,
+    identity.executablePath,
+    "owned Tauri executable path changed",
+  );
+  assert.equal(current.sizeBytes, identity.sizeBytes, "owned Tauri executable size changed");
+  assert.equal(current.sha256, identity.sha256, "owned Tauri executable hash changed");
+  return current;
+}
+
+/** 构造隔离 dev 进程环境；Native 模式移除 Java/JAR 入口，所有模式隔离真实用户数据。 */
 export function buildLaunchEnvironment({
   directories,
   java,
   jar,
+  nativeExecutable,
   frontendPort,
   cdpPort,
   cargoTargetDirectory,
@@ -498,10 +821,6 @@ export function buildLaunchEnvironment({
     USERPROFILE: directories.settings,
     CARGO_HOME: process.env.CARGO_HOME?.trim() || join(process.env.USERPROFILE, ".cargo"),
     RUSTUP_HOME: process.env.RUSTUP_HOME?.trim() || join(process.env.USERPROFILE, ".rustup"),
-    JAVA_HOME: dirname(dirname(java)),
-    JA_JAVA25_HOME: dirname(dirname(java)),
-    JA_DEBUG_JAVA: java,
-    JA_DEBUG_JAR: jar,
     JA_E2E_RUNTIME_ROOT: directories.runtime,
     JA_E2E_DEV_PORT: String(frontendPort),
     VITE_JA_E2E_PROJECT_PATH: directories.workspace,
@@ -519,8 +838,23 @@ export function buildLaunchEnvironment({
           JA_E2E_EDGEDRIVER_SESSION_PATH: edgeDriverSessionPath,
           JA_E2E_WEBVIEW_DATA_DIR: join(directories.local, "main", "ja-review-edge-profile"),
         }),
-    PATH: [dirname(java), inheritedPath].filter(Boolean).join(";"),
   };
+  if (nativeExecutable === undefined) {
+    env.JAVA_HOME = dirname(dirname(java));
+    env.JA_JAVA25_HOME = dirname(dirname(java));
+    env.JA_DEBUG_JAVA = java;
+    env.JA_DEBUG_JAR = jar;
+  } else {
+    delete env.JAVA_HOME;
+    delete env.JA_JAVA25_HOME;
+    delete env.JA_DEBUG_JAVA;
+    delete env.JA_DEBUG_JAR;
+    delete env.JA_E2E_APP_SERVER_JAR;
+    env.JA_E2E_RUNTIME_MODE = "production";
+  }
+  env.PATH = [java === undefined ? undefined : dirname(java), inheritedPath]
+    .filter(Boolean)
+    .join(";");
   delete env.Path;
   for (const name of ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"]) delete env[name];
   for (const name of Object.keys(env)) {
@@ -549,11 +883,11 @@ function launchTauri({ overlay, environment }) {
   return { child, output };
 }
 
-/** 等待 CDP version endpoint，launcher 提前退出时立即失败而非耗尽完整期限。 */
+/** attach 没有本地 launcher；仅 launch 模式在子进程退出时提前失败，避免误判 CDP 冷启动。 */
 async function waitForCdp(endpoint, launch, deadline = Date.now() + 120_000) {
   const url = new URL("/json/version", endpoint).href;
   while (Date.now() < deadline) {
-    if (launch?.child.exitCode !== null) {
+    if (launch !== undefined && launch.child.exitCode !== null) {
       throw new Error(`Tauri launcher exited before CDP: ${launch.output.stderr.slice(-1000)}`);
     }
     try {
@@ -561,7 +895,7 @@ async function waitForCdp(endpoint, launch, deadline = Date.now() + 120_000) {
       const payload = await response.json();
       if (response.ok && typeof payload.webSocketDebuggerUrl === "string") return endpoint;
     } catch {
-      // CDP cold start is expected to refuse connections until WebView2 owns the port.
+      // WebView2 占用端口前，CDP 冷启动阶段可能会拒绝连接。
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
@@ -673,9 +1007,36 @@ function safeFailure(error, runRoot) {
 }
 
 /**
+ * @author kongweiguang
+ * 阶段与页面诊断仅属于默认 Review driver；专用注入 driver 的既有参数和副作用保持不变。
+ */
+export function createReviewDriverHooks(
+  driver,
+  isDefaultRun,
+  onStage = () => {},
+  reportFailureDiagnostic = () => {},
+) {
+  if (isDefaultRun !== true || driver !== runReviewRedesignWebView2) return {};
+  return {
+    setStage(stage) {
+      assert.ok(REVIEW_DRIVER_STAGES.includes(stage), "Review driver stage must be closed");
+      onStage(stage);
+    },
+    onFailureDiagnostic(candidate) {
+      const diagnostic = sanitizeReviewThreadFailureDiagnostic(candidate);
+      if (diagnostic !== undefined) reportFailureDiagnostic(diagnostic);
+    },
+  };
+}
+
+/**
+ * @author kongweiguang
  * 执行 attach 或自主 launch 模式，并原子发布 JSON 报告。非 CLI 调用可注入窄场景 driver，
  * 以复用相同的 profile、进程与清理所有权；启动前夹具钩子只拿本轮随机 Temp 目录，
- * 旧数据库等特殊验收必须在 Java sidecar 首次启动前写完。
+ * 旧数据库等特殊验收必须在 Java sidecar 首次启动前写完；已校验的 Native identity 只交给本轮 driver，
+ * Tauri identity 则在 CDP ready 后从本轮 launcher 的真实后代捕获并于 driver 后复核；报告门禁先于
+ * 接管测量结果，以便失败时保留隔离现场并继续由 launcher owner 负责清理。默认 Review driver 的失败
+ * 阶段与脱敏 Thread readiness 诊断随报告保存，不把通用 hook 强加给其他注入 driver。
  */
 export async function runProduction(options) {
   await mkdir(options.evidenceDirectory, { recursive: true });
@@ -694,6 +1055,10 @@ export async function runProduction(options) {
   let fixtureFacts;
   let edgeDriverIdentity;
   let edgeDriverSession;
+  let nativeImageIdentity;
+  let tauriExecutableIdentity;
+  let driverStage;
+  let driverDiagnostic;
   try {
     let endpoint = options.cdpEndpoint;
     if (endpoint === undefined) {
@@ -707,12 +1072,22 @@ export async function runProduction(options) {
           : validateEdgeDriver(options.edgeDriver),
       ]);
       edgeDriverIdentity = validatedEdgeDriver;
+      if (options.nativeExecutable !== undefined) {
+        const nativeStat = await stat(options.nativeExecutable);
+        if (!nativeStat.isFile() || nativeStat.size < 1) {
+          throw new Error("Native executable is empty");
+        }
+        nativeImageIdentity = {
+          sha256: toolchain.nativeSha256,
+          sizeBytes: nativeStat.size,
+          resourceName: "sidecars/ja-app-server-x86_64-pc-windows-msvc.exe",
+          noFallback: true,
+          sourceHashMatched: toolchain.nativeSha256 === options.expectedNativeSha256,
+        };
+      }
       [fixtureFacts] = await Promise.all([
         createReviewGitFixture(directories.workspace, options),
-        writeIsolatedSettings(
-          directories.home,
-          options.providerBaseUrl,
-        ),
+        writeIsolatedSettings(directories.home, options.providerBaseUrl),
       ]);
       if (options.prepareIsolatedHome !== undefined) {
         await options.prepareIsolatedHome({
@@ -730,11 +1105,13 @@ export async function runProduction(options) {
         frontendPort,
         options.edgeDriver !== undefined,
         options.hiddenWindow === true,
+        options.nativeExecutable,
       );
       const environment = buildLaunchEnvironment({
         directories,
         java: toolchain.java,
         jar: options.jar,
+        nativeExecutable: options.nativeExecutable,
         frontendPort,
         cdpPort: automationPort,
         cargoTargetDirectory: options.cargoTargetDirectory,
@@ -772,18 +1149,47 @@ export async function runProduction(options) {
     }
     browser = await chromium.connectOverCDP(endpoint);
     const page = await findTauriPage(browser, frontendPort);
-    report = await driver({
+    if (launch !== undefined) {
+      const processSnapshot = await readOwnedProcessSnapshot(launch.child.pid);
+      tauriExecutableIdentity = await readOwnedTauriExecutableIdentity(
+        processSnapshot,
+        launch.child.pid,
+        options.cargoTargetDirectory,
+      );
+    }
+    const driverHooks = createReviewDriverHooks(
+      driver,
+      options.driver === undefined,
+      (stage) => {
+        driverStage = stage;
+      },
+      (diagnostic) => {
+        driverDiagnostic = diagnostic;
+      },
+    );
+    const driverReport = await driver({
       page,
       workspaceRoot: directories.workspace,
       evidenceDirectory: join(options.evidenceDirectory, "screenshots"),
       scope: options.scope,
       isolatedRuntimeHome: directories.home,
+      isolatedRuntimeDirectory: directories.runtime ?? join(directories.root, "runtime"),
+      nativeImageIdentity,
+      ...driverHooks,
     });
-    report.execution = {
-      boundary: options.cdpEndpoint === undefined ? "debug_jar" : "external_cdp",
-      nativeImageVerified: false,
+    driverReport.execution = {
+      boundary:
+        options.cdpEndpoint !== undefined
+          ? "external_cdp"
+          : nativeImageIdentity === undefined
+            ? "debug_jar"
+            : "native_sidecar",
+      nativeImageVerified: nativeImageIdentity !== undefined,
+      nativeImage: nativeImageIdentity,
       fixture: options.fixture,
       fixtureFacts,
+      ...(driverStage === undefined ? {} : { driverStage }),
+      ...(tauriExecutableIdentity === undefined ? {} : { tauri: tauriExecutableIdentity }),
       edgeDriver:
         edgeDriverIdentity === undefined
           ? undefined
@@ -798,21 +1204,44 @@ export async function runProduction(options) {
           ? undefined
           : { sha256: await sha256(options.jar), size: (await stat(options.jar)).size },
     };
-    await validateReport?.(report);
+    if (nativeImageIdentity !== undefined) {
+      const currentStat = await stat(options.nativeExecutable);
+      assert.equal(currentStat.size, nativeImageIdentity.sizeBytes);
+      assert.equal(await sha256(options.nativeExecutable), nativeImageIdentity.sha256);
+    }
+    if (tauriExecutableIdentity !== undefined) {
+      await verifyOwnedTauriExecutableIdentity(
+        tauriExecutableIdentity,
+        options.cargoTargetDirectory,
+      );
+    }
+    await validateReport?.(driverReport);
+    report = driverReport;
     await writeFile(
       join(options.evidenceDirectory, reportFileName),
-      `${JSON.stringify(report, null, 2)}\n`,
+      `${JSON.stringify(driverReport, null, 2)}\n`,
       "utf8",
     );
-    return report;
+    return driverReport;
   } catch (error) {
     const failure = {
       // 可选保留隔离失败现场只用于测试诊断，不改变owned进程的清理责任。
       contractVersion: 1,
       verdict: "FAIL",
       scope: options.scope,
-      runtimeBoundary: options.cdpEndpoint === undefined ? "debug_jar" : "external_cdp",
+      runtimeBoundary:
+        options.cdpEndpoint !== undefined
+          ? "external_cdp"
+          : options.nativeExecutable === undefined
+            ? "debug_jar"
+            : "native_sidecar",
       nativeImageVerified: false,
+      nativeImage: nativeImageIdentity,
+      ...(driverStage === undefined ? {} : { driverStage }),
+      ...(driverDiagnostic === undefined ? {} : { driverDiagnostic }),
+      ...(tauriExecutableIdentity === undefined
+        ? {}
+        : { execution: { tauri: tauriExecutableIdentity } }),
       error: safeFailure(error, directories?.root),
     };
     if (options.preserveFailedProfile === true && directories?.root !== undefined) {
@@ -851,7 +1280,7 @@ export async function runProduction(options) {
 }
 
 /** 只做工具链、路径与 fixture 参数预检，不启动 Tauri 或写 Git workspace。 */
-async function runPreflight(options) {
+export async function runPreflight(options) {
   if (options.cdpEndpoint === undefined) {
     await validateToolchain(options);
     if (options.edgeDriver !== undefined) {
@@ -864,7 +1293,7 @@ async function runPreflight(options) {
   return {
     status: "ready",
     scope: options.scope,
-    runtimeBoundary: "debug_jar",
+    runtimeBoundary: options.nativeExecutable === undefined ? "debug_jar" : "native_sidecar",
     nativeImageVerified: false,
   };
 }

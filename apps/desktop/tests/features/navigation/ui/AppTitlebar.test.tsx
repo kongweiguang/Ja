@@ -49,6 +49,7 @@ describe("AppTitlebar", () => {
     expect(screen.getAllByRole("button")).toHaveLength(6);
     expect(root.querySelector(".ja-titlebar-caption")).not.toBeInTheDocument();
     expect(screen.queryByText("Ja")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新连接" })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "最小化" }));
     await user.click(screen.getByRole("button", { name: "最大化" }));
@@ -148,6 +149,37 @@ describe("AppTitlebar", () => {
     expect(screen.getByRole("button", { name: "关闭" })).toHaveAttribute("aria-busy", "true");
     fireEvent.doubleClick(screen.getByRole("banner", { name: "应用标题栏" }));
     expect(invokeWindowActionMock).not.toHaveBeenCalled();
+  });
+
+  /** 标题栏只转发已有重连动作；等待态仍保留稳定图标位置并隔离原生窗口手势。 */
+  it("shows an optional reconnect icon and disables it while the owner is reconnecting", async () => {
+    const user = userEvent.setup();
+    const onReconnect = vi.fn(async () => undefined);
+    const props = { ...titlebarProps(), onReconnect };
+    const { rerender } = render(<AppTitlebar {...props} />);
+    const reconnect = screen.getByRole("button", { name: "重新连接" });
+    expect(reconnect).toHaveClass("ja-titlebar-button");
+    expect(reconnect.querySelector(".lucide-rotate-cw")).toBeInTheDocument();
+    expect(reconnect).not.toHaveTextContent("重新连接");
+    await user.hover(reconnect);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("重新连接");
+    await user.unhover(reconnect);
+    await user.click(reconnect);
+    expect(onReconnect).toHaveBeenCalledOnce();
+
+    rerender(<AppTitlebar {...props} reconnectPending />);
+    expect(reconnect).toBeDisabled();
+    expect(reconnect).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(reconnect);
+    fireEvent.doubleClick(reconnect);
+    expect(onReconnect).toHaveBeenCalledOnce();
+    expect(invokeWindowActionMock).not.toHaveBeenCalled();
+
+    rerender(<AppTitlebar {...props} />);
+    await user.click(reconnect);
+    expect(onReconnect).toHaveBeenCalledTimes(2);
+    rerender(<AppTitlebar {...titlebarProps()} />);
+    expect(screen.queryByRole("button", { name: "重新连接" })).not.toBeInTheDocument();
   });
 
   it("keeps navigation state accessible and dispatches enabled actions", async () => {

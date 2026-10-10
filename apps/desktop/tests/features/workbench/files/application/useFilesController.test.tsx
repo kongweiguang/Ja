@@ -13,7 +13,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FilesWorkspaceLifecycle } from "@/features/workbench/files";
 import type {
   FilesControllerPorts,
@@ -65,14 +65,6 @@ vi.mock("@/features/workbench/editor", async (importOriginal) => {
       />
     ),
   };
-});
-
-/** 为真实 MergeView 补齐无布局环境下的 Range 合同，使冲突测试不依赖浏览器几何。 */
-beforeAll(() => {
-  Object.defineProperty(Range.prototype, "getClientRects", {
-    configurable: true,
-    value: () => [] as unknown as DOMRectList,
-  });
 });
 
 afterEach(() => {
@@ -1646,32 +1638,141 @@ describe("FilesWorkspace", () => {
     }
   });
 
+  /**
+   * @author kongweiguang
+   * 固定 500ms debounce 尚未到期的交错；测试线程调度不能把“待保存”变成“保存中”并改变 Rename 合同。
+   */
   it("remaps the open document path, revision and pending autosave after rename", async () => {
     const { operations } = createOperations();
-    const user = userEvent.setup();
+    const renameAck = deferred<{ revision: FileRevision }>();
+    vi.mocked(operations.moveEntry!).mockReturnValueOnce(renameAck.promise);
     render(<FilesWorkspace workspaceId="ws_test" operations={operations} />);
     await screen.findByText("main.ts");
     fireEvent.click(screen.getByText("main.ts"));
     const editor = await screen.findByRole("textbox", { name: "编辑文件 main.ts" });
+    vi.useFakeTimers();
     fireEvent.change(editor, { target: { value: "dirty before rename" } });
+    expect(operations.saveFile).not.toHaveBeenCalled();
     fireEvent.contextMenu(within(screen.getByTestId("file-tree")).getByText("main.ts"));
-    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
+    const renameBeforeChange = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    fireEvent.change(renameBeforeChange, { target: { value: "index.ts" } });
     const rename = screen.getByRole("textbox", { name: "重命名 main.ts" });
-    await user.clear(rename);
-    await user.type(rename, "index.ts");
-    await user.keyboard("{Enter}");
-
-    const movedEditor = await screen.findByRole("textbox", { name: "编辑文件 index.ts" });
-    fireEvent.keyDown(movedEditor, { key: "s", ctrlKey: true });
-    await waitFor(() =>
-      expect(operations.saveFile).toHaveBeenCalledWith(
-        expect.objectContaining({
-          relativePath: "index.ts",
-          expectedRevision: revision("file", "move-r"),
-          content: "dirty before rename",
-        }),
-      ),
+    expect(rename).toHaveValue("index.ts");
+    fireEvent.keyDown(rename, { key: "Enter" });
+    expect(operations.moveEntry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relativePath: "main.ts",
+        newName: "index.ts",
+        expectedRevision: revision("file", "r1"),
+      }),
     );
+    await act(async () => {
+      renameAck.resolve({ revision: revision("file", "move-r") });
+      await renameAck.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const movedEditor = screen.getByRole("textbox", { name: "编辑文件 index.ts" });
+    expect(operations.saveFile).not.toHaveBeenCalled();
+    expect(movedEditor).toHaveValue("dirty before rename");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+      await Promise.resolve();
+    });
+    expect(operations.saveFile).toHaveBeenCalledTimes(1);
+    expect(operations.saveFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relativePath: "index.ts",
+        expectedRevision: revision("file", "move-r"),
+        content: "dirty before rename",
+      }),
+    );
+  });
+
+  /**
+   * @author kongweiguang
+   * 区分已开始的 CAS 与可迁移 debounce：在途写入不自动重发或丢草稿，用户只能在 ACK 后显式重试 Rename。
+   */
+  it("keeps the original draft when autosave is in flight and allows an explicit rename retry after ACK", async () => {
+    const { operations, resolveSave } = createOperations();
+    const onNotice = vi.fn();
+    render(<FilesWorkspace workspaceId="ws_test" operations={operations} onNotice={onNotice} />);
+    await screen.findByText("main.ts");
+    fireEvent.click(screen.getByText("main.ts"));
+    const editor = await screen.findByRole("textbox", { name: "编辑文件 main.ts" });
+    vi.useFakeTimers();
+    fireEvent.change(editor, { target: { value: "draft while saving" } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+      await Promise.resolve();
+    });
+    expect(operations.saveFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relativePath: "main.ts",
+        expectedRevision: revision("file", "r1"),
+        content: "draft while saving",
+      }),
+    );
+    fireEvent.contextMenu(within(screen.getByTestId("file-tree")).getByText("main.ts"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
+    const blockedRenameBeforeChange = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    fireEvent.change(blockedRenameBeforeChange, { target: { value: "index.ts" } });
+    const blockedRename = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    expect(blockedRename).toHaveValue("index.ts");
+    fireEvent.keyDown(blockedRename, { key: "Enter" });
+    expect(screen.queryByRole("textbox", { name: "重命名 main.ts" })).not.toBeInTheDocument();
+
+    expect(operations.moveEntry).not.toHaveBeenCalled();
+    expect(onNotice).toHaveBeenCalledWith("文件正在保存，请保存完成后再移动。");
+    expect(screen.getByRole("textbox", { name: "编辑文件 main.ts" })).toHaveValue(
+      "draft while saving",
+    );
+    expect(screen.queryByRole("textbox", { name: "编辑文件 index.ts" })).not.toBeInTheDocument();
+
+    const saveRequest = vi.mocked(operations.saveFile).mock.calls[0]?.[0];
+    const savePromise = vi.mocked(operations.saveFile).mock.results[0]?.value as
+      | Promise<FileSaveResult>
+      | undefined;
+    expect(saveRequest).toBeDefined();
+    expect(savePromise).toBeDefined();
+    await act(async () => {
+      resolveSave({ revision: revision("file", "saved-r"), mutationId: saveRequest!.mutationId });
+      await savePromise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const renameAck = deferred<{ revision: FileRevision }>();
+    vi.mocked(operations.moveEntry!).mockReturnValueOnce(renameAck.promise);
+    fireEvent.contextMenu(within(screen.getByTestId("file-tree")).getByText("main.ts"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
+    const retryRenameBeforeChange = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    fireEvent.change(retryRenameBeforeChange, { target: { value: "index.ts" } });
+    const retryRename = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    expect(retryRename).toHaveValue("index.ts");
+    fireEvent.keyDown(retryRename, { key: "Enter" });
+    expect(operations.moveEntry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relativePath: "main.ts",
+        targetDirectory: "",
+        newName: "index.ts",
+        expectedRevision: revision("file", "saved-r"),
+      }),
+    );
+    await act(async () => {
+      renameAck.resolve({ revision: revision("file", "move-r") });
+      await renameAck.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("textbox", { name: "编辑文件 index.ts" })).toBeInTheDocument();
+    expect(operations.moveEntry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "编辑文件 index.ts" })).toHaveValue(
+      "draft while saving",
+    );
+    expect(operations.saveFile).toHaveBeenCalledTimes(1);
   });
 
   it("waits for the latest save before granting a workspace-change lease", async () => {

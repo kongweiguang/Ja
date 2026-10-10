@@ -7,8 +7,7 @@ use crate::app_server_process::error::AppServerProcessError;
 use crate::app_server_process::lifecycle::RestartPolicy;
 use crate::app_server_process::protocol;
 use crate::app_server_process::protocol::{
-    Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, contains_secret_marker,
-    validate_initialize_params,
+    Limits, MAX_READY_TIMEOUT, MAX_SHUTDOWN_TIMEOUT, validate_initialize_params,
 };
 use base64::Engine as _;
 use std::collections::BTreeMap;
@@ -256,8 +255,7 @@ impl SidecarConfig {
             .map_err(|_| AppServerProcessError::InvalidConfig)?;
         if self.args.iter().any(|arg| {
             let value = arg.to_string_lossy();
-            contains_secret_marker(&value)
-                || value == "--ja-runtime-generation"
+            value == "--ja-runtime-generation"
                 || value.starts_with("--ja-runtime-generation=")
                 || value == "--ja-transport"
                 || value.starts_with("--ja-transport=")

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 /// 证明 outbound c: ID 由单调整数保证不复用，不需要随请求总量增长的 seen 集合。
 #[test]
-fn outbound_request_ids_are_never_reused_or_evicted() {
-    let mut ledger = OutboundRequestLedger::new();
+fn outbound_rpc_request_ids_are_never_reused_or_evicted() {
+    let mut ledger = OutboundRpcRequestLedger::new();
     let mut seen = HashSet::new();
     for _ in 0..10_000 {
         assert!(seen.insert(ledger.allocate().unwrap()));
@@ -19,7 +19,7 @@ fn outbound_request_ids_are_never_reused_or_evicted() {
     ledger.next = u64::MAX;
     assert_eq!(
         ledger.allocate(),
-        Err(AppServerProcessError::RequestLedgerExhausted)
+        Err(AppServerProcessError::RpcRequestLedgerExhausted)
     );
 }
 

@@ -32,7 +32,7 @@ const requestTimeoutMs = 30_000;
 /** 只接受显式环境或当前唯一 app-server 构建目录中的非空 fat JAR。 */
 async function resolveJar() {
   const jar = resolve(process.env.JA_KERNEL_SMOKE_JAR
-    ?? join(repoRoot, "app-server", "target", "ja-app-server.jar"));
+    ?? join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar"));
   const metadata = await stat(jar);
   if (!metadata.isFile() || metadata.size === 0) throw new Error("Ja App Server JAR is unavailable");
   return jar;

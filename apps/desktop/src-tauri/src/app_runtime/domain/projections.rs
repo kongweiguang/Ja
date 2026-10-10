@@ -8,16 +8,14 @@
 pub enum WorkspaceKind {
     Project,
     Session,
-    LegacyShared,
 }
 
 impl WorkspaceKind {
-    /// JA-RPC 以固定 wire 名称区分项目、会话和旧共享根，未知值必须失败关闭。
+    /// JA-RPC 只允许真实项目与临时会话，未知或旧类型必须失败关闭。
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "project" => Some(Self::Project),
             "session" => Some(Self::Session),
-            "legacy_shared" => Some(Self::LegacyShared),
             _ => None,
         }
     }
@@ -27,7 +25,6 @@ impl WorkspaceKind {
         match self {
             Self::Project => "project",
             Self::Session => "session",
-            Self::LegacyShared => "legacy_shared",
         }
     }
 }
@@ -41,7 +38,6 @@ pub struct WorkspaceDto {
     pub trust: String,
     pub revision: u64,
     pub kind: WorkspaceKind,
-    pub legacy_shared_workspace_id: Option<String>,
 }
 
 /// Thread 切换时返回已校验的 Java root，Renderer 可以展示它但不能将其作为 native 输入。
@@ -52,7 +48,6 @@ pub struct WorkspaceActivation {
     pub display_name: String,
     pub trust: String,
     pub kind: WorkspaceKind,
-    pub legacy_shared_workspace_id: Option<String>,
 }
 
 /// Settings 页面只需要脱敏目录事实；启动参数与环境始终留在 infrastructure。
@@ -63,6 +58,18 @@ pub struct RuntimeStorageInfo {
     pub log_path: Option<String>,
     pub cache_path: Option<String>,
     pub last_backup: Option<String>,
+    pub storage_recovery: Option<StorageRecovery>,
+}
+
+/// 恢复决策由 Java 负责；宿主仅携带稳定事实和不透明的备份身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRecovery {
+    pub id: String,
+    pub phase: String,
+    pub reason: Option<String>,
+    pub history_available: bool,
+    pub backup_available: bool,
+    pub rebuilt: bool,
 }
 
 /// Java 受管附件的最小原生投影；hash、workspace、时间与物理路径不会继续进入 WebView。

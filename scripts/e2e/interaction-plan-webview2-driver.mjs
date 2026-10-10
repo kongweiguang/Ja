@@ -204,7 +204,6 @@ export function createInteractionPlanWebView2Driver(options) {
     runExecutionScenario,
     runRecoveryScenario,
     runIsolationScenario,
-    runGoalRegressionScenario,
     runSoakScenario,
     recordStage = () => {},
   } = options;
@@ -1133,11 +1132,6 @@ export function createInteractionPlanWebView2Driver(options) {
     return frames;
   }
 
-  async function goalRegressionEvidence() {
-    recordStage("interaction_plan:goal-regression");
-    return requiredCallback(runGoalRegressionScenario, "runGoalRegressionScenario")();
-  }
-
   async function soakEvidence() {
     recordStage("interaction_plan:soak");
     return requiredCallback(runSoakScenario, "runSoakScenario")();
@@ -1151,7 +1145,6 @@ export function createInteractionPlanWebView2Driver(options) {
     recoveryEvidence,
     isolationEvidence,
     visualEvidence,
-    goalRegressionEvidence,
     soakEvidence,
   });
 }

@@ -3,7 +3,7 @@
 
 import { useEffect, useState, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
-import { ConversationTimelineSurface } from "@/app/composition/ConversationTimelineSurface";
+import { ConversationTimelineSurface } from "@/features/conversation";
 import { NavigationSidebar, type ThreadProjection } from "@/features/navigation";
 import {
   Composer,
@@ -46,6 +46,7 @@ const PREFERENCES: ComposerPreferences = {
 };
 
 const RUNNING_TURN: TimelineTurn = {
+  origin: "native" as const,
   threadId: THREAD_ID,
   turnId: TURN_ID,
   status: "running",
@@ -89,7 +90,6 @@ function prepareTimeline(): void {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: null,
       nextCursor: null,
     },
@@ -163,6 +163,7 @@ export function StreamingStabilityBrowserFixture() {
             currentThreadId={THREAD_ID}
             threads={threads}
             historyBusy={historyBusy}
+            historyHasError={false}
             newConversationDisabled={false}
             projectBusy={false}
             compact={false}
@@ -170,8 +171,11 @@ export function StreamingStabilityBrowserFixture() {
             activeAction="workspace"
             conversationSearchOpen={false}
             onNewConversation={() => undefined}
+            onNewConversationForProject={() => undefined}
             onSelectConversation={() => undefined}
+            onEditProject={() => undefined}
             onOpenProjectFolder={openProjectFolderFixture}
+            onCopyProjectPath={async () => undefined}
             onOpenConversationSearch={() => undefined}
             onRenameConversation={async () => undefined}
             onPinConversation={async () => undefined}
@@ -186,7 +190,6 @@ export function StreamingStabilityBrowserFixture() {
             onOpenSettings={() => undefined}
             onRequestClose={() => undefined}
             onOpenWorkspaceFolder={async () => undefined}
-            onOpenLegacySharedFolder={async () => undefined}
           />
         </div>
         <div className="ja-workspace-stage">
@@ -369,7 +372,14 @@ window.__JA_STREAMING_STABILITY__ = {
         occurredAt: "2026-09-20T00:00:10Z",
         state: "completed",
         summary: "完成",
-        finalMessage: { messageId: "item_streaming_stability_final", text: finalText },
+        summaryTotalCharacters: 2,
+        summaryTruncated: false,
+        finalMessage: {
+          messageId: "item_streaming_stability_final",
+          text: finalText,
+          totalCharacters: Array.from(finalText).length,
+          truncated: false,
+        },
         changeSet: {
           state: "complete",
           incompleteReasons: [],

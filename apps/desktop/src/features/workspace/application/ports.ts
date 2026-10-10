@@ -4,8 +4,7 @@
 /** application 只需要 Host 已校验过的 workspace 事实，不依赖具体 Tauri DTO。 */
 interface WorkspaceCatalogRecord {
   workspaceId: string;
-  kind: "project" | "session" | "legacy_shared";
-  legacySharedWorkspaceId: string | null;
+  kind: "project" | "session";
   root: string;
   displayName: string;
   trust: "trusted" | "untrusted";
@@ -33,7 +32,20 @@ export interface WorkspaceRuntimeState {
  * mutation 能力；production adapter 通过 TypeScript 结构类型直接注入。
  */
 export interface WorkspaceHistoryPort {
-  workspaceOpen?: (input: { cwd: string; displayName?: string }) => Promise<WorkspaceCatalogRecord>;
+  workspaceOpen?: (
+    input: { cwd: string; displayName?: string } | { workspaceId: string },
+  ) => Promise<WorkspaceCatalogRecord>;
+  workspaceRead?: (input: { workspaceId: string }) => Promise<WorkspaceCatalogRecord>;
+  workspaceUpdate?: (input: {
+    workspaceId: string;
+    expectedRevision: number;
+    displayName?: string;
+    cwd?: string;
+  }) => Promise<WorkspaceCatalogRecord>;
+  workspaceSetTrust(input: {
+    workspaceId: string;
+    trust: WorkspaceCatalogRecord["trust"];
+  }): Promise<{ accepted: true }>;
   workspaceList(input?: {
     kind?: WorkspaceCatalogRecord["kind"];
     cursor?: string;
@@ -47,8 +59,7 @@ export interface WorkspaceHistoryPort {
 /** Rust activation 投影包含 canonical root；renderer 只消费此值，不把路径传回 native。 */
 export interface WorkspaceActivationRecord {
   workspaceId: string;
-  kind: "project" | "session" | "legacy_shared";
-  legacySharedWorkspaceId: string | null;
+  kind: "project" | "session";
   rootPath: string;
   displayName: string;
   trust: "trusted" | "untrusted";

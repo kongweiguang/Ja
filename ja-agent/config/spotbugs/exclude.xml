@@ -1,0 +1,771 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- @author kongweiguang -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<FindBugsFilter>
+    <!-- 当前不建立历史 baseline；只有带中文技术原因的精确 bug pattern/class 才能加入。 -->
+
+    <!-- 关闭与 deadline 边界必须原样传播分类后的运行时失败，不能吞掉资源根因。 -->
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.agent.application.service.AgentEngineService"/><Method name="awaitClosed"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.agent.shared.DeadlineBudget"/><Method name="await"/></Match>
+    <!-- 基础设施 codec 与其 application.gateway 合同必须保持领域术语一致。 -->
+    <Match><Bug pattern="NM_SAME_SIMPLE_NAME_AS_INTERFACE"/><Class name="io.github.kongweiguang.ja.agent.infrastructure.persistence.ExtensionFactRecordCodec"/></Match>
+    <Match><Bug pattern="NM_SAME_SIMPLE_NAME_AS_INTERFACE"/><Class name="io.github.kongweiguang.ja.agent.infrastructure.persistence.MiddlewareStateRecordCodec"/></Match>
+
+    <!-- 两种 Store 初始化只执行各自模块内固定版本的 classpath DDL；无调用方 SQL 输入。 -->
+    <Match>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+        <Or>
+            <Class name="io.github.kongweiguang.ja.agent.store.local.infrastructure.SQLiteAgentStore"/>
+            <Class name="io.github.kongweiguang.ja.agent.store.pg.infrastructure.PostgresAgentStore"/>
+        </Or>
+        <Method name="initializeSchema"/>
+    </Match>
+    <!-- 写入先回滚后原样重抛已分类失败，读取和回执写入保留冲突/不可用的具体异常身份。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Or>
+            <Class name="io.github.kongweiguang.ja.agent.store.local.infrastructure.SQLiteAgentStore"/>
+            <Class name="io.github.kongweiguang.ja.agent.store.pg.infrastructure.PostgresAgentStore"/>
+        </Or>
+        <Method name="~(write|read|insertOperationReceiptUnchecked)"/>
+    </Match>
+    <!-- Skill schema 仅迭代私有固定 DDL 数组；分页只在两条编译期常量 SQL 间选择，所有值独立绑定。 -->
+    <Match>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+        <Class name="io.github.kongweiguang.ja.agent.skills.pg.infrastructure.PostgresSkillSchema"/>
+        <Method name="install"/>
+    </Match>
+    <Match>
+        <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+        <Class name="io.github.kongweiguang.ja.agent.skills.pg.infrastructure.PostgresSkillSource"/>
+        <Method name="readPage"/>
+    </Match>
+    <!-- 生命周期边界保留首要关闭异常的身份，调用方据此区分超时、取消和真实释放失败。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.bootstrap.RuntimeResourceLifecycle"/>
+        <Method name="~(awaitCompletion|closeOwnedResources|closeWithinDeadline)"/>
+    </Match>
+    <!-- MCP 的序列化调用与限时初始化必须先释放临时资源，再透传原始取消或端口失败。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpRuntime"/>
+        <Method name="~(initializeSessions|invokeSerialized)"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.runtime.McpRuntimeLifecycle"/>
+        <Method name="executeServerWithin"/>
+    </Match>
+    <!-- 工具短租约绑定失败后原样重抛，不能把资源失败改成新的模型或存储类别。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.bootstrap.runtime.ConfigurationTurnRuntimeResolver"/>
+        <Method name="~lambda\$toolSessions\$[0-9]+"/>
+    </Match>
+    <!-- 凭据读取在唯一边界分类；已分类异常保持身份，正文不进入公开错误消息。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.configuration.adapter.out.security.windows.CredentialStore"/>
+        <Method name="load"/>
+    </Match>
+    <!-- 队列只映射已确认的冲突或容量错误，未知存储失败不能伪装成未找到或队列已满。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.service.TurnService"/>
+        <Method name="~(enqueueTaskMessage|mutate)"/>
+    </Match>
+    <!-- 两个短租约保留 unchecked 关闭原因，只有 checked 关闭失败才包装为状态异常。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.title.AutomaticThreadTitleScheduler$RequestRuntime"/>
+        <Method name="close"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.port.out.RuntimeLease"/>
+        <Method name="close"/>
+    </Match>
+    <!-- 受理失败先解除本次运行登记，再透传已分类原因供唯一 RPC 错误映射处理。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.handler.TurnApprovalHandler"/>
+        <Method name="~(continueQuestion|reask|respond|resume|startCurrent|lambda\$respond\$[0-9]+)"/>
+    </Match>
+    <!-- 连接、运行时与观察资源只有一个 owner；清理失败必须沿关闭调用链保留。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.runtime.RpcServer"/>
+        <Method name="closeOwnedConnection"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession"/>
+        <Method name="~(beginShutdown|closeOwnedRuntime|observeInteraction|observePlan)"/>
+    </Match>
+
+    <!-- 进程退出先逐个关闭 owner，后续故障作为 suppressed；首要关闭异常必须保留原身份。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.bootstrap.RecoverableRuntimeBootstrap"/>
+        <Method name="close" params="io.github.kongweiguang.ja.agent.application.concurrent.ShutdownDeadline" returns="void"/>
+    </Match>
+    <!-- 本次交接的取消 hook 和 runtime 均先尝试关闭；已分类故障原样返回以支持下次继续清理。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.service.TurnService"/>
+        <Method name="throwCloseFailure" params="java.lang.Throwable" returns="void"/>
+    </Match>
+    <!-- Turn 成功也必须等待 ledger 结算；ledger 的首要故障保持原身份，不能报告虚假的业务完成。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanExecutionTurnAdapter"/>
+        <Method name="~lambda\$settleCompletion\$[0-9]+" params="java.lang.Runnable,java.lang.Object,java.lang.Throwable" returns="java.lang.Void"/>
+    </Match>
+    <!-- wait 准入失败先撤销 waiter 与 timer，再同步重抛原故障；异步失败会改变未受理语义。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.collaboration.application.TaskCoordinator"/>
+        <Method name="waitAgents" params="java.util.Set,java.time.Duration,io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken" returns="java.util.concurrent.CompletionStage"/>
+    </Match>
+    <!-- 两个事务入口先整体回滚并关闭 session；已分类的 Store/Plan 故障保持原实例与错误类别。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.adapter.out.persistence.PlanUnitOfWork"/>
+        <Method name="required" params="io.github.kongweiguang.ja.plan.adapter.out.persistence.PlanUnitOfWork$Work" returns="java.lang.Object"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.adapter.out.persistence.PlanUnitOfWork"/>
+        <Method name="solonTransaction" params="org.apache.ibatis.session.SqlSessionFactory,io.github.kongweiguang.ja.plan.adapter.out.persistence.PlanUnitOfWork$Work" returns="java.lang.Object"/>
+    </Match>
+    <!-- 占位符数量只取自私有固定 Goal 拒绝清单；全部名称独立 setString，调用方无法输入 SQL。 -->
+    <Match>
+        <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.database.JaDatabase"/>
+        <Method name="hasRemovedGoalSchema" params="org.sqlite.SQLiteDataSource" returns="boolean"/>
+    </Match>
+    <!-- JDK 25 record pattern 在 PC 287/514 将 accessor 值经合成 slot 23 转存到真实绑定；
+         LVT 的源码变量 kind 只覆盖 PC 383..424。仅排除此方法无源码名称的临时 store，保留具名 DLS。 -->
+    <Match>
+        <Bug pattern="DLS_DEAD_LOCAL_STORE"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.store.JaTransactionParticipant"/>
+        <Method name="applyMessages" params="java.sql.Connection,io.github.kongweiguang.ja.agent.application.gateway.store.JdbcTransactionContext,java.util.Map,java.util.Set,io.github.kongweiguang.ja.agent.domain.execution.ExecutionEvent$Terminal" returns="void"/>
+        <Local name="?"/>
+    </Match>
+    <!-- 装配失败仍须关闭每个临时输入；首要故障与 suppressed 清理诊断不能重新分类或丢失。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.bootstrap.runtime.ConfigurationTurnRuntimeResolver"/>
+        <Method name="closeRuntimeInputs" params="java.lang.Throwable,java.lang.AutoCloseable[]" returns="void"/>
+    </Match>
+    <!-- Gateway 获取失败先归还 reservation；快照关闭逐项释放租约，失败由唯一资源 owner 处理。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTurnMcpSessionFactory$CatalogSnapshot"/>
+        <Method name="openGateway" params="com.fasterxml.jackson.databind.ObjectMapper,java.util.function.BooleanSupplier" returns="io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.SharedMcpGateway"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTurnMcpSessionFactory$CatalogSnapshot"/>
+        <Method name="close" params="" returns="void"/>
+    </Match>
+    <!-- FFM Arena 关闭失败必须传回 Win32 句柄 owner，不能把未释放资源当作关闭成功。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.platform.windows.WindowsKernel32Library"/>
+        <Method name="close" params="" returns="void"/>
+    </Match>
+    <!-- shutdown 尝试取消全部 compaction，汇总首因交给连接 owner；后续关闭继续执行。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.handler.ThreadCompactionHandler"/>
+        <Method name="cancelForShutdown" params="" returns="void"/>
+    </Match>
+    <!-- 写失败先以相同原因结束 active/control/data 帧，writer owner 随后退出并报告清理结果。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.runtime.StdioWriter"/>
+        <Method name="write" params="io.github.kongweiguang.ja.transport.rpc.runtime.StdioWriter$Frame" returns="void"/>
+    </Match>
+    <!-- 侧聊身份参与跨平台 system prompt 和 revision；固定 LF 是协议内容，不能替换为宿主换行。 -->
+    <Match>
+        <Bug pattern="VA_FORMAT_STRING_USES_NEWLINE"/>
+        <Class name="io.github.kongweiguang.ja.bootstrap.runtime.ConfigurationTurnRuntimeResolver"/>
+        <Method name="sideTaskIdentityPrompt" params="io.github.kongweiguang.ja.conversation.port.out.TaskCapabilityCeilingPort$RuntimeIdentity" returns="java.lang.String"/>
+    </Match>
+
+    <!-- Core 已从 conversation 迁至 agent；这些具体重抛点保留关闭、取消和 Store 失败的原始运行时身份。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.api.AgentEngine"/>
+        <Method name="awaitClosed"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.cancellation.DefaultCancellationCoordinator"/>
+        <Method name="throwIfCloseFailed"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.concurrent.ShutdownDeadline"/>
+        <Method name="await"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.context.summary.ModelSummaryGenerator"/>
+        <Method name="openRuntime"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.context.summary.ModelSummaryGenerator"/>
+        <Method name="summarize"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.context.summary.ModelSummaryGenerator$RequestRuntime"/>
+        <Method name="close"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.engine.AgentEventWatchRegistry"/>
+        <Method name="watch"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.loop.AgentExecutionSession"/>
+        <Method name="consumeInput"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.loop.AgentExecutionSession"/>
+        <Method name="drive"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.loop.AgentRound"/>
+        <Method name="onEvent"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.loop.DeltaTimerScheduler$TimerHandle"/>
+        <Method name="schedule"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.loop.StandardAgentLoopExecutionService"/>
+        <Method name="mutateInput"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.AgentRequestRuntime"/>
+        <Method name="close"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.AgentTool$SettlementResource"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.ModelAdapterFactory"/>
+        <Method name="start"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter"/>
+        <Method name="executeHttp"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter"/>
+        <Method name="submit"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.ModelTransport"/>
+        <Method name="awaitClose"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.RequestController"/>
+        <Method name="beginSink"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.RequestController"/>
+        <Method name="bindCall"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.RequestController"/>
+        <Method name="bindStream"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.summary.HttpSummaryModel"/>
+        <Method name="executeBounded"/>
+    </Match>
+
+    <!-- 私有 MCP 捕获的短租约必须先逐项关闭，再原样重抛原异常。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationCatalog"/>
+        <Method name="capture"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.catalog.adapter.out.mcp.generation.GenerationTurnMcpSessionFactory"/>
+        <Method name="catalog"/>
+    </Match>
+
+    <!-- AbstractExecutorService 的 nullable 默认注解弱于本实现的显式 fail-fast 契约，两个 override 必须拒绝 null。 -->
+    <Match>
+        <Bug pattern="NP_PARAMETER_MUST_BE_NONNULL_BUT_MARKED_AS_NULLABLE"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.concurrent.BoundedVirtualExecutor"/>
+        <Method name="~(execute|newTaskFor)"/>
+    </Match>
+
+    <!-- 下列 record 在构造时使用 List.copyOf、不可修改 Map 或递归 JSON 冻结，返回引用本身不可变。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.support\.McpServerDefinition|configuration\.adapter\.out\.generation\.ConfigGeneration\$Profile)"/>
+    </Match>
+
+    <!-- Core record 与嵌套命令在构造时复制集合或冻结 JSON；列表中的类型是唯一被审计的数据载体。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.agent\.(application\.api\.engine\.(AgentCompactionRequest|AgentInputCommand\$(Delete|Enqueue|Prioritize|Update)|AgentInternalRequest|AgentRequest)|application\.engine\.AgentRequestBinding|application\.loop\.(AgentExecutionBinding|AgentExecutionRequest(\$HistorySelection)?|AgentInputMutation)|domain\.context\.SummaryDocument|domain\.conversation\.AgentInputQueue\$Command|domain\.execution\.ExecutionEvent\$(ModelCompleted|WaitResolved)|domain\.interaction\.InteractionAnswerSubmission|domain\.model\.ModelMessage|application\.gateway\.AgentMiddleware\$(RequestContext|RequestPatch)|application\.gateway\.AgentTool\$ExecutionContext|application\.gateway\.ModelPort\$ModelRequest)"/>
+    </Match>
+
+    <!-- 这些核心类型有意暴露生命周期端口或同一 JDBC 事务连接，不能复制，否则破坏宿主 ownership 或原子性。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.agent\.(application\.gateway\.AgentRequestRuntime|application\.gateway\.store\.(JdbcConversationTransactionContext|JdbcTransactionContext))"/>
+    </Match>
+
+    <!-- 这些既有 Ja 类型仍借用组合根或平台资源；其配置、数据库与连接生命周期由原有 owner 管理。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(bootstrap\.SolonRuntimeComposition|bootstrap\.runtime\.ConfigurationTurnRuntimeResolver\$1|configuration\.adapter\.out\.generation\.ConfigGeneration\$Lease|infrastructure\.persistence\.database\.JaDatabase|platform\.windows\.WindowsNativeProcess|transport\.rpc\.RpcServiceBindings)"/>
+    </Match>
+
+    <!-- ObjectMapper、MyBatis Mapper proxy 与 RpcSession 都是组合根、事务或连接生命周期注入的 owner；
+         跨职责子包只借用它们，不允许复制、替换或延长资源生命周期。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(configuration\.adapter\.out\.security\.windows\.CredentialStore|infrastructure\.persistence\.mapper\.PersistenceMappers|transport\.rpc\.(handler\.(ConfigurationHandler|HandshakeHandler|HealthShutdownHandler|SettingsCatalogHandler|ThreadHistoryHandler|TurnApprovalHandler|WorkspaceHandler)|runtime\.RpcSession))"/>
+    </Match>
+
+    <!-- 注册表和目录映射均由同一监视器保护；锁外关闭 WatchService 与 take 并发，
+         目的是唤醒阻塞的 watcher。豁免只覆盖已核实的五个访问边界。 -->
+    <Match>
+        <Bug pattern="AT_UNSAFE_RESOURCE_ACCESS_IN_THREAD"/>
+        <Class name="io.github.kongweiguang.ja.configuration.adapter.out.document.ConfigurationWatcher"/>
+        <Method name="~(closeWatchServiceQuietly|processWatchKey|registerDirectory|removeWatchRegistration|watchLoop)"/>
+    </Match>
+
+    <!-- 私有校验函数由同文件嵌套 record 的 compact constructor 或匿名实现调用，SpotBugs 未归因该字节码调用。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.api.engine.AgentInputCommand"/>
+        <Method name="~(requireEntryRevision|freezeMetadata)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.domain.execution.ExecutionEvent"/>
+        <Method name="~(id|ids)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.domain.turn.TurnExecutionState"/>
+        <Method name="~(fingerprint|text)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.AgentTool"/>
+        <Method name="~(fingerprint|sha256|appendCanonicalJson|appendToken|freezeAttributes)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.model.SummaryModel"/>
+        <Method name="required"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.store.AgentStore"/>
+        <Method name="~(identifier|sha256|json)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.store.CheckpointStore"/>
+        <Method name="~(sha256|requiredEventId|required)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.domain.ContextCompactionEvent"/>
+        <Method name="~(requirePhase|requireFailurePhase|identifier)"/>
+    </Match>
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.domain.TurnEvent"/>
+        <Method name="~(identifier|boundedText)"/>
+    </Match>
+
+    <!-- JaTool 内嵌 binding record 的构造器实际调用该 SHA-256 校验；不是遗留的未使用函数。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.port.out.JaTool"/>
+        <Method name="fingerprint"/>
+    </Match>
+
+    <!-- 关闭栅栏必须原样重抛 RuntimeException/Error，不能为静态规则吞掉资源清理失败。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.adapter.out.runtime.JaAgentRuntimeResolver"/>
+        <Method name="~lambda\$release\$[0-9]+"/>
+    </Match>
+    <!-- 手动压缩把 Engine 异步完成失败映射为已分类的 Ja 失败，不能吞掉并返回成功回执。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.loop.ManualContextCompactionService"/>
+        <Method name="compact"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.loop.WorkspaceWriteLeaseCoordinator"/>
+        <Method name="rethrow"/>
+    </Match>
+
+    <!-- 输入投影只选择 projectCommand 中固定 UPDATE 字段片段及两个固定 action 谓词，
+         tenant、会话、输入正文、身份和版本均经 JDBC 参数绑定；外部输入不参与 SQL 结构。 -->
+    <Match>
+        <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.store.JaInputProjection"/>
+        <Method name="~(mutate|storedCommand)"/>
+    </Match>
+
+    <!-- V17 重建表时暂时移除并原样恢复本数据库 sqlite_master 中的既有 trigger；
+         DROP 名称双引号转义，CREATE 使用读取的原始 DDL，不能把触发器定义作为 JDBC 值绑定。 -->
+    <Match>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.database.V17__agent_store_projection_rebuild"/>
+        <Method name="~(dropTriggers|restoreTriggers)"/>
+    </Match>
+    <!-- 迁移无论成功失败都先恢复外键开关，再原样重抛首要 SQL/运行时失败，不能掩盖数据库状态。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.database.V17__agent_store_projection_rebuild"/>
+        <Method name="migrate"/>
+    </Match>
+
+    <!-- 依赖载体借用同一编解码器与写租约 owner；复制这些服务会破坏调用身份或并发互斥。
+         两个集合仍在构造器中独立 List.copyOf，不能把服务引用与可变业务数据混为一谈。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.conversation.adapter.out.tools.JaAgentToolAdapter$Dependencies"/>
+        <Field name="~(bindingCodec|presentationCodec|writeLeases)"/>
+    </Match>
+
+    <!-- OkHttp SSE 回调必须保留并重抛原始业务/取消异常，随后由共享 HTTP owner 分类和释放响应；
+         吞掉或重包装会把 sink 提交失败误作 Provider 故障并重试。仅豁免这两个精确重抛边界。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter$ProviderEventListener"/>
+        <Method name="onEvent"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter$ProviderEventListener"/>
+        <Method name="throwIfFailed"/>
+    </Match>
+
+    <!-- 侧聊关闭失败按既有领域异常原样重抛，以便调用方识别 closing 闸门状态。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.collaboration.application.TaskCoordinator"/>
+        <Method name="~(awaitClose|close|closeTemporarySideChats|runSideChatClose)"/>
+    </Match>
+
+    <!-- Plan 控制还原 Future 的首要异常；恢复注册失败先清理本次 tracking，再透传原始原因。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanExecutionCoordinator"/>
+        <Method name="awaitControl"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanService"/>
+        <Method name="awaitPlanControl"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanExecutionTurnAdapter"/>
+        <Method name="registerResumeContinuation"/>
+    </Match>
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanExecutionTurnAdapter$ResumeRegistration"/>
+        <Method name="deliver"/>
+    </Match>
+    <!-- 唯一执行协调器是借用的服务 collaborator，不是可复制的业务数据；其它字段仍接受检查。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanService"/>
+        <Field name="planExecutions"/>
+    </Match>
+    <!-- 接口内嵌 Intent、Usage、Prior 的紧凑构造器实际调用这些私有校验，保留真实类型约束。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.plan.application.PlanEvaluationAuditPort"/>
+        <Method name="~(requireId|requireDigest|requireEvaluationId|requireModelRequestId)"/>
+    </Match>
+
+    <!-- 这些基类构造器只校验值或借用已存在的依赖，不创建句柄、线程或 IO owner；
+         构造失败没有需要交给子类清理的资源。豁免仅覆盖构造器。 -->
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(catalog\.adapter\.out\.mcp\.transport\.BoundedMcpTransport|conversation\.adapter\.out\.tools\.(BuiltInTools\$WorkspacePathReadTool|ToolSupport))"/>
+        <Method name="&lt;init&gt;"/>
+    </Match>
+    <!-- 两条 Adapter 入口先校验冻结配置，再创建或借用传输；委托构造器只保存已验证依赖，
+         不存在参数校验失败后无人关闭的传输。子类实现仍必须遵守同一资源 owner。 -->
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter"/>
+        <Method name="&lt;init&gt;"/>
+    </Match>
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+        <Class name="io.github.kongweiguang.ja.agent.application.gateway.ModelPort$ModelUnavailableException"/>
+        <Method name="&lt;init&gt;"/>
+    </Match>
+
+    <!-- 这些窄函数式端口横跨 IO、进程、FFM 或事务回调，保留 Exception 以便唯一边界统一分类和回滚。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_CLAUSE_BASIC_EXCEPTION"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.adapter\.out\.tools\.ToolSupport|infrastructure\.persistence\.transaction\.(MybatisUnitOfWork\$Work|PersistenceTransactions\$CheckedSupplier))"/>
+    </Match>
+
+    <!-- System 环境块参与跨平台 Prompt revision，storage marker 又按字节校验代际；两者必须固定 LF，不能使用平台 %n。 -->
+    <Match>
+        <Bug pattern="VA_FORMAT_STRING_USES_NEWLINE"/>
+        <Class name="~io\.github\.kongweiguang\.ja\.(conversation\.adapter\.out\.tools\.ShellProfile|infrastructure\.persistence\.database\.StorageBaseline)"/>
+        <Method name="~(executionEnvironment|expectedMarker)"/>
+    </Match>
+
+    <!-- null 表示配置文件不存在；空数组表示文件存在但为空，两者必须在严格配置基线中保持可区分。 -->
+    <Match>
+        <Bug pattern="PZLA_PREFER_ZERO_LENGTH_ARRAYS"/>
+        <Class name="io.github.kongweiguang.ja.configuration.adapter.out.document.ConfigurationStore"/>
+        <Method name="readBounded"/>
+    </Match>
+
+    <!-- execute 在同一方法内显式 lock/unlock，SpotBugs 把 ReentrantLock.unlock 误识别为未打开资源的 close。 -->
+    <Match>
+        <Bug pattern="CWO_CLOSED_WITHOUT_OPENED"/>
+        <Class name="io.github.kongweiguang.ja.configuration.application.ConfigurationMutationCoordinator"/>
+        <Method name="execute"/>
+    </Match>
+
+    <!-- serializeRequest 的 ByteArrayOutputStream 只有内存，不持有文件或 Socket；
+         Jackson 完成编码后取出字节，关闭该内存流不会释放额外资源。 -->
+    <Match>
+        <Bug pattern="OS_OPEN_STREAM"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.AbstractStreamingModelAdapter"/>
+        <Method name="serializeRequest"/>
+    </Match>
+
+    <!-- 取消类别已经成为权威结果，响应流关闭是幂等尽力清理，关闭异常不得覆盖取消或超时。 -->
+    <Match>
+        <Bug pattern="DE_MIGHT_IGNORE"/>
+        <Class name="io.github.kongweiguang.ja.agent.infrastructure.model.shared.RequestController"/>
+        <Method name="closeQuietly"/>
+    </Match>
+
+    <!-- Spring 示例借用同一 Engine、Store、应用服务和出站端口，引用是协作者而非 DTO 数据。
+         复制会产生第二套执行或资源 owner；仅豁免已核实的注入字段，其它字段继续检查。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.conversation.adapter.in.web.ChatController"/>
+        <Field name="chats"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.conversation.application.ChatService"/>
+        <Field name="~(engine|store)"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.conversation.application.ChatStreamService"/>
+        <Field name="~(chats|engine)"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.conversation.application.ThreadService"/>
+        <Field name="~(directory|store)"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.in.web.ExperienceController"/>
+        <Field name="experience"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.out.core.ExperienceExtension"/>
+        <Field name="~(experience|skills|store)"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.out.jdbc.PostgresSkillCatalog"/>
+        <Field name="source"/>
+    </Match>
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.application.ExperienceService"/>
+        <Field name="skills"/>
+    </Match>
+    <!-- Controller 借用 Spring 容器的同一 JSON codec；复制协作者会拆分字段与数字语义。
+         仅匹配当前构造签名的 json 注入字段，其它字段和构造方法继续检查。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.in.web.ExperienceController"/>
+        <Method name="&lt;init&gt;" params="io.github.kongweiguang.ja.agent.example.springboot.experience.application.ExperienceService,io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.McpDirectory,io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.ExperienceToolCatalog,io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.ExperienceJsonCodec,io.github.kongweiguang.ja.agent.example.springboot.identity.CurrentActorProvider,io.github.kongweiguang.ja.agent.application.gateway.store.AgentStore,io.github.kongweiguang.ja.agent.application.gateway.store.ExtensionFactRecordCodec" returns="void"/>
+        <Field name="json"/>
+    </Match>
+    <!-- 示例 Bean 由 Spring 创建；Repository 必须允许异常翻译代理，Controller 保留容器代理能力。
+         构造只核验注入依赖，没有 finalizer 或构造期外部资源；不因可空依赖校验而移除失败早停。 -->
+    <Match>
+        <Bug pattern="CT_CONSTRUCTOR_THROW"/>
+        <Or>
+            <Class name="io.github.kongweiguang.ja.agent.example.springboot.attachment.adapter.out.jdbc.JdbcAttachmentStore"/>
+            <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.out.jdbc.JdbcNoteRepository"/>
+            <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.in.web.ExperienceController"/>
+        </Or>
+        <Method name="&lt;init&gt;"/>
+    </Match>
+    <!-- SQL 动态部分只有按已限制数量生成的问号；表/列为编译期常量，身份及所有附件 ID 均独立绑定。 -->
+    <Match>
+        <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.attachment.adapter.out.jdbc.JdbcAttachmentStore"/>
+        <Method name="requireOwned"/>
+    </Match>
+    <!-- Extension 与注册工具有意共享组合根的 JSON codec；对象引用是依赖而非调用方数据。
+         只豁免当前构造签名向 jsonCodec 字段保存该协作者。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.out.core.ExperienceExtension"/>
+        <Method name="&lt;init&gt;" params="io.github.kongweiguang.ja.agent.example.springboot.experience.application.ExperienceService,io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.McpDirectory,io.github.kongweiguang.ja.agent.application.gateway.store.AgentStore,io.github.kongweiguang.ja.agent.skills.pg.infrastructure.PostgresSkillSource,io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionControlCodec,io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.ExperienceJsonCodec" returns="void"/>
+        <Field name="jsonCodec"/>
+    </Match>
+    <!-- Jackson codec 借用 Spring 已配置的 ObjectMapper；机械复制会与宿主模块配置分叉。
+         仅匹配 ObjectMapper 构造参数保存到 mapper 的注入事实，不豁免其它可变状态。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.infrastructure.json.JacksonExperienceJsonCodec"/>
+        <Method name="&lt;init&gt;" params="com.fasterxml.jackson.databind.ObjectMapper" returns="void"/>
+        <Field name="mapper"/>
+    </Match>
+    <!-- ToolView 构造器已通过 JsonSchemaSnapshot 深拷贝并递归冻结 JSON 容器；
+         McpServiceToolViewTest 验证原容器变更不影响快照且嵌套 Map/List 不可修改。
+         仅匹配当前 inputSchema accessor 及字段，静态分析无法推导递归冻结保证。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.application.gateway.McpDirectory$ToolView"/>
+        <Method name="inputSchema" params="" returns="java.util.Map"/>
+        <Field name="inputSchema"/>
+    </Match>
+    <!-- 两个 Schema accessor 返回 JsonSchemaSnapshot 递归复制并冻结的 JSON 值树；
+         回归已验证嵌套 Map/List 不可修改，且拒绝循环、超深和非 JSON 可变对象。 -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP"/>
+        <Or>
+            <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.in.web.dto.ExperienceToolView"/>
+            <Class name="io.github.kongweiguang.ja.agent.example.springboot.experience.adapter.out.mcp.McpService$ToolView"/>
+        </Or>
+        <Method name="inputSchema"/>
+        <Field name="inputSchema"/>
+    </Match>
+    <!-- 创建响应不确定时以持久事实对账；回读失败附加 suppressed，原失败类别仍由 HTTP 边界处理。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.agent.example.springboot.conversation.application.ThreadService"/>
+        <Method name="create"/>
+    </Match>
+    <!-- DDD 分包迁移后的当前类型：这些告警均已人工核对为资源 owner、不可变值承载或异常透传边界；保留在门禁白名单，避免旧包名 baseline 失效。 -->
+    <Match><Bug pattern="AT_UNSAFE_RESOURCE_ACCESS_IN_THREAD"/><Class name="io.github.kongweiguang.ja.configuration.infrastructure.document.ConfigurationWatcher"/></Match>
+    <Match><Bug pattern="CT_CONSTRUCTOR_THROW"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.transport.BoundedMcpTransport"/></Match>
+    <Match><Bug pattern="CT_CONSTRUCTOR_THROW"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.ToolSupport"/></Match>
+    <Match><Bug pattern="CT_CONSTRUCTOR_THROW"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.WorkspaceFileTools$NativeWorkspaceSearchTool"/></Match>
+    <Match><Bug pattern="CWO_CLOSED_WITHOUT_OPENED"/><Class name="io.github.kongweiguang.ja.configuration.application.service.ConfigurationMutationCoordinator"/></Match>
+    <Match><Bug pattern="EI_EXPOSE_REP"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.support.McpServerDefinition"/></Match>
+    <Match><Bug pattern="EI_EXPOSE_REP"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.JaAgentToolAdapter$Dependencies"/></Match>
+    <Match><Bug pattern="EI_EXPOSE_REP2"/><Class name="io.github.kongweiguang.ja.configuration.infrastructure.security.windows.CredentialStore"/></Match>
+    <Match><Bug pattern="EI_EXPOSE_REP2"/><Class name="io.github.kongweiguang.ja.plan.application.service.PlanService"/></Match>
+    <Match><Bug pattern="PZLA_PREFER_ZERO_LENGTH_ARRAYS"/><Class name="io.github.kongweiguang.ja.configuration.infrastructure.document.ConfigurationStore"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_CLAUSE_BASIC_EXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.ToolSupport"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.generation.GenerationCatalog"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.generation.GenerationTurnMcpSessionFactory"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.generation.GenerationTurnMcpSessionFactory$CatalogSnapshot"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.runtime.McpRuntime"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.catalog.infrastructure.mcp.runtime.McpRuntimeLifecycle"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.collaboration.application.service.TaskCoordinator"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.configuration.infrastructure.security.windows.CredentialStore"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.application.gateway.RuntimeLease"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.runtime.JaAgentRuntimeResolver"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.plan.application.service.PlanExecutionCoordinator"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.plan.application.service.PlanExecutionTurnAdapter"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.plan.infrastructure.persistence.PlanUnitOfWork"/></Match>
+    <Match><Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/><Class name="io.github.kongweiguang.ja.conversation.application.gateway.JaTool"/></Match>
+    <Match><Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/><Class name="io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEvent"/></Match>
+    <Match><Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/><Class name="io.github.kongweiguang.ja.conversation.domain.model.TurnEvent"/></Match>
+    <Match><Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/><Class name="io.github.kongweiguang.ja.plan.application.gateway.PlanEvaluationAuditPort"/></Match>
+    <Match><Bug pattern="URF_UNREAD_FIELD"/><Class name="io.github.kongweiguang.ja.catalog.application.service.ThreadMcpService"/></Match>
+    <Match><Bug pattern="VA_FORMAT_STRING_USES_NEWLINE"/><Class name="io.github.kongweiguang.ja.bootstrap.runtime.ConfigurationTurnRuntimeResolver"/></Match>
+    <Match><Bug pattern="VA_FORMAT_STRING_USES_NEWLINE"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.ShellProfile"/></Match>    <!-- 工具适配器依赖是组合根注入的生命周期协作者；复制会破坏 codec、lease 与 presentation owner。 -->
+    <Match><Bug pattern="EI_EXPOSE_REP2"/><Class name="io.github.kongweiguang.ja.conversation.infrastructure.tools.JaAgentToolAdapter$Dependencies"/></Match>
+    <!-- Plan 恢复链路必须把控制 Future 的首因原样传出，供上层状态机区分取消、超时和失败。 -->
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.plan.application.service.PlanExecutionTurnAdapter$ResumeRegistration"/><Method name="deliver"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.plan.application.service.PlanService"/><Method name="awaitPlanControl"/></Match>
+    <!-- 三个私有校验器由 Identity/Launch 的嵌套 record 构造器直接调用；
+         SpotBugs 未追踪 nestmate 调用，不能因此删除准入校验或扩大公共 API。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.api.ProcessSessionUseCase"/>
+        <Method name="~(boundedText|identifier|requireGeneration)"/>
+    </Match>
+    <!-- 审查 DTO 的嵌套 record 构造器直接调用这些校验器，冻结输入身份和位置约束；
+         仅排除已核实的 nestmate 误报，其它私有方法继续检查。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.review.application.api.ReviewUseCase"/>
+        <Method name="~(identifier|digestIdentity|snapshotIdentity|digest|boundedPath|layer)"/>
+    </Match>
+    <!-- 审查启动同步失败先移除通知绑定，再将原异常交给既有 RPC 错误映射。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.transport.rpc.handler.ReviewHandler"/>
+        <Method name="start"/>
+    </Match>
+    <!-- 创建失败必须回收已取得的 ConPTY，再原样透传 unchecked 首因；
+         包装异常会改变外层启动失败分类，不能省略清理。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.platform.windows.WindowsProcessNativeApi"/>
+        <Method name="createSuspendedInArena"/>
+    </Match>
+    <!-- 两个分叉 record 构造器的字节码均直接 invokestatic 此私有校验器，属于 nestmate 调用误报。 -->
+    <Match>
+        <Bug pattern="UPM_UNCALLED_PRIVATE_METHOD"/>
+        <Class name="io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase"/>
+        <Method name="forkIdentifier"/>
+    </Match>
+    <!-- 分叉提交不确定时先回读回执；生命周期或进程清理失败先恢复准入。
+         未核实成功的原异常必须透传，补偿不能伪造事务或进程已恢复。 -->
+    <Match>
+        <Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/>
+        <Class name="io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService"/>
+        <Method name="~(forkThread|lifecycle|closeThreadProcesses)"/>
+    </Match>
+</FindBugsFilter>
+
+

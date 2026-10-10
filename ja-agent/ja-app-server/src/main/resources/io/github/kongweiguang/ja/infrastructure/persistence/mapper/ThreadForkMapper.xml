@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadForkMapper">
+    <resultMap id="operationRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadForkRecords$OperationRow">
+        <constructor>
+            <arg column="operation_key" javaType="string"/>
+            <arg column="request_fingerprint" javaType="string"/>
+            <arg column="result_json" javaType="string"/>
+            <arg column="created_at_ms" javaType="string"
+                 typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="seedRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadForkRecords$SeedRow">
+        <constructor>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="source_thread_id" javaType="string"/>
+            <arg column="source_turn_id" javaType="string"/>
+            <arg column="source_item_id" javaType="string"/>
+            <arg column="source_thread_revision" javaType="_long"/>
+            <arg column="seed_json" javaType="string"/>
+            <arg column="created_at_ms" javaType="string"
+                 typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="historyItemRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadForkRecords$HistoryItemRow">
+        <constructor>
+            <arg column="ordinal" javaType="_long"/>
+            <arg column="item_id" javaType="string"/>
+            <arg column="source_thread_id" javaType="string"/>
+            <arg column="source_item_id" javaType="string"/>
+            <arg column="source_turn_id" javaType="string"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="context_through_ordinal" javaType="java.lang.Long"/>
+            <arg column="item_json" javaType="string"/>
+            <arg column="full_content" javaType="string"/>
+            <arg column="turn_json" javaType="string"/>
+            <arg column="created_at_ms" javaType="string"
+                 typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="contextMessageRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.ThreadForkRecords$ContextMessageRow">
+        <constructor>
+            <arg column="ordinal" javaType="_long"/>
+            <arg column="source_thread_id" javaType="string"/>
+            <arg column="source_item_id" javaType="string"/>
+            <arg column="source_message_id" javaType="string"/>
+            <arg column="message_json" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <select id="selectOperation" resultMap="operationRow">
+        SELECT operation_key,request_fingerprint,result_json,created_at_ms
+        FROM ja_thread_fork_operation WHERE operation_key=#{operationKey}
+    </select>
+    <insert id="insertOperation">
+        INSERT INTO ja_thread_fork_operation(operation_key,request_fingerprint,result_json,created_at_ms)
+        VALUES(#{operationKey},#{requestFingerprint},#{resultJson},
+        #{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <select id="selectSeed" resultMap="seedRow">
+        SELECT thread_id,source_thread_id,source_turn_id,source_item_id,source_thread_revision,seed_json,created_at_ms
+        FROM ja_thread_fork_seed WHERE thread_id=#{threadId}
+    </select>
+    <insert id="insertSeed">
+        INSERT INTO ja_thread_fork_seed(thread_id,source_thread_id,source_turn_id,source_item_id,source_thread_revision,seed_json,created_at_ms)
+        VALUES(#{threadId},#{sourceThreadId},#{sourceTurnId},#{sourceItemId},#{sourceThreadRevision},#{seedJson},
+        #{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <insert id="insertAttachment">
+        INSERT INTO ja_thread_fork_attachment(thread_id,attachment_id,source_thread_id,source_attachment_id,ordinal,created_at_ms)
+        VALUES(#{threadId},#{attachmentId},#{sourceThreadId},#{sourceAttachmentId},#{ordinal},
+        #{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <update id="claimSourceRevision">
+        UPDATE ja_conversation_thread SET revision=revision
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at_ms IS NULL
+    </update>
+    <select id="selectHistoryItems" resultMap="historyItemRow">
+        SELECT ordinal,item_id,source_thread_id,source_item_id,source_turn_id,turn_id,
+        context_through_ordinal,item_json,full_content,turn_json,created_at_ms
+        FROM ja_thread_fork_history_item WHERE thread_id=#{threadId}
+        <if test="afterOrdinal != null">AND ordinal &gt; #{afterOrdinal}</if>
+        <if test="beforeOrdinal != null">AND ordinal &lt; #{beforeOrdinal}</if>
+        ORDER BY ordinal <if test="descending">DESC</if><if test="!descending">ASC</if> LIMIT #{limit}
+    </select>
+    <select id="selectHistoryItem" resultMap="historyItemRow">
+        SELECT ordinal,item_id,source_thread_id,source_item_id,source_turn_id,turn_id,
+        context_through_ordinal,item_json,full_content,turn_json,created_at_ms
+        FROM ja_thread_fork_history_item WHERE thread_id=#{threadId} AND item_id=#{itemId}
+    </select>
+    <select id="selectHistoryCursor" resultMap="historyItemRow">
+        SELECT ordinal,item_id,source_thread_id,source_item_id,source_turn_id,turn_id,
+        context_through_ordinal,item_json,full_content,turn_json,created_at_ms
+        FROM ja_thread_fork_history_item WHERE thread_id=#{threadId} AND item_id=#{itemId}
+    </select>
+    <select id="selectContextMessages" resultMap="contextMessageRow">
+        SELECT ordinal,source_thread_id,source_item_id,source_message_id,message_json
+        FROM ja_thread_fork_context_message WHERE thread_id=#{threadId}
+        <if test="throughOrdinal != null">AND ordinal &lt;= #{throughOrdinal}</if>
+        ORDER BY ordinal
+    </select>
+    <insert id="insertHistoryItem">
+        INSERT INTO ja_thread_fork_history_item(thread_id,ordinal,item_id,source_thread_id,source_item_id,
+        source_turn_id,turn_id,context_through_ordinal,item_json,full_content,turn_json,created_at_ms)
+        VALUES(#{threadId},#{ordinal},#{itemId},#{sourceThreadId},#{sourceItemId},#{sourceTurnId},#{turnId},
+        #{contextThroughOrdinal},#{itemJson},#{fullContent},#{turnJson},
+        #{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <insert id="insertContextMessage">
+        INSERT INTO ja_thread_fork_context_message(thread_id,ordinal,source_thread_id,source_item_id,source_message_id,message_json)
+        VALUES(#{threadId},#{ordinal},#{sourceThreadId},#{sourceItemId},#{sourceMessageId},#{messageJson})
+    </insert>
+    <select id="selectHistoryAttachmentIds" resultType="string">
+        SELECT DISTINCT json_extract(value,'$.attachmentId') FROM ja_thread_fork_history_item,
+        json_tree(ja_thread_fork_history_item.item_json)
+        WHERE ja_thread_fork_history_item.thread_id=#{threadId} AND key='attachmentId'
+    </select>
+</mapper>

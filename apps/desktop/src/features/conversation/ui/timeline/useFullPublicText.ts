@@ -1,11 +1,17 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback } from "react";
+import type { TimelineItemAdapter } from "../../domain/timelineTypes";
 
-/** 长内容只在用户动作后读取；稳定消息身份隔离迟到结果，并让查看与复制共用一次请求。 */
+type FullPublicTextItem = Pick<TimelineItemAdapter, "itemId" | "bodyHydration" | "answerHydration">;
+
+/**
+ * 长内容只在用户动作后读取；TimelineStore 是正文与请求状态的唯一 owner，
+ * 组件仅派生查看/复制状态，避免虚拟行卸载后丢缓存或重复持有整份正文。
+ */
 export function useFullPublicText(
-  itemId: string | undefined,
+  item: FullPublicTextItem | undefined,
   readFullText: (() => Promise<string>) | undefined,
 ): {
   text: string | undefined;
@@ -13,37 +19,18 @@ export function useFullPublicText(
   error: boolean;
   load: () => Promise<string>;
 } {
-  const [loaded, setLoaded] = useState<{ itemId: string; text: string }>();
-  const [loadingItemId, setLoadingItemId] = useState<string>();
-  const [errorItemId, setErrorItemId] = useState<string>();
-  const pendingRef = useRef<{ itemId: string; promise: Promise<string> } | undefined>(undefined);
-  const text = loaded !== undefined && loaded.itemId === itemId ? loaded.text : undefined;
-  const loading = loadingItemId !== undefined && loadingItemId === itemId;
-  const error = errorItemId !== undefined && errorItemId === itemId;
+  const hydration = item?.answerHydration ?? item?.bodyHydration;
+  const text = hydration?.status === "complete" ? hydration.text : undefined;
+  const loading = hydration?.status === "loading";
+  const error = hydration?.status === "error";
 
-  /** 同一条消息的查看和复制共用在途分页；旧消息回包仅更新带身份的缓存，不污染当前内容。 */
+  /** 同一身份的并发读取由 TimelineStore 合并；本 hook 不保留返回正文副本。 */
   const load = useCallback(async (): Promise<string> => {
     if (text !== undefined) return text;
-    if (readFullText === undefined || itemId === undefined) throw new Error("完整内容暂时不可用。");
-    if (pendingRef.current?.itemId === itemId) return pendingRef.current.promise;
-    setLoadingItemId(itemId);
-    setErrorItemId(undefined);
-    const request = readFullText()
-      .then((content) => {
-        setLoaded({ itemId, text: content });
-        return content;
-      })
-      .catch((failure: unknown) => {
-        setErrorItemId(itemId);
-        throw failure;
-      })
-      .finally(() => {
-        if (pendingRef.current?.promise === request) pendingRef.current = undefined;
-        setLoadingItemId((current) => (current === itemId ? undefined : current));
-      });
-    pendingRef.current = { itemId, promise: request };
-    return request;
-  }, [itemId, readFullText, text]);
+    if (readFullText === undefined || item?.itemId === undefined)
+      throw new Error("完整内容暂时不可用。");
+    return readFullText();
+  }, [item?.itemId, readFullText, text]);
 
   return { text, loading, error, load };
 }

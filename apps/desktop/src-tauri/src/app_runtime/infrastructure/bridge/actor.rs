@@ -25,6 +25,10 @@ pub(crate) enum BridgeCommand {
     WorkspaceOpen {
         root: PathBuf,
         display_name: String,
+        reply: Reply<WorkspaceDto>,
+    },
+    WorkspaceSetTrust {
+        workspace_id: String,
         trust: String,
         reply: Reply<WorkspaceDto>,
     },
@@ -32,12 +36,21 @@ pub(crate) enum BridgeCommand {
         workspace_id: String,
         reply: Reply<WorkspaceDto>,
     },
+    WorkspaceRead {
+        workspace_id: String,
+        reply: Reply<WorkspaceDto>,
+    },
+    WorkspaceUpdate {
+        input: WorkspaceUpdateInput,
+        reply: Reply<WorkspaceDto>,
+    },
     WorkspacePathSearch {
         input: WorkspacePathSearchInput,
         reply: Reply<WorkspacePathSearchResult>,
     },
     HealthRead {
-        reply: Reply<()>,
+        retry: bool,
+        reply: Reply<Option<crate::app_runtime::StorageRecovery>>,
     },
     TurnStart {
         params: Value,
@@ -73,8 +86,8 @@ pub(crate) enum BridgeCommand {
         params: Value,
         reply: Reply<Value>,
     },
-    Goal {
-        method: GoalMethod,
+    Workflow {
+        method: WorkflowMethod,
         params: Value,
         reply: Reply<Value>,
     },
@@ -222,9 +235,12 @@ impl Completion {
         }
     }
 
-    /// 设计原因：该函数位于单 owner actor 边界，必须保持命令顺序、终态可见性与有界等待。
-    /// 唤醒有界 waiter 前先发布 worker 终止事实，保持 happens-before 顺序。
+    /// 设计原因：单 owner actor 的完成条件与 waiter 检查共用 Condvar 锁，避免通知落在检查与休眠之间。
+    /// 锁中毒时保持未完成，使退出确认失败关闭，而不恢复未知同步状态。
     pub(crate) fn mark_done(&self) {
+        let Ok(_guard) = self.lock.lock() else {
+            return;
+        };
         self.done.store(true, Ordering::Release);
         self.wake.notify_all();
     }
@@ -510,6 +526,7 @@ impl Drop for RuntimeBridgeInner {
 pub(super) struct ActorContext {
     pub(super) config: LaunchConfig,
     pub(super) sink: EventSink,
+    pub(super) native_identity: NativeClientIdentity,
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) terminal_fault: Arc<TerminalFault>,
     pub(super) detached_event_generation: Arc<AtomicU64>,
@@ -535,6 +552,7 @@ pub(super) fn actor_loop(
         .set_phase(RuntimeControlPhase::ActorEnter);
     context.runtime_control.record("actor_enter");
     context.runtime_control.before_actor_loop();
+    let mut native_identity = context.native_identity;
     let mut runtime: Option<RunningRuntime> = None;
     let mut pending_cleanup: Option<SharedAppServerClient> = None;
     let mut next_generation = 1_u64;
@@ -561,8 +579,11 @@ pub(super) fn actor_loop(
             }
             let result = stop_runtime(
                 &context.sink,
+                &context.config,
                 &mut runtime,
                 &mut pending_cleanup,
+                &mut native_identity,
+                false,
                 &context.current_generation,
                 &context.terminal_fault,
                 &context.cleanup_fault,
@@ -613,8 +634,11 @@ pub(super) fn actor_loop(
             }
             if let Err(error) = stop_runtime(
                 &context.sink,
+                &context.config,
                 &mut runtime,
                 &mut pending_cleanup,
+                &mut native_identity,
+                false,
                 &context.current_generation,
                 &context.terminal_fault,
                 &context.cleanup_fault,
@@ -663,6 +687,7 @@ pub(super) fn actor_loop(
                 let result = start_runtime(StartRuntimeContext {
                     config: &context.config,
                     sink: &context.sink,
+                    identity: &mut native_identity,
                     runtime: &mut runtime,
                     pending_cleanup: &mut pending_cleanup,
                     next_generation: &mut next_generation,
@@ -707,8 +732,11 @@ pub(super) fn actor_loop(
                 }
                 let result = stop_runtime(
                     &context.sink,
+                    &context.config,
                     &mut runtime,
                     &mut pending_cleanup,
+                    &mut native_identity,
+                    true,
                     &context.current_generation,
                     &context.terminal_fault,
                     &context.cleanup_fault,
@@ -751,7 +779,6 @@ pub(super) fn actor_loop(
             Ok(BridgeCommand::WorkspaceOpen {
                 root,
                 display_name,
-                trust,
                 reply,
             }) => {
                 let _ = reply.send(workspace_open_runtime(
@@ -759,6 +786,18 @@ pub(super) fn actor_loop(
                     &mut runtime,
                     root,
                     display_name,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::WorkspaceSetTrust {
+                workspace_id,
+                trust,
+                reply,
+            }) => {
+                let _ = reply.send(workspace_set_trust_runtime(
+                    &context.config,
+                    &mut runtime,
+                    workspace_id,
                     trust,
                     &context.exit_control,
                 ));
@@ -774,6 +813,25 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
+            Ok(BridgeCommand::WorkspaceRead {
+                workspace_id,
+                reply,
+            }) => {
+                let _ = reply.send(workspace_read_runtime(
+                    &context.config,
+                    &mut runtime,
+                    workspace_id,
+                    &context.exit_control,
+                ));
+            }
+            Ok(BridgeCommand::WorkspaceUpdate { input, reply }) => {
+                let _ = reply.send(workspace_update_runtime(
+                    &context.config,
+                    &mut runtime,
+                    input,
+                    &context.exit_control,
+                ));
+            }
             Ok(BridgeCommand::WorkspacePathSearch { input, reply }) => {
                 let _ = reply.send(workspace_path_search_runtime(
                     &context.config,
@@ -782,11 +840,12 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::HealthRead { reply }) => {
+            Ok(BridgeCommand::HealthRead { retry, reply }) => {
                 let _ = reply.send(health_read_runtime(
                     &context.config,
                     &mut runtime,
                     &context.exit_control,
+                    retry,
                 ));
             }
             Ok(BridgeCommand::TurnStart { params, reply }) => {
@@ -863,12 +922,12 @@ pub(super) fn actor_loop(
                     &context.exit_control,
                 ));
             }
-            Ok(BridgeCommand::Goal {
+            Ok(BridgeCommand::Workflow {
                 method,
                 params,
                 reply,
             }) => {
-                let _ = reply.send(goal_request_runtime(
+                let _ = reply.send(workflow_request_runtime(
                     &context.config,
                     &mut runtime,
                     method,
@@ -1064,8 +1123,11 @@ pub(super) fn actor_loop(
         {
             if let Err(error) = stop_runtime(
                 &context.sink,
+                &context.config,
                 &mut runtime,
                 &mut pending_cleanup,
+                &mut native_identity,
+                false,
                 &context.current_generation,
                 &context.terminal_fault,
                 &context.cleanup_fault,

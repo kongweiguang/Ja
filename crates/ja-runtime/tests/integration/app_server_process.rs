@@ -90,7 +90,7 @@ if ($null -ne $environmentPath) {
     ) -join [char]10
     [IO.File]::WriteAllText($environmentPath, $environmentLines, [Text.UTF8Encoding]::new($false))
 }
-$initializeResult = '{"protocolMajor":1,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads_v1","plan_goal_v1","interaction_v1"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
+$initializeResult = '{"protocolMajor":2,"protocolMinor":0,"serverInstanceId":"srv_public_fixture","runtime":{"engine":"ja-kernel","engineVersion":"0.1.1"},"capabilities":{"methods":[],"events":[],"accessModes":["approval_required","full_access"],"collaborationModes":["default","plan"],"features":["task_threads","plan","interaction"]},"limits":{"maxFrameBytes":4194304,"maxInFlightRequests":64,"maxInboundQueueFrames":256,"maxControlOutboundQueueFrames":64,"maxDataOutboundQueueFrames":1024,"maxConcurrentTurns":8,"maxAdmittedTurns":64,"maxThreadQueuedTurns":8,"maxSnapshotPageItems":200,"maxToolBatchConcurrency":8,"maxTurnQueuedInputs":8,"maxTurnQueuedInputBytes":524288}}'
 function Write-Lf([string]$Text) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Text + [char]10)
     $stdout = [Console]::OpenStandardOutput()
@@ -129,9 +129,8 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         OsString::from("-EnvironmentPath"),
         environment_path.clone().into_os_string(),
     ];
-    // Windows PowerShell cold start plus the two-frame handshake is environmental fixture work,
-    // not a product five-second latency SLO. Keep the real lifecycle assertion bounded while
-    // leaving the production default timeout and every request/cleanup deadline untouched.
+    // Windows PowerShell 冷启动和双帧握手属于环境夹具工作，不代表产品的五秒延迟 SLO。
+    // 真实生命周期断言应设有界时长，同时保持生产默认超时以及每个请求和清理期限不变。
     config.ready_timeout = Duration::from_secs(15);
     config.shutdown_timeout = Duration::from_secs(2);
     let mut supervisor = SidecarSupervisor::new_with_host_generation(config, 7).unwrap();

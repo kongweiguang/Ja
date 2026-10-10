@@ -5,8 +5,8 @@
 param(
     [string]$RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path,
     [string]$OutputDirectory = 'release\sbom',
-    [string]$MavenBomPath = 'app-server\target\ja-app-server-bom.json',
-    [string]$CargoToolchain = '1.88.0',
+    [string]$MavenBomPath = 'ja-agent\target\ja-app-server-bom.json',
+    [string]$CargoToolchain = '1.98.0',
     [string]$CorrespondingSourcePath = '',
     [string[]]$ArtifactPath = @(),
     [switch]$FailOnBlocker
@@ -14,17 +14,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\lib\diagnostics.ps1')
 
 function Resolve-RepositoryPath {
     <#
     .SYNOPSIS
-    Resolves a caller-supplied path without allowing report paths to escape the repository.
+    解析调用方提供的路径，并禁止报告路径越出仓库。
 
     .DESCRIPTION
-    The report is intended to be reproducible on a clean checkout.  Constraining generated
-    paths to the repository prevents accidental inclusion of a developer's home directory or
-    credentials while still allowing an explicit source/artifact path to be reported as an
-    external input by name only.
+    报告应能在干净检出中复现。将生成路径限制在仓库内，可防止意外收录开发者主目录或凭据；
+    同时仍允许仅按名称将显式来源或产物路径标记为外部输入。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -46,12 +45,11 @@ function Resolve-RepositoryPath {
 function Get-RelativeRepositoryPath {
     <#
     .SYNOPSIS
-    Converts an existing repository path into a stable slash-separated report path.
+    将现有仓库路径转换为稳定的斜杠分隔报告路径。
 
     .DESCRIPTION
-    Absolute Windows paths are machine-specific and can leak usernames.  All repository-owned
-    evidence is therefore recorded relative to the checkout so the same source tree produces
-    comparable provenance across runners.
+    Windows 绝对路径与具体机器绑定，可能泄露用户名。因此，仓库内的证据都记录为相对检出目录的路径，
+    使相同源码树在不同 runner 上生成可比较的来源信息。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -69,12 +67,16 @@ function Get-RelativeRepositoryPath {
 function Invoke-ExternalCommand {
     <#
     .SYNOPSIS
-    Runs one mature dependency tool and captures its exit code without persisting raw logs.
+    运行一个成熟的依赖工具并捕获退出码，不持久化原始日志。
 
     .DESCRIPTION
-    License and SBOM tools may print environment paths or accidental secret material on failure.
-    Keeping stdout/stderr in memory lets the caller parse structured output and return only the
-    bounded exit/status facts in provenance instead of copying unredacted diagnostics.
+    许可证和 SBOM 工具失败时可能输出环境路径或意外回显的敏感内容。
+    只解析完整 stdout，stderr 在独立的内存流中保留，避免诊断插入 JSON 后破坏许可证证据。
+    Application 解析在 Windows 固定使用 pnpm.cmd，排除 PowerShell shim 的脚本输出语义；
+    独立 runspace 使用结构化参数并保留真实原生退出码，不拼接 Shell 命令或持久化原始日志。
+    pnpm/Cargo 的机器 JSON 固定为 UTF-8；Windows 无控制台子进程可能默认按 ANSI 解码，
+    因此只在此调用内固定解码并恢复调用方编码，避免多字节内容损坏 JSON 的引号边界。
+    非零退出的 stderr 必须进入既有脱敏诊断通道；恢复缺失环境时显式传 NullString，保留原有空值语义。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -87,16 +89,47 @@ function Invoke-ExternalCommand {
         $oldEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
         [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
     }
+    $pipeline = $null
+    $runspace = $null
+    $priorConsoleEncoding = [Console]::OutputEncoding
     try {
-        $output = @(& $FilePath @Arguments 2>&1 | ForEach-Object { [string]$_ })
-        $exitCode = $LASTEXITCODE
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        $null = $runspace.SessionStateProxy.Path.SetLocation((Get-Location).ProviderPath)
+        $pipeline = [Management.Automation.PowerShell]::Create()
+        $pipeline.Runspace = $runspace
+        $null = $pipeline.AddCommand($command.Source)
+        foreach ($argument in $Arguments) { $null = $pipeline.AddArgument($argument) }
+        $output = @($pipeline.Invoke() | ForEach-Object { [string]$_.PSObject.BaseObject })
+        $standardError = @($pipeline.Streams.Error | ForEach-Object { [string]$_ })
+        $null = $pipeline.Commands.Clear()
+        $pipeline.Streams.Error.Clear()
+        $null = $pipeline.AddScript('$LASTEXITCODE')
+        $exitCodes = @($pipeline.Invoke())
+        if ($exitCodes.Count -ne 1 -or $null -eq $exitCodes[0].PSObject.BaseObject) {
+            throw 'native command exit code is unavailable'
+        }
+        $exitCode = [int]$exitCodes[0].PSObject.BaseObject
+        if ($exitCode -ne 0 -and $standardError.Count -gt 0) {
+            [Console]::Error.WriteLine((ConvertTo-SafeDiagnosticText -Value ($standardError -join [Environment]::NewLine) -RepositoryRoot $root))
+        }
         return [PSCustomObject]@{
             ExitCode = $exitCode
             Output = $output
+            StandardError = $standardError
         }
     } finally {
+        if ($null -ne $pipeline) { $pipeline.Dispose() }
+        if ($null -ne $runspace) { $runspace.Dispose() }
+        [Console]::OutputEncoding = $priorConsoleEncoding
         foreach ($name in $Environment.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process')
+            if ($null -eq $oldEnvironment[$name]) {
+                [Environment]::SetEnvironmentVariable($name, [System.Management.Automation.Language.NullString]::Value, 'Process')
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $oldEnvironment[$name], 'Process')
+            }
         }
     }
 }
@@ -104,12 +137,11 @@ function Invoke-ExternalCommand {
 function Get-ToolVersion {
     <#
     .SYNOPSIS
-    Records a short tool identity while avoiding full diagnostic output.
+    记录精简的工具身份信息，避免保留完整诊断输出。
 
     .DESCRIPTION
-    Exact tool identity is part of provenance, but complete version banners can contain local
-    install paths.  The first non-empty line is sufficient for audit correlation and keeps the
-    report free of machine-specific details.
+    工具的准确身份属于来源信息，但完整版本横幅可能包含本机安装路径。保留第一条非空行即可关联审计，
+    也能避免报告包含机器专属信息。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -131,35 +163,31 @@ function Get-ToolVersion {
 function Convert-JsonCommandOutput {
     <#
     .SYNOPSIS
-    Parses JSON emitted by a CLI while tolerating a bounded non-JSON warning prefix.
+    严格解析 CLI 完整 stdout 的单个 JSON 对象。
 
     .DESCRIPTION
-    Package managers occasionally emit advisory lines before structured output.  Extracting the
-    outer JSON object preserves the mature tool's data without turning this script into a second
-    license parser; malformed or multi-document output remains a hard audit failure.
+    stdout 是成熟工具的机器契约；前缀、后缀或多个文档必须失败，不能通过截取花括号掩盖输出污染。
+    诊断仅来自独立 stderr；此处沿用成熟 JSON 解析器，不增加宽松提取或自定义解析规则。
     #>
     param(
         [Parameter(Mandatory = $true)][string[]]$Lines
     )
 
     $text = ($Lines -join [Environment]::NewLine).Trim()
-    $start = $text.IndexOf('{')
-    $end = $text.LastIndexOf('}')
-    if ($start -lt 0 -or $end -le $start) {
+    if (-not $text.StartsWith('{') -or -not $text.EndsWith('}')) {
         throw 'tool did not emit a JSON object'
     }
-    return ($text.Substring($start, $end - $start + 1) | ConvertFrom-Json)
+    return ($text | ConvertFrom-Json)
 }
 
 function Write-StableJson {
     <#
     .SYNOPSIS
-    Writes UTF-8 JSON with an explicit newline and no timestamp-dependent formatting.
+    写入 UTF-8 JSON，明确添加换行且不使用依赖时间戳的格式。
 
     .DESCRIPTION
-    Release evidence must hash identically when lockfiles and tool output are unchanged.  The
-    script therefore leaves timestamps out of the schema and centralizes serialization so every
-    report file uses the same depth, encoding, and newline policy.
+    锁文件和工具输出未变化时，发布证据的哈希必须保持一致。因此 schema 不包含时间戳，并集中处理序列化，
+    使所有报告文件使用相同的深度、编码和换行规则。
     #>
     param(
         [Parameter(Mandatory = $true)]$Value,
@@ -173,12 +201,11 @@ function Write-StableJson {
 function Get-FileEvidence {
     <#
     .SYNOPSIS
-    Computes a SHA-256 and size for one existing file.
+    计算现有文件的 SHA-256 和大小。
 
     .DESCRIPTION
-    SHA-256 is the cross-platform checksum required by the artifact manifest contract.  Hashing
-    actual files rather than names or lockfile claims prevents a stale report from being treated
-    as provenance for a different output.
+    SHA-256 是产物清单合同要求的跨平台校验和。直接计算实际文件，而不是依赖名称或锁文件声明，
+    可避免把过期报告误当作其他输出的来源证明。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -200,12 +227,11 @@ function Get-FileEvidence {
 function Get-InputEvidence {
     <#
     .SYNOPSIS
-    Hashes the fixed dependency inputs that determine the report.
+    对决定报告内容的固定依赖输入计算哈希。
 
     .DESCRIPTION
-    The input set intentionally names package manifests, lockfiles, and legal entry points only;
-    generated targets and user configuration are excluded so provenance is reproducible and does
-    not accidentally capture credentials or unrelated dirty-worktree files.
+    输入集合有意只列出软件包清单、锁文件和法务入口；排除生成目录及用户配置，
+    以保证来源信息可复现，且不会意外收录凭据或工作区中无关的未提交文件。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot
@@ -217,7 +243,15 @@ function Get-InputEvidence {
         'Cargo.toml',
         'apps/desktop/src-tauri/Cargo.toml',
         'Cargo.lock',
-        'app-server/pom.xml',
+        'ja-agent/pom.xml',
+        'ja-agent/ja-agent-core/pom.xml',
+        'ja-agent/extensions/ja-agent-store-local/pom.xml',
+        'ja-agent/extensions/ja-agent-store-pg/pom.xml',
+        'ja-agent/extensions/ja-agent-skills-local/pom.xml',
+        'ja-agent/extensions/ja-agent-skills-pg/pom.xml',
+        'ja-agent/example/pom.xml',
+        'ja-agent/example/ja-agent-example-springboot/pom.xml',
+        'ja-agent/ja-app-server/pom.xml',
         'LICENSE'
     )
     $facts = @()
@@ -225,8 +259,7 @@ function Get-InputEvidence {
         $path = Resolve-RepositoryPath -Path $relativePath -BasePath $RepositoryRoot -RequireExisting
         $facts += Get-FileEvidence -Path $path -RepositoryRoot $RepositoryRoot
     }
-    # Optional notice and review entry points are evidence when present, while their absence is
-    # handled by the dedicated archive audit instead of aborting report generation prematurely.
+# 可选的声明和审查入口若存在就作为证据；若缺失，则交由专门的归档审计处理，不提前中止报告生成。
     foreach ($relativePath in @('THIRD_PARTY_NOTICES.md', 'legal/third-party/manifest.json', 'LICENSES/README.md')) {
         $entry = Resolve-RepositoryPath -Path $relativePath -BasePath $RepositoryRoot
         if (Test-Path -LiteralPath $entry -PathType Leaf) {
@@ -239,12 +272,11 @@ function Get-InputEvidence {
 function Get-GitProvenance {
     <#
     .SYNOPSIS
-    Captures the source commit and dirty-state without recording changed file names.
+    记录源码提交和工作区是否有改动，但不记录变更文件名。
 
     .DESCRIPTION
-    A release report must distinguish a reproducible commit from a developer checkout.  The
-    dirty flag is enough for that decision; listing paths would add irrelevant user information
-    and could expose secrets in a report intended for distribution.
+    发布报告需要区分可复现的提交和开发者工作区。dirty 标记足以作出判断；列出路径会增加无关用户信息，
+    还可能在准备分发的报告中暴露密钥。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot
@@ -267,12 +299,11 @@ function Get-GitProvenance {
 function Get-NodeLicenseInventory {
     <#
     .SYNOPSIS
-    Projects pnpm's mature license inventory into a path-free, deterministic evidence file.
+    将 pnpm 成熟的许可证清单整理为不含本机路径且结果确定的证据文件。
 
     .DESCRIPTION
-    `pnpm licenses list` remains the authority for npm package license metadata; Ja only removes
-    machine paths and sorts records.  Offline mode is enforced through npm_config_offline so the
-    release report cannot silently resolve a different package tree.
+    `pnpm licenses list` 仍是 npm 软件包许可证元数据的权威来源；Ja 只删除机器路径并排序记录。
+    通过 npm_config_offline 强制使用离线模式，避免发布报告悄然解析出另一套软件包树。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot
@@ -312,12 +343,11 @@ function Get-NodeLicenseInventory {
 function Get-CargoLicenseInventory {
     <#
     .SYNOPSIS
-    Uses Cargo's locked offline metadata as the Rust dependency/license source.
+    使用 Cargo 锁定的离线元数据作为 Rust 依赖和许可证来源。
 
     .DESCRIPTION
-    Cargo already resolves package source, checksum, and declared SPDX expression from the lock;
-    this projection keeps only audit fields and omits absolute manifest/target paths.  No custom
-    license classification is performed, so nonstandard expressions remain visible for review.
+    Cargo 已从锁文件解析软件包来源、校验和及声明的 SPDX 表达式；此处只保留审计字段并省略 manifest/target 绝对路径。
+    不执行自定义许可证分类，因此非标准表达式仍会显示给审查者。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -358,12 +388,12 @@ function Get-CargoLicenseInventory {
 function Normalize-MavenBom {
     <#
     .SYNOPSIS
-    Removes CycloneDX fields that are intentionally nondeterministic between identical runs.
+    移除相同输入的多次运行中有意保持不确定的 CycloneDX 字段。
 
     .DESCRIPTION
-    CycloneDX's mature Maven plugin emits a UUID and generation timestamp.  Those values identify
-    a run rather than its dependency graph, so they are removed from the archived evidence while
-    preserving component licenses, hashes, purls, and external references verbatim.
+    CycloneDX 成熟的 Maven 插件会输出 UUID 和生成时间戳。这些值标识的是一次运行，而非依赖关系图，
+    因此从归档证据中移除，同时原样保留组件许可证、哈希、purl 和外部引用。规范允许省略的集合保持省略，
+    不在规范化时补造元数据；缺失事实留给审计生成阻塞项。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path
@@ -376,15 +406,15 @@ function Normalize-MavenBom {
     if ($bom.PSObject.Properties['serialNumber']) {
         $bom.PSObject.Properties.Remove('serialNumber')
     }
-    if ($bom.metadata -and $bom.metadata.PSObject.Properties['timestamp']) {
+    if ($bom.PSObject.Properties['metadata'] -and $bom.metadata -and $bom.metadata.PSObject.Properties['timestamp']) {
         $bom.metadata.PSObject.Properties.Remove('timestamp')
     }
-    if ($bom.components) {
+    if ($bom.PSObject.Properties['components'] -and $bom.components) {
         $bom.components = @($bom.components | Sort-Object { [string]$_.'bom-ref' })
     }
-    if ($bom.dependencies) {
+    if ($bom.PSObject.Properties['dependencies'] -and $bom.dependencies) {
         foreach ($dependency in @($bom.dependencies)) {
-            if ($dependency.dependsOn) {
+            if ($dependency.PSObject.Properties['dependsOn'] -and $dependency.dependsOn) {
                 $dependency.dependsOn = @($dependency.dependsOn | Sort-Object)
             }
         }
@@ -395,9 +425,8 @@ function Normalize-MavenBom {
 
 function Get-EvidenceHash {
     <#
-    Recomputes approved input identities with an explicit algorithm. Raw repository inputs retain
-    byte identity, while CycloneDX ignores only run metadata and ordering that do not change the
-    dependency graph reviewed by the release owner.
+    使用明确算法重新计算已批准输入的身份。仓库原始输入保留字节级身份；对于 CycloneDX，
+    只忽略不会改变发布负责人所审依赖关系图的运行元数据和顺序。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -420,31 +449,40 @@ function Get-EvidenceHash {
 function Get-MavenBomAudit {
     <#
     .SYNOPSIS
-    Validates an offline CycloneDX Maven BOM without re-resolving dependencies.
+    在不重新解析依赖的情况下校验离线 CycloneDX Maven BOM。
 
     .DESCRIPTION
-    CycloneDX Maven 2.9.1 currently declares Maven online mode even when its artifacts are cached.
-    The report therefore accepts a previously generated BOM as a signed-input boundary and checks
-    its license/hash/reference completeness offline; it never silently substitutes a hand-built
-    license scanner.
+    CycloneDX Maven 2.9.1 当前即使产物已缓存，也会将 Maven 标记为在线模式。因此报告接受此前生成的 BOM 作为已确认输入边界，
+    并离线检查其许可证、哈希和引用完整性；绝不悄然改用手写许可证扫描器。可选字段缺省与空集合均计为缺失，
+    使 StrictMode 下仍能生成原有失败关闭的阻塞报告，而不是在披露缺失前中断。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path
     )
 
     $bom = Normalize-MavenBom -Path $Path
-    $components = @($bom.components)
-    $missingLicenses = @($components | Where-Object { @($_.licenses).Count -eq 0 })
-    $missingHashes = @($components | Where-Object { @($_.hashes | Where-Object { [string]$_.alg -eq 'SHA-256' }).Count -eq 0 })
-    $missingReferences = @($components | Where-Object { @($_.externalReferences).Count -eq 0 })
+    $components = @(if ($bom.PSObject.Properties['components'] -and $bom.components) { $bom.components })
+    $missingLicenses = @($components | Where-Object {
+        -not $_.PSObject.Properties['licenses'] -or $null -eq $_.licenses -or @($_.licenses).Count -eq 0
+    })
+    $missingHashes = @($components | Where-Object {
+        -not $_.PSObject.Properties['hashes'] -or $null -eq $_.hashes -or
+            @($_.hashes | Where-Object { $_.PSObject.Properties['alg'] -and [string]$_.alg -eq 'SHA-256' }).Count -eq 0
+    })
+    $missingReferences = @($components | Where-Object {
+        -not $_.PSObject.Properties['externalReferences'] -or $null -eq $_.externalReferences -or @($_.externalReferences).Count -eq 0
+    })
     $rootLicense = @()
-    if ($bom.metadata -and $bom.metadata.component) {
+    if ($bom.PSObject.Properties['metadata'] -and $bom.metadata -and
+        $bom.metadata.PSObject.Properties['component'] -and $bom.metadata.component -and
+        $bom.metadata.component.PSObject.Properties['licenses']) {
         foreach ($license in @($bom.metadata.component.licenses)) {
-            if ($license.license.id) { $rootLicense += [string]$license.license.id }
-            elseif ($license.license.name) { $rootLicense += [string]$license.license.name }
+            if ($null -eq $license -or -not $license.PSObject.Properties['license'] -or $null -eq $license.license) { continue }
+            if ($license.license.PSObject.Properties['id'] -and $license.license.id) { $rootLicense += [string]$license.license.id }
+            elseif ($license.license.PSObject.Properties['name'] -and $license.license.name) { $rootLicense += [string]$license.license.name }
         }
     }
-    # CycloneDX may normalize SPDX GPL-3.0-or-later to the equivalent ``GPL-3.0+`` token.
+# CycloneDX 可能会将 SPDX GPL-3.0-or-later 规范化为等价标记 ``GPL-3.0+``。
     $rootExpected = @($rootLicense | Where-Object { $_ -match '(?i)GPL-3\.0(?:-or-later|\+)|GNU General Public License.*3' }).Count -gt 0
     return [PSCustomObject][ordered]@{
         bomFormat = [string]$bom.bomFormat
@@ -461,8 +499,8 @@ function Get-MavenBomAudit {
 
 function Get-LicenseArchiveFileSetAudit {
     <#
-    Verifies that every archived text is hash-addressed, referenced exactly once as a set, and has
-    bytes matching its filename.  This prevents a status field from approving stale or stray text.
+    验证每份归档文本都以哈希寻址，在集合中恰好被引用一次，且字节内容与文件名中的哈希一致。
+    这样可避免状态字段错误批准过期或多余文本。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ArchiveRoot,
@@ -504,8 +542,7 @@ function Get-LicenseArchiveFileSetAudit {
 
 function Get-LicenseArchiveInputAudit {
     <#
-    Compares the promoted role-bound input hashes with the current lockfiles/manifests and the
-    Maven BOM supplied to this run; path names may differ for generated BOMs but roles may not.
+    将已晋级且绑定角色的输入哈希与当前锁文件、清单及本次提供的 Maven BOM 对比；生成的 BOM 路径可以不同，但角色必须一致。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -519,7 +556,15 @@ function Get-LicenseArchiveInputAudit {
         'cargo-workspace-manifest' = 'Cargo.toml'
         'cargo-package-manifest' = 'apps/desktop/src-tauri/Cargo.toml'
         'cargo-lock' = 'Cargo.lock'
-        'maven-manifest' = 'app-server/pom.xml'
+        'maven-parent-manifest' = 'ja-agent/pom.xml'
+        'maven-core-manifest' = 'ja-agent/ja-agent-core/pom.xml'
+        'maven-store-local-manifest' = 'ja-agent/extensions/ja-agent-store-local/pom.xml'
+        'maven-store-pg-manifest' = 'ja-agent/extensions/ja-agent-store-pg/pom.xml'
+        'maven-skills-local-manifest' = 'ja-agent/extensions/ja-agent-skills-local/pom.xml'
+        'maven-skills-pg-manifest' = 'ja-agent/extensions/ja-agent-skills-pg/pom.xml'
+        'maven-example-manifest' = 'ja-agent/example/pom.xml'
+        'maven-example-spring-boot-manifest' = 'ja-agent/example/ja-agent-example-springboot/pom.xml'
+        'maven-app-server-manifest' = 'ja-agent/ja-app-server/pom.xml'
         'maven-bom' = $MavenBomPath
     }
     $inputs = @($Manifest.inputs)
@@ -550,21 +595,19 @@ function Get-LicenseArchiveInputAudit {
 function Get-LicenseArchiveAudit {
     <#
     .SYNOPSIS
-    Checks whether the repository contains an approved, hash-addressed third-party license archive.
+    检查仓库中是否包含已批准且以哈希寻址的第三方许可证归档。
 
     .DESCRIPTION
-    The archive manifest is the review boundary.  A non-empty directory with a pending source
-    review must not silently close the release gate, so the status is checked in addition to the
-    text-file count.  This function only validates evidence shape; it does not classify licenses.
+    归档清单是审查边界。若目录非空但源码审查仍待处理，就不能悄然关闭发布门禁；
+    因此除了文本文件数量，还必须检查状态。本函数只验证证据结构，不分类许可证。
     #>
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
         [Parameter(Mandatory = $true)][string]$MavenBomPath
     )
 
-    # The archive may legitimately be absent before the release owner has
-    # reviewed candidates; preserve that state as zero evidence instead of
-    # throwing before the fail-closed blocker list can be generated.
+# 发布负责人审查候选项之前，归档可能确实不存在；将其保留为零项证据，
+# 以便生成失败关闭的阻塞项清单，而不是提前抛出异常。
     $licenseRoot = Resolve-RepositoryPath -Path 'LICENSES' -BasePath $RepositoryRoot
     $textRoot = Join-Path $licenseRoot 'approved\text'
     $files = @()
@@ -622,12 +665,11 @@ function Get-LicenseArchiveAudit {
 function Get-ArtifactAudit {
     <#
     .SYNOPSIS
-    Hashes explicitly supplied release artifacts and never scans broad workspace directories.
+    对显式提供的发布产物计算哈希，绝不扫描宽泛的工作区目录。
 
     .DESCRIPTION
-    Release output names and signatures must come from actual files.  Requiring explicit paths
-    avoids treating ignored build debris as a distributable artifact and keeps this report safe on
-    a dirty development checkout.
+    发布输出名称和签名必须来自实际文件。要求提供明确路径，可避免把忽略的构建残留当作可分发产物，
+    也让本报告能在存在未提交改动的开发工作区中安全运行。
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Paths,
@@ -650,12 +692,11 @@ function Get-ArtifactAudit {
 function Add-Blocker {
     <#
     .SYNOPSIS
-    Adds one stable release-gate code and reason to the report.
+    向报告添加一个稳定的发布门禁代码和原因。
 
     .DESCRIPTION
-    Codes make CI assertions durable while short reasons keep the report useful to a human.  The
-    function deliberately accepts no raw tool output so secrets and host paths cannot enter the
-    release evidence through an error branch.
+    稳定代码使 CI 断言不易失效，简短原因则让报告便于人工阅读。本函数有意不接收原始工具输出，
+    避免密钥或主机路径经由错误分支进入发布证据。
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Blockers,
@@ -669,11 +710,11 @@ function Add-Blocker {
 function Write-ChecksumManifest {
     <#
     .SYNOPSIS
-    Writes a sorted SHA-256 manifest for the generated evidence files.
+    为生成的证据文件写入排序后的 SHA-256 清单。
 
     .DESCRIPTION
-    The manifest excludes itself to avoid a checksum cycle; every listed file is hashed after it
-    is written.  Sorting by slash-normalized path keeps the same inputs byte-stable across hosts.
+    清单排除自身以避免校验和循环；每个列出的文件都会在写入后计算哈希。
+    按斜杠规范化的路径排序，可使相同输入在不同主机上生成完全一致的字节内容。
     #>
     param(
         [Parameter(Mandatory = $true)][string[]]$Paths,
@@ -716,7 +757,7 @@ if (Test-Path -LiteralPath $mavenInput -PathType Leaf) {
     if ($mavenBomAudit.missingExternalReferenceCount -gt 0) { Add-Blocker -Blockers $blockers -Code 'MAVEN_BOM_REFERENCE_MISSING' -Reason 'one or more Maven BOM components lack source/reference URLs' }
     if (-not $mavenBomAudit.rootLicenseMatchesJa) { Add-Blocker -Blockers $blockers -Code 'PROJECT_LICENSE_METADATA_MISMATCH' -Reason 'Maven BOM root component does not declare Ja GPL-3.0-or-later' }
 } else {
-    # Remove only the script-owned normalized BOM so a prior run cannot be mistaken for current evidence.
+# 只删除脚本管理的规范化 BOM，避免把之前运行的文件误认为本轮证据。
     if (Test-Path -LiteralPath $mavenOutputPath -PathType Leaf) {
         Remove-Item -LiteralPath $mavenOutputPath -Force
     }
@@ -798,8 +839,7 @@ $provenance = [PSCustomObject][ordered]@{
 }
 Write-StableJson -Value $provenance -Path $provenancePath
 
-# Rewrite the checksum manifest once more so provenance is covered; the manifest still excludes
-# itself to avoid a self-referential hash cycle.
+# 再次写入校验和清单以涵盖来源信息；清单仍排除自身，避免产生自引用哈希循环。
 Write-ChecksumManifest -Paths @($evidencePaths + $reportPath + $provenancePath) -RepositoryRoot $root -ManifestPath $checksumPath
 
 Write-Output ("status={0} blockers={1} output={2}" -f $report.status, $blockers.Count, (Get-RelativeRepositoryPath -Path $outputRoot -BasePath $root))

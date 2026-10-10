@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":"c:workspace-busy-title","method":"workspace/update","params":{"workspaceId":"ws_demo","expectedRevision":1,"cwd":"C:\\Projects\\moved"}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title","error":{"code":-32100,"message":"暂时无法更改项目目录：占用会话：会话“结算核对”：运行中。请先等待运行任务结束后重试。","data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":true,"errorId":"err_00000000000000000000000000000321"}}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-token","method":"workspace/update","params":{"workspaceId":"ws_demo","expectedRevision":1,"cwd":"C:\\Projects\\moved"}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-token","error":{"code":-32100,"message":"暂时无法更改项目目录：占用会话：会话“token 调试”：运行中。请先等待运行任务结束后重试。","data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":true,"errorId":"err_00000000000000000000000000000322"}}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-path","method":"workspace/update","params":{"workspaceId":"ws_demo","expectedRevision":1,"cwd":"C:\\Projects\\moved"}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-path","error":{"code":-32100,"message":"暂时无法更改项目目录：占用会话：会话“C:\\项目\\src\\README.md”：运行中。请先等待运行任务结束后重试。","data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":true,"errorId":"err_00000000000000000000000000000323"}}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-hex","method":"workspace/update","params":{"workspaceId":"ws_demo","expectedRevision":1,"cwd":"C:\\Projects\\moved"}}
+{"jsonrpc":"2.0","id":"c:workspace-busy-title-hex","error":{"code":-32100,"message":"暂时无法更改项目目录：占用会话：会话“0123456789abcdef0123456789abcdef”：运行中。请先等待运行任务结束后重试。","data":{"errorCode":"WORKSPACE_BUSY","category":"conflict","retryable":true,"errorId":"err_00000000000000000000000000000324"}}}

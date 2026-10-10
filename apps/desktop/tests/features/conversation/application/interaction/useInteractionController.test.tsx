@@ -1,4 +1,5 @@
 // @author kongweiguang
+// @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
@@ -11,15 +12,14 @@ import type {
 } from "@/features/conversation/application/interactionPort";
 
 const request = {
-  requestId: "input_one",
+  interactionId: "interaction_one",
   threadId: "thr_one",
   turnId: null,
   toolCallId: null,
   planRevisionId: null,
   runId: null,
-  goalId: null,
   status: "pending" as const,
-  revision: 3,
+  interactionRevision: 3,
   questions: [
     {
       questionId: "question_one",
@@ -37,7 +37,7 @@ const request = {
 
 const multipleRequest = {
   ...request,
-  requestId: "input_multiple",
+  interactionId: "interaction_multiple",
   questions: [
     {
       questionId: "question_multiple",
@@ -55,7 +55,7 @@ const multipleRequest = {
 
 const multipleOtherRequest = {
   ...multipleRequest,
-  requestId: "input_multiple_other",
+  interactionId: "interaction_multiple_other",
   questions: [
     {
       ...multipleRequest.questions[0]!,
@@ -66,7 +66,7 @@ const multipleOtherRequest = {
 
 const pagedRequest = {
   ...request,
-  requestId: "input_paged",
+  interactionId: "interaction_paged",
   questions: [
     request.questions[0]!,
     {
@@ -79,7 +79,7 @@ const pagedRequest = {
 
 const threePageRequest = {
   ...pagedRequest,
-  requestId: "input_three_pages",
+  interactionId: "interaction_three_pages",
   questions: [
     ...pagedRequest.questions,
     {
@@ -126,14 +126,14 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
-    const secondRequest = { ...request, requestId: "input_two", threadId: "thr_two" };
+    const secondRequest = { ...request, interactionId: "interaction_two", threadId: "thr_two" };
     const second = portWith({
       threadId: "thr_two",
       eventSequence: 1,
       request: secondRequest,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const firstCard = document.createElement("div");
     firstCard.dataset["interactionCard"] = "true";
@@ -149,8 +149,8 @@ describe("useInteractionController", () => {
       useInteractionController({ threadId: "thr_two", port: second }),
     );
     await waitFor(() => {
-      expect(firstHook.result.current.request?.requestId).toBe("input_one");
-      expect(secondHook.result.current.request?.requestId).toBe("input_two");
+      expect(firstHook.result.current.request?.interactionId).toBe("interaction_one");
+      expect(secondHook.result.current.request?.interactionId).toBe("interaction_two");
     });
 
     act(() => {
@@ -168,7 +168,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const card = document.createElement("div");
     card.dataset["interactionCard"] = "true";
@@ -192,11 +192,11 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_one"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_one"));
 
     await act(async () => {
       await result.current.submit();
@@ -216,14 +216,14 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request: multipleRequest,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const card = document.createElement("div");
     card.dataset["interactionCard"] = "true";
     card.dataset["interactionThreadId"] = "thr_one";
     document.body.append(card);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_multiple"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_multiple"));
 
     act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true })));
     act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "2", bubbles: true })));
@@ -245,14 +245,16 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request: multipleOtherRequest,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const card = document.createElement("div");
     card.dataset["interactionCard"] = "true";
     card.dataset["interactionThreadId"] = "thr_one";
     document.body.append(card);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_multiple_other"));
+    await waitFor(() =>
+      expect(result.current.request?.interactionId).toBe("interaction_multiple_other"),
+    );
 
     act(() =>
       result.current.setAnswer("question_multiple", {
@@ -288,7 +290,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request: pagedRequest,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const card = document.createElement("div");
     card.dataset["interactionCard"] = "true";
@@ -298,7 +300,7 @@ describe("useInteractionController", () => {
     card.append(radio);
     document.body.append(card);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_paged"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_paged"));
 
     act(() =>
       radio.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })),
@@ -318,7 +320,13 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 9,
       request: threePageRequest,
-      draft: { revision: 4, answers: [], page: 2, collapsed: true },
+      draft: {
+        interactionId: request.interactionId,
+        draftRevision: 4,
+        answers: [],
+        page: 2,
+        collapsed: true,
+      },
     };
     const port = portWith(snapshot);
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
@@ -334,37 +342,37 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     vi.mocked(old.submit).mockReturnValueOnce(first.promise);
-    const secondRequest = { ...request, requestId: "input_two", threadId: "thr_two" };
+    const secondRequest = { ...request, interactionId: "interaction_two", threadId: "thr_two" };
     const next = portWith({
       threadId: "thr_two",
       eventSequence: 1,
       request: secondRequest,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     const { result, rerender } = renderHook(
       ({ threadId, port }: { threadId: string; port: InteractionPort }) =>
         useInteractionController({ threadId, port }),
       { initialProps: { threadId: "thr_one", port: old } },
     );
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_one"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_one"));
     act(() => {
       void result.current.submit();
     });
     rerender({ threadId: "thr_two", port: next });
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_two"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_two"));
     first.resolve({
       threadId: "thr_one",
       eventSequence: 2,
       request: { ...request, status: "answered" },
-      draft: { revision: 2, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 2, answers: [] },
     });
     await act(async () => {
       await first.promise;
     });
-    expect(result.current.request?.requestId).toBe("input_two");
+    expect(result.current.request?.interactionId).toBe("interaction_two");
   });
 
   it("已回答快照优先显示服务端答案，不让本地草稿冒充确认摘要", async () => {
@@ -372,7 +380,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const serverAnswer = {
       questionId: "question_one",
@@ -383,9 +391,10 @@ describe("useInteractionController", () => {
     const answeredSnapshot: InteractionSnapshot = {
       threadId: "thr_one",
       eventSequence: 2,
-      request: { ...request, status: "answered", answers: [serverAnswer], revision: 4 },
+      request: { ...request, status: "answered", answers: [serverAnswer], interactionRevision: 4 },
       draft: {
-        revision: 3,
+        interactionId: request.interactionId,
+        draftRevision: 3,
         answers: [
           { questionId: "question_one", optionIds: [], freeText: "本地未确认", skipped: false },
         ],
@@ -419,11 +428,15 @@ describe("useInteractionController", () => {
     act(() => listener?.({ kind: "snapshot_changed", threadId: "thr_one", eventSequence: 2 }));
     await waitFor(() => expect(result.current.request?.status).toBe("answered"));
     expect(result.current.answers["question_one"]).toEqual(serverAnswer);
-    expect(result.current.answeredRequest?.requestId).toBe(answeredSnapshot.request?.requestId);
+    expect(result.current.answeredRequest?.interactionId).toBe(
+      answeredSnapshot.request?.interactionId,
+    );
     expect(result.current.answeredAnswers["question_one"]).toEqual(serverAnswer);
     act(() => listener?.({ kind: "snapshot_changed", threadId: "thr_one", eventSequence: 3 }));
     await waitFor(() => expect(result.current.request).toBeNull());
-    expect(result.current.answeredRequest?.requestId).toBe(answeredSnapshot.request?.requestId);
+    expect(result.current.answeredRequest?.interactionId).toBe(
+      answeredSnapshot.request?.interactionId,
+    );
     expect(result.current.answeredAnswers["question_one"]).toEqual(serverAnswer);
   });
 
@@ -433,7 +446,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.subscribe).mockImplementation((_input, next) => {
@@ -444,7 +457,7 @@ describe("useInteractionController", () => {
       .mockResolvedValueOnce(snapshot)
       .mockRejectedValueOnce(new Error("offline"));
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_one"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_one"));
     act(() => listener?.({ kind: "snapshot_changed", threadId: "thr_one", eventSequence: 3 }));
     await waitFor(() => expect(result.current.error).toContain("暂时不可用"));
     vi.mocked(port.read).mockResolvedValueOnce({ ...snapshot, eventSequence: 3 });
@@ -459,7 +472,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.subscribe).mockImplementation((_input, next) => {
@@ -494,7 +507,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.saveDraft).mockReturnValueOnce(firstSave.promise);
@@ -523,7 +536,8 @@ describe("useInteractionController", () => {
       ...snapshot,
       eventSequence: 2,
       draft: {
-        revision: 2,
+        interactionId: request.interactionId,
+        draftRevision: 2,
         answers: [
           { questionId: "question_one", optionIds: ["option_one"], freeText: null, skipped: false },
         ],
@@ -537,18 +551,18 @@ describe("useInteractionController", () => {
     expect(result.current.answers["question_one"]?.freeText).toBe("自定义");
   });
 
-  it("草稿冲突先更新服务端 revision，后续保存不会重复使用旧 revision", async () => {
+  it("草稿冲突先更新服务端 draftRevision，后续保存不会重复使用旧版本", async () => {
     vi.useFakeTimers();
     const snapshot: InteractionSnapshot = {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const conflictSnapshot: InteractionSnapshot = {
       ...snapshot,
       eventSequence: 2,
-      draft: { revision: 2, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 2, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.saveDraft).mockRejectedValueOnce({
@@ -600,7 +614,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.saveDraft)
@@ -643,7 +657,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const port = portWith(snapshot);
     const { result, unmount } = renderHook(() =>
@@ -670,7 +684,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     };
     const serverDraft = {
       questionId: "question_one",
@@ -681,12 +695,12 @@ describe("useInteractionController", () => {
     const conflictSnapshot: InteractionSnapshot = {
       ...snapshot,
       eventSequence: 2,
-      draft: { revision: 2, answers: [serverDraft] },
+      draft: { interactionId: request.interactionId, draftRevision: 2, answers: [serverDraft] },
     };
     const acknowledgedSnapshot: InteractionSnapshot = {
       ...conflictSnapshot,
       eventSequence: 3,
-      draft: { revision: 3, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 3, answers: [] },
     };
     const port = portWith(snapshot);
     vi.mocked(port.saveDraft)
@@ -725,7 +739,7 @@ describe("useInteractionController", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    // 冲突表示服务端已有较新草稿，卸载阶段不得自动用新 revision 覆盖它。
+    // 冲突表示服务端已有较新草稿，卸载阶段不得自动用新 draftRevision 覆盖它。
     expect(port.saveDraft).toHaveBeenCalledOnce();
 
     vi.mocked(port.read).mockResolvedValue(conflictSnapshot);
@@ -734,7 +748,7 @@ describe("useInteractionController", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(resumed.result.current.request?.requestId).toBe("input_one");
+    expect(resumed.result.current.request?.interactionId).toBe("interaction_one");
     expect(resumed.result.current.answers["question_one"]?.freeText).toBe("卸载前最后编辑");
     expect(resumed.result.current.retryAction).toBe("draft");
 
@@ -764,7 +778,7 @@ describe("useInteractionController", () => {
       threadId: "thr_one",
       eventSequence: 1,
       request,
-      draft: { revision: 1, answers: [] },
+      draft: { interactionId: request.interactionId, draftRevision: 1, answers: [] },
     });
     vi.mocked(port.submit)
       .mockRejectedValueOnce(new Error("offline"))
@@ -772,10 +786,10 @@ describe("useInteractionController", () => {
         threadId: "thr_one",
         eventSequence: 2,
         request: { ...request, status: "answered" },
-        draft: { revision: 2, answers: [] },
+        draft: { interactionId: request.interactionId, draftRevision: 2, answers: [] },
       });
     const { result } = renderHook(() => useInteractionController({ threadId: "thr_one", port }));
-    await waitFor(() => expect(result.current.request?.requestId).toBe("input_one"));
+    await waitFor(() => expect(result.current.request?.interactionId).toBe("interaction_one"));
     act(() =>
       result.current.setAnswer("question_one", {
         questionId: "question_one",
@@ -798,8 +812,8 @@ describe("useInteractionController", () => {
     await act(async () => {
       await result.current.retrySubmit();
     });
-    const firstKey = vi.mocked(port.submit).mock.calls[0]?.[0].idempotencyKey;
-    const secondKey = vi.mocked(port.submit).mock.calls[1]?.[0].idempotencyKey;
+    const firstKey = vi.mocked(port.submit).mock.calls[0]?.[0].operationKey;
+    const secondKey = vi.mocked(port.submit).mock.calls[1]?.[0].operationKey;
     expect(firstKey).toBeDefined();
     expect(secondKey).toBeDefined();
     expect(secondKey).not.toBe(firstKey);

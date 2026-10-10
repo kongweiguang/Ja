@@ -31,6 +31,17 @@ function testHasPointerCapture(): boolean {
 /** 测试环境只补齐浏览器方法形状，不伪造 pointer capture 生命周期。 */
 function testPointerCapture(): void {}
 
+/** jsdom 不提供真实布局；空矩形只满足测量 API 形状，不能作为视觉布局证据。 */
+function testRangeClientRects(): DOMRectList {
+  return [] as unknown as DOMRectList;
+}
+
+if (Range.prototype.getClientRects === undefined) {
+  Object.defineProperty(Range.prototype, "getClientRects", {
+    configurable: true,
+    value: testRangeClientRects,
+  });
+}
 if (HTMLElement.prototype.scrollIntoView === undefined) {
   HTMLElement.prototype.scrollIntoView = testScrollIntoView;
 }

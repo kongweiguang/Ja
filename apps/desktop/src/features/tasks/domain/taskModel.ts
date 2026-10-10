@@ -19,6 +19,7 @@ export type TaskState =
   | "queued"
   | "running"
   | "waiting_approval"
+  | "waiting_input"
   | "suspended"
   | "completed"
   | "failed"
@@ -53,6 +54,7 @@ export type TaskActivityKind =
   | "follow_up_queued"
   | "progress"
   | "waiting_approval"
+  | "waiting_input"
   | "resumed"
   | "completed"
   | "failed"
@@ -90,7 +92,6 @@ export interface TaskMailboxMessage {
 export interface TaskThreadSummary {
   threadId: string;
   workspaceId: string;
-  activeGoalId: string | null;
   preferences: {
     providerId: string;
     modelId: string;
@@ -105,6 +106,7 @@ export interface TaskThreadSummary {
   latestTurnStatus:
     | "queued"
     | "running"
+    | "waiting_input"
     | "waiting_approval"
     | "suspended"
     | "completed"
@@ -141,6 +143,14 @@ export interface TaskReadModel {
 
 export type TaskHostEvent =
   | {
+      method: "task/closed";
+      params: {
+        rootThreadId: string;
+        taskThreadId: string;
+        closedThreadIds: string[];
+      };
+    }
+  | {
       method: "task/activity";
       params: {
         rootThreadId: string;
@@ -174,7 +184,8 @@ export type TaskHostEvent =
 
 /** 右栏分组把“需要人工处理”置于终态之前，失败与挂起不会被完成列表掩盖。 */
 export function taskSection(summary: TaskSummary): "running" | "attention" | "completed" {
-  if (["waiting_approval", "suspended", "failed"].includes(summary.state)) return "attention";
+  if (["waiting_approval", "waiting_input", "suspended", "failed"].includes(summary.state))
+    return "attention";
   if (["idle", "queued", "running"].includes(summary.state)) return "running";
   return "completed";
 }
@@ -190,6 +201,8 @@ export function taskStateLabel(state: TaskState): string {
       return "运行中";
     case "waiting_approval":
       return "等待确认";
+    case "waiting_input":
+      return "等待回答";
     case "suspended":
       return "已挂起";
     case "completed":

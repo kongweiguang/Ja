@@ -11,11 +11,16 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_stop,
         crate::app_runtime::ja_runtime_state,
         crate::app_runtime::ja_runtime_storage_info,
+        crate::app_runtime::ja_runtime_storage_backup_open,
+        crate::app_runtime::ja_runtime_storage_retry,
         crate::app_runtime::ja_runtime_workspace_activate,
         crate::app_runtime::ja_runtime_workspace_path_search,
         crate::app_runtime::ja_runtime_recovery_state,
         crate::app_runtime::ja_runtime_acknowledge_recovery,
         crate::app_runtime::ja_runtime_workspace_open,
+        crate::app_runtime::ja_runtime_workspace_read,
+        crate::app_runtime::ja_runtime_workspace_update,
+        crate::app_runtime::ja_workspace_set_trust,
         crate::app_runtime::ja_runtime_query,
         crate::app_runtime::ja_runtime_task_create,
         crate::app_runtime::ja_runtime_task_list,
@@ -28,20 +33,9 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_task_cancel,
         crate::app_runtime::ja_runtime_task_tree_delete,
         crate::app_runtime::ja_runtime_task_close,
-        crate::app_runtime::ja_runtime_goal_read,
-        crate::app_runtime::ja_runtime_goal_events_read,
-        crate::app_runtime::ja_runtime_goal_observe,
-        crate::app_runtime::ja_runtime_goal_unobserve,
         crate::app_runtime::ja_runtime_plan_read,
         crate::app_runtime::ja_runtime_plan_current_read,
         crate::app_runtime::ja_runtime_plan_revisions_list,
-        crate::app_runtime::ja_runtime_goal_evidence_list,
-        crate::app_runtime::ja_runtime_goal_create,
-        crate::app_runtime::ja_runtime_goal_plan_attach,
-        crate::app_runtime::ja_runtime_goal_plan_detach,
-        crate::app_runtime::ja_runtime_goal_pause,
-        crate::app_runtime::ja_runtime_goal_resume,
-        crate::app_runtime::ja_runtime_goal_stop,
         crate::app_runtime::ja_runtime_interaction_read,
         crate::app_runtime::ja_runtime_interaction_observe,
         crate::app_runtime::ja_runtime_interaction_unobserve,
@@ -61,6 +55,13 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_runtime_plan_resume,
         crate::app_runtime::ja_runtime_plan_stop,
         crate::app_runtime::ja_runtime_plan_reject,
+        crate::app_runtime::ja_process_list,
+        crate::app_runtime::ja_process_read,
+        crate::app_runtime::ja_process_write,
+        crate::app_runtime::ja_process_stop,
+        crate::app_runtime::ja_ai_review_start,
+        crate::app_runtime::ja_ai_review_read,
+        crate::app_runtime::ja_thread_fork,
         crate::app_runtime::ja_approval_respond,
         crate::app_runtime::ja_turn_start,
         crate::app_runtime::ja_turn_continue,
@@ -77,7 +78,6 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_configuration_patch,
         crate::app_runtime::ja_configuration_replace,
         crate::app_runtime::ja_configuration_reset,
-        crate::app_runtime::ja_configuration_restore,
         crate::app_runtime::ja_credential_set,
         crate::app_runtime::ja_credential_delete,
         crate::app_runtime::ja_credential_reveal_provider,
@@ -87,7 +87,7 @@ macro_rules! ja_command_handler {
         crate::app_runtime::ja_thread_list,
         crate::app_runtime::ja_thread_search,
         crate::app_runtime::ja_thread_read,
-        crate::app_runtime::ja_thread_message_content_read,
+        crate::app_runtime::ja_thread_item_content_read,
         crate::app_runtime::ja_thread_observe,
         crate::app_runtime::ja_operation_read,
         crate::app_runtime::ja_thread_unobserve,
@@ -113,6 +113,7 @@ macro_rules! ja_command_handler {
         crate::attachment_preview::commands::ja_attachment_preview_read,
         crate::attachment_preview::commands::ja_attachment_preview_close,
         crate::review::interface::commands::ja_review_catalog,
+        crate::review::interface::commands::ja_review_capture_snapshot,
         crate::review::interface::commands::ja_review_snapshot,
         crate::review::interface::commands::ja_review_file_diff,
         crate::review::interface::commands::ja_review_apply,
@@ -612,14 +613,18 @@ pub fn run() {
             java_logs_dir,
         )?;
         let app_handle = app.handle().clone();
+        let workspace_events = crate::app_runtime::WorkspaceMetadataEventRouter::default();
+        let event_router = workspace_events.clone();
         let sink: EventSink = Arc::new(move |payload| {
+            event_router.observe(&payload);
             app_handle
                 .emit(RPC_FRAME_EVENT, payload)
                 .map_err(|_| EventEmitError::DeliveryFailed)
         });
         // 即使需要 recovery 也继续托管 host，使窗口能渲染类型化恢复界面，
         // 而不是在 Tauri 创建 UI surface 前直接让 setup 失败。
-        let runtime_host = RuntimeHost::new(config, sink);
+        let runtime_host =
+            RuntimeHost::new_with_workspace_event_router(config, sink, &workspace_events);
         let attachment_preview_host = Arc::new(
             attachment_preview::AttachmentPreviewHost::new().map_err(|error| {
                 tauri::Error::Setup((Box::new(error) as Box<dyn std::error::Error>).into())
@@ -739,7 +744,7 @@ pub fn run() {
                 || !preview_empty
                 || !workspace_watchers_empty
                 || !attachments.is_shutdown_complete()
-                || attachment_previews.cache_bytes().unwrap_or(usize::MAX) != 0
+                || !attachment_previews_exit_ready(&attachment_previews)
             {
                 host.record_forced_exit();
                 tracing::error!("runtime Exit reached before cleanup confirmation");
@@ -831,20 +836,63 @@ pub(crate) fn handle_full_exit_request_event<R: tauri::Runtime>(
     code: Option<i32>,
     trace: &DebugExitTrace,
 ) -> bool {
+    handle_full_exit_request_event_with_preview_close(app_handle, code, trace, |params| {
+        close_attachment_preview_session(app_handle, params)
+    })
+}
+
+/// 同步 MockRuntime 与生产退出流程；固定 close 回调仅替换 ACK 来源，保留相同 deadline 和其他 owner 清理顺序。
+pub(crate) fn handle_full_exit_request_event_with_preview_close<R, C>(
+    app_handle: &tauri::AppHandle<R>,
+    code: Option<i32>,
+    trace: &DebugExitTrace,
+    close_preview: C,
+) -> bool
+where
+    R: tauri::Runtime,
+    C: FnMut(
+        ja_runtime::app_server_process::AttachmentPreviewCloseParams,
+    ) -> Result<(), crate::attachment_preview::AttachmentPreviewError>,
+{
     if code.is_some() {
         return false;
     }
     trace.record(DebugExitTraceEvent::RequestEntered);
-    handle_full_exit_requested(app_handle);
+    handle_full_exit_requested_with_preview_close(app_handle, close_preview);
     trace.record(DebugExitTraceEvent::RequestReturned);
     true
 }
 
+/// 将共享 App Server 的 close 结果收窄为附件预览的稳定恢复分类，不泄露 session identity 或 RPC payload。
+fn close_attachment_preview_session<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    params: ja_runtime::app_server_process::AttachmentPreviewCloseParams,
+) -> Result<(), crate::attachment_preview::AttachmentPreviewError> {
+    let runtime = app_handle.state::<RuntimeHost>();
+    runtime.attachment_preview_close(params).map_err(|error| {
+        crate::attachment_preview::AttachmentPreviewError::runtime(error.retryable)
+    })
+}
+
 /// 在同一个绝对 deadline 内关闭全部 Rust owner，包括 child Preview WebView 和原生 workspace watcher。
-/// Preview 自行执行绑定身份的 close ACK，因为应用级 WebView 枚举无法可靠发现 child WebView。
-/// callback 执行时最终窗口已进入销毁流程，清理失败不能阻止退出并遗留无头进程；随后由
-/// `RunEvent::Exit` 记录 recovery，既有进程树与 Drop 清理保留为最后安全边界。
+/// App Server 是共享 owner，Host 退出只断开当前连接；附件预览 identity 只有收到全部 close ACK 后才能清除。
+/// ACK 丢失或期限耗尽时保留完整 session 集合供幂等重试，并让 `RunEvent::Exit` readiness 明确失败。
 fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    handle_full_exit_requested_with_preview_close(app_handle, |params| {
+        close_attachment_preview_session(app_handle, params)
+    });
+}
+
+/// 所有本地 owner 都继续清理；close 回调可注入 ACK 故障，但共享 App Server 生命周期仍归独立 owner 管理。
+fn handle_full_exit_requested_with_preview_close<R, C>(
+    app_handle: &tauri::AppHandle<R>,
+    mut close_preview: C,
+) where
+    R: tauri::Runtime,
+    C: FnMut(
+        ja_runtime::app_server_process::AttachmentPreviewCloseParams,
+    ) -> Result<(), crate::attachment_preview::AttachmentPreviewError>,
+{
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(20))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(20));
@@ -859,15 +907,8 @@ fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R
     let preview_result = preview.shutdown_until(app_handle, deadline);
     let workspace_watcher_result = workspace::shutdown_all_until(deadline);
     let attachment_result = attachments.shutdown();
-    let attachment_preview_result = attachment_previews.drain_server_sessions().map(|sessions| {
-        for session in sessions {
-            if let Ok(params) =
-                ja_runtime::app_server_process::AttachmentPreviewCloseParams::new(session.as_str())
-            {
-                let _ = runtime.attachment_preview_close(params);
-            }
-        }
-    });
+    let attachment_preview_result =
+        close_attachment_previews_until(&attachment_previews, deadline, &mut close_preview);
     let runtime_result = cleanup_on_exit_until(&runtime, deadline);
     if !native_shortcut_result
         .as_ref()
@@ -882,6 +923,68 @@ fn handle_full_exit_requested<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R
     {
         tracing::error!("application cleanup did not complete before exit deadline");
     }
+}
+
+/// 非破坏性快照后逐条在 RPC 开始前检查共享 deadline；在途 RPC 沿用配置 timeout，任一未确认时保留 host 中的全集。
+fn close_attachment_previews_until<C>(
+    host: &crate::attachment_preview::AttachmentPreviewHost,
+    deadline: Instant,
+    mut close_preview: C,
+) -> Result<(), crate::attachment_preview::AttachmentPreviewError>
+where
+    C: FnMut(
+        ja_runtime::app_server_process::AttachmentPreviewCloseParams,
+    ) -> Result<(), crate::attachment_preview::AttachmentPreviewError>,
+{
+    use crate::attachment_preview::{AttachmentPreviewError, AttachmentPreviewErrorCode};
+    use ja_runtime::app_server_process::AttachmentPreviewCloseParams;
+
+    let sessions = host.server_sessions()?;
+    let mut unacknowledged_sessions = 0usize;
+    let mut deadline_skipped_sessions = 0usize;
+    for (index, session) in sessions.iter().enumerate() {
+        if Instant::now() >= deadline {
+            deadline_skipped_sessions = sessions.len() - index;
+            unacknowledged_sessions += deadline_skipped_sessions;
+            break;
+        }
+        let params = match AttachmentPreviewCloseParams::new(session.as_str()) {
+            Ok(params) => params,
+            Err(_) => {
+                unacknowledged_sessions += 1;
+                continue;
+            }
+        };
+        if let Err(error) = close_preview(params) {
+            tracing::warn!(error_code = ?error.code, "attachment preview close was not acknowledged during exit");
+            unacknowledged_sessions += 1;
+        }
+    }
+
+    if unacknowledged_sessions > 0 {
+        tracing::error!(
+            unacknowledged_sessions = unacknowledged_sessions,
+            deadline_skipped_sessions = deadline_skipped_sessions,
+            "attachment preview sessions remain unconfirmed at application exit"
+        );
+        return Err(AttachmentPreviewError::new(
+            AttachmentPreviewErrorCode::SourceUnavailable,
+        ));
+    }
+
+    host.clear()?;
+    Ok(())
+}
+
+/// 最终 Exit 同时要求本地缓存为空且远端 identity 集合已清空；查询失败按无法证明清理完成处理。
+pub(crate) fn attachment_previews_exit_ready(
+    host: &crate::attachment_preview::AttachmentPreviewHost,
+) -> bool {
+    let cache_empty = host.cache_bytes().is_ok_and(|bytes| bytes == 0);
+    let sessions_empty = host
+        .server_sessions()
+        .is_ok_and(|sessions| sessions.is_empty());
+    cache_empty && sessions_empty
 }
 
 /// 从托盘或其它显式应用级入口进入唯一完整退出路径；调用方不得直接 `exit(0)` 绕过 owner 清理。

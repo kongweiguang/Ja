@@ -536,8 +536,8 @@ export function Workbench({
   };
 
   /** 仅恢复仍属于当前会话的焦点，避免关闭菜单排队的 RAF 抢走新菜单焦点并将其关闭。 */
-  const restoreTabContextMenuFocus = (sessionId: number): void => {
-    if (tabContextMenuSequenceRef.current !== sessionId) return;
+  const restoreTabContextMenuFocus = (menuSequence: number): void => {
+    if (tabContextMenuSequenceRef.current !== menuSequence) return;
     const trigger = tabContextMenuTriggerRef.current;
     if (trigger?.isConnected) trigger.focus();
   };
@@ -911,7 +911,9 @@ function capabilityMenuDefinitions(
   return definitions.filter(({ value }) => value !== "new");
 }
 
-/** `+` 统一承载可用 Tab 菜单；侧聊创建仍由 composition root 签发实例身份。 */
+/**
+ * `+` 统一承载可用 Tab 菜单，侧聊身份由 composition root 签发；会话隐藏或 inert 时不应接收关闭后的焦点回跳。
+ */
 function WorkbenchCapabilityMenu({
   definitions,
   activeTab,
@@ -929,10 +931,12 @@ function WorkbenchCapabilityMenu({
   onFocusConversation?: () => void;
   onCreateSideTask?: () => void;
 }): ReactElement {
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+
   return (
     <Menu>
       <MenuTrigger asChild>
-        <IconButton className="ja-workbench-add-tab" label="新建标签页">
+        <IconButton ref={triggerRef} className="ja-workbench-add-tab" label="新建标签页">
           <Plus aria-hidden="true" />
         </IconButton>
       </MenuTrigger>
@@ -941,6 +945,12 @@ function WorkbenchCapabilityMenu({
         align="end"
         sideOffset={6}
         aria-label="右侧栏能力"
+        onCloseAutoFocus={(event) => {
+          const trigger = triggerRef.current;
+          if (trigger !== null && trigger.closest("[hidden], [inert]") !== null) {
+            event.preventDefault();
+          }
+        }}
       >
         {definitions.map(({ value, label, Icon }) => (
           <MenuItem

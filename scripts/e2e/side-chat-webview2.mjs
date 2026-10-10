@@ -16,6 +16,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import process from "node:process";
 import { chromium } from "@playwright/test";
+import { assertSideChatCloseReceipt } from "./side-chat-close-evidence.mjs";
 
 const endpoint = process.env.JA_E2E_SIDE_CHAT_CDP_ENDPOINT?.trim();
 const evidenceDirectory = process.env.JA_E2E_SIDE_CHAT_ARTIFACT_DIR?.trim();
@@ -36,7 +37,6 @@ const SIDE_SECOND_MARKER = "JA_SIDE_CHAT_CHILD_SECOND";
 const SIDE_RUNNING_MARKER = "JA_SIDE_CHAT_CHILD_RUNNING";
 const SIDE_AFTER_RUNNING_MARKER = "JA_SIDE_CHAT_CHILD_AFTER_RUNNING";
 const SIDE_PLAN_MARKER = "JA_SIDE_CHAT_SIDE_PLAN";
-const SIDE_GOAL_MARKER = "JA_SIDE_CHAT_SIDE_GOAL";
 const BTW_MARKER = "JA_SIDE_CHAT_BTW_CONTENT";
 const MAILBOX_MARKER = "JA_SIDE_CHAT_MAILBOX";
 const RUNNING_MAILBOX_MARKER = "JA_SIDE_CHAT_RUNNING_MAILBOX";
@@ -209,21 +209,19 @@ async function startLoopbackProvider() {
           ? "btw"
           : scenario.includes(SIDE_AFTER_RUNNING_MARKER)
             ? "side_after_running"
-            : scenario.includes(SIDE_GOAL_MARKER)
-              ? "side_goal"
-              : scenario.includes(SIDE_PLAN_MARKER)
-                ? "side_plan"
-                : scenario.includes(SIDE_RUNNING_MARKER)
-                  ? "side_running"
-                  : scenario.includes(SIDE_SECOND_MARKER)
-                    ? "side_second"
-                    : scenario.includes(SIDE_FIRST_MARKER)
-                      ? "side_first"
-                      : serialized.includes(BTW_MARKER)
-                        ? "btw"
-                        : serialized.includes(ROOT_MARKER)
-                          ? "root"
-                          : "unknown";
+            : scenario.includes(SIDE_PLAN_MARKER)
+              ? "side_plan"
+              : scenario.includes(SIDE_RUNNING_MARKER)
+                ? "side_running"
+                : scenario.includes(SIDE_SECOND_MARKER)
+                  ? "side_second"
+                  : scenario.includes(SIDE_FIRST_MARKER)
+                    ? "side_first"
+                    : serialized.includes(BTW_MARKER)
+                      ? "btw"
+                      : serialized.includes(ROOT_MARKER)
+                        ? "root"
+                        : "unknown";
     const record = {
       sequence: ++sequence,
       marker,
@@ -315,13 +313,11 @@ async function startLoopbackProvider() {
                 ? "JA_SIDE_CHAT_AFTER_RUNNING_DONE"
                 : marker === "side_running"
                   ? "JA_SIDE_CHAT_RUNNING_DONE"
-                  : marker === "side_goal"
-                    ? "JA_SIDE_CHAT_GOAL_DONE"
-                    : marker === "side_plan"
-                      ? "JA_SIDE_CHAT_PLAN_DONE"
-                      : marker === "side_second"
-                        ? "JA_SIDE_CHAT_SECOND_DONE"
-                        : "JA_SIDE_CHAT_FIRST_DONE";
+                  : marker === "side_plan"
+                    ? "JA_SIDE_CHAT_PLAN_DONE"
+                    : marker === "side_second"
+                      ? "JA_SIDE_CHAT_SECOND_DONE"
+                      : "JA_SIDE_CHAT_FIRST_DONE";
     const message = {
       id: `msg_side_chat_${record.sequence}`,
       type: "message",
@@ -428,18 +424,20 @@ async function configureLoopbackProvider(page, provider) {
     await page.getByRole("option", { name: "Anthropic Messages", exact: true }).click();
   }
   await dialog.getByLabel("Base URL").fill(provider.url);
-  await dialog.getByLabel("API key / token").fill("isolated-loopback-no-billing-token");
+  await dialog
+    .getByRole("textbox", { name: "API Key", exact: true })
+    .fill("isolated-loopback-no-billing-token");
   const rows = dialog.locator(".ja-provider-model-row");
   assert.ok((await rows.count()) >= 1, "模型设置页没有模型行");
   const fill = async (row, model) => {
     await row.getByLabel("显示名称").fill(model);
     await row.getByLabel("上游模型标识").fill(model);
     await row.getByLabel("上下文 Tokens").fill("128000");
-    await row.getByLabel("最大输出 Tokens").fill("8192");
+    await row.getByLabel("单次最大输出 Tokens").fill("8192");
   };
   await fill(rows.nth(0), PRIMARY_MODEL);
   if ((await rows.count()) < 2)
-    await dialog.getByRole("button", { name: "添加模型", exact: true }).click();
+    await dialog.getByRole("button", { name: "手动添加", exact: true }).click();
   await fill(rows.nth(1), SECONDARY_MODEL);
   await dialog
     .getByRole("button", { name: creating ? "保存供应商" : "保存更改", exact: true })
@@ -834,14 +832,18 @@ async function inspectVisualParity(page) {
   return { ...evidence, narrowOverflow };
 }
 
-/** QueueOnly 只落到目标 Mailbox，空闲目标不启动 Provider；消息只在下一轮请求前消费。 */
+/**
+ * QueueOnly 只落到目标 Mailbox，空闲目标不启动 Provider；task/read 只核对入箱事实，正文权限必须经
+ * Thread/item 身份读取，不能把 Mailbox 预览当作完整历史或跨会话读取授权。operationKey 是该持久写入的去重键，
+ * 与 JSON-RPC 请求 id 及 Thread 身份分离；响应未知时重试必须复用同一个键。
+ */
 async function exerciseMailbox(page, provider, rootThreadId, side) {
   const idleBefore = provider.requests.length;
   const receipt = await invoke(page, messageCommand, {
     senderThreadId: rootThreadId,
     targetThreadId: side.threadId,
     content: [{ type: "text", text: MAILBOX_MARKER }],
-    idempotencyKey: `side-chat-mailbox-${Date.now()}`,
+    operationKey: `side-chat-mailbox-${Date.now()}`,
   });
   assert.equal(receipt.ok, true, `Mailbox 投递失败：${JSON.stringify(receipt.error)}`);
   await new Promise((resolve) => setTimeout(resolve, 300));
@@ -856,11 +858,40 @@ async function exerciseMailbox(page, provider, rootThreadId, side) {
     mailbox.some((message) => JSON.stringify(message.content).includes(MAILBOX_MARKER)),
     "Mailbox 没有持久化消息正文",
   );
+  const messageId = receipt.value?.messageId;
+  assert.match(messageId ?? "", /^item_/u, "投递回执没有稳定消息 item 身份");
+  const thread = requireInvoke(await readThread(page, side.threadId), "收件侧聊历史");
+  const messageItem = thread.items?.find((item) => item.itemId === messageId);
+  assert.equal(messageItem?.kind, "thread_message", "收件 Thread 未投影对应 Mailbox item");
+  const content = requireInvoke(
+    await invoke(page, "ja_thread_item_content_read", {
+      threadId: side.threadId,
+      itemId: messageId,
+      offsetCharacters: 0,
+      limitCharacters: 256,
+    }),
+    "收件 Mailbox 正文读取",
+  );
+  assert.equal(content.itemId, messageId);
+  assert.equal(content.content, MAILBOX_MARKER, "收件 Thread 读取的正文与投递不一致");
+  assert.equal(content.truncated, false, "短 Mailbox 正文不应被截断");
   const before = provider.requests.length;
   await sendComposer(side.composer, SIDE_SECOND_MARKER, "JA_SIDE_CHAT_SECOND_DONE");
   const request = await waitForRequest(provider, "side_second", before);
   assert.equal(request.hasMailboxMarker, true, "下一次 Provider 请求前没有消费 Mailbox");
-  return { receipt: receipt.value, request };
+  return { receipt: receipt.value, request, messageId };
+}
+
+/** 同一 owner 的其他 Thread 不能借已投递的 item 身份读取收件侧聊私有正文。 */
+async function rejectMailboxReadFromOtherThread(page, threadId, itemId) {
+  const result = await invoke(page, "ja_thread_item_content_read", {
+    threadId,
+    itemId,
+    offsetCharacters: 0,
+    limitCharacters: 256,
+  });
+  assert.equal(result.ok, false, "无关 Thread 读取了其他会话的 Mailbox 正文");
+  assert.equal(result.error?.code, "THREAD_NOT_FOUND", "未授权 item 应使用统一不可枚举错误");
 }
 
 /** 在同一个 Turn 内通过真实工具边界继续第二次模型请求，验证消息无需等当前问题结束。 */
@@ -872,7 +903,7 @@ async function exerciseRunningMailbox(page, provider, rootThreadId, side) {
     senderThreadId: rootThreadId,
     targetThreadId: side.threadId,
     content: [{ type: "text", text: RUNNING_MAILBOX_MARKER }],
-    idempotencyKey: `side-chat-running-${Date.now()}`,
+    operationKey: `side-chat-running-${Date.now()}`,
   });
   assert.equal(message.ok, true, `运行中 Mailbox 投递失败：${JSON.stringify(message.error)}`);
   assert.equal(provider.requests.length, before + 1, "运行中 QueueOnly 消息错误地启动或打断了请求");
@@ -905,15 +936,15 @@ async function createSideOwnedChild(page, side) {
 }
 
 /**
- * 让同一个真实侧聊同时经过 Plan 与 Goal 入口，确保 task/close 先处理关联资源，
- * 再返回 closed=true；脚本不直接写数据库，也不把 Goal/Plan 状态伪装成普通正文。
+ * 在真实侧聊 Composer 中单独创建并读取 Plan，确认侧聊复用主会话的 Plan 能力。
+ * 该检查走真实 Composer 与 RPC，避免通过直接写状态伪造侧聊的 Plan 能力。
  */
-async function createSidePlanAndGoal(page, provider, side) {
+async function createSidePlan(page, provider, side) {
   const input = side.composer.getByRole("textbox", { name: "消息", exact: true });
   await input.fill("/plan on");
   await input.press("Enter");
   await side.composer
-    .locator('[data-goal-ui="mode-status"]')
+    .locator('[data-plan-ui="mode-status"]')
     .waitFor({ state: "visible", timeout: 15_000 });
   const beforePlan = provider.requests.length;
   await sendComposer(side.composer, SIDE_PLAN_MARKER, "JA_SIDE_CHAT_PLAN_DONE");
@@ -930,32 +961,11 @@ async function createSidePlanAndGoal(page, provider, side) {
   await input.fill("/plan off");
   await input.press("Enter");
   await side.composer
-    .locator('[data-goal-ui="mode-status"]')
+    .locator('[data-plan-ui="mode-status"]')
     .waitFor({ state: "hidden", timeout: 15_000 });
-
-  await input.fill("/goal");
-  await input.press("Enter");
-  const editor = page.getByRole("textbox", { name: /目标/u }).last();
-  await editor.waitFor({ state: "visible", timeout: 15_000 });
-  await editor.fill(`侧聊关闭资源回收 ${SIDE_GOAL_MARKER}`);
-  await side.composer.getByRole("button", { name: "创建目标", exact: true }).click();
-  await input.waitFor({ state: "visible", timeout: 15_000 });
-  const taskRead = await invoke(page, "ja_runtime_task_read", { taskThreadId: side.threadId });
-  assert.equal(
-    taskRead.ok,
-    true,
-    `侧聊 Goal 创建后 task/read 失败：${JSON.stringify(taskRead.error)}`,
-  );
-  const goalId = taskRead.value?.thread?.activeGoalId;
-  assert.equal(typeof goalId, "string", "侧聊没有真实 Goal owner");
-  const goal = await invoke(page, "ja_runtime_goal_read", { goalId });
-  assert.equal(goal.ok, true, `侧聊 Goal read 失败：${JSON.stringify(goal.error)}`);
-  assert.equal(goal.value?.goal?.owner?.taskThreadId, side.threadId, "Goal owner 不是当前侧聊");
   return {
     planId: currentPlan.value.current.plan.planId,
-    goalId,
     planRequest,
-    goalOwnerThreadId: goal.value.goal.owner.taskThreadId,
   };
 }
 
@@ -974,16 +984,98 @@ async function listThreads(page, workspaceId) {
 }
 
 /**
+ * 只对当前侧聊的一次 transport 提交注入延迟失败；真实界面必须保留 Tab 与 Thread，
+ * 呈现 closing/错误并允许重试。重试才穿透真实 App Server，返回的 ID 集合作为 UI ACK 证据。
+ */
+async function exerciseSideChatCloseRetry(page, side, shell) {
+  await page.evaluate(({ command, threadId }) => {
+    const previous = globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__;
+    const state = { attempts: 0, delegated: 0, released: false };
+    globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__ = state;
+    globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = async (request, delegate) => {
+      if (request?.command !== command || request?.args?.input?.taskThreadId !== threadId)
+        return previous === undefined ? delegate() : previous(request, delegate);
+      state.attempts += 1;
+      if (state.attempts === 1) {
+        await new Promise((resolve) => { state.release = resolve; });
+        state.released = true;
+        throw { code: "TASK_CLOSE_FAILED" };
+      }
+      state.delegated += 1;
+      const result = previous === undefined ? await delegate() : await previous(request, delegate);
+      state.closedThreadIds = Array.isArray(result?.closedThreadIds)
+        ? [...result.closedThreadIds]
+        : undefined;
+      return result;
+    };
+    state.restore = () => {
+      state.release?.();
+      globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = previous;
+    };
+  }, { command: closeCommand, threadId: side.threadId });
+  try {
+    const close = shell.locator('[data-tab-close="true"]');
+    await close.click();
+    await waitForCondition(
+      "侧聊 closing transaction",
+      async () => (await page.evaluate(() => globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__?.attempts)) === 1 &&
+        await close.isDisabled(),
+    );
+    assert.equal(await side.tab.count(), 1, "closing 期间提前移除了侧聊 Tab");
+    assert.equal((await readThread(page, side.threadId)).ok, true, "失败提交前侧聊 Thread 已丢失");
+    await capture(page, "03a-side-chat-close-pending");
+    await page.evaluate(() => globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__?.release?.());
+    const workbench = page.locator('.ja-thread-workbench-session:not([hidden]) .ja-workbench:visible');
+    const error = workbench.getByRole("alert").filter({
+      has: page.getByRole("heading", { name: "关闭失败", exact: true }),
+    });
+    await error.waitFor({ state: "visible", timeout: 20_000 });
+    assert.equal(await side.tab.count(), 1, "关闭失败后提前移除了侧聊 Tab");
+    assert.equal((await readThread(page, side.threadId)).ok, true, "关闭失败后侧聊 Thread 已丢失");
+    assert.equal(await close.isEnabled(), true, "关闭失败没有恢复操作入口");
+    await capture(page, "03b-side-chat-close-failed");
+    await error.getByRole("button", { name: "重试", exact: true }).click();
+    await waitForCondition("侧聊重试关闭 ACK", async () => (await side.tab.count()) === 0, 30_000);
+    const state = await page.evaluate(() => {
+      const fault = globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__;
+      return {
+        attempts: fault.attempts,
+        delegated: fault.delegated,
+        released: fault.released,
+        closedThreadIds: fault.closedThreadIds,
+      };
+    });
+    assert.deepEqual(
+      { attempts: state.attempts, delegated: state.delegated, released: state.released },
+      { attempts: 2, delegated: 1, released: true },
+    );
+    return {
+      injectedFailure: "transport_before_commit",
+      closingObserved: true,
+      failedTabRetained: true,
+      failedThreadRetained: true,
+      retryDelegatedOnce: true,
+      closedThreadIds: state.closedThreadIds,
+    };
+  } finally {
+    await page.evaluate(() => {
+      globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__?.restore?.();
+      delete globalThis.__JA_SIDE_CHAT_CLOSE_FAULT__;
+    }).catch(() => undefined);
+  }
+}
+
+/**
  * 关闭先验证 UI 操作确实完成服务端删除/关闭，再调用幂等 close 检查回执；
  * 若 UI 只是移除 Tab 而没有关闭后端 Thread，第一次 read 会立即失败验收，
- * 不会被后续的补偿 command 掩盖。
+ * 不会被后续的补偿 command 掩盖；UI closing/失败/重试也必须先完成。
  */
 async function closeSideChat(page, side) {
   // 每个标签的关闭按钮是 tab 的兄弟；必须用固定 Thread 的容器定位，不能按重名“关闭侧聊”猜目标。
   const shell = page
     .locator(".ja-workbench-tab-shell")
     .filter({ has: page.locator(`[data-workbench-tab="side-task:${side.threadId}"]`) });
-  await shell.locator('[data-tab-close="true"]').click();
+  const lifecycle = await exerciseSideChatCloseRetry(page, side, shell);
   await waitForCondition(
     "侧聊关闭 ACK",
     async () =>
@@ -1003,10 +1095,15 @@ async function closeSideChat(page, side) {
   );
   const closeResult = await invoke(page, closeCommand, { taskThreadId: side.threadId });
   assert.equal(closeResult.ok, true, `task/close 调用失败：${JSON.stringify(closeResult.error)}`);
-  assert.equal(
-    closeResult.value?.closed,
-    true,
-    `task/close 没有返回 closed=true：${JSON.stringify(closeResult.value)}`,
+  const closedThreadIds = assertSideChatCloseReceipt(
+    closeResult.value,
+    side.threadId,
+    [side.threadId],
+  );
+  assert.deepEqual(
+    lifecycle.closedThreadIds,
+    closedThreadIds,
+    "UI 关闭 ACK 与幂等重试返回了不同的关闭范围",
   );
   const read = await readThread(page, side.threadId);
   const closed = read.ok !== true || ["closed", "deleted"].includes(read.value?.status);
@@ -1017,14 +1114,75 @@ async function closeSideChat(page, side) {
   );
   return {
     clicked: true,
+    lifecycle,
     command: closeCommand,
-    closed: closeResult.value.closed,
+    closedThreadIds,
     uiReadCode: uiRead.error?.code ?? uiRead.value?.status ?? "closed",
     readCode: read.error?.code ?? read.value?.status ?? "closed",
   };
 }
 
-/** 初始阶段执行全部真实交互，并写入极小状态供 launcher 重启阶段读取。 */
+/** 通过现有 RPC frame channel 只收集 task/closed，核对全局观察者通知与关闭 ACK。 */
+async function subscribeTaskClosedEvents(page) {
+  return page.evaluate(async () => {
+    const internals = globalThis.__TAURI_INTERNALS__;
+    if (typeof internals?.transformCallback !== "function" || typeof internals.invoke !== "function") {
+      throw new Error("task/closed 验收缺少 Tauri event bridge");
+    }
+    globalThis.__JA_SIDE_CHAT_CLOSE_EVENTS__ = [];
+    const handler = internals.transformCallback((value) => {
+      const payload = value !== null && typeof value === "object" && value.payload !== undefined
+        ? value.payload
+        : value;
+      if (payload?.method !== "task/closed") return;
+      const events = globalThis.__JA_SIDE_CHAT_CLOSE_EVENTS__;
+      if (Array.isArray(events) && events.length < 32) events.push(payload);
+    });
+    return internals.invoke("plugin:event|listen", {
+      event: "ja://rpc/frame",
+      target: { kind: "Any" },
+      handler,
+    });
+  });
+}
+
+/** 在同一隔离窗口观察服务端通知，容许通知早于 UI ACK 到达。 */
+async function waitForTaskClosedEvent(page, rootThreadId, taskThreadId) {
+  let event;
+  await waitForCondition("task/closed 侧聊清理通知", async () => {
+    event = await page.evaluate(({ expectedRootThreadId, expectedTaskThreadId }) => {
+      const events = globalThis.__JA_SIDE_CHAT_CLOSE_EVENTS__;
+      if (!Array.isArray(events)) return undefined;
+      const payload = events.find((candidate) =>
+        candidate?.method === "task/closed" &&
+        candidate.params?.rootThreadId === expectedRootThreadId &&
+        candidate.params?.taskThreadId === expectedTaskThreadId,
+      )?.params;
+      if (payload === undefined) return undefined;
+      return {
+        rootThreadId: payload.rootThreadId,
+        taskThreadId: payload.taskThreadId,
+        closedThreadIds: payload.closedThreadIds,
+        paramsFields: Object.keys(payload).sort(),
+      };
+    }, { expectedRootThreadId: rootThreadId, expectedTaskThreadId: taskThreadId });
+    return event !== undefined;
+  }, 30_000);
+  return event;
+}
+
+/** 关闭观察者时释放精确 Tauri listener，避免跨阶段保留 callback。 */
+async function unsubscribeTaskClosedEvents(page, eventId) {
+  await page.evaluate(async (listenerId) => {
+    await globalThis.__TAURI_INTERNALS__?.invoke?.("plugin:event|unlisten", {
+      event: "ja://rpc/frame",
+      eventId: listenerId,
+    });
+    delete globalThis.__JA_SIDE_CHAT_CLOSE_EVENTS__;
+  }, eventId);
+}
+
+/** 初始阶段执行真实交互，并用 RPC 通知核对侧聊关闭集合后再保存重启状态。 */
 async function runInitial(page, provider) {
   await page.locator(".ja-composer").first().waitFor({ state: "visible", timeout: 60_000 });
   await configureLoopbackProvider(page, provider);
@@ -1083,7 +1241,8 @@ async function runInitial(page, provider) {
   const second = await openSideChat(page);
   const secondSnapshot = threadFacts(await readThread(page, second.threadId));
   assert.equal(secondSnapshot?.turns.length, 0, "第二个空侧聊创建时唤醒 Provider");
-  const sidePlanGoal = await createSidePlanAndGoal(page, provider, second);
+  await rejectMailboxReadFromOtherThread(page, second.threadId, mailbox.messageId);
+  const sidePlan = await createSidePlan(page, provider, second);
   await first.tab.click();
   await first.region
     .getByText("JA_SIDE_CHAT_FIRST_DONE", { exact: true })
@@ -1120,7 +1279,7 @@ async function runInitial(page, provider) {
   assert.equal(
     listed.some((thread) => thread.threadId === second.threadId),
     true,
-    "thread/list 缺少创建过 Goal/Plan 的侧聊",
+    "thread/list 缺少包含独立 Plan 的侧聊",
   );
   const navigationThreadIds = await page
     .locator(".ja-navigation-thread-row button[data-thread-id]")
@@ -1139,11 +1298,34 @@ async function runInitial(page, provider) {
       `主导航错误展示临时侧聊：${sideThreadId}`,
     );
   }
-  const close = await closeSideChat(page, second);
+  const closeListener = await subscribeTaskClosedEvents(page);
+  let close;
+  let closeEvent;
+  try {
+    close = await closeSideChat(page, second);
+    closeEvent = await waitForTaskClosedEvent(page, rootThreadId, second.threadId);
+    assert.deepEqual(
+      closeEvent.paramsFields,
+      ["closedThreadIds", "rootThreadId", "taskThreadId"],
+      "task/closed 业务 params 不符合严格字段闭集",
+    );
+    const eventClosedThreadIds = assertSideChatCloseReceipt(
+      { closedThreadIds: closeEvent.closedThreadIds },
+      second.threadId,
+      close.closedThreadIds,
+    );
+    assert.deepEqual(
+      eventClosedThreadIds,
+      close.closedThreadIds,
+      "task/closed 通知与 task/close ACK 的清理范围不同",
+    );
+  } finally {
+    await unsubscribeTaskClosedEvents(page, closeListener).catch(() => undefined);
+  }
   assert.equal(await access(retainedFile).then(() => true), true, "关闭侧聊误删主 workspace 文件");
   await writeFile(
     join(evidenceDirectory, "side-chat-state.json"),
-    `${JSON.stringify({ rootThreadId, sideThreadId: second.threadId, liveSideThreadId: first.threadId, btwSideThreadId: btw.first.threadId, btwIdleSideThreadId: btw.idle.threadId, btwRequestTargetThreadId: btw.requestTargetThreadId, childTaskThreadId: childTask.taskThreadId, workspaceId, sidePlanGoal }, null, 2)}\n`,
+    `${JSON.stringify({ rootThreadId, sideThreadId: second.threadId, liveSideThreadId: first.threadId, btwSideThreadId: btw.first.threadId, btwIdleSideThreadId: btw.idle.threadId, btwRequestTargetThreadId: btw.requestTargetThreadId, childTaskThreadId: childTask.taskThreadId, workspaceId, sidePlan, close: { closedThreadIds: close.closedThreadIds, eventClosedThreadIds: closeEvent.closedThreadIds } }, null, 2)}\n`,
     "utf8",
   );
   await capture(page, "03-side-chat-after-close");
@@ -1165,9 +1347,10 @@ async function runInitial(page, provider) {
       rootRequestCountBeforeContent: btw.rootRequestCountBeforeContent,
       rootRequestCountAfterContent: btw.rootRequestCountAfterContent,
     },
-    sidePlanGoal,
+    sidePlan,
     visual,
     close,
+    closeEvent,
     providerRequestCount: provider.requests.length,
   };
 }

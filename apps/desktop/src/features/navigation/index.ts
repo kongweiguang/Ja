@@ -8,6 +8,8 @@ export { NavigationSidebar } from "./ui/NavigationSidebar";
 export type { NavigationSidebarProps } from "./ui/NavigationSidebar";
 export { ConversationSearchDialog } from "./ui/ConversationSearchDialog";
 export { ConversationRenameDialog } from "./ui/ConversationRenameDialog";
+export { ProjectEditDialog } from "./ui/ProjectEditDialog";
+export type { ProjectEditDialogProps, ProjectEditInput } from "./ui/ProjectEditDialog";
 export { detectDesktopPlatform } from "./application/detectDesktopPlatform";
 export type { NavigatorLike } from "./application/detectDesktopPlatform";
 export { useWindowFrameController } from "./application/useWindowFrameController";

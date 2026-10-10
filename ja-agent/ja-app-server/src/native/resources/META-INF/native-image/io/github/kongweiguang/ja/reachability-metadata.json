@@ -1,0 +1,151 @@
+{
+  "comment": "@author kongweiguang；MyBatis 动态代理由 Solon AOT 生成；FFM 声明覆盖 Job、ConPTY 和挂起进程属性列表，Native 不得缺少 JVM 已支持的进程能力。",
+  "reflection": [],
+  "foreign": {
+    "downcalls": [
+      {
+        "returnType": "void",
+        "parameterTypes": ["void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["jint", "void*", "void*", "jint", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "jint", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "void*", "void*", "jlong", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "void*", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "jint", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "jint", "void*", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "jint", "void*", "void*", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "jint", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": ["void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": ["void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": ["jint", "jint", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "jint", "jint", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jshort", "jshort"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "jint", "void*", "void*", "void*", "void*", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": [],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "void*", "void*", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": [
+          "void*", "void*", "void*", "void*", "jint", "jint",
+          "void*", "void*", "void*", "void*"
+        ],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "void*", "jint"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "void*",
+        "parameterTypes": ["void*", "jint", "jint", "void*", "jint", "jint", "void*"],
+        "options": {"captureCallState": true}
+      },
+      {
+        "returnType": "jint",
+        "parameterTypes": ["void*", "jint", "void*", "jint", "void*"],
+        "options": {"captureCallState": true}
+      }
+    ]
+  }
+}

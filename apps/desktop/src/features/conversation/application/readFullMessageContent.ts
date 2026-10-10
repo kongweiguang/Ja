@@ -1,13 +1,13 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { ConversationHistoryPort } from "./ports";
+import type { ConversationHistoryPort, ConversationItemContentReader } from "./ports";
 
 /** 按服务端 Unicode 游标逐页读取；身份、长度和前台栅栏任一变化都拒绝交付残缺内容。 */
-export async function readFullMessageContent(
-  readPage: NonNullable<ConversationHistoryPort["messageContentRead"]>,
+export async function readFullItemContent(
+  readPage: ConversationItemContentReader,
   threadId: string,
-  messageId: string,
+  itemId: string,
   isCurrent: () => boolean = () => true,
 ): Promise<string> {
   let offsetCharacters = 0;
@@ -15,11 +15,11 @@ export async function readFullMessageContent(
   const chunks: string[] = [];
   for (;;) {
     if (!isCurrent()) throw new Error("当前对话已切换，请重新打开内容。");
-    const page = await readPage({ threadId, messageId, offsetCharacters, limitCharacters: 32_768 });
+    const page = await readPage({ threadId, itemId, offsetCharacters, limitCharacters: 65_536 });
     if (!isCurrent()) throw new Error("当前对话已切换，请重新打开内容。");
     const end = page.nextOffsetCharacters ?? page.totalCharacters;
     if (
-      page.messageId !== messageId ||
+      page.itemId !== itemId ||
       page.offsetCharacters !== offsetCharacters ||
       (totalCharacters !== undefined && page.totalCharacters !== totalCharacters) ||
       page.truncated !== (page.nextOffsetCharacters !== null) ||
@@ -36,29 +36,28 @@ export async function readFullMessageContent(
   }
 }
 
-/** 最终答复按已提交历史分页查齐本次 Tool 之后的所有文本段，避免只读当前可见页漏掉前缀。 */
+/** 最终答复按已提交历史分页查齐正文；把 adapter 方法交给回调 pager 时保留其 bridge receiver。 */
 export async function readFullAnswerContent(
-  history: Pick<ConversationHistoryPort, "threadRead" | "messageContentRead">,
+  history: Pick<ConversationHistoryPort, "threadRead" | "itemContentRead">,
   threadId: string,
-  finalMessageId: string,
+  finalItemId: string,
   isCurrent: () => boolean = () => true,
   minimumRevision?: number,
   expectedTurnId?: string,
+  readItemContent?: (threadId: string, itemId: string, isCurrent: () => boolean) => Promise<string>,
 ): Promise<string> {
-  const readPage = history.messageContentRead;
-  if (readPage === undefined) throw new Error("完整回复暂时不可用。");
   const consistencyDeadline = Date.now() + 10_000;
-  let ordered: string[];
+  let orderedItemIds: string[];
   for (;;) {
     const scanned = await scanAnswerMessageIds(
       history,
       threadId,
-      finalMessageId,
+      finalItemId,
       expectedTurnId,
       isCurrent,
     );
-    if (scanned.messageIds.length > 0) {
-      ordered = scanned.messageIds;
+    if (scanned.itemIds.length > 0) {
+      orderedItemIds = scanned.itemIds;
       break;
     }
     if (
@@ -70,14 +69,12 @@ export async function readFullAnswerContent(
     await new Promise((resolve) => setTimeout(resolve, 120));
   }
   const segments: string[] = [];
-  for (const messageId of ordered) {
+  const readPage = history.itemContentRead.bind(history);
+  for (const itemId of orderedItemIds) {
     segments.push(
-      await readFullMessageContent(
-        (input) => readPage.call(history, input),
-        threadId,
-        messageId,
-        isCurrent,
-      ),
+      await (readItemContent === undefined
+        ? readFullItemContent(readPage, threadId, itemId, isCurrent)
+        : readItemContent(threadId, itemId, isCurrent)),
     );
   }
   const last = segments.pop() ?? "";
@@ -92,16 +89,16 @@ export async function readFullAnswerContent(
 async function scanAnswerMessageIds(
   history: Pick<ConversationHistoryPort, "threadRead">,
   threadId: string,
-  finalMessageId: string,
+  finalItemId: string,
   expectedTurnId: string | undefined,
   isCurrent: () => boolean,
-): Promise<{ messageIds: string[]; revision: number }> {
+): Promise<{ itemIds: string[]; revision: number }> {
   let cursor: string | undefined;
   let revision: number | undefined;
   let matchedTurnId: string | undefined;
   let reachedBoundary = false;
   const visited = new Set<string>();
-  const messageIdsNewestFirst: string[] = [];
+  const itemIdsNewestFirst: string[] = [];
   while (!reachedBoundary) {
     if (!isCurrent()) throw new Error("当前对话已切换，请重新打开回复。");
     const page = await history.threadRead({ threadId, tail: true, cursor, limit: 200 });
@@ -114,7 +111,7 @@ async function scanAnswerMessageIds(
       if (item === undefined) continue;
       if (matchedTurnId === undefined) {
         if (
-          item.itemId !== finalMessageId &&
+          item.itemId !== finalItemId &&
           !(
             expectedTurnId !== undefined &&
             item.kind === "final_answer" &&
@@ -124,7 +121,7 @@ async function scanAnswerMessageIds(
           continue;
         if (item.kind !== "final_answer") throw new Error("最终回复身份已变化。");
         matchedTurnId = item.turnId;
-        messageIdsNewestFirst.push(item.itemId);
+        itemIdsNewestFirst.push(item.itemId);
         continue;
       }
       if (
@@ -136,7 +133,7 @@ async function scanAnswerMessageIds(
         reachedBoundary = true;
         break;
       }
-      if (item.kind === "assistant_progress") messageIdsNewestFirst.push(item.itemId);
+      if (item.kind === "assistant_progress") itemIdsNewestFirst.push(item.itemId);
     }
     if (reachedBoundary || page.nextCursor === null) break;
     if (page.nextCursor === cursor || visited.has(page.nextCursor))
@@ -145,7 +142,7 @@ async function scanAnswerMessageIds(
     cursor = page.nextCursor;
   }
   return {
-    messageIds: matchedTurnId === undefined ? [] : messageIdsNewestFirst.reverse(),
+    itemIds: matchedTurnId === undefined ? [] : itemIdsNewestFirst.reverse(),
     revision: revision ?? -1,
   };
 }

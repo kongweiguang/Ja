@@ -83,9 +83,9 @@ try {
 
     $sourceFiles = @(
         Get-Item -LiteralPath (Join-Path $repositoryRoot 'package.json')
-        Get-Item -LiteralPath (Join-Path $repositoryRoot 'app-server/pom.xml')
-        Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'app-server/src/main') -File -Recurse
-        Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'contracts/ja-rpc/v1') -File -Recurse
+        Get-Item -LiteralPath (Join-Path $repositoryRoot 'ja-agent/ja-app-server/pom.xml')
+        Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'ja-agent/ja-app-server/src/main') -File -Recurse
+        Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'contracts/ja-rpc/v2') -File -Recurse
     )
     $latestSourceTime = ($sourceFiles | Sort-Object -Property LastWriteTimeUtc | Select-Object -Last 1).LastWriteTimeUtc
     $artifactTime = [datetime]::UtcNow

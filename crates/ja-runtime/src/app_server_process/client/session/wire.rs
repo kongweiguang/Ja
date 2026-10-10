@@ -346,12 +346,20 @@ fn is_context_lifecycle_notification(frame: &RpcFrame) -> bool {
     )
 }
 
-/// Task activity/mailbox 与 Approval 是不可重建的即时交互信号；它们使用 control reserve，
-/// 队列耗尽时终止 generation，也不能像 progress/delta 一样静默丢弃。
+/// Task activity/mailbox、Approval 与 Tool recovery 是不可重建的交互事实；它们占用 control reserve，
+/// 队列耗尽时终止 generation，不能像 progress/delta 一样静默丢弃。
 fn is_durable_interaction_notification(frame: &RpcFrame) -> bool {
     matches!(
         frame.method(),
-        Some("task/activity" | "task/mailbox-changed" | "approval/requested" | "approval/resolved")
+        Some(
+            "task/activity"
+                | "task/mailbox-changed"
+                | "task/closed"
+                | "tool/recovery-changed"
+                | "approval/requested"
+                | "approval/resolved"
+                | "approval/closed"
+        )
     )
 }
 

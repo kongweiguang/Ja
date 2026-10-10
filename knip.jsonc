@@ -5,12 +5,12 @@
     "apps/desktop/tests/app/e2e/main.tsx",
     "scripts/docs/capture-readme.mjs",
     // 这些文件是桌面各 capability 的显式公共边界；仓库内未消费的导出仍供 composition/宿主按边界引用。
-    "apps/desktop/src/api/protocol/goal.ts",
+    "apps/desktop/src/api/protocol/plan.ts",
     "apps/desktop/src/api/protocol/protocol.ts",
     "apps/desktop/src/api/tauri/attachmentPreview.ts",
     "apps/desktop/src/api/tauri/runtime.ts",
     "apps/desktop/src/features/conversation/index.ts",
-    "apps/desktop/src/features/goals/index.ts",
+    "apps/desktop/src/features/plans/index.ts",
     "apps/desktop/src/features/tasks/index.ts",
     "apps/desktop/src/features/workbench/index.ts",
     "apps/desktop/src/features/workbench/preview/application/index.ts",
@@ -19,12 +19,17 @@
     "scripts/e2e/kernel-loop-smoke.mjs",
     "scripts/e2e/real-provider-smoke.mjs",
     // Python Native sidecar smoke 以进程 fixture 路径启动该文件；删除条件是该 smoke 改用生产产物或移除。
-    "scripts/e2e/fixtures/v1-smoke-mock-sidecar.mjs",
+    "scripts/e2e/fixtures/v2-smoke-mock-sidecar.mjs",
     // Runtime refresh smoke 通过动态生成的 MCP TOML args 启动该文件；删除条件是改为静态模块引用或移除该验收。
     "scripts/e2e/fixtures/runtime-refresh-mcp.mjs",
     "scripts/e2e/webview2-edgedriver-runner.mjs",
     "scripts/e2e/conversation-recovery-webview2.mjs",
     "scripts/e2e/windows-desktop-smoke.mjs",
+    "scripts/e2e/process-session-webview2.mjs",
+    "scripts/e2e/turn-change-artifact-rpc.mjs",
+    "scripts/e2e/cli-review-loopback.mjs",
+    "scripts/e2e/sse-webview2.mjs",
+    "scripts/e2e/storage-recovery-webview2.mjs",
     // Settings/Workbench 真窗验收由维护者直接按 CLI 启动；fixture 由 MCP STDIO 参数再启动。
     "scripts/e2e/mcp-settings-webview2.mjs",
     "scripts/e2e/models-overview-webview2.mjs",
@@ -44,8 +49,6 @@
     "scripts/e2e/configuration-availability-webview2.mjs",
     "scripts/e2e/review-redesign-browser.mjs",
     "scripts/e2e/workbench-tab-context-webview2.mjs",
-    // V6 共享会话迁移的真窗入口由维护者使用隔离 Java/JAR/evidence 参数单独启动。
-    "scripts/e2e/legacy-workspace-menu-webview2.mjs",
     // 流式恢复与图片附件的独立浏览器验收由维护者通过 CLI 启动，fixture 由 Vite HTML 加载。
     "scripts/e2e/conversation-progress-webview2.mjs",
     "scripts/e2e/image-ux-browser.mjs",
@@ -57,6 +60,7 @@
     "apps/desktop/tests/app/e2e/readmeBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/streamingStabilityBrowserFixture.tsx",
     "apps/desktop/tests/app/e2e/imageUxBrowserFixture.tsx",
+    "apps/desktop/tests/app/e2e/turnChangesCardBrowserFixture.tsx",
     // 设置和模型预览由独立浏览器入口直接加载真实组件，不能因无静态 import 被清理。
     "apps/desktop/tests/app/e2e/settingsStyle.preview.tsx",
     "apps/desktop/tests/features/settings/ui/modelsOverview.preview.tsx",
@@ -68,6 +72,10 @@
     "scripts/**/*.{js,mjs,cjs,ts}",
     "tests/contract/**/*.{ts,tsx}",
   ],
+  // 唯一无法从 Node 图解析的浏览器绝对路径映射到真实实现，不屏蔽 unresolved 检查。
+  "paths": {
+    "/src/api/tauri/closeBehavior.ts": ["apps/desktop/src/api/tauri/closeBehavior.ts"],
+  },
   "ignore": [
     // 这些文件是架构门禁按路径读取的允许/拒绝语料，不是可导入的 TypeScript 模块；
     // 删除条件是 check-architecture 不再读取对应 fixture 目录。
@@ -77,21 +85,27 @@
   "ignoreUnresolved": [
     // 真窗 smoke 中的 Vite 浏览器绝对路径只在 page.evaluate 运行；删除条件是改为 Knip 可解析的静态入口。
     "/src/api/protocol/protocol.ts",
-    "/src/api/protocol/goal.ts",
+    "/src/api/protocol/plan.ts",
+    "/src/api/tauri/plans.ts",
     "/src/api/tauri/history.ts",
+    // 进程会话验收在 Vite page.evaluate 中动态加载生产适配器，Node 不解析该浏览器绝对路径。
+    "/src/api/tauri/process.ts",
     "/src/api/tauri/settings.ts",
     "/src/api/tauri/runtime.ts",
     "/src/features/conversation/application/timelineStore.ts",
     "/src/features/conversation/domain/timelineContracts.ts",
     "/src/features/conversation/index.ts",
     "/src/api/tauri/tasks.ts",
+    // CAS 真窗重确认在 Vite 页面内复用生产取消范围计算，Node 不解析该浏览器绝对路径。
+    "/src/features/tasks/domain/taskModel.ts",
   ],
   "ignoreBinaries": [
     // Windows 真窗 runner 只在清理自己启动的进程树时调用系统 taskkill；删除条件是统一改用 Node 原生进程树终止。
     "taskkill.exe",
     // Fail-fast 回归直接启动系统 PowerShell 7；它不是 npm 依赖，删除条件是改用 Node 原生 shell runner。
     "pwsh",
-    "pwsh.exe",
+    // Windows 监听端口快照从系统 netstat.exe 读取，不属于仓库 npm 依赖。
+    "netstat.exe",
   ],
   // Zod schema 与领域类型常在声明文件内部组合成公开根 schema；内部有真实引用时不按未使用出口处理。
   "ignoreExportsUsedInFile": true,

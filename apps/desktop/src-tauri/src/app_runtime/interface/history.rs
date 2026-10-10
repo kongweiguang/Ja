@@ -4,22 +4,22 @@
 // Workspace/Thread 历史命令的 Tauri DTO 适配。
 
 use super::history_model::{
-    AcceptedResult, HistoryMethod, MessageContentReadInput, MessageContentReadResult,
-    OperationReadInput, OperationReadResult, ThreadCompactCancelInput, ThreadCompactInput,
-    ThreadCompactResult, ThreadCreateInput, ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto,
-    ThreadListInput, ThreadListResult, ThreadMcpReadInput, ThreadMcpStatusResult,
-    ThreadMutationInput, ThreadObservationInput, ThreadObservationResult, ThreadPinInput,
-    ThreadPreferencesUpdateInput, ThreadReadInput, ThreadReadResult, ThreadRenameInput,
-    ThreadSearchInput, ThreadUsageReadInput, ThreadUsageSummary, WorkspaceListInput,
-    WorkspaceListResult, dispatch_compaction, dispatch_compaction_cancel, dispatch_mutation,
-    dispatch_pin, dispatch_thread_lifecycle, parse_message_content_read, parse_operation_read,
-    parse_thread, parse_thread_discovery, parse_thread_mcp_status, parse_thread_observation,
-    parse_thread_page, parse_thread_read, parse_thread_usage_summary, parse_workspace_page,
-    request_history, request_thread_discover, validate_message_content_read,
-    validate_operation_read, validate_thread_create, validate_thread_discover,
-    validate_thread_list, validate_thread_mcp_read, validate_thread_observation,
-    validate_thread_preferences_update, validate_thread_read, validate_thread_rename,
-    validate_thread_search, validate_thread_usage_read, validate_workspace_list,
+    AcceptedResult, HistoryMethod, ItemContentReadInput, ItemContentReadResult, OperationReadInput,
+    OperationReadResult, ThreadCompactCancelInput, ThreadCompactInput, ThreadCompactResult,
+    ThreadCreateInput, ThreadDiscoverInput, ThreadDiscoverResult, ThreadDto, ThreadListInput,
+    ThreadListResult, ThreadMcpReadInput, ThreadMcpStatusResult, ThreadMutationInput,
+    ThreadObservationInput, ThreadObservationResult, ThreadPinInput, ThreadPreferencesUpdateInput,
+    ThreadReadInput, ThreadReadResult, ThreadRenameInput, ThreadSearchInput, ThreadUsageReadInput,
+    ThreadUsageSummary, WorkspaceListInput, WorkspaceListResult, dispatch_compaction,
+    dispatch_compaction_cancel, dispatch_mutation, dispatch_pin, dispatch_thread_lifecycle,
+    parse_item_content_read, parse_operation_read, parse_thread, parse_thread_discovery,
+    parse_thread_mcp_status, parse_thread_observation, parse_thread_page, parse_thread_read,
+    parse_thread_usage_summary, parse_workspace_page, request_history, request_thread_discover,
+    validate_item_content_read, validate_operation_read, validate_thread_create,
+    validate_thread_discover, validate_thread_list, validate_thread_mcp_read,
+    validate_thread_observation, validate_thread_preferences_update, validate_thread_read,
+    validate_thread_rename, validate_thread_search, validate_thread_usage_read,
+    validate_workspace_list,
 };
 use crate::app_runtime::{RuntimeCommandError, RuntimeHost};
 
@@ -112,19 +112,19 @@ pub fn ja_thread_read(
     parse_thread_read(result)
 }
 
-/// 已提交 Assistant 正文按消息身份分页；Rust 复核每一页的字符进度后才交给 WebView。
+/// Thread 正文按 item 身份分页；Rust 复核字符进度后才交给 WebView，避免快照预览承担全文传输。
 #[tauri::command]
-pub fn ja_thread_message_content_read(
-    input: MessageContentReadInput,
+pub fn ja_thread_item_content_read(
+    input: ItemContentReadInput,
     state: tauri::State<'_, RuntimeHost>,
-) -> Result<MessageContentReadResult, RuntimeCommandError> {
-    validate_message_content_read(&input)?;
+) -> Result<ItemContentReadResult, RuntimeCommandError> {
+    validate_item_content_read(&input)?;
     let result = request_history(
         &state,
-        HistoryMethod::MessageContentRead,
+        HistoryMethod::ItemContentRead,
         serde_json::to_value(&input).map_err(|_| RuntimeCommandError::invalid_params())?,
     )?;
-    parse_message_content_read(result, &input)
+    parse_item_content_read(result, &input)
 }
 
 /// 先获得连接级观察 ACK，再由调用方读取权威快照；切换期间的事件由服务端排队。
@@ -150,12 +150,13 @@ pub fn ja_operation_read(
     state: tauri::State<'_, RuntimeHost>,
 ) -> Result<OperationReadResult, RuntimeCommandError> {
     validate_operation_read(&input)?;
+    let expected_source_thread_id = input.source_thread_id.clone();
     let result = request_history(
         &state,
         HistoryMethod::OperationRead,
         serde_json::to_value(input).map_err(|_| RuntimeCommandError::invalid_params())?,
     )?;
-    parse_operation_read(result)
+    parse_operation_read(result, expected_source_thread_id.as_deref())
 }
 
 /// 释放隐藏或关闭 Thread 的连接级订阅，后台 Turn 本身继续运行。
@@ -174,7 +175,7 @@ pub fn ja_thread_unobserve(
     parse_thread_observation(result, &expected_thread_id)
 }
 
-/// 读取只含覆盖范围和累计值的持久计量，不加载 Timeline 正文，也不参与用户界面渲染。
+/// 只代理服务端累计计量供详情浮层按需读取，不加载 Timeline 正文或另行统计用量。
 #[tauri::command]
 pub fn ja_thread_usage_read(
     input: ThreadUsageReadInput,

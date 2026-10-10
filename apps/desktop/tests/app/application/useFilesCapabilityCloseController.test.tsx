@@ -26,7 +26,12 @@ function lifecycle(
   workspaceId: string,
   flushForWorkspaceChange: () => Promise<FilesWorkspaceCloseLease>,
 ): FilesWorkspaceLifecycle {
-  return { workspaceId, flushForWorkspaceChange };
+  return {
+    workspaceId,
+    listUnsavedDocuments: () => [],
+    flushForWorkspaceChange,
+    prepareForWorkspaceRebind: async () => ({ commit: () => undefined, release: () => undefined }),
+  };
 }
 
 afterEach(() => cleanup());

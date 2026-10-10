@@ -1277,7 +1277,7 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   gap: 8px;
 }
 
-/* 侧栏宽度不等于窗口宽度；保留前导控件的真实宽度，让模型区换行而不是遮挡 Plan/Goal。 */
+/* 侧栏宽度不等于窗口宽度；保留前导控件的真实宽度，让模型区换行而不是遮挡 Plan。 */
 .ja-composer__leading {
   flex: 0 0 auto;
   max-width: 100%;
@@ -1381,9 +1381,15 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   width: min(280px, calc(100vw - 24px));
   min-width: 0;
   max-width: min(280px, calc(100vw - 24px));
+  /* 使用锚点周围的真实可用高度；短窗口只滚动详情，避免账本越界或溢出卡片。 */
+  max-height: min(
+    calc(100vh - 24px),
+    var(--radix-popover-content-available-height, calc(100vh - 24px))
+  );
   padding: 0;
   border-color: color-mix(in srgb, var(--ja-border-strong) 80%, transparent);
-  overflow: visible;
+  overflow: auto;
+  overscroll-behavior: contain;
   user-select: text;
 }
 
@@ -1469,6 +1475,13 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
   color: var(--ja-foreground-tertiary);
 }
 
+.ja-context-usage-popover__note {
+  margin: 0;
+  color: var(--ja-foreground-tertiary);
+  font-size: 0.75rem;
+  line-height: 1.125rem;
+}
+
 .ja-composer .ja-select-trigger {
   max-width: 176px;
   min-height: 30px;
@@ -1534,6 +1547,12 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
 .ja-composer__model-trigger:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.ja-composer__model-trigger--unavailable:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ja-accent) 42%, var(--ja-border));
+  color: var(--ja-accent);
+  background: color-mix(in srgb, var(--ja-accent) 7%, var(--ja-surface));
 }
 
 .ja-composer__selection-menu {
@@ -1705,6 +1724,35 @@ button.ja-composer-attachment__content.is-previewable:focus-visible {
 
 .ja-composer__error {
   color: var(--ja-danger);
+}
+
+.ja-composer__error-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.ja-composer__error-action {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ja-accent);
+  background: transparent;
+  font: inherit;
+  font-size: var(--ja-text-caption-size);
+  font-weight: var(--ja-weight-semibold);
+  cursor: pointer;
+}
+
+.ja-composer__error-action:hover {
+  background: var(--ja-control-hover);
+}
+
+.ja-composer__error-action:focus-visible {
+  outline: 2px solid var(--ja-focus);
+  outline-offset: 1px;
 }
 
 .ja-composer__spin {

@@ -39,7 +39,7 @@ where
     assert!(serde_json::from_value::<T>(input).is_err());
 }
 
-/// 在 Tauri 边界锁定 JA-RPC v1 五种写 DTO 的必填语义，避免把约束推迟到 Java 运行期才发现。
+/// 在 Tauri 边界锁定 JA-RPC v2 五种写 DTO 的必填语义，避免把约束推迟到 Java 运行期才发现。
 #[test]
 fn cas_write_dtos_reject_missing_and_null_expected_version() {
     assert_expected_version_is_required::<ConfigPatchInput>(json!({

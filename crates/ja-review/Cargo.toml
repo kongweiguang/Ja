@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# @author kongweiguang
+
+[package]
+name = "ja-review"
+version.workspace = true
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+thiserror = "=2.0.20"
+tokio-util = { version = "=0.7.19", features = ["rt"] }
+
+[[test]]
+name = "unit"
+path = "tests/unit/mod.rs"
+
+[[test]]
+name = "int_collection"
+path = "tests/integration/snapshot_collection.rs"

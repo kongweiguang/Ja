@@ -122,12 +122,16 @@ function createTurnPort(): ConversationTurnPort {
   };
 }
 
-/** 初始化 ready generation 与 Thread snapshot，使 application 竞态测试使用真实 reducer 状态。 */
-function prepareThread(threadId = "thr_one", workspaceId = "ws_one"): void {
+/** 初始化 ready generation 与 Thread snapshot；SID 参数用于验证同代服务实例切换的所有权围栏。@author kongweiguang */
+function prepareThread(
+  threadId = "thr_one",
+  workspaceId = "ws_one",
+  serverInstanceId = "srv_test",
+): void {
   useTimelineStore.getState().reset();
   useTimelineStore.getState().applyHostEvent({
     kind: "status",
-    status: { status: "ready", generation: 1, serverInstanceId: "srv_test" },
+    status: { status: "ready", generation: 1, serverInstanceId },
     eventId: "evt_ready",
     occurredAt: "2026-08-28T00:00:00Z",
   });
@@ -141,7 +145,6 @@ function prepareThread(threadId = "thr_one", workspaceId = "ws_one"): void {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     },
     workspaceId,
@@ -205,6 +208,44 @@ describe("useConversationInteractionController", () => {
   afterEach(() => {
     cleanup();
     useTimelineStore.getState().reset();
+  });
+
+  it("不因其它 Thread 的 Turn 受理而提交当前会话交互控制器", () => {
+    prepareThread();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_other",
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_other",
+    );
+    let renderCount = 0;
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { unmount } = renderHook(() => {
+      renderCount += 1;
+      return useConversationInteractionController(options(createTurnPort(), modelPort));
+    });
+    const initialRenderCount = renderCount;
+
+    act(() => {
+      useTimelineStore.getState().applyTurnAccepted({
+        threadId: "thr_other",
+        turnId: "turn_other",
+        threadRevision: 1,
+        submittedText: "与当前会话无关",
+        submittedAt: "2026-10-07T00:00:00Z",
+      });
+    });
+
+    expect(renderCount).toBe(initialRenderCount);
+    unmount();
   });
 
   it("同一 Thread 重复提交只调用一次 Turn port，且不等待 ACK 就清空草稿", async () => {
@@ -297,10 +338,10 @@ describe("useConversationInteractionController", () => {
 
     let sending!: Promise<void>;
     act(() => {
-      sending = result.current.send({ text: "制定并实施 Goal" });
+      sending = result.current.send({ text: "制定并实施计划" });
     });
     await waitFor(() => expect(planCreationPort.create).toHaveBeenCalledOnce());
-    expect(planCreationPort.create).toHaveBeenCalledWith("thr_one", "制定并实施 Goal", 0);
+    expect(planCreationPort.create).toHaveBeenCalledWith("thr_one", "制定并实施计划", 0);
     expect(turnPort.submitTurn).not.toHaveBeenCalled();
 
     created.resolve(true);
@@ -336,7 +377,7 @@ describe("useConversationInteractionController", () => {
     expect(turnPort.submitTurn).not.toHaveBeenCalled();
   });
 
-  it("Default 模式不创建 Plan，Plan 模式即使已有 Goal 也只创建独立 Plan", async () => {
+  it("Default 模式不创建 Plan，Plan 模式按当前 Thread 创建独立 Plan", async () => {
     prepareThread();
     const turnPort = createTurnPort();
     const planCreationPort: ConversationPlanCreationPort = {
@@ -366,9 +407,9 @@ describe("useConversationInteractionController", () => {
         planCreationPort,
       }),
     );
-    await act(async () => result.current.send({ text: "继续已有目标" }));
+    await act(async () => result.current.send({ text: "制定第二个计划" }));
     expect(planCreationPort.create).toHaveBeenCalledOnce();
-    expect(planCreationPort.create).toHaveBeenCalledWith("thr_two", "继续已有目标", 0);
+    expect(planCreationPort.create).toHaveBeenCalledWith("thr_two", "制定第二个计划", 0);
     expect(turnPort.submitTurn).toHaveBeenCalledTimes(2);
   });
 
@@ -1099,6 +1140,7 @@ describe("useConversationInteractionController", () => {
           revision: 4,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_cancel_guard",
               status: "cancelled",
               requestedAt: "2026-08-28T00:00:01Z",
@@ -1113,7 +1155,6 @@ describe("useConversationInteractionController", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_one",
@@ -1134,6 +1175,7 @@ describe("useConversationInteractionController", () => {
           revision: 1,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_recovered_active",
               status: "running",
               requestedAt: "2026-08-28T00:00:01Z",
@@ -1148,7 +1190,6 @@ describe("useConversationInteractionController", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_one",
@@ -1178,6 +1219,7 @@ describe("useConversationInteractionController", () => {
             revision: 2,
             turns: [
               {
+                origin: "native" as const,
                 turnId: "turn_recovered_active",
                 status: "completed",
                 requestedAt: "2026-08-28T00:00:01Z",
@@ -1192,7 +1234,6 @@ describe("useConversationInteractionController", () => {
             contextUsage: null,
             liveStream: null,
             taskActivities: [],
-            goalActivities: [],
             nextCursor: null,
           },
           "ws_one",
@@ -1219,6 +1260,7 @@ describe("useConversationInteractionController", () => {
         revision: 1,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_recovered_cancel_reject",
             status: "running" as const,
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1233,7 +1275,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       };
       useTimelineStore.getState().applySnapshot(activeSnapshot, "ws_one");
@@ -1268,6 +1309,7 @@ describe("useConversationInteractionController", () => {
             revision: 3,
             turns: [
               {
+                origin: "native" as const,
                 turnId: "turn_recovered_cancel_reject",
                 requestedAt: "2026-08-28T00:00:01Z",
                 updatedAt: "2026-08-28T00:00:04Z",
@@ -1290,7 +1332,7 @@ describe("useConversationInteractionController", () => {
     }
   });
 
-  /** recovered waiting states are user-driven and must not become a periodic read loop. */
+  /** 恢复出的等待状态必须由用户触发，不能变成定时读取循环。 */
   it("waiting_approval 与 suspended 恢复态不启动持续对账", async () => {
     vi.useFakeTimers();
     try {
@@ -1302,6 +1344,7 @@ describe("useConversationInteractionController", () => {
             revision: 1,
             turns: [
               {
+                origin: "native" as const,
                 turnId: `turn_waiting_${status}`,
                 status,
                 requestedAt: "2026-08-28T00:00:01Z",
@@ -1316,7 +1359,6 @@ describe("useConversationInteractionController", () => {
             contextUsage: null,
             liveStream: null,
             taskActivities: [],
-            goalActivities: [],
             nextCursor: null,
           },
           "ws_one",
@@ -1349,6 +1391,7 @@ describe("useConversationInteractionController", () => {
         revision: 1,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_backoff",
             status: "running" as const,
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1363,7 +1406,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       };
       useTimelineStore.getState().applySnapshot(snapshot, "ws_one");
@@ -1421,6 +1463,7 @@ describe("useConversationInteractionController", () => {
         revision: 1,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_watchdog_cleanup",
             status: "running" as const,
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1435,7 +1478,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       };
       const activeTurn = activeSnapshot.turns[0];
@@ -1535,6 +1577,7 @@ describe("useConversationInteractionController", () => {
             revision: 2,
             turns: [
               {
+                origin: "native" as const,
                 turnId: "turn_cancel_visibility",
                 status: "running",
                 requestedAt: "2026-08-28T00:00:01Z",
@@ -1549,7 +1592,6 @@ describe("useConversationInteractionController", () => {
             contextUsage: null,
             liveStream: null,
             taskActivities: [],
-            goalActivities: [],
             nextCursor: null,
           },
           "ws_one",
@@ -1574,6 +1616,7 @@ describe("useConversationInteractionController", () => {
             revision: 3,
             turns: [
               {
+                origin: "native" as const,
                 turnId: "turn_cancel_visibility",
                 status: "cancelled",
                 requestedAt: "2026-08-28T00:00:01Z",
@@ -1588,7 +1631,6 @@ describe("useConversationInteractionController", () => {
             contextUsage: null,
             liveStream: null,
             taskActivities: [],
-            goalActivities: [],
             nextCursor: null,
           },
           "ws_one",
@@ -1612,6 +1654,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancel_terminal",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1626,7 +1669,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1660,6 +1702,7 @@ describe("useConversationInteractionController", () => {
           revision: 5,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_cancel_terminal",
               status: "cancelled",
               requestedAt: "2026-08-28T00:00:01Z",
@@ -1674,7 +1717,6 @@ describe("useConversationInteractionController", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_one",
@@ -1693,6 +1735,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancel_late",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1707,7 +1750,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1750,6 +1792,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancel_failure",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1764,7 +1807,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1796,6 +1838,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancel_portal",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1810,7 +1853,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1840,6 +1882,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancel_late_failure",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1854,7 +1897,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1902,6 +1944,7 @@ describe("useConversationInteractionController", () => {
         revision: 7,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_suspended_later",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:02Z",
@@ -1911,6 +1954,7 @@ describe("useConversationInteractionController", () => {
             changeSet: null,
           },
           {
+            origin: "native" as const,
             turnId: "turn_suspended",
             status: "suspended",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -1954,7 +1998,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2063,7 +2106,7 @@ describe("useConversationInteractionController", () => {
     ]);
   });
 
-  /** 附件-only 入队携带可渲染摘要；失败恢复原附件时不得覆盖等待期间的新草稿。 */
+  /** 仅附件入队时携带可渲染摘要；失败后恢复原附件时不得覆盖等待期间的新草稿。 */
   it("附件-only 入队失败后无损恢复附件并保留新草稿", async () => {
     prepareThread();
     useTimelineStore.getState().applyTurnAccepted({
@@ -2217,6 +2260,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed",
             status: "failed",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -2228,8 +2272,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_question",
             turnId: "turn_failed",
+            truncated: false,
+            totalCharacters: 4,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "原始问题" }],
@@ -2240,7 +2287,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2308,6 +2354,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_internal_failed",
             sourceMessageId: null,
             status: "failed",
@@ -2323,7 +2370,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2349,6 +2395,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed",
             sourceMessageId: null,
             status: "failed",
@@ -2361,8 +2408,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_question",
             turnId: "turn_failed",
+            truncated: false,
+            totalCharacters: 4,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "原始问题" }],
@@ -2373,7 +2423,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2386,6 +2435,7 @@ describe("useConversationInteractionController", () => {
           revision: 5,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_failed",
               sourceMessageId: null,
               status: "failed",
@@ -2398,8 +2448,11 @@ describe("useConversationInteractionController", () => {
           ],
           items: [
             {
+              origin: "native" as const,
               itemId: "item_authoritative_question",
               turnId: "turn_failed",
+              truncated: false,
+              totalCharacters: 4,
               kind: "user_input",
               createdAt: "2026-08-28T00:00:01Z",
               content: [{ type: "text", text: "原始问题" }],
@@ -2410,7 +2463,6 @@ describe("useConversationInteractionController", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_one",
@@ -2443,6 +2495,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed",
             sourceMessageId: null,
             status: "failed",
@@ -2455,8 +2508,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_question",
             turnId: "turn_failed",
+            truncated: false,
+            totalCharacters: 3,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "旧问题" }],
@@ -2467,7 +2523,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2479,6 +2534,7 @@ describe("useConversationInteractionController", () => {
           revision: 5,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_failed",
               sourceMessageId: null,
               status: "failed",
@@ -2489,6 +2545,7 @@ describe("useConversationInteractionController", () => {
               changeSet: null,
             },
             {
+              origin: "native" as const,
               turnId: "turn_newer",
               sourceMessageId: null,
               status: "failed",
@@ -2501,16 +2558,22 @@ describe("useConversationInteractionController", () => {
           ],
           items: [
             {
+              origin: "native" as const,
               itemId: "item_failed_question",
               turnId: "turn_failed",
+              truncated: false,
+              totalCharacters: 3,
               kind: "user_input",
               createdAt: "2026-08-28T00:00:01Z",
               content: [{ type: "text", text: "旧问题" }],
               attachments: [],
             },
             {
+              origin: "native" as const,
               itemId: "item_newer_question",
               turnId: "turn_newer",
+              truncated: false,
+              totalCharacters: 3,
               kind: "user_input",
               createdAt: "2026-08-28T00:00:03Z",
               content: [{ type: "text", text: "新问题" }],
@@ -2521,7 +2584,6 @@ describe("useConversationInteractionController", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_one",
@@ -2551,6 +2613,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_cancelled",
             sourceMessageId: null,
             status: "cancelled",
@@ -2563,16 +2626,22 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_cancelled_first",
             turnId: "turn_cancelled",
+            truncated: false,
+            totalCharacters: 5,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "第一个问题" }],
             attachments: [],
           },
           {
+            origin: "native" as const,
             itemId: "item_cancelled_last",
             turnId: "turn_cancelled",
+            truncated: false,
+            totalCharacters: 6,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01.500Z",
             content: [{ type: "text", text: "最后一个问题" }],
@@ -2583,7 +2652,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2612,6 +2680,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed_edit",
             sourceMessageId: null,
             status: "failed",
@@ -2624,8 +2693,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_edit_question",
             turnId: "turn_failed_edit",
+            truncated: false,
+            totalCharacters: 3,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [
@@ -2647,7 +2719,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2728,6 +2799,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed_edit",
             sourceMessageId: null,
             status: "failed",
@@ -2740,8 +2812,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_edit_question",
             turnId: "turn_failed_edit",
+            truncated: false,
+            totalCharacters: 3,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "原问题" }],
@@ -2752,7 +2827,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2804,6 +2878,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed_cancel_edit",
             sourceMessageId: null,
             status: "failed",
@@ -2816,8 +2891,11 @@ describe("useConversationInteractionController", () => {
         ],
         items: [
           {
+            origin: "native" as const,
             itemId: "item_failed_cancel_edit",
             turnId: "turn_failed_cancel_edit",
+            truncated: false,
+            totalCharacters: 4,
             kind: "user_input",
             createdAt: "2026-08-28T00:00:01Z",
             content: [{ type: "text", text: "历史问题" }],
@@ -2828,7 +2906,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2858,6 +2935,7 @@ describe("useConversationInteractionController", () => {
         revision: 4,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_failed_draft",
             status: "failed",
             requestedAt: "2026-08-28T00:00:01Z",
@@ -2872,7 +2950,6 @@ describe("useConversationInteractionController", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -3029,6 +3106,44 @@ describe("useConversationInteractionController", () => {
     expect(result.current.localSubmissions).toEqual([]);
   });
 
+  /** Provider/Model/凭据不可用时拒绝丢弃草稿，并告诉组合层显示模型设置直达入口。 */
+  it("preserves the draft and requests model settings for configuration admission errors", async () => {
+    prepareThread();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.submitTurn).mockRejectedValue({ code: "PROVIDER_OR_MODEL_NOT_FOUND" });
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    await act(async () => result.current.send({ text: "保留这段草稿" }));
+
+    expect(result.current.draft).toBe("保留这段草稿");
+    expect(result.current.modelSettingsRequired).toBe(true);
+    expect(result.current.error).toBe("当前会话模型已不可用，输入草稿已保留。请配置模型后重试。");
+    expect(result.current.localSubmissions).toEqual([]);
+  });
+
+  /** 配置不可用属于可修复准入失败，恢复原文并投影直达模型设置的状态。 */
+  it("preserves the draft and exposes model settings when the selected model is unavailable", async () => {
+    prepareThread();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.submitTurn).mockRejectedValue({ code: "PROVIDER_OR_MODEL_NOT_FOUND" });
+    const modelPort = { updatePreferences: vi.fn(async () => undefined) };
+    const { result } = renderHook(() =>
+      useConversationInteractionController(options(turnPort, modelPort)),
+    );
+
+    await act(async () => {
+      await result.current.send({ text: "保留这段内容" });
+    });
+
+    expect(result.current.draft).toBe("保留这段内容");
+    expect(result.current.modelSettingsRequired).toBe(true);
+    expect(result.current.error).toBe("当前会话模型已不可用，输入草稿已保留。请配置模型后重试。");
+    expect(result.current.localSubmissions).toEqual([]);
+  });
+
   it("旧 Thread 偏好失败后切换新 Thread 不继承错误或 busy", async () => {
     prepareThread();
     prepareThread("thr_two", "ws_two");
@@ -3067,7 +3182,6 @@ describe("useConversationInteractionController", () => {
       reason: "需要确认",
       expiresAt: "2026-08-28T00:10:00Z",
     };
-
     await act(async () => result.current.approve(approval, "approve"));
     expect(turnPort.approvalRespond).toHaveBeenCalledWith({
       approvalId: "appr_one",
@@ -3075,5 +3189,441 @@ describe("useConversationInteractionController", () => {
       decision: "approve",
       expectedThreadRevision: 7,
     });
+  });
+
+  /** close 回执按实体 owner 补缺索引，清除侧聊完整本地投影而保留主聊和未关闭侧聊。@author kongweiguang */
+  it("真实 Interaction hook 在索引缺失时清理精确侧聊草稿、附件、Turn、队列与审批", async () => {
+    prepareThread();
+    for (const threadId of ["thr_other", "thr_side"]) {
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId,
+          revision: 0,
+          turns: [],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+    }
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_side",
+        revision: 1,
+        turns: [
+          {
+            origin: "native" as const,
+            turnId: "turn_side",
+            status: "running",
+            requestedAt: "2026-08-28T00:00:01Z",
+            updatedAt: "2026-08-28T00:00:02Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: {
+          turnId: "turn_side",
+          revision: 1,
+          accepting: true,
+          items: [
+            {
+              inputId: "input_side",
+              turnId: "turn_side",
+              content: [{ type: "text", text: "后续输入" }],
+              attachments: [],
+              kind: "follow_up",
+              status: "pending",
+              issue: null,
+              inputRevision: 0,
+              createdAt: "2026-08-28T00:00:03Z",
+            },
+          ],
+        },
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const sideApproval = {
+      approvalId: "approval_side",
+      threadId: "thr_side",
+      turnId: "turn_side",
+      threadRevision: 1,
+      callId: "call_side",
+      toolName: "shell",
+      reason: "待用户确认",
+      expiresAt: "2026-08-28T00:10:00Z",
+    };
+    useTimelineStore.setState((state) => ({
+      approvalsById: {
+        ...state.approvalsById,
+        approval_side: { threadId: "thr_side", approval: sideApproval },
+      },
+      approvalIdsByThread: {
+        ...state.approvalIdsByThread,
+        thr_side: ["approval_side"],
+      },
+    }));
+
+    const attachmentPort: ConversationAttachmentPort = {
+      pickerImport: vi.fn(async ({ operationId, onEvent }) => {
+        onEvent({
+          kind: "started",
+          operationId,
+          attemptId: "attempt_side",
+          itemId: "item_side",
+          fileName: "侧聊附件.txt",
+          sizeBytes: 12,
+          mediaKind: "text",
+        });
+        onEvent({
+          kind: "completed",
+          operationId,
+          attemptId: "attempt_side",
+          itemId: "item_side",
+          attachment: {
+            attachmentId: "attachment_side",
+            fileName: "侧聊附件.txt",
+            sizeBytes: 12,
+            mediaKind: "text",
+            mediaType: "text/plain",
+          },
+        });
+      }),
+      dropImport: vi.fn(async () => undefined),
+      clipboardImport: vi.fn(async () => ({ outcome: "accepted" as const })),
+      retryImport: vi.fn(async () => undefined),
+      cancelImport: vi.fn(async () => undefined),
+      discardAttempt: vi.fn(async () => undefined),
+      discardAttachment: vi.fn(async () => undefined),
+    };
+    const turnPort = createTurnPort();
+    const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+    const base = options(turnPort, preferencesPort, { attachmentPort });
+    const { result, rerender } = renderHook(
+      (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+      { initialProps: base },
+    );
+
+    act(() => {
+      result.current.updateDraft("主聊草稿");
+      result.current.updateContextReferences([
+        {
+          type: "workspace_reference",
+          workspaceId: "ws_one",
+          relativePath: "main.md",
+          kind: "file",
+        },
+      ]);
+    });
+    rerender(options(turnPort, preferencesPort, { ...base, threadId: "thr_other" }));
+    act(() => {
+      result.current.updateDraft("未关闭侧聊草稿");
+      result.current.updateContextReferences([
+        {
+          type: "workspace_reference",
+          workspaceId: "ws_one",
+          relativePath: "other.md",
+          kind: "file",
+        },
+      ]);
+    });
+    rerender(options(turnPort, preferencesPort, { ...base, threadId: "thr_side" }));
+    act(() => {
+      result.current.updateDraft("关闭侧聊草稿");
+      result.current.updateContextReferences([
+        {
+          type: "workspace_reference",
+          workspaceId: "ws_one",
+          relativePath: "side.md",
+          kind: "file",
+        },
+      ]);
+    });
+    await act(async () => result.current.importAttachments());
+    expect(result.current.attachmentDraftItems).toEqual([
+      expect.objectContaining({ state: "ready", itemId: "item_side" }),
+    ]);
+
+    let accepted!: boolean;
+    act(() => {
+      useTimelineStore.setState((state) => ({
+        turnIdsByThread: { ...state.turnIdsByThread, thr_side: [] },
+        approvalIdsByThread: { ...state.approvalIdsByThread, thr_side: [] },
+      }));
+      accepted = result.current.clearClosedThreads(["thr_side"], {
+        serverInstanceId: "srv_test",
+        generation: 1,
+      });
+    });
+
+    expect(accepted).toBe(true);
+    const state = useTimelineStore.getState();
+    expect(state.isThreadClosed("thr_side")).toBe(true);
+    expect(state.threads["thr_side"]).toBeUndefined();
+    expect(state.turns["turn_side"]).toBeUndefined();
+    expect(state.inputQueueByTurn["turn_side"]).toBeUndefined();
+    expect(state.approvalsById["approval_side"]).toBeUndefined();
+    expect(attachmentPort.discardAttachment).toHaveBeenCalledWith({
+      attachmentId: "attachment_side",
+    });
+
+    rerender(options(turnPort, preferencesPort, { ...base, threadId: "thr_side" }));
+    expect(result.current.draft).toBe("");
+    expect(result.current.contextReferences).toEqual([]);
+    expect(result.current.attachmentDraftItems).toEqual([]);
+    rerender(base);
+    expect(result.current.draft).toBe("主聊草稿");
+    expect(result.current.contextReferences).toEqual([
+      { type: "workspace_reference", workspaceId: "ws_one", relativePath: "main.md", kind: "file" },
+    ]);
+    rerender(options(turnPort, preferencesPort, { ...base, threadId: "thr_other" }));
+    expect(result.current.draft).toBe("未关闭侧聊草稿");
+    expect(result.current.contextReferences).toEqual([
+      {
+        type: "workspace_reference",
+        workspaceId: "ws_one",
+        relativePath: "other.md",
+        kind: "file",
+      },
+    ]);
+  });
+
+  /** close tombstone 和 operation token 同时隔离异步移除的成功、失败回流及新 SID 同名草稿。@author kongweiguang */
+  it.each(["resolve", "reject"] as const)(
+    "侧聊关闭后附件移除迟到 %s 不影响新 SID 同 ID 草稿",
+    async (outcome) => {
+      prepareThread("thr_shared");
+      const oldDiscard = deferred<void>();
+      const attachmentPort: ConversationAttachmentPort = {
+        pickerImport: vi.fn(async ({ operationId, onEvent }) => {
+          onEvent({
+            kind: "started",
+            operationId,
+            attemptId: "attempt_shared",
+            itemId: "item_shared",
+            fileName: "shared.txt",
+            sizeBytes: 20,
+            mediaKind: "text",
+          });
+          onEvent({
+            kind: "completed",
+            operationId,
+            attemptId: "attempt_shared",
+            itemId: "item_shared",
+            attachment: {
+              attachmentId: "attachment_shared",
+              fileName: "shared.txt",
+              sizeBytes: 20,
+              mediaKind: "text",
+              mediaType: "text/plain",
+            },
+          });
+        }),
+        dropImport: vi.fn(async () => undefined),
+        clipboardImport: vi.fn(async () => ({ outcome: "accepted" as const })),
+        retryImport: vi.fn(async () => undefined),
+        cancelImport: vi.fn(async () => undefined),
+        discardAttempt: vi.fn(async () => undefined),
+        discardAttachment: vi
+          .fn()
+          .mockImplementationOnce(() => oldDiscard.promise)
+          .mockResolvedValue(undefined),
+      };
+      const onAttachmentRemoved = vi.fn();
+      const turnPort = createTurnPort();
+      const preferencesPort = { updatePreferences: vi.fn(async () => undefined) };
+      const original = options(turnPort, preferencesPort, { attachmentPort, onAttachmentRemoved });
+      const { result, rerender } = renderHook(
+        (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+        { initialProps: original },
+      );
+      await act(async () => result.current.importAttachments());
+      let oldRemoval!: Promise<void>;
+      act(() => {
+        oldRemoval = result.current.removeAttachment("item_shared");
+      });
+      expect(result.current.attachmentDraftItems[0]?.state).toBe("removing");
+
+      act(() =>
+        expect(
+          result.current.clearClosedThreads(["thr_shared"], {
+            serverInstanceId: "srv_test",
+            generation: 1,
+          }),
+        ).toBe(true),
+      );
+      prepareThread("thr_shared", "ws_one", "srv_restarted");
+      rerender(original);
+      act(() => {
+        result.current.updateDraft("新 Runtime 草稿");
+        result.current.updateContextReferences([
+          {
+            type: "workspace_reference",
+            workspaceId: "ws_one",
+            relativePath: "new.md",
+            kind: "file",
+          },
+        ]);
+      });
+      await act(async () => result.current.importAttachments());
+
+      await act(async () => {
+        if (outcome === "resolve") oldDiscard.resolve(undefined);
+        else oldDiscard.reject(new Error("old Runtime discard failed"));
+        await oldRemoval;
+      });
+      expect(result.current.draft).toBe("新 Runtime 草稿");
+      expect(result.current.contextReferences).toEqual([
+        {
+          type: "workspace_reference",
+          workspaceId: "ws_one",
+          relativePath: "new.md",
+          kind: "file",
+        },
+      ]);
+      expect(result.current.attachmentDraftItems).toEqual([
+        expect.objectContaining({
+          state: "ready",
+          itemId: "item_shared",
+          attachmentId: "attachment_shared",
+        }),
+      ]);
+      expect(result.current.error).toBeUndefined();
+      expect(onAttachmentRemoved).not.toHaveBeenCalled();
+    },
+  );
+
+  /** close 会同时压制 cancel、resume、approval 与偏好 mutation 的迟到失败 UI。@author kongweiguang */
+  it("索引缺失的权威 close 清理活动动作，迟到失败不恢复忙碌或错误", async () => {
+    prepareThread();
+    const cancelThreadId = "thr_cancel_side";
+    const resumeThreadId = "thr_resume_side";
+    for (const [threadId, turnId, status] of [
+      [cancelThreadId, "turn_cancel_side", "running"],
+      [resumeThreadId, "turn_resume_side", "suspended"],
+    ] as const) {
+      useTimelineStore.getState().applySnapshot(
+        {
+          threadId,
+          revision: 1,
+          turns: [
+            {
+              origin: "native" as const,
+              turnId,
+              status,
+              requestedAt: "2026-08-28T00:00:01Z",
+              updatedAt: "2026-08-28T00:00:02Z",
+              completedAt: null,
+              errorCode: null,
+              changeSet: null,
+            },
+          ],
+          items: [],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          nextCursor: null,
+        },
+        "ws_one",
+      );
+    }
+    const cancelAck = deferred<ConversationCancelResult>();
+    const resumeAck = deferred<ConversationAcceptedTurn>();
+    const approvalAck = deferred<void>();
+    const preferenceAck = deferred<void>();
+    const turnPort = createTurnPort();
+    vi.mocked(turnPort.cancelTurn).mockReturnValue(cancelAck.promise);
+    vi.mocked(turnPort.resumeTurn).mockReturnValue(resumeAck.promise);
+    vi.mocked(turnPort.approvalRespond).mockReturnValue(approvalAck.promise);
+    const preferencesPort = { updatePreferences: vi.fn(() => preferenceAck.promise) };
+    const base = options(turnPort, preferencesPort, { threadId: cancelThreadId });
+    const { result, rerender } = renderHook(
+      (props: ConversationInteractionOptions) => useConversationInteractionController(props),
+      { initialProps: base },
+    );
+    const approval = {
+      approvalId: "approval_cancel_side",
+      threadId: cancelThreadId,
+      turnId: "turn_cancel_side",
+      threadRevision: 1,
+      callId: "call_cancel_side",
+      toolName: "shell",
+      reason: "等待审批",
+      expiresAt: "2026-08-28T00:10:00Z",
+    };
+    useTimelineStore.setState((state) => ({
+      approvalsById: {
+        ...state.approvalsById,
+        [approval.approvalId]: { threadId: cancelThreadId, approval },
+      },
+      approvalIdsByThread: {
+        ...state.approvalIdsByThread,
+        [cancelThreadId]: [approval.approvalId],
+      },
+    }));
+    let cancelRequest!: Promise<void>;
+    let approvalRequest!: Promise<void>;
+    let preferenceRequest!: Promise<void>;
+    act(() => {
+      cancelRequest = result.current.cancel();
+      approvalRequest = result.current.approve(approval, "approve");
+      preferenceRequest = result.current.changeAccessMode("full_access");
+    });
+    expect(result.current.cancelling).toBe(true);
+    expect(result.current.preferenceBusy).toBe(true);
+
+    const resumeOptions = options(turnPort, preferencesPort, { threadId: resumeThreadId });
+    rerender(resumeOptions);
+    let resumeRequest!: Promise<void>;
+    act(() => {
+      resumeRequest = result.current.resume();
+    });
+    expect(result.current.resuming).toBe(true);
+
+    act(() => {
+      const state = useTimelineStore.getState();
+      useTimelineStore.setState({
+        turnIdsByThread: {
+          ...state.turnIdsByThread,
+          [cancelThreadId]: [],
+          [resumeThreadId]: [],
+        },
+        approvalIdsByThread: { ...state.approvalIdsByThread, [cancelThreadId]: [] },
+      });
+      expect(
+        result.current.clearClosedThreads([cancelThreadId, resumeThreadId], {
+          serverInstanceId: "srv_test",
+          generation: 1,
+        }),
+      ).toBe(true);
+    });
+    expect(result.current.resuming).toBe(false);
+    expect(useTimelineStore.getState().turns["turn_cancel_side"]).toBeUndefined();
+    expect(useTimelineStore.getState().turns["turn_resume_side"]).toBeUndefined();
+    expect(useTimelineStore.getState().inputQueueByTurn["turn_cancel_side"]).toBeUndefined();
+    expect(useTimelineStore.getState().approvalsById[approval.approvalId]).toBeUndefined();
+
+    await act(async () => {
+      cancelAck.reject(new Error("cancel after close"));
+      resumeAck.reject(new Error("resume after close"));
+      approvalAck.reject(new Error("approval after close"));
+      preferenceAck.reject(new Error("preferences after close"));
+      await Promise.all([cancelRequest, resumeRequest, approvalRequest, preferenceRequest]);
+    });
+    expect(result.current.error).toBeUndefined();
+    rerender(base);
+    expect(result.current.cancelling).toBe(false);
+    expect(result.current.resuming).toBe(false);
+    expect(result.current.error).toBeUndefined();
   });
 });

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.SideChatMapper">
+    <resultMap id="marker"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords$SideChatMarkerRow">
+        <constructor>
+            <idArg column="thread_id" javaType="String"/>
+            <arg column="state" javaType="String"/>
+        </constructor>
+    </resultMap>
+
+    <update id="insertOpen">
+        UPDATE ja_conversation_thread SET temporary_lifecycle_state='OPEN'
+        WHERE thread_id=#{threadId} AND temporary_lifecycle_state IS NULL
+    </update>
+    <select id="selectMarker" resultMap="marker">
+        SELECT thread_id,temporary_lifecycle_state AS state FROM ja_conversation_thread
+        WHERE thread_id=#{threadId} AND temporary_lifecycle_state IS NOT NULL
+    </select>
+    <select id="selectMarkers" resultMap="marker">
+        SELECT t.thread_id,t.temporary_lifecycle_state AS state FROM ja_conversation_thread t
+        JOIN ja_conversation_lineage l ON l.child_thread_id=t.thread_id
+        WHERE t.temporary_lifecycle_state IS NOT NULL AND l.task_kind='SIDE_TASK' AND l.lifecycle='INDEPENDENT'
+        ORDER BY t.thread_id
+    </select>
+    <select id="selectSubtreeThreadIds" resultType="string">
+        WITH RECURSIVE tree(thread_id,depth) AS (
+        SELECT thread_id,0 FROM ja_conversation_thread WHERE thread_id=#{threadId} AND temporary_lifecycle_state IS NOT NULL
+        UNION ALL SELECT l.child_thread_id,t.depth+1 FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id)
+        SELECT thread_id FROM tree ORDER BY depth,thread_id
+    </select>
+    <update id="markSubtreeClosing">
+        WITH RECURSIVE tree(thread_id) AS (
+        SELECT thread_id FROM ja_conversation_thread WHERE thread_id=#{threadId} AND temporary_lifecycle_state IS NOT NULL
+        UNION ALL SELECT l.child_thread_id FROM ja_conversation_lineage l JOIN tree t ON l.parent_thread_id=t.thread_id)
+        UPDATE ja_conversation_thread SET temporary_lifecycle_state='CLOSING'
+        WHERE thread_id IN(SELECT thread_id FROM tree)
+    </update>
+    <select id="selectClosingOwner" resultType="string">
+        WITH RECURSIVE ancestors(thread_id) AS (
+        SELECT #{threadId} UNION ALL SELECT l.parent_thread_id FROM ja_conversation_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id)
+        SELECT t.thread_id FROM ja_conversation_thread t JOIN ancestors a ON a.thread_id=t.thread_id
+        WHERE t.temporary_lifecycle_state='CLOSING' ORDER BY t.thread_id LIMIT 1
+    </select>
+</mapper>

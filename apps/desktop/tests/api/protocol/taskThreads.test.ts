@@ -29,7 +29,68 @@ const task = {
 
 const content = [{ type: "text", text: "Inspect the parser boundary." }] as const;
 
-describe("JA-RPC v1 Task Threads", () => {
+describe("JA-RPC v2 Task Threads", () => {
+  /** 持久澄清态必须同时被摘要和活动解析，否则重启后侧聊会消失或停止回读。 */
+  it("accepts a task waiting for clarification", () => {
+    const waitingTask = {
+      ...task,
+      state: "waiting_input",
+      latestActivitySequence: 3,
+      latestSafeSummary: "Waiting for an answer",
+    };
+    expect(parseMethodResult("task/list", { items: [waitingTask] })).toMatchObject({
+      items: [{ state: "waiting_input" }],
+    });
+    const activity = {
+      activitySequence: 3,
+      activityId: "activity_waiting_input",
+      rootThreadId: "thr_root",
+      taskThreadId: "thr_side_1",
+      actorThreadId: "thr_side_1",
+      causalTurnId: "turn_child",
+      kind: "waiting_input",
+      summary: { text: "Waiting for an answer" },
+      createdAt: "2026-09-03T08:00:02Z",
+    };
+    expect(
+      parseMethodResult("task/read", {
+        task: waitingTask,
+        thread: {
+          threadId: "thr_side_1",
+          workspaceId: "ws_root",
+          workspaceKind: "project",
+          preferences: null,
+          title: "Inspect parser",
+          status: "active",
+          pinned: false,
+          latestTurnStatus: "waiting_input",
+          latestTurnSeen: false,
+          revision: 3,
+          createdAt: "2026-09-03T08:00:00Z",
+          updatedAt: "2026-09-03T08:00:02Z",
+        },
+        contextSeed: {
+          contextSeedId: "seed_side_1",
+          parentRevision: 7,
+          inheritanceMode: "effective_context",
+          taskBrief: null,
+          inheritedContextSummary: "Parent context frozen at revision 7.",
+          inheritedContextPreview: [
+            {
+              role: "user",
+              text: "Inspect the parser boundary.",
+              attachmentIds: [],
+            },
+          ],
+          fingerprint: "a".repeat(64),
+          createdAt: "2026-09-03T08:00:00Z",
+        },
+        activities: [activity],
+        mailbox: [],
+        nextCursor: null,
+      }),
+    ).toMatchObject({ activities: [{ kind: "waiting_input" }] });
+  });
   /** 十个方法分别锁定 QueueOnly、Follow-up 唤醒和显式整树删除所需的严格字段。 */
   it("accepts the complete task method and result surface", () => {
     const cases = [
@@ -60,8 +121,6 @@ describe("JA-RPC v1 Task Threads", () => {
             threadId: "thr_side_1",
             workspaceId: "ws_root",
             workspaceKind: "session",
-            legacySharedWorkspaceId: null,
-            activeGoalId: null,
             preferences: {
               providerId: "provider_side",
               modelId: "model_side",
@@ -117,7 +176,7 @@ describe("JA-RPC v1 Task Threads", () => {
           senderThreadId: "thr_root",
           targetThreadId: "thr_side_1",
           content,
-          idempotencyKey: "message-1",
+          operationKey: "message-1",
         },
         { accepted: true, messageId: "msg_note", mailboxSequence: 2 },
       ],
@@ -127,7 +186,7 @@ describe("JA-RPC v1 Task Threads", () => {
           senderThreadId: "thr_root",
           targetThreadId: "thr_side_1",
           content,
-          idempotencyKey: "followup-1",
+          operationKey: "followup-1",
           expectedTaskRevision: 3,
         },
         { accepted: true, messageId: "msg_followup", turnId: "turn_side_2", task },
@@ -226,8 +285,6 @@ describe("JA-RPC v1 Task Threads", () => {
         threadId: "thr_other",
         workspaceId: "ws_root",
         workspaceKind: "session",
-        legacySharedWorkspaceId: null,
-        activeGoalId: null,
         preferences: null,
         title: "Other thread",
         status: "active",
@@ -298,7 +355,6 @@ describe("JA-RPC v1 Task Threads", () => {
       turns: [],
       items: [],
       taskActivities: [{ activity: childActivity, task: childTask }],
-      goalActivities: [],
       inputQueue: null,
       contextUsage: null,
       liveStream: null,
@@ -353,7 +409,7 @@ describe("JA-RPC v1 Task Threads", () => {
         senderThreadId: "thr_root",
         targetThreadId: "thr_side_1",
         content,
-        idempotencyKey: "message-1",
+        operationKey: "message-1",
         wake: true,
       }),
     ).toThrow();
@@ -465,6 +521,8 @@ describe("JA-RPC v1 Task Threads", () => {
       sourceThreadId: "thr_source_1",
       sourceTitle: "主会话",
       content: "只作为外部会话内容处理",
+      totalCharacters: 11,
+      truncated: false,
     };
     const snapshot = {
       threadId: "thr_target_1",
@@ -483,7 +541,6 @@ describe("JA-RPC v1 Task Threads", () => {
       ],
       items: [threadMessage],
       taskActivities: [],
-      goalActivities: [],
       inputQueue: null,
       contextUsage: null,
       liveStream: null,

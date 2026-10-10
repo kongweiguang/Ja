@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.AgentMapper">
+    <resultMap id="clientOperationRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ClientOperationRow">
+        <constructor>
+            <arg column="operation_key" javaType="string"/>
+            <arg column="method" javaType="string"/>
+            <arg column="request_fingerprint" javaType="string"/>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="thread_revision" javaType="_long"/>
+            <arg column="is_queued" javaType="_boolean"/>
+            <arg column="approval_id" javaType="string"/>
+            <arg column="decision" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <select id="selectClientOperation" resultMap="clientOperationRow">
+        SELECT operation_key,method,request_fingerprint,thread_id,turn_id,thread_revision,
+        is_queued,approval_id,decision,created_at_ms FROM ja_client_operation
+        WHERE operation_key=#{operationKey}
+    </select>
+    <resultMap id="inputOperationRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputOperationRow">
+        <constructor>
+            <arg column="operation_key" javaType="string"/>
+            <arg column="request_fingerprint" javaType="string"/>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="input_id" javaType="string"/>
+            <arg column="input_kind" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <select id="selectInputOperation" resultMap="inputOperationRow">
+        SELECT operation_key,request_fingerprint,thread_id,turn_id,input_id,input_kind,created_at_ms
+        FROM ja_input_operation_receipt WHERE operation_key=#{operationKey}
+    </select>
+    <resultMap id="turnRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$TurnRow">
+        <constructor>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="state" javaType="string"/>
+            <arg column="mutation_version" javaType="_long"/>
+            <arg column="requested_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completed_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="terminal_summary" javaType="string"/>
+            <arg column="error_code" javaType="string"/>
+            <arg column="error_message" javaType="string"/>
+            <arg column="cancel_requested_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="cancel_reason" javaType="string"/>
+            <arg column="cancel_thread_revision" javaType="java.lang.Long"/>
+            <arg column="cancel_turn_mutation_version" javaType="java.lang.Long"/>
+            <arg column="input_queue_revision" javaType="_long"/>
+            <arg column="is_accepting_inputs" javaType="_boolean"/>
+            <arg column="thread_revision" javaType="java.lang.Long"/>
+            <arg column="change_set_json" javaType="string"/>
+            <arg column="is_current_path" javaType="_boolean"/>
+            <arg column="source_message_id" javaType="string"/>
+            <arg column="terminal_message_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="admissionUserRecordRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$AdmissionUserRecordRow">
+        <constructor>
+            <arg column="message_id" javaType="string"/>
+            <arg column="role" javaType="string"/>
+            <arg column="record_id" javaType="string"/>
+            <arg column="record_type" javaType="string"/>
+            <arg column="payload_schema_version" javaType="_int"/>
+            <arg column="record_sequence" javaType="_long"/>
+            <arg column="payload_json" javaType="string"/>
+            <arg column="occurred_at_ms" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="pendingInputRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$PendingInputRow">
+        <constructor>
+            <arg column="input_id" javaType="string"/>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="content_json" javaType="string"/>
+            <arg column="validation_status" javaType="string"/>
+            <arg column="issue_error_code" javaType="string"/>
+            <arg column="issue_message" javaType="string"/>
+            <arg column="is_issue_retryable" javaType="java.lang.Boolean"/>
+            <arg column="input_revision" javaType="_long"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="attachments_json" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="toolArtifactRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ToolArtifactRow">
+        <constructor>
+            <arg column="artifact_id" javaType="string"/>
+            <arg column="content" javaType="string"/>
+            <arg column="character_length" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <!-- 队列摘要以 content 原序为准；没有本 input 预留的引用只发布不可用占位，禁止跨 Workspace 泄露元数据。 -->
+    <sql id="pendingAttachmentProjection">
+        COALESCE((SELECT json_group_array(json_object('attachmentId',ordered.attachment_id,
+        'displayName',ordered.display_name,'sizeBytes',ordered.size_bytes,
+        'mediaKind',ordered.media_kind,'mediaType',ordered.media_type))
+        FROM (SELECT json_extract(block.value,'$.attachmentId') AS attachment_id,
+        CASE WHEN a.attachment_id IS NULL THEN '附件不可用' ELSE a.display_name END AS display_name,
+        CASE WHEN a.attachment_id IS NULL THEN 0 ELSE a.size_bytes END AS size_bytes,
+        CASE WHEN a.attachment_id IS NULL THEN 'binary' ELSE lower(a.media_kind) END AS media_kind,
+        CASE WHEN a.attachment_id IS NULL THEN 'application/octet-stream' ELSE a.media_type END AS media_type
+        FROM json_each(ja_turn_input.content_json) block
+        LEFT JOIN ja_turn_input_attachment pia
+        ON pia.input_id=ja_turn_input.input_id
+        AND pia.attachment_id=json_extract(block.value,'$.attachmentId')
+        LEFT JOIN ja_attachment a ON a.attachment_id=pia.attachment_id
+        WHERE json_extract(block.value,'$.kind')='attachment'
+        ORDER BY CAST(block.key AS INTEGER)) ordered),json_array())
+    </sql>
+    <select id="selectTurns" resultMap="turnRow">
+        SELECT x.turn_id,x.thread_id,x.state,x.mutation_version,x.requested_at_ms,x.updated_at_ms,
+        x.completed_at_ms,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at_ms,x.cancel_reason,
+        x.cancel_thread_revision,x.cancel_turn_mutation_version,
+        x.input_queue_revision,x.is_accepting_inputs,
+        NULL AS thread_revision,c.change_set_json,x.is_current_path,x.source_message_id,
+        (SELECT tm.item_id FROM ja_conversation_timeline_entry tm JOIN ja_conversation_message m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
+        FROM ja_conversation_turn x LEFT JOIN ja_turn_change_set c ON c.turn_id=x.turn_id
+        WHERE x.thread_id=#{threadId} ORDER BY x.turn_sequence
+    </select>
+    <!-- latest 历史页只需其 item owner、会话真实最新 Turn 与队列头；三者由 SQL 去重并按序返回。 -->
+    <select id="selectSnapshotTurns" resultMap="turnRow">
+        SELECT x.turn_id,x.thread_id,x.state,x.mutation_version,x.requested_at_ms,x.updated_at_ms,
+        x.completed_at_ms,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at_ms,x.cancel_reason,
+        x.cancel_thread_revision,x.cancel_turn_mutation_version,
+        x.input_queue_revision,x.is_accepting_inputs,
+        NULL AS thread_revision,c.change_set_json,x.is_current_path,x.source_message_id,
+        (SELECT tm.item_id FROM ja_conversation_timeline_entry tm JOIN ja_conversation_message m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
+        FROM ja_conversation_turn x LEFT JOIN ja_turn_change_set c ON c.turn_id=x.turn_id
+        WHERE x.thread_id=#{threadId} AND (
+        x.turn_sequence=(SELECT MAX(latest.turn_sequence) FROM ja_conversation_turn latest WHERE latest.thread_id=#{threadId})
+        OR x.turn_id=(SELECT pending.turn_id FROM ja_conversation_turn pending WHERE pending.thread_id=#{threadId}
+        AND pending.state IN ('QUEUED','RUNNING','WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')
+        ORDER BY pending.turn_sequence LIMIT 1)
+        <if test="hasTurnIds">
+            OR x.turn_id IN
+            <foreach collection="turnIds" item="turnId" open="(" separator="," close=")">#{turnId}</foreach>
+        </if>
+        ) ORDER BY x.turn_sequence
+    </select>
+    <select id="selectTurnById" resultMap="turnRow">
+        SELECT x.turn_id,x.thread_id,x.state,x.mutation_version,x.requested_at_ms,x.updated_at_ms,
+        x.completed_at_ms,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at_ms,x.cancel_reason,
+        x.cancel_thread_revision,x.cancel_turn_mutation_version,
+        x.input_queue_revision,x.is_accepting_inputs,
+        t.revision AS thread_revision,c.change_set_json,x.is_current_path,x.source_message_id,
+        (SELECT tm.item_id FROM ja_conversation_timeline_entry tm JOIN ja_conversation_message m ON m.message_id=tm.item_id
+        WHERE tm.turn_id=x.turn_id AND tm.thread_id=x.thread_id AND tm.kind='FINAL_ANSWER'
+        ORDER BY m.ordinal DESC LIMIT 1) AS terminal_message_id
+        FROM ja_conversation_turn x JOIN ja_conversation_thread t ON t.thread_id=x.thread_id
+        LEFT JOIN ja_turn_change_set c ON c.turn_id=x.turn_id
+        WHERE x.turn_id=#{turnId} AND t.deleted_at_ms IS NULL
+    </select>
+    <select id="hasOtherTurns" resultType="boolean">
+        SELECT EXISTS(SELECT 1 FROM ja_conversation_turn WHERE thread_id=#{threadId} AND turn_id&lt;&gt;#{turnId} LIMIT 1)
+    </select>
+    <select id="selectAdmissionUserMessage" resultMap="admissionUserRecordRow">
+        SELECT m.message_id,m.role,r.record_id,r.record_type,r.payload_schema_version,r.record_sequence,r.payload_json,r.occurred_at_ms
+        FROM ja_conversation_message m JOIN ja_conversation_timeline_entry t ON t.item_id=m.message_id
+        AND t.thread_id=m.thread_id AND t.turn_id=m.turn_id
+        JOIN agent_record r ON r.tenant_id=m.core_tenant_id AND r.thread_id=m.core_thread_id
+        AND r.turn_id=m.core_turn_id AND r.record_id=m.core_record_id AND r.user_id=#{ownerUserId}
+        WHERE m.thread_id=#{threadId} AND m.turn_id=#{turnId}
+        AND m.role='USER' AND t.kind='USER_INPUT'
+        ORDER BY m.ordinal LIMIT 1
+    </select>
+    <select id="selectToolArtifact" resultMap="toolArtifactRow">
+        SELECT artifact_id,content,character_length FROM ja_tool_artifact
+        WHERE thread_id=#{threadId} AND turn_id=#{turnId} AND call_id=#{callId} AND artifact_id=#{artifactId}
+    </select>
+    <select id="countUsageForTurn" resultType="int">
+        SELECT COUNT(*) FROM ja_turn_usage WHERE turn_id=#{turnId}
+    </select>
+    <select id="selectPendingInputs" resultMap="pendingInputRow">
+        SELECT input_id,thread_id,turn_id,kind,content_json,validation_status,issue_error_code,
+        issue_message,is_issue_retryable,input_revision,created_at_ms,
+        <include refid="pendingAttachmentProjection"/>
+        AS attachments_json
+        FROM ja_turn_input
+        WHERE turn_id=#{turnId} AND state='PENDING'
+        ORDER BY CASE kind WHEN 'STEERING' THEN 0 ELSE 1 END,
+        CASE WHEN kind='STEERING' THEN priority_sequence ELSE input_sequence END
+    </select>
+</mapper>

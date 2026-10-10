@@ -176,7 +176,8 @@
 .ja-task-tree-meta svg[data-state="running"] {
   color: var(--ja-accent);
 }
-.ja-task-tree-meta svg[data-state="waiting_approval"] {
+.ja-task-tree-meta svg[data-state="waiting_approval"],
+.ja-task-tree-meta svg[data-state="waiting_input"] {
   color: var(--ja-warning);
 }
 .ja-task-tree-meta svg[data-state="failed"] {

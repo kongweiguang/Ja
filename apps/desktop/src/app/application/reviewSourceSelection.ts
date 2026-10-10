@@ -15,8 +15,8 @@ export function canOpenTurnReview(
 }
 
 /**
- * 每个 runtime/Workspace/Thread 首次都进入 Git 未提交；之后 preserve 用户显式选择，
- * 新 Turn 到达只更新菜单事实，不能抢走正在阅读的 Git 或历史范围。
+ * 每个 runtime/Workspace/Thread 首次都进入 Git 未提交状态；此后保留用户的显式选择，
+ * 新 Turn 到达时只更新菜单事实，不能抢走用户正在查看的 Git 或历史范围。
  */
 export function decideInitialReviewSource(
   selectedScope: string | undefined,

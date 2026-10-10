@@ -1,0 +1,690 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.HistoryMapper">
+    <resultMap id="inputHistoryRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InputHistoryRow">
+        <constructor>
+            <arg column="item_id" javaType="string"/>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="public_text" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="truncated" javaType="_boolean"/>
+        </constructor>
+    </resultMap>
+    <select id="selectInputHistoryPage" resultMap="inputHistoryRow">
+        <!-- Full substring search follows the exact Core message reference; navigation previews never define matches. -->
+        WITH input_texts AS (
+        SELECT tm.item_id,tm.thread_id,tm.created_at_ms,
+        COALESCE((SELECT json_extract(b.value,'$.text')
+        FROM json_each(json_extract(r.payload_json,'$.blocks')) b
+        WHERE json_extract(b.value,'$.kind')='text'), '') AS public_text
+        FROM ja_conversation_timeline_entry tm
+        JOIN ja_conversation_thread t ON t.thread_id=tm.thread_id
+        JOIN ja_conversation_message m ON m.message_id=tm.message_id
+        AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+        JOIN agent_record r ON r.tenant_id=m.core_tenant_id AND r.thread_id=m.core_thread_id
+        AND r.turn_id=m.core_turn_id AND r.record_id=m.core_record_id AND r.user_id=t.owner_user_id
+        WHERE tm.kind='USER_INPUT' AND m.role='USER' AND r.record_type='agent.user.message'
+        AND r.payload_schema_version=1 AND t.owner_user_id='user_local' AND t.deleted_at_ms IS NULL
+        AND t.temporary_lifecycle_state IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage l WHERE l.child_thread_id=tm.thread_id)
+        )
+        SELECT item_id,thread_id,substr(public_text,1,32768) AS public_text,created_at_ms,
+        (length(CAST(public_text AS BLOB))>32768 OR length(public_text)>32768) AS truncated
+        FROM input_texts
+        <if test="normalizedQuery != null and normalizedQuery != ''">
+            WHERE instr(lower(public_text),#{normalizedQuery})>0
+        </if>
+        <if test="cursorTime != null">
+            <choose><when test="normalizedQuery != null and normalizedQuery != ''">AND</when><otherwise>WHERE</otherwise></choose>
+            (created_at_ms &lt; #{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (created_at_ms=#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND item_id &lt; #{cursorId}))
+        </if>
+        ORDER BY created_at_ms DESC,item_id DESC LIMIT #{limit}
+    </select>
+    <resultMap id="workspaceRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceRow">
+        <constructor>
+            <arg column="workspace_id" javaType="string"/>
+            <arg column="root_path" javaType="string"/>
+            <arg column="display_name" javaType="string"/>
+            <arg column="trust" javaType="string"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="kind" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="workspaceBusyBlockerRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceBusyBlockerRow">
+        <constructor>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="thread_title" javaType="string"/>
+            <arg column="blocker_kind" javaType="string"/>
+            <arg column="blocker_state" javaType="string"/>
+            <arg column="occurrences" javaType="_long"/>
+            <arg column="total_blockers" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="threadRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRow">
+        <constructor>
+            <arg column="thread_id" javaType="string"/>
+            <arg column="owner_user_id" javaType="string"/>
+            <arg column="workspace_id" javaType="string"/>
+            <arg column="title" javaType="string"/>
+            <arg column="workspace_kind" javaType="string"/>
+            <arg column="provider_id" javaType="string"/>
+            <arg column="model_id" javaType="string"/>
+            <arg column="reasoning_level" javaType="string"/>
+            <arg column="access_mode" javaType="string"/>
+            <arg column="collaboration_mode" javaType="string"/>
+            <arg column="title_source" javaType="string"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="pinned_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="archived_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="deleted_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="latest_turn_status" javaType="string"/>
+            <arg column="latest_turn_seen" javaType="_boolean"/>
+            <arg column="latest_turn_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="snapshotItemRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$SnapshotItemRow">
+        <constructor>
+            <arg column="item_id" javaType="string"/>
+            <arg column="item_kind" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="call_id" javaType="string"/>
+            <arg column="tool_name" javaType="string"/>
+            <arg column="tool_ordinal" javaType="java.lang.Long"/>
+            <arg column="tool_state" javaType="string"/>
+            <arg column="message_kind" javaType="string"/>
+            <arg column="preview_text" javaType="string"/>
+            <arg column="total_characters" javaType="java.lang.Integer"/>
+            <arg column="model_round" javaType="java.lang.Long"/>
+            <arg column="presentation_json" javaType="string"/>
+            <arg column="approval_id" javaType="string"/>
+            <arg column="decision" javaType="string"/>
+            <arg column="expires_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="attachments_json" javaType="string"/>
+            <arg column="context_references_json" javaType="string"/>
+            <arg column="source_thread_id" javaType="string"/>
+            <arg column="source_title" javaType="string"/>
+            <arg column="context_message_id" javaType="string"/>
+            <arg column="context_message_ordinal" javaType="java.lang.Long"/>
+            <arg column="timeline_sequence" javaType="java.lang.Long"/>
+            <arg column="turn_sequence" javaType="java.lang.Long"/>
+            <arg column="semantic_order" javaType="java.lang.Integer"/>
+            <arg column="ordinal_order" javaType="java.lang.Long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="contextUsageRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ContextUsageRow">
+        <constructor>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="model_request_id" javaType="string"/>
+            <arg column="model_round" javaType="_long"/>
+            <arg column="model_request_ordinal" javaType="_int"/>
+            <arg column="purpose" javaType="string"/>
+            <arg column="certainty" javaType="string"/>
+            <arg column="profile_json" javaType="string"/>
+            <arg column="input_tokens" javaType="java.lang.Long"/>
+            <arg column="output_tokens" javaType="java.lang.Long"/>
+            <arg column="total_tokens" javaType="java.lang.Long"/>
+            <arg column="cache_read_tokens" javaType="java.lang.Long"/>
+            <arg column="cache_write_tokens" javaType="java.lang.Long"/>
+            <arg column="new_input_tokens" javaType="java.lang.Long"/>
+            <arg column="input_accounting" javaType="string"/>
+            <arg column="estimated_context_tokens" javaType="java.lang.Long"/>
+            <arg column="occurred_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="threadUsageSummaryRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadUsageSummaryRow">
+        <constructor>
+            <arg column="request_count" javaType="_long"/>
+            <arg column="measured_request_count" javaType="_long"/>
+            <arg column="new_input_request_count" javaType="_long"/>
+            <arg column="new_input_tokens" javaType="_long"/>
+            <arg column="output_request_count" javaType="_long"/>
+            <arg column="output_tokens" javaType="_long"/>
+            <arg column="total_request_count" javaType="_long"/>
+            <arg column="total_tokens" javaType="_long"/>
+            <arg column="cache_read_request_count" javaType="_long"/>
+            <arg column="cache_read_tokens" javaType="_long"/>
+            <arg column="cache_write_request_count" javaType="_long"/>
+            <arg column="cache_write_tokens" javaType="_long"/>
+            <arg column="cache_complete_request_count" javaType="_long"/>
+            <arg column="cache_complete_input_tokens" javaType="_long"/>
+            <arg column="cache_complete_read_tokens" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="changeSetArtifactRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ChangeSetArtifactRow">
+        <constructor>
+            <arg column="artifact_id" javaType="string"/>
+            <arg column="sha256" javaType="string"/>
+            <arg column="content" javaType="string"/>
+            <arg column="byte_length" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <select id="selectWorkspace" resultMap="workspaceRow">
+        SELECT workspace_id,root_path,display_name,trust,revision,updated_at_ms,kind
+        FROM ja_workspace WHERE workspace_id=#{workspaceId}
+    </select>
+    <select id="selectWorkspaceByRoot" resultMap="workspaceRow">
+        SELECT workspace_id,root_path,display_name,trust,revision,updated_at_ms,kind
+        FROM ja_workspace WHERE root_path=#{rootPath}
+    </select>
+    <insert id="insertWorkspace">
+        INSERT INTO
+        ja_workspace(workspace_id,root_path,display_name,trust,created_at_ms,updated_at_ms,kind)
+        VALUES(#{workspaceId},#{rootPath},#{displayName},#{trust},#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{kind})
+    </insert>
+    <select id="selectWorkspacePage" resultMap="workspaceRow">
+        SELECT workspace_id,root_path,display_name,trust,revision,updated_at_ms,kind FROM
+        ja_workspace
+        <where>
+            <if test="kind != null">kind=#{kind}</if>
+            <if test="cursorTime != null">AND (updated_at_ms&lt;#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (updated_at_ms=#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND workspace_id&lt;#{cursorId}))</if>
+        </where>
+        ORDER BY updated_at_ms DESC,workspace_id DESC LIMIT #{limit}
+    </select>
+    <update id="compareAndSetWorkspaceTrust">
+        UPDATE ja_workspace SET trust=#{trust},revision=revision+1,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE workspace_id=#{workspaceId} AND revision=#{expectedRevision}
+    </update>
+    <update id="compareAndSetWorkspaceUpdate">
+        UPDATE ja_workspace SET root_path=#{rootPath},display_name=#{displayName},
+        trust=CASE WHEN #{resetTrust}=1 THEN 'UNTRUSTED' ELSE trust END,
+        revision=revision+1,
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE workspace_id=#{workspaceId} AND revision=#{expectedRevision} AND kind='PROJECT'
+    </update>
+    <select id="selectWorkspaceBusyBlockers" resultMap="workspaceBusyBlockerRow">
+        WITH blockers AS (
+            SELECT t.thread_id,t.title AS thread_title,'TURN' AS blocker_kind,
+            turn.state AS blocker_state,COUNT(*) AS occurrences
+            FROM ja_conversation_thread t JOIN ja_conversation_turn turn ON turn.thread_id=t.thread_id
+            WHERE t.workspace_id=#{workspaceId}
+            AND turn.state IN ('QUEUED','RUNNING','WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')
+            GROUP BY t.thread_id,t.title,turn.state
+            UNION ALL
+            SELECT t.thread_id,t.title AS thread_title,'INPUT' AS blocker_kind,
+            input.state AS blocker_state,COUNT(*) AS occurrences
+            FROM ja_conversation_thread t JOIN ja_turn_input input ON input.thread_id=t.thread_id
+            WHERE t.workspace_id=#{workspaceId} AND input.state='PENDING'
+            GROUP BY t.thread_id,t.title,input.state
+            UNION ALL
+            SELECT t.thread_id,t.title AS thread_title,'PLAN' AS blocker_kind,
+            plan.status AS blocker_state,COUNT(*) AS occurrences
+            FROM ja_conversation_thread t JOIN ja_plan plan ON plan.owner_thread_id=t.thread_id
+            WHERE t.workspace_id=#{workspaceId} AND plan.status IN ('EXECUTING','VERIFYING','PAUSED')
+            GROUP BY t.thread_id,t.title,plan.status
+        )
+        SELECT thread_id,thread_title,blocker_kind,blocker_state,occurrences,
+        COUNT(*) OVER() AS total_blockers
+        FROM blockers ORDER BY thread_id,blocker_kind,blocker_state LIMIT 3
+    </select>
+    <delete id="deleteWorkspace">
+        DELETE FROM ja_workspace WHERE workspace_id=#{workspaceId} AND revision=#{expectedRevision}
+        AND NOT EXISTS(SELECT 1 FROM ja_conversation_thread WHERE workspace_id=#{workspaceId} AND deleted_at_ms IS NULL)
+    </delete>
+    <select id="selectThread" resultMap="threadRow">
+        SELECT thread_id,owner_user_id,workspace_id,title,
+        (SELECT kind FROM ja_workspace w WHERE w.workspace_id=ja_conversation_thread.workspace_id) AS workspace_kind,
+        provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms,pinned_at_ms,archived_at_ms,deleted_at_ms,
+        (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+        COALESCE((SELECT turn_sequence&lt;=COALESCE(ja_conversation_thread.last_seen_turn_sequence,0) FROM ja_conversation_turn
+        WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        (SELECT turn_id FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_id
+        FROM ja_conversation_thread WHERE thread_id=#{threadId} AND deleted_at_ms IS NULL
+    </select>
+    <resultMap id="itemContentReferenceRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ItemContentReferenceRow">
+        <constructor>
+            <arg column="item_id" javaType="string"/>
+            <arg column="kind" javaType="string"/>
+            <arg column="owner_user_id" javaType="string"/>
+            <arg column="core_tenant_id" javaType="string"/>
+            <arg column="core_thread_id" javaType="string"/>
+            <arg column="core_turn_id" javaType="string"/>
+            <arg column="core_record_id" javaType="string"/>
+            <arg column="mailbox_content_json" javaType="string"/>
+            <arg column="total_characters" javaType="_int"/>
+        </constructor>
+    </resultMap>
+    <!-- 索引直接命中公开 item；owner、当前路径和未删除 Thread 必须在同一快照内成立。 -->
+    <select id="selectItemContentReference" resultMap="itemContentReferenceRow">
+        SELECT e.item_id,e.kind,t.owner_user_id,m.core_tenant_id,m.core_thread_id,m.core_turn_id,
+        m.core_record_id,b.content_json AS mailbox_content_json,e.total_characters
+        FROM ja_conversation_timeline_entry e JOIN ja_conversation_thread t ON t.thread_id=e.thread_id
+        JOIN ja_conversation_turn x ON x.turn_id=e.turn_id AND x.thread_id=e.thread_id
+        LEFT JOIN ja_conversation_message m ON m.message_id=e.message_id AND m.thread_id=e.thread_id AND m.turn_id=e.turn_id
+        LEFT JOIN ja_task_mailbox_message b ON b.message_id=e.mailbox_message_id AND b.to_thread_id=e.thread_id
+        WHERE e.thread_id=#{threadId} AND e.item_id=#{itemId} AND t.owner_user_id='user_local'
+        AND t.deleted_at_ms IS NULL AND x.is_current_path=1 AND e.is_current_path=1
+    </select>
+    <insert id="insertThread">
+        INSERT INTO ja_conversation_thread(thread_id,owner_user_id,workspace_id,title,provider_id,model_id,reasoning_level,access_mode,
+        collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms)
+        VALUES(#{threadId},#{ownerUserId},#{workspaceId},#{title},#{providerId},#{modelId},#{reasoningLevel},#{accessMode},
+        #{collaborationMode},#{titleSource},0,#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <select id="selectThreadPage" resultMap="threadRow">
+        SELECT thread_id,owner_user_id,workspace_id,title,
+        (SELECT kind FROM ja_workspace w WHERE w.workspace_id=ja_conversation_thread.workspace_id) AS workspace_kind,
+        provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms,pinned_at_ms,archived_at_ms,deleted_at_ms,
+        (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+        COALESCE((SELECT turn_sequence&lt;=COALESCE(ja_conversation_thread.last_seen_turn_sequence,0) FROM ja_conversation_turn
+        WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        (SELECT turn_id FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_id
+        FROM ja_conversation_thread WHERE workspace_id=#{workspaceId} AND archived_at_ms IS NULL AND deleted_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage WHERE child_thread_id=ja_conversation_thread.thread_id)
+        <if test="cursorPinned != null">AND (
+            (CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END)&lt;#{cursorPinned}
+            OR ((CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END)=#{cursorPinned} AND (
+            COALESCE(pinned_at_ms,updated_at_ms)&lt;#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+            OR (COALESCE(pinned_at_ms,updated_at_ms)=#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND updated_at_ms&lt;#{cursorUpdatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+            OR (COALESCE(pinned_at_ms,updated_at_ms)=#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND updated_at_ms=#{cursorUpdatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND thread_id&lt;#{cursorId})
+            ))
+            )
+        </if>
+        ORDER BY CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END DESC,
+        COALESCE(pinned_at_ms,updated_at_ms) DESC,updated_at_ms DESC,thread_id DESC LIMIT #{limit}
+    </select>
+    <select id="selectSessionThreadPage" resultMap="threadRow">
+        SELECT thread_id,owner_user_id,workspace_id,title,
+        (SELECT kind FROM ja_workspace w WHERE w.workspace_id=ja_conversation_thread.workspace_id) AS workspace_kind,
+        provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms,pinned_at_ms,archived_at_ms,deleted_at_ms,
+        (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+        COALESCE((SELECT turn_sequence&lt;=COALESCE(ja_conversation_thread.last_seen_turn_sequence,0) FROM ja_conversation_turn
+        WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        (SELECT turn_id FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_id
+        FROM ja_conversation_thread WHERE workspace_id IN (SELECT workspace_id FROM ja_workspace WHERE kind='SESSION')
+        AND archived_at_ms IS NULL AND deleted_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage WHERE child_thread_id=ja_conversation_thread.thread_id)
+        <if test="cursorPinned != null">AND (
+            (CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END)&lt;#{cursorPinned}
+            OR ((CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END)=#{cursorPinned} AND (
+            COALESCE(pinned_at_ms,updated_at_ms)&lt;#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+            OR (COALESCE(pinned_at_ms,updated_at_ms)=#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND updated_at_ms&lt;#{cursorUpdatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+            OR (COALESCE(pinned_at_ms,updated_at_ms)=#{cursorSortTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND updated_at_ms=#{cursorUpdatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND thread_id&lt;#{cursorId})
+            ))
+            )
+        </if>
+        ORDER BY CASE WHEN pinned_at_ms IS NULL THEN 0 ELSE 1 END DESC,
+        COALESCE(pinned_at_ms,updated_at_ms) DESC,updated_at_ms DESC,thread_id DESC LIMIT #{limit}
+    </select>
+    <select id="searchThreadPage" resultMap="threadRow">
+        SELECT thread_id,owner_user_id,workspace_id,title,
+        (SELECT kind FROM ja_workspace w WHERE w.workspace_id=ja_conversation_thread.workspace_id) AS workspace_kind,
+        provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms,pinned_at_ms,archived_at_ms,deleted_at_ms,
+        (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+        COALESCE((SELECT turn_sequence&lt;=COALESCE(ja_conversation_thread.last_seen_turn_sequence,0) FROM ja_conversation_turn
+        WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        (SELECT turn_id FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_id
+        FROM ja_conversation_thread WHERE workspace_id=#{workspaceId} AND deleted_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage WHERE child_thread_id=ja_conversation_thread.thread_id)
+        <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
+        <if test="cursorTime != null">AND (updated_at_ms&lt;#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (updated_at_ms=#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND thread_id&lt;#{cursorId}))</if>
+        ORDER BY updated_at_ms DESC,thread_id DESC LIMIT #{limit}
+    </select>
+    <select id="searchSessionThreadPage" resultMap="threadRow">
+        SELECT thread_id,owner_user_id,workspace_id,title,
+        (SELECT kind FROM ja_workspace w WHERE w.workspace_id=ja_conversation_thread.workspace_id) AS workspace_kind,
+        provider_id,model_id,reasoning_level,access_mode,collaboration_mode,title_source,
+        revision,created_at_ms,updated_at_ms,pinned_at_ms,archived_at_ms,deleted_at_ms,
+        (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_status,
+        COALESCE((SELECT turn_sequence&lt;=COALESCE(ja_conversation_thread.last_seen_turn_sequence,0) FROM ja_conversation_turn
+        WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1),1) AS latest_turn_seen,
+        (SELECT turn_id FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) AS latest_turn_id
+        FROM ja_conversation_thread WHERE workspace_id IN (SELECT workspace_id FROM ja_workspace WHERE kind='SESSION')
+        AND deleted_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM ja_conversation_lineage WHERE child_thread_id=ja_conversation_thread.thread_id)
+        <if test="normalizedQuery != ''">AND instr(lower(title),#{normalizedQuery})&gt;0</if>
+        <if test="cursorTime != null">AND (updated_at_ms&lt;#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (updated_at_ms=#{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} AND thread_id&lt;#{cursorId}))</if>
+        ORDER BY updated_at_ms DESC,thread_id DESC LIMIT #{limit}
+    </select>
+    <update id="compareAndSetThreadTitle">
+        UPDATE ja_conversation_thread SET title=#{title},title_source=#{titleSource},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND deleted_at_ms IS NULL
+        <choose>
+            <when test="placeholderOnly">
+                AND revision&gt;=#{expectedRevision} AND title_source='PLACEHOLDER'
+            </when>
+            <otherwise>
+                AND revision=#{expectedRevision}
+            </otherwise>
+        </choose>
+    </update>
+    <update id="compareAndSetThreadPreferences">
+        UPDATE ja_conversation_thread SET provider_id=#{providerId},model_id=#{modelId},reasoning_level=#{reasoningLevel},
+        access_mode=#{accessMode},collaboration_mode=#{collaborationMode},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at_ms IS NULL
+    </update>
+    <select id="selectLastCurrentPathQuestionMessageId" resultType="string">
+        SELECT tm.item_id
+        FROM ja_conversation_timeline_entry tm
+        JOIN ja_conversation_message m ON m.message_id=tm.item_id AND m.thread_id=tm.thread_id AND m.turn_id=tm.turn_id
+        JOIN ja_conversation_turn t ON t.turn_id=tm.turn_id AND t.thread_id=tm.thread_id AND t.is_current_path=1
+        WHERE tm.thread_id=#{threadId} AND tm.kind='USER_INPUT' AND m.role='USER'
+        ORDER BY m.ordinal DESC LIMIT 1
+    </select>
+    <select id="isReaskableQuestion" resultType="boolean">
+        SELECT EXISTS(
+        SELECT 1 FROM ja_conversation_message source
+        JOIN ja_conversation_timeline_entry source_item ON source_item.item_id=source.message_id
+        AND source_item.thread_id=source.thread_id AND source_item.turn_id=source.turn_id
+        AND source_item.message_kind='USER_INPUT'
+        JOIN ja_conversation_turn owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+        AND owner.is_current_path=1
+        WHERE source.thread_id=#{threadId} AND source.message_id=#{sourceMessageId} AND source.role='USER'
+        AND source.message_id=(
+        SELECT latest.item_id FROM ja_conversation_timeline_entry latest
+        JOIN ja_conversation_message latest_message ON latest_message.message_id=latest.item_id
+        AND latest_message.thread_id=latest.thread_id AND latest_message.turn_id=latest.turn_id
+        JOIN ja_conversation_turn latest_turn ON latest_turn.turn_id=latest.turn_id
+        AND latest_turn.thread_id=latest.thread_id AND latest_turn.is_current_path=1
+        WHERE latest.thread_id=#{threadId} AND latest.message_kind='USER_INPUT'
+        AND latest_message.role='USER'
+        ORDER BY latest_message.ordinal DESC LIMIT 1)
+        AND NOT EXISTS(SELECT 1 FROM ja_conversation_timeline_entry earlier
+        JOIN ja_conversation_message earlier_message ON earlier_message.message_id=earlier.item_id
+        WHERE earlier.thread_id=source.thread_id AND earlier.turn_id=owner.turn_id
+        AND earlier.message_kind='USER_INPUT' AND earlier_message.role='USER'
+        AND earlier_message.ordinal&lt;source.ordinal)
+        AND (SELECT latest_attempt.state FROM ja_conversation_turn latest_attempt
+        WHERE latest_attempt.thread_id=source.thread_id AND latest_attempt.is_current_path=1
+        AND (latest_attempt.turn_id=owner.turn_id OR latest_attempt.source_message_id=source.message_id)
+        ORDER BY latest_attempt.turn_sequence DESC LIMIT 1) IN ('FAILED','CANCELLED')
+        AND NOT EXISTS(SELECT 1 FROM ja_conversation_turn successful
+        WHERE successful.thread_id=source.thread_id AND successful.is_current_path=1
+        AND successful.state='COMPLETED'
+        AND (successful.turn_id=owner.turn_id OR successful.source_message_id=source.message_id))
+        )
+    </select>
+    <update id="cutCurrentPathFromQuestion">
+        UPDATE ja_conversation_turn SET is_current_path=0
+        WHERE thread_id=#{threadId} AND is_current_path=1 AND turn_sequence&gt;=(
+        SELECT owner.turn_sequence FROM ja_conversation_message source
+        JOIN ja_conversation_turn owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+        WHERE source.thread_id=#{threadId} AND source.message_id=#{sourceMessageId})
+    </update>
+    <update id="compareAndSetThreadPin">
+        UPDATE ja_conversation_thread SET pinned_at_ms=#{pinnedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision}
+        AND archived_at_ms IS NULL AND deleted_at_ms IS NULL
+    </update>
+    <update id="compareAndSetThreadSeen">
+        UPDATE ja_conversation_thread SET last_seen_turn_sequence=(
+        SELECT turn_sequence FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id
+        ORDER BY turn_sequence DESC LIMIT 1),
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at_ms IS NULL
+        AND (SELECT state FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1) IN ('COMPLETED','FAILED')
+        AND COALESCE(last_seen_turn_sequence,0)&lt;(
+        SELECT turn_sequence FROM ja_conversation_turn WHERE ja_conversation_turn.thread_id=ja_conversation_thread.thread_id
+        ORDER BY turn_sequence DESC LIMIT 1)
+    </update>
+    <update id="updateThreadLifecycle">
+        UPDATE ja_conversation_thread
+        <choose>
+            <when test="delete == true">SET deleted_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},pinned_at_ms=NULL,</when>
+            <otherwise>SET archived_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},pinned_at_ms=NULL,</otherwise>
+        </choose>
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision} AND deleted_at_ms IS NULL
+        <if test="delete == false">AND archived_at_ms IS NULL</if>
+        <if test="delete == true">AND NOT EXISTS (
+            SELECT 1 FROM ja_conversation_lineage
+            WHERE child_thread_id=#{threadId} OR parent_thread_id=#{threadId}
+            )
+        </if>
+    </update>
+    <update id="restoreThread">
+        UPDATE ja_conversation_thread SET archived_at_ms=NULL,pinned_at_ms=NULL,updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND revision=#{expectedRevision}
+        AND archived_at_ms IS NOT NULL AND deleted_at_ms IS NULL
+    </update>
+    <select id="countActiveTurns" resultType="int">
+        SELECT COUNT(*) FROM ja_conversation_turn WHERE thread_id=#{threadId}
+        AND state IN ('QUEUED','RUNNING','WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')
+    </select>
+    <!-- 两种分页共享持久条目和复合排序键，避免最新页与普通历史对同批摘要、正文、Tool 的次序产生分歧。 -->
+    <sql id="snapshotOrderedItems">
+        WITH call_owners AS (
+        SELECT p.thread_id,p.turn_id,p.call_id,MIN(m.message_id) AS context_message_id,
+        MIN(m.ordinal) AS context_message_ordinal
+        FROM ja_tool_call_preview p JOIN ja_conversation_message m
+        ON m.thread_id=p.thread_id AND m.turn_id=p.turn_id AND m.core_record_id=p.assistant_message_record_id
+        GROUP BY p.thread_id,p.turn_id,p.call_id
+        ), items AS (
+        SELECT e.item_id,'message' AS item_kind,e.created_at_ms,e.turn_id,NULL AS call_id,NULL AS tool_name,
+        NULL AS tool_ordinal,NULL AS tool_state,e.kind AS message_kind,e.preview_text,e.total_characters,e.model_round,
+        NULL AS presentation_json,NULL AS approval_id,NULL AS decision,NULL AS expires_at_ms,
+        CASE WHEN e.kind='USER_INPUT' THEN COALESCE((
+        SELECT json_group_array(json_object('attachmentId',ordered.attachment_id,'displayName',ordered.display_name,
+        'sizeBytes',ordered.size_bytes,'mediaKind',lower(ordered.media_kind),'mediaType',ordered.media_type))
+        FROM (SELECT a.attachment_id,a.display_name,a.size_bytes,a.media_kind,a.media_type
+        FROM json_each(e.attachments_json) metadata JOIN ja_attachment a
+        ON a.attachment_id=json_extract(metadata.value,'$.attachmentId')
+        ORDER BY json_extract(metadata.value,'$.ordinal')) ordered),json_array()) ELSE NULL END AS attachments_json,
+        e.context_references_json,e.source_thread_id,e.source_title,e.message_id AS context_message_id,m.ordinal AS context_message_ordinal,
+        e.sequence AS timeline_sequence,x.turn_sequence AS turn_sequence
+        FROM ja_conversation_timeline_entry e JOIN ja_conversation_turn x ON x.turn_id=e.turn_id AND x.thread_id=e.thread_id
+        LEFT JOIN ja_conversation_message m ON m.message_id=e.message_id AND m.thread_id=e.thread_id AND m.turn_id=e.turn_id
+        WHERE e.thread_id=#{threadId} AND e.is_current_path=1 AND x.is_current_path=1
+        <!-- 等待态只在快照读取时按同一审批身份派生；保留持久 PREPARED/PENDING 作为授权与事件输入边界。 -->
+        UNION ALL SELECT t.thread_id||':'||t.turn_id||':'||t.call_id||'_call','tool_call',t.created_at_ms,t.turn_id,t.call_id,
+        t.tool_name,t.ordinal,t.state,NULL,NULL,NULL,NULL,
+        CASE WHEN t.state='PREPARED' AND json_extract(t.presentation_json,'$.status')='pending'
+        AND EXISTS(SELECT 1 FROM ja_approval a WHERE a.thread_id=t.thread_id AND a.turn_id=t.turn_id
+        AND a.call_id=t.call_id AND a.decision IS NULL)
+        AND EXISTS(SELECT 1 FROM ja_conversation_turn waiting WHERE waiting.thread_id=t.thread_id
+        AND waiting.turn_id=t.turn_id AND waiting.state='WAITING_APPROVAL')
+        THEN json_set(t.presentation_json,'$.status','waiting_approval') ELSE t.presentation_json END,
+        NULL,NULL,NULL,NULL,NULL,NULL,NULL,owner.context_message_id,owner.context_message_ordinal,
+        COALESCE((SELECT MIN(e.sequence) FROM ja_conversation_timeline_entry e
+        WHERE e.thread_id=t.thread_id AND e.turn_id=t.turn_id AND e.message_id=owner.context_message_id),0),x.turn_sequence
+        FROM ja_tool_call t JOIN ja_conversation_turn x ON x.turn_id=t.turn_id AND x.thread_id=t.thread_id
+        LEFT JOIN call_owners owner ON owner.thread_id=t.thread_id AND owner.turn_id=t.turn_id AND owner.call_id=t.call_id
+        WHERE t.thread_id=#{threadId} AND x.is_current_path=1
+        UNION ALL SELECT a.approval_id,'approval',a.requested_at_ms,a.turn_id,a.call_id,t.tool_name,NULL,NULL,
+        NULL,NULL,NULL,NULL,NULL,a.approval_id,a.decision,a.expires_at_ms,NULL,NULL,NULL,NULL
+        ,owner.context_message_id,owner.context_message_ordinal,
+        COALESCE((SELECT MIN(e.sequence) FROM ja_conversation_timeline_entry e
+        WHERE e.thread_id=a.thread_id AND e.turn_id=a.turn_id AND e.message_id=owner.context_message_id),0),x.turn_sequence
+        FROM ja_approval a JOIN ja_tool_call t ON t.thread_id=a.thread_id AND t.turn_id=a.turn_id AND t.call_id=a.call_id
+        JOIN ja_conversation_turn x ON x.turn_id=a.turn_id AND x.thread_id=a.thread_id
+        LEFT JOIN call_owners owner ON owner.thread_id=a.thread_id AND owner.turn_id=a.turn_id AND owner.call_id=a.call_id
+        WHERE a.thread_id=#{threadId} AND x.is_current_path=1
+        ), ordered_items AS (
+        SELECT *,CASE WHEN message_kind='USER_INPUT' THEN 0 WHEN message_kind='REASONING_SUMMARY' THEN 1
+        WHEN message_kind='ASSISTANT_PROGRESS' THEN 2 WHEN item_kind='tool_call' THEN 3 WHEN item_kind='approval' THEN 4
+        ELSE 5 END AS semantic_order,COALESCE(tool_ordinal,-1) AS ordinal_order FROM items)
+    </sql>
+    <!-- 同一提交的摘要/正文先于 Tool，Tool 使用原始 ordinal；游标从原条目还原相同排序键，避免随机 ID 颠倒因果或分页漏行。 -->
+    <select id="selectSnapshotItems" resultMap="snapshotItemRow">
+        <include refid="snapshotOrderedItems"/>
+        SELECT item_id,item_kind,created_at_ms,turn_id,call_id,tool_name,tool_ordinal,tool_state,message_kind,
+        preview_text,total_characters,model_round,presentation_json,approval_id,decision,expires_at_ms,attachments_json,
+        context_references_json,source_thread_id,source_title,context_message_id,context_message_ordinal,
+        timeline_sequence,turn_sequence,semantic_order,ordinal_order FROM ordered_items
+        <if test="cursorTime != null">
+            WHERE (created_at_ms,semantic_order,ordinal_order,item_id)&gt;(
+            #{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},
+            (SELECT semantic_order FROM ordered_items WHERE item_id=#{cursorId}),
+            (SELECT ordinal_order FROM ordered_items WHERE item_id=#{cursorId}),
+            #{cursorId})
+        </if>
+        ORDER BY created_at_ms,semantic_order,ordinal_order,item_id LIMIT #{limit}
+    </select>
+    <!-- SQLite 在数据库侧反向 keyset 取最近 N+1 项；额外项只用来判断是否存在更旧一页。 -->
+    <select id="selectSnapshotItemsLatest" resultMap="snapshotItemRow">
+        <include refid="snapshotOrderedItems"/>
+        SELECT item_id,item_kind,created_at_ms,turn_id,call_id,tool_name,tool_ordinal,tool_state,message_kind,
+        preview_text,total_characters,model_round,presentation_json,approval_id,decision,expires_at_ms,attachments_json,
+        context_references_json,source_thread_id,source_title,context_message_id,context_message_ordinal,
+        timeline_sequence,turn_sequence,semantic_order,ordinal_order FROM ordered_items
+        <if test="cursorTime != null">
+            WHERE (created_at_ms,semantic_order,ordinal_order,item_id)&lt;(
+            #{cursorTime,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},
+            (SELECT semantic_order FROM ordered_items WHERE item_id=#{cursorId}),
+            (SELECT ordinal_order FROM ordered_items WHERE item_id=#{cursorId}),
+            #{cursorId})
+        </if>
+        ORDER BY created_at_ms DESC,semantic_order DESC,ordinal_order DESC,item_id DESC LIMIT #{limit}
+    </select>
+    <select id="selectSnapshotItem" resultMap="snapshotItemRow">
+        <include refid="snapshotOrderedItems"/>
+        SELECT item_id,item_kind,created_at_ms,turn_id,call_id,tool_name,tool_ordinal,tool_state,message_kind,
+        preview_text,total_characters,model_round,presentation_json,approval_id,decision,expires_at_ms,attachments_json,
+        context_references_json,source_thread_id,source_title,context_message_id,context_message_ordinal,
+        timeline_sequence,turn_sequence,semantic_order,ordinal_order FROM ordered_items
+        WHERE item_id=#{itemId} LIMIT 1
+    </select>
+    <!-- Fork 使用 Core message/Turn 因果键取精确结算边界，timestamp 和哈希 item ID 只用于最终稳定 tie-break。 -->
+    <select id="selectForkSnapshotItems" resultMap="snapshotItemRow">
+        <include refid="snapshotOrderedItems"/>
+        SELECT item_id,item_kind,created_at_ms,turn_id,call_id,tool_name,tool_ordinal,tool_state,message_kind,
+        preview_text,total_characters,model_round,presentation_json,approval_id,decision,expires_at_ms,attachments_json,
+        context_references_json,source_thread_id,source_title,context_message_id,context_message_ordinal,
+        timeline_sequence,turn_sequence,semantic_order,ordinal_order
+        FROM ordered_items
+        WHERE (
+        (context_message_ordinal IS NOT NULL AND
+        (turn_sequence,context_message_ordinal,semantic_order,ordinal_order,timeline_sequence,item_id)&lt;=(
+        (SELECT turn_sequence FROM ordered_items WHERE item_id=#{boundaryItemId}),
+        (SELECT context_message_ordinal FROM ordered_items WHERE item_id=#{boundaryItemId}),
+        (SELECT semantic_order FROM ordered_items WHERE item_id=#{boundaryItemId}),
+        (SELECT ordinal_order FROM ordered_items WHERE item_id=#{boundaryItemId}),
+        (SELECT timeline_sequence FROM ordered_items WHERE item_id=#{boundaryItemId}),#{boundaryItemId}))
+        OR (context_message_ordinal IS NULL AND (
+        turn_sequence &lt; (SELECT turn_sequence FROM ordered_items WHERE item_id=#{boundaryItemId})
+        OR (turn_sequence=(SELECT turn_sequence FROM ordered_items WHERE item_id=#{boundaryItemId})
+        AND timeline_sequence &lt;= (SELECT timeline_sequence FROM ordered_items WHERE item_id=#{boundaryItemId}))))
+        )
+        <if test="cursorTurnSequence != null">
+            AND (turn_sequence,COALESCE(context_message_ordinal,0),semantic_order,ordinal_order,timeline_sequence,item_id)&gt;(
+            #{cursorTurnSequence},COALESCE(#{cursorContextMessageOrdinal},0),#{cursorSemanticOrder},#{cursorOrdinalOrder},
+            #{cursorTimelineSequence},#{cursorItemId})
+        </if>
+        ORDER BY turn_sequence,COALESCE(context_message_ordinal,0),semantic_order,ordinal_order,timeline_sequence,item_id
+        LIMIT #{limit}
+    </select>
+    <!-- 只对存在续答来源的 Turn 取 owner/旧 attempt 身份，不把全量 Core record body 拉到 Java。 -->
+    <select id="selectSupersededErrorTurnIds" resultType="string">
+        WITH latest_attempt AS (
+        SELECT source_message_id,MAX(turn_sequence) AS latest_sequence FROM ja_conversation_turn
+        WHERE thread_id=#{threadId} AND is_current_path=1 AND source_message_id IS NOT NULL
+        GROUP BY source_message_id
+        )
+        SELECT owner.turn_id FROM latest_attempt attempt
+        JOIN ja_conversation_message source ON source.message_id=attempt.source_message_id
+        AND source.thread_id=#{threadId} AND source.role='USER'
+        JOIN ja_conversation_turn owner ON owner.turn_id=source.turn_id AND owner.thread_id=source.thread_id
+        UNION
+        SELECT previous.turn_id FROM latest_attempt attempt
+        JOIN ja_conversation_turn previous ON previous.thread_id=#{threadId} AND previous.is_current_path=1
+        AND previous.source_message_id=attempt.source_message_id
+        AND previous.turn_sequence&lt;attempt.latest_sequence
+    </select>
+    <select id="selectLatestContextUsage" resultMap="contextUsageRow">
+        SELECT u.turn_id,u.model_request_id,u.model_round,u.model_request_ordinal,u.purpose,u.certainty,
+        u.profile_json,u.input_tokens,u.output_tokens,u.total_tokens,u.cache_read_tokens,u.cache_write_tokens,
+        u.new_input_tokens,u.input_accounting,u.estimated_context_tokens,u.created_at_ms AS occurred_at_ms
+        FROM ja_turn_usage u JOIN ja_conversation_turn x ON x.turn_id=u.turn_id
+        WHERE u.thread_id=#{threadId} AND x.is_current_path=1 AND u.purpose='ASSISTANT'
+        ORDER BY x.turn_sequence DESC,u.model_request_ordinal DESC,u.usage_id DESC LIMIT 1
+    </select>
+    <select id="selectExecutionCursor" resultType="string">
+        SELECT cursor_json FROM agent_execution
+        WHERE tenant_id=#{tenantId} AND thread_id=#{threadId} AND turn_id=#{turnId}
+        AND user_id=#{userId}
+        AND mutation_version=#{mutationVersion} AND state=#{state}
+        AND cursor_schema_version=#{schemaVersion}
+    </select>
+    <select id="selectThreadUsageSummary" resultMap="threadUsageSummaryRow">
+        SELECT
+        COUNT(*) AS request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' THEN 1 ELSE 0 END), 0) AS measured_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS
+        new_input_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL THEN new_input_tokens ELSE 0 END), 0)
+        AS new_input_tokens,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND output_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS
+        output_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND output_tokens IS NOT NULL THEN output_tokens ELSE 0 END), 0) AS
+        output_tokens,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND total_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS
+        total_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0) AS
+        total_tokens,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_read_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS
+        cache_read_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END),
+        0) AS cache_read_tokens,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS
+        cache_write_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND cache_write_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END),
+        0) AS cache_write_tokens,
+        <!-- 已含缓存的输入直接取原始完整 input，避免扣除 write 后再拼分母时漏算；排除缓存的输入须补齐读写。 -->
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE') THEN 1 ELSE 0 END), 0) AS
+        cache_complete_request_count,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE')
+        THEN CASE WHEN input_accounting='INPUT_INCLUDES_CACHE'
+        THEN input_tokens
+        ELSE new_input_tokens + cache_read_tokens + cache_write_tokens END ELSE 0 END), 0) AS
+        cache_complete_input_tokens,
+        COALESCE(SUM(CASE WHEN certainty='KNOWN' AND new_input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL
+        AND (cache_write_tokens IS NOT NULL OR input_accounting='INPUT_INCLUDES_CACHE') THEN cache_read_tokens ELSE 0
+        END), 0) AS cache_complete_read_tokens
+        FROM ja_turn_usage
+        WHERE thread_id=#{threadId} AND purpose IN ('ASSISTANT','SUMMARY')
+    </select>
+    <insert id="insertChangeSet">
+        INSERT INTO ja_turn_change_set(thread_id,turn_id,workspace_id,change_set_json,artifact_id,committed_at_ms)
+        SELECT #{threadId},#{turnId},#{workspaceId},#{changeSetJson},#{artifactId},#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE EXISTS(SELECT 1 FROM ja_conversation_turn x JOIN ja_conversation_thread t ON t.thread_id=x.thread_id
+        WHERE x.turn_id=#{turnId} AND x.thread_id=#{threadId} AND t.workspace_id=#{workspaceId}
+        AND x.state IN ('COMPLETED','FAILED','CANCELLED'))
+    </insert>
+    <insert id="insertChangeSetArtifact">
+        INSERT INTO ja_change_set_artifact(artifact_id,thread_id,turn_id,content,sha256,byte_length,created_at_ms)
+        VALUES(#{artifactId},#{threadId},#{turnId},#{unifiedDiff},#{sha256},#{byteLength},#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <select id="selectChangeSetArtifact" resultMap="changeSetArtifactRow">
+        SELECT a.artifact_id,a.sha256,a.content,a.byte_length FROM ja_change_set_artifact a
+        JOIN ja_conversation_thread t ON t.thread_id=a.thread_id AND t.deleted_at_ms IS NULL
+        JOIN ja_conversation_turn x ON x.turn_id=a.turn_id AND x.thread_id=a.thread_id
+        WHERE a.thread_id=#{threadId} AND a.turn_id=#{turnId} AND a.artifact_id=#{artifactId}
+        AND x.state IN ('COMPLETED','FAILED','CANCELLED')
+    </select>
+</mapper>

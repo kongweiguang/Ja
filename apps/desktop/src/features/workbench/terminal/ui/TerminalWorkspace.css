@@ -255,6 +255,8 @@
 }
 
 .ja-terminal-split {
+  --ja-terminal-split-pane-minimum: 2rem;
+  --ja-terminal-split-handle-size: 0.4rem;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -280,10 +282,10 @@
   overflow: hidden;
 }
 .ja-terminal-split.is-horizontal > .ja-terminal-split-child {
-  min-width: 2rem;
+  min-width: var(--ja-terminal-split-pane-minimum);
 }
 .ja-terminal-split.is-vertical > .ja-terminal-split-child {
-  min-height: 2rem;
+  min-height: var(--ja-terminal-split-pane-minimum);
 }
 .ja-terminal-split-child.is-rest {
   flex: 1 1 0;
@@ -291,7 +293,7 @@
 
 .ja-terminal-split-handle {
   z-index: 1;
-  flex: 0 0 0.4rem;
+  flex: 0 0 var(--ja-terminal-split-handle-size);
   border: 0;
   background: var(--ja-border);
   cursor: col-resize;
@@ -319,10 +321,13 @@
   flex-direction: column;
   overflow: hidden;
   background: var(--ja-terminal-pane-background);
+  container-name: ja-terminal-pane;
+  container-type: inline-size;
 }
 
 .ja-terminal-pane-toolbar {
   display: flex;
+  min-width: 0;
   min-height: 1.8rem;
   flex: 0 0 auto;
   align-items: center;
@@ -335,12 +340,24 @@
   line-height: var(--ja-line-caption);
 }
 
+.ja-terminal-pane-heading {
+  display: block;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ja-terminal-pane-label {
   color: var(--ja-foreground);
+}
+.ja-terminal-pane-separator {
+  padding: 0 0.2rem;
 }
 .ja-terminal-pane-cwd {
   min-width: 0;
   max-width: 45%;
+  flex: 0 1 auto;
   overflow: hidden;
   color: var(--ja-terminal-muted);
   direction: rtl;
@@ -353,8 +370,12 @@
 }
 .ja-terminal-pane-actions {
   display: flex;
+  flex: 0 0 auto;
   margin-left: auto;
   gap: 0.1rem;
+}
+.ja-terminal-pane-actions .ja-terminal-pane-menu-trigger {
+  display: none;
 }
 .ja-terminal-pane-actions button {
   display: grid;
@@ -369,6 +390,50 @@
   border-radius: 0.2rem;
   background: var(--ja-terminal-hover);
   color: var(--ja-foreground);
+}
+
+/* Pane 变窄时先让出 cwd，操作空间不足再收进现有菜单。 */
+@container ja-terminal-pane (max-width: 180px) {
+  .ja-terminal-pane-toolbar {
+    gap: 0.2rem;
+    padding-inline: 0.2rem;
+  }
+
+  .ja-terminal-pane-heading {
+    flex: 1 1 0;
+  }
+
+  .ja-terminal-pane-cwd {
+    display: none;
+  }
+
+  .ja-terminal-pane-actions {
+    gap: 0.05rem;
+  }
+
+  .ja-terminal-pane-actions button {
+    padding: 0.1rem;
+  }
+}
+
+@container ja-terminal-pane (max-width: 72px) {
+  .ja-terminal-pane-toolbar {
+    gap: 0;
+    padding-inline: 0;
+  }
+
+  .ja-terminal-pane-actions {
+    gap: 0;
+  }
+
+  .ja-terminal-pane-actions button:not(.ja-terminal-pane-menu-trigger) {
+    display: none;
+  }
+
+  .ja-terminal-pane-actions .ja-terminal-pane-menu-trigger {
+    display: grid;
+    padding: 0.25rem;
+  }
 }
 .ja-terminal-output-warning {
   display: flex;

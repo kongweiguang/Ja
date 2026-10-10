@@ -11,11 +11,9 @@ const MAX_CATALOG_REFERENCES = 128;
 const MAX_MAP_ENTRIES = 64;
 const MAX_MAP_VALUE = 8_192;
 
-/** Skill 引用名允许 Unicode，但不能携带授权来源分隔符或 C0 控制字符。 */
+/** 配置引用沿用 wire 的 ASCII kebab 名称，避免已保存身份与运行时目录使用不同语法。 */
 const isConfigSkillReferenceName = (value: string): boolean =>
-  value.length >= 1 &&
-  value.length <= 512 &&
-  [...value].every((character) => character !== ":" && (character.codePointAt(0) ?? 0) > 0x1f);
+  value.length >= 1 && value.length <= 256 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
 
 /** 配置身份保持不透明，并只接受 schema v2 的稳定命名空间。 */
 export const ConfigCredentialRefSchema = z
@@ -41,13 +39,11 @@ export const ConfigSkillReferenceSchema = z
   .string()
   .regex(/^(?:user|ja|project):/)
   .refine((value) => isConfigSkillReferenceName(value.slice(value.indexOf(":") + 1)))
-  .max(520);
+  .max(264);
 const ConfigUserSkillReferenceSchema = ConfigSkillReferenceSchema.refine(
   (value) => value.startsWith("user:") || value.startsWith("ja:"),
 );
-const ConfigProjectSkillReferenceSchema = ConfigSkillReferenceSchema.refine((value) =>
-  value.startsWith("project:"),
-);
+const ConfigProjectSkillReferenceSchema = ConfigSkillReferenceSchema;
 
 /** 配置离开 renderer 前拒绝 Secret 形状键，避免高级 Map 成为凭据旁路。 */
 function safeConfigMap(value: Record<string, string>): boolean {
@@ -101,6 +97,7 @@ const configModelCapabilitiesSchema = z
   .object({
     context_window_tokens: z.number().int().min(4_096).max(4_000_000),
     max_output_tokens: z.number().int().min(1).max(1_000_000),
+    supports_output_schema: z.boolean().optional(),
   })
   .strict()
   .refine((value) => value.max_output_tokens < value.context_window_tokens);
@@ -134,8 +131,8 @@ export const ConfigModelSchema = z
     }
   });
 
-/** Provider 是稳定路由与凭据边界，一个 Provider 可以管理多个独立模型能力。 */
-export const ConfigProviderSchema = z
+/** Provider 的共同连接形状；effective 项目覆盖可显式得到空模型目录。 */
+const ConfigProviderBaseSchema = z
   .object({
     provider_id: ConfigProviderIdSchema,
     name: z.string().trim().min(1).max(MAX_TEXT),
@@ -144,14 +141,31 @@ export const ConfigProviderSchema = z
     credential_id: ConfigCredentialRefSchema,
     network_timeouts: configNetworkTimeoutsSchema,
     agent_defaults: configAgentDefaultsSchema,
-    models: z.array(ConfigModelSchema).min(1).max(MAX_CATALOG_ITEMS),
+    models: z.array(ConfigModelSchema).max(MAX_CATALOG_ITEMS),
   })
+  .strict();
+
+/** Provider 是稳定路由与凭据边界；用户层可执行连接至少需要一个模型。 */
+export const ConfigProviderSchema = ConfigProviderBaseSchema.extend({
+  models: z.array(ConfigModelSchema).min(1).max(MAX_CATALOG_ITEMS),
+})
   .strict()
-  .superRefine((provider, context) => {
-    if (new Set(provider.models.map((model) => model.model_id)).size !== provider.models.length) {
-      context.addIssue({ code: "custom", path: ["models"], message: "duplicate model id" });
-    }
-  });
+  .superRefine(validateUniqueProviderModels);
+
+/** Effective Provider 允许项目显式空目录；模型运行前的有效选择仍在 root 引用处校验。 */
+export const ConfigEffectiveProviderSchema = ConfigProviderBaseSchema.superRefine(
+  validateUniqueProviderModels,
+);
+
+/** Provider 的模型集合始终按稳定 model_id 去重，与数组位置和显示名无关。 */
+function validateUniqueProviderModels(
+  provider: { models: Array<{ model_id: string }> },
+  context: z.RefinementCtx,
+): void {
+  if (new Set(provider.models.map((model) => model.model_id)).size !== provider.models.length) {
+    context.addIssue({ code: "custom", path: ["models"], message: "duplicate model id" });
+  }
+}
 
 /** 子智能体策略只允许用户级模型引用；独立 Provider/Model 身份由配置目录持有。 */
 export const ConfigSubagentsSchema = z
@@ -208,8 +222,7 @@ export const ConfigMcpServerSchema = z
   })
   .strict();
 
-/** 只解析 app-server 返回的当前 v2 用户配置，并在 renderer 边界校验默认选择的真实引用。 */
-export const ConfigDocumentSchema = z
+const ConfigDocumentBaseSchema = z
   .object({
     schema_version: z.literal(2),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
@@ -223,112 +236,210 @@ export const ConfigDocumentSchema = z
     mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS),
     disabled_skills: z.array(ConfigUserSkillReferenceSchema).max(MAX_CATALOG_ITEMS),
   })
-  .strict()
-  .superRefine((document, context) => {
-    if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
-      context.addIssue({
-        code: "custom",
-        path: ["disabled_skills"],
-        message: "duplicate skill reference",
-      });
-    }
-    if (
-      new Set(document.providers.map((provider) => provider.provider_id)).size !==
+  .strict();
+const ConfigEffectiveDocumentBaseSchema = ConfigDocumentBaseSchema.extend({
+  providers: z.array(ConfigEffectiveProviderSchema).max(MAX_CATALOG_ITEMS),
+}).strict();
+
+/** 校验真实 ID 引用；仅用户文档禁止重复绑定凭据，effective 允许项目显式重用 vault 引用。 */
+function validateConfigDocumentReferences(
+  document: z.infer<typeof ConfigDocumentBaseSchema>,
+  context: z.RefinementCtx,
+  requireUniqueCredentials: boolean,
+): void {
+  if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["disabled_skills"],
+      message: "duplicate skill reference",
+    });
+  }
+  if (
+    new Set(document.providers.map((provider) => provider.provider_id)).size !==
+    document.providers.length
+  ) {
+    context.addIssue({ code: "custom", path: ["providers"], message: "duplicate provider id" });
+  }
+  if (
+    requireUniqueCredentials &&
+    new Set(document.providers.map((provider) => provider.credential_id)).size !==
       document.providers.length
-    ) {
-      context.addIssue({ code: "custom", path: ["providers"], message: "duplicate provider id" });
-    }
-    if (
-      new Set(document.providers.map((provider) => provider.credential_id)).size !==
-      document.providers.length
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["providers"],
-        message: "duplicate provider credential id",
-      });
-    }
-    if (document.subagents.provider_id !== null && document.subagents.model_id !== null) {
-      const provider = document.providers.find(
-        (candidate) => candidate.provider_id === document.subagents.provider_id,
-      );
-      const model = provider?.models.find(
-        (candidate) => candidate.model_id === document.subagents.model_id,
-      );
-      if (model === undefined) {
-        context.addIssue({
-          path: ["subagents", "model_id"],
-          code: "custom",
-          message: "unknown selection",
-        });
-      } else if (
-        document.subagents.reasoning_level !== null &&
-        model.reasoning_level_map[document.subagents.reasoning_level] === undefined
-      ) {
-        context.addIssue({
-          path: ["subagents", "reasoning_level"],
-          code: "custom",
-          message: "unsupported reasoning level",
-        });
-      }
-    }
-    const hasProvider = document.default_provider_id !== null;
-    const hasModel = document.default_model_id !== null;
-    if (hasProvider !== hasModel) {
-      context.addIssue({
-        code: "custom",
-        path: ["default_model_id"],
-        message: "incomplete selection",
-      });
-      return;
-    }
-    if (!hasProvider) {
-      if (document.default_reasoning_level !== null) {
-        context.addIssue({
-          code: "custom",
-          path: ["default_reasoning_level"],
-          message: "orphan reasoning",
-        });
-      }
-      return;
-    }
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["providers"],
+      message: "duplicate provider credential id",
+    });
+  }
+  if (document.subagents.provider_id !== null && document.subagents.model_id !== null) {
     const provider = document.providers.find(
-      (candidate) => candidate.provider_id === document.default_provider_id,
+      (candidate) => candidate.provider_id === document.subagents.provider_id,
     );
     const model = provider?.models.find(
-      (candidate) => candidate.model_id === document.default_model_id,
+      (candidate) => candidate.model_id === document.subagents.model_id,
     );
     if (model === undefined) {
       context.addIssue({
+        path: ["subagents", "model_id"],
         code: "custom",
-        path: ["default_model_id"],
         message: "unknown selection",
       });
     } else if (
-      document.default_reasoning_level !== null &&
-      model.reasoning_level_map[document.default_reasoning_level] === undefined
+      document.subagents.reasoning_level !== null &&
+      model.reasoning_level_map[document.subagents.reasoning_level] === undefined
     ) {
+      context.addIssue({
+        path: ["subagents", "reasoning_level"],
+        code: "custom",
+        message: "unsupported reasoning level",
+      });
+    }
+  }
+  const hasProvider = document.default_provider_id !== null;
+  const hasModel = document.default_model_id !== null;
+  if (hasProvider !== hasModel) {
+    context.addIssue({
+      code: "custom",
+      path: ["default_model_id"],
+      message: "incomplete selection",
+    });
+    return;
+  }
+  if (!hasProvider) {
+    if (document.default_reasoning_level !== null) {
       context.addIssue({
         code: "custom",
         path: ["default_reasoning_level"],
-        message: "unsupported",
+        message: "orphan reasoning",
+      });
+    }
+    return;
+  }
+  const provider = document.providers.find(
+    (candidate) => candidate.provider_id === document.default_provider_id,
+  );
+  const model = provider?.models.find(
+    (candidate) => candidate.model_id === document.default_model_id,
+  );
+  if (model === undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["default_model_id"],
+      message: "unknown selection",
+    });
+  } else if (
+    document.default_reasoning_level !== null &&
+    model.reasoning_level_map[document.default_reasoning_level] === undefined
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["default_reasoning_level"],
+      message: "unsupported",
+    });
+  }
+}
+
+/** 读取和写入用户层时拒绝重复 credential owner，避免凭据身份含糊。 */
+export const ConfigDocumentSchema = ConfigDocumentBaseSchema.superRefine((document, context) =>
+  validateConfigDocumentReferences(document, context, true),
+);
+
+/** Effective 可含项目显式引用的其它全局凭据；普通用户配置仍由 ConfigDocumentSchema 校验。 */
+export const ConfigEffectiveDocumentSchema = ConfigEffectiveDocumentBaseSchema.superRefine(
+  (document, context) => validateConfigDocumentReferences(document, context, false),
+);
+
+/** 项目可切换现有 Provider 的连接目标，但连接目标必须带明示的用户凭据引用。 */
+const ConfigProjectProviderSchema = z
+  .object({
+    provider_id: ConfigProviderIdSchema,
+    api: z.enum(["openai_responses", "anthropic_messages", "openai_chat_completions"]).optional(),
+    base_url: z.string().min(1).max(2_048).refine(isSafeHttpUrl).optional(),
+    credential_id: ConfigCredentialRefSchema.optional(),
+    network_timeouts: z
+      .object({
+        connect_timeout_ms: z.number().int().min(100).max(120_000).optional(),
+        request_timeout_ms: z.number().int().min(1_000).max(3_600_000).optional(),
+      })
+      .strict()
+      .optional(),
+    agent_defaults: z
+      .object({
+        context: z.object({ auto_compact: z.boolean().optional() }).strict().optional(),
+      })
+      .strict()
+      .optional(),
+    models: z.array(ConfigModelSchema).max(MAX_CATALOG_ITEMS).optional(),
+    removed_model_ids: z.array(ConfigModelIdSchema).max(MAX_CATALOG_ITEMS).optional(),
+  })
+  .strict()
+  .superRefine((provider, context) => {
+    const routeFields = [provider.api, provider.base_url, provider.credential_id];
+    if (
+      routeFields.some((value) => value !== undefined) &&
+      routeFields.some((value) => value === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["credential_id"],
+        message: "project provider route requires an explicit credential reference",
+      });
+    }
+    if (provider.models !== undefined && provider.removed_model_ids !== undefined) {
+      const modelIds = new Set(provider.models.map((model) => model.model_id));
+      if (provider.removed_model_ids.some((modelId) => modelIds.has(modelId))) {
+        context.addIssue({
+          code: "custom",
+          path: ["removed_model_ids"],
+          message: "a model cannot be overridden and removed together",
+        });
+      }
+    }
+    if (
+      provider.models !== undefined &&
+      new Set(provider.models.map((model) => model.model_id)).size !== provider.models.length
+    ) {
+      context.addIssue({ code: "custom", path: ["models"], message: "duplicate project model id" });
+    }
+    if (
+      provider.removed_model_ids !== undefined &&
+      new Set(provider.removed_model_ids).size !== provider.removed_model_ids.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["removed_model_ids"],
+        message: "duplicate removed model id",
       });
     }
   });
-
-/**
- * 项目文档只开放已信任项目的 Skill 与完整 MCP 定义；Provider 和执行策略仍属用户层。
- */
 export const ConfigProjectDocumentSchema = z
   .object({
     schema_version: z.literal(2),
     config_revision: z.number().int().min(0).max(MAX_SAFE_INTEGER),
-    disabled_skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).default([]),
-    mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS).default([]),
+    default_access_mode: z.enum(["approval_required", "full_access"]).optional(),
+    default_provider_id: ConfigProviderIdSchema.nullable().optional(),
+    default_model_id: ConfigModelIdSchema.nullable().optional(),
+    default_reasoning_level: ConfigReasoningLevelSchema.nullable().optional(),
+    interaction: z.object({ clarification_enabled: z.boolean().optional() }).strict().optional(),
+    subagents: z
+      .object({
+        enabled: z.boolean().optional(),
+        provider_id: ConfigProviderIdSchema.nullable().optional(),
+        model_id: ConfigModelIdSchema.nullable().optional(),
+        reasoning_level: ConfigReasoningLevelSchema.nullable().optional(),
+      })
+      .strict()
+      .optional(),
+    providers: z.array(ConfigProjectProviderSchema).max(MAX_CATALOG_ITEMS).optional(),
+    disabled_skills: z.array(ConfigProjectSkillReferenceSchema).max(MAX_CATALOG_ITEMS).optional(),
+    mcp_servers: z.array(ConfigMcpServerSchema).max(MAX_CATALOG_ITEMS).optional(),
   })
   .strict()
   .superRefine((document, context) => {
-    if (new Set(document.disabled_skills).size !== document.disabled_skills.length) {
+    if (
+      document.disabled_skills !== undefined &&
+      new Set(document.disabled_skills).size !== document.disabled_skills.length
+    ) {
       context.addIssue({
         code: "custom",
         path: ["disabled_skills"],
@@ -336,9 +447,17 @@ export const ConfigProjectDocumentSchema = z
       });
     }
     if (
+      document.mcp_servers !== undefined &&
       new Set(document.mcp_servers.map((server) => server.mcp_id)).size !==
-      document.mcp_servers.length
+        document.mcp_servers.length
     ) {
       context.addIssue({ code: "custom", path: ["mcp_servers"], message: "duplicate MCP id" });
+    }
+    if (
+      document.providers !== undefined &&
+      new Set(document.providers.map((provider) => provider.provider_id)).size !==
+        document.providers.length
+    ) {
+      context.addIssue({ code: "custom", path: ["providers"], message: "duplicate Provider id" });
     }
   });

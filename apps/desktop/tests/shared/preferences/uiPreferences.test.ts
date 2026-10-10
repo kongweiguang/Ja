@@ -22,7 +22,7 @@ import {
   useUiPreferencesStore,
 } from "@/shared/preferences/uiPreferences";
 
-/** 重置当前 UI-only schema；Terminal 已迁入自己的领域持久化 adapter。 */
+/** 重置当前仅供界面使用的数据结构；Terminal 已迁入自己的领域持久化适配器。 */
 function resetPreferences(): void {
   localStorage.clear();
   useUiPreferencesStore.setState({

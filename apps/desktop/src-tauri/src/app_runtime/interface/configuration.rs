@@ -8,12 +8,12 @@
 
 use crate::app_runtime::{
     ConfigurationPatchParams, ConfigurationReadParams, ConfigurationReplaceParams,
-    ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse,
-    ConfigurationRestoreParams, CredentialDeleteParams, CredentialRevealProviderParams,
-    CredentialSetParams, RuntimeCommandError, RuntimeHost,
+    ConfigurationRequest, ConfigurationResetParams, ConfigurationResponse, CredentialDeleteParams,
+    CredentialRevealProviderParams, CredentialSetParams, RuntimeCommandError, RuntimeHost,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::fmt;
 
 pub(crate) const MAX_VERSION_BYTES: usize = 256;
@@ -83,13 +83,6 @@ pub struct ConfigResetInput {
     pub expected_version: String,
 }
 
-/// 从 Java 管理的最近完整用户快照恢复；不携带 scope、路径或配置正文，避免 WebView 扩大恢复范围。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConfigRestoreInput {
-    pub expected_version: String,
-}
-
 /// 唯一持有 Secret 字节的 Tauri DTO；刻意不实现 `Clone`、`Debug` 或 `Serialize`，command 返回后立即清空缓冲区。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -123,18 +116,18 @@ pub struct CredentialRevealProviderInput {
 }
 
 /// 稳定且脱敏的 Tauri 错误；Java 细节与 Secret 值不得越过该边界。
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsCommandError {
     pub code: &'static str,
-    pub message: &'static str,
+    pub message: Cow<'static, str>,
     pub retryable: bool,
 }
 
 impl fmt::Display for SettingsCommandError {
     /// 使用固定消息，避免解析器、路径或凭据细节泄漏。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(self.message.as_ref())
     }
 }
 
@@ -156,7 +149,7 @@ impl SettingsCommandError {
     fn invalid() -> Self {
         Self {
             code: "INVALID_PARAMS",
-            message: "settings request parameters are invalid",
+            message: Cow::Borrowed("settings request parameters are invalid"),
             retryable: false,
         }
     }
@@ -165,7 +158,7 @@ impl SettingsCommandError {
     fn unavailable() -> Self {
         Self {
             code: "SETTINGS_UNAVAILABLE",
-            message: "settings are unavailable",
+            message: Cow::Borrowed("settings are unavailable"),
             retryable: true,
         }
     }
@@ -248,26 +241,6 @@ pub async fn ja_configuration_reset(
             ConfigurationResetParams::try_new(params).map_err(SettingsCommandError::from)?,
         );
         let value = request_configuration!(&host, request, ConfigurationResponse::Reset)?;
-        validate_write_result(value)
-    })
-    .await
-    .map_err(|_| SettingsCommandError::unavailable())?
-}
-
-/// 通过专用恢复命令请求 Java 备份原文并恢复最近完整用户快照。
-#[tauri::command]
-pub async fn ja_configuration_restore(
-    input: ConfigRestoreInput,
-    state: tauri::State<'_, RuntimeHost>,
-) -> Result<Value, SettingsCommandError> {
-    validate_restore(&input)?;
-    let host = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let params = serde_json::to_vec(&input).map_err(|_| SettingsCommandError::invalid())?;
-        let request = ConfigurationRequest::Restore(
-            ConfigurationRestoreParams::try_new(params).map_err(SettingsCommandError::from)?,
-        );
-        let value = request_configuration!(&host, request, ConfigurationResponse::Restore)?;
         validate_write_result(value)
     })
     .await
@@ -428,11 +401,6 @@ fn validate_reset(input: &ConfigResetInput) -> Result<(), SettingsCommandError> 
     validate_version(&input.expected_version)
 }
 
-/// 恢复只绑定用户层 CAS；不接受可由 WebView 伪造的配置内容或工作区身份。
-fn validate_restore(input: &ConfigRestoreInput) -> Result<(), SettingsCommandError> {
-    validate_version(&input.expected_version)
-}
-
 /// 凭据只在专用 command 中校验有界、无控制字符的 secret；不解析 provider 语义，也不把 secret 复制到配置文档。
 fn validate_credential(input: &CredentialSetInput) -> Result<(), SettingsCommandError> {
     validate_credential_id(&input.credential_id)?;
@@ -486,6 +454,7 @@ fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandEr
         "effective",
         "user",
         "project",
+        "sources",
         "credentials",
         "cas",
         "diagnostics",
@@ -494,6 +463,9 @@ fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandEr
         "workspaceId",
     ];
     if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(SettingsCommandError::unavailable());
+    }
+    if !valid_configuration_sources(object.get("sources")) {
         return Err(SettingsCommandError::unavailable());
     }
     match object.get("workspaceId") {
@@ -537,6 +509,21 @@ fn validate_redacted_projection(value: Value) -> Result<Value, SettingsCommandEr
     Ok(value)
 }
 
+/// 固定来源投影的字段格式与枚举，避免未知来源数据被错误呈现为可用配置。
+fn valid_configuration_sources(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_object).is_some_and(|sources| {
+        sources.len() <= 4096
+            && sources.iter().all(|(field, source)| {
+                !field.is_empty()
+                    && field.len() <= 256
+                    && field.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                    && matches!(source.as_str(), Some("default" | "user" | "project"))
+            })
+    })
+}
+
 /// 问题是无原文的 UI 投影；Rust 在转发前固定字段闭集，防止服务端异常对象借配置通道进入 WebView。
 fn valid_configuration_issue(value: &Value) -> bool {
     let Some(issue) = value.as_object() else {
@@ -569,7 +556,7 @@ fn valid_configuration_issue(value: &Value) -> bool {
             actions.len() <= 3
                 && actions
                     .iter()
-                    .all(|action| matches!(action.as_str(), Some("edit" | "retry" | "restore")))
+                    .all(|action| matches!(action.as_str(), Some("edit" | "retry" | "repair")))
         });
     issue
         .get("id")

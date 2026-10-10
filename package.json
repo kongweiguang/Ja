@@ -1,7 +1,7 @@
 {
   "name": "ja",
   "private": true,
-  "version": "0.1.21",
+  "version": "0.2.0",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -15,6 +15,10 @@
   },
   "scripts": {
     "dev": "vite --config apps/desktop/vite.config.ts",
+    "dev:example:spring": "vite --config ja-agent/example/ja-agent-example-springboot/frontend/vite.config.ts",
+    "typecheck:example:spring": "tsc --noEmit -p ja-agent/example/ja-agent-example-springboot/frontend/tsconfig.json",
+    "test:example:spring": "vitest run apps/desktop/tests/api/spring-boot apps/desktop/tests/app/spring-boot",
+    "build:example:spring": "pnpm typecheck:example:spring && vite build --config ja-agent/example/ja-agent-example-springboot/frontend/vite.config.ts",
     "build": "pnpm typecheck && vite build --config apps/desktop/vite.config.ts",
     "preview": "vite preview --config apps/desktop/vite.config.ts",
     "tauri": "node scripts/dev/tauri.mjs",
@@ -26,6 +30,8 @@
     "typecheck": "tsc --noEmit --pretty false && tsc --noEmit -p tsconfig.node.json --pretty false",
     "check:architecture": "node scripts/check-architecture.mjs",
     "check:unused": "knip",
+    "verify:coding-agent-deadline": "node scripts/e2e/coding-agent-deadline.mjs",
+    "verify:coding-agent-webview2": "node scripts/e2e/coding-agent-webview2.mjs",
     "format:frontend": "prettier --write \"apps/desktop/**/*.{ts,tsx,css}\"",
     "format:frontend:check": "prettier --check \"apps/desktop/**/*.{ts,tsx,css}\"",
     "lint": "pnpm format:frontend:check && eslint . --max-warnings 0",

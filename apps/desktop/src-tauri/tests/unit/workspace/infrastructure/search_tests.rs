@@ -29,7 +29,7 @@ fn default_ignored_directory_policy_is_narrow() {
 #[test]
 fn ignored_relative_path_policy_matches_nested_generated_directories() {
     assert!(is_default_ignored_relative_path(
-        "app-server/target/classes/App.class"
+        "ja-agent/ja-app-server/target/classes/App.class"
     ));
     assert!(is_default_ignored_relative_path(
         r"apps\desktop\node_modules\vite\index.js"

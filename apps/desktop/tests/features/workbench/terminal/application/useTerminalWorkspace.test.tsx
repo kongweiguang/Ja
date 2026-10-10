@@ -381,7 +381,7 @@ describe("useTerminalWorkspace", () => {
     expect(order).toEqual(["input:start", "input:finish", "close"]);
   });
 
-  /** 工作区 teardown 先升起准入栅栏，再排空全部已接受窗格队尾后执行 close-all。 */
+  /** 工作区销毁流程先升起准入栅栏，再排空全部已接受窗格队尾后执行 close-all。 */
   it("waits for accepted input before native close-all", async () => {
     const inputGate = deferred<void>();
     const input = vi.fn(async () => inputGate.promise);

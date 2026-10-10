@@ -2,13 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
-import {
-  publishTaskHostEvent,
-  useTaskActivityTimeline,
-  type TaskActivity,
-  type TaskSummary,
-} from "@/features/tasks";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useTaskActivityTimeline, type TaskActivity, type TaskSummary } from "@/features/tasks";
 import { useTimelineStore } from "@/features/conversation";
 
 const task: TaskSummary = {
@@ -49,21 +44,18 @@ function activity(overrides: Partial<TaskActivity> = {}): TaskActivity {
   };
 }
 
-/** 发布路径与生产 Runtime composition 一致，测试不直接改写 hook 内部状态。 */
+/** 经 TimelineStore 的同一单调归约入口投递活动，测试不直接写 Hook 展示状态。 @author kongweiguang */
 function publish(rootThreadId: string, nextActivity: TaskActivity, nextTask = task): void {
   const taskProjection =
     nextTask.rootThreadId === rootThreadId
       ? nextTask
       : { ...nextTask, rootThreadId, parentThreadId: rootThreadId };
-  publishTaskHostEvent({
-    method: "task/activity",
-    params: {
-      rootThreadId,
-      taskThreadId: taskProjection.taskThreadId,
-      taskRevision: taskProjection.revision,
-      activity: { ...nextActivity, rootThreadId },
-      task: taskProjection,
-    },
+  useTimelineStore.getState().applyTaskActivity({
+    rootThreadId,
+    taskThreadId: taskProjection.taskThreadId,
+    taskRevision: taskProjection.revision,
+    activity: { ...nextActivity, rootThreadId },
+    task: taskProjection,
   });
 }
 
@@ -92,7 +84,6 @@ function prepareSnapshot(
         contextUsage: null,
         liveStream: null,
         taskActivities: activities,
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_tasks",
@@ -102,6 +93,7 @@ function prepareSnapshot(
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   useTimelineStore.getState().reset();
 });
 
@@ -123,11 +115,17 @@ describe("useTaskActivityTimeline", () => {
       publish(
         "thr_root",
         activity({
+          activityId: "activity_updated",
           summary: { text: "已更新" },
           activitySequence: 4,
           createdAt: "2026-09-03T08:00:10Z",
         }),
-        { ...task, startedAt: "2026-09-03T08:00:09Z", revision: 4 },
+        {
+          ...task,
+          startedAt: "2026-09-03T08:00:09Z",
+          revision: 4,
+          latestActivitySequence: 4,
+        },
       ),
     );
     expect(result.current).toHaveLength(1);
@@ -139,13 +137,14 @@ describe("useTaskActivityTimeline", () => {
     expect(result.current.map((entry) => entry.activity.activitySequence)).toEqual([4]);
 
     rerender({ rootThreadId: "thr_other", generation: 1 });
-    expect(result.current).toEqual([]);
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0]?.task.parentThreadId).toBe("thr_other");
     act(() => publish("thr_other", activity({ activityId: "activity_other" })));
     expect(result.current).toHaveLength(1);
     expect(result.current[0]?.task.rootThreadId).toBe("thr_other");
   });
 
-  it("空快照替换会清除旧活动，runtime generation 改变时不会泄漏上一代投影", () => {
+  it("runtime generation 改变时不会泄漏上一代活动", () => {
     prepareSnapshot("thr_root", [{ activity: activity(), task }]);
     const { result, rerender } = renderHook(
       ({ generation }) => useTaskActivityTimeline("thr_root", generation),
@@ -153,10 +152,13 @@ describe("useTaskActivityTimeline", () => {
     );
     expect(result.current).toHaveLength(1);
 
-    act(() => prepareSnapshot("thr_root", [], 1));
-    expect(result.current).toEqual([]);
-
-    act(() => publish("thr_root", activity({ activityId: "activity_live" })));
+    act(() =>
+      publish("thr_root", activity({ activityId: "activity_live", activitySequence: 4 }), {
+        ...task,
+        revision: 3,
+        latestActivitySequence: 4,
+      }),
+    );
     expect(result.current).toHaveLength(1);
     rerender({ generation: 2 });
     expect(result.current).toEqual([]);
@@ -210,7 +212,7 @@ describe("useTaskActivityTimeline", () => {
     act(() =>
       publish("thr_root", activity({ activityId: "activity_direct_new", activitySequence: 4 }), {
         ...task,
-        revision: 3,
+        revision: 4,
         latestActivitySequence: 4,
       }),
     );
@@ -248,11 +250,63 @@ describe("useTaskActivityTimeline", () => {
           taskThreadId: sideChild.taskThreadId,
           activitySequence: 4,
         }),
-        { ...sideChild, revision: 3, latestActivitySequence: 4 },
+        { ...sideChild, revision: 4, latestActivitySequence: 4 },
       ),
     );
     expect(result.current.map((entry) => entry.activity.activityId)).toEqual([
       "activity_side_child_live",
     ]);
+  });
+
+  /** 隐藏时没有 store listener 或 React commit；恢复后读取同一权威 owner slice。 @author kongweiguang */
+  it("隐藏期间暂停高频订阅，恢复后读取未丢失活动且不串 Thread", () => {
+    prepareSnapshot("thr_root", [{ activity: activity(), task }]);
+    let renderCount = 0;
+    let subscribedListeners = 0;
+    const originalSubscribe = useTimelineStore.subscribe.bind(useTimelineStore);
+    const subscribe = vi.spyOn(useTimelineStore, "subscribe");
+    subscribe.mockImplementation((listener) => {
+      subscribedListeners += 1;
+      const unsubscribe = originalSubscribe(listener);
+      return () => {
+        subscribedListeners -= 1;
+        unsubscribe();
+      };
+    });
+    const { result, rerender } = renderHook(
+      ({ rootThreadId, active }) => {
+        renderCount += 1;
+        return useTaskActivityTimeline(rootThreadId, 1, active);
+      },
+      { initialProps: { rootThreadId: "thr_root", active: true } },
+    );
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_child"]);
+    expect(subscribedListeners).toBe(2);
+
+    rerender({ rootThreadId: "thr_root", active: false });
+    expect(result.current).toEqual([]);
+    expect(subscribedListeners).toBe(0);
+    const hiddenRenderCount = renderCount;
+
+    act(() =>
+      publish(
+        "thr_root",
+        activity({
+          activityId: "activity_hidden",
+          activitySequence: 4,
+          createdAt: "2026-09-03T08:00:10Z",
+        }),
+        { ...task, revision: 3, latestActivitySequence: 4 },
+      ),
+    );
+    expect(renderCount).toBe(hiddenRenderCount);
+    expect(result.current).toEqual([]);
+
+    rerender({ rootThreadId: "thr_root", active: true });
+    expect(result.current.map((entry) => entry.activity.activityId)).toEqual(["activity_hidden"]);
+    expect(subscribedListeners).toBe(2);
+
+    rerender({ rootThreadId: "thr_other", active: true });
+    expect(result.current).toEqual([]);
   });
 });

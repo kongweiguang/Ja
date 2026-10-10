@@ -85,6 +85,17 @@ mod client_session_scope {
     }
 }
 
+mod native_client_identity_scope {
+    pub(crate) use crate::app_server_process::shared::NativeClientIdentity;
+
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/unit/app_server_process/shared_identity_tests.rs"
+        ));
+    }
+}
+
 mod client_session_events_scope {
     pub(crate) use crate::app_server_process::client::session::events::*;
     pub(crate) use crate::app_server_process::client::session::wire::{
@@ -199,6 +210,20 @@ mod protocol_handshake_scope {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/unit/app_server_process/protocol/handshake_tests.rs"
+        ));
+    }
+}
+
+mod protocol_usage_scope {
+    pub(crate) use crate::app_server_process::{
+        ThreadUsageSummary, parse_thread_context_usage, parse_thread_usage_summary,
+    };
+    pub(crate) use serde_json::{Value, json};
+
+    mod tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/unit/app_server_process/protocol/usage_tests.rs"
         ));
     }
 }

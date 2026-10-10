@@ -241,7 +241,113 @@ describe("FileTree pointer move", () => {
   });
 });
 
+/** 显式路径定位只展开必要祖先，忽略目录可在 Rust 定向 page 加载后正常成为选择项。 */
+describe("FileTree directory reveal", () => {
+  /** @author kongweiguang：等待受控 selection effect 生效后再断言定位结果。 */
+  it("opens ancestors, selects, and scrolls to the requested directory", async () => {
+    installViewportGeometry(400, 240);
+    const target = directory("src/nested", [file("src/nested/readme.md")]);
+    const nodes = [directory("src", [target])];
+    const { rerender } = render(<FileTree nodes={nodes} />);
+    rerender(
+      <FileTree
+        nodes={nodes}
+        selectedPath={target.path}
+        revealRequest={{ path: target.path, sequence: 1 }}
+      />,
+    );
+
+    const row = await screen.findByText("nested");
+    expect(row).toBeVisible();
+    await waitFor(() =>
+      expect(row.closest('[role="treeitem"]')).toHaveAttribute("aria-selected", "true"),
+    );
+    expect(row.closest('[role="treeitem"]')).toHaveAttribute("aria-level", "2");
+  });
+});
+
 describe("FileTree production explorer interactions", () => {
+  /**
+   * @author kongweiguang
+   * 用真实键盘在中间插入文本，约束虚拟行重绘不得替换输入节点或重置用户光标。
+   */
+  it("keeps inline rename focus and caret while typing into the middle of a name", async () => {
+    installViewportGeometry(400, 240);
+    const user = userEvent.setup();
+    const node = file("main.ts");
+    render(<FileTree nodes={[node]} selectedPath={node.path} onRename={vi.fn()} />);
+
+    const tree = await screen.findByRole("tree", { name: "工作区文件" });
+    fireEvent.keyDown(tree, { key: "F2" });
+    const input = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    expect(input).toHaveFocus();
+
+    await user.keyboard("{ArrowLeft}{ArrowLeft}{ArrowLeft}");
+    await user.keyboard("-copy");
+
+    const currentInput = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    expect(currentInput).toBe(input);
+    expect(currentInput).toHaveFocus();
+    expect(currentInput).toHaveValue("main-copy.ts");
+    expect((currentInput as HTMLInputElement).selectionStart).toBe("main-copy".length);
+  });
+
+  /**
+   * @author kongweiguang
+   * 原生组合态 Enter 可能用于确认输入法候选；只允许 composition 结束后的 Enter 提交文件名。
+   */
+  it("does not commit a Chinese inline rename while native IME composition is active", () => {
+    installViewportGeometry(400, 240);
+    const node = file("main.ts");
+    const onRename = vi.fn();
+    render(<FileTree nodes={[node]} selectedPath={node.path} onRename={onRename} />);
+
+    const tree = screen.getByRole("tree", { name: "工作区文件" });
+    fireEvent.keyDown(tree, { key: "F2" });
+    const input = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "新文件名" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+
+    expect(screen.getByRole("textbox", { name: "重命名 main.ts" })).toBe(input);
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("新文件名");
+    expect(onRename).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(input, { data: "名" });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: false });
+    expect(onRename).toHaveBeenCalledTimes(1);
+    expect(onRename).toHaveBeenCalledWith(node, "新文件名");
+  });
+
+  /**
+   * @author kongweiguang
+   * 原生组合态 Escape 可能取消候选而非文件 Rename；保留草稿直到 composition 结束再确认。
+   */
+  it("does not cancel a Chinese inline rename when Escape is used during native IME composition", () => {
+    installViewportGeometry(400, 240);
+    const node = file("main.ts");
+    const onRename = vi.fn();
+    render(<FileTree nodes={[node]} selectedPath={node.path} onRename={onRename} />);
+
+    const tree = screen.getByRole("tree", { name: "工作区文件" });
+    fireEvent.keyDown(tree, { key: "F2" });
+    const input = screen.getByRole("textbox", { name: "重命名 main.ts" });
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "新文件名" } });
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true });
+
+    expect(screen.getByRole("textbox", { name: "重命名 main.ts" })).toBe(input);
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("新文件名");
+    expect(onRename).not.toHaveBeenCalled();
+
+    fireEvent.compositionEnd(input, { data: "名" });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: false });
+    expect(onRename).toHaveBeenCalledTimes(1);
+    expect(onRename).toHaveBeenCalledWith(node, "新文件名");
+  });
+
   it("uses the measured viewport height instead of a fixed business height", async () => {
     installViewportGeometry(312, 684);
 

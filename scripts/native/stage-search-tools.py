@@ -1,12 +1,10 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Stage the pinned fd and ripgrep releases used by Ja workspace discovery.
+"""暂存 Ja 工作区发现功能使用的固定版本 fd 和 ripgrep。
 
-The runtime must never turn a missing search executable into a first-use network
-download.  This build-time adapter therefore accepts only the release assets and
-SHA-256 values recorded below, extracts them into the Tauri resource directory,
-and writes a portable manifest beside the binaries.
+运行时不能因缺少搜索可执行文件而在首次使用时联网下载。因此，此构建期适配器只接受下方记录的
+release 资产及 SHA-256 值，将其解压到 Tauri 资源目录，并在二进制文件旁写入可移植清单。
 """
 
 from __future__ import annotations

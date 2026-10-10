@@ -21,7 +21,7 @@ EXTENSION_PATTERN = re.compile(r"^\.[A-Za-z0-9]+$")
 
 
 def sha256(path: Path) -> str:
-    """Hash a real bundle artifact in chunks without loading an installer into memory."""
+    """分块计算真实安装包摘要，避免将安装器全部读入内存。"""
 
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -31,7 +31,7 @@ def sha256(path: Path) -> str:
 
 
 def artifact_entry(path: Path) -> dict[str, Any]:
-    """Describe only the portable file facts needed to reproduce a bundle checksum."""
+    """仅记录可复现安装包摘要所需的可移植文件信息。"""
 
     if not path.is_file() or path.stat().st_size <= 0:
         raise RuntimeError(f"bundle artifact is missing or empty: {path.name}")
@@ -45,7 +45,7 @@ def artifact_entry(path: Path) -> dict[str, Any]:
 
 
 def load_sidecar_manifest(path: Path, source_commit: str) -> dict[str, Any]:
-    """Verify that bundle evidence came from the copy-mode sidecar staged by this workflow."""
+    """验证安装包证据来自此工作流通过复制模式暂存的 sidecar。"""
 
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -81,7 +81,7 @@ def load_sidecar_manifest(path: Path, source_commit: str) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    """Keep evidence inputs explicit so a report cannot silently scan an unrelated directory."""
+    """明确声明证据输入，避免报告静默扫描无关目录。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle-dir", required=True, type=Path)

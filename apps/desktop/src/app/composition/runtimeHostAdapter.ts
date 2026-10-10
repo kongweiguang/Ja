@@ -14,7 +14,7 @@ import type {
   RuntimeSettingsResult,
 } from "../application/runtimePorts";
 import { publishTaskHostEvent } from "@/features/tasks";
-import { publishGoalHostEvent } from "@/features/goals";
+import { publishPlanHostEvent } from "@/features/plans";
 import { publishInteractionHostEvent, useTimelineStore } from "@/features/conversation";
 
 /**
@@ -68,7 +68,9 @@ async function queryRuntime<M extends RuntimeSettingsMethod>(
 
 /**
  * 在唯一 composition 边界把 Tauri Runtime adapter 投影为 application port。所有方法都
- * 保留原 adapter 的校验、订阅与错误语义，同时阻止 Provider 直接知道 Tauri 工厂。
+ * 保留原 adapter 的校验、订阅与错误语义；Task Activity 先归约到共享 Timeline 实体，
+ * 让隐藏视图可以暂停展示订阅而不丢事件，再分发控制器仍需消费的 Task 通知。
+ * @author kongweiguang
  */
 export function createRuntimeHostPort(
   adapter: RuntimeHostAdapter = createRuntimeHostAdapter(),
@@ -79,13 +81,15 @@ export function createRuntimeHostPort(
     stop: () => adapter.stop(),
     state: () => adapter.state(),
     storageInfo: () => adapter.storageInfo(),
+    openStorageBackup:
+      adapter.openStorageBackup === undefined ? undefined : (id) => adapter.openStorageBackup!(id),
+    retryStorage: adapter.retryStorage === undefined ? undefined : () => adapter.retryStorage!(),
     activateWorkspace: (workspaceId) => adapter.activateWorkspace(workspaceId),
     recoveryState: () => adapter.recoveryState(),
     acknowledgeRecovery: (confirmation) => adapter.acknowledgeRecovery(confirmation),
     pendingOperations: () => adapter.pendingOperations(),
     recheckPendingOperations: () => adapter.recheckPendingOperations(),
-    acknowledgePendingOperation: (clientOperationId) =>
-      adapter.acknowledgePendingOperation(clientOperationId),
+    acknowledgePendingOperation: (operationKey) => adapter.acknowledgePendingOperation(operationKey),
     subscribePendingOperations: (listener) => adapter.subscribePendingOperations(listener),
     approvalRespond: (input) => adapter.approvalRespond(input),
     turnStart: (input) => adapter.turnStart(input),
@@ -103,6 +107,8 @@ export function createRuntimeHostPort(
     subscribe: (listener) =>
       adapter.subscribe((event) => {
         if (event.kind === "task") {
+          if (event.event.method === "task/activity")
+            useTimelineStore.getState().applyTaskActivity(event.event.params);
           publishTaskHostEvent(event.event);
           return;
         }
@@ -126,33 +132,15 @@ export function createRuntimeHostPort(
         }
         if (event.kind === "plan") {
           const params = event.event.params;
-          publishGoalHostEvent({
+          publishPlanHostEvent({
             method: "plan/changed",
             planId: params.planId,
             ownerThreadId: params.ownerThreadId,
             planRevision: params.planRevision,
-            planEventSequence: params.eventSequence,
             plan: { ...params.plan, ownerThreadId: params.plan.owner.threadId },
             progress: params.progress,
-            goalRevision: 0,
             eventSequence: params.eventSequence,
             occurredAt: params.occurredAt,
-          });
-          return;
-        }
-        if (event.kind === "goal") {
-          const params = event.event.params;
-          const ownerThreadId =
-            event.event.method === "goal/changed" && event.event.params.goal.owner.kind === "thread"
-              ? event.event.params.goal.owner.threadId
-              : undefined;
-          publishGoalHostEvent({
-            method: event.event.method,
-            goalId: params.goalId,
-            goalRevision: params.goalRevision,
-            eventSequence: params.eventSequence,
-            occurredAt: params.occurredAt,
-            ...(ownerThreadId === undefined ? {} : { ownerThreadId }),
           });
           return;
         }

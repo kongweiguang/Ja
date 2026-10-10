@@ -14,9 +14,7 @@ import type { ConversationContextReference, UserContentBlock } from "../domain/u
 export interface ConversationThread {
   threadId: string;
   workspaceId: string;
-  workspaceKind: "project" | "session" | "legacy_shared";
-  legacySharedWorkspaceId: string | null;
-  activeGoalId: string | null;
+  workspaceKind: "project" | "session";
   preferences: ConversationThreadPreferences | null;
   title: string;
   status: "active" | "archived" | "deleted";
@@ -24,6 +22,7 @@ export interface ConversationThread {
   latestTurnStatus:
     | "queued"
     | "running"
+    | "waiting_input"
     | "waiting_approval"
     | "suspended"
     | "completed"
@@ -35,6 +34,27 @@ export interface ConversationThread {
   createdAt: string;
   updatedAt: string;
 }
+
+/** 分叉 identity 在首次发送前即冻结，结果未知的重试必须原样复用整组字段。 */
+export interface ConversationThreadForkInput {
+  sourceThreadId: string;
+  sourceItemId: string;
+  expectedThreadRevision: number;
+  operationKey: string;
+}
+
+/** 返回的来源三元组用于核对请求身份，目标 Thread 则可在成功创建后单独重开。 */
+export interface ConversationThreadForkResult {
+  thread: ConversationThread;
+  source: { threadId: string; itemId: string; threadRevision: number };
+}
+
+export type ConversationThreadForkRecovery =
+  | { state: "pending"; input: ConversationThreadForkInput }
+  | { state: "created"; input: ConversationThreadForkInput; result: ConversationThreadForkResult };
+
+/** 创建完成由持久恢复状态表示；动作结果只表达本次是否打开，避免两套创建状态。 */
+export type ConversationThreadForkOutcome = "opened" | "deferred" | "open_failed";
 
 /** Runtime 投影只用于判断当前 generation 是否允许恢复 authoritative snapshot。 */
 export interface ConversationRuntimeState {
@@ -93,6 +113,26 @@ export interface ConversationUsageSummary {
 export interface ConversationUsageReader {
   read(input: { threadId: string }): Promise<ConversationUsageSummary>;
 }
+
+export interface ConversationItemContentReadInput {
+  threadId: string;
+  itemId: string;
+  offsetCharacters: number;
+  limitCharacters: number;
+}
+
+export interface ConversationItemContentPage {
+  itemId: string;
+  offsetCharacters: number;
+  nextOffsetCharacters: number | null;
+  totalCharacters: number;
+  truncated: boolean;
+  content: string;
+}
+
+export type ConversationItemContentReader = (
+  input: ConversationItemContentReadInput,
+) => Promise<ConversationItemContentPage>;
 
 /**
  * Conversation 端口只包含 Thread catalog、create 和 read；workspace 打开由独立端口负责，
@@ -158,20 +198,14 @@ export interface ConversationHistoryPort {
     limit?: number;
     tail?: true;
   }): Promise<TimelineSnapshot>;
-  /** 旧测试端口可以不提供；生产按消息身份分页读取完整公开正文。 */
-  messageContentRead?: (input: {
-    threadId: string;
-    messageId: string;
-    offsetCharacters: number;
-    limitCharacters: number;
-  }) => Promise<{
-    messageId: string;
-    offsetCharacters: number;
-    nextOffsetCharacters: number | null;
-    totalCharacters: number;
-    truncated: boolean;
-    content: string;
-  }>;
+  /** 将指定已结算答复及此前历史冻结到独立 Thread。 */
+  threadFork?: (input: ConversationThreadForkInput) => Promise<ConversationThreadForkResult>;
+  /** 重载后恢复未知请求与已创建回执；绝不为同一锚点重建第二个 Thread。 */
+  recoverThreadForks?: () => Promise<readonly ConversationThreadForkRecovery[]>;
+  /** 目标 Thread 成功打开后才确认 receipt，打开失败时留给同锚点重试。 */
+  acknowledgeThreadForkOpened?: (operationKey: string) => Promise<void>;
+  /** 正文通过稳定 Item identity 分页读取；不再由 Thread 快照承载完整正文。 */
+  itemContentRead: ConversationItemContentReader;
   /** 先确认连接订阅再读权威快照，隐藏时释放订阅而不取消后台任务。 */
   threadObserve(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
   threadUnobserve(input: { threadId: string }): Promise<{ accepted: true; threadId: string }>;
@@ -232,6 +266,7 @@ export interface ConversationCancelResult {
   status:
     | "queued"
     | "running"
+    | "waiting_input"
     | "waiting_approval"
     | "suspended"
     | "completed"
@@ -444,7 +479,7 @@ export interface ConversationTurnPort {
     expectedThreadRevision: number;
     expectedRecoveryRevision: number;
     decision: "retry" | "skip";
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<{
     accepted: true;
     turnId: string;
@@ -481,7 +516,7 @@ export interface ConversationTurnPort {
   }): Promise<void>;
 }
 
-/** Plan mode 只等待独立 Plan artifact 的持久化 ACK，不读取、创建或改写 Goal 聚合。 */
+/** Plan mode 等待独立 Plan artifact 的持久化 ACK。 */
 export interface ConversationPlanCreationPort {
   create(
     ownerThreadId: string,
@@ -529,4 +564,18 @@ export type ConversationHostEvent =
       reason?: string;
     }
   | { kind: "timeline"; event: TimelineEvent }
+  | {
+      kind: "resync_required";
+      event: {
+        serverInstanceId: string;
+        eventId: string;
+        sequence: number;
+        occurredAt: string;
+        generation: number;
+        workspaceId: string;
+        threadId: string;
+        turnId: string;
+        reasonCode: "projection_failed";
+      };
+    }
   | { kind: "projection_fault"; reason: "invalid_native_event" };

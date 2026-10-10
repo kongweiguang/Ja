@@ -477,7 +477,7 @@ impl RuntimeHostHarness {
         }
     }
 
-    /// 经 JA-RPC v1 配置白名单写入测试 Profile，不开放任意 RPC 方法。
+    /// 经 JA-RPC v2 配置白名单写入测试 Profile，不开放任意 RPC 方法。
     pub fn config_request(
         &self,
         method: &'static str,
@@ -523,7 +523,6 @@ impl RuntimeHostHarness {
             ConfigurationResponse::Patch(value) => value.into_bytes(),
             ConfigurationResponse::Replace(value) => value.into_bytes(),
             ConfigurationResponse::Reset(value) => value.into_bytes(),
-            ConfigurationResponse::Restore(value) => value.into_bytes(),
             ConfigurationResponse::CredentialSet(value) => value.into_bytes(),
             ConfigurationResponse::CredentialDelete(value) => value.into_bytes(),
             ConfigurationResponse::CredentialRevealProvider(value) => value.into_bytes(),

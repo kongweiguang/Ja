@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +15,8 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const stageScript = path.join(packageRoot, "scripts", "stage.mjs");
 const sourceCommit = "a".repeat(40);
 const fixtureDirectories = new Set();
+const require = createRequire(import.meta.url);
+const { searchToolContract } = require("../bin/verify.cjs");
 
 /** 生成仅具备机器头的测试产物，验证打包准入但不执行伪造程序。 */
 function pe(machine, marker) {
@@ -25,17 +28,63 @@ function pe(machine, marker) {
   return buffer;
 }
 
-/** 让每个测试在系统临时目录隔离输入、报告和输出，不触碰仓库并行修改。 */
+/** 在系统临时目录构造闭合的原生与工具清单，避免测试借用 runner PATH 掩盖漏包。 */
 async function fixture(machine = 0x8664) {
   const directory = await mkdtemp(path.join(tmpdir(), "ja-npm-stage-"));
   fixtureDirectories.add(directory);
   const cli = path.join(directory, "ja.exe");
   const server = path.join(directory, "ja-app-server.exe");
   const report = path.join(directory, "build-report.json");
+  const searchTools = path.join(directory, "sidecars", "tools");
+  await mkdir(searchTools, { recursive: true });
   const cliBytes = pe(machine, 1);
   const serverBytes = pe(0x8664, 2);
   await writeFile(cli, cliBytes);
   await writeFile(server, serverBytes);
+  const tools = [];
+  for (const expected of searchToolContract) {
+    const binaryName = expected.name + ".exe";
+    const binaryBytes = pe(0x8664, expected.name === "fd" ? 3 : 4);
+    const binaryPath = path.join(searchTools, binaryName);
+    await writeFile(binaryPath, binaryBytes);
+    const licenses = [];
+    for (const sourceName of expected.licenseNames) {
+      const fileName = expected.name + "-" + sourceName;
+      const licenseBytes = Buffer.from("license fixture for " + fileName, "utf8");
+      const licensePath = path.join(searchTools, fileName);
+      await writeFile(licensePath, licenseBytes);
+      licenses.push({
+        sourceName,
+        relativePath: "tools/" + fileName,
+        fileName,
+        sizeBytes: licenseBytes.length,
+        sha256: createHash("sha256").update(licenseBytes).digest("hex"),
+      });
+    }
+    tools.push({
+      name: expected.name,
+      version: expected.version,
+      repository: expected.repository,
+      releaseTag: expected.releaseTag,
+      asset: expected.asset,
+      binary: {
+        relativePath: "tools/" + binaryName,
+        versionOutput: (expected.name === "rg" ? "ripgrep " : "fd ") + expected.version,
+        fileName: binaryName,
+        sizeBytes: binaryBytes.length,
+        sha256: createHash("sha256").update(binaryBytes).digest("hex"),
+      },
+      licenses,
+    });
+  }
+  await writeFile(path.join(searchTools, "tools-manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    product: "Ja",
+    stagingMode: "copy",
+    sourceCommit,
+    target: { platform: "windows", arch: "x86_64", targetTriple: "x86_64-pc-windows-msvc" },
+    tools,
+  }));
   await writeFile(report, JSON.stringify({
     schemaVersion: 1,
     product: "Ja",
@@ -51,7 +100,7 @@ async function fixture(machine = 0x8664) {
       },
     },
   }));
-  return { directory, cli, server, report, out: path.join(directory, "staged") };
+  return { directory, cli, server, report, searchTools, out: path.join(directory, "staged") };
 }
 
 /** 每项测试后移除大体积 tarball 和原生产物，避免 Windows 本机验收污染用户临时目录。 */
@@ -60,11 +109,12 @@ afterEach(async () => {
   fixtureDirectories.clear();
 });
 
-/** 故意只测打包进程边界，确保实际发布命令所用参数和错误码受验收。 */
+/** 把工具目录作为必需输入，确保 stage 不能静默退回到发布 runner 的 PATH。 */
 function runStage(input, extra = []) {
   return spawnSync(process.execPath, [stageScript,
     "--cli", input.cli,
     "--app-server", input.server,
+    "--search-tools", input.searchTools,
     "--native-report", input.report,
     "--source-commit", sourceCommit,
     "--out", input.out,
@@ -105,6 +155,20 @@ test("stage creates a complete public Windows x64 package", async () => {
   const stagedServer = await readFile(path.join(input.out, "runtime", "bin", "sidecars", "ja-app-server-x86_64-pc-windows-msvc.exe"));
   assert.deepEqual(stagedCli, await readFile(input.cli));
   assert.deepEqual(stagedServer, await readFile(input.server));
+  const expectedToolFiles = ["tools-manifest.json"];
+  for (const tool of searchToolContract) {
+    expectedToolFiles.push(tool.name + ".exe");
+    expectedToolFiles.push(...tool.licenseNames.map((name) => tool.name + "-" + name));
+  }
+  for (const fileName of expectedToolFiles) {
+    const packagePath = "runtime/bin/sidecars/tools/" + fileName;
+    const stagedPath = path.join(input.out, ...packagePath.split("/"));
+    const sourcePath = path.join(input.searchTools, fileName);
+    const stagedBytes = await readFile(stagedPath);
+    assert.deepEqual(stagedBytes, await readFile(sourcePath));
+    assert.equal(runtimeManifest.artifacts[packagePath].sizeBytes, stagedBytes.length);
+    assert.equal(runtimeManifest.artifacts[packagePath].sha256, createHash("sha256").update(stagedBytes).digest("hex"));
+  }
   const verify = spawnSync(process.execPath, [path.join(input.out, "bin", "verify.cjs")], { encoding: "utf8" });
   assert.equal(verify.status, 0, verify.stderr);
   const pack = runNpm("pack --dry-run --json", input.out);
@@ -114,6 +178,7 @@ test("stage creates a complete public Windows x64 package", async () => {
     "package.json", "README.md", "LICENSE", "NOTICE.md", "third_party/codex-LICENSE", "bin/ja.cjs", "bin/verify.cjs",
     "runtime/manifest.json", "runtime/bin/ja.exe",
     "runtime/bin/sidecars/ja-app-server-x86_64-pc-windows-msvc.exe",
+    ...expectedToolFiles.map((fileName) => "runtime/bin/sidecars/tools/" + fileName),
   ]) {
     assert.ok(packed.has(file), `npm tarball omits ${file}`);
   }
@@ -130,9 +195,24 @@ test("stage creates a complete public Windows x64 package", async () => {
   const moduleRoot = path.join(install, "node_modules", "@kongweiguang", "ja");
   assert.ok((await stat(path.join(moduleRoot, "runtime", "bin", "ja.exe"))).isFile());
   assert.ok((await stat(path.join(moduleRoot, "runtime", "bin", "sidecars", "ja-app-server-x86_64-pc-windows-msvc.exe"))).isFile());
+  assert.ok((await stat(path.join(moduleRoot, "runtime", "bin", "sidecars", "tools", "fd.exe"))).isFile());
+  assert.ok((await stat(path.join(moduleRoot, "runtime", "bin", "sidecars", "tools", "rg.exe"))).isFile());
   if (process.platform === "win32") {
     assert.ok((await stat(path.join(install, "node_modules", ".bin", "ja.cmd"))).isFile());
   }
+});
+
+/** 丢失一个 manifest 工具时必须在创建包目录前失败，防止 PATH 偶然补齐发布输入。 */
+test("stage rejects an incomplete pinned search-tool manifest", async () => {
+  const input = await fixture();
+  const manifestPath = path.join(input.searchTools, "tools-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.tools = manifest.tools.filter((tool) => tool.name !== "rg");
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const result = runStage(input);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /exactly the pinned fd and rg tools/);
+  await assert.rejects(stat(input.out), { code: "ENOENT" });
 });
 
 /** 错架构输入必须在创建发布目录前失败，防止 CI 留下貌似完整的包。 */
@@ -165,4 +245,17 @@ test("publish verification rejects a changed native executable", async () => {
   const verify = spawnSync(process.execPath, [path.join(input.out, "bin", "verify.cjs")], { encoding: "utf8" });
   assert.notEqual(verify.status, 0);
   assert.match(verify.stderr, /native artifact verification failed/);
+});
+
+/** 包内搜索二进制必须与工具 manifest 和 runtime manifest 双重摘要一致。 */
+test("publish verification rejects a changed packaged search tool", async () => {
+  const input = await fixture();
+  assert.equal(runStage(input).status, 0);
+  const stagedRg = path.join(input.out, "runtime", "bin", "sidecars", "tools", "rg.exe");
+  const changed = await readFile(stagedRg);
+  changed[100] ^= 1;
+  await writeFile(stagedRg, changed);
+  const verify = spawnSync(process.execPath, [path.join(input.out, "bin", "verify.cjs")], { encoding: "utf8" });
+  assert.notEqual(verify.status, 0);
+  assert.match(verify.stderr, /does not match its manifest/);
 });

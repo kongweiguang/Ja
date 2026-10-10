@@ -11,7 +11,7 @@ import {
   type PreviewWorkspaceLifecycle,
 } from "@/features/workbench/preview";
 import type { TerminalWorkspaceAdapter } from "@/features/workbench/terminal";
-import type { ReviewPort } from "@/features/workbench/review";
+import type { AiReviewGateway, ReviewPort } from "@/features/workbench/review";
 import type { WorkspaceProjection } from "@/features/workspace";
 import type { WorkspaceFilesHostPort } from "./workbenchFilesAdapter";
 
@@ -20,6 +20,7 @@ export type { PreviewWorkspaceLifecycle } from "@/features/workbench/preview";
 export interface JaWorkbenchAdapters {
   workspace: WorkspaceFilesHostPort;
   review: ReviewPort;
+  aiReview: AiReviewGateway;
   terminal: TerminalWorkspaceAdapter;
   preview: NativePreviewPort;
 }

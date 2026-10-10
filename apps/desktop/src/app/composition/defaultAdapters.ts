@@ -15,37 +15,81 @@ import {
 import { pickDirectory } from "@/api/tauri/dialog";
 import { createHistoryAdapter } from "@/api/tauri/history";
 import { TauriPreviewAdapter } from "@/api/tauri/preview";
-import { createReviewAdapter } from "@/api/tauri/review";
+import { createReviewAdapter, type ReviewAdapter } from "@/api/tauri/review";
 import { parseSettingsConfigurationChange, TauriSettingsAdapter } from "@/api/tauri/settings";
 import { TauriTerminalAdapter } from "@/api/tauri/terminal";
 import { createWorkspaceHostAdapter } from "@/api/tauri/workspace";
 import { nativeDropRouterFor } from "@/api/tauri/nativeDrop";
 import { defaultNativeBridge } from "@/api/tauri/runtime";
-import { createGoalAdapter } from "@/api/tauri/goals";
+import { createPlanAdapter } from "@/api/tauri/plans";
 import { createInteractionAdapter } from "@/api/tauri/interaction";
 import { createInteractionPort, subscribeInteractionHostEvents } from "@/features/conversation";
 import { createTurnArtifactAdapter, type TurnArtifactAdapter } from "@/api/tauri/turnArtifacts";
 import type { WorkspacePickerPort } from "@/features/workspace";
 import type { AttachmentPreviewPort } from "@/features/workbench/preview";
-import type { TurnReviewPort } from "@/features/workbench/review";
+import type { AiReviewGateway, TurnReviewPort } from "@/features/workbench/review";
 import type { ConversationArtifactPort, ConversationAttachmentPort } from "@/features/conversation";
 import type { JaWorkbenchAdapters } from "../useJaWorkbench";
-import { createGoalPort, subscribeGoalHostEvents } from "@/features/goals";
+import { createPlanPort, subscribePlanHostEvents } from "@/features/plans";
 
 export const DEFAULT_DESKTOP_INTEGRATIONS = createDesktopIntegrationAdapters();
+const reviewAdapter = createReviewAdapter();
+const historyAdapter = createHistoryAdapter();
 export const DEFAULT_WORKBENCH_ADAPTERS: JaWorkbenchAdapters = {
   workspace: createWorkspaceHostAdapter(),
-  review: createReviewAdapter(),
+  review: reviewAdapter,
+  aiReview: createAiReviewGateway(reviewAdapter, historyAdapter),
   terminal: new TauriTerminalAdapter(),
   preview: new TauriPreviewAdapter(),
 };
+
+/** 应用组合根把 Review 与 History 原生适配器收窄为功能契约，避免控制器依赖协议 DTO。 */
+export function createAiReviewGateway(
+  adapter: ReviewAdapter,
+  history: ReturnType<typeof createHistoryAdapter>,
+): AiReviewGateway {
+  return {
+    captureSnapshot: (input) => adapter.captureSnapshot(input),
+    startAiReview: (input) => adapter.startAiReview(input),
+    readAiReview: (input) => adapter.readAiReview(input),
+    readHistoryPage: async (input) => {
+      const page = await history.threadRead(input);
+      return {
+        threadId: page.threadId,
+        revision: page.revision,
+        turns: page.turns.map(({ turnId, status, requestedAt }) => ({
+          turnId,
+          status,
+          requestedAt,
+        })),
+        items: page.items.flatMap((item) =>
+          item.kind !== "tool_call"
+            ? []
+            : [
+                {
+                  itemId: item.itemId,
+                  turnId: item.turnId,
+                  createdAt: item.createdAt,
+                  toolName: item.toolName,
+                  status: item.presentation.status,
+                  ...(item.presentation.artifactId === undefined
+                    ? {}
+                    : { artifactId: item.presentation.artifactId }),
+                },
+              ],
+        ),
+        nextCursor: page.nextCursor,
+      };
+    },
+  };
+}
 export const DEFAULT_SETTINGS_ADAPTER = new TauriSettingsAdapter();
 /** 在 composition adapter 模块暴露类型化失效投影，避免应用组合组件接触 API/wire 模块。 */
 export const projectSettingsConfigurationChange = parseSettingsConfigurationChange;
-export const DEFAULT_HISTORY_ADAPTER = createHistoryAdapter();
-/** Goal feature 与 Task 共用唯一 Runtime 事件订阅，mutation 仍走专用 Tauri command。 */
-export const DEFAULT_GOAL_PORT = createGoalPort(createGoalAdapter(), {
-  subscribe: subscribeGoalHostEvents,
+export const DEFAULT_HISTORY_ADAPTER = historyAdapter;
+/** Plan 与 Task 共用唯一 Runtime 事件订阅，mutation 仍走类型化 Tauri command。 */
+export const DEFAULT_PLAN_PORT = createPlanPort(createPlanAdapter(), {
+  subscribe: subscribePlanHostEvents,
 });
 /** 问答动作走专用 typed adapter，事件复用唯一宿主监听器。 */
 export const DEFAULT_INTERACTION_PORT = createInteractionPort(createInteractionAdapter(), {

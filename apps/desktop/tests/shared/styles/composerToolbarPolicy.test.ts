@@ -19,8 +19,8 @@ const COMPOSER_SOURCE = readFileSync(
   ),
   "utf8",
 );
-const GOALS_SOURCE = readFileSync(
-  join(process.cwd(), "apps", "desktop", "src", "features", "goals", "ui", "goals.css"),
+const PLANS_SOURCE = readFileSync(
+  join(process.cwd(), "apps", "desktop", "src", "features", "plans", "ui", "plans.css"),
   "utf8",
 );
 
@@ -30,11 +30,11 @@ describe("Composer toolbar layout policy", () => {
     expect(COMPOSER_SOURCE).toMatch(/\.ja-composer__toolbar\s*\{[^}]*flex-wrap:\s*wrap;/u);
     expect(COMPOSER_SOURCE).toMatch(/\.ja-composer__leading\s*\{[^}]*flex:\s*0 0 auto;/u);
   });
-  it("keeps access disclosure compact and preserves the Plan or Goal label", () => {
+  it("keeps access disclosure compact and preserves the Plan label", () => {
     expect(COMPOSER_SOURCE).toMatch(
       /\.ja-composer__access-select\s*\{[^}]*width:\s*fit-content;[^}]*flex:\s*0 0 auto;[^}]*gap:\s*4px;/u,
     );
-    expect(GOALS_SOURCE).toMatch(/\.ja-composer-goal-status\s*\{[^}]*flex:\s*0 0 auto;/u);
+    expect(PLANS_SOURCE).toMatch(/\.ja-composer-plan-status\s*\{[^}]*flex:\s*0 0 auto;/u);
   });
 
   /** 文件树引用必须锁定到与普通附件相同的横向文件卡尺寸，避免 flex 把文件名压成零宽。 */

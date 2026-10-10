@@ -5,6 +5,7 @@
 
 use crate::app_runtime::RuntimeCommandError;
 use ja_runtime::app_server_process::AppServerProcessError;
+use std::borrow::Cow;
 
 impl RuntimeCommandError {
     /// 将 foundation 错误映射为稳定桌面类别与重试策略，不泄漏内部错误文本。
@@ -13,33 +14,33 @@ impl RuntimeCommandError {
             AppServerProcessError::InvalidConfig => Self::configuration(),
             AppServerProcessError::Incompatible => Self {
                 code: "PROTOCOL_INCOMPATIBLE",
-                message: "sidecar protocol is incompatible",
+                message: Cow::Borrowed("sidecar protocol is incompatible"),
                 retryable: false,
             },
             AppServerProcessError::Faulted => Self {
                 code: "RUNTIME_FAULTED",
-                message: "runtime is faulted",
+                message: Cow::Borrowed("runtime is faulted"),
                 retryable: false,
             },
             AppServerProcessError::Backoff { .. } => Self {
                 code: "RUNTIME_BACKOFF",
-                message: "runtime restart is cooling down",
+                message: Cow::Borrowed("runtime restart is cooling down"),
                 retryable: true,
             },
             AppServerProcessError::ShuttingDown => Self {
                 code: "SHUTTING_DOWN",
-                message: "runtime is shutting down",
+                message: Cow::Borrowed("runtime is shutting down"),
                 retryable: true,
             },
             AppServerProcessError::NotReady | AppServerProcessError::InvalidState => Self {
                 code: "RUNTIME_NOT_READY",
-                message: "runtime is not ready",
+                message: Cow::Borrowed("runtime is not ready"),
                 retryable: true,
             },
             AppServerProcessError::DeadlineExceeded | AppServerProcessError::ShutdownTimeout => {
                 Self {
                     code: "RUNTIME_TIMEOUT",
-                    message: "runtime operation timed out",
+                    message: Cow::Borrowed("runtime operation timed out"),
                     retryable: true,
                 }
             }
@@ -48,7 +49,7 @@ impl RuntimeCommandError {
             | AppServerProcessError::Spawn
             | AppServerProcessError::SessionClosed => Self {
                 code: "SIDECAR_CRASHED",
-                message: "sidecar process is unavailable",
+                message: Cow::Borrowed("sidecar process is unavailable"),
                 retryable: true,
             },
             AppServerProcessError::Codec(_)
@@ -57,13 +58,13 @@ impl RuntimeCommandError {
             | AppServerProcessError::QueueFull(_)
             | AppServerProcessError::QueueClosed(_)
             | AppServerProcessError::PendingLimit
-            | AppServerProcessError::RequestLedgerExhausted
+            | AppServerProcessError::RpcRequestLedgerExhausted
             | AppServerProcessError::DuplicateRequest
             | AppServerProcessError::Cancelled
             | AppServerProcessError::InvalidTimeout
             | AppServerProcessError::InvalidErrorCatalog => Self {
                 code: "RUNTIME_PROTOCOL_ERROR",
-                message: "runtime protocol operation failed",
+                message: Cow::Borrowed("runtime protocol operation failed"),
                 retryable: false,
             },
         }

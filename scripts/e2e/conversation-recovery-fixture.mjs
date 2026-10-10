@@ -71,19 +71,48 @@ function latestUserText(input) {
   return undefined;
 }
 
-/** HTTP fixture 按最后一个用户请求分类，所以无气泡的 continue 仍绑定原问题 marker。 */
+/**
+ * 仅在 user 历史里寻找最近出现的恢复场景 marker；无 marker 的后续“继续”不能覆盖原始场景身份。
+ */
+function latestKnownRecoveryMarker(input) {
+  let userTexts = [];
+  if (typeof input === "string") {
+    userTexts = [input];
+  } else if (Array.isArray(input)) {
+    userTexts = input
+      .filter((message) => message !== null && typeof message === "object" && message.role === "user")
+      .map((message) => {
+        if (typeof message.content === "string") return message.content;
+        if (!Array.isArray(message.content)) return "";
+        return message.content
+          .filter((block) => block !== null && typeof block === "object" && typeof block.text === "string")
+          .map((block) => block.text)
+          .join("\n");
+      });
+    if (userTexts.length === 0 && input.every((value) => typeof value === "string")) {
+      userTexts = [input.join("\n")];
+    }
+  }
+  let latest;
+  for (const text of userTexts) {
+    const markers = text.matchAll(/JA_RECOVERY_(TURN_\d+|[A-Z][A-Z0-9_]*)/gu);
+    for (const marker of markers) latest = marker[0];
+  }
+  return latest;
+}
+
+/** HTTP fixture 优先保留最近的 user 场景 marker；只有没有已知 marker 时才分类为通用 continue。 */
 export function requestStep(payload) {
   if (String(payload.instructions ?? "").includes("context compaction model")) return "summary";
   const input = JSON.stringify(payload.input ?? []);
   if (input.includes("<user_request>") && input.includes("<assistant_reply>")) return "title";
+  const marker = latestKnownRecoveryMarker(payload.input);
+  if (marker !== undefined) {
+    return marker.startsWith("JA_RECOVERY_TURN_") ? marker.slice("JA_RECOVERY_TURN_".length) : marker;
+  }
   const currentUserText = latestUserText(payload.input);
   if (currentUserText?.trim() === "继续") return "continue";
-  const markerText =
-    currentUserText ??
-    (typeof payload.input === "string" ? payload.input : JSON.stringify(payload.input ?? []));
-  const marker = [...markerText.matchAll(/JA_RECOVERY_(TURN_\d+|[A-Z][A-Z0-9_]*)/gu)].at(-1)?.[0];
-  if (marker === undefined) return "other";
-  return marker.startsWith("JA_RECOVERY_TURN_") ? marker.slice("JA_RECOVERY_TURN_".length) : marker;
+  return "other";
 }
 
 /**
@@ -114,14 +143,41 @@ function continuationContext(payload, step) {
   };
 }
 
+/** 只记录有界路由事实，便于诊断续答失败且不保存用户正文。 */
+function inputRoutingFacts(payload) {
+  const input = payload.input;
+  const userTexts = Array.isArray(input)
+    ? input
+        .filter((item) => item !== null && typeof item === "object" && item.role === "user")
+        .map((item) =>
+          typeof item.content === "string"
+            ? item.content
+            : Array.isArray(item.content)
+              ? item.content
+                  .filter((block) => block !== null && typeof block === "object")
+                  .map((block) => (typeof block.text === "string" ? block.text : ""))
+                  .join("\n")
+              : "",
+        )
+    : [];
+  const latestUser = userTexts.at(-1) ?? "";
+  return {
+    inputShape: Array.isArray(input) ? "messages" : typeof input,
+    userMessageCount: userTexts.length,
+    latestUserHasRecoveryMarker: /JA_RECOVERY_[A-Z0-9_]+/u.test(latestUser),
+    latestUserHasContinueMarker: latestUser.includes("JA_RECOVERY_CONTINUE"),
+    anyUserHasContinueMarker: userTexts.some((text) => text.includes("JA_RECOVERY_CONTINUE")),
+  };
+}
+
 /** 构造完整 function_call SSE，让 loopback 真窗可以检查 Tool 结果提交后的请求历史。 */
 function functionCallStream(id) {
   const item = {
     id: `fc_${id}`,
     type: "function_call",
     call_id: RECOVERY_TOOL_CALL_ID,
-    name: "shell",
-    arguments: JSON.stringify({ command: "Write-Output JA_RECOVERY_TOOL_ONCE_EXECUTED", timeout_ms: 5_000 }),
+    name: "exec_command",
+    arguments: JSON.stringify({ cmd: "Write-Output JA_RECOVERY_TOOL_ONCE_EXECUTED", timeout_ms: 5_000 }),
   };
   const response = {
     id: `resp_${id}`,
@@ -269,6 +325,7 @@ export async function startRecoveryFixture() {
         mode,
         functionCallCount,
         functionCallOutputCount,
+        inputRoutingFacts: inputRoutingFacts(payload),
         ...(step === "continue" || step === "JA_RECOVERY_CONTINUE"
           ? { continuationContext: continuationContext(payload, step) }
           : {}),

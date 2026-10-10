@@ -2,7 +2,33 @@
 // @author kongweiguang
 
 use super::*;
+use ja_runtime::app_server_process::LifecycleState;
 use uuid::Uuid;
+
+/// Exited 与 Backoff 仍持有上一代连接事实时必须映射为崩溃，避免 reload 将故障误认作初始停止。
+#[test]
+fn closed_lifecycle_states_remain_crashed_until_explicit_restart() {
+    assert_eq!(
+        RuntimeStatusKind::from_lifecycle(LifecycleState::Exited),
+        RuntimeStatusKind::Crashed
+    );
+    assert_eq!(
+        RuntimeStatusKind::from_lifecycle(LifecycleState::Backoff),
+        RuntimeStatusKind::Crashed
+    );
+    assert_eq!(
+        RuntimeStatusKind::from_lifecycle(LifecycleState::Incompatible),
+        RuntimeStatusKind::Incompatible
+    );
+    assert_eq!(
+        RuntimeStatusKind::from_lifecycle(LifecycleState::Faulted),
+        RuntimeStatusKind::Faulted
+    );
+    assert_eq!(
+        RuntimeStatusKind::from_lifecycle(LifecycleState::Ready),
+        RuntimeStatusKind::Ready
+    );
+}
 
 /// staged native resource 缺失时必须关闭失败，release app 不得静默搜索 PATH 或 JAVA_HOME。
 #[test]

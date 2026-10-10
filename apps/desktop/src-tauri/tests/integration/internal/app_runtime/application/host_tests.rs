@@ -57,27 +57,28 @@ fn constructor_preserves_four_directory_production_policy() {
         std::env::current_exe().expect("test executable"),
         args.clone(),
         home_dir,
-        data_dir,
+        data_dir.clone(),
         run_dir.clone(),
         log_dir,
     );
     let sink: EventSink = Arc::new(|_| Ok(()));
     let host = RuntimeHost::new(config, sink);
 
-    let info = host.storage_info();
-    let canonical_run_dir = fs::canonicalize(&run_dir).expect("canonical runtime directory");
-    let reported_run_dir =
+    let info = host.storage_info().expect("storage paths before backend starts");
+    let canonical_data_dir = fs::canonicalize(&data_dir).expect("canonical data directory");
+    let reported_data_dir =
         fs::canonicalize(Path::new(&info.data_path)).expect("canonical reported runtime directory");
-    assert_eq!(reported_run_dir, canonical_run_dir);
+    assert_eq!(reported_data_dir, canonical_data_dir);
     assert!(info.native_image);
     fs::remove_dir_all(root).expect("remove constructor fixture");
 }
 
-/// Runtime storage 事实必须反映固定 launch policy 与既有 durable backup，且不暴露 executable
+/// Runtime storage 事实必须反映固定 launch policy；任意同名文件不代表 Java 已保留可用备份。
+/// 投影不得暴露 executable
 /// 或 argument data。Windows 的 8.3 短路径与长路径可能指向同一目录，断言按规范化后的
 /// 文件身份比较，保留真实目录契约而不锁定操作系统的字符串表示。
 #[test]
-fn storage_info_reports_jvm_run_directory_and_backup() {
+fn storage_info_reports_data_and_log_directories_without_guessing_backup() {
     let root = std::env::temp_dir().join(format!("ja-runtime-storage-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).expect("runtime storage fixture");
     fs::write(root.join("ja.sqlite.bak"), b"backup").expect("backup fixture");
@@ -91,16 +92,16 @@ fn storage_info_reports_jvm_run_directory_and_backup() {
         sink,
     );
 
-    let info = host.storage_info();
+    let info = host.storage_info().expect("storage paths before backend starts");
 
     assert!(!info.native_image);
     let canonical_root = fs::canonicalize(&root).expect("canonical runtime storage directory");
     let reported_root =
         fs::canonicalize(Path::new(&info.data_path)).expect("canonical reported storage directory");
     assert_eq!(reported_root, canonical_root);
-    assert_eq!(info.log_path, None);
+    assert_eq!(info.log_path.as_ref().map(Path::new).map(|path| fs::canonicalize(path).expect("reported log directory")), Some(canonical_root));
     assert_eq!(info.cache_path, None);
-    assert_eq!(info.last_backup.as_deref(), Some("已生成本地备份"));
+    assert_eq!(info.last_backup, None);
     fs::remove_dir_all(root).expect("remove runtime storage fixture");
 }
 
@@ -160,7 +161,6 @@ fn workspace_poison_rejects_capability_lookup_and_reconfiguration() {
         host.open_workspace(crate::app_runtime::WorkspaceOpenInput {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             display_name: None,
-            trust: "trusted".to_owned(),
         })
         .expect_err("poisoned binding must block project configuration")
         .code,

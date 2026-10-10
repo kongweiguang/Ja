@@ -1,9 +1,12 @@
-# @author kongweiguang
+﻿# @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 param()
 
 $ErrorActionPreference = 'Stop'
+# JSONL 客户端固定 UTF-8；中文路径不得依赖宿主控制台的 OEM 代码页。
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -133,6 +136,15 @@ try {
     while (($line = [Console]::In.ReadLine()) -ne $null) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $command = $line | ConvertFrom-Json
+        if ($command.action -eq 'matches_text') {
+            # 仅验证显式复制的 fixture 文本，不输出用户原始剪贴板正文或额外修改格式。
+            $matches = Invoke-ClipboardWrite {
+                [System.Windows.Forms.Clipboard]::ContainsText() -and
+                [System.Windows.Forms.Clipboard]::GetText() -ceq [string]$command.expected
+            }
+            Write-BrokerResult @{ status = 'matches_text'; matches = [bool]$matches }
+            continue
+        }
         if ($command.action -eq 'set') {
             foreach ($resource in $fixtureResources) { $resource.Dispose() }
             $fixtureResources.Clear()

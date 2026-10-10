@@ -8,8 +8,10 @@ import {
   CircleMinus,
   CirclePause,
   CircleX,
+  Copy,
   FolderOpen,
   LoaderCircle,
+  MessageCircle,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -63,11 +65,12 @@ interface NavigationPointerMenu {
   session: number;
 }
 
-/** 实时状态与未读提醒使用同一无障碍命名入口，但终态成功不冒充持续运行状态。 */
+/** 让澄清等待与审批等待可区分，避免用户误以为等待输入需要批准。 */
 function turnStatusLabel(status: NonNullable<ThreadProjection["latestTurnStatus"]>): string {
   return {
     queued: "等待回复",
     running: "正在工作",
+    waiting_input: "等待你的输入",
     waiting_approval: "等待批准",
     suspended: "回复已暂停",
     completed: "有新回复",
@@ -77,7 +80,7 @@ function turnStatusLabel(status: NonNullable<ThreadProjection["latestTurnStatus"
 }
 
 /**
- * 实时阶段与 cancelled 状态始终可见；completed/failed 只在服务端权威未读时提示。
+ * 等待输入与等待批准采用不同图标；completed/failed 只在服务端权威未读时提示。
  * 只接收状态原子值，使 Thread revision 等无关投影变化不重建 Spinner 并重播合法的旋转动效。
  */
 const ThreadTurnStatus = memo(function ThreadTurnStatus({
@@ -94,6 +97,7 @@ const ThreadTurnStatus = memo(function ThreadTurnStatus({
   const Icon = {
     queued: LoaderCircle,
     running: LoaderCircle,
+    waiting_input: MessageCircle,
     waiting_approval: CircleAlert,
     suspended: CirclePause,
     completed: undefined,
@@ -144,7 +148,7 @@ export interface NavigationSidebarProps {
   currentThreadId?: string;
   threads: ThreadProjection[];
   historyBusy: boolean;
-  historyError?: string;
+  historyHasError: boolean;
   newConversationDisabled: boolean;
   projectBusy: boolean;
   compact: boolean;
@@ -152,10 +156,12 @@ export interface NavigationSidebarProps {
   activeAction: "workspace" | "settings";
   conversationSearchOpen: boolean;
   onNewConversation: () => void | Promise<void>;
+  onNewConversationForProject: (workspaceId: string) => void | Promise<void>;
   onSelectConversation: (threadId: string) => void | Promise<void>;
+  onEditProject: (workspaceId: string, restoreFocus: () => void) => void;
   onOpenProjectFolder: (workspaceId: string) => Promise<void>;
+  onCopyProjectPath: (workspaceId: string) => Promise<void>;
   onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
-  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
   onOpenConversationSearch: () => void;
   onRenameConversation: (threadId: string, title: string) => Promise<void>;
   onPinConversation: (threadId: string, pinned: boolean) => Promise<void>;
@@ -282,7 +288,7 @@ function TopActionButton({
   );
 }
 
-/** 独立渲染单个项目行，使选择项目不会改变历史列表的状态所有权或布局。 */
+/** 独立渲染单个项目行；stable workspaceId 让应用弹窗在响应式卸载重建后能定位相同项目。 @author kongweiguang */
 function ProjectRow({
   project,
   selected,
@@ -290,7 +296,10 @@ function ProjectRow({
   compact,
   disabled,
   onSelect,
+  onNewConversation,
+  onEditProject,
   onOpenProjectFolder,
+  onCopyProjectPath,
   onRequestClose,
 }: {
   project: NavigationProject;
@@ -299,7 +308,10 @@ function ProjectRow({
   compact: boolean;
   disabled: boolean;
   onSelect: (workspaceId: string) => void | Promise<void>;
+  onNewConversation: (workspaceId: string) => void | Promise<void>;
+  onEditProject: (workspaceId: string, restoreFocus: () => void) => void;
   onOpenProjectFolder: (workspaceId: string) => Promise<void>;
+  onCopyProjectPath: (workspaceId: string) => Promise<void>;
   onRequestClose: () => void;
 }): ReactElement {
   const displayName = project.displayName.trim() || "未命名项目";
@@ -334,8 +346,17 @@ function ProjectRow({
     if (source?.isConnected && !source.hasAttribute("disabled")) source.focus();
     else rowRef.current?.querySelector<HTMLElement>("button")?.focus();
   };
+  /** 编辑弹窗由应用级 composition 托管，关闭后仍能定位到发起它的项目行按钮。 */
+  const restoreProjectRowFocus = (): void => {
+    rowRef.current?.querySelector<HTMLElement>("button")?.focus();
+  };
   return (
-    <div ref={rowRef} onContextMenu={handleContextMenu} onKeyDown={handleKeyDown}>
+    <div
+      ref={rowRef}
+      data-workspace-id={project.workspaceId}
+      onContextMenu={handleContextMenu}
+      onKeyDown={handleKeyDown}
+    >
       <WorkspaceScopeRow
         kind="project"
         label={displayName}
@@ -363,6 +384,25 @@ function ProjectRow({
             disabled={disabled}
             onSelect={() =>
               runNavigationAction(
+                () => onNewConversation(project.workspaceId),
+                compact,
+                onRequestClose,
+              )
+            }
+          >
+            <SquarePen aria-hidden="true" />
+            新建对话
+          </MenuItem>
+          <MenuItem
+            disabled={disabled}
+            onSelect={() => onEditProject(project.workspaceId, restoreProjectRowFocus)}
+          >
+            <Pencil aria-hidden="true" />
+            编辑项目…
+          </MenuItem>
+          <MenuItem
+            onSelect={() =>
+              runNavigationAction(
                 () => onOpenProjectFolder(project.workspaceId),
                 compact,
                 onRequestClose,
@@ -370,7 +410,19 @@ function ProjectRow({
             }
           >
             <FolderOpen aria-hidden="true" />
-            在资源管理器中打开项目目录
+            在资源管理器中打开
+          </MenuItem>
+          <MenuItem
+            onSelect={() =>
+              runNavigationAction(
+                () => onCopyProjectPath(project.workspaceId),
+                false,
+                onRequestClose,
+              )
+            }
+          >
+            <Copy aria-hidden="true" />
+            复制项目路径
           </MenuItem>
         </PointerContextMenu>
       )}
@@ -422,7 +474,6 @@ function ThreadRowMenuItems({
   onRequestRename,
   onPin,
   onOpenWorkspaceFolder,
-  onOpenLegacySharedFolder,
   onArchive,
 }: {
   thread: ThreadProjection;
@@ -434,7 +485,6 @@ function ThreadRowMenuItems({
   onRequestRename: (thread: ThreadProjection) => void;
   onPin: (threadId: string, pinned: boolean) => Promise<void>;
   onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
-  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
   onArchive: (threadId: string) => Promise<void>;
 }): ReactElement {
   return (
@@ -456,21 +506,6 @@ function ThreadRowMenuItems({
         <FolderOpen aria-hidden="true" />
         打开工作文件夹
       </MenuItem>
-      {thread.legacySharedWorkspaceId == null ? null : (
-        <MenuItem
-          disabled={pending}
-          onSelect={() =>
-            runNavigationAction(
-              () => onOpenLegacySharedFolder(thread.threadId),
-              compact,
-              onRequestClose,
-            )
-          }
-        >
-          <FolderOpen aria-hidden="true" />
-          打开旧共享文件夹
-        </MenuItem>
-      )}
       <MenuItem
         disabled={pending || !canArchive}
         title={canArchive ? undefined : archiveLabel}
@@ -493,7 +528,6 @@ function HistoryRow({
   compact,
   onSelect,
   onOpenWorkspaceFolder,
-  onOpenLegacySharedFolder,
   onRequestRename,
   onPin,
   onArchive,
@@ -505,7 +539,6 @@ function HistoryRow({
   compact: boolean;
   onSelect: (threadId: string) => void | Promise<void>;
   onOpenWorkspaceFolder: (threadId: string) => Promise<void>;
-  onOpenLegacySharedFolder: (threadId: string) => Promise<void>;
   onRequestRename: (thread: ThreadProjection) => void;
   onPin: (threadId: string, pinned: boolean) => Promise<void>;
   onArchive: (threadId: string) => Promise<void>;
@@ -634,7 +667,6 @@ function HistoryRow({
               onRequestRename={onRequestRename}
               onPin={onPin}
               onOpenWorkspaceFolder={onOpenWorkspaceFolder}
-              onOpenLegacySharedFolder={onOpenLegacySharedFolder}
               onArchive={onArchive}
             />
           </MenuContent>
@@ -661,7 +693,6 @@ function HistoryRow({
             onRequestRename={onRequestRename}
             onPin={onPin}
             onOpenWorkspaceFolder={onOpenWorkspaceFolder}
-            onOpenLegacySharedFolder={onOpenLegacySharedFolder}
             onArchive={onArchive}
           />
         </PointerContextMenu>
@@ -712,8 +743,8 @@ function SectionToggle({ title, open }: { title: string; open: boolean }): React
  * 按 Codex 结构渲染侧栏，并用 props identity 隔离 Timeline 高频更新；真实目录、选择或状态变化
  * 仍正常提交，流式正文与 Tool metadata 不应让整个导航树重复渲染或重启动画。
  * 历史读取只在“最近对话”标题行保留固定尺寸的状态指示器，避免用列表占位替换既有内容，
- * 从而让跨项目恢复保持空间稳定；异常详情在状态旁按需打开并居中排版，悬停只解释原因，
- * 恢复操作仍由组合层持有。
+ * 项目目录错误保留本域重试入口；历史错误由会话通知承载，侧栏只用派生布尔阻止误报空历史。
+ * @author kongweiguang
  */
 export const NavigationSidebar = memo(function NavigationSidebar(
   props: NavigationSidebarProps,
@@ -778,17 +809,15 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                       compact={props.compact}
                       disabled={props.projectBusy}
                       onSelect={props.onSelectProject}
+                      onNewConversation={props.onNewConversationForProject}
+                      onEditProject={props.onEditProject}
                       onOpenProjectFolder={props.onOpenProjectFolder}
+                      onCopyProjectPath={props.onCopyProjectPath}
                       onRequestClose={props.onRequestClose}
                     />
                   </div>
                 ))}
               </div>
-              {props.projectCatalogLoading && props.projects.length === 0 ? (
-                <p className="ja-navigation-catalog-status" role="status">
-                  正在读取项目…
-                </p>
-              ) : null}
               {props.projectCatalogError === undefined ? null : (
                 <div className="ja-navigation-catalog-error" role="alert">
                   <span>{props.projectCatalogError}</span>
@@ -838,14 +867,7 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                 aria-label="最近对话列表"
                 aria-busy={props.historyBusy || undefined}
               >
-                {props.historyError === undefined ? null : (
-                  <p className="ja-navigation-error" role="alert">
-                    {props.historyError}
-                  </p>
-                )}
-                {!props.historyBusy &&
-                props.threads.length === 0 &&
-                props.historyError === undefined ? (
+                {!props.historyBusy && props.threads.length === 0 && !props.historyHasError ? (
                   <p className="ja-navigation-empty">还没有历史对话。</p>
                 ) : null}
                 {props.threads.map((thread) => (
@@ -856,7 +878,6 @@ export const NavigationSidebar = memo(function NavigationSidebar(
                       compact={props.compact}
                       onSelect={props.onSelectConversation}
                       onOpenWorkspaceFolder={props.onOpenWorkspaceFolder}
-                      onOpenLegacySharedFolder={props.onOpenLegacySharedFolder}
                       onRequestRename={setRenameThread}
                       onPin={props.onPinConversation}
                       onArchive={props.onArchiveConversation}

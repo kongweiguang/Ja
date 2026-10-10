@@ -1,0 +1,8 @@
+{"jsonrpc":"2.0","id":"c:workspace-id-open","method":"workspace/open","params":{"workspaceId":"ws_project_stable"}}
+{"jsonrpc":"2.0","id":"c:workspace-id-open","result":{"workspaceId":"ws_project_stable","root":"C:\\项目 原路径","displayName":"保留对话的项目","trust":"trusted","kind":"project","revision":0}}
+{"jsonrpc":"2.0","id":"c:workspace-metadata-read","method":"workspace/read","params":{"workspaceId":"ws_project_stable"}}
+{"jsonrpc":"2.0","id":"c:workspace-metadata-read","result":{"workspaceId":"ws_project_stable","root":"C:\\项目 原路径","displayName":"保留对话的项目","trust":"trusted","kind":"project","revision":0}}
+{"jsonrpc":"2.0","id":"c:workspace-edit","method":"workspace/update","params":{"workspaceId":"ws_project_stable","expectedRevision":0,"displayName":"新的 Ja 名称","cwd":"C:\\项目 新路径"}}
+{"jsonrpc":"2.0","id":"c:workspace-edit","result":{"workspaceId":"ws_project_stable","root":"C:\\项目 新路径","displayName":"新的 Ja 名称","trust":"untrusted","kind":"project","revision":1}}
+{"jsonrpc":"2.0","method":"workspace/metadata-changed","params":{"serverInstanceId":"srv_demo","eventId":"evt_workspace_metadata_1","sequence":1,"occurredAt":"2026-10-10T02:00:00Z","generation":1,"workspaceId":"ws_project_stable","revision":1}}
+{"jsonrpc":"2.0","id":"c:workspace-rename","method":"workspace/update","params":{"workspaceId":"ws_project_stable","expectedRevision":1,"displayName":"目录丢失也可改名"}}

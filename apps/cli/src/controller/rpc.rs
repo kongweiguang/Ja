@@ -4,12 +4,12 @@
 //! CLI 到 Java owner 的窄协议适配；任何请求错误都不被当作成功结果继续展示。
 
 use ja_runtime::app_server_process::{
-    AppServerProcessError, EventPump, SharedAppServerClient, SidecarConfig,
+    AppServerProcessError, EventPump, NativeClientIdentity, SharedAppServerClient, SidecarConfig,
 };
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::CliError;
@@ -19,6 +19,7 @@ const TURN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Connection {
     client: SharedAppServerClient,
+    identity: NativeClientIdentity,
     replaced: bool,
 }
 
@@ -26,19 +27,54 @@ impl Connection {
     /// 按需接入单一 Java owner；进程生命周期由共享后台拥有，CLI 退出只释放连接。
     pub fn connect_or_start() -> Result<Self, CliError> {
         let config = sidecar_config()?;
-        let client = SharedAppServerClient::connect_or_start(config, 1).map_err(connect_error)?;
+        let identity = NativeClientIdentity::new_current_process().map_err(connect_error)?;
+        let client =
+            SharedAppServerClient::connect_or_start(config, 1, &identity).map_err(connect_error)?;
         Ok(Self {
             client,
+            identity,
             replaced: false,
         })
     }
 
     /// 状态与停止操作只连接已有后台，避免只读管理命令意外启动服务。
     pub fn connect_existing() -> Result<Self, CliError> {
+        let identity = NativeClientIdentity::new_current_process().map_err(connect_error)?;
+        Self::connect_existing_with_identity(identity)
+    }
+
+    /// 同一 CLI Host 的断线恢复复用原 lifetime token，不因 WebSocket 重建另开 Owner。
+    pub fn reconnect_existing(&self) -> Result<Self, CliError> {
+        Self::connect_existing_with_identity(self.identity.clone())
+    }
+
+    /// 后台只读连接复用当前 Host 身份；连接建立也纳入读取预算，避免失联时积累后台线程。
+    pub(super) fn read_connection_factory(
+        &self,
+        timeout: Duration,
+    ) -> impl FnOnce() -> Result<Self, CliError> + Send + 'static {
+        let identity = self.identity.clone();
+        move || {
+            let mut config = sidecar_config()?;
+            config.ready_timeout = timeout;
+            let client = SharedAppServerClient::connect_existing(&config, 1, &identity)
+                .map_err(connect_error)?;
+            Ok(Self {
+                client,
+                identity,
+                replaced: false,
+            })
+        }
+    }
+
+    /// 管理连接只创建一次 Native identity；内部重连必须显式传入原身份而不走默认生成。
+    fn connect_existing_with_identity(identity: NativeClientIdentity) -> Result<Self, CliError> {
         let config = sidecar_config()?;
-        let client = SharedAppServerClient::connect_existing(&config, 1).map_err(connect_error)?;
+        let client = SharedAppServerClient::connect_existing(&config, 1, &identity)
+            .map_err(connect_error)?;
         Ok(Self {
             client,
+            identity,
             replaced: false,
         })
     }
@@ -66,7 +102,15 @@ impl Connection {
         let frame = self
             .client
             .request(method, params, timeout)
-            .map_err(|error| CliError::transport(format!("{method}: {error}")))?;
+            .map_err(|error| match error {
+                AppServerProcessError::Codec(_)
+                | AppServerProcessError::ProtocolFault
+                | AppServerProcessError::Incompatible
+                | AppServerProcessError::InvalidErrorCatalog => {
+                    CliError::protocol(format!("{method}: {error}"))
+                }
+                _ => CliError::transport(format!("{method}: {error}")),
+            })?;
         if let Some(error) = frame.error() {
             return Err(CliError::rpc(
                 error.code(),
@@ -81,36 +125,62 @@ impl Connection {
     }
 
     /// 会产生副作用的请求由客户端操作 ID 关联持久 ledger；ACK 丢失后只查询，不自动重发。
-    pub fn request_operation(
+    pub fn request_operation(&mut self, method: &str, params: Value) -> Result<Value, CliError> {
+        let id = format!("op_{}", uuid::Uuid::new_v4().simple());
+        self.request_operation_with_key(method, params, &id)
+    }
+
+    /// 发送控制器保留原操作身份供回读；review/start 在 ledger 中使用 turn/start 规范名。
+    pub(super) fn request_operation_with_key(
         &mut self,
         method: &str,
         mut params: Value,
+        id: &str,
     ) -> Result<Value, CliError> {
+        let source_thread_id = params
+            .get("sourceThreadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if !matches!(
             method,
             "turn/start"
+                | "review/start"
                 | "turn/continue"
                 | "turn/reask"
                 | "approval/respond"
                 | "turn/input/enqueue"
+                | "thread/fork"
         ) {
             return Err(CliError::protocol("该方法没有操作账本合同"));
         }
-        let id = format!("op_{}", uuid::Uuid::new_v4().simple());
+        let ledger_method = if method == "review/start" {
+            "turn/start"
+        } else {
+            method
+        };
         let object = params
             .as_object_mut()
             .ok_or_else(|| CliError::protocol("操作参数必须是对象"))?;
-        object.insert("clientOperationId".into(), Value::String(id.clone()));
+        object.insert("operationKey".into(), Value::String(id.to_owned()));
         match self.request(method, params) {
             Ok(result) => Ok(result),
             Err(error) if error.rpc_code.is_some() => Err(error),
             Err(_) => {
-                if let Ok(value) = self.lookup_operation(&id, method) {
+                if let Ok(value) = self.lookup_operation_with_source(
+                    id,
+                    ledger_method,
+                    source_thread_id.as_deref(),
+                ) {
                     return Ok(value);
                 }
-                let mut probe = Connection::connect_existing()
-                    .map_err(|_| CliError::uncertain_operation(&id))?;
-                let lookup = probe.lookup_operation(&id, method);
+                let mut probe = self
+                    .reconnect_existing()
+                    .map_err(|_| CliError::uncertain_operation(id))?;
+                let lookup = probe.lookup_operation_with_source(
+                    id,
+                    ledger_method,
+                    source_thread_id.as_deref(),
+                );
                 self.client = probe.client;
                 self.replaced = true;
                 lookup
@@ -119,10 +189,31 @@ impl Connection {
     }
 
     /// ledger 的 unknown 不证明未执行；只接受同 method 的 committed 原回执。
-    fn lookup_operation(&mut self, id: &str, method: &str) -> Result<Value, CliError> {
+    pub(super) fn lookup_operation(&mut self, id: &str, method: &str) -> Result<Value, CliError> {
+        self.lookup_operation_with_source(id, method, None)
+    }
+
+    /// Fork receipt reads are scoped to the frozen source Thread so a reused key cannot cross owners.
+    pub(super) fn lookup_operation_with_source(
+        &mut self,
+        id: &str,
+        method: &str,
+        source_thread_id: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let mut params = json!({"operationKey":id});
+        if let Some(source_thread_id) = source_thread_id {
+            params["sourceThreadId"] = Value::String(source_thread_id.to_owned());
+        }
         let lookup = self
-            .request("operation/read", json!({"clientOperationId":id}))
+            .request("operation/read", params)
             .map_err(|_| CliError::uncertain_operation(id))?;
+        if source_thread_id.is_some_and(|expected| {
+            lookup.get("threadId").and_then(Value::as_str) != Some(expected)
+        }) {
+            return Err(CliError::protocol(
+                "分叉操作账本 owner 与来源 Thread 不一致",
+            ));
+        }
         match lookup.get("status").and_then(Value::as_str) {
             Some("unknown") => Err(CliError::uncertain_operation(id)),
             Some("committed") if lookup.get("method").and_then(Value::as_str) == Some(method) => {
@@ -170,18 +261,14 @@ impl Connection {
 
     /// 只经 Java 的安全关闭协议执行 stop；force 也由 Java 校验并有界取消。
     pub fn stop_server(&mut self, force: bool) -> Result<(), CliError> {
-        if force {
-            let result = self.request("runtime/shutdown", json!({"force":true}))?;
-            if result.get("accepted").and_then(Value::as_bool) != Some(true)
-                || result.get("status").and_then(Value::as_str) != Some("shutting_down")
-            {
-                return Err(CliError::protocol("后台未确认停止"));
+        match super::server_stop::stop_server(force, |method, params| self.request(method, params))
+        {
+            Ok(()) => Ok(()),
+            Err(super::server_stop::StopServerError::Request(error)) => Err(error),
+            Err(super::server_stop::StopServerError::Unconfirmed) => {
+                Err(CliError::protocol("后台未确认停止"))
             }
-            return Ok(());
         }
-        self.client
-            .stop_server(Duration::from_secs(15))
-            .map_err(CliError::transport)
     }
 
     /// 显式连接释放与 TUI 终端恢复可并行收口，任何一端都不拥有后台执行树。
@@ -197,21 +284,29 @@ impl Connection {
     }
 }
 
-/// 握手阶段断连多见于旧后台拒绝新方法目录；给出可操作诊断且不自动结束可能仍有任务的 owner。
-fn connect_error(error: AppServerProcessError) -> CliError {
+/// 只有协议校验明确失败才判断版本不兼容；普通握手断连也可能来自宿主身份或权限校验，不能据此要求重启 owner。
+pub(super) fn connect_error(error: AppServerProcessError) -> CliError {
     if matches!(
+        error,
+        AppServerProcessError::Codec(_)
+            | AppServerProcessError::ProtocolFault
+            | AppServerProcessError::Incompatible
+            | AppServerProcessError::InvalidErrorCatalog
+    ) {
+        CliError::protocol(format!(
+            "后台协议不兼容或响应无效：{error}；请使用配套版本重启后台"
+        ))
+    } else if matches!(
         error,
         AppServerProcessError::SessionClosed | AppServerProcessError::HandshakeFailed
     ) {
-        CliError::transport(
-            "App Server 握手被关闭；可能是后台与当前 CLI 版本不匹配。请先完成活动任务，再使用配套版本重启后台",
-        )
+        CliError::transport("App Server 连接握手未完成；请检查后台日志与终端权限后重试")
     } else {
         CliError::transport(error)
     }
 }
 
-/// 与桌面共用 ~/.ja 四目录；开发调试 JAR 仅由桌面既有 JA_DEBUG_* 显式指定。
+/// 与桌面共用 JA_HOME 或默认 ~/.ja 四目录，防止端点身份与配置/数据库根分离。
 fn sidecar_config() -> Result<SidecarConfig, CliError> {
     let home = runtime_home()?;
     let data = home.join("data");
@@ -249,8 +344,22 @@ fn sidecar_config() -> Result<SidecarConfig, CliError> {
     Ok(config)
 }
 
-/// 开发/隔离验证可显式重定向整个 Ja 根；release 固定使用当前用户的真实产品目录。
+/// 正式 JA_HOME 在所有构建中重定向整个 Ja 根；非法显式值立即失败，不能静默连接默认旧后台。
 pub(super) fn runtime_home() -> Result<PathBuf, CliError> {
+    if let Some(root) = std::env::var_os("JA_HOME") {
+        let root = PathBuf::from(root);
+        if !root.is_absolute()
+            || root.parent().is_none()
+            || root
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(CliError::configuration(
+                "JA_HOME 必须是无遍历分量的非根绝对目录",
+            ));
+        }
+        return Ok(root);
+    }
     #[cfg(debug_assertions)]
     if let Some(root) = std::env::var_os("JA_E2E_RUNTIME_ROOT") {
         let root = PathBuf::from(root);
@@ -272,9 +381,14 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, CliError> {
     fs::canonicalize(path).map_err(|_| CliError::configuration("Ja 运行目录无法规范化"))
 }
 
-/// 逐层拒绝符号链接与 Windows reparse point，然后逐层创建；endpoint/token 不能被目录别名重定向。
+/// 先拒绝 traversal 再逐层检查 symlink/reparse；endpoint/token 不能被目录别名或父级路径重定向。
 pub(super) fn ensure_directory_tree(path: &Path) -> Result<(), CliError> {
-    if !path.is_absolute() || path.parent().is_none() {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
         return Err(CliError::configuration("Ja 运行目录边界无效"));
     }
     let mut missing = Vec::new();

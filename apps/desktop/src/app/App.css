@@ -1,6 +1,38 @@
 /* @author kongweiguang */
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
+.ja-project-rebind-dialog.ja-dialog-content {
+  width: min(36rem, calc(100vw - 2rem));
+  padding: 1.5rem;
+  display: grid;
+  gap: 1rem;
+}
+.ja-project-rebind-dialog > h2 {
+  margin: 0;
+  font-size: 1.125rem;
+  line-height: 1.4;
+}
+.ja-project-rebind-dialog > p {
+  margin: 0;
+  color: var(--ja-foreground-muted);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.ja-project-rebind-documents {
+  margin: 0;
+  padding-inline-start: 1.25rem;
+  max-height: min(14rem, 30vh);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+}
+.ja-project-rebind-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 * {
   box-sizing: border-box;
   scrollbar-color: var(--ja-scrollbar-thumb) var(--ja-scrollbar-track);
@@ -396,6 +428,7 @@ button {
 }
 
 .ja-conversation-body {
+  position: relative;
   display: flex;
   min-height: 0;
   flex: 1;
@@ -546,20 +579,16 @@ button {
   color: var(--ja-warning);
   font-size: var(--ja-text-control-size);
 }
+.ja-inline-status {
+  color: var(--ja-foreground-muted);
+  font-size: var(--ja-text-control-size);
+}
 .ja-recovery-card {
   margin: 0.75rem clamp(0.75rem, 3vw, 1.5rem) 0;
   padding: 0.75rem 0.85rem;
   border: 1px solid color-mix(in srgb, var(--ja-warning) 34%, var(--ja-border));
   border-radius: var(--ja-radius-md);
   background: var(--ja-warning-soft);
-}
-.ja-conversation > .ja-recovery-card,
-.ja-conversation > .ja-inline-error,
-.ja-conversation > .ja-inline-attention {
-  position: relative;
-  z-index: 4;
-  flex: 0 0 auto;
-  margin: 0.85rem 1.25rem 0;
 }
 .ja-recovery-card h2 {
   margin: 0.3rem 0 0;
@@ -630,76 +659,6 @@ button {
   content: "";
 }
 
-.ja-toaster {
-  --ja-titlebar-height: 36px;
-  width: min(356px, calc(100vw - 1.5rem));
-  max-width: calc(100vw - 1.5rem);
-  z-index: 1000;
-}
-.ja-toaster[data-sonner-toaster] [data-sonner-toast] {
-  width: min(356px, calc(100vw - 1.5rem));
-  max-width: 100%;
-  min-height: 2.75rem;
-  padding: 0.72rem 2.85rem 0.72rem 0.9rem;
-  border: 1px solid var(--ja-border-strong);
-  border-radius: var(--ja-radius-lg);
-  color: var(--ja-foreground);
-  background: color-mix(in srgb, var(--ja-surface-elevated, var(--ja-surface)) 94%, transparent);
-  box-shadow: var(--ja-shadow-floating);
-  font-size: var(--ja-text-control-size);
-  line-height: var(--ja-line-control);
-  backdrop-filter: blur(18px) saturate(1.15);
-  -webkit-backdrop-filter: blur(18px) saturate(1.15);
-}
-.ja-toaster[data-sonner-toaster] [data-description] {
-  color: var(--ja-foreground-muted);
-}
-.ja-toaster[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-close-button] {
-  top: 0.5rem;
-  right: 0.5rem;
-  left: auto;
-  width: 1.75rem;
-  height: 1.75rem;
-  padding: 0;
-  border: 1px solid var(--ja-border);
-  border-radius: 50%;
-  color: var(--ja-foreground-muted);
-  background: var(--ja-surface-muted);
-  transform: none;
-}
-.ja-toaster[data-sonner-toaster] [data-sonner-toast][data-styled="true"] [data-close-button]:hover {
-  border-color: var(--ja-border-strong);
-  color: var(--ja-foreground);
-  background: var(--ja-control-hover);
-}
-
-/* 模糊不可用或用户降低透明度时改用不透明语义表面，保证通知文字对比度且避免 GPU 模糊开销。 */
-@supports not (backdrop-filter: blur(1px)) {
-  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
-    background: var(--ja-surface-elevated, var(--ja-surface));
-  }
-}
-
-@media (prefers-reduced-transparency: reduce) {
-  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
-    background: var(--ja-surface-elevated, var(--ja-surface));
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
-  }
-}
-
-@media (max-width: 600px) {
-  .ja-toaster[data-sonner-toaster] {
-    width: calc(100vw - 1rem);
-    max-width: calc(100vw - 1rem);
-  }
-  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
-    width: 100%;
-    max-width: 100%;
-    padding-inline-end: 2.75rem;
-  }
-}
-
 @media (max-width: 704px) {
   .ja-conversation-composer-dock {
     margin-bottom: 0.6rem;
@@ -760,11 +719,6 @@ button {
   }
   .ja-conversation-empty-icon {
     filter: none;
-  }
-  .ja-toaster[data-sonner-toaster] [data-sonner-toast] {
-    border: 1px solid CanvasText;
-    background: Canvas;
-    backdrop-filter: none;
   }
   .ja-resize-handle::after {
     border-radius: 0;

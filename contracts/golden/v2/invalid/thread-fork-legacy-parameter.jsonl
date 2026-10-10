@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":"c:legacy-thread-fork","method":"thread/fork","params":{"sourceThreadId":"thr_demo","sourceTurnId":"turn_demo","expectedThreadRevision":7,"operationKey":"op_5123456789abcdef0123456789abcdef"}}

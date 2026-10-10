@@ -11,9 +11,9 @@ use crate::app_runtime::{
 };
 use crate::preview::local_file::{
     PreviewFileKind, browser_document_signature, classify_text_file, resolve_file,
-    resolve_reveal_file_path,
+    resolve_reveal_target,
 };
-use crate::preview::{PreviewErrorCode, PreviewResolveFileInput};
+use crate::preview::{PreviewErrorCode, PreviewMode, PreviewResolveFileInput};
 use crate::runtime_test_support::RuntimeHostHarness;
 use std::fs::{self, File};
 use std::io::Write;
@@ -123,19 +123,17 @@ impl RuntimeBridgePort for ConfiguredWorkspaceBridge {
         &self,
         root: PathBuf,
         display_name: String,
-        trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
-        if root != self.root || trust != "trusted" {
+        if root != self.root {
             return Err(RuntimeCommandError::invalid_params());
         }
         Ok(WorkspaceDto {
             workspace_id: "ws_preview_fixture".to_owned(),
             root: root.to_string_lossy().into_owned(),
             display_name,
-            trust,
+            trust: "untrusted".to_owned(),
             revision: 1,
             kind: WorkspaceKind::Project,
-            legacy_shared_workspace_id: None,
         })
     }
 
@@ -219,6 +217,7 @@ impl RuntimePlatformPort for ConfiguredWorkspacePlatform {
     fn storage_info(&self) -> RuntimeStorageInfo {
         RuntimeStorageInfo {
             native_image: false,
+            storage_recovery: None,
             data_path: self.root.to_string_lossy().into_owned(),
             log_path: None,
             cache_path: None,
@@ -231,15 +230,13 @@ impl RuntimePlatformPort for ConfiguredWorkspacePlatform {
         &self,
         cwd: &str,
         display_name: Option<&str>,
-        trust: &str,
     ) -> Result<WorkspaceRuntimeSource, RuntimeCommandError> {
-        if Path::new(cwd) != self.root.as_path() || trust != "trusted" {
+        if Path::new(cwd) != self.root.as_path() {
             return Err(RuntimeCommandError::invalid_params());
         }
         Ok(WorkspaceRuntimeSource {
             root: self.root.clone(),
             display_name: display_name.unwrap_or("Preview fixture").to_owned(),
-            trust: trust.to_owned(),
         })
     }
 }
@@ -253,7 +250,6 @@ fn runtime_with_configured_workspace(root: &Path) -> (RuntimeHost, String) {
         .start_and_open_workspace(WorkspaceOpenInput {
             cwd: root.to_string_lossy().into_owned(),
             display_name: Some("Preview fixture".to_owned()),
-            trust: "trusted".to_owned(),
         })
         .expect("configure workspace through Host");
     (runtime, workspace.workspace_id)
@@ -289,6 +285,7 @@ fn workspace_relative_path_resolution_uses_configured_canonical_binding() {
             workspace_id: Some(workspace_id.clone()),
             line: None,
             column: None,
+            preview_mode: PreviewMode::Editor,
         },
     )
     .expect("resolve relative workspace target");
@@ -326,6 +323,7 @@ fn absolute_text_file_resolution_returns_canonical_read_only_target() {
             workspace_id: None,
             line: Some(2),
             column: Some(3),
+            preview_mode: PreviewMode::Editor,
         },
     )
     .expect("resolve existing text");
@@ -351,14 +349,35 @@ fn absolute_text_file_resolution_returns_canonical_read_only_target() {
     assert!(resolution.workspace_relative_path.is_none());
 }
 
-/// 文件 URL 的浏览器类型再次从规范路径解析，缺失和目录均返回稳定错误分类。
+/// HTML 默认保留源码；显式 Browser 才返回 file URL，目录则返回无 URL 的独立类型。
 #[test]
-fn browser_file_resolution_and_invalid_targets_have_stable_results() {
+fn html_preview_and_directory_resolution_have_explicit_closed_kinds() {
     let fixture = temporary_file("本地 页面.html", b"<html><img src='pixel.svg'></html>");
     let runtime = runtime_host_for_absolute_resolution();
     let file_url = url::Url::from_file_path(&fixture.0)
         .expect("file URL")
         .to_string();
+    let source = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: file_url.clone(),
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("resolve HTML source");
+    assert_eq!(source.kind, PreviewFileKind::Text);
+    assert!(
+        source
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("<html>")
+    );
+    assert!(source.file_url.is_some());
+
     let browser = resolve_file(
         &runtime,
         &PreviewResolveFileInput {
@@ -366,13 +385,76 @@ fn browser_file_resolution_and_invalid_targets_have_stable_results() {
             workspace_id: None,
             line: None,
             column: None,
+            preview_mode: PreviewMode::Browser,
         },
     )
-    .expect("resolve HTML");
+    .expect("explicitly preview HTML");
     assert_eq!(browser.kind, PreviewFileKind::Browser);
     assert!(browser.content.is_none());
     assert_eq!(browser.mime_type.as_deref(), Some("text/html"));
-    assert!(browser.file_url.starts_with("file:///"));
+    assert!(
+        browser
+            .file_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file:///"))
+    );
+
+    let extensionless_html = temporary_file("document.data", b"<!doctype html><html></html>");
+    let extensionless_target = extensionless_html.0.to_string_lossy().into_owned();
+    let source = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: extensionless_target.clone(),
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("extensionless HTML source");
+    assert_eq!(source.kind, PreviewFileKind::Text);
+    let preview = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: extensionless_target,
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Browser,
+        },
+    )
+    .expect("explicit extensionless HTML preview");
+    assert_eq!(preview.kind, PreviewFileKind::Browser);
+    assert!(preview.content.is_none());
+
+    let pdf_without_extension = temporary_file("document", b"%PDF-1.7\nfixture");
+    let pdf = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: pdf_without_extension.0.to_string_lossy().into_owned(),
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("signature-recognized PDF");
+    assert_eq!(pdf.kind, PreviewFileKind::Browser);
+    assert_eq!(pdf.mime_type, None);
+
+    let opaque = temporary_file("opaque.bin", &[0, 1, 2, 0xff]);
+    let unsupported = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: opaque.0.to_string_lossy().into_owned(),
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("opaque binary is resolved but not browser-enabled");
+    assert_eq!(unsupported.kind, PreviewFileKind::Unsupported);
 
     let missing = std::env::temp_dir()
         .join(format!("ja-preview-missing-{}.txt", uuid::Uuid::new_v4()))
@@ -386,49 +468,159 @@ fn browser_file_resolution_and_invalid_targets_have_stable_results() {
                 workspace_id: None,
                 line: None,
                 column: None,
+                preview_mode: PreviewMode::Editor,
             }
         )
         .expect_err("missing target")
         .code(),
         PreviewErrorCode::FileNotFound
     );
-    assert_eq!(
-        resolve_file(
-            &runtime,
-            &PreviewResolveFileInput {
-                target: std::env::temp_dir().to_string_lossy().into_owned(),
-                workspace_id: None,
-                line: None,
-                column: None,
-            }
-        )
-        .expect_err("directory target")
-        .code(),
-        PreviewErrorCode::FileIsDirectory
-    );
+    let directory = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: std::env::temp_dir().to_string_lossy().into_owned(),
+            workspace_id: None,
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("directory target resolves without enumerating it");
+    assert_eq!(directory.kind, PreviewFileKind::Directory);
+    assert!(directory.file_url.is_none());
+    assert!(directory.content.is_none());
+    assert!(directory.read_only);
+    assert!(!directory.within_workspace);
+    let wire = serde_json::to_value(directory).expect("serialize directory resolution");
+    assert_eq!(wire["kind"], "directory");
+    assert!(wire["fileUrl"].is_null());
+    assert!(wire["workspaceRelativePath"].is_null());
 }
 
-/// Explorer 路径解析与普通点击共用 canonical/readability 边界，且不要求文本分类。
+/// 明确路径只解析被点中的 ignored 子目录，不递归扫描，并保留工作区相对定位语义。
 #[test]
-fn reveal_path_resolves_external_file_and_reports_missing_target() {
+fn nested_ignored_directory_resolves_as_workspace_directory() {
+    let workspace = temporary_directory();
+    let nested = workspace.0.join(".git").join("objects");
+    fs::create_dir_all(&nested).expect("create explicit ignored directory");
+    let (runtime, workspace_id) = runtime_with_configured_workspace(&workspace.0);
+    let resolution = resolve_file(
+        &runtime,
+        &PreviewResolveFileInput {
+            target: ".git/objects".to_owned(),
+            workspace_id: Some(workspace_id),
+            line: None,
+            column: None,
+            preview_mode: PreviewMode::Editor,
+        },
+    )
+    .expect("resolve explicitly named ignored directory");
+
+    assert_eq!(resolution.kind, PreviewFileKind::Directory);
+    assert_eq!(
+        resolution.workspace_relative_path.as_deref(),
+        Some(".git/objects")
+    );
+    assert!(resolution.within_workspace);
+    assert!(!resolution.read_only);
+    assert!(resolution.file_url.is_none());
+    assert!(resolution.content.is_none());
+}
+
+/// 尾分隔符只用于表明目录；中文与空格路径仍由 Workspace 核验且目录不得签发 file URL。
+#[test]
+fn workspace_relative_directory_targets_accept_trailing_separators() {
+    let workspace = temporary_directory();
+    let nested = workspace.0.join("web").join("图形 示例");
+    fs::create_dir_all(&nested).expect("create directory with Unicode and spaces");
+    let (runtime, workspace_id) = runtime_with_configured_workspace(&workspace.0);
+
+    for target in ["web/图形 示例/", "web\\图形 示例\\"] {
+        let resolution = resolve_file(
+            &runtime,
+            &PreviewResolveFileInput {
+                target: target.to_owned(),
+                workspace_id: Some(workspace_id.clone()),
+                line: None,
+                column: None,
+                preview_mode: PreviewMode::Editor,
+            },
+        )
+        .expect("resolve an explicitly linked directory");
+
+        assert_eq!(resolution.kind, PreviewFileKind::Directory, "{target}");
+        assert_eq!(
+            resolution.workspace_relative_path.as_deref(),
+            Some("web/图形 示例"),
+            "{target}"
+        );
+        assert!(resolution.within_workspace, "{target}");
+        assert!(!resolution.read_only, "{target}");
+        assert!(resolution.file_url.is_none(), "{target}");
+        assert!(resolution.content.is_none(), "{target}");
+    }
+
+    for target in [".", "./"] {
+        assert_eq!(
+            resolve_file(
+                &runtime,
+                &PreviewResolveFileInput {
+                    target: target.to_owned(),
+                    workspace_id: Some(workspace_id.clone()),
+                    line: None,
+                    column: None,
+                    preview_mode: PreviewMode::Editor,
+                },
+            )
+            .expect_err("dot aliases must remain rejected by the existing Workspace guard")
+            .code(),
+            PreviewErrorCode::FileTargetInvalid,
+            "{target}"
+        );
+    }
+}
+
+/// Explorer reveal 核验文件与目录且保留外部绝对路径的 UTF-8/空格 spelling。
+#[test]
+fn reveal_resolves_external_file_and_directory_targets() {
     let fixture = temporary_file("资料 空间.svg", b"<svg></svg>");
+    let directory = temporary_directory();
     let runtime = runtime_host_for_absolute_resolution();
     let input = PreviewResolveFileInput {
         target: fixture.0.to_string_lossy().into_owned(),
         workspace_id: None,
         line: None,
         column: None,
+        preview_mode: PreviewMode::Editor,
     };
+    let file_target = resolve_reveal_target(&runtime, &input).expect("reveal file target");
     assert_eq!(
-        resolve_reveal_file_path(&runtime, &input).expect("reveal target"),
+        file_target.path,
         fs::canonicalize(&fixture.0).expect("canonical fixture")
     );
+    assert_eq!(file_target.kind, crate::workspace::domain::EntryKind::File);
+
+    let directory_input = PreviewResolveFileInput {
+        target: directory.0.to_string_lossy().into_owned(),
+        ..input.clone()
+    };
+    let directory_target =
+        resolve_reveal_target(&runtime, &directory_input).expect("reveal directory target");
+    assert_eq!(
+        directory_target.path,
+        fs::canonicalize(&directory.0).expect("canonical directory")
+    );
+    assert_eq!(
+        directory_target.kind,
+        crate::workspace::domain::EntryKind::Directory
+    );
+
     let missing = PreviewResolveFileInput {
         target: format!("{}-missing", input.target),
         ..input
     };
     assert_eq!(
-        resolve_reveal_file_path(&runtime, &missing)
+        resolve_reveal_target(&runtime, &missing)
             .expect_err("missing target")
             .code(),
         PreviewErrorCode::FileNotFound
@@ -465,7 +657,7 @@ fn resolver_text_classification_reuses_workspace_decoding_rules() {
     assert!(!truncated);
 }
 
-/// 未知扩展名按字节解码；非文本普通文件仍交给 WebView2 尝试打开。
+/// 未知扩展名按字节解码；文本进入 Files，无法解码的二进制失败关闭。
 #[test]
 fn unknown_plain_text_and_binary_are_routed_by_bounded_content() {
     let text = temporary_file("README", b"a plain README without an extension");
@@ -485,7 +677,7 @@ fn unknown_plain_text_and_binary_are_routed_by_bounded_content() {
     let (kind, content, truncated) =
         classify_text_file(File::open(&binary.0).expect("open binary"), 4)
             .expect("classify binary");
-    assert_eq!(kind, PreviewFileKind::Browser);
+    assert_eq!(kind, PreviewFileKind::Unsupported);
     assert!(content.is_none());
     assert!(!truncated);
 

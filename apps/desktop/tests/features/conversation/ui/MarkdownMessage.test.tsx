@@ -16,7 +16,7 @@ describe("MarkdownMessage destinations", () => {
       <MarkdownMessage content="[custom file](./asset.scene#L12C3)" onOpenFile={onOpenFile} />,
     );
 
-    const button = screen.getByRole("button", { name: "在 Ja 中打开文件 ./asset.scene" });
+    const button = screen.getByRole("button", { name: "在 Ja 中打开路径 ./asset.scene" });
     expect(button).toHaveAttribute("data-file-reference", "./asset.scene");
     expect(button.closest("a")).toBeNull();
     await userEvent.click(button);
@@ -34,15 +34,15 @@ describe("MarkdownMessage destinations", () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "在 Ja 中打开文件 ./文档 空间.txt" }));
+    await userEvent.click(screen.getByRole("button", { name: "在 Ja 中打开路径 ./文档 空间.txt" }));
     await userEvent.click(
-      screen.getByRole("button", { name: "在 Ja 中打开文件 C:/Projects/测试 目录/a b.svg" }),
+      screen.getByRole("button", { name: "在 Ja 中打开路径 C:/Projects/测试 目录/a b.svg" }),
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "在 Ja 中打开文件 C:/Projects/测试 目录/main.ts" }),
+      screen.getByRole("button", { name: "在 Ja 中打开路径 C:/Projects/测试 目录/main.ts" }),
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "在 Ja 中打开文件 \\\\server\\share\\测试 文档.md" }),
+      screen.getByRole("button", { name: "在 Ja 中打开路径 \\\\server\\share\\测试 文档.md" }),
     );
     expect(onOpenFile).toHaveBeenNthCalledWith(
       1,
@@ -106,7 +106,7 @@ describe("MarkdownMessage destinations", () => {
     const path = String.raw`C:\repo\src\App.tsx`;
     render(<MarkdownMessage content={`Open \`${path}:12:3\`.`} onOpenFile={onOpenFile} />);
 
-    const button = screen.getByRole("button", { name: `在 Ja 中打开文件 ${path}` });
+    const button = screen.getByRole("button", { name: `在 Ja 中打开路径 ${path}` });
     await userEvent.click(button);
     expect(onOpenFile).toHaveBeenCalledWith({ path, line: 12, column: 3 }, button);
   });
@@ -121,8 +121,8 @@ describe("MarkdownMessage destinations", () => {
         onOpenFile={onOpenFile}
       />,
     );
-    const explicit = screen.getByRole("button", { name: "在 Ja 中打开文件 ./中文 文件.txt" });
-    const inline = screen.getByRole("button", { name: `在 Ja 中打开文件 ${path}` });
+    const explicit = screen.getByRole("button", { name: "在 Ja 中打开路径 ./中文 文件.txt" });
+    const inline = screen.getByRole("button", { name: `在 Ja 中打开路径 ${path}` });
     expect(explicit).toHaveAttribute("title", expect.stringContaining("Ctrl+点击"));
     fireEvent.click(explicit, { ctrlKey: true });
     fireEvent.click(inline, { ctrlKey: true });
@@ -135,14 +135,32 @@ describe("MarkdownMessage destinations", () => {
     expect(onOpenFile).toHaveBeenNthCalledWith(2, { path, line: 3 }, inline, "explorer");
   });
 
+  /** HTML 才提供显式 Browser 动作；普通 click 始终留给 Ja 的路径解析与文件 Tab。 */
+  it("offers browser preview only from the HTML path context menu", async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn();
+    render(
+      <MarkdownMessage content="[页面](./页面.xhtml) [图片](./地图.svg)" onOpenFile={onOpenFile} />,
+    );
+
+    const html = screen.getByRole("button", { name: "在 Ja 中打开路径 ./页面.xhtml" });
+    fireEvent.contextMenu(html, { clientX: 20, clientY: 30 });
+    await user.click(await screen.findByRole("menuitem", { name: "在浏览器中预览" }));
+    expect(onOpenFile).toHaveBeenCalledWith({ path: "./页面.xhtml" }, html, "browser");
+
+    const svg = screen.getByRole("button", { name: "在 Ja 中打开路径 ./地图.svg" });
+    fireEvent.contextMenu(svg, { clientX: 40, clientY: 50 });
+    expect(screen.queryByRole("menuitem", { name: "在浏览器中预览" })).not.toBeInTheDocument();
+  });
+
   /** 键盘用户获得同等的原生显示动作，普通 Enter 仍只打开 Ja 文件页。 */
   it("routes Ctrl+Enter through the Explorer path without also opening a Ja tab", async () => {
     const onOpenFile = vi.fn();
     render(
       <MarkdownMessage content="[查看](./文档.txt) 和 `./旧文档.txt`" onOpenFile={onOpenFile} />,
     );
-    const explicit = screen.getByRole("button", { name: "在 Ja 中打开文件 ./文档.txt" });
-    const inline = screen.getByRole("button", { name: "在 Ja 中打开文件 ./旧文档.txt" });
+    const explicit = screen.getByRole("button", { name: "在 Ja 中打开路径 ./文档.txt" });
+    const inline = screen.getByRole("button", { name: "在 Ja 中打开路径 ./旧文档.txt" });
     expect(explicit).toHaveAttribute("aria-keyshortcuts", "Control+Enter");
     expect(inline).toHaveAttribute("aria-description", expect.stringContaining("Ctrl+Enter"));
     explicit.focus();

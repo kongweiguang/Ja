@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -107,7 +107,7 @@ async function writeIsolatedHome(homeRoot) {
  * 为 Tauri 继承生产窗口事实，只替换 devUrl、隔离 identifier 与本轮 CSP；隐藏且不聚焦窗口，
  * 让 CDP 真窗验收不抢占操作者桌面，同时保留真实 Tauri/WebView2 渲染和原生 IPC。
  */
-async function writeTauriOverlay(runtimeRoot, frontendPort) {
+export async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const [base, windows] = await Promise.all([
     readFile(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8").then(
       JSON.parse,
@@ -128,7 +128,11 @@ async function writeTauriOverlay(runtimeRoot, frontendPort) {
   const config = {
     ...base,
     identifier: `io.github.kongweiguang.ja.side_chat_e2e_${frontendPort}`,
-    build: { ...base.build, devUrl: origin, beforeDevCommand: base.build.beforeDevCommand },
+    build: {
+      ...base.build,
+      devUrl: origin,
+      beforeDevCommand: { ...base.build.beforeDevCommand, cwd: repoRoot },
+    },
     app: {
       ...base.app,
       windows: [window],
@@ -320,7 +324,10 @@ async function primeWebViewProfile(
       }
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
     }
-    if (!ready) throw new Error("隔离 WebView2 profile 未在期限内完成预热");
+    if (!ready) {
+      const output = launch.output.slice(-4).join("\n");
+      throw new Error(`隔离 WebView2 profile 未在期限内完成预热${output ? `：\n${output}` : ""}`);
+    }
   } catch (error) {
     failure = error;
   } finally {
@@ -332,12 +339,23 @@ async function primeWebViewProfile(
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
 }
 
-/** 启动本轮唯一 launcher root；环境绑定隔离 profile、Java 25 与专属 Cargo target。 */
-function startTauri(directories, frontendPort, cdpPort, configPath, java, jar, targetDirectory) {
-  const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
-  const hostUserProfile = process.env.USERPROFILE ?? process.env.HOME ?? "";
+/**
+ * 构造隔离 Tauri 子进程环境，并清除 Windows 大小写重复的 Path 键，
+ * 确保更新后的 PATH 与 Java、pnpm 和宿主 Cargo 工具链使用同一搜索路径。
+ */
+export function buildTauriEnvironment({
+  directories,
+  frontendPort,
+  cdpPort,
+  java,
+  jar,
+  targetDirectory,
+  baseEnvironment = process.env,
+}) {
+  const inheritedPath = baseEnvironment.PATH ?? baseEnvironment.Path ?? "";
+  const hostUserProfile = baseEnvironment.USERPROFILE ?? baseEnvironment.HOME ?? "";
   const env = {
-    ...process.env,
+    ...baseEnvironment,
     APPDATA: directories.appdata,
     LOCALAPPDATA: directories.localappdata,
     USERPROFILE: directories.settings,
@@ -346,8 +364,9 @@ function startTauri(directories, frontendPort, cdpPort, configPath, java, jar, t
     JA_E2E_DEV_PORT: String(frontendPort),
     VITE_JA_E2E_PROJECT_PATH: directories.workspace,
     CARGO_TARGET_DIR: targetDirectory,
-    CARGO_HOME: process.env.CARGO_HOME ?? join(hostUserProfile, ".cargo"),
-    RUSTUP_HOME: process.env.RUSTUP_HOME ?? join(hostUserProfile, ".rustup"),
+    CARGO_HOME: baseEnvironment.CARGO_HOME ?? join(hostUserProfile, ".cargo"),
+    RUSTUP_HOME: baseEnvironment.RUSTUP_HOME ?? join(hostUserProfile, ".rustup"),
+    TAURI_DEV_HOST: "127.0.0.1",
     JAVA_HOME: dirname(dirname(java)),
     JA_JAVA25_HOME: dirname(dirname(java)),
     JA_E2E_JAVA_HOME: dirname(dirname(java)),
@@ -358,6 +377,20 @@ function startTauri(directories, frontendPort, cdpPort, configPath, java, jar, t
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `${edgeDebugArguments}${cdpPort}`,
     PATH: [dirname(java), inheritedPath].filter(Boolean).join(";"),
   };
+  delete env.Path;
+  return env;
+}
+
+/** 启动本轮唯一 launcher root；环境绑定隔离 profile、Java 25 与专属 Cargo target。 */
+function startTauri(directories, frontendPort, cdpPort, configPath, java, jar, targetDirectory) {
+  const env = buildTauriEnvironment({
+    directories,
+    frontendPort,
+    cdpPort,
+    java,
+    jar,
+    targetDirectory,
+  });
   const command = process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe";
   // cmd.exe 的 /s /c 在内部命令和路径都带引号时需要最外层引号，避免首个路径被剥离。
   const line = `""pnpm.cmd" tauri dev --no-watch --config "${configPath}""`;
@@ -470,7 +503,7 @@ async function resolveJavaAndJar() {
     process.env.JA_E2E_SIDE_CHAT_APP_SERVER_JAR?.trim() ||
       process.env.JA_E2E_APP_SERVER_JAR?.trim() ||
       process.env.JA_DEBUG_JAR?.trim() ||
-      join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+      join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar"),
   );
   await access(java);
   await access(jar);
@@ -603,6 +636,25 @@ async function runPhase(
   if (failure !== undefined) throw failure;
 }
 
+/**
+ * 正常退出必须删除目标侧聊及隔离库中的全部临时标记；持久 Thread 可以继续存在。
+ * V1 将临时生命周期内联到 Thread，不能借旧独立表制造已清理的假象。
+ */
+export function assertNormalExitSideChatsPurged(database, sideThreadId) {
+  if (typeof sideThreadId !== "string" || sideThreadId.length === 0)
+    throw new Error("正常退出缺少存活侧聊身份");
+  const remaining = database
+    .prepare("SELECT COUNT(*) AS count FROM ja_conversation_thread WHERE thread_id=?")
+    .get(sideThreadId);
+  const markers = database
+    .prepare(
+      "SELECT COUNT(*) AS count FROM ja_conversation_thread WHERE temporary_lifecycle_state IS NOT NULL",
+    )
+    .get();
+  if (remaining.count !== 0 || markers.count !== 0)
+    throw new Error("正常退出未清除存活临时侧聊");
+}
+
 /** 创建隔离目录、预热 profile、串行执行 initial/restart，并收口本轮真实进程。 */
 async function main() {
   if (process.platform !== "win32") throw new Error("侧聊 runner 仅支持 Windows 11");
@@ -669,13 +721,7 @@ async function main() {
       readOnly: true,
     });
     try {
-      if (!restart.normalExitSideThreadId) throw new Error("正常退出缺少存活侧聊身份");
-      const remaining = database
-        .prepare("SELECT COUNT(*) AS count FROM threads WHERE thread_id=?")
-        .get(restart.normalExitSideThreadId);
-      const markers = database.prepare("SELECT COUNT(*) AS count FROM temporary_side_chats").get();
-      if (remaining.count !== 0 || markers.count !== 0)
-        throw new Error("正常退出未清除存活临时侧聊");
+      assertNormalExitSideChatsPurged(database, restart.normalExitSideThreadId);
     } finally {
       database.close();
     }
@@ -691,4 +737,6 @@ async function main() {
   if (exitCode !== 0) process.exitCode = exitCode;
 }
 
-await main();
+const invokedPath =
+  process.argv[1] === undefined ? undefined : pathToFileURL(resolve(process.argv[1])).href;
+if (invokedPath === import.meta.url) await main();

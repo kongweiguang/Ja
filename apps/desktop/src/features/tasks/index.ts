@@ -11,6 +11,7 @@ export type {
   TaskResumePort,
   TaskThreadRenamePort,
   TaskTranscriptPort,
+  TaskTranscriptSnapshot,
   TaskPreferencesPort,
 } from "./application/ports";
 export { publishTaskHostEvent, subscribeTaskHostEvents } from "./application/taskEventBus";

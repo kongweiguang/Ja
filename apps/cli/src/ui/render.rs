@@ -1,28 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
-use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ratatui::backend::Backend;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph, Widget};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
-use super::markdown::render_markdown;
+use super::composer::input_visual_lines;
+use super::markdown::{code_label_line, render_code_lines, render_markdown};
 use super::model::{
-    InteractionQuestionKind, PendingPrompt, TimelineEntry, TimelineKind, TimelineStatus, TurnState,
-    UiChoice,
+    InteractionQuestionKind, PendingPrompt, StreamPresentation, TimelineEntry, TimelineKind,
+    TimelineStatus, TurnState, UiChoice,
 };
 use super::state::{
     ChoiceKind, DetailScroll, Panel, UiState, command_description, command_label, matching_commands,
 };
+use super::transcript::TranscriptBlock;
+use super::usage::usage_line;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const MUTED: Color = Color::Rgb(136, 136, 150);
+const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 40, 43);
+const COMPOSER_FOREGROUND: Color = Color::Rgb(238, 239, 241);
 const MAX_SELECTOR_ITEMS: usize = 8;
 pub(super) const WORKING_INDICATOR_INTERVAL: Duration = Duration::from_millis(240);
 const WORKING_INLINE_HINT_MIN_WIDTH: usize = 32;
@@ -34,7 +37,7 @@ struct SelectionRow {
     tag: Option<String>,
 }
 
-/// 仿照 Pi 编辑器与 Codex 命令列表，把候选接在输入框下方；对话保持原终端滚动历史。
+/// 正文与底部交互区共享唯一几何计划；正文追加和滚动不会改变 Composer 的行坐标。
 pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
     let Some(plan) = render_plan(area, state) else {
@@ -43,48 +46,61 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(plan.leading_height),
             Constraint::Length(plan.history_height),
-            Constraint::Length(plan.welcome_gap_height),
+            Constraint::Length(plan.spacer_height),
             Constraint::Length(plan.first_height),
             Constraint::Length(plan.second_height),
             Constraint::Length(plan.footer_height),
         ])
         .split(area);
-    if plan.history_height > 0 {
-        render_history(frame, regions[1], &plan.history);
-    }
+    let mut transcript = state.transcript.borrow_mut();
+    transcript.set_intro(state.should_show_welcome().then(|| {
+        let lines = welcome_lines(state, plan.width);
+        let source = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        TranscriptBlock {
+            key: "welcome".into(),
+            source_key: "welcome".into(),
+            source_start: 0,
+            source,
+            lines: wrap_transcript_lines(lines, plan.width),
+        }
+    }));
+    transcript.update_layout(
+        area.width,
+        regions[0],
+        regions[1],
+        transcript_active_blocks(state, plan.width),
+    );
+    transcript.render(frame);
+    drop(transcript);
     if plan.pending {
         if plan.panel_height > 0 {
-            render_pending_inline(frame, regions[3], state);
+            render_pending_inline(frame, regions[2], state);
         }
         if plan.show_composer {
-            render_composer(
-                frame,
-                regions[4],
-                state,
-                plan.width,
-                &plan.composer_lines,
-                plan.visible_composer_lines,
-            );
+            render_composer(frame, regions[3], state, &plan);
         }
     } else if plan.full_choice {
-        render_choice_view(frame, regions[3], state);
+        render_choice_view(frame, regions[2], state);
+    } else if plan.selector_above_composer || plan.help {
+        if plan.help {
+            render_help_panel(frame, regions[2], state);
+        } else {
+            render_selector(frame, regions[2], state);
+        }
+        render_composer(frame, regions[3], state, &plan);
     } else {
-        render_composer(
-            frame,
-            regions[3],
-            state,
-            plan.width,
-            &plan.composer_lines,
-            plan.visible_composer_lines,
-        );
+        render_composer(frame, regions[2], state, &plan);
         if plan.panel_height > 0 {
-            render_selector(frame, regions[4], state);
+            render_selector(frame, regions[3], state);
         }
     }
     if plan.footer_height > 0 {
-        render_footer(frame, regions[5], state);
+        render_footer(frame, regions[4], state);
     }
     render_panel(frame, area, state);
 }
@@ -95,42 +111,112 @@ struct RenderPlan {
     visible_composer_lines: usize,
     pending: bool,
     full_choice: bool,
+    selector_above_composer: bool,
+    help: bool,
     show_composer: bool,
-    composer_height: u16,
+    vertical_padding: u16,
     panel_height: u16,
     footer_height: u16,
-    history: Vec<Line<'static>>,
     history_height: u16,
-    leading_height: u16,
-    welcome_gap_height: u16,
+    spacer_height: u16,
     first_height: u16,
     second_height: u16,
 }
 
-/** 共享渲染与视口测量的同一份几何预算，避免动态高度偏离真实控件布局。 */
+/** 先固定编辑与必要反馈预算，再分配正文；内容长度与浏览状态不参与底部坐标计算。 */
 fn render_plan(area: Rect, state: &UiState) -> Option<RenderPlan> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    let width = area.width.max(4) as usize;
+    let width = area.width as usize;
     let composer_lines = state.composer().visual_lines(width);
-    let max_composer_lines = (area.height as usize / 3).max(1);
+    let max_composer_lines = (state.terminal_height() / 3)
+        .max(1)
+        .min(area.height.saturating_sub(2).max(1) as usize);
     let visible_composer_lines = composer_lines.len().min(max_composer_lines);
     let pending = matches!(state.panel(), Some(Panel::Pending));
+    let help = matches!(state.panel(), Some(Panel::Help { .. }));
+    let help_content_height = if help {
+        help_panel_content_height(width)
+    } else {
+        0
+    };
     let full_choice = matches!(
         state.panel(),
         Some(Panel::Choices { kind, .. }) if !matches!(kind, ChoiceKind::Files | ChoiceKind::Skills)
     );
+    let selector_above_composer = matches!(
+        state.panel(),
+        Some(Panel::Choices {
+            kind: ChoiceKind::Files | ChoiceKind::Skills,
+            ..
+        })
+    );
     let show_composer = (!pending && !full_choice) || (pending && pending_editor_visible(state));
+    let required_panel_room = if pending || full_choice {
+        5
+    } else if help {
+        help_content_height
+    } else {
+        selector_rows(state)
+            .map(|(rows, _)| rows.len().min(4) as u16)
+            .unwrap_or(0)
+    };
+    let minimum_panel = if help {
+        help_content_height.min(2)
+    } else {
+        required_panel_room
+    };
+    // 优先保留编辑、面板最小操作区和双行反馈，再为回复尾部及返回入口预留最多五行。
+    // 极矮窗缩减正文预算；同尺寸下预算不随回复增长或 Turn 终态变化。
+    let history_floor = 5u16.min(
+        area.height.saturating_sub(
+            u16::from(show_composer)
+                .saturating_mul(visible_composer_lines as u16)
+                .saturating_add(minimum_panel)
+                .saturating_add(2),
+        ),
+    );
+    let minimum_interaction = u16::from(show_composer)
+        .saturating_mul(visible_composer_lines as u16)
+        .saturating_add(minimum_panel)
+        .saturating_add(history_floor);
+    let footer_height = if state.snapshot().thread_id.is_some()
+        && area.height >= minimum_interaction.saturating_add(3)
+    {
+        3
+    } else if area.height == 1 {
+        u16::from(!show_composer)
+    } else {
+        area.height.saturating_sub(1).min(2)
+    };
+    let vertical_padding = u16::from(
+        area.height
+            .saturating_sub(footer_height)
+            .saturating_sub(visible_composer_lines as u16)
+            .saturating_sub(required_panel_room)
+            .saturating_sub(history_floor)
+            >= 2,
+    );
     let composer_height = if show_composer {
-        (visible_composer_lines as u16 + 1).min(area.height)
+        (visible_composer_lines as u16 + vertical_padding * 2)
+            .min(area.height.saturating_sub(footer_height))
     } else {
         0
     };
-    let footer_height = u16::from(area.height >= 2);
     let panel_budget = area.height.saturating_sub(composer_height + footer_height);
     let mut panel_height = if pending {
         panel_budget.min(8)
+    } else if help {
+        // 帮助至少保留标题与一行正文；其余空间先留给活动尾部，短窗仍可滚动到全部按键。
+        let reserved_history = if state.snapshot().turn_state == TurnState::Working {
+            history_floor.min(panel_budget.saturating_sub(2))
+        } else {
+            0
+        };
+        panel_budget
+            .saturating_sub(reserved_history)
+            .min(help_content_height)
     } else if full_choice {
         selector_rows(state)
             .map(|(rows, _)| rows.len().min(8).saturating_add(3) as u16)
@@ -146,38 +232,19 @@ fn render_plan(area: Rect, state: &UiState) -> Option<RenderPlan> {
             .min(panel_budget)
     };
     let interaction_room = area.height.saturating_sub(composer_height + footer_height);
-    let card_height = if width < 20 { 1 } else { 7 };
-    let panel_floor = if panel_height == 0 {
-        0
-    } else if pending || full_choice {
-        5
-    } else {
-        4
-    };
-    let show_welcome = shows_welcome(state) && interaction_room >= card_height + panel_floor;
-    if show_welcome {
-        panel_height = panel_height.min(interaction_room.saturating_sub(card_height));
-    }
+    panel_height = panel_height.min(interaction_room.saturating_sub(history_floor));
     let history_budget = area
         .height
         .saturating_sub(composer_height + panel_height + footer_height);
-    let show_welcome_tip = show_welcome && width >= 40 && history_budget >= card_height + 3;
-    let history = history_lines(state, width, show_welcome, show_welcome_tip);
-    let history_height = u16::try_from(history.len())
-        .unwrap_or(u16::MAX)
-        .min(history_budget);
-    let spacer_height = history_budget.saturating_sub(history_height);
-    let (leading_height, welcome_gap_height) = if show_welcome {
-        (0, spacer_height)
-    } else {
-        (spacer_height, 0)
-    };
-    let first_height = if pending || full_choice {
+    let spacer_height = u16::from(history_budget >= 2);
+    let history_height = history_budget.saturating_sub(spacer_height);
+    let panel_before_composer = pending || full_choice || selector_above_composer || help;
+    let first_height = if panel_before_composer {
         panel_height
     } else {
         composer_height
     };
-    let second_height = if pending || full_choice {
+    let second_height = if panel_before_composer {
         composer_height
     } else {
         panel_height
@@ -188,59 +255,17 @@ fn render_plan(area: Rect, state: &UiState) -> Option<RenderPlan> {
         visible_composer_lines,
         pending,
         full_choice,
+        selector_above_composer,
+        help,
         show_composer,
-        composer_height,
+        vertical_padding,
         panel_height,
         footer_height,
-        history,
         history_height,
-        leading_height,
-        welcome_gap_height,
+        spacer_height,
         first_height,
         second_height,
     })
-}
-
-/** 只占用实际内容所需的行数，并给已提交回复与编辑区留一行间距；长草稿和详情保留完整空间。 */
-pub fn desired_viewport_height(state: &UiState, width: u16, max_height: u16) -> u16 {
-    let max_height = max_height.max(1);
-    if state
-        .composer()
-        .visual_lines(usize::from(width.max(4)))
-        .len()
-        > 1
-        || matches!(
-            state.panel(),
-            Some(Panel::Help | Panel::Details { .. } | Panel::ChoiceDetail { .. })
-        )
-    {
-        return max_height;
-    }
-    let area = Rect::new(0, 0, width.max(1), max_height);
-    let Some(plan) = render_plan(area, state) else {
-        return 1;
-    };
-    let content_height = plan
-        .history_height
-        .saturating_add(plan.composer_height)
-        .saturating_add(plan.panel_height)
-        .saturating_add(plan.footer_height)
-        .max(1);
-    let separates_scrollback_from_composer = plan.history_height == 0
-        && state.snapshot().turn_state != TurnState::Working
-        && state.panel().is_none()
-        && !state.snapshot().timeline.is_empty()
-        && content_height < max_height;
-    content_height
-        .saturating_add(u16::from(separates_scrollback_from_composer))
-        .min(max_height)
-}
-
-/// 首屏卡片留在终端历史起点，其余活动消息贴近底部输入区；空白只能位于二者之间。
-fn shows_welcome(state: &UiState) -> bool {
-    state.snapshot().thread_id.is_some()
-        && state.snapshot().timeline.is_empty()
-        && !state.snapshot().has_older_history
 }
 
 /// Codex 的审批列表取代 Composer；只有文本题或自由回答仍需要硬件输入光标。
@@ -259,46 +284,19 @@ fn pending_editor_visible(state: &UiState) -> bool {
     }
 }
 
-/// 只把稳定段插入 Inline viewport 之前；Paragraph 按当前列宽求真实行数，resize 不会重放。
-pub fn insert_scrollback<B: Backend>(
-    terminal: &mut Terminal<B>,
-    entries: &[TimelineEntry],
-) -> io::Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let area = terminal.size()?;
-    if area.width == 0 {
-        return Ok(());
-    }
-    let lines = wrap_scrollback_lines(scrollback_lines(entries), area.width as usize);
-    for chunk in lines.chunks(4096) {
-        let paragraph = Paragraph::new(Text::from(chunk.to_vec()));
-        terminal.insert_before(chunk.len() as u16, |buffer| {
-            paragraph.render(buffer.area, buffer)
-        })?;
-    }
-    Ok(())
-}
-
-/// 将一个批次渲染成完整稳定行，批次间空行只由此处加入一次。
-fn scrollback_lines(entries: &[TimelineEntry]) -> Vec<Line<'static>> {
+/// 稳定与活动正文复用相同排版入口；缓存由 transcript 按条目身份和宽度管理。
+pub(super) fn transcript_entry_lines(entry: &TimelineEntry, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::default());
-        }
-        append_entry_lines(&mut lines, entry);
-    }
-    lines
+    append_entry_lines(&mut lines, entry, false, width);
+    wrap_transcript_lines(lines, width)
 }
 
-/// 以 Ratatui 的实际列宽将每个样式字素手工折行，使 insert_before 的高度精确且稳定。
-fn wrap_scrollback_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+/// 字素折行保留整行样式，正文与面板共享显示列宽语义。
+fn wrap_transcript_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
     for line in lines {
-        let mut current = Line::default();
+        let mut current = Line::default().style(line.style);
         let mut cells = 0usize;
         for span in line.spans {
             let mut segment = String::new();
@@ -306,7 +304,7 @@ fn wrap_scrollback_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'s
                 if grapheme == "\n" {
                     push_wrapped_span(&mut current, &mut segment, span.style);
                     wrapped.push(current);
-                    current = Line::default();
+                    current = Line::default().style(line.style);
                     cells = 0;
                     continue;
                 }
@@ -314,7 +312,7 @@ fn wrap_scrollback_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'s
                 if cells > 0 && cells.saturating_add(cell_width) > width {
                     push_wrapped_span(&mut current, &mut segment, span.style);
                     wrapped.push(current);
-                    current = Line::default();
+                    current = Line::default().style(line.style);
                     cells = 0;
                 }
                 segment.push_str(grapheme);
@@ -334,211 +332,152 @@ fn push_wrapped_span(line: &mut Line<'static>, text: &mut String, style: Style) 
     }
 }
 
-/// 欢迎卡只展示权威模型、目录和权限；小窗口退化为短标签而不折断边框。
-fn welcome_card(state: &UiState, width: usize) -> Vec<Line<'static>> {
-    if width < 20 {
-        return vec![Line::from("Ja")];
-    }
-    let card_width = width.min(50);
-    let model = state
-        .snapshot()
-        .model_identifier
-        .as_deref()
-        .unwrap_or("未配置");
-    let model = if let Some(level) = state.snapshot().reasoning_label.as_deref() {
-        format!("{model} {level}")
-    } else {
-        model.to_owned()
-    };
+/// 新会话首屏只写品牌、实际工作目录和当前权限，模型统一留在状态栏。
+fn welcome_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
     let directory = state
         .snapshot()
         .workspace_path
         .as_deref()
         .or(state.snapshot().project_label.as_deref())
         .unwrap_or("当前目录");
-    let directory = abbreviate_home(directory);
     let permission = state
         .snapshot()
         .permission_label
         .as_deref()
         .unwrap_or("默认");
-    let border = Style::default().fg(Color::DarkGray);
-    let mut lines = vec![Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(card_width - 2)),
-        border,
-    ))];
-    lines.push(welcome_title_row(card_width));
-    lines.push(welcome_blank_row(card_width));
-    lines.push(welcome_model_row(&model, card_width));
-    lines.push(welcome_field_row("目录：       ", &directory, card_width));
-    lines.push(welcome_field_row("权限：       ", permission, card_width));
-    lines.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(card_width - 2)),
-        border,
-    )));
-    lines
-}
-
-/// 模型切换命令只在卡片列宽足够时靠右显示，模拟 Codex 的蓝色可发现入口。
-fn welcome_model_row(model: &str, width: usize) -> Line<'static> {
-    let label = "模型：       ";
-    let link = "  /model 切换";
-    let room = width.saturating_sub(4);
-    let used = UnicodeWidthStr::width(label)
-        + UnicodeWidthStr::width(model)
-        + UnicodeWidthStr::width(link);
-    if used > room {
-        return welcome_field_row(label, model, width);
-    }
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(label, Style::default().fg(MUTED)),
-        Span::styled(model.to_owned(), Style::default().fg(Color::Reset)),
-        Span::raw(" ".repeat(room - used)),
-        Span::styled(link, Style::default().fg(Color::Cyan)),
-        Span::styled(" │", Style::default().fg(Color::DarkGray)),
-    ])
-}
-
-/// 标题与版本分开着色，保持 Codex 卡片里品牌先于次要版本信息的视觉层级。
-fn welcome_title_row(width: usize) -> Line<'static> {
-    let title = ">_ Ja";
-    let version = format!(" (v{})", env!("CARGO_PKG_VERSION"));
-    let room = width.saturating_sub(4);
-    let used = UnicodeWidthStr::width(title) + UnicodeWidthStr::width(version.as_str());
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Reset)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(version, Style::default().fg(MUTED)),
-        Span::raw(" ".repeat(room.saturating_sub(used))),
-        Span::styled(" │", Style::default().fg(Color::DarkGray)),
-    ])
-}
-
-/// 卡片固定标签列按终端显示宽度补齐，长目录只截断值而不移动后续行的起点。
-fn welcome_field_row(label: &str, value: &str, width: usize) -> Line<'static> {
-    let room = width.saturating_sub(4);
-    let label_width = UnicodeWidthStr::width(label);
-    let value = truncate_cells(value, room.saturating_sub(label_width));
-    let used = label_width + UnicodeWidthStr::width(value.as_str());
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(label.to_owned(), Style::default().fg(MUTED)),
-        Span::styled(value, Style::default().fg(Color::Reset)),
-        Span::raw(" ".repeat(room.saturating_sub(used))),
-        Span::styled(" │", Style::default().fg(Color::DarkGray)),
-    ])
-}
-
-/// 仅在当前目录确实位于宿主 Home 内时缩写为 ~，避免把别的用户目录误标成自己的。
-fn abbreviate_home(path: &str) -> String {
-    let path = if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
-        format!("\\\\{unc}")
+    let brand = truncate_cells(">_ Ja", width);
+    let directory_label = if width >= 6 {
+        "目录： "
+    } else if width >= 4 {
+        "目录"
     } else {
-        path.strip_prefix("\\\\?\\").unwrap_or(path).to_owned()
+        ""
     };
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(|value| value.to_string_lossy().into_owned());
-    let Some(home) = home else {
-        return path;
-    };
-    let home = home.trim_end_matches(['\\', '/']);
-    let Some(prefix) = path.get(..home.len()) else {
-        return path;
-    };
-    let matches = if cfg!(windows) {
-        prefix.eq_ignore_ascii_case(home)
+    let permission_label = if width >= 6 {
+        "权限： "
+    } else if width >= 4 {
+        "权限"
     } else {
-        prefix == home
+        ""
     };
-    if !matches {
-        return path.to_owned();
-    }
-    let suffix = &path[home.len()..];
-    if suffix.is_empty() || suffix.starts_with(['\\', '/']) {
-        format!("~{suffix}")
-    } else {
-        path
-    }
+    let version = truncate_cells(
+        &format!(" v{}", env!("CARGO_PKG_VERSION")),
+        width.saturating_sub(UnicodeWidthStr::width(brand.as_str())),
+    );
+    let directory = truncate_cells(
+        &display_directory(directory),
+        width.saturating_sub(UnicodeWidthStr::width(directory_label)),
+    );
+    let permission = truncate_cells(
+        permission,
+        width.saturating_sub(UnicodeWidthStr::width(permission_label)),
+    );
+    vec![
+        Line::from(vec![
+            Span::styled(
+                brand,
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(version, Style::default().fg(MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled(directory_label, Style::default().fg(MUTED)),
+            Span::styled(directory, Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled(permission_label, Style::default().fg(MUTED)),
+            Span::styled(permission, Style::default().fg(Color::Reset)),
+        ]),
+    ]
 }
 
-/// 空行只用于卡片标题和参数之间的呼吸间距，不引入额外框架或装饰。
-fn welcome_blank_row(width: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-        Span::raw(" ".repeat(width.saturating_sub(4))),
-        Span::styled(" │", Style::default().fg(Color::DarkGray)),
-    ])
-}
-
-/// 初始提示只占用有余量的首屏；工作提示紧随最近回复，宽度允许时把 Esc 操作也放在同一行。
-fn history_lines(
-    state: &UiState,
-    width: usize,
-    show_welcome: bool,
-    show_welcome_tip: bool,
-) -> Vec<Line<'static>> {
+/// 活动块携带归档后的同一源身份；状态动效保留在正文尾部，不改变底部区域预算。
+fn transcript_active_blocks(state: &UiState, width: usize) -> Vec<TranscriptBlock> {
+    let mut blocks = Vec::new();
+    for entry in state.visible_entries() {
+        let mut lines = Vec::new();
+        let stream_continuation = state.stream_has_started(&entry.id);
+        if stream_continuation && entry.text.is_empty() {
+            continue;
+        }
+        if let Some((presentation, spacing)) = state.stream_tail_layout(&entry.id) {
+            if !stream_continuation || spacing {
+                append_reply_gap(&mut lines);
+            }
+            append_stream_fragment(
+                &mut lines,
+                &entry.text,
+                presentation,
+                width,
+                matches!(entry.kind, TimelineKind::ReasoningSummary),
+            );
+        } else {
+            append_entry_lines(&mut lines, entry, stream_continuation, width);
+        }
+        let (source_key, source_start) = state.transcript_source(&entry.id);
+        blocks.push(TranscriptBlock {
+            key: entry.id.clone(),
+            source_key,
+            source_start,
+            source: entry.text.clone(),
+            lines: wrap_transcript_lines(lines, width),
+        });
+    }
     let mut lines = Vec::new();
-    if show_welcome {
-        let mut welcome = welcome_card(state, width);
-        if show_welcome_tip {
-            welcome.push(Line::default());
-            welcome.push(Line::default());
-            welcome.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "提示：",
-                    Style::default()
-                        .fg(Color::Reset)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("/ 命令 · @ 引用文件", Style::default().fg(MUTED)),
-            ]));
-        }
-        return welcome;
-    }
-    if state.snapshot().has_older_history {
-        lines.push(Line::from(Span::styled(
-            "↑  Ctrl+↑ 加载更早记录",
-            Style::default().fg(MUTED),
-        )));
-    }
-    let mut first_entry = true;
-    for entry in state
-        .visible_entries()
-        .rev()
-        .take(18)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        if !first_entry {
-            lines.push(Line::default());
-        }
-        append_entry_lines(&mut lines, entry);
-        first_entry = false;
-    }
     if state.snapshot().turn_state == TurnState::Working
         && state.snapshot().pending_prompt.is_none()
     {
+        lines.push(Line::default());
+        let elapsed = state
+            .snapshot()
+            .turn_started_at
+            .and_then(|started| SystemTime::now().duration_since(started).ok())
+            .map(|elapsed| elapsed.as_secs());
         lines.push(working_indicator_line(
-            state.composer().is_empty() && width >= WORKING_INLINE_HINT_MIN_WIDTH,
+            state.panel().is_none()
+                && state.composer().is_empty()
+                && width >= WORKING_INLINE_HINT_MIN_WIDTH,
+            elapsed.filter(|_| width >= 48),
         ));
+    } else if state.snapshot().turn_state == TurnState::Paused {
+        lines.push(Line::default());
+        lines.push(paused_indicator_line());
     }
     if !lines.is_empty() {
-        lines.push(Line::default());
+        blocks.push(TranscriptBlock {
+            key: "turn-status".into(),
+            source_key: "turn-status".into(),
+            source_start: 0,
+            source: String::new(),
+            lines: wrap_transcript_lines(lines, width),
+        });
     }
-    wrap_scrollback_lines(lines, width)
+    if let Some(text) = state.visible_pending_message_text() {
+        let mut lines = Vec::new();
+        append_input_lines(&mut lines, text, width);
+        blocks.push(TranscriptBlock {
+            key: "pending-message".into(),
+            source_key: "pending-message".into(),
+            source_start: 0,
+            source: text.into(),
+            lines: wrap_transcript_lines(lines, width),
+        });
+    }
+    blocks
 }
 
-/// 固定宽度的三个点依次提亮；窄窗或已有草稿时把取消提示留给底栏。
-fn working_indicator_line(show_cancel_hint: bool) -> Line<'static> {
+/// 快照只证明执行已挂起，未提供暂停来源，因此稳定显示通用状态而不推断 Plan 操作。
+fn paused_indicator_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "• 运行已暂停或中断",
+        Style::default().fg(MUTED),
+    ))
+}
+
+/// 保留三点动效；用时取后台起点，窄窗优先留下取消按键，未来或无效时间不显示。
+fn working_indicator_line(show_cancel_hint: bool, elapsed: Option<u64>) -> Line<'static> {
     let phase = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -557,76 +496,250 @@ fn working_indicator_line(show_cancel_hint: bool) -> Line<'static> {
         };
         spans.push(Span::styled(".", Style::default().fg(color)));
     }
+    if let Some(seconds) = elapsed {
+        spans.push(Span::styled(
+            format!(" · {}", work_duration(seconds)),
+            Style::default().fg(MUTED),
+        ));
+    }
     if show_cancel_hint {
         spans.push(Span::styled(" · Esc 中断", Style::default().fg(MUTED)));
     }
     Line::from(spans)
 }
 
-/// 历史比当前屏幕长时只显示活动尾部；稳定正文仍由 insert_before 保存到终端滚动区。
-fn render_history(frame: &mut Frame<'_>, area: Rect, lines: &[Line<'static>]) {
-    let start = lines.len().saturating_sub(area.height as usize);
-    frame.render_widget(Paragraph::new(Text::from(lines[start..].to_vec())), area);
+/// 与完成态共用中文时长格式，亚秒任务保留真实精度边界，不显示虚构的零秒。
+fn work_duration(seconds: u64) -> String {
+    if seconds == 0 {
+        "不足1秒".into()
+    } else if seconds < 60 {
+        format!("{seconds}秒")
+    } else if seconds < 3600 {
+        format!("{}分{}秒", seconds / 60, seconds % 60)
+    } else {
+        format!("{}小时{}分", seconds / 3600, seconds % 3600 / 60)
+    }
 }
 
-/// 按 Codex 的时间线语法投影：用户 ›、过程和回答 •、工具命令及有界树形输出。
-fn append_entry_lines(lines: &mut Vec<Line<'static>>, entry: &TimelineEntry) {
+/// 发送问题与可编辑草稿使用成对前景和底色，保证历史留白与正文的可读性一致。
+fn input_style() -> Style {
+    Style::default()
+        .fg(COMPOSER_FOREGROUND)
+        .bg(COMPOSER_BACKGROUND)
+}
+
+/// Paragraph 的空行样式不填充整行，用真实空格延展灰底，确保历史留白和行尾与输入一致。
+fn input_history_line(mut text: String, width: usize) -> Line<'static> {
+    let remaining = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    text.push_str(&" ".repeat(remaining));
+    Line::raw(text).style(input_style())
+}
+
+/// 待发送与权威问题复用字素折行和整行灰底，测量和绘制不能维护两种问题宽度。
+fn append_input_lines(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
+    lines.push(Line::default());
+    lines.push(input_history_line(String::new(), width));
+    lines.extend(
+        input_visual_lines(text, width)
+            .into_iter()
+            .map(|text| input_history_line(text, width)),
+    );
+    lines.push(input_history_line(String::new(), width));
+}
+
+/// 问题与草稿共用折行和灰底；工具预览限制显示行数，不读取完整产物或改变执行状态。
+fn append_entry_lines(
+    lines: &mut Vec<Line<'static>>,
+    entry: &TimelineEntry,
+    stream_continuation: bool,
+    width: usize,
+) {
     match &entry.kind {
-        TimelineKind::User => append_plain(lines, &entry.text, "› ", Color::Reset),
-        TimelineKind::Assistant | TimelineKind::FinalAnswer | TimelineKind::Commentary => {
-            let mut rendered = render_markdown(&entry.text).lines;
-            if let Some(first) = rendered.first_mut() {
-                first.spans.insert(0, Span::raw("• "));
-            } else {
-                rendered.push(Line::raw("•"));
+        TimelineKind::User => {
+            append_input_lines(lines, &entry.text, width);
+        }
+        TimelineKind::WorkSummary { elapsed_seconds } => {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!("  工作用时 {}", work_duration(*elapsed_seconds)),
+                Style::default().fg(MUTED),
+            )));
+        }
+        TimelineKind::Assistant
+        | TimelineKind::FinalAnswer
+        | TimelineKind::Commentary
+        | TimelineKind::ReasoningSummary => {
+            if !stream_continuation {
+                append_reply_gap(lines);
             }
-            for line in rendered.iter_mut().skip(1) {
-                line.spans.insert(0, Span::raw("  "));
-            }
-            lines.extend(rendered);
+            append_reply_lines(
+                lines,
+                render_markdown(&entry.text, width.saturating_sub(2).max(1)).lines,
+                matches!(entry.kind, TimelineKind::ReasoningSummary),
+            );
             if entry.status == Some(TimelineStatus::Failed)
                 && let Some(detail) = entry.detail.as_deref()
             {
-                append_plain(lines, &bounded_lines(detail, 3), "   ", Color::Reset);
+                append_plain(
+                    lines,
+                    &bounded_lines(detail, 3),
+                    "   ",
+                    if entry.status == Some(TimelineStatus::Failed) {
+                        Color::Red
+                    } else {
+                        Color::Reset
+                    },
+                );
             }
         }
-        TimelineKind::Tool { action, target } => {
+        TimelineKind::AssistantFragment {
+            first,
+            presentation,
+            reasoning,
+        } => {
+            if *first {
+                append_reply_gap(lines);
+            }
+            append_stream_fragment(lines, &entry.text, *presentation, width, *reasoning);
+        }
+        TimelineKind::Tool {
+            action,
+            target,
+            preview_truncated,
+        } => {
+            append_reply_gap(lines);
+            let action_color = if entry.status == Some(TimelineStatus::Failed) {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
             lines.push(Line::from(vec![
-                Span::raw("• "),
+                Span::raw("  "),
                 Span::styled(
                     action.clone(),
                     Style::default()
-                        .fg(Color::Reset)
+                        .fg(action_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(target.clone(), Style::default().fg(Color::Reset)),
+                Span::styled(
+                    truncate_cells(
+                        target,
+                        width.saturating_sub(UnicodeWidthStr::width(action.as_str()) + 5),
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(" ▸", Style::default().fg(MUTED)),
             ]));
-            if let Some(detail) = entry.detail.as_deref() {
-                let limit = if entry.status == Some(TimelineStatus::Failed) {
-                    6
-                } else {
-                    4
-                };
-                for (index, text) in detail.lines().take(limit).enumerate() {
-                    let prefix = if index == 0 { "  └ " } else { "    " };
-                    lines.push(Line::from(Span::styled(
-                        format!("{prefix}{}", truncate_detail_line(text, 512)),
-                        Style::default().fg(MUTED),
-                    )));
-                }
-                if detail.lines().count() > limit {
-                    lines.push(Line::from(Span::styled(
-                        "    …输出已截断，Ctrl+O 查看详情",
-                        Style::default().fg(MUTED),
-                    )));
-                }
-            }
+            append_tool_preview(lines, entry, width, *preview_truncated);
         }
     }
 }
 
+/// 成功与失败共用三行安全预览；同时保留源端截断事实，不能把短预览误当完整结果。
+fn append_tool_preview(
+    lines: &mut Vec<Line<'static>>,
+    entry: &TimelineEntry,
+    width: usize,
+    preview_truncated: bool,
+) {
+    let indent = width.saturating_sub(1).min(4);
+    let content_width = width.saturating_sub(indent);
+    let detail = entry
+        .detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty());
+    if detail.is_none() && entry.status != Some(TimelineStatus::Running) {
+        lines.push(Line::from(Span::styled(
+            truncate_cells("  └ （暂无结果预览）", width),
+            Style::default().fg(MUTED),
+        )));
+    }
+    let mut source_lines = detail.unwrap_or_default().lines();
+    let mut truncated = preview_truncated;
+    for index in 0..3 {
+        let Some(text) = source_lines.next() else {
+            break;
+        };
+        let text = text.replace('\t', "    ");
+        truncated |= UnicodeWidthStr::width(text.as_str()) > content_width;
+        let prefix = if index == 0 && indent == 4 {
+            "  └ ".to_owned()
+        } else {
+            " ".repeat(indent)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", truncate_cells(&text, content_width)),
+            Style::default().fg(MUTED),
+        )));
+    }
+    if truncated || source_lines.next().is_some() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{}{}",
+                " ".repeat(indent),
+                truncate_cells("… Ctrl+O 查看详情", content_width),
+            ),
+            Style::default().fg(MUTED),
+        )));
+    }
+}
+
+/// 已归档区块与活动尾部共用宽度和代码渲染，正文类别只影响色彩而不改写源文本。
+fn append_stream_fragment(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    presentation: StreamPresentation,
+    width: usize,
+    reasoning: bool,
+) {
+    let content_width = width.saturating_sub(2).max(1);
+    let mut rendered = match presentation {
+        StreamPresentation::Markdown => render_markdown(text, content_width).lines,
+        StreamPresentation::CodeLabel => vec![code_label_line(text)],
+        StreamPresentation::Code => render_code_lines(text, content_width),
+        StreamPresentation::Literal => text
+            .lines()
+            .map(|line| Line::raw(line.replace('\t', "    ")))
+            .collect::<Vec<_>>(),
+        StreamPresentation::Spacer => vec![Line::default()],
+    };
+    if presentation == StreamPresentation::Spacer {
+        // 区块间距独立于代码正文里的真实空行；流账本只产生一次 Spacer。
+        lines.push(Line::default());
+    } else {
+        append_reply_lines(lines, std::mem::take(&mut rendered), reasoning);
+    }
+}
+
+/// 留白只在区块边界增加一次；源代码的真实空白行由代码 renderer 自行保留。
+fn append_reply_gap(lines: &mut Vec<Line<'static>>) {
+    if lines.last().is_none_or(|line| !line.spans.is_empty()) {
+        lines.push(Line::default());
+    }
+}
+
+/// 外层只加两列正文边距，列表和引用的续行缩进由共享 renderer 测量，避免二次布局分歧。
+fn append_reply_lines(
+    lines: &mut Vec<Line<'static>>,
+    rendered: Vec<Line<'static>>,
+    reasoning: bool,
+) {
+    for mut line in rendered {
+        if reasoning {
+            for span in &mut line.spans {
+                span.style = span.style.fg(MUTED).add_modifier(Modifier::ITALIC);
+            }
+        }
+        if !line.spans.is_empty() {
+            line.spans.insert(0, Span::raw("  "));
+        }
+        lines.push(line);
+    }
+}
+
 /// 将普通用户或 Commentary 正文拆为行，避免显示重复的角色标题。
+/// 纯文本只强调首行身份符号，正文及后续缩进行由调用方的语义颜色控制。
 fn append_plain(lines: &mut Vec<Line<'static>>, value: &str, prefix: &str, color: Color) {
     for (index, line) in value.lines().enumerate() {
         let mut spans = Vec::new();
@@ -634,7 +747,7 @@ fn append_plain(lines: &mut Vec<Line<'static>>, value: &str, prefix: &str, color
             spans.push(Span::styled(
                 prefix.to_owned(),
                 Style::default()
-                    .fg(Color::Reset)
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
         } else if index > 0 && !prefix.is_empty() {
@@ -675,50 +788,49 @@ fn truncate_detail_line(value: &str, max_bytes: usize) -> String {
     output
 }
 
-/// Codex 式 Composer 不画边框；硬件光标保留字素位置供 Windows IME 定位。
-fn render_composer(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &UiState,
-    width: usize,
-    lines: &[String],
-    visible_lines: usize,
-) {
+/// 箭头与已发送问题共用左缘，只保留上下留白；绘制与光标共享实际内容矩形。
+fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, plan: &RenderPlan) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let input_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-    let (cursor_row, cursor_column) = state.composer().visual_cursor(width);
+    let padding_rows = plan.vertical_padding.min(area.height / 2);
+    let input_area = Rect::new(
+        area.x,
+        area.y + padding_rows,
+        area.width,
+        area.height.saturating_sub(padding_rows * 2),
+    );
+    if input_area.width == 0 || input_area.height == 0 {
+        return;
+    }
+    frame.render_widget(Block::default().style(input_style()), area);
+    let (cursor_row, cursor_column) = state.composer().visual_cursor(plan.width);
+    let visible_lines = plan.visible_composer_lines.min(input_area.height as usize);
     let first_visible = cursor_row.saturating_add(1).saturating_sub(visible_lines);
     let visible = if state.composer().is_empty() && state.panel().is_none() {
-        vec![Line::from(vec![
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate_cells("让 Ja 完成任何任务", area.width.saturating_sub(2) as usize),
-                Style::default().fg(MUTED),
-            ),
-        ])]
+        vec![Line::from(Span::styled(
+            if input_area.width >= 2 { "› " } else { "›" },
+            input_style().add_modifier(Modifier::BOLD),
+        ))]
     } else {
-        lines
+        plan.composer_lines
             .iter()
             .skip(first_visible)
             .take(input_area.height as usize)
             .map(|line| Line::from(line.clone()))
             .collect::<Vec<_>>()
     };
-    frame.render_widget(Paragraph::new(Text::from(visible)), input_area);
+    frame.render_widget(
+        Paragraph::new(Text::from(visible)).style(input_style()),
+        input_area,
+    );
     let row = cursor_row
         .saturating_sub(first_visible)
         .min(input_area.height.saturating_sub(1) as usize);
     let column = cursor_column.min(input_area.width.saturating_sub(1) as usize);
     if !matches!(
         state.panel(),
-        Some(Panel::Help | Panel::Details { .. } | Panel::ChoiceDetail { .. })
+        Some(Panel::Details { .. } | Panel::ChoiceDetail { .. } | Panel::ModelSettings)
     ) {
         frame.set_cursor_position(Position::new(
             input_area.x + column as u16,
@@ -727,16 +839,67 @@ fn render_composer(
     }
 }
 
-/// 底栏按当前面板给出下一步按键，恢复选择明确显示导航、确认和返回动作。
+/// 身份、用量与操作反馈各有固定位置；空闲帮助也留在操作行，避免挤占会话身份。
+/// 矮窗先让用量退出；刷新入口让位于审批和恢复反馈，不能用计量错误覆盖聊天操作。
+/// @author kongweiguang
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let snapshot = state.snapshot();
+    let identity_height = u16::from(area.height >= 2);
+    if identity_height > 0 {
+        let identity = status_identity(snapshot, area.width as usize);
+        frame.render_widget(
+            Paragraph::new(identity),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
+    if area.height >= 3 {
+        frame.render_widget(
+            Paragraph::new(usage_line(snapshot.usage.as_ref(), area.width as usize)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
+    let area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    if state.older_history_failed() && state.panel().is_none() {
+        render_status_message(
+            frame,
+            area,
+            snapshot.notice.as_deref().unwrap_or("读取更早历史失败"),
+            if area.width < 12 { "F5" } else { "F5 重试" },
+        );
+        return;
+    }
+    if state.prompt_response_needs_refresh()
+        || snapshot
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("F5"))
+    {
+        let hint = match (
+            state.can_retry_cancellation(),
+            state.panel().is_some(),
+            area.width < 18,
+        ) {
+            (true, _, false) => "F5 核实 · Esc 重试",
+            (false, true, false) => "F5 核实 · Esc 返回",
+            (_, true, true) | (true, _, true) => "F5 · Esc",
+            (false, false, true) => "F5",
+            (false, false, false) => "F5 核实",
+        };
+        render_status_message(
+            frame,
+            area,
+            snapshot.notice.as_deref().unwrap_or("提交结果暂未核实"),
+            hint,
+        );
+        return;
+    }
     if state.prompt_submission_pending() && matches!(state.panel(), Some(Panel::Pending)) {
         frame.render_widget(
             Paragraph::new(truncate_cells(
-                "  正在提交回答，内容已暂存 · Esc 收起",
+                "正在发送回答 · Esc 收起",
                 area.width as usize,
             ))
             .style(Style::default().fg(MUTED)),
@@ -744,15 +907,32 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         );
         return;
     }
+    if state.has_pending_submission() {
+        let message = if state.pending_message_text().is_some() {
+            "正在发送"
+        } else {
+            "正在导入附件"
+        };
+        render_status_message(frame, area, message, "");
+        return;
+    }
     if let Some(notice) = snapshot.notice.as_deref() {
-        frame.render_widget(
-            Paragraph::new(truncate_cells(notice, area.width as usize)).style(
-                Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            area,
-        );
+        if let Some(hint) = notice_panel_hint(state, area.width) {
+            render_status_message(frame, area, notice, hint);
+        } else {
+            frame.render_widget(
+                Paragraph::new(truncate_cells(notice, area.width as usize)).style(
+                    Style::default()
+                        .fg(Color::Reset)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                area,
+            );
+        }
+        return;
+    }
+    if state.older_history_loading() {
+        render_status_message(frame, area, "正在读取更早历史", "");
         return;
     }
     let hint = match state.panel() {
@@ -770,6 +950,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             kind: ChoiceKind::Attachments,
             ..
         }) => Some("  Enter 预览 · Del 移除 · Esc 返回"),
+        Some(Panel::Choices {
+            kind: ChoiceKind::ToolSteps,
+            ..
+        }) => Some("  ↑↓ 选择 · Enter 详情 · Esc 返回"),
         Some(Panel::Choices {
             kind: ChoiceKind::Reasoning,
             ..
@@ -794,14 +978,47 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             kind: ChoiceKind::Threads,
             ..
         }) => Some("  ↑↓ 选择 · Enter 恢复 · Esc 返回"),
+        Some(Panel::Choices {
+            kind: ChoiceKind::ForkReplies,
+            ..
+        }) if snapshot.fork_reply_next_cursor.is_some() => {
+            Some("  ↑↓ 选择 · PgDn 更早 · Enter 分叉 · Esc 返回")
+        }
+        Some(Panel::Choices {
+            kind: ChoiceKind::ForkReplies,
+            ..
+        }) => Some("  ↑↓ 选择 · Enter 分叉 · Esc 返回"),
         Some(Panel::Choices { .. }) => Some("  Enter 确认或 Esc 返回"),
         Some(Panel::Pending) => Some(pending_footer_hint(state, area.width)),
-        Some(Panel::Help | Panel::Details { .. } | Panel::ChoiceDetail { .. }) => {
-            Some("  Esc 返回")
+        Some(Panel::Help { .. }) if snapshot.turn_state == TurnState::Working => {
+            Some(if area.width < 24 {
+                "Esc/? 收起"
+            } else if area.width < 64 {
+                "回复继续 · ↑↓ 浏览 · Esc/? 收起"
+            } else {
+                "回复继续 · ↑↓/PgUp/PgDn/Home/End 浏览 · Esc/? 收起"
+            })
         }
+        Some(Panel::Help { .. }) if area.width < 40 => Some("↑↓/Pg 翻页 · Esc/? 返回"),
+        Some(Panel::Help { .. }) => Some("↑↓/PgUp/PgDn/Home/End 浏览 · Esc/? 返回"),
+        Some(Panel::Details { .. } | Panel::ChoiceDetail { .. }) => Some("  Esc 返回"),
+        Some(Panel::ModelSettings) => None,
         None => None,
     };
     if let Some(hint) = hint {
+        let hint = if UnicodeWidthStr::width(hint) > area.width as usize {
+            match state.panel() {
+                Some(Panel::Help { .. }) => "Esc/? · ↑↓",
+                Some(Panel::Commands { .. }) => "Esc · Enter · Tab",
+                Some(Panel::Pending) => "Esc · Enter · F2",
+                Some(Panel::Choices { .. }) => "Esc · Enter",
+                Some(Panel::Details { .. } | Panel::ChoiceDetail { .. }) => "Esc",
+                Some(Panel::ModelSettings) => "Esc",
+                None => hint,
+            }
+        } else {
+            hint
+        };
         frame.render_widget(
             Paragraph::new(truncate_cells(hint, area.width as usize))
                 .style(Style::default().fg(MUTED)),
@@ -825,56 +1042,163 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         return;
     }
     let attaching = state.composer().text().starts_with("/attach ");
-    let (left, right) = if state.has_pending_submission() {
-        ("  正在提交，草稿已暂存".to_owned(), Some("请稍候"))
-    } else if attaching {
-        ("  附件路径 · 含空格请加引号".to_owned(), Some("Enter 导入"))
-    } else {
-        let model = snapshot.model_identifier.as_deref().unwrap_or("未配置模型");
-        let model = if let Some(level) = snapshot.reasoning_label.as_deref() {
-            format!("{model} {level}")
+    if attaching {
+        render_status_message(frame, area, "附件路径 · 含空格请加引号", "Enter 导入");
+        return;
+    }
+    if snapshot.turn_state == TurnState::Paused {
+        let hint = if state.suspended_control_pending() {
+            "F5 核实恢复结果"
         } else {
-            model.to_owned()
+            "F6 恢复任务 · F7 取消任务"
         };
-        let directory = snapshot
-            .workspace_path
-            .as_deref()
-            .or(snapshot.project_label.as_deref())
-            .unwrap_or("当前目录");
-        let directory = truncate_cells(&abbreviate_home(directory), 48);
-        let left = format!("  {model} · {directory}");
-        let right = match snapshot.turn_state {
-            TurnState::Working
-                if state.composer().is_empty()
-                    && (area.width as usize) < WORKING_INLINE_HINT_MIN_WIDTH =>
-            {
-                Some("Esc 中断")
-            }
-            TurnState::Working if state.composer().is_empty() => None,
-            TurnState::Working => Some("Enter 调整 · Tab 排队"),
-            TurnState::Failed if snapshot.continuation_available && state.composer().is_empty() => {
-                Some("Enter 继续回复")
-            }
-            _ => None,
-        };
-        (left, right)
+        frame.render_widget(
+            Paragraph::new(truncate_cells(hint, area.width as usize))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+    let hint = match snapshot.turn_state {
+        TurnState::Idle if snapshot.usage.as_ref().is_some_and(|usage| usage.stale) => {
+            Some(if area.width < 16 {
+                "F5 刷新"
+            } else {
+                "  F5 刷新用量"
+            })
+        }
+        TurnState::Idle if state.composer().is_empty() => Some(if area.width < 6 {
+            "?"
+        } else if area.width < 14 {
+            "? 帮助"
+        } else {
+            "  ? 查看快捷键"
+        }),
+        TurnState::Working if snapshot.local_operation.is_some() => Some("Esc 取消"),
+        TurnState::Working if state.composer().is_empty() => Some("Esc 中断"),
+        TurnState::Working => Some("Enter 调整 · Tab 排队"),
+        TurnState::Paused if area.width < 40 => Some("/status 核实"),
+        TurnState::Paused => Some("/status 核实状态 · /plan status 查看计划"),
+        TurnState::Failed if snapshot.continuation_available && state.composer().is_empty() => {
+            Some("Enter 继续回复")
+        }
+        _ => None,
     };
+    if let Some(hint) = hint {
+        frame.render_widget(
+            Paragraph::new(truncate_cells(hint, area.width as usize))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+    }
+}
+
+/// 显示操作错误时仍留下能退回或重试当前面板的按键，窄屏把 Esc 放在首位。
+fn notice_panel_hint(state: &UiState, width: u16) -> Option<&'static str> {
+    if width < 29 {
+        return Some("Esc 返回");
+    }
+    match state.panel() {
+        Some(Panel::Commands { .. }) => Some("Tab 补全 · Esc 返回"),
+        Some(Panel::Choices { .. }) | Some(Panel::Pending) => Some("Enter 重试 · Esc 返回"),
+        Some(Panel::Help { .. }) => Some("Esc/? 返回"),
+        Some(Panel::Details { .. } | Panel::ChoiceDetail { .. }) => Some("Esc 返回"),
+        Some(Panel::ModelSettings) => Some("Esc 返回"),
+        None => None,
+    }
+}
+
+/// 身份按模型、目录、标题连续排列；只在空间不足时分配剩余列，不用填充空格把标题推到右端。
+fn status_identity(snapshot: &super::model::UiSnapshot, width: usize) -> Line<'static> {
+    let model = snapshot.model_identifier.as_deref().unwrap_or("未配置模型");
+    let model = snapshot
+        .reasoning_label
+        .as_deref()
+        .map_or_else(|| model.to_owned(), |level| format!("{model} {level}"));
+    let directory = snapshot
+        .workspace_path
+        .as_deref()
+        .or(snapshot.project_label.as_deref())
+        .unwrap_or("当前目录");
+    let directory = display_directory(directory);
+    let title = snapshot
+        .thread_title
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut spans = Vec::new();
+    let padding = usize::from(width >= 4) * 2;
+    let mut remaining = width.saturating_sub(padding * 2);
+    if padding > 0 {
+        spans.push(Span::raw(" ".repeat(padding)));
+    }
+    let model = truncate_cells(&model, remaining);
+    remaining = remaining.saturating_sub(UnicodeWidthStr::width(model.as_str()));
+    if !model.is_empty() {
+        spans.push(Span::styled(
+            model,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // 长路径和长标题共享空间；短路径释放的列可供标题使用，不限制正常短值的自然位置。
+    let title = if remaining >= 8 {
+        let content_budget = remaining.saturating_sub(6);
+        let directory_width = UnicodeWidthStr::width(directory.as_str());
+        truncate_cells(
+            &title,
+            content_budget.saturating_sub(directory_width.min(content_budget / 2)),
+        )
+    } else {
+        String::new()
+    };
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let directory_budget =
+        remaining.saturating_sub(3 + title_width + usize::from(title_width > 0) * 3);
+    if directory_budget > 0 && remaining >= 4 {
+        spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+        let directory = truncate_cells(&directory, directory_budget);
+        spans.push(Span::styled(directory, Style::default().fg(Color::Green)));
+    }
+    if title_width > 0 {
+        spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(title, Style::default().fg(Color::LightBlue)));
+    }
+    if padding > 0 {
+        spans.push(Span::raw(" ".repeat(padding)));
+    }
+    Line::from(spans)
+}
+
+/// Windows 的规范化前缀用于文件身份，展示时还原用户可读的驱动器或 UNC 路径。
+fn display_directory(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
+    }
+}
+
+/// 提交与附件导入暂时占用状态行时也保留原有左右对齐关系。
+fn render_status_message(frame: &mut Frame<'_>, area: Rect, message: &str, hint: &str) {
     let width = area.width as usize;
-    let right = right.map(|value| truncate_cells(value, width));
-    let right_width = right.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
-    let left_width = width.saturating_sub(right_width + usize::from(right_width > 0) * 2);
+    let right = truncate_cells(hint, width);
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let left_width = width.saturating_sub(right_width + 2);
     if left_width > 0 {
         frame.render_widget(
-            Paragraph::new(truncate_cells(&left, left_width))
-                .style(Style::default().fg(Color::Reset)),
+            Paragraph::new(truncate_cells(message, left_width)).style(Style::default().fg(MUTED)),
             Rect::new(area.x, area.y, left_width as u16, 1),
         );
     }
-    if let Some(right) = right {
+    if !right.is_empty() {
         frame.render_widget(
             Paragraph::new(right).style(
                 Style::default()
-                    .fg(Color::Reset)
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             Rect::new(
@@ -927,7 +1251,8 @@ fn pending_footer_hint(state: &UiState, width: u16) -> &'static str {
     }
 }
 
-/// 候选行共享名称/描述列；会话空态区分项目无历史与当前搜索无匹配项。
+/// @author kongweiguang
+/// 候选行共享名称/描述列；Fork 的空缓存、读取失败与成功空历史分别显示真实状态。
 fn selector_rows(state: &UiState) -> Option<(Vec<SelectionRow>, Option<usize>)> {
     match state.panel()? {
         Panel::Commands { selected } => {
@@ -956,10 +1281,17 @@ fn selector_rows(state: &UiState) -> Option<(Vec<SelectionRow>, Option<usize>)> 
             let selected = (!choices.is_empty()).then_some(*selected);
             let rows = if choices.is_empty() {
                 vec![SelectionRow {
-                    name: if *kind == ChoiceKind::Threads && !state.thread_query().is_empty() {
-                        "当前项目没有匹配的会话".to_owned()
-                    } else {
-                        empty_choice_label(*kind).to_owned()
+                    name: match *kind {
+                        ChoiceKind::ForkReplies if state.snapshot().fork_reply_loading => {
+                            "正在加载回复…".to_owned()
+                        }
+                        ChoiceKind::ForkReplies if state.snapshot().fork_reply_load_failed => {
+                            "读取回复失败；按 Esc 返回后重试 /fork".to_owned()
+                        }
+                        ChoiceKind::Threads if !state.thread_query().is_empty() => {
+                            "当前项目没有匹配的会话".to_owned()
+                        }
+                        _ => empty_choice_label(*kind).to_owned(),
                     },
                     description: None,
                     tag: None,
@@ -1009,7 +1341,7 @@ fn selector_rows(state: &UiState) -> Option<(Vec<SelectionRow>, Option<usize>)> 
     }
 }
 
-/// 候选作为输入框下方的普通行参与布局，不清屏、不画浮窗，缩放后仍能看见当前项。
+/// 候选作为普通行参与布局，不清屏或画浮窗，避免终端缩放时遮住当前项。
 fn render_selector(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some((rows, selected)) = selector_rows(state) else {
         return;
@@ -1148,6 +1480,10 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ),
         ChoiceKind::Permissions => ("选择权限".to_owned(), "更改当前会话的执行权限"),
         ChoiceKind::Threads => ("恢复会话".to_owned(), "当前项目 · 搜索标题 · PgDn 加载更多"),
+        ChoiceKind::ForkReplies => (
+            "从回复处新建会话".to_owned(),
+            "包含所选回复及此前历史 · PgDn 加载更早回复",
+        ),
         ChoiceKind::InputHistory => (
             "搜索输入历史".to_owned(),
             "搜索输入 · PgDn 更多 · 列表保留最近 64 条",
@@ -1155,6 +1491,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ChoiceKind::Attachments => ("附件".to_owned(), "Enter 预览，Del 移除"),
         ChoiceKind::Files => ("引用文件".to_owned(), "选择工作区文件"),
         ChoiceKind::Skills => ("引用技能".to_owned(), "选择可用技能"),
+        ChoiceKind::ToolSteps => ("工具步骤".to_owned(), "Enter 查看详情 · Esc 返回回复"),
     };
     let description =
         if *kind == ChoiceKind::InputHistory && !state.input_history_query().is_empty() {
@@ -1207,7 +1544,11 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         };
         let prefix_width = UnicodeWidthStr::width(number.as_str()) + 2;
         let room = (content.width as usize).saturating_sub(prefix_width);
-        let name_room = label_width.min(room);
+        let name_room = if *kind == ChoiceKind::ToolSteps {
+            room
+        } else {
+            label_width.min(room)
+        };
         let name = truncate_cells(&row.name, name_room);
         let name_cells = UnicodeWidthStr::width(name.as_str());
         let mut spans = vec![
@@ -1236,7 +1577,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 },
             ),
         ];
-        if content.width >= 55 {
+        if content.width >= 55 && *kind != ChoiceKind::ToolSteps {
             let padding = label_width.saturating_sub(name_cells);
             spans.push(Span::raw(" ".repeat(padding)));
             if let Some(description) = row.description.as_deref() {
@@ -1255,7 +1596,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
 }
 
-/// 审批和长文本暂用独立查看层；常见选择操作由输入框下方的行列表承载。
+/// 详情继续使用全区查看层；帮助由 RenderPlan 在输入区上方预留空间。
 fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some(panel) = state.panel() else {
         return;
@@ -1265,22 +1606,31 @@ fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     }
     match panel {
         Panel::Commands { .. } | Panel::Choices { .. } => {}
-        Panel::Help => render_details_panel(
-            frame,
-            area,
-            "Ja 快捷键",
-            "Enter 发送或确认，Shift+Enter / Ctrl+J 换行\n/ 打开命令，Tab 补全，@ 引用文件\nEsc 关闭面板，Ctrl+R 搜索输入历史，/resume 恢复会话\nCtrl+↑ 加载更早记录，Ctrl+O 查看最近步骤\n详情用 ↑↓ / PgUp/PgDn 浏览；F2 查看完整候选说明或审批问题\nCtrl+C 清草稿 / 取消 / 退出，Ctrl+D 空草稿退出",
-            DetailScroll::FromTop(0),
-            false,
-        ),
+        Panel::Help { .. } => {}
         Panel::Details {
-            entry_id: _,
+            entry_id,
             title,
             body,
             scroll,
             return_to_pending,
         } => {
-            render_details_panel(frame, area, title, body, *scroll, *return_to_pending);
+            let refreshable = entry_id == "status"
+                || entry_id.starts_with("diff:")
+                || state.snapshot().timeline.iter().any(|entry| {
+                    entry.id == *entry_id && matches!(entry.kind, TimelineKind::Tool { .. })
+                });
+            render_details_panel(
+                frame,
+                area,
+                title,
+                body,
+                *scroll,
+                *return_to_pending,
+                (
+                    refreshable,
+                    state.snapshot().notice.as_deref().filter(|_| refreshable),
+                ),
+            );
         }
         Panel::ChoiceDetail {
             kind,
@@ -1296,10 +1646,229 @@ fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             let body = choice
                 .and_then(|choice| choice.detail.as_deref())
                 .unwrap_or("没有更多说明");
-            render_details_panel(frame, area, title, body, *scroll, false);
+            render_details_panel(frame, area, title, body, *scroll, false, (false, None));
         }
         Panel::Pending => unreachable!(),
+        Panel::ModelSettings => {
+            if let Some(view) = state.model_settings_view() {
+                super::model_settings::render(frame, area, &view);
+            }
+        }
     }
+}
+
+/// 帮助与输入区共享窄窗边距规则，布局测量和绘制不能使用不同正文列宽。
+fn help_inner_width(width: usize) -> usize {
+    let inset = if width >= 8 { 4 } else { 0 };
+    width.saturating_sub(inset).max(1)
+}
+
+/// 分组按显示列宽流入三、二或一列；刷新说明包含用量，入口与测量绘制保持一致。
+fn help_body_lines(width: usize) -> Vec<Line<'static>> {
+    let groups: [(&str, &[(&str, &str)]); 3] = [
+        (
+            "输入",
+            &[
+                ("/", "打开命令"),
+                ("@", "引用文件"),
+                ("$", "引用 Skill"),
+                ("Tab", "补全或确认候选"),
+                ("Ctrl+J", "换行（或 Shift+Enter）"),
+                ("Ctrl+R", "搜索输入历史"),
+            ],
+        ),
+        (
+            "会话",
+            &[
+                ("Enter", "发送；工作中调整任务"),
+                ("Tab", "工作中排队发送"),
+                ("/resume", "恢复会话"),
+                ("/plan create", "创建并规划目标"),
+                ("/plan execute", "执行已定稿 Plan"),
+                ("/plan status", "查看当前 Plan"),
+                ("Esc", "返回；空草稿时取消任务"),
+                ("F5", "刷新会话与用量"),
+            ],
+        ),
+        (
+            "浏览",
+            &[
+                ("滚轮 / PgUp / PgDn", "浏览正文；顶部加载更早记录"),
+                ("Ctrl+Home / Ctrl+End", "已加载顶部 / 最新回复"),
+                ("Esc", "清选区 / 回到底部 / 取消"),
+                ("Ctrl+C / Ctrl+Insert", "有选区时复制原文"),
+                ("Ctrl+O", "浏览工具步骤"),
+                ("F2", "查看候选或问题详情"),
+                ("↑ / ↓", "帮助或详情逐行滚动"),
+                ("PgUp / PgDn", "帮助或详情按页滚动"),
+                ("Home / End", "帮助或详情顶部 / 底部"),
+            ],
+        ),
+    ];
+    let width = help_inner_width(width);
+    let mut body = vec![Line::default()];
+    let mut first = 0;
+    while first < groups.len() {
+        let mut columns = Vec::new();
+        let mut used = 0;
+        for &(title, entries) in &groups[first..] {
+            let column_width = help_group_width(title, entries).min(width);
+            let gap = if columns.is_empty() { 0 } else { 4 };
+            if used + gap + column_width > width {
+                break;
+            }
+            columns.push((help_group_lines(title, entries, column_width), column_width));
+            used += gap + column_width;
+        }
+        let height = columns
+            .iter()
+            .map(|(lines, _)| lines.len())
+            .max()
+            .unwrap_or(0);
+        for row in 0..height {
+            let mut line = Line::default();
+            for (column, (lines, column_width)) in columns.iter().enumerate() {
+                let content = lines.get(row).cloned().unwrap_or_default();
+                let padding = column_width.saturating_sub(content.width());
+                line.spans.extend(content.spans);
+                if column + 1 < columns.len() {
+                    line.spans.push(Span::raw(" ".repeat(padding + 4)));
+                }
+            }
+            body.push(line);
+        }
+        body.push(Line::default());
+        first += columns.len();
+    }
+    body.extend(help_group_lines(
+        "",
+        &[
+            ("Ctrl+C", "清草稿 / 取消 / 连按退出"),
+            ("Ctrl+D", "空草稿退出"),
+        ],
+        width,
+    ));
+    body
+}
+
+/// 列宽由真实按键和说明决定，中文标题按显示列计量，避免宽窗仍被任意上限截短。
+fn help_group_width(title: &str, entries: &[(&str, &str)]) -> usize {
+    let keys = entries
+        .iter()
+        .map(|(key, _)| key.width())
+        .max()
+        .unwrap_or(0);
+    let descriptions = entries
+        .iter()
+        .map(|(_, text)| text.width())
+        .max()
+        .unwrap_or(0);
+    title.width().max(keys + 2 + descriptions)
+}
+
+/// 说明续行对齐其文本列；极窄窗口将按键和说明分行，确保滚动后仍能读到完整操作。
+fn help_group_lines(title: &str, entries: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = if title.is_empty() {
+        Vec::new()
+    } else {
+        wrap_transcript_lines(
+            vec![Line::from(Span::styled(
+                title.to_owned(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))],
+            width,
+        )
+    };
+    let keys = entries
+        .iter()
+        .map(|(key, _)| key.width())
+        .max()
+        .unwrap_or(0);
+    let stacked = width < keys + 2 + 8;
+    let indent = if stacked {
+        usize::from(width > 2) * 2
+    } else {
+        keys + 2
+    };
+    for &(key, description) in entries {
+        if stacked {
+            lines.extend(wrap_transcript_lines(
+                vec![Line::from(Span::styled(key.to_owned(), Color::LightBlue))],
+                width,
+            ));
+        }
+        let wrapped = wrap_transcript_lines(
+            vec![Line::raw(description.to_owned())],
+            width.saturating_sub(indent).max(1),
+        );
+        for (row, mut content) in wrapped.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if !stacked && row == 0 {
+                spans.push(Span::styled(key.to_owned(), Color::LightBlue));
+                spans.push(Span::raw(" ".repeat(indent.saturating_sub(key.width()))));
+            } else {
+                spans.push(Span::raw(" ".repeat(indent)));
+            }
+            spans.append(&mut content.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+/// 帮助高度由同一份折行结果测量，终端限制不足时再由 DetailScroll 提供浏览。
+fn help_panel_content_height(width: usize) -> u16 {
+    u16::try_from(help_body_lines(width).len().saturating_add(1)).unwrap_or(u16::MAX)
+}
+
+/// 标题与分组保留一行呼吸空间；短窗只滚动正文，输入及返回提示继续留在原区域。
+fn render_help_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let inset = u16::from(area.width >= 8) * 2;
+    let inner = Rect::new(
+        area.x + inset,
+        area.y,
+        area.width.saturating_sub(inset * 2),
+        area.height,
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let scroll = match state.panel() {
+        Some(Panel::Help { scroll }) => *scroll,
+        _ => return,
+    };
+    let lines = help_body_lines(area.width as usize);
+    let header_height = u16::from(inner.height >= 2);
+    if header_height > 0 {
+        frame.render_widget(
+            Paragraph::new("Ja 快捷键").style(Style::default().add_modifier(Modifier::BOLD)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    let content = inner.height.saturating_sub(header_height);
+    if content == 0 {
+        return;
+    }
+    let maximum = lines.len().saturating_sub(content as usize);
+    let start = match scroll {
+        DetailScroll::FromTop(offset) => offset.min(maximum),
+        DetailScroll::FromBottom(offset) => maximum.saturating_sub(offset),
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(content as usize)
+                .collect::<Vec<_>>(),
+        )),
+        Rect::new(inner.x, inner.y + header_height, inner.width, content),
+    );
 }
 
 /// Codex 审批列表的标题/问题/选项结构改为无边框内联区，保留 Ja 的回答 CAS 语义。
@@ -1351,7 +1920,7 @@ fn render_pending_inline(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             .fg(Color::Reset)
             .add_modifier(Modifier::BOLD),
     ))];
-    let wrapped_question = wrap_scrollback_lines(
+    let wrapped_question = wrap_transcript_lines(
         vec![Line::raw(heading.to_owned())],
         content.width.max(1) as usize,
     );
@@ -1442,13 +2011,15 @@ fn empty_choice_label(kind: ChoiceKind) -> &'static str {
         ChoiceKind::Permissions => "权限选项暂不可用",
         ChoiceKind::Threads => "当前项目暂无可恢复会话",
         ChoiceKind::InputHistory => "暂无匹配的输入历史",
+        ChoiceKind::ForkReplies => "当前会话还没有可分叉的已结算回复",
         ChoiceKind::Files => "没有匹配的文件",
         ChoiceKind::Skills => "没有匹配的技能",
         ChoiceKind::Attachments => "暂无附件",
+        ChoiceKind::ToolSteps => "当前会话尚无工具步骤",
     }
 }
 
-/// 只读查看器沿用 Codex 的无侧框正文：标题、细分隔线、内容和固定操作行。
+/// 只读详情将重读能力与诊断一同呈现，失败保留正文及固定返回操作，避免错误被整屏遮住。
 fn render_details_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1456,7 +2027,9 @@ fn render_details_panel(
     body: &str,
     scroll: DetailScroll,
     return_to_pending: bool,
+    feedback: (bool, Option<&str>),
 ) {
+    let (refreshable, notice) = feedback;
     frame.render_widget(Clear, area);
     let inset = u16::from(area.width >= 4) * 2;
     let inner = Rect::new(
@@ -1483,12 +2056,13 @@ fn render_details_panel(
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
     }
-    let content_height = inner.height.saturating_sub(3);
+    let show_notice = notice.is_some() && inner.height >= 5;
+    let content_height = inner.height.saturating_sub(3 + u16::from(show_notice));
     let source = body
         .split('\n')
         .map(|line| Line::raw(line.to_owned()))
         .collect();
-    let lines = wrap_scrollback_lines(source, inner.width as usize);
+    let lines = wrap_transcript_lines(source, inner.width as usize);
     let total = lines.len();
     let maximum = total.saturating_sub(content_height as usize);
     let start = match scroll {
@@ -1513,11 +2087,19 @@ fn render_details_panel(
     } else {
         "Esc 返回"
     };
+    let refresh_hint = if refreshable { " · F5 重读" } else { "" };
     let footer = if inner.width < 50 {
-        format!("↑↓ 滚动 · {return_label}  {end}/{total}")
+        format!("↑↓ 滚动{refresh_hint} · {return_label}  {end}/{total}")
     } else {
-        format!("↑↓ 滚动 · PgUp/PgDn 翻页 · Home/End · {return_label}  {end}/{total}")
+        format!("↑↓ 滚动 · PgUp/PgDn 翻页 · Home/End{refresh_hint} · {return_label}  {end}/{total}")
     };
+    if show_notice && let Some(notice) = notice {
+        frame.render_widget(
+            Paragraph::new(truncate_cells(notice, inner.width as usize))
+                .style(Style::default().fg(Color::Red)),
+            Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
+        );
+    }
     if inner.height >= 2 {
         frame.render_widget(
             Paragraph::new(truncate_cells(&footer, inner.width as usize))

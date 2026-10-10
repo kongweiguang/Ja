@@ -29,17 +29,16 @@ export interface InteractionAnswer {
 }
 
 export interface InteractionRequest {
-  requestId: string;
+  interactionId: string;
   threadId: string;
   turnId?: string | null;
   toolCallId?: string | null;
   planRevisionId?: string | null;
   runId?: string | null;
-  goalId?: string | null;
   questions: readonly InteractionQuestion[];
   answers: readonly InteractionAnswer[];
   status: "pending" | "answered" | "cancelled" | "superseded";
-  revision: number;
+  interactionRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -49,7 +48,8 @@ export interface InteractionSnapshot {
   eventSequence: number;
   request: InteractionRequest | null;
   draft: {
-    revision: number;
+    interactionId: string;
+    draftRevision: number;
     answers: readonly InteractionAnswer[];
     page?: number;
     collapsed?: boolean;
@@ -86,25 +86,25 @@ export interface InteractionPort {
   ): () => void;
   saveDraft(input: {
     threadId: string;
-    requestId: string;
+    interactionId: string;
     expectedDraftRevision: number;
     answers: readonly InteractionAnswer[];
     page: number;
     collapsed: boolean;
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
   submit(input: {
     threadId: string;
-    requestId: string;
-    expectedRevision: number;
+    interactionId: string;
+    expectedInteractionRevision: number;
     answers: readonly InteractionAnswer[];
-    idempotencyKey: string;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
   cancel(input: {
     threadId: string;
-    requestId: string;
-    expectedRevision: number;
-    idempotencyKey: string;
+    interactionId: string;
+    expectedInteractionRevision: number;
+    operationKey: string;
   }): Promise<InteractionSnapshot>;
 }
 

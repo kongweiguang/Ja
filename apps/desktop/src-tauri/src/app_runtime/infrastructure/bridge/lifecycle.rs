@@ -3,6 +3,7 @@
 
 // lifecycle 只负责 generation、启动状态转换和原生 Runtime owner 交接。
 
+use super::exit_cleanup::{close_native_client_and_rotate, disconnect_client_until};
 use super::*;
 use ja_runtime::app_server_process::AppServerProcessError;
 
@@ -31,7 +32,7 @@ fn runtime_startup_error_variant(error: &AppServerProcessError) -> &'static str 
         AppServerProcessError::QueueFull(_) => "queue_full",
         AppServerProcessError::QueueClosed(_) => "queue_closed",
         AppServerProcessError::PendingLimit => "pending_limit",
-        AppServerProcessError::RequestLedgerExhausted => "request_ledger_exhausted",
+        AppServerProcessError::RpcRequestLedgerExhausted => "rpc_request_ledger_exhausted",
         AppServerProcessError::DuplicateRequest => "duplicate_request",
         AppServerProcessError::DeadlineExceeded => "deadline_exceeded",
         AppServerProcessError::Cancelled => "cancelled",
@@ -68,12 +69,12 @@ fn log_runtime_startup_failure(
     );
 }
 
-pub(super) struct EventDrain {
-    pub(super) cancel: SyncSender<()>,
-    pub(super) completion: Arc<Completion>,
-    pub(super) generation: u64,
-    pub(super) detached_event_generation: Arc<AtomicU64>,
-    pub(super) join: Option<JoinHandle<()>>,
+pub(crate) struct EventDrain {
+    pub(crate) cancel: SyncSender<()>,
+    pub(crate) completion: Arc<Completion>,
+    pub(crate) generation: u64,
+    pub(crate) detached_event_generation: Arc<AtomicU64>,
+    pub(crate) join: Option<JoinHandle<()>>,
 }
 
 pub(super) struct EventDrainContext {
@@ -116,19 +117,24 @@ impl EventDrain {
         self.completion.wait_until(deadline)
     }
 
-    /// 设计原因：该函数维护 generation 生命周期转换，启动失败与停止都必须留下可确认的 owner 状态。
-    /// 只在确认完成后 join；未完成 worker 通过释放 handle 脱离，并报告为有界 shutdown fault。
-    pub(super) fn finish(&mut self, deadline: Instant) -> Result<(), RuntimeCommandError> {
+    /// 设计原因：Runtime/quarantine 是 EventDrain 的唯一 join owner；首轮超时必须保留 handle，供后续回收。
+    /// 仅在 worker 完成且 join 成功后以同代际 CAS 清除 detached 标记，不延长调用方 deadline。
+    pub(crate) fn finish(&mut self, deadline: Instant) -> Result<(), RuntimeCommandError> {
         if !self.completion.done.load(Ordering::Acquire) && !self.wait_until(deadline) {
             tracing::error!("runtime event worker exceeded its bounded stop deadline");
             self.detached_event_generation
                 .store(self.generation, Ordering::Release);
-            self.join.take();
             return Err(RuntimeCommandError::shutdown_timeout());
         }
         if let Some(join) = self.join.take() {
             join.join()
                 .map_err(|_| RuntimeCommandError::unavailable())?;
+            let _ = self.detached_event_generation.compare_exchange(
+                self.generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
         Ok(())
     }
@@ -326,6 +332,7 @@ pub(super) fn cleanup_confirmed(
 pub(super) struct StartRuntimeContext<'a> {
     pub(super) config: &'a LaunchConfig,
     pub(super) sink: &'a EventSink,
+    pub(super) identity: &'a mut NativeClientIdentity,
     pub(super) runtime: &'a mut Option<RunningRuntime>,
     pub(super) pending_cleanup: &'a mut Option<SharedAppServerClient>,
     pub(super) next_generation: &'a mut u64,
@@ -342,6 +349,7 @@ pub(super) struct StartRuntimeContext<'a> {
 /// 最多启动一个 Ja App Server sidecar generation；此边界返回不含 token 的 Host 状态前，
 /// handshake 必须已消费 ready-token echo。WebView 在重载窗口内暂时不可达时，状态投影可由
 /// 后续 `state` snapshot 补回，因此不能将投递失败升级为 sidecar 启动失败并销毁用户会话。
+/// 已退出 client 仍作为本地故障事实保留；显式 start 复用有界 cleanup，并在确认后才连接新 client。
 /// 启动错误日志只投影固定阶段、枚举类别和 generation，不记录 wire 内容或原始错误文本。
 pub(super) fn start_runtime(
     context: StartRuntimeContext<'_>,
@@ -349,6 +357,7 @@ pub(super) fn start_runtime(
     let StartRuntimeContext {
         config,
         sink,
+        identity,
         runtime,
         pending_cleanup,
         next_generation,
@@ -363,14 +372,73 @@ pub(super) fn start_runtime(
     if exit_control.is_cancelled() {
         return Err(RuntimeCommandError::shutdown_timeout());
     }
-    if detached_event_generation.load(Ordering::Acquire) != 0
-        || cleanup_fault.is_pending()
-        || pending_cleanup.is_some()
-    {
+    if detached_event_generation.load(Ordering::Acquire) != 0 {
         return Err(RuntimeCommandError::shutdown_timeout());
     }
     if let Some(current) = runtime.as_mut() {
-        return Ok(current_status(current));
+        if pending_cleanup.is_some() {
+            return Err(RuntimeCommandError::shutdown_timeout());
+        }
+        let cleanup_generation = cleanup_fault.generation();
+        match current.client.state() {
+            ja_runtime::app_server_process::LifecycleState::Ready
+            | ja_runtime::app_server_process::LifecycleState::Busy
+                if cleanup_generation == 0 =>
+            {
+                return Ok(current_status(current));
+            }
+            ja_runtime::app_server_process::LifecycleState::Exited
+            | ja_runtime::app_server_process::LifecycleState::Backoff => {
+                if cleanup_generation != 0 && cleanup_generation != current.generation {
+                    return Err(RuntimeCommandError::shutdown_timeout());
+                }
+                let Some(mut previous) = runtime.take() else {
+                    return Err(RuntimeCommandError::unavailable());
+                };
+                current_generation.store(0, Ordering::Release);
+                if let Err(error) = shutdown_components(
+                    &mut previous,
+                    cleanup_deadline(exit_control, config.shutdown_timeout),
+                    runtime_control.as_ref(),
+                ) {
+                    cleanup_fault.mark(previous.generation);
+                    *runtime = Some(previous);
+                    return Err(error);
+                }
+                cleanup_fault.clear(previous.generation);
+                terminal_fault.clear();
+                task_observations.clear();
+            }
+            _ if cleanup_generation == 0 => return Ok(current_status(current)),
+            _ => return Err(RuntimeCommandError::shutdown_timeout()),
+        }
+    } else if let Some(mut pending) = pending_cleanup.take() {
+        let generation = pending.generation();
+        let cleanup_generation = cleanup_fault.generation();
+        if cleanup_generation != 0 && cleanup_generation != generation {
+            *pending_cleanup = Some(pending);
+            return Err(RuntimeCommandError::shutdown_timeout());
+        }
+        let cleanup_deadline = cleanup_deadline(exit_control, config.shutdown_timeout);
+        let cleanup_result = close_native_client_and_rotate(
+            &mut pending,
+            config,
+            identity,
+            true,
+            cleanup_deadline,
+            runtime_control.as_ref(),
+        )
+        .and_then(|()| {
+            disconnect_client_until(&mut pending, cleanup_deadline, runtime_control.as_ref())
+        });
+        if let Err(error) = cleanup_result {
+            cleanup_fault.mark(generation);
+            *pending_cleanup = Some(pending);
+            return Err(error);
+        }
+        cleanup_fault.clear(generation);
+    } else if cleanup_fault.is_pending() {
+        return Err(RuntimeCommandError::shutdown_timeout());
     }
     if let Err(error) = emit_status(sink, RuntimeStatusKind::Starting, 0, None, "starting", None)
         && projection_failure_is_terminal(&error)
@@ -381,7 +449,7 @@ pub(super) fn start_runtime(
     // 本地请求编号只约束并发启动；事件和状态必须统一使用后台的权威 generation。
     let host_generation = *next_generation;
     let mut client = runtime_control
-        .connect_client(config, host_generation)
+        .connect_client(config, host_generation, identity)
         .inspect_err(|_| runtime_control.record("start_client_connect_error"))?;
     if let Some(session) = client.session_for_cancellation() {
         exit_control.attach_session(session);
@@ -389,6 +457,8 @@ pub(super) fn start_runtime(
     if exit_control.is_cancelled() {
         retain_failed_client(
             client,
+            config,
+            identity,
             pending_cleanup,
             cleanup_fault,
             cleanup_deadline(exit_control, config.shutdown_timeout),
@@ -405,6 +475,8 @@ pub(super) fn start_runtime(
             log_runtime_startup_failure("event_pump_take", &error, generation);
             retain_failed_client(
                 client,
+                config,
+                identity,
                 pending_cleanup,
                 cleanup_fault,
                 cleanup_deadline(exit_control, config.shutdown_timeout),
@@ -433,6 +505,8 @@ pub(super) fn start_runtime(
             current_generation.store(0, Ordering::Release);
             retain_failed_client(
                 client,
+                config,
+                identity,
                 pending_cleanup,
                 cleanup_fault,
                 cleanup_deadline(exit_control, config.shutdown_timeout),
@@ -458,11 +532,19 @@ pub(super) fn start_runtime(
         if projection_failure_is_terminal(&error) {
             current_generation.store(0, Ordering::Release);
             let mut current = current;
-            if let Err(cleanup_error) = shutdown_components(
-                &mut current,
-                cleanup_deadline(exit_control, config.shutdown_timeout),
+            let cleanup_deadline = cleanup_deadline(exit_control, config.shutdown_timeout);
+            let cleanup_result = close_native_client_and_rotate(
+                &mut current.client,
+                config,
+                identity,
+                true,
+                cleanup_deadline,
                 runtime_control.as_ref(),
-            ) {
+            )
+            .and_then(|()| {
+                shutdown_components(&mut current, cleanup_deadline, runtime_control.as_ref())
+            });
+            if let Err(cleanup_error) = cleanup_result {
                 cleanup_fault.mark(generation);
                 *runtime = Some(current);
                 tracing::error!(

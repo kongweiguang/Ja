@@ -6,14 +6,17 @@ import {
   timelineEventFromUnknown,
   timelineSnapshotValidationReason,
 } from "@/features/conversation/domain/timelineContracts";
+import { turnStatusLabel } from "@/features/conversation/domain/timelineTypes";
 import {
   applyEventValue,
   applyRuntimeStatus,
   applySnapshot as applyTimelineSnapshot,
+  applyTaskActivity,
   applyTurnAccepted,
   createTimelineState,
   markThreadResync,
   type ApplySnapshotOptions,
+  type TimelineTaskActivityInput,
   type TimelineState,
 } from "@/features/conversation/domain/timelineReducer";
 
@@ -30,11 +33,12 @@ function requestUsage(
   overrides: Record<string, unknown> = {},
 ) {
   const base = {
-    requestId: `request_${modelRound}`,
-    requestOrdinal: modelRound,
+    modelRequestId: `modelreq_${modelRound}`,
+    modelRequestOrdinal: modelRound,
     modelRound,
     purpose: "assistant" as const,
     certainty: "known" as const,
+    contextEstimate: null,
     profile: {
       providerId: "provider_demo",
       modelId: "model_demo",
@@ -76,6 +80,21 @@ function presentation(
     relativePaths: [],
     truncated: false,
     ...overrides,
+  };
+}
+
+/** 为完整正文夹具生成 JA-RPC v2 必填长度事实，按 Unicode code point 而非 UTF-16 单元计数。 */
+function publicTextMetadata(text: string) {
+  return { truncated: false, totalCharacters: Array.from(text).length };
+}
+
+/** 为终态 fixture 生成与 JA-RPC v2 一致的 512 code-point 公开预览。 */
+function terminalPreview(text: string) {
+  const characters = Array.from(text);
+  return {
+    text: characters.slice(0, 512).join(""),
+    totalCharacters: characters.length,
+    truncated: characters.length > 512,
   };
 }
 
@@ -143,6 +162,30 @@ function event(
     occurredAt: `2026-08-18T00:00:0${Math.min(threadRevision, 9)}Z`,
     ...params,
   };
+  if (method === "turn/terminal") {
+    if (
+      params["summaryTotalCharacters"] === undefined &&
+      params["summaryTruncated"] === undefined
+    ) {
+      const summary = terminalPreview(
+        typeof baseParams["summary"] === "string" ? baseParams["summary"] : "",
+      );
+      baseParams["summary"] = summary.text;
+      baseParams["summaryTotalCharacters"] = summary.totalCharacters;
+      baseParams["summaryTruncated"] = summary.truncated;
+    }
+    const finalMessage = baseParams["finalMessage"];
+    if (
+      typeof finalMessage === "object" &&
+      finalMessage !== null &&
+      (finalMessage as Record<string, unknown>)["totalCharacters"] === undefined &&
+      (finalMessage as Record<string, unknown>)["truncated"] === undefined
+    ) {
+      const value = finalMessage as Record<string, unknown>;
+      const preview = terminalPreview(typeof value["text"] === "string" ? value["text"] : "");
+      baseParams["finalMessage"] = { ...value, ...preview };
+    }
+  }
   if (method === "turn/terminal" && !("changeSet" in params)) {
     baseParams["changeSet"] = {
       state: "complete",
@@ -174,7 +217,349 @@ function applySnapshot(
   return applyTimelineSnapshot(state, value, workspaceId, options);
 }
 
+/** 为 Activity 单调归约构造 owner/task/activity 三种 revision 与 identity 一致的事实。 @author kongweiguang */
+function taskActivityInput(
+  activitySequence = 3,
+  taskRevision = 2,
+  activityId = `activity_${activitySequence}`,
+): TimelineTaskActivityInput {
+  const taskThreadId = "thr_activity_child";
+  const task = {
+    taskThreadId,
+    parentThreadId: threadId,
+    rootThreadId: threadId,
+    originTurnId: turnId,
+    taskName: "检查合同",
+    depth: 1,
+    taskKind: "subagent" as const,
+    lifecycle: "attached" as const,
+    state: "running" as const,
+    revision: taskRevision,
+    latestActivitySequence: activitySequence,
+    unreadCount: 1,
+    descendantCount: 0,
+    runningDescendantCount: 0,
+    needsAttentionCount: 0,
+    latestSafeSummary: "正在检查",
+    startedAt: "2026-09-03T08:00:00Z",
+    completedAt: null,
+    updatedAt: `2026-09-03T08:00:${String(activitySequence).padStart(2, "0")}Z`,
+  };
+  return {
+    rootThreadId: threadId,
+    taskThreadId,
+    taskRevision,
+    task,
+    activity: {
+      activitySequence,
+      activityId,
+      rootThreadId: threadId,
+      taskThreadId,
+      actorThreadId: taskThreadId,
+      causalTurnId: turnId,
+      kind: "progress",
+      summary: { text: `进度 ${activitySequence}` },
+      createdAt: task.updatedAt,
+    },
+  };
+}
+
 describe("timeline reducer", () => {
+  /** 同一 Task 的 revision 与 Activity 水位独立单调；重复 identity 幂等，旧事件不能倒退摘要。 @author kongweiguang */
+  it("reduces Task Activity by root, task revision and immutable activity identity", () => {
+    let state = applyRuntimeStatus(createTimelineState(), {
+      status: "ready",
+      generation: 1,
+      serverInstanceId,
+    });
+    const first = taskActivityInput();
+    state = applyTaskActivity(state, first);
+    expect(state.lastOutcome).toBe("applied");
+    const firstEntries = state.taskActivitiesByRootThread[threadId];
+
+    state = applyTaskActivity(state, first);
+    expect(state.lastOutcome).toBe("duplicate");
+    expect(state.taskActivitiesByRootThread[threadId]).toBe(firstEntries);
+
+    state = applyTaskActivity(state, taskActivityInput(4, 3, "activity_next"));
+    expect(state.lastOutcome).toBe("applied");
+    expect(
+      state.taskActivitiesByRootThread[threadId]?.map((entry) => entry.activity.activityId),
+    ).toEqual(["activity_3", "activity_next"]);
+
+    const newestEntries = state.taskActivitiesByRootThread[threadId];
+    state = applyTaskActivity(state, taskActivityInput(4, 2, "activity_next"));
+    expect(state.lastOutcome).toBe("duplicate");
+    expect(state.taskActivitiesByRootThread[threadId]).toBe(newestEntries);
+    state = applyTaskActivity(state, taskActivityInput(2, 2, "activity_late_arrival"));
+    expect(state.lastOutcome).toBe("applied");
+    expect(
+      state.taskActivitiesByRootThread[threadId]?.find(
+        (entry) => entry.activity.activityId === "activity_late_arrival",
+      )?.task,
+    ).toMatchObject({ revision: 3, latestActivitySequence: 4 });
+
+    state = applyTaskActivity(state, {
+      ...taskActivityInput(6, 4, "activity_wrong_owner"),
+      rootThreadId: "thr_other",
+    });
+    expect(state.lastOutcome).toBe("invalid");
+    expect(state.taskActivitiesByRootThread["thr_other"]).toBeUndefined();
+  });
+
+  /** 新 Snapshot 可补历史但不能抹掉期间收到的 Task Event；随行摘要统一推进到最新 Task revision。 @author kongweiguang */
+  it("merges a late snapshot with newer live Task Activity without duplication or regression", () => {
+    let state = applyRuntimeStatus(createTimelineState(), {
+      status: "ready",
+      generation: 1,
+      serverInstanceId,
+    });
+    const first = taskActivityInput();
+    const baseline = {
+      threadId,
+      revision: 4,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [{ activity: first.activity, task: first.task }],
+      liveStream: null,
+      nextCursor: null,
+    };
+    state = applySnapshot(state, baseline, "ws_one");
+    expect(state.lastOutcome).toBe("applied");
+
+    state = applyTaskActivity(state, taskActivityInput(4, 3, "activity_live"));
+    expect(state.lastOutcome).toBe("applied");
+    state = applySnapshot(state, { ...baseline, revision: 5 }, "ws_one");
+    expect(state.lastOutcome).toBe("applied");
+
+    const stored = state.taskActivitiesByRootThread[threadId] ?? [];
+    expect(stored.map((entry) => entry.activity.activityId)).toEqual([
+      "activity_3",
+      "activity_live",
+    ]);
+    expect(stored.every((entry) => entry.task.revision === 3)).toBe(true);
+    state = applyTaskActivity(state, taskActivityInput(4, 3, "activity_live"));
+    expect(state.lastOutcome).toBe("duplicate");
+    expect(state.taskActivitiesByRootThread[threadId]).toHaveLength(2);
+  });
+
+  /** 同 revision 的空快照只在请求期 owner 切片未变时清空；无围栏的显式快照仍保持权威语义。 @author kongweiguang */
+  it("preserves Task Activity changed after an empty snapshot read began", () => {
+    const baseline = readyState();
+    const readFence = { threadId, entries: baseline.taskActivitiesByRootThread[threadId] };
+    const live = applyTaskActivity(baseline, taskActivityInput(3, 2, "activity_during_read"));
+    const liveSlice = live.taskActivitiesByRootThread[threadId];
+    expect(liveSlice).toHaveLength(1);
+
+    const empty = (revision: number) => ({
+      threadId,
+      revision,
+      turns: [],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      taskActivities: [],
+      nextCursor: null,
+    });
+    const raced = applySnapshot(live, empty(4), "ws_one", {
+      taskActivityReadFence: readFence,
+    });
+    expect(raced.taskActivitiesByRootThread[threadId]).toBe(liveSlice);
+
+    const stableEmpty = applySnapshot(raced, empty(5), "ws_one", {
+      taskActivityReadFence: { threadId, entries: liveSlice },
+    });
+    expect(stableEmpty.taskActivitiesByRootThread[threadId]).toEqual([]);
+
+    const directEmpty = applySnapshot(stableEmpty, empty(6), "ws_one");
+    expect(directEmpty.taskActivitiesByRootThread[threadId]).toEqual([]);
+  });
+
+  /** Domain admission 要求审批绑定无媒体的待执行展示，防止绕开 transport schema 后丢失安全边界。 */
+  it("requires a pending media-free Tool presentation on approval requests", () => {
+    const requested = {
+      approvalId: "appr_pending_tool",
+      callId: "call_pending_tool",
+      toolName: "shell",
+      presentation: presentation("shell", "pending", { command: "pnpm test" }),
+      reason: "需要确认",
+      expiresAt: "2099-08-18T00:00:01Z",
+      from: "running",
+      to: "waiting_approval",
+    };
+
+    expect(timelineEventFromUnknown(event("approval/requested", 2, requested))).toBeDefined();
+    expect(
+      timelineEventFromUnknown(
+        event("approval/requested", 2, {
+          ...requested,
+          presentation: presentation("shell", "success", { command: "pnpm test" }),
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      timelineEventFromUnknown(
+        event("approval/requested", 2, {
+          ...requested,
+          presentation: presentation("shell", "pending", {
+            command: "pnpm test",
+            media: [
+              {
+                attachmentId: "att_approval_image",
+                displayName: "screen.png",
+                mediaType: "image/png",
+                sizeBytes: 128,
+              },
+            ],
+          }),
+        }),
+      ),
+    ).toBeUndefined();
+    const missing = event("approval/requested", 2, requested) as {
+      params: Record<string, unknown>;
+    };
+    delete missing.params["presentation"];
+    expect(timelineEventFromUnknown(missing)).toBeUndefined();
+  });
+
+  /** 缺失 Turn 或错位 Prepared Tool 行时只请求权威重同步，不能制造伪工具或审批卡片。 */
+  it("resyncs approval requests with missing Turn or mismatched Tool identity without projecting rows", () => {
+    const requested = {
+      approvalId: "appr_missing_target",
+      callId: "call_missing_target",
+      toolName: "shell",
+      presentation: presentation("shell", "pending", { command: "pnpm test" }),
+      reason: "需要确认",
+      expiresAt: "2099-08-18T00:00:01Z",
+      from: "running",
+      to: "waiting_approval",
+    };
+    let running = readyState();
+    running = apply(running, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+
+    const missingTool = apply(running, event("approval/requested", 2, requested));
+    expect(missingTool.resyncRequired[threadId]).toBe("missing_item");
+    expect(missingTool.turns[turnId]?.status).toBe("running");
+    expect(missingTool.approvalsById[requested.approvalId]).toBeUndefined();
+    expect(missingTool.items["item_2"]).toBeUndefined();
+    expect(Object.values(missingTool.items).some((item) => item.kind === "tool_call")).toBe(false);
+
+    const withPreparedTool = apply(
+      running,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_model_step_for_missing_target",
+        text: "准备执行命令",
+        modelRound: 1,
+        usage: requestUsage(1, 8, 2, 10),
+        toolCalls: [
+          {
+            callId: requested.callId,
+            toolName: requested.toolName,
+            ordinal: 0,
+            presentation: requested.presentation,
+          },
+        ],
+      }),
+    );
+    const toolItemId =
+      withPreparedTool.toolItemIdByCallId[`${threadId}:${turnId}:${requested.callId}`];
+    expect(toolItemId).toBeDefined();
+    const mismatchedTool = {
+      ...withPreparedTool,
+      items: {
+        ...withPreparedTool.items,
+        [toolItemId as string]: {
+          ...withPreparedTool.items[toolItemId as string]!,
+          turnId: "turn_other",
+        },
+      },
+    };
+    const rejectedTool = apply(mismatchedTool, event("approval/requested", 3, requested));
+    expect(rejectedTool.resyncRequired[threadId]).toBe("missing_item");
+    expect(rejectedTool.turns[turnId]?.status).toBe("running");
+    expect(rejectedTool.approvalsById[requested.approvalId]).toBeUndefined();
+    expect(rejectedTool.items["item_3"]).toBeUndefined();
+
+    const missingTurn = {
+      ...withPreparedTool,
+      turns: {},
+    };
+    const rejectedTurn = apply(missingTurn, event("approval/requested", 3, requested));
+    expect(rejectedTurn.resyncRequired[threadId]).toBe("invalid_event");
+    expect(rejectedTurn.approvalsById[requested.approvalId]).toBeUndefined();
+    expect(rejectedTurn.items["item_3"]).toBeUndefined();
+  });
+
+  /** Domain parser 与 transport schema 共享终态缺失/空值规则，并保留真实 ChangeSet 对象。 */
+  it("distinguishes a missing terminal change set from an explicit null", () => {
+    const committed = {
+      state: "partial",
+      incompleteReasons: ["commit_unconfirmed"],
+      files: [],
+      stats: { files: 0, additions: 0, deletions: 0, binaryFiles: 0, truncated: false },
+    };
+    const failedWithFact = event("turn/terminal", 2, {
+      state: "failed",
+      summary: "failed",
+      errorCode: "MODEL_ERROR",
+      errorMessage: "failed",
+      changeSet: committed,
+    });
+    expect(timelineEventFromUnknown(failedWithFact)).toMatchObject({
+      params: { changeSet: committed },
+    });
+    expect(
+      timelineEventFromUnknown(
+        event("turn/terminal", 2, {
+          state: "failed",
+          summary: "failed",
+          errorCode: "MODEL_ERROR",
+          errorMessage: "failed",
+          changeSet: null,
+        }),
+      ),
+    ).toMatchObject({ params: { changeSet: null } });
+    expect(
+      timelineEventFromUnknown(
+        event("turn/terminal", 2, {
+          state: "completed",
+          summary: "done",
+          changeSet: null,
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      timelineEventFromUnknown(
+        event("turn/terminal", 2, {
+          state: "cancelled",
+          summary: "cancelled",
+          changeSet: null,
+        }),
+      ),
+    ).toMatchObject({ params: { changeSet: null } });
+    const missingChangeSet = event("turn/terminal", 2, {
+      state: "cancelled",
+      summary: "cancelled",
+      changeSet: null,
+    }) as { params: Record<string, unknown> };
+    delete missingChangeSet.params["changeSet"];
+    expect(timelineEventFromUnknown(missingChangeSet)).toBeUndefined();
+    expect(
+      timelineEventFromUnknown(
+        event("turn/terminal", 2, {
+          state: "unknown",
+          summary: "unknown",
+          changeSet: null,
+        }),
+      ),
+    ).toBeUndefined();
+    expect(turnStatusLabel("waiting_input")).toBe("等待你的输入");
+    expect(turnStatusLabel("running")).toBe("正在工作");
+  });
+
   /** 最后一轮只带尾段时，已确认的同 Turn 草稿仍组成一份完整最终答复。 */
   it("joins live output-limit segments without a full terminal copy", () => {
     let state = readyState();
@@ -223,6 +608,52 @@ describe("timeline reducer", () => {
     expect(capped.items["item_answer_capped"]?.text).toBe("first part second part");
   });
 
+  /** 终态合并以 code point 计数，并保留 512 字预览背后的完整摘要与正文长度。 */
+  it("preserves terminal preview metadata when merging astral text", () => {
+    const preview = "😀".repeat(512);
+    const mergedText = `${preview}尾`;
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/text-delta", 1, {
+        eventId: "evt_terminal_preview_delta",
+        sequence: 2,
+        streamSeq: 1,
+        text: mergedText,
+      }),
+    );
+    state = apply(
+      state,
+      event("turn/terminal", 2, {
+        eventId: "evt_terminal_preview",
+        sequence: 3,
+        state: "completed",
+        summary: preview,
+        summaryTotalCharacters: 600,
+        summaryTruncated: true,
+        finalMessage: {
+          messageId: "item_terminal_preview",
+          text: preview,
+          totalCharacters: 600,
+          truncated: true,
+        },
+      }),
+    );
+
+    expect(state.items["item_terminal_preview"]).toMatchObject({
+      text: mergedText,
+      bodyTotalCharacters: 600,
+      bodyTruncated: true,
+    });
+    expect(state.turns[turnId]).toMatchObject({
+      summary: preview,
+      summaryTotalCharacters: 600,
+      summaryTruncated: true,
+    });
+    expect(Array.from(state.items["item_terminal_preview"]?.text ?? "")).toHaveLength(513);
+  });
+
   /** 历史只拼接最后一个 Tool 之后的续写段，旧版已合并终态也不能重复前缀。 */
   it("rebuilds durable output-limit segments without crossing tools", () => {
     const snapshot = (finalText: string) => ({
@@ -245,6 +676,7 @@ describe("timeline reducer", () => {
           turnId,
           kind: "assistant_progress",
           text: "tool preface ",
+          ...publicTextMetadata("tool preface "),
           modelRound: 1,
           createdAt: "2026-08-18T00:00:01Z",
         },
@@ -263,6 +695,7 @@ describe("timeline reducer", () => {
           turnId,
           kind: "assistant_progress",
           text: "first part ",
+          ...publicTextMetadata("first part "),
           modelRound: 2,
           createdAt: "2026-08-18T00:00:03Z",
         },
@@ -271,6 +704,7 @@ describe("timeline reducer", () => {
           turnId,
           kind: "final_answer",
           text: finalText,
+          ...publicTextMetadata(finalText),
           createdAt: "2026-08-18T00:00:04Z",
         },
       ],
@@ -278,7 +712,6 @@ describe("timeline reducer", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     });
     const current = applySnapshot(readyState(), snapshot("second part"), "ws_one");
@@ -328,7 +761,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [taskActivityEntry()],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -346,7 +778,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -372,7 +803,6 @@ describe("timeline reducer", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [entry],
-      goalActivities: [],
       nextCursor: null,
     });
     expect(timelineSnapshotValidationReason(snapshot(taskActivityEntry()))).toBeUndefined();
@@ -428,7 +858,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "",
@@ -501,7 +930,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -531,6 +959,7 @@ describe("timeline reducer", () => {
           turnId,
           kind: "user_input",
           content: [{ type: "text", text: "先执行工具" }],
+          ...publicTextMetadata("先执行工具"),
           attachments: [],
           createdAt: "2026-08-18T00:00:00Z",
         },
@@ -544,16 +973,19 @@ describe("timeline reducer", () => {
           presentation: presentation("read", "success"),
           createdAt: "2026-08-18T00:00:01Z",
         },
-        ...[
-          ["steering", "先按新方向处理", "调整方向已优先处理"],
-          ["edited", "编辑后的普通消息", "编辑后的普通消息已处理"],
-          ["follow_up", "最后一条普通消息", "最后一条普通消息已处理"],
-        ].flatMap(([suffix, input, answer], index) => [
+        ...(
+          [
+            ["steering", "先按新方向处理", "调整方向已优先处理"],
+            ["edited", "编辑后的普通消息", "编辑后的普通消息已处理"],
+            ["follow_up", "最后一条普通消息", "最后一条普通消息已处理"],
+          ] as const
+        ).flatMap(([suffix, input, answer], index) => [
           {
             itemId: `item_${suffix}_input`,
             turnId,
             kind: "user_input",
             content: [{ type: "text", text: input }],
+            ...publicTextMetadata(input),
             attachments: [],
             createdAt: `2026-08-18T00:00:0${index + 2}Z`,
           },
@@ -562,6 +994,7 @@ describe("timeline reducer", () => {
             turnId,
             kind: "final_answer",
             text: answer,
+            ...publicTextMetadata(answer),
             createdAt: `2026-08-18T00:00:0${index + 5}Z`,
           },
         ]),
@@ -570,7 +1003,6 @@ describe("timeline reducer", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     };
 
@@ -598,7 +1030,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -624,8 +1055,8 @@ describe("timeline reducer", () => {
             toolName: "read",
             ordinal: 0,
             presentation: presentation("read", "pending", {
-              inputPreview: "README.md",
-              relativePaths: ["README.md"],
+              inputPreview: "proposal preview",
+              relativePaths: [],
             }),
           },
         ],
@@ -640,6 +1071,10 @@ describe("timeline reducer", () => {
         approvalId: "appr_review_read",
         callId: "call_fake_review_read",
         toolName: "read",
+        presentation: presentation("read", "pending", {
+          inputPreview: "README.md",
+          relativePaths: ["README.md"],
+        }),
         reason: "Tool requires approval",
         expiresAt: "2099-08-18T00:00:01Z",
         from: "running",
@@ -653,6 +1088,10 @@ describe("timeline reducer", () => {
     expect(state.items[preparedTool?.itemId ?? ""]?.metadata?.presentation?.status).toBe(
       "waiting_approval",
     );
+    expect(state.items[preparedTool?.itemId ?? ""]?.metadata?.presentation).toMatchObject({
+      inputPreview: "README.md",
+      relativePaths: ["README.md"],
+    });
     expect(state.resyncRequired[threadId]).toBeUndefined();
     expect(state.approvalsById["appr_review_read"]?.approval?.callId).toBe("call_fake_review_read");
   });
@@ -692,6 +1131,10 @@ describe("timeline reducer", () => {
         approvalId: "appr_one",
         callId: "call_one",
         toolName: "shell",
+        presentation: presentation("shell", "pending", {
+          command: "pnpm test",
+          relativeCwd: "workspace",
+        }),
         reason: "运行测试",
         expiresAt: "2099-08-18T00:00:01Z",
         from: "running",
@@ -716,6 +1159,9 @@ describe("timeline reducer", () => {
       }),
     );
     expect(state.items[preparedTool?.itemId ?? ""]?.metadata?.presentation?.status).toBe("running");
+    expect(state.items[preparedTool?.itemId ?? ""]?.metadata?.presentation?.command).toBe(
+      "pnpm test",
+    );
     state = apply(state, event("tool/started", 5, { callId: "call_one", ordinal: 0 }));
     expect(state.items[preparedTool?.itemId ?? ""]?.metadata?.presentation?.status).toBe("running");
     state = apply(
@@ -766,6 +1212,146 @@ describe("timeline reducer", () => {
     expect(state.items["item_final"]?.metadata?.usageTotalTokens).toBe(15);
     expect(state.items["item_final"]?.metadata?.failureReply).toBeUndefined();
     expect(state.lastOutcome).toBe("applied");
+    expect(state.resyncRequired[threadId]).toBeUndefined();
+  });
+
+  /** Provider callId 仅在 Turn 内唯一；后续 Turn 的 live started 必须命中自己的 Item。 */
+  it("isolates live Tool items when a later Turn reuses the same callId", () => {
+    let state = readyState();
+    state = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 0,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    const firstTurnId = "turn_first_identity";
+    const secondTurnId = "turn_second_identity";
+    state = applyTurnAccepted(state, {
+      threadId,
+      turnId: firstTurnId,
+      threadRevision: 1,
+      submittedText: "第一轮",
+      submittedAt: "2026-08-18T00:00:01Z",
+    });
+    state = apply(
+      state,
+      event("turn/state-changed", 2, {
+        turnId: firstTurnId,
+        from: "queued",
+        to: "running",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 3, {
+        turnId: firstTurnId,
+        messageId: "item_first_model_step",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(1, 8, 2, 10),
+        toolCalls: [
+          {
+            callId: "call_reused_across_turns",
+            toolName: "shell",
+            ordinal: 0,
+            presentation: presentation("shell", "pending", { command: "first" }),
+          },
+        ],
+      }),
+    );
+    state = apply(
+      state,
+      event("tool/started", 4, {
+        turnId: firstTurnId,
+        callId: "call_reused_across_turns",
+        ordinal: 0,
+      }),
+    );
+    state = apply(
+      state,
+      event("tool/batch-committed", 5, {
+        turnId: firstTurnId,
+        results: [
+          {
+            callId: "call_reused_across_turns",
+            outcome: "succeeded",
+            ordinal: 0,
+            presentation: presentation("shell", "success", { command: "first" }),
+          },
+        ],
+      }),
+    );
+    state = apply(
+      state,
+      event("turn/terminal", 6, {
+        turnId: firstTurnId,
+        state: "completed",
+        summary: "第一轮完成",
+      }),
+    );
+    state = applyTurnAccepted(state, {
+      threadId,
+      turnId: secondTurnId,
+      threadRevision: 7,
+      submittedText: "第二轮",
+      submittedAt: "2026-08-18T00:00:07Z",
+    });
+    state = apply(
+      state,
+      event("turn/state-changed", 8, {
+        turnId: secondTurnId,
+        from: "queued",
+        to: "running",
+      }),
+    );
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 9, {
+        turnId: secondTurnId,
+        messageId: "item_second_model_step",
+        text: "",
+        modelRound: 1,
+        usage: requestUsage(1, 8, 2, 10, { modelRequestId: "modelreq_second_turn" }),
+        toolCalls: [
+          {
+            callId: "call_reused_across_turns",
+            toolName: "shell",
+            ordinal: 0,
+            presentation: presentation("shell", "pending", { command: "second" }),
+          },
+        ],
+      }),
+    );
+    state = apply(
+      state,
+      event("tool/started", 10, {
+        turnId: secondTurnId,
+        callId: "call_reused_across_turns",
+        ordinal: 0,
+      }),
+    );
+
+    const toolItems = Object.values(state.items).filter(
+      (item) => item.metadata?.callId === "call_reused_across_turns",
+    );
+    expect(toolItems).toHaveLength(2);
+    expect(toolItems.find((item) => item.turnId === firstTurnId)).toMatchObject({
+      status: "completed",
+      metadata: { presentation: { status: "success" } },
+    });
+    expect(toolItems.find((item) => item.turnId === secondTurnId)).toMatchObject({
+      status: "in_progress",
+      metadata: { presentation: { status: "running" } },
+    });
     expect(state.resyncRequired[threadId]).toBeUndefined();
   });
 
@@ -842,7 +1428,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -883,6 +1468,30 @@ describe("timeline reducer", () => {
       text: "本轮未能完成，请检查后重试。",
       metadata: { failureReply: true },
     });
+  });
+
+  /** 失败终态没有助手文案时，只保留权威错误与终态，不合成 Final Timeline item。 */
+  it("keeps the real failure message when a failed terminal omits finalMessage", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("turn/terminal", 2, {
+        state: "failed",
+        summary: "本轮未能完成",
+        errorCode: "MODEL_UPSTREAM_REJECTED",
+        errorMessage: "模型服务拒绝了请求",
+      }),
+    );
+
+    expect(state.turns[turnId]).toMatchObject({
+      status: "failed",
+      error: { code: "MODEL_UPSTREAM_REJECTED", message: "模型服务拒绝了请求" },
+    });
+    const finalItems = (state.itemIdsByThread[threadId] ?? [])
+      .map((itemId) => state.items[itemId])
+      .filter((item) => item?.kind === "agent_message" && item.final);
+    expect(finalItems).toHaveLength(0);
   });
 
   /** Terminal 不应抹掉仍有阅读价值的瞬态内容；历史快照到达后再由持久事实完整接管。 */
@@ -1008,7 +1617,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1043,7 +1651,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1053,6 +1660,95 @@ describe("timeline reducer", () => {
     expect(late.threadRevisionByThread[threadId]).toBe(18);
     expect(late.turns[turnId]?.status).toBe("suspended");
     expect(late.turns[turnId]?.threadRevision).toBe(18);
+  });
+
+  /** Controller 不再复制正文状态；共享 Reducer 必须自己保住同 revision 已接纳的 Turn 终态。 */
+  it("keeps an accepted terminal Turn when a same-revision running snapshot arrives", () => {
+    const completed = applySnapshot(
+      readyState(),
+      {
+        threadId,
+        revision: 21,
+        turns: [
+          {
+            turnId,
+            status: "completed",
+            requestedAt: "2026-08-18T00:00:01Z",
+            updatedAt: "2026-08-18T00:00:21Z",
+            completedAt: "2026-08-18T00:00:21Z",
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+
+    const late = applySnapshot(
+      completed,
+      {
+        threadId,
+        revision: 21,
+        turns: [
+          {
+            turnId,
+            status: "running",
+            requestedAt: "2026-08-18T00:00:01Z",
+            updatedAt: "2026-08-18T00:00:21Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+
+    expect(late.lastOutcome).toBe("late");
+    expect(late.snapshotRevisionByThread[threadId]).toBe(21);
+    expect(late.turns[turnId]?.status).toBe("completed");
+
+    const otherThread = applySnapshot(
+      late,
+      {
+        threadId: "thr_other",
+        revision: 21,
+        turns: [
+          {
+            turnId: "turn_other",
+            status: "running",
+            requestedAt: "2026-08-18T00:00:01Z",
+            updatedAt: "2026-08-18T00:00:21Z",
+            completedAt: null,
+            errorCode: null,
+            changeSet: null,
+          },
+        ],
+        items: [],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+
+    expect(otherThread.lastOutcome).toBe("applied");
+    expect(otherThread.turns[turnId]?.status).toBe("completed");
+    expect(otherThread.turns["turn_other"]?.status).toBe("running");
   });
 
   /** Queue 使用独立 revision；同一 Thread revision 的迟到快照不能撤销已提交的附件修复状态。 */
@@ -1097,7 +1793,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1155,7 +1850,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1210,7 +1904,7 @@ describe("timeline reducer", () => {
     );
     expect(state.items["item_tool_only"]).toBeUndefined();
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_1",
+      modelRequestId: "modelreq_1",
       modelRound: 1,
       inputTokens: 40_000,
     });
@@ -1226,7 +1920,7 @@ describe("timeline reducer", () => {
     );
     expect(state.items["item_empty_final"]).toBeUndefined();
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_2",
+      modelRequestId: "modelreq_2",
       modelRound: 2,
       inputTokens: 48_000,
       measuredAt: "2026-08-18T00:00:02Z",
@@ -1234,7 +1928,7 @@ describe("timeline reducer", () => {
   });
 
   /** 请求序号是 Context Usage 的唯一新旧边界，迟到的旧请求不得覆盖更新事实。 */
-  it("拒绝较低 requestOrdinal 覆盖最新请求", () => {
+  it("拒绝较低 modelRequestOrdinal 覆盖最新请求", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
     state = apply(
@@ -1286,14 +1980,14 @@ describe("timeline reducer", () => {
     );
 
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_2",
-      requestOrdinal: 2,
+      modelRequestId: "modelreq_2",
+      modelRequestOrdinal: 2,
       inputTokens: 20,
     });
   });
 
-  /** 新请求尚无可靠计量时继续保留上一笔 KNOWN，直到新的可信 Usage 到达。 */
-  it("保留旧 KNOWN 直到新 Usage 到达", () => {
+  /** 后续模型请求的 UNKNOWN 必须淘汰较早基准，避免继续显示已过时的上下文百分比。 */
+  it("后续请求为 UNKNOWN 时清除较早的 KNOWN", () => {
     let state = readyState();
     state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
     state = apply(
@@ -1350,10 +2044,108 @@ describe("timeline reducer", () => {
     );
 
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_1",
-      requestOrdinal: 1,
+      modelRequestId: "modelreq_2",
+      modelRequestOrdinal: 2,
+      certainty: "unknown",
+      inputTokens: null,
+    });
+  });
+
+  /** Dispatch 估算先更新当前请求，Provider 结算后再由同身份实测原位替换。 */
+  it("从 UNKNOWN dispatch 估算收敛到 Provider 实测", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/context-estimated", 2, {
+        usage: requestUsage(1, 0, 0, 0, {
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: {
+            certainty: "estimated",
+            source: "local",
+            usedTokens: 18_500,
+            limitTokens: 128_000,
+            measuredAt: "2026-08-18T00:00:02Z",
+          },
+        }),
+      }),
+    );
+
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      modelRequestId: "modelreq_1",
+      certainty: "unknown",
+      contextEstimate: { usedTokens: 18_500, source: "local" },
+    });
+
+    state = apply(
+      state,
+      event("turn/terminal", 3, {
+        state: "completed",
+        summary: "完成",
+        finalMessage: { messageId: "item_estimated_final", text: "完成" },
+        usage: requestUsage(1, 18_200, 300, 18_500, {
+          measuredAt: "2026-08-18T00:00:03Z",
+          contextEstimate: null,
+        }),
+      }),
+    );
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      modelRequestId: "modelreq_1",
       certainty: "known",
-      inputTokens: 10,
+      totalTokens: 18_500,
+      contextEstimate: null,
+    });
+  });
+
+  /** Provider 拒绝后没有结算用量时，终态应保留请求开始时已发出的本地估算。 */
+  it("未知失败用量保留同一请求的上下文估算并接收失败终态", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/context-estimated", 2, {
+        usage: requestUsage(1, 0, 0, 0, {
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: {
+            certainty: "estimated",
+            source: "local",
+            usedTokens: 18_500,
+            limitTokens: 128_000,
+            measuredAt: "2026-08-18T00:00:02Z",
+          },
+        }),
+      }),
+    );
+
+    state = apply(
+      state,
+      event("turn/terminal", 3, {
+        state: "failed",
+        summary: "上游拒绝了本次请求。",
+        errorCode: "MODEL_UPSTREAM_REJECTED",
+        usage: requestUsage(1, 0, 0, 0, {
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: null,
+        }),
+      }),
+    );
+
+    expect(state.lastOutcome).toBe("applied");
+    expect(state.turns[turnId]?.status).toBe("failed");
+    expect(state.resyncRequired[threadId]).toBeUndefined();
+    expect(state.contextUsageByThread[threadId]).toMatchObject({
+      modelRequestId: "modelreq_1",
+      certainty: "unknown",
+      contextEstimate: { usedTokens: 18_500, source: "local" },
     });
   });
 
@@ -1408,8 +2200,8 @@ describe("timeline reducer", () => {
     );
 
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_1",
-      requestOrdinal: 1,
+      modelRequestId: "modelreq_1",
+      modelRequestOrdinal: 1,
       certainty: "known",
       inputTokens: 10,
       totalTokens: 12,
@@ -1481,7 +2273,7 @@ describe("timeline reducer", () => {
       }),
     );
     const conflictingUnknown = requestUsage(1, 0, 0, 0, {
-      requestId: "request_other",
+      modelRequestId: "modelreq_other",
       certainty: "unknown",
       inputTokens: null,
       outputTokens: null,
@@ -1500,7 +2292,7 @@ describe("timeline reducer", () => {
 
     expect(state.lastOutcome).toBe("resync_required");
     expect(state.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_1",
+      modelRequestId: "modelreq_1",
       certainty: "known",
       inputTokens: 10,
     });
@@ -1637,6 +2429,7 @@ describe("timeline reducer", () => {
             turnId,
             kind: "reasoning_summary" as const,
             text: "刷新后仍可见的公开摘要",
+            ...publicTextMetadata("刷新后仍可见的公开摘要"),
             modelRound: 1,
             createdAt: "2026-08-18T00:00:01Z",
           },
@@ -1645,7 +2438,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1709,7 +2501,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -1749,6 +2540,7 @@ describe("timeline reducer", () => {
         approvalId: "appr_read",
         callId: "call_read",
         toolName: "read",
+        presentation: presentation("read"),
         reason: "读取参考",
         expiresAt: "2099-09-01T00:00:00Z",
         from: "running",
@@ -1830,6 +2622,12 @@ describe("timeline reducer", () => {
           turnId,
           kind: "user_input",
           content: input.content,
+          ...publicTextMetadata(
+            input.content
+              .filter((block) => block.type === "text")
+              .map((block) => block.text)
+              .join(""),
+          ),
           attachments: input.attachments,
           createdAt: input.createdAt,
         },
@@ -1906,6 +2704,7 @@ describe("timeline reducer", () => {
         approvalId: "appr_pending",
         callId: "call_pending",
         toolName: "write_file",
+        presentation: presentation("write"),
         reason: "写入文件",
         expiresAt: "2099-08-18T00:00:01Z",
         from: "running",
@@ -1916,6 +2715,121 @@ describe("timeline reducer", () => {
     expect(state.approvalsById["appr_pending"]?.decision).toBeUndefined();
     expect(state.approvalsById["appr_pending"]?.closedAt).toBeDefined();
     expect(state.turns[turnId]?.status).toBe("cancelled");
+  });
+
+  /** 持久关闭原因全部只关闭卡片，不制造用户 deny decision。 */
+  it.each(["cancelled", "superseded", "expired"] as const)(
+    "closes a %s approval through its typed event without a user decision",
+    (reason) => {
+      let state = readyState();
+      state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+      state = apply(
+        state,
+        event("assistant/model-step-committed", 2, {
+          messageId: "item_approval_close_step",
+          text: "准备修改",
+          modelRound: 1,
+          toolCalls: [
+            {
+              callId: "call_approval_close",
+              toolName: "write_file",
+              ordinal: 0,
+              presentation: presentation("write"),
+            },
+          ],
+        }),
+      );
+      state = apply(
+        state,
+        event("approval/requested", 3, {
+          approvalId: "appr_system_closed",
+          callId: "call_approval_close",
+          toolName: "write_file",
+          presentation: presentation("write"),
+          reason: "写入文件",
+          expiresAt: "2099-08-18T00:00:01Z",
+          from: "running",
+          to: "waiting_approval",
+        }),
+      );
+      state = apply(
+        state,
+        event("approval/closed", 4, {
+          approvalId: "appr_system_closed",
+          reason,
+        }),
+      );
+
+      expect(state.approvalsById["appr_system_closed"]).toMatchObject({
+        approval: { approvalId: "appr_system_closed", closedReason: reason },
+        closedAt: expect.any(String),
+      });
+      expect(state.approvalsById["appr_system_closed"]?.decision).toBeUndefined();
+      expect(state.items["item_3"]).toMatchObject({
+        kind: "approval",
+        status: "completed",
+        metadata: { requiresUserAction: false },
+      });
+      expect(state.lastOutcome).toBe("applied");
+    },
+  );
+
+  /** 恢复变更只更新同一 Tool 的 affordance revision，不把未知副作用投影成失败结果。 */
+  it("projects tool recovery revisions without changing tool completion status", () => {
+    let state = readyState();
+    state = apply(state, event("turn/state-changed", 1, { from: "queued", to: "running" }));
+    state = apply(
+      state,
+      event("assistant/model-step-committed", 2, {
+        messageId: "item_recovery_step",
+        text: "准备读取",
+        modelRound: 1,
+        toolCalls: [
+          {
+            callId: "toolu_01Jxyz:part.2",
+            toolName: "read_file",
+            ordinal: 0,
+            presentation: presentation("read"),
+          },
+        ],
+      }),
+    );
+    state = apply(
+      state,
+      event("tool/recovery-changed", 3, {
+        recoveryId: "recovery_one",
+        callId: "toolu_01Jxyz:part.2",
+        revision: 1,
+        status: "pending",
+        requiresUserAction: true,
+      }),
+    );
+
+    const tool =
+      state.items[state.toolItemIdByCallId[`${threadId}:${turnId}:toolu_01Jxyz:part.2`] ?? ""];
+    expect(tool?.metadata?.presentation).toMatchObject({
+      status: "pending",
+      recovery: { revision: 1 },
+    });
+    expect(tool?.status).toBe("in_progress");
+
+    state = apply(
+      state,
+      event("tool/recovery-changed", 4, {
+        recoveryId: "recovery_one",
+        callId: "toolu_01Jxyz:part.2",
+        revision: 2,
+        status: "skipped",
+        disposition: "skip",
+        requiresUserAction: false,
+      }),
+    );
+    const settled =
+      state.items[state.toolItemIdByCallId[`${threadId}:${turnId}:toolu_01Jxyz:part.2`] ?? ""];
+    expect(settled?.metadata?.presentation).toMatchObject({ status: "pending" });
+    expect(settled?.metadata?.presentation).not.toHaveProperty("recovery");
+    expect(settled?.status).toBe("in_progress");
+    expect(state.lastOutcome).toBe("applied");
   });
 
   it("does not advance a terminal thread from late context or workspace events", () => {
@@ -1960,7 +2874,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2152,7 +3065,7 @@ describe("timeline reducer", () => {
     );
     expect(state.contextUsageByThread[threadId]).toMatchObject({
       certainty: "known",
-      requestOrdinal: 1,
+      modelRequestOrdinal: 1,
       inputTokens: 40_000,
     });
 
@@ -2206,7 +3119,7 @@ describe("timeline reducer", () => {
     );
     expect(recovered.contextUsageByThread[threadId]).toMatchObject({
       certainty: "known",
-      requestOrdinal: 2,
+      modelRequestOrdinal: 2,
       inputTokens: 12_000,
     });
 
@@ -2233,7 +3146,6 @@ describe("timeline reducer", () => {
           turnId,
         },
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -2242,23 +3154,34 @@ describe("timeline reducer", () => {
     expect(restored.contextCompactionByThread[threadId]).toBeUndefined();
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
       certainty: "known",
-      requestOrdinal: 1,
+      modelRequestOrdinal: 1,
       inputTokens: 40_000,
     });
   });
 
-  /** 恢复快照缺少或暂时没有 Usage 时，不得把当前 Composer 环清空或降级成未知。 */
-  it("在恢复快照缺失计量时保留旧 KNOWN", () => {
+  /** 空快照不抹除已知读数，但新的 UNKNOWN 请求必须淘汰旧占用。 */
+  it("只在快照没有请求事实时保留旧读数", () => {
     const state = readyState();
     state.contextUsageByThread[threadId] = { ...requestUsage(1, 40_000, 1_000, 41_000), turnId };
     const baseSnapshot = {
       threadId,
       revision: 1,
-      turns: [],
+      turns: [
+        {
+          turnId,
+          sourceMessageId: null,
+          status: "running" as const,
+          requestedAt: "2026-08-18T00:00:01Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
       items: [],
       inputQueue: null,
       taskActivities: [],
-      goalActivities: [],
+      liveStream: null,
       nextCursor: null,
     };
     const withoutUsage = applySnapshot(state, { ...baseSnapshot, contextUsage: null }, "ws_one");
@@ -2284,9 +3207,11 @@ describe("timeline reducer", () => {
       },
       "ws_one",
     );
+    expect(withUnknown.lastOutcome).toBe("applied");
     expect(withUnknown.contextUsageByThread[threadId]).toMatchObject({
-      certainty: "known",
-      inputTokens: 40_000,
+      certainty: "unknown",
+      modelRequestOrdinal: 2,
+      inputTokens: null,
     });
   });
 
@@ -2321,7 +3246,6 @@ describe("timeline reducer", () => {
           turnId: "turn_new",
         },
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2329,7 +3253,7 @@ describe("timeline reducer", () => {
 
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
       turnId: "turn_old",
-      requestId: "request_2",
+      modelRequestId: "modelreq_2",
       inputTokens: 20,
     });
   });
@@ -2497,7 +3421,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2565,6 +3488,7 @@ describe("timeline reducer", () => {
             kind: "user_input",
             createdAt: "2026-08-18T00:00:00Z",
             content: [{ type: "text", text: "问题" }],
+            ...publicTextMetadata("问题"),
             attachments: [],
           },
         ],
@@ -2575,7 +3499,6 @@ describe("timeline reducer", () => {
           measuredAt: "2026-08-18T00:00:01Z",
         },
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -2587,7 +3510,7 @@ describe("timeline reducer", () => {
     expect(restored.items["item_user"]?.kind).toBe("user_message");
     expect(restored.turns["turn_snapshot"]?.changeSet).toBeNull();
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
-      requestId: "request_2",
+      modelRequestId: "modelreq_2",
       inputTokens: 52_000,
       totalTokens: 56_000,
     });
@@ -2606,7 +3529,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2639,7 +3561,6 @@ describe("timeline reducer", () => {
           measuredAt: "2026-08-18T00:00:01Z",
         },
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -2687,7 +3608,7 @@ describe("timeline reducer", () => {
         text: "",
         modelRound: 1,
         usage: requestUsage(1, 12_000, 1_000, 13_000, {
-          requestId: "request_new",
+          modelRequestId: "modelreq_new",
           measuredAt: "2026-08-18T00:00:04Z",
         }),
         toolCalls: [],
@@ -2696,7 +3617,7 @@ describe("timeline reducer", () => {
     expect(state.lastOutcome).toBe("applied");
     expect(state.contextUsageByThread[threadId]).toMatchObject({
       turnId: "turn_new",
-      requestId: "request_new",
+      modelRequestId: "modelreq_new",
       inputTokens: 12_000,
     });
     state = apply(
@@ -2712,8 +3633,70 @@ describe("timeline reducer", () => {
     expect(state.lastOutcome).toBe("applied");
     expect(state.contextUsageByThread[threadId]).toMatchObject({
       turnId: "turn_new",
-      requestId: "request_new",
+      modelRequestId: "modelreq_new",
       inputTokens: 12_000,
+    });
+  });
+
+  /** Core 的摘要提交会推进水位，旧来源的完成事件仍须触发权威快照，不能被当成迟到事件丢弃。 */
+  it("resyncs a compaction commit beyond the current durable watermark", () => {
+    const state = readyState();
+    state.threadRevisionByThread[threadId] = 85;
+    const next = apply(
+      state,
+      event("context/compacted", 103, {
+        turnId: null,
+        compactionId: "cmp_core_watermark",
+        checkpointId: "checkpoint_core_watermark",
+        trigger: "manual",
+        sourceRevision: 83,
+        inputTokensBefore: 31_058,
+        inputTokensAfter: 21_204,
+        strategyVersion: "ja-context-v1",
+      }),
+    );
+    expect(next.lastOutcome).toBe("gap");
+    expect(next.resyncRequired[threadId]).toBe("gap");
+    expect(next.threadRevisionByThread[threadId]).toBe(85);
+  });
+
+  /** 无 lifecycle 的恢复也必须接纳更新的检查点估算，不靠旧助手请求的计量时间判断摘要先后。 */
+  it("restores a newer checkpoint estimate for the same assistant request", () => {
+    const state = readyState();
+    state.contextUsageByThread[threadId] = { ...requestUsage(1, 300, 12, 312), turnId };
+    const restored = applySnapshot(
+      state,
+      {
+        threadId,
+        revision: 5,
+        turns: [],
+        items: [],
+        inputQueue: null,
+        contextUsage: {
+          ...requestUsage(1, 0, 0, 0),
+          turnId,
+          certainty: "unknown",
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          contextEstimate: {
+            certainty: "estimated",
+            source: "local",
+            usedTokens: 21_204,
+            limitTokens: 128_000,
+            measuredAt: "2026-08-18T00:00:02Z",
+          },
+        },
+        taskActivities: [],
+        liveStream: null,
+        nextCursor: null,
+      },
+      "ws_one",
+    );
+    expect(restored.lastOutcome).toBe("applied");
+    expect(restored.contextUsageByThread[threadId]).toMatchObject({
+      certainty: "unknown",
+      contextEstimate: { usedTokens: 21_204 },
     });
   });
 
@@ -2743,7 +3726,6 @@ describe("timeline reducer", () => {
           measuredAt: "2026-08-18T00:00:03Z",
         },
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -2751,7 +3733,7 @@ describe("timeline reducer", () => {
     );
     expect(restored.contextUsageByThread[threadId]).toMatchObject({
       certainty: "known",
-      requestOrdinal: 1,
+      modelRequestOrdinal: 1,
       inputTokens: 12_000,
     });
   });
@@ -2819,6 +3801,7 @@ describe("timeline reducer", () => {
             createdAt: "2026-08-18T00:00:03Z",
             turnId: "turn_snapshot",
             content: [{ type: "attachment", attachmentId: "att_snapshot" }],
+            ...publicTextMetadata(""),
             attachments: [
               {
                 attachmentId: "att_snapshot",
@@ -2834,7 +3817,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2907,6 +3889,7 @@ describe("timeline reducer", () => {
             kind: "user_input",
             createdAt: "2026-08-18T00:00:00Z",
             content: [{ type: "text", text: "第一问" }],
+            ...publicTextMetadata("第一问"),
             attachments: [],
           },
           {
@@ -2915,6 +3898,7 @@ describe("timeline reducer", () => {
             kind: "user_input",
             createdAt: "2026-08-18T00:01:00Z",
             content: [{ type: "text", text: "第二问" }],
+            ...publicTextMetadata("第二问"),
             attachments: [],
           },
           {
@@ -2923,6 +3907,7 @@ describe("timeline reducer", () => {
             kind: "final_answer",
             createdAt: "2026-08-18T00:00:02Z",
             text: "第一问已完成",
+            ...publicTextMetadata("第一问已完成"),
           },
           {
             itemId: "item_second_prior_answer",
@@ -2930,6 +3915,7 @@ describe("timeline reducer", () => {
             kind: "final_answer",
             createdAt: "2026-08-18T00:00:59Z",
             text: "此前排队输入已处理",
+            ...publicTextMetadata("此前排队输入已处理"),
           },
           {
             itemId: "item_second_failure_reply",
@@ -2937,13 +3923,13 @@ describe("timeline reducer", () => {
             kind: "final_answer",
             createdAt: "2026-08-18T00:01:01Z",
             text: "本轮未能完成，请稍后重试。",
+            ...publicTextMetadata("本轮未能完成，请稍后重试。"),
           },
         ],
         inputQueue: null,
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -2973,7 +3959,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -3045,6 +4030,7 @@ describe("timeline reducer", () => {
           turnId,
           kind: "user_input",
           content: [{ type: "text", text: "补充" }],
+          ...publicTextMetadata("补充"),
           attachments: [],
         },
         inputQueue: { turnId, revision: 4, accepting: true, items: [] },
@@ -3088,7 +4074,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -3158,6 +4143,7 @@ describe("timeline reducer", () => {
               { type: "attachment", attachmentId: attachment.attachmentId },
               { type: "text", text: "分析这张图" },
             ],
+            ...publicTextMetadata("分析这张图"),
             attachments: [attachment],
             createdAt: "2026-09-08T00:00:00Z",
           },
@@ -3166,7 +4152,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -3193,6 +4178,7 @@ describe("timeline reducer", () => {
         sourceThreadId: "thr_source_one",
         sourceTitle: "来源会话",
         content: "第一条 **原文**",
+        ...publicTextMetadata("第一条 **原文**"),
       },
       {
         itemId: "item_message_second",
@@ -3202,6 +4188,7 @@ describe("timeline reducer", () => {
         sourceThreadId: "thr_source_two",
         sourceTitle: "另一个来源",
         content: "第二条",
+        ...publicTextMetadata("第二条"),
       },
     ];
     const firstMessage = messages[0];
@@ -3227,7 +4214,6 @@ describe("timeline reducer", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_one",
@@ -3274,7 +4260,13 @@ describe("timeline reducer", () => {
       state,
       event("turn/messages_received", 3, {
         sequence: 13,
-        items: [{ ...firstMessage, content: "不应覆盖原文" }],
+        items: [
+          {
+            ...firstMessage,
+            content: "不应覆盖原文",
+            ...publicTextMetadata("不应覆盖原文"),
+          },
+        ],
       }),
     );
     expect(conflicting.lastOutcome).toBe("resync_required");
@@ -3312,7 +4304,6 @@ describe("timeline reducer", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: {
         turnId,
         streamSeq: 1,
@@ -3390,7 +4381,6 @@ describe("timeline reducer", () => {
         inputQueue: null,
         contextUsage: null,
         taskActivities: [],
-        goalActivities: [],
         liveStream: {
           turnId,
           streamSeq: 2,
@@ -3423,6 +4413,50 @@ describe("timeline reducer", () => {
     ]);
   });
 
+  /**
+   * @author kongweiguang
+   * Domain 必须接受协议定义的每个 durable Turn 状态；waiting_input 是暂停等待用户而非损坏快照。
+   */
+  it.each([
+    "queued",
+    "running",
+    "waiting_input",
+    "waiting_approval",
+    "suspended",
+    "completed",
+    "failed",
+    "cancelled",
+  ] as const)("应用所有合法 Thread snapshot Turn 状态 %s", (status) => {
+    const snapshot = {
+      threadId,
+      revision: 1,
+      turns: [
+        {
+          turnId,
+          sourceMessageId: null,
+          status,
+          requestedAt: "2026-08-18T00:00:00Z",
+          updatedAt: "2026-08-18T00:00:01Z",
+          completedAt: null,
+          errorCode: null,
+          changeSet: null,
+        },
+      ],
+      items: [],
+      inputQueue: null,
+      contextUsage: null,
+      taskActivities: [],
+      liveStream: null,
+      nextCursor: null,
+    };
+
+    expect(timelineSnapshotValidationReason(snapshot)).toBeUndefined();
+    const applied = applySnapshot(readyState(), snapshot, "ws_one");
+    expect(applied.lastOutcome).toBe("applied");
+    expect(applied.turns[turnId]?.status).toBe(status);
+    expect(applied.threadRevisionByThread[threadId]).toBe(1);
+  });
+
   it("允许从已提交前缀开始的 live baseline，并忽略被 snapshot 覆盖的迟到 committed event", () => {
     const snapshot = {
       threadId,
@@ -3442,7 +4476,6 @@ describe("timeline reducer", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: {
         turnId,
         streamSeq: 4,
@@ -3489,7 +4522,6 @@ describe("timeline reducer", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: {
         turnId,
         streamSeq: 1,
@@ -3534,7 +4566,6 @@ describe("timeline reducer", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: { turnId, streamSeq: 1, segments: [segment] },
       nextCursor: null,
     };
@@ -3619,13 +4650,13 @@ describe("timeline reducer", () => {
             kind: "assistant_progress",
             createdAt: "2026-08-18T00:00:02Z",
             text: "不应重复展示",
+            ...publicTextMetadata("不应重复展示"),
             modelRound: 1,
           },
         ],
         inputQueue: null,
         contextUsage: null,
         taskActivities: [],
-        goalActivities: [],
         liveStream: { turnId, streamSeq: 2, segments: [] },
         nextCursor: null,
       },
@@ -3660,7 +4691,6 @@ describe("timeline reducer", () => {
         inputQueue: null,
         contextUsage: null,
         taskActivities: [],
-        goalActivities: [],
         liveStream: null,
         nextCursor: null,
       },
@@ -3892,7 +4922,6 @@ describe("timeline reducer", () => {
         inputQueue: null,
         contextUsage: null,
         taskActivities: [],
-        goalActivities: [],
         liveStream: { turnId, streamSeq: 1, segments: [] },
         nextCursor: null,
       },
@@ -3994,7 +5023,6 @@ describe("timeline reducer", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: null,
       nextCursor: null,
     };

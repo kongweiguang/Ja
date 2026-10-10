@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":"c:turn-schema","method":"turn/start","params":{"threadId":"thr_demo","content":[{"type":"text","text":"Return the credential field name."}],"operationKey":"op_0123456789abcdef0123456789abcdef","runtimeOverrides":{"modelId":"model_demo","accessMode":"full_access","outputSchema":{"type":"object","properties":{"password":{"type":"string"}},"required":["password"],"additionalProperties":false}}}}
+{"jsonrpc":"2.0","id":"c:turn-schema","result":{"accepted":true,"queued":false,"turnId":"turn_schema","threadRevision":8}}

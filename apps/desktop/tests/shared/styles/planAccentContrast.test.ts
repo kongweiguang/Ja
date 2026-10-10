@@ -23,8 +23,8 @@ const INTERACTION_SOURCE = readFileSync(
   ),
   "utf8",
 ).toLowerCase();
-const GOALS_SOURCE = readFileSync(
-  join(process.cwd(), "apps", "desktop", "src", "features", "goals", "ui", "goals.css"),
+const PLANS_SOURCE = readFileSync(
+  join(process.cwd(), "apps", "desktop", "src", "features", "plans", "ui", "plans.css"),
   "utf8",
 ).toLowerCase();
 
@@ -85,19 +85,19 @@ describe("Plan and interaction accent contrast policy", () => {
     expect(INTERACTION_SOURCE).toMatch(
       /\.ja-interaction-card__option-affordance\s*\{[^}]*color:\s*var\(--ja-accent-emphasis\);/u,
     );
-    expect(GOALS_SOURCE).toMatch(
+    expect(PLANS_SOURCE).toMatch(
       /\.ja-plan-timeline__footer\s*>\s*button\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,
     );
-    expect(GOALS_SOURCE).toMatch(
+    expect(PLANS_SOURCE).toMatch(
       /\.ja-plan-timeline__actions\s+button\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,
     );
-    expect(GOALS_SOURCE).toMatch(
+    expect(PLANS_SOURCE).toMatch(
       /\.ja-plan-timeline__actions\s+button\.is-primary\s*\{[^}]*background:\s*var\(--ja-accent-emphasis\);/u,
     );
-    expect(GOALS_SOURCE).toMatch(
+    expect(PLANS_SOURCE).toMatch(
       /\.ja-plan-alert\s+button\s*\{[^}]*color:\s*color-mix\(in srgb,\s*var\(--ja-accent-emphasis\)\s+80%,\s*var\(--ja-foreground\)\);/u,
     );
-    expect(GOALS_SOURCE).toMatch(
+    expect(PLANS_SOURCE).toMatch(
       /\.ja-plan-button\.is-primary\s*\{[^}]*background:\s*var\(--ja-accent-emphasis\);/u,
     );
   });

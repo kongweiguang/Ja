@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","method":"tool/recovery-changed","params":{"serverInstanceId":"srv_recovery","eventId":"evt_recovery_invalid","sequence":63,"occurredAt":"2026-09-26T00:00:03Z","generation":1,"workspaceId":"ws_recovery","threadId":"thr_recovery","turnId":"turn_recovery","threadRevision":63,"recoveryId":"recovery_1","callId":"toolu_01Jabc:part.2","revision":1,"status":"pending","requiresUserAction":false}}
+{"jsonrpc":"2.0","method":"approval/closed","params":{"serverInstanceId":"srv_recovery","eventId":"evt_approval_fake_deny","sequence":64,"occurredAt":"2026-09-26T00:00:04Z","generation":1,"workspaceId":"ws_recovery","threadId":"thr_recovery","turnId":"turn_recovery","threadRevision":64,"approvalId":"appr_1","reason":"deny","decision":"deny"}}
+

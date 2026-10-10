@@ -6,6 +6,7 @@ import type {
   ProviderRequestProfile,
   TimelineContextUsage,
   TimelineThreadContextUsage,
+  TimelineOrigin,
   TimelineTurnState,
   ToolPresentation,
   TurnChangeSet,
@@ -16,11 +17,21 @@ interface SnapshotItemBase {
   itemId: string;
   createdAt: string;
   turnId: string;
+  origin: TimelineOrigin;
+}
+
+type WithoutTimelineOrigin<T> = T extends unknown ? Omit<T, "origin"> : never;
+type TimelineLiveItem = WithoutTimelineOrigin<TimelineSnapshotItem>;
+
+interface PublicTextPreview {
+  truncated: boolean;
+  totalCharacters: number;
 }
 
 /** 与平坦 items 并列的权威 Turn 元数据，失败码不包含服务端错误正文。 */
 interface TimelineSnapshotTurn {
   turnId: string;
+  origin: TimelineOrigin;
   /** 隐藏 continuation 在 reload 时回到原问题 exchange；普通与 reask Turn 显式为 null。 */
   sourceMessageId?: string | null;
   status: TimelineTurnState;
@@ -31,22 +42,34 @@ interface TimelineSnapshotTurn {
   changeSet: TurnChangeSet | null;
 }
 
-/** Thread snapshot 的持久 Item 闭集与 JA-RPC v1 保持一致，但不依赖 transport Schema。 */
+/** Thread snapshot 的持久 Item 闭集与 JA-RPC v2 保持一致，但不依赖 transport Schema。 */
 export type TimelineSnapshotItem =
-  | (SnapshotItemBase & {
-      kind: "user_input";
-      content: UserContentBlock[];
-      attachments: AttachmentSummary[];
-    })
-  | (SnapshotItemBase & {
-      kind: "thread_message";
-      sourceThreadId: string;
-      sourceTitle: string;
-      content: string;
-    })
-  | (SnapshotItemBase & { kind: "assistant_progress"; text: string; modelRound: number })
-  | (SnapshotItemBase & { kind: "reasoning_summary"; text: string; modelRound: number })
-  | (SnapshotItemBase & { kind: "final_answer"; text: string })
+  | (SnapshotItemBase &
+      PublicTextPreview & {
+        kind: "user_input";
+        content: UserContentBlock[];
+        attachments: AttachmentSummary[];
+      })
+  | (SnapshotItemBase &
+      PublicTextPreview & {
+        kind: "thread_message";
+        sourceThreadId: string;
+        sourceTitle: string;
+        content: string;
+      })
+  | (SnapshotItemBase &
+      PublicTextPreview & {
+        kind: "assistant_progress";
+        text: string;
+        modelRound: number;
+      })
+  | (SnapshotItemBase &
+      PublicTextPreview & {
+        kind: "reasoning_summary";
+        text: string;
+        modelRound: number;
+      })
+  | (SnapshotItemBase & PublicTextPreview & { kind: "final_answer"; text: string })
   | (SnapshotItemBase & {
       kind: "tool_call";
       callId: string;
@@ -99,6 +122,7 @@ export type TimelineTaskActivityKind =
   | "follow_up_queued"
   | "progress"
   | "waiting_approval"
+  | "waiting_input"
   | "resumed"
   | "completed"
   | "failed"
@@ -149,16 +173,6 @@ export interface TimelineTaskActivityEntry {
   task: TimelineTaskSummary;
 }
 
-/** Thread snapshot 中的 Goal 只保留不可逆终态，完整计划和证据不进入 Conversation Store。 */
-export interface TimelineGoalActivity {
-  goalId: string;
-  objective: string;
-  status: "achieved" | "stopped";
-  goalRevision: number;
-  eventSequence: number;
-  occurredAt: string;
-}
-
 /** thread/read 的可恢复 live 基线；reasoningSummary 是 wire 语义，Renderer 再投影为 reasoning。 */
 export interface TimelineLiveStreamSegment {
   kind: "assistant" | "reasoningSummary";
@@ -183,7 +197,6 @@ export interface TimelineSnapshot {
   inputQueue: InputQueue | null;
   contextUsage: TimelineThreadContextUsage | null;
   taskActivities: TimelineTaskActivityEntry[];
-  goalActivities: TimelineGoalActivity[];
   liveStream: TimelineLiveStream | null;
   nextCursor: string | null;
 }
@@ -231,7 +244,7 @@ export type TimelineEvent =
       "turn/input-consumed",
       SemanticBase & {
         input: QueuedInput;
-        userItem: Extract<TimelineSnapshotItem, { kind: "user_input" }>;
+        userItem: Extract<TimelineLiveItem, { kind: "user_input" }>;
         inputQueue: InputQueue;
         assistantSettlement?: {
           messageId: string;
@@ -245,7 +258,7 @@ export type TimelineEvent =
   | EventEnvelope<
       "turn/messages_received",
       SemanticBase & {
-        items: Array<Extract<TimelineSnapshotItem, { kind: "thread_message" }>>;
+        items: Array<Extract<TimelineLiveItem, { kind: "thread_message" }>>;
       }
     >
   | EventEnvelope<
@@ -269,6 +282,7 @@ export type TimelineEvent =
         }>;
       }
     >
+  | EventEnvelope<"assistant/context-estimated", SemanticBase & { usage: UsageProjection }>
   | EventEnvelope<
       "assistant/text-delta" | "assistant/reasoning-summary-delta",
       SemanticBase & { streamSeq: number; text: string }
@@ -287,11 +301,23 @@ export type TimelineEvent =
       }
     >
   | EventEnvelope<
+      "tool/recovery-changed",
+      SemanticBase & {
+        recoveryId: string;
+        callId: string;
+        revision: number;
+        status: "pending" | "verified" | "retried" | "skipped";
+        disposition?: "verified" | "retry" | "skip";
+        requiresUserAction: boolean;
+      }
+    >
+  | EventEnvelope<
       "approval/requested",
       SemanticBase & {
         approvalId: string;
         callId: string;
         toolName: string;
+        presentation: ToolPresentation;
         reason: string;
         expiresAt: string;
         from: "running";
@@ -306,6 +332,10 @@ export type TimelineEvent =
         from: "waiting_approval";
         to: "running";
       }
+    >
+  | EventEnvelope<
+      "approval/closed",
+      SemanticBase & { approvalId: string; reason: "cancelled" | "superseded" | "expired" }
     >
   | EventEnvelope<
       "context/compaction-started",
@@ -342,11 +372,18 @@ export type TimelineEvent =
       SemanticBase & {
         state: "completed" | "failed" | "cancelled";
         summary: string;
-        finalMessage?: { messageId: string; text: string };
+        summaryTotalCharacters: number;
+        summaryTruncated: boolean;
+        finalMessage?: {
+          messageId: string;
+          text: string;
+          totalCharacters: number;
+          truncated: boolean;
+        };
         usage?: UsageProjection;
         errorCode?: string;
         errorMessage?: string;
-        changeSet: TurnChangeSet;
+        changeSet: TurnChangeSet | null;
       }
     >
   | EventEnvelope<
@@ -376,6 +413,18 @@ export type TimelineEvent =
       }
     >
   | EventEnvelope<
+      "workspace/metadata-changed",
+      {
+        serverInstanceId: string;
+        eventId: string;
+        sequence: number;
+        occurredAt: string;
+        generation: number;
+        workspaceId: string;
+        revision: number;
+      }
+    >
+  | EventEnvelope<
       "configuration/changed",
       {
         serverInstanceId: string;
@@ -396,18 +445,22 @@ const TIMELINE_METHODS = new Set<TimelineEvent["method"]>([
   "turn/state-changed",
   "turn/retry-started",
   "assistant/model-step-committed",
+  "assistant/context-estimated",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
   "tool/started",
   "tool/batch-committed",
+  "tool/recovery-changed",
   "approval/requested",
   "approval/resolved",
+  "approval/closed",
   "context/compaction-started",
   "context/compacted",
   "context/compaction-failed",
   "turn/terminal",
   "runtime/status-changed",
   "thread/metadata-changed",
+  "workspace/metadata-changed",
   "configuration/changed",
 ]);
 
@@ -418,22 +471,27 @@ const WORKSPACE_SCOPED_METHODS = new Set<TimelineEvent["method"]>([
   "turn/state-changed",
   "turn/retry-started",
   "assistant/model-step-committed",
+  "assistant/context-estimated",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
   "tool/started",
   "tool/batch-committed",
+  "tool/recovery-changed",
   "approval/requested",
   "approval/resolved",
+  "approval/closed",
   "context/compaction-started",
   "context/compacted",
   "context/compaction-failed",
   "turn/terminal",
   "thread/metadata-changed",
+  "workspace/metadata-changed",
 ]);
 
 /**
- * 为 domain 直接调用提供 fail-closed 的最小形状 admission；production store 在进入此处前
- * 已由 canonical JA-RPC Schema 完整校验，异常字段会在 reducer 的 try/catch 中变为 invalid。
+ * 为 domain 直接调用提供 fail-closed 的最小形状 admission；终态缺失 ChangeSet 一律拒绝，
+ * completed 必须携带对象，failed/cancelled 的 null 只表示没有已提交的 ChangeSet 事实。
+ * Production store 在进入此处前由 canonical JA-RPC Schema 完整校验。
  */
 export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefined {
   if (typeof value !== "object" || value === null) return undefined;
@@ -472,6 +530,16 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
     )
       return undefined;
   }
+  if (root["method"] === "assistant/context-estimated") {
+    const usage = params["usage"];
+    if (
+      !isTimelineContextUsage(usage) ||
+      usage.certainty !== "unknown" ||
+      usage.purpose !== "assistant" ||
+      usage.contextEstimate == null
+    )
+      return undefined;
+  }
   if (root["method"] === "tool/started") {
     if (
       typeof params["callId"] !== "string" ||
@@ -500,6 +568,15 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
         callIds.add(callId);
         return true;
       })
+    )
+      return undefined;
+  }
+  if (root["method"] === "approval/requested") {
+    const presentation = params["presentation"];
+    if (
+      !isToolPresentation(presentation) ||
+      presentation.status !== "pending" ||
+      (presentation.media !== undefined && presentation.media.length > 0)
     )
       return undefined;
   }
@@ -543,7 +620,39 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
   }
   if (root["method"] === "turn/terminal") {
     if (params["usage"] !== undefined && !isTimelineContextUsage(params["usage"])) return undefined;
-    if (!isTurnChangeSet(params["changeSet"])) return undefined;
+    if (
+      typeof params["summary"] !== "string" ||
+      !isPublicTextPreview(
+        params["summary"],
+        params["summaryTruncated"],
+        params["summaryTotalCharacters"],
+      )
+    )
+      return undefined;
+    if (params["finalMessage"] !== undefined) {
+      const finalMessage = params["finalMessage"];
+      if (typeof finalMessage !== "object" || finalMessage === null || Array.isArray(finalMessage))
+        return undefined;
+      const finalMessageRecord = finalMessage as Record<string, unknown>;
+      if (
+        typeof finalMessageRecord["messageId"] !== "string" ||
+        typeof finalMessageRecord["text"] !== "string" ||
+        !isPublicTextPreview(
+          finalMessageRecord["text"] as string,
+          finalMessageRecord["truncated"],
+          finalMessageRecord["totalCharacters"],
+        )
+      )
+        return undefined;
+    }
+    const state = params["state"];
+    if (state !== "completed" && state !== "failed" && state !== "cancelled") return undefined;
+    const changeSet = params["changeSet"];
+    if (
+      (changeSet === null && state === "completed") ||
+      (changeSet !== null && !isTurnChangeSet(changeSet))
+    )
+      return undefined;
   }
   return value as TimelineEvent;
 }
@@ -595,6 +704,15 @@ export function timelineSnapshotValidationReason(
   if (root["nextCursor"] !== null && typeof root["nextCursor"] !== "string") return "next_cursor";
   const invalidItem = root["items"].findIndex((item) => !isTimelineSnapshotItem(item));
   if (invalidItem >= 0) return `item:${invalidItem}`;
+  const turns = root["turns"] as TimelineSnapshotTurn[];
+  const items = root["items"] as TimelineSnapshotItem[];
+  if (
+    items.some((item) => {
+      const owner = turns.find((turn) => turn.turnId === item.turnId);
+      return owner === undefined || owner.origin !== item.origin;
+    })
+  )
+    return "item_origin_owner";
   return undefined;
 }
 
@@ -818,24 +936,27 @@ function isUserContentBlock(value: unknown): value is UserContentBlock {
   }
 }
 
-/** Usage 按唯一请求和必填画像严格校验；UNKNOWN 不能伪造 token。 */
+/** Usage 按唯一请求和必填画像严格校验；未知计量不能伪造 token，快照估算必须匹配同一窗口。 */
 function isTimelineContextUsage(value: unknown): value is TimelineContextUsage {
   if (typeof value !== "object" || value === null) return false;
   const usage = value as Record<string, unknown>;
   const inputTokens = usage["inputTokens"];
   const outputTokens = usage["outputTokens"];
   const totalTokens = usage["totalTokens"];
+  const contextEstimate = usage["contextEstimate"];
   const commonValid =
-    typeof usage["requestId"] === "string" &&
-    usage["requestId"].startsWith("request_") &&
-    Number.isSafeInteger(usage["requestOrdinal"]) &&
-    (usage["requestOrdinal"] as number) >= 1 &&
+    typeof usage["modelRequestId"] === "string" &&
+    usage["modelRequestId"].startsWith("modelreq_") &&
+    Number.isSafeInteger(usage["modelRequestOrdinal"]) &&
+    (usage["modelRequestOrdinal"] as number) >= 1 &&
     Number.isSafeInteger(usage["modelRound"]) &&
     (usage["modelRound"] as number) >= 1 &&
     (usage["purpose"] === "assistant" || usage["purpose"] === "summary") &&
-    typeof usage["measuredAt"] === "string";
+    typeof usage["measuredAt"] === "string" &&
+    isTimelineContextEstimate(contextEstimate, usage["profile"]);
   if (!commonValid) return false;
   if (!isProviderRequestProfile(usage["profile"])) return false;
+  if (contextEstimate != null && usage["certainty"] !== "unknown") return false;
   if (usage["certainty"] === "unknown") {
     return inputTokens === null && outputTokens === null && totalTokens === null;
   }
@@ -850,25 +971,51 @@ function isTimelineContextUsage(value: unknown): value is TimelineContextUsage {
   );
 }
 
-/** Thread 快照补足事件外壳提供的 Turn 身份，重启后仍能关联请求级 Usage。 */
+/** 本地派发或检查点估算必须注明来源和请求冻结的上下文窗口。 */
+function isTimelineContextEstimate(value: unknown, profile: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "object") return false;
+  const estimate = value as Record<string, unknown>;
+  const profileWindow =
+    typeof profile === "object" && profile !== null
+      ? (profile as Record<string, unknown>)["contextWindowTokens"]
+      : undefined;
+  return (
+    estimate["certainty"] === "estimated" &&
+    estimate["source"] === "local" &&
+    Number.isSafeInteger(estimate["usedTokens"]) &&
+    (estimate["usedTokens"] as number) >= 0 &&
+    Number.isSafeInteger(estimate["limitTokens"]) &&
+    estimate["limitTokens"] === profileWindow &&
+    typeof estimate["measuredAt"] === "string"
+  );
+}
+
+/** Thread 快照必须带 Turn 身份与估算 nullable 槽位，重启后仍能恢复一致的上下文投影。 */
 function isThreadContextUsage(value: unknown): value is TimelineThreadContextUsage {
   const usage = value as unknown as Record<string, unknown>;
   return (
     isTimelineContextUsage(value) &&
+    Object.prototype.hasOwnProperty.call(usage, "contextEstimate") &&
     typeof usage["turnId"] === "string" &&
     (usage["turnId"] as string).startsWith("turn_")
   );
 }
 
-/** 对 domain reducer 再做一次最小闭集校验，拒绝 transport seam 之外注入的伪造 Turn。 */
+/**
+ * @author kongweiguang
+ * 持久快照 Turn 状态须覆盖当前 JA-RPC 合法闭集；身份、nullable 槽位与 changeSet 仍由 domain 严格复核。
+ */
 function isTimelineSnapshotTurn(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const turn = value as Record<string, unknown>;
   return (
     typeof turn["turnId"] === "string" &&
+    (turn["origin"] === "native" || turn["origin"] === "inherited") &&
     [
       "queued",
       "running",
+      "waiting_input",
       "waiting_approval",
       "suspended",
       "completed",
@@ -1077,23 +1224,44 @@ function isTimelineSnapshotItem(value: unknown): value is TimelineSnapshotItem {
   if (
     typeof item["itemId"] !== "string" ||
     typeof item["createdAt"] !== "string" ||
-    typeof item["turnId"] !== "string"
+    typeof item["turnId"] !== "string" ||
+    (item["origin"] !== "native" && item["origin"] !== "inherited")
   )
     return false;
   switch (item["kind"]) {
-    case "user_input":
+    case "user_input": {
+      const preview = Array.isArray(item["content"])
+        ? item["content"]
+            .filter(
+              (block): block is Record<string, unknown> =>
+                typeof block === "object" && block !== null && "type" in block,
+            )
+            .filter((block) => block["type"] === "text")
+            .map((block) => block["text"])
+            .filter((text): text is string => typeof text === "string")
+            .join("")
+        : undefined;
       return (
         Array.isArray(item["content"]) &&
         item["content"].every(isUserContentBlock) &&
-        isAttachmentSummaryList(item["attachments"], item["content"])
+        isAttachmentSummaryList(item["attachments"], item["content"]) &&
+        isPublicTextPreview(preview, item["truncated"], item["totalCharacters"])
       );
+    }
     case "thread_message":
       return isThreadMessageItem(item);
     case "final_answer":
-      return typeof item["text"] === "string";
+      return (
+        typeof item["text"] === "string" &&
+        isPublicTextPreview(item["text"], item["truncated"], item["totalCharacters"])
+      );
     case "assistant_progress":
     case "reasoning_summary":
-      return typeof item["text"] === "string" && Number.isSafeInteger(item["modelRound"]);
+      return (
+        typeof item["text"] === "string" &&
+        Number.isSafeInteger(item["modelRound"]) &&
+        isPublicTextPreview(item["text"], item["truncated"], item["totalCharacters"])
+      );
     case "tool_call":
       return (
         typeof item["callId"] === "string" &&
@@ -1115,7 +1283,29 @@ function isTimelineSnapshotItem(value: unknown): value is TimelineSnapshotItem {
   }
 }
 
-/** 跨会话消息只允许冻结来源身份与纯文本正文，避免通信内容伪装成用户或系统输入。 */
+/** 预览必须是正文的完整 code-point 前缀，禁止把有限预览误当全文交付。 */
+function isPublicTextPreview(
+  preview: string | undefined,
+  truncated: unknown,
+  totalCharacters: unknown,
+): boolean {
+  if (
+    preview === undefined ||
+    typeof truncated !== "boolean" ||
+    !Number.isSafeInteger(totalCharacters) ||
+    (totalCharacters as number) < 0
+  )
+    return false;
+  const previewCharacters = Array.from(preview).length;
+  return (
+    previewCharacters <= (totalCharacters as number) &&
+    (truncated
+      ? previewCharacters < (totalCharacters as number)
+      : previewCharacters === totalCharacters)
+  );
+}
+
+/** 跨会话消息保留原生/继承归属和冻结来源，精确字段集防止通信内容伪装成用户或系统输入。 */
 function isThreadMessageItem(value: unknown, expectedTurnId?: unknown): boolean {
   if (typeof value !== "object" || value === null) return false;
   const item = value as Record<string, unknown>;
@@ -1125,14 +1315,18 @@ function isThreadMessageItem(value: unknown, expectedTurnId?: unknown): boolean 
     "createdAt",
     "itemId",
     "kind",
+    "origin",
     "sourceThreadId",
     "sourceTitle",
+    "totalCharacters",
+    "truncated",
     "turnId",
   ];
   return (
     keys.length === expectedKeys.length &&
     keys.every((key, index) => key === expectedKeys[index]) &&
     item["kind"] === "thread_message" &&
+    (item["origin"] === "native" || item["origin"] === "inherited") &&
     isThreadMessageIdentifier(item["itemId"], "item_", 101) &&
     typeof item["createdAt"] === "string" &&
     isThreadMessageIdentifier(item["turnId"], "turn_", 101) &&
@@ -1147,7 +1341,8 @@ function isThreadMessageItem(value: unknown, expectedTurnId?: unknown): boolean 
     !item["sourceTitle"].includes("\n") &&
     typeof item["content"] === "string" &&
     item["content"].length <= 1_048_576 &&
-    !item["content"].includes("\u0000")
+    !item["content"].includes("\u0000") &&
+    isPublicTextPreview(item["content"], item["truncated"], item["totalCharacters"])
   );
 }
 

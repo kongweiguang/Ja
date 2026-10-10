@@ -4,20 +4,24 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFile, mkdir, copyFile, writeFile, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = path.resolve(packageRoot, "..", "..");
+const require = createRequire(import.meta.url);
+const { inspectSearchTools } = require("../bin/verify.cjs");
 const target = "win32-x64";
 const nativePaths = {
   cli: "runtime/bin/ja.exe",
   appServer: "runtime/bin/sidecars/ja-app-server-x86_64-pc-windows-msvc.exe",
+  searchTools: "runtime/bin/sidecars/tools",
 };
 
-/** 只接受明确的构建产物与源码身份；包名来自私有模板，版本来自根清单。 */
+/** 显式绑定搜索工具 artifact，确保发布包不会依赖构建 runner 的 PATH。 */
 function parseArgs(argv) {
-  const allowed = new Set(["--cli", "--app-server", "--native-report", "--source-commit", "--out"]);
+  const allowed = new Set(["--cli", "--app-server", "--search-tools", "--native-report", "--source-commit", "--out"]);
   const args = {};
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
@@ -66,7 +70,7 @@ function verifyNativeReport(report, server, sourceCommit, serverName) {
   }
 }
 
-/** 校验固定 npm 身份与 Ja 版本，并仅创建新输出目录以隔离发布候选。 */
+/** 校验同一源码的 CLI、App Server 和搜索工具后再创建新目录，保持发布候选自包含。 */
 async function stage(args) {
   const rootManifest = JSON.parse(await readFile(path.join(repositoryRoot, "package.json"), "utf8"));
   if (!/^\d+\.\d+\.\d+$/.test(rootManifest.version)) {
@@ -74,6 +78,7 @@ async function stage(args) {
   }
   const cliPath = path.resolve(args["--cli"]);
   const serverPath = path.resolve(args["--app-server"]);
+  const searchToolsPath = path.resolve(args["--search-tools"]);
   const out = path.resolve(args["--out"]);
   if (cliPath === serverPath) throw new Error("CLI and App Server must be different artifacts");
   const [cli, server, report] = await Promise.all([
@@ -82,6 +87,7 @@ async function stage(args) {
     readFile(path.resolve(args["--native-report"]), "utf8").then(JSON.parse),
   ]);
   verifyNativeReport(report, server, args["--source-commit"], path.basename(serverPath));
+  const searchTools = inspectSearchTools(searchToolsPath, args["--source-commit"]);
   const sourcePackage = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
   if (sourcePackage.private !== true || sourcePackage.name !== "@kongweiguang/ja") {
     throw new Error("source package must be the private @kongweiguang/ja template");
@@ -101,6 +107,7 @@ async function stage(args) {
   await mkdir(path.join(out, "bin"));
   await mkdir(path.join(out, "third_party"));
   await mkdir(path.join(out, "runtime", "bin", "sidecars"), { recursive: true });
+  await mkdir(path.join(out, ...nativePaths.searchTools.split("/")));
   await copyFile(path.join(packageRoot, "bin", "ja.cjs"), path.join(out, "bin", "ja.cjs"));
   await copyFile(path.join(packageRoot, "bin", "verify.cjs"), path.join(out, "bin", "verify.cjs"));
   await copyFile(path.join(packageRoot, "README.md"), path.join(out, "README.md"));
@@ -109,6 +116,9 @@ async function stage(args) {
   await copyFile(path.join(repositoryRoot, "apps", "cli", "third_party", "codex-LICENSE"), path.join(out, "third_party", "codex-LICENSE"));
   await copyFile(cliPath, path.join(out, ...nativePaths.cli.split("/")));
   await copyFile(serverPath, path.join(out, ...nativePaths.appServer.split("/")));
+  for (const file of searchTools.files) {
+    await copyFile(file.sourcePath, path.join(out, ...file.packagePath.split("/")));
+  }
   await writeFile(path.join(out, "package.json"), `${JSON.stringify(publishPackage, null, 2)}\n`);
   await writeFile(path.join(out, "runtime", "manifest.json"), `${JSON.stringify({
     schemaVersion: 1,
@@ -118,6 +128,10 @@ async function stage(args) {
     artifacts: {
       [nativePaths.cli]: { sizeBytes: cli.sizeBytes, sha256: cli.sha256 },
       [nativePaths.appServer]: { sizeBytes: server.sizeBytes, sha256: server.sha256 },
+      ...Object.fromEntries(searchTools.files.map((file) => [
+        file.packagePath,
+        { sizeBytes: file.sizeBytes, sha256: file.sha256 },
+      ])),
     },
   }, null, 2)}\n`);
   const verify = spawnSync(process.execPath, [path.join(out, "bin", "verify.cjs")], {

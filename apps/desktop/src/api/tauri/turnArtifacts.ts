@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { z } from "zod";
+import { ToolCallIdSchema } from "../protocol/identifiers";
 import {
   defaultNativeBridge,
   normalizeRuntimeError,
@@ -20,10 +21,6 @@ const ThreadIdSchema = z
 const TurnIdSchema = z
   .string()
   .regex(/^turn_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
-  .max(101);
-const CallIdSchema = z
-  .string()
-  .regex(/^call_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/)
   .max(101);
 const ArtifactIdSchema = z
   .string()
@@ -48,7 +45,7 @@ const ToolArtifactReadInputSchema = z
     workspaceId: WorkspaceIdSchema,
     threadId: ThreadIdSchema,
     turnId: TurnIdSchema,
-    callId: CallIdSchema,
+    callId: ToolCallIdSchema,
     artifactId: ArtifactIdSchema,
     offsetCharacters: PageOffsetSchema,
     limitCharacters: z.number().int().min(1).max(65_536),

@@ -135,6 +135,131 @@ fn session_close_during_wait_wakes_request_without_sleep() {
     );
 }
 
+/// Scoped close fences new RPCs and cancels old waiters, while the response reader stays alive for its ACK.
+#[test]
+fn client_close_cancels_old_requests_without_closing_ack_reader() {
+    let (server_to_host_reader, mut server_to_host_writer) = pipe_pair();
+    let (host_to_server_reader, host_to_server_writer) = pipe_pair();
+    let session = session_from_io(
+        server_to_host_reader,
+        host_to_server_writer,
+        EmptyReader,
+        31,
+        Limits::default(),
+    )
+    .expect("session fixture");
+    let gate = session.admission_gate();
+    let _event_pump = session.take_event_pump().expect("single event pump");
+
+    let caller = session.clone();
+    let caller_gate = Arc::clone(&gate);
+    let pending = thread::spawn(move || {
+        caller.request_with_gate(
+            "task/create",
+            json!({}),
+            Duration::from_secs(10),
+            &caller_gate,
+        )
+    });
+    let old_request = host_to_server_reader
+        .receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("old request reaches writer");
+    let old_frame = codec::decode_frame(&old_request, Limits::default().max_frame_bytes)
+        .expect("valid old request");
+    let old_id = old_frame.id().to_owned();
+
+    session
+        .begin_client_close_until(Instant::now() + Duration::from_secs(2))
+        .expect("close fences requests and releases old waiter");
+    assert_eq!(
+        pending.join().expect("old waiter joins"),
+        Err(AppServerProcessError::Cancelled)
+    );
+
+    let closing_session = session.clone();
+    let close =
+        thread::spawn(move || closing_session.request_client_close(1_000, Duration::from_secs(1)));
+    let close_request = host_to_server_reader
+        .receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("lifecycle close crosses the closed admission gate");
+    let close_frame = codec::decode_frame(&close_request, Limits::default().max_frame_bytes)
+        .expect("valid close request");
+
+    let late_old_response =
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":\"{old_id}\",\"result\":{{}}}}\n");
+    server_to_host_writer
+        .write_all(late_old_response.as_bytes())
+        .expect("late old response");
+    let close_ack = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{}\",\"result\":{{\"accepted\":true}}}}\n",
+        close_frame.id()
+    );
+    server_to_host_writer
+        .write_all(close_ack.as_bytes())
+        .expect("lifecycle close ACK");
+
+    let response = close
+        .join()
+        .expect("close caller joins")
+        .expect("close ACK");
+    assert_eq!(
+        response.result().value(),
+        Some(&json!({ "accepted": true }))
+    );
+    assert!(!session.inner.closed.load(Ordering::Acquire));
+    assert_eq!(
+        session.request_with_gate("task/create", json!({}), Duration::from_secs(1), &gate,),
+        Err(AppServerProcessError::ShuttingDown)
+    );
+    close_session(&session);
+}
+
+/// 设计原因：WriterCompletion 与关闭路径共享同一条件锁，避免 writer 终态通知被 waiter 丢弃。
+/// 验证持锁期间完成发布会阻塞，解锁后唤醒，并保留已到期 deadline 与 poison 失败结果。
+#[test]
+fn writer_completion_publication_uses_condition_lock_and_preserves_failures() {
+    let completion = Arc::new(WriterCompletion::new());
+    assert!(!completion.wait_until(std::time::Instant::now()));
+
+    let guard = completion
+        .wait_lock
+        .lock()
+        .expect("healthy writer completion lock");
+    let (started, started_receiver) = mpsc::channel();
+    let (published, published_receiver) = mpsc::channel();
+    let worker_completion = Arc::clone(&completion);
+    let worker = thread::spawn(move || {
+        started.send(()).expect("test receiver remains open");
+        worker_completion.mark_done();
+        published.send(()).expect("test receiver remains open");
+    });
+
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("completion worker started");
+    let published_while_locked = published_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+    drop(guard);
+
+    if !published_while_locked {
+        published_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion publishes after condition lock is released");
+    }
+    worker.join().expect("completion worker joins");
+
+    assert!(!published_while_locked);
+    assert!(completion.wait_until(std::time::Instant::now()));
+
+    let failed = WriterCompletion::new();
+    poison_mutex(&failed.wait_lock);
+    failed.mark_done();
+    assert!(!failed.wait_until(std::time::Instant::now()));
+}
+
 /// EventPump 只能被唯一 owner 取得，且 shutdown gate 必须与并发请求准入保持线性顺序。
 #[test]
 fn event_pump_is_take_once_and_shutdown_gate_is_linearized() {
@@ -323,7 +448,7 @@ fn poisoned_request_ledger_fails_closed_before_writer_enqueue() {
         Limits::default(),
     )
     .expect("session fixture");
-    poison_mutex(&session.inner.outbound_request_ids);
+    poison_mutex(&session.inner.outbound_rpc_request_ids);
 
     assert_eq!(
         session.request("workspace/list", json!({}), Duration::from_secs(1)),

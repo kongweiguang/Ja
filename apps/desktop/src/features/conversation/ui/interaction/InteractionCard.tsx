@@ -26,7 +26,7 @@ interface InteractionCardProps {
 export function InteractionCard({ controller }: InteractionCardProps): ReactElement | null {
   const titleId = useId();
   const requiredDescriptionId = `${titleId}-required`;
-  // 交互卡不会因 requestId 更新而 remount；局部校验必须绑定服务端请求，避免旧请求的失败提示
+  // 交互卡不会因 interactionId 更新而 remount；局部校验必须绑定服务端交互，避免旧交互的失败提示
   // 在下一轮提问首次打开时泄漏出来。答案、草稿与提交幂等性仍由 controller 统一持有。
   const [validationQuestionKey, setValidationQuestionKey] = useState<string>();
   const [submitAttemptedRequestId, setSubmitAttemptedRequestId] = useState<string>();
@@ -76,7 +76,7 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
         data-interaction-card="true"
         data-interaction-thread-id={request.threadId}
         data-interaction-status="pending-collapsed"
-        data-request-id={request.requestId}
+        data-interaction-id={request.interactionId}
         aria-label="待回答的问题"
       >
         <div className="ja-interaction-card__summary-heading">
@@ -113,10 +113,10 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
   const selectedOptionIds = answer?.optionIds ?? [];
   const otherSelected = answer?.freeText !== null && answer?.freeText !== undefined;
   const isLastQuestion = pageIndex === request.questions.length - 1;
-  const questionKey = `${request.requestId}:${question.questionId}`;
+  const questionKey = `${request.interactionId}:${question.questionId}`;
   const shouldShowValidation =
     validation !== undefined &&
-    (validationQuestionKey === questionKey || submitAttemptedRequestId === request.requestId);
+    (validationQuestionKey === questionKey || submitAttemptedRequestId === request.interactionId);
   const needsExplicitAdvance =
     question.type !== "single" ||
     otherSelected ||
@@ -171,7 +171,7 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
   };
   /** 提交前先标记当前验证状态，controller 仍负责跨题检查、CAS 与单飞提交。 */
   const submit = (): void => {
-    setSubmitAttemptedRequestId(request.requestId);
+    setSubmitAttemptedRequestId(request.interactionId);
     if (validation !== undefined) {
       setValidationQuestionKey(questionKey);
       return;
@@ -185,7 +185,7 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
       data-interaction-card="true"
       data-interaction-thread-id={request.threadId}
       data-interaction-status="pending"
-      data-request-id={request.requestId}
+      data-interaction-id={request.interactionId}
       data-question-id={question.questionId}
       tabIndex={0}
       aria-labelledby={titleId}
@@ -269,7 +269,7 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
                 >
                   <input
                     type={question.type === "single" ? "radio" : "checkbox"}
-                    name={`interaction-${request.requestId}-${question.questionId}`}
+                    name={`interaction-${request.interactionId}-${question.questionId}`}
                     checked={checked}
                     onChange={() => selectOption(option, checked)}
                   />
@@ -298,7 +298,7 @@ export function InteractionCard({ controller }: InteractionCardProps): ReactElem
                 >
                   <input
                     type={question.type === "single" ? "radio" : "checkbox"}
-                    name={`interaction-${request.requestId}-${question.questionId}`}
+                    name={`interaction-${request.interactionId}-${question.questionId}`}
                     checked={otherSelected}
                     onChange={() => {
                       setValidationQuestionKey(undefined);

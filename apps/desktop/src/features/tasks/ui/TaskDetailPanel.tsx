@@ -2,18 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { Bot, ChevronDown, CircleAlert, LoaderCircle } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { useEffect, useMemo, useState, type ComponentProps, type ReactElement } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
-  ChatTimeline,
   Composer,
+  ConversationTimelineSurface,
   InteractionCard,
   resolveContextUsage,
-  selectApprovalClosedAt,
-  selectApprovalDecisions,
-  selectApprovals,
-  selectGoalActivitiesForOwner,
-  selectItemsForThread,
+  selectApprovalClosedAtForThread,
+  selectApprovalDecisionsForThread,
+  selectApprovalsForThread,
+  selectTurnsForThread,
   useTimelineStore,
   type ComposerSlashCommand,
   type ComposerNativeDropEvent,
@@ -25,19 +24,16 @@ import {
   type ConversationUsageReader,
   type HistoryAttachmentThumbnailPort,
   type InteractionController,
-  type TimelineGoalActivity,
 } from "@/features/conversation";
 import {
-  ComposerGoalStatus,
-  GoalActivityCard,
-  GoalStatusBar,
+  ComposerPlanStatus,
   PlanTimelineBlock,
   PlanWorkbench,
-  type GoalController,
-} from "@/features/goals";
+  type PlanController,
+} from "@/features/plans";
 import { Button, ErrorState } from "@/shared/ui/primitives";
 import type { WorkbenchTaskTab } from "@/features/workbench";
-import type { TaskController } from "../application/useTaskController";
+import { isTaskRevisionConflict, type TaskController } from "../application/useTaskController";
 import { propagatingTaskDescendantCount, taskStateLabel } from "../domain/taskModel";
 import "./tasks.css";
 
@@ -78,7 +74,7 @@ export interface TaskComposerEnvironment {
 export interface TaskTranscriptActions {
   readonly onOpenLink?: (url: string) => void | Promise<void>;
   readonly onCopyText?: (text: string) => Promise<void>;
-  readonly onReadMessageContent?: (threadId: string, messageId: string) => Promise<string>;
+  readonly onReadMessageContent?: (threadId: string, itemId: string) => Promise<string>;
   readonly onReadAnswerContent?: (
     threadId: string,
     finalMessageId: string,
@@ -98,7 +94,7 @@ export interface TaskTranscriptActions {
     expectedThreadRevision: number;
     expectedRecoveryRevision: number;
     decision: "retry" | "skip";
-    idempotencyKey: string;
+    operationKey: string;
   }) => Promise<unknown>;
   readonly onOpenAttachmentPreview?: (
     attachment: {
@@ -111,27 +107,121 @@ export interface TaskTranscriptActions {
   ) => void;
 }
 
-/** 读失败保留原会话和草稿；重试只重读当前 Task，不重新发送任何内容。 */
+/** 读失败保留原会话和草稿；无重试入口的提示可与原确认控件共存，避免重复副作用按钮。 */
 function DetailReadAlert({
   message,
   onRetry,
 }: {
   message: string;
-  onRetry: () => void;
+  onRetry?: () => void;
 }): ReactElement {
   return (
     <div className="ja-task-read-alert" role="alert">
       <CircleAlert aria-hidden="true" />
       <span>{message}</span>
-      <Button variant="ghost" size="sm" onClick={onRetry}>
-        重试
-      </Button>
+      {onRetry === undefined ? null : (
+        <Button variant="ghost" size="sm" onClick={onRetry}>
+          重试
+        </Button>
+      )}
     </div>
   );
 }
 
+/** Timeline subscription and terminal-Plan reconciliation exist only while this Task Thread is visible. */
+function TaskConversationTimeline({
+  threadId,
+  controller,
+  conversation,
+  clarification,
+  plan,
+  environment,
+  transcriptActions,
+  externalRows,
+}: {
+  threadId: string;
+  controller: TaskController;
+  conversation?: ConversationInteractionController;
+  clarification?: InteractionController;
+  plan?: PlanController;
+  environment?: TaskComposerEnvironment;
+  transcriptActions?: TaskTranscriptActions;
+  externalRows?: ComponentProps<typeof ConversationTimelineSurface>["externalRows"];
+}): ReactElement {
+  const turns = useTimelineStore(useShallow(selectTurnsForThread(threadId)));
+  const approvals = useTimelineStore(useShallow(selectApprovalsForThread(threadId)));
+  const approvalDecisions = useTimelineStore(
+    useShallow(selectApprovalDecisionsForThread(threadId)),
+  );
+  const approvalClosedAt = useTimelineStore(useShallow(selectApprovalClosedAtForThread(threadId)));
+  const latestTerminalTurnId = useMemo(
+    () =>
+      turns
+        .filter((turn) => ["completed", "failed", "cancelled"].includes(turn.status))
+        .sort((left, right) => (left.completedAt ?? "").localeCompare(right.completedAt ?? ""))
+        .at(-1)?.turnId,
+    [turns],
+  );
+  const currentPlanId = plan?.planModel?.plan.planId;
+  const refreshPlan = plan?.refresh;
+  /** A visible terminal turn may have committed Plan facts not present in its earlier Thread snapshot. */
+  useEffect(() => {
+    if (currentPlanId !== undefined && latestTerminalTurnId !== undefined) void refreshPlan?.();
+  }, [currentPlanId, latestTerminalTurnId, refreshPlan]);
+
+  return (
+    <ConversationTimelineSurface
+      threadId={threadId === "" ? undefined : threadId}
+      answeredRequest={clarification?.answeredRequest ?? null}
+      answeredAnswers={clarification?.answeredAnswers ?? {}}
+      turns={turns}
+      approvals={approvals}
+      approvalDecisions={approvalDecisions}
+      approvalClosedAt={approvalClosedAt}
+      skills={environment?.skills}
+      localSubmissions={conversation?.localSubmissions}
+      editableSourceMessageId={conversation?.editableSourceMessageId}
+      onEditQuestion={conversation?.editQuestion}
+      externalRows={externalRows}
+      onApprovalDecision={(approval, decision) =>
+        conversation !== undefined
+          ? conversation.approve(approval, decision)
+          : controller.approvalRespond(
+              approval.approvalId,
+              approval.turnId,
+              approval.threadRevision,
+              decision,
+            )
+      }
+      onOpenLink={transcriptActions?.onOpenLink}
+      onCopyText={transcriptActions?.onCopyText}
+      onReadMessageContent={
+        transcriptActions?.onReadMessageContent === undefined
+          ? undefined
+          : (_threadId, itemId) => transcriptActions.onReadMessageContent!(threadId, itemId)
+      }
+      onReadAnswerContent={
+        transcriptActions?.onReadAnswerContent === undefined
+          ? undefined
+          : (finalMessageId, minimumRevision, turnId) =>
+              transcriptActions.onReadAnswerContent!(
+                threadId,
+                finalMessageId,
+                minimumRevision,
+                turnId,
+              )
+      }
+      onReadToolArtifact={transcriptActions?.onReadToolArtifact}
+      onResolveToolRecovery={transcriptActions?.onResolveToolRecovery}
+      onOpenAttachmentPreview={transcriptActions?.onOpenAttachmentPreview}
+      emptyText="随时开始新的任务"
+      className="ja-task-chat-timeline"
+    />
+  );
+}
+
 /**
- * 侧聊拥有真实 Thread，和主任务使用相同的交互 controller、Timeline、Composer 与 Plan/Goal
+ * 侧聊拥有真实 Thread，和主任务使用相同的交互 controller、Timeline、Composer 与 Plan
  * 组件。视图不再创建精简版草稿或解析历史格式；Subagent 保持只读正文和显式控制入口。
  */
 export function TaskDetailPanel({
@@ -140,8 +230,9 @@ export function TaskDetailPanel({
   composerEnvironment: environment,
   transcriptActions,
   conversation,
-  goal,
+  plan,
   clarification,
+  active = true,
   planDetailsOpen = false,
   onPlanDetailsChange,
   focusRequest,
@@ -151,8 +242,10 @@ export function TaskDetailPanel({
   composerEnvironment?: TaskComposerEnvironment;
   transcriptActions?: TaskTranscriptActions;
   conversation?: ConversationInteractionController;
-  goal?: GoalController;
+  plan?: PlanController;
   clarification?: InteractionController;
+  /** Hidden retained Workbench hosts must not observe stream-heavy Thread state or start Workspace IO. */
+  active?: boolean;
   planDetailsOpen?: boolean;
   onPlanDetailsChange?: (open: boolean) => void;
   /** 空侧聊创建完成后由 Host 发出一次性焦点 token，避免查询全局 DOM 抢走主 Composer 焦点。 */
@@ -166,7 +259,7 @@ export function TaskDetailPanel({
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState<string>();
-  /** Subagent 的递归取消保持显式确认；失败不会把 Task 状态乐观改成终态。 */
+  /** Subagent 的递归取消保持显式确认；冲突退回入口，普通失败保留原确认以供用户显式重试。 */
   const controlSubagent = async (resume: boolean): Promise<void> => {
     if (task === undefined || controlBusy) return;
     setControlBusy(true);
@@ -175,46 +268,25 @@ export function TaskDetailPanel({
       if (resume) await controller.resume(task);
       else await controller.cancel(task);
       setConfirmCancel(false);
-    } catch {
-      setControlError(resume ? "任务恢复失败，请重试。" : "取消请求未完成，请重试。");
+    } catch (error) {
+      const revisionConflict = !resume && isTaskRevisionConflict(error);
+      if (revisionConflict) setConfirmCancel(false);
+      setControlError(
+        revisionConflict
+          ? error instanceof Error
+            ? error.message
+            : "任务状态已更新，请查看最新任务及取消范围后重新确认。"
+          : resume
+            ? "任务恢复失败，请重试。"
+            : "取消请求未完成，请重试。",
+      );
     } finally {
       setControlBusy(false);
     }
   };
-  const items = useTimelineStore(useShallow(selectItemsForThread(threadId)));
-  const turns = useTimelineStore(
-    useShallow((state) => Object.values(state.turns).filter((turn) => turn.threadId === threadId)),
+  const hasTimelineSnapshot = useTimelineStore(
+    (state) => state.snapshotRevisionByThread[threadId] !== undefined,
   );
-  const approvals = useTimelineStore(
-    useShallow((state) =>
-      selectApprovals(state).filter((approval) => approval.threadId === threadId),
-    ),
-  );
-  const approvalDecisions = useTimelineStore(useShallow(selectApprovalDecisions));
-  const approvalClosedAt = useTimelineStore(useShallow(selectApprovalClosedAt));
-  const persistedGoalActivities = useTimelineStore(selectGoalActivitiesForOwner(threadId));
-  /** 与主会话一样以 mutation ACK 补齐终态卡片，下一次持久快照再按 Goal identity 去重接管。 */
-  const goalActivities = useMemo<readonly TimelineGoalActivity[]>(() => {
-    const current = goal?.model?.goal;
-    if (
-      current === undefined ||
-      current.ownerThreadId !== threadId ||
-      (current.status !== "achieved" && current.status !== "stopped") ||
-      persistedGoalActivities.some((activity) => activity.goalId === current.goalId)
-    )
-      return persistedGoalActivities;
-    return [
-      ...persistedGoalActivities,
-      {
-        goalId: current.goalId,
-        objective: current.objective,
-        status: current.status,
-        goalRevision: current.revision,
-        eventSequence: goal?.model?.eventSequence ?? current.revision,
-        occurredAt: current.updatedAt,
-      },
-    ];
-  }, [goal?.model, persistedGoalActivities, threadId]);
   const usage = useTimelineStore((state) => state.contextUsageByThread[threadId]);
   const invalidatedAt = useTimelineStore(
     (state) => state.contextUsageInvalidatedAtByThread[threadId],
@@ -226,8 +298,8 @@ export function TaskDetailPanel({
   );
   /** 与主 Composer 保持同一刷新语义：仅新的请求身份或恢复事实才能刷新已打开浮层。 */
   const usageRefreshRevision = [
-    usage?.requestId,
-    usage?.requestOrdinal,
+    usage?.modelRequestId,
+    usage?.modelRequestOrdinal,
     usage?.modelRound,
     usage?.measuredAt,
     invalidatedAt,
@@ -237,37 +309,23 @@ export function TaskDetailPanel({
   const context =
     controller.detail?.task.taskThreadId === threadId ? controller.detail.contextSeed : undefined;
   const closing = controller.closingTaskThreadId === threadId;
-  const currentStepTitle = goal?.model?.plan?.steps.find(
-    (step) => step.stepId === goal.model?.goal.currentStepId,
-  )?.title;
-  const latestTerminalTurnId = turns
-    .filter((turn) => ["completed", "failed", "cancelled"].includes(turn.status))
-    .sort((left, right) => (left.completedAt ?? "").localeCompare(right.completedAt ?? ""))
-    .at(-1)?.turnId;
-  const currentPlanId = goal?.planModel?.plan.planId;
-  const refreshGoal = goal?.refresh;
-  /** 独立 Plan 不一定产生 Goal 事件；与主会话一样在 Turn 终态重读一次权威 Plan。 */
-  useEffect(() => {
-    if (currentPlanId !== undefined && latestTerminalTurnId !== undefined) void refreshGoal?.();
-  }, [currentPlanId, latestTerminalTurnId, refreshGoal]);
-  const externalRows = goalActivities.map((activity) => ({
-    rowId: `goal-terminal:${activity.goalId}`,
-    occurredAt: activity.occurredAt,
-    revision: `${activity.goalRevision}:${activity.eventSequence}`,
-    content: <GoalActivityCard activity={activity} />,
-  }));
-  if (goal?.planModel !== undefined)
+  const externalRows = [] as {
+    rowId: string;
+    occurredAt: string;
+    revision: string;
+    content: ReactElement;
+  }[];
+  if (plan?.planModel !== undefined)
     externalRows.push({
-      rowId: `plan:${goal.planModel.plan.planId}`,
-      occurredAt: goal.planModel.plan.updatedAt,
-      revision: String(goal.planModel.plan.revision),
+      rowId: `plan:${plan.planModel.plan.planId}`,
+      occurredAt: plan.planModel.plan.updatedAt,
+      revision: String(plan.planModel.plan.revision),
       content: (
         <PlanTimelineBlock
-          model={goal.model}
-          planModel={goal.planModel}
-          busy={goal.busyAction !== undefined}
+          planModel={plan.planModel}
+          busy={plan.busyAction !== undefined}
           onOpenDetails={() => onPlanDetailsChange?.(true)}
-          onExecute={goal.execute}
+          onExecute={plan.execute}
         />
       ),
     });
@@ -297,7 +355,9 @@ export function TaskDetailPanel({
               继续运行
             </Button>
           ) : task !== undefined &&
-            ["queued", "running", "waiting_approval"].includes(task.state) ? (
+            controller.error === undefined &&
+            controller.detailError === undefined &&
+            ["queued", "running", "waiting_approval", "waiting_input"].includes(task.state) ? (
             confirmCancel ? (
               <div className="ja-task-cancel-confirm" role="group" aria-label="确认取消任务">
                 <span>
@@ -321,18 +381,23 @@ export function TaskDetailPanel({
                 </Button>
               </div>
             ) : (
-              <Button variant="ghost" size="sm" onClick={() => setConfirmCancel(true)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setControlError(undefined);
+                  setConfirmCancel(true);
+                }}
+              >
                 取消任务
               </Button>
             )
           ) : null}
         </header>
       ) : null}
-      {controlError === undefined ? null : (
-        <DetailReadAlert
-          message={controlError}
-          onRetry={() => void controlSubagent(task?.state === "suspended")}
-        />
+      {controlError === undefined ? null : <DetailReadAlert message={controlError} />}
+      {controller.error === undefined ? null : (
+        <DetailReadAlert message={controller.error} onRetry={() => void controller.refresh()} />
       )}
       {controller.detailError === undefined ? null : (
         <DetailReadAlert
@@ -368,94 +433,45 @@ export function TaskDetailPanel({
           )}
         </details>
       ) : null}
-      {planDetailsOpen ? null : controller.detailLoading && controller.transcript === undefined ? (
+      {planDetailsOpen ? null : controller.detailLoading && !hasTimelineSnapshot ? (
         <div className="ja-task-loading" role="status">
           <LoaderCircle className="ja-task-spin" aria-hidden="true" />
           正在读取任务…
         </div>
-      ) : (
-        <ChatTimeline
-          className="ja-task-chat-timeline"
-          threadId={threadId === "" ? undefined : threadId}
-          items={items}
-          turns={turns}
-          approvals={approvals}
-          skills={environment?.skills}
-          approvalDecisions={approvalDecisions}
-          approvalClosedAt={approvalClosedAt}
-          localSubmissions={conversation?.localSubmissions}
-          editableSourceMessageId={conversation?.editableSourceMessageId}
-          onEditQuestion={conversation?.editQuestion}
+      ) : active ? (
+        <TaskConversationTimeline
+          threadId={threadId}
+          controller={controller}
+          conversation={conversation}
+          clarification={clarification}
+          plan={plan}
+          environment={environment}
+          transcriptActions={transcriptActions}
           externalRows={externalRows}
-          onApprovalDecision={(approval, decision) =>
-            conversation !== undefined
-              ? conversation.approve(approval, decision)
-              : controller.approvalRespond(
-                  approval.approvalId,
-                  approval.turnId,
-                  approval.threadRevision,
-                  decision,
-                )
-          }
-          onOpenLink={transcriptActions?.onOpenLink}
-          onCopyText={transcriptActions?.onCopyText}
-          onReadMessageContent={
-            transcriptActions?.onReadMessageContent === undefined || threadId === ""
-              ? undefined
-              : (messageId) => transcriptActions.onReadMessageContent!(threadId, messageId)
-          }
-          onReadAnswerContent={
-            transcriptActions?.onReadAnswerContent === undefined || threadId === ""
-              ? undefined
-              : (finalMessageId, minimumRevision, turnId) =>
-                  transcriptActions.onReadAnswerContent!(
-                    threadId,
-                    finalMessageId,
-                    minimumRevision,
-                    turnId,
-                  )
-          }
-          onReadToolArtifact={transcriptActions?.onReadToolArtifact}
-          onResolveToolRecovery={transcriptActions?.onResolveToolRecovery}
-          onOpenAttachmentPreview={transcriptActions?.onOpenAttachmentPreview}
-          emptyText="随时开始新的任务"
         />
-      )}
-      {planDetailsOpen && goal !== undefined ? (
+      ) : null}
+      {planDetailsOpen && plan !== undefined ? (
         <div className="ja-task-plan-details">
           <Button variant="ghost" size="sm" onClick={() => onPlanDetailsChange?.(false)}>
             返回对话
           </Button>
           <PlanWorkbench
-            model={goal.model}
-            planModel={goal.planModel}
-            revisions={goal.revisions}
-            evidence={goal.evidence}
-            loading={goal.loading}
-            error={goal.error}
-            busyAction={goal.busyAction}
-            onRetry={goal.refresh}
-            onSaveDraft={goal.saveDraft}
-            onDiscardDraft={goal.discardDraft}
-            onPropose={goal.propose}
-            onFinalizePlan={goal.finalizePlan}
-            onExecute={goal.execute}
-            onPausePlan={goal.pausePlan}
-            onResumePlan={goal.resumePlan}
-            onStopPlan={goal.stopPlan}
-            onAttachPlan={
-              goal.model === undefined ||
-              goal.planModel === undefined ||
-              (goal.model.goal.status !== "active" && goal.model.goal.status !== "paused") ||
-              goal.model.goal.activePlanId === goal.planModel.plan.planId
-                ? undefined
-                : goal.attachPlan
-            }
-            onDetachPlan={goal.model?.goal.activePlanId == null ? undefined : goal.detachPlan}
-            onReject={goal.reject}
-            onPause={goal.pause}
-            onResume={goal.resume}
-            onContinue={goal.resume}
+            planModel={plan.planModel}
+            revisions={plan.revisions}
+            evidence={plan.evidence}
+            loading={plan.loading}
+            error={plan.error}
+            busyAction={plan.busyAction}
+            onRetry={plan.refresh}
+            onSaveDraft={plan.saveDraft}
+            onDiscardDraft={plan.discardDraft}
+            onPropose={plan.propose}
+            onFinalizePlan={plan.finalizePlan}
+            onExecute={plan.execute}
+            onPausePlan={plan.pausePlan}
+            onResumePlan={plan.resumePlan}
+            onStopPlan={plan.stopPlan}
+            onReject={plan.reject}
           />
         </div>
       ) : null}
@@ -465,6 +481,7 @@ export function TaskDetailPanel({
           data-task-state={task?.state}
         >
           <Composer
+            active={active}
             focusRequest={focusRequest}
             interactionSlot={
               clarification === undefined ? undefined : (
@@ -477,8 +494,8 @@ export function TaskDetailPanel({
             threadId={threadId}
             workspaceId={environment?.workspaceId}
             runtimeGeneration={environment?.runtimeGeneration}
-            nativeDropEvent={environment?.nativeDropEvent}
-            dropZoneRef={environment?.dropZoneRef}
+            nativeDropEvent={active ? environment?.nativeDropEvent : undefined}
+            dropZoneRef={active ? environment?.dropZoneRef : undefined}
             contextReferences={conversation.contextReferences}
             onContextReferencesChange={conversation.updateContextReferences}
             preferences={conversation.preferences}
@@ -508,7 +525,7 @@ export function TaskDetailPanel({
             importingAttachments={conversation.importingAttachments}
             cancelling={conversation.cancelling}
             resuming={conversation.resuming}
-            error={conversation.error ?? goal?.error}
+            error={conversation.error ?? plan?.error}
             queuedInputs={conversation.queuedInputs}
             queueAccepting={conversation.queueAccepting}
             contextUsage={contextUsage}
@@ -521,33 +538,13 @@ export function TaskDetailPanel({
             }
             modeStatus={
               conversation.preferences === undefined ? undefined : (
-                <ComposerGoalStatus
+                <ComposerPlanStatus
                   mode={conversation.preferences.collaborationMode}
-                  goal={goal?.model?.goal}
-                  currentStepTitle={currentStepTitle}
                   busy={conversation.preferenceBusy}
-                  onOpenGoal={() => onPlanDetailsChange?.(true)}
                   onOpenPlan={
-                    goal?.planModel === undefined ? undefined : () => onPlanDetailsChange?.(true)
+                    plan?.planModel === undefined ? undefined : () => onPlanDetailsChange?.(true)
                   }
                   onDisablePlan={() => conversation.changeCollaborationMode("default")}
-                />
-              )
-            }
-            goalStatus={
-              goal?.model === undefined ? undefined : (
-                <GoalStatusBar
-                  goal={goal.model.goal}
-                  evaluation={goal.model.evaluation}
-                  currentStepTitle={currentStepTitle}
-                  busy={goal.busyAction !== undefined}
-                  onOpen={() => onPlanDetailsChange?.(true)}
-                  onPause={() => void goal.pause()}
-                  onResume={() => void goal.resume()}
-                  onResolve={() => onPlanDetailsChange?.(true)}
-                  onContinue={() => void goal.resume()}
-                  hasPendingQuestion={clarification?.request?.status === "pending"}
-                  onAnswerQuestion={() => clarification?.setCollapsed(false)}
                 />
               )
             }

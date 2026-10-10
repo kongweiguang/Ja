@@ -1,0 +1,2426 @@
+{
+  "columns": [
+    {
+      "table": "agent_commit_receipt",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "turn_id",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "user_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "commit_key",
+      "ordinal": 5,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "fingerprint",
+      "ordinal": 6,
+      "type": "character(64)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "thread_revision",
+      "ordinal": 7,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "mutation_version",
+      "ordinal": 8,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "first_event_sequence",
+      "ordinal": 9,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "last_event_sequence",
+      "ordinal": 10,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "receipt_json",
+      "ordinal": 11,
+      "type": "text",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "occurred_at_ms",
+      "ordinal": 12,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "user_id",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "revision",
+      "ordinal": 4,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "event_sequence",
+      "ordinal": 5,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "record_sequence",
+      "ordinal": 6,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "latest_execution_sequence",
+      "ordinal": 7,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "created_at_ms",
+      "ordinal": 8,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_conversation",
+      "name": "updated_at_ms",
+      "ordinal": 9,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "event_sequence",
+      "ordinal": 3,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "turn_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "user_id",
+      "ordinal": 5,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "event_id",
+      "ordinal": 6,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "event_type",
+      "ordinal": 7,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "payload_schema_version",
+      "ordinal": 8,
+      "type": "integer",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "thread_revision",
+      "ordinal": 9,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "mutation_version",
+      "ordinal": 10,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "last_record_sequence",
+      "ordinal": 11,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "payload_json",
+      "ordinal": 12,
+      "type": "text",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_event",
+      "name": "occurred_at_ms",
+      "ordinal": 13,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "turn_id",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "user_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "admission_sequence",
+      "ordinal": 5,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "state",
+      "ordinal": 6,
+      "type": "character varying(128)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "mutation_version",
+      "ordinal": 7,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "cursor_schema_version",
+      "ordinal": 8,
+      "type": "integer",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "cursor_json",
+      "ordinal": 9,
+      "type": "text",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "last_record_sequence",
+      "ordinal": 10,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "created_at_ms",
+      "ordinal": 11,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_execution",
+      "name": "updated_at_ms",
+      "ordinal": 12,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "user_id",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "owner_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "fencing_token",
+      "ordinal": 5,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "expires_at_ms",
+      "ordinal": 6,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_lease",
+      "name": "updated_at_ms",
+      "ordinal": 7,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "user_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "operation_key",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "thread_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "turn_id",
+      "ordinal": 5,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "operation_type",
+      "ordinal": 6,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "fingerprint",
+      "ordinal": 7,
+      "type": "character(64)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "thread_revision",
+      "ordinal": 8,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "mutation_version",
+      "ordinal": 9,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "first_event_sequence",
+      "ordinal": 10,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "last_event_sequence",
+      "ordinal": 11,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "receipt_json",
+      "ordinal": 12,
+      "type": "text",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "occurred_at_ms",
+      "ordinal": 13,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "tenant_id",
+      "ordinal": 1,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "thread_id",
+      "ordinal": 2,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "turn_id",
+      "ordinal": 3,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "user_id",
+      "ordinal": 4,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "record_id",
+      "ordinal": 5,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "record_type",
+      "ordinal": 6,
+      "type": "character varying(256)",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "payload_schema_version",
+      "ordinal": 7,
+      "type": "integer",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "record_sequence",
+      "ordinal": 8,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "payload_json",
+      "ordinal": 9,
+      "type": "text",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_record",
+      "name": "occurred_at_ms",
+      "ordinal": 10,
+      "type": "bigint",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_schema_version",
+      "name": "singleton_id",
+      "ordinal": 1,
+      "type": "integer",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    },
+    {
+      "table": "agent_schema_version",
+      "name": "schema_version",
+      "ordinal": 2,
+      "type": "integer",
+      "notNull": true,
+      "default": null,
+      "identity": "",
+      "generated": ""
+    }
+  ],
+  "constraints": [
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_check",
+      "type": "c",
+      "columns": [
+        10,
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(last_event_sequence >= first_event_sequence)"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_commit_key_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((commit_key)::text) >= 1) AND (length((commit_key)::text) <= 256)) AND ((commit_key)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_fingerprint_check",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(fingerprint ~ '^[0-9a-f]{64}$'::text)"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_first_event_sequence_check",
+      "type": "c",
+      "columns": [
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(first_event_sequence >= 0)"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_mutation_version_check",
+      "type": "c",
+      "columns": [
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(mutation_version > 0)"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_thread_revision_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(thread_revision > 0)"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_turn_id_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((turn_id)::text) >= 1) AND (length((turn_id)::text) <= 256)) AND ((turn_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "agent_commit_receipt_user_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "ck_agent_commit_receipt_json",
+      "type": "c",
+      "columns": [
+        11
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((jsonb_typeof((receipt_json)::jsonb) = 'object'::text) AND (octet_length(receipt_json) <= 16777216))"
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "fk_agent_commit_receipt_execution",
+      "type": "f",
+      "columns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceTable": "agent_execution",
+      "referenceColumns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_commit_receipt",
+      "name": "pk_agent_commit_receipt",
+      "type": "p",
+      "columns": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_event_sequence_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(event_sequence >= 0)"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_latest_execution_sequence_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(latest_execution_sequence >= 0)"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_record_sequence_check",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(record_sequence >= 0)"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_revision_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(revision >= 0)"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "agent_conversation_user_id_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_conversation",
+      "name": "pk_agent_conversation",
+      "type": "p",
+      "columns": [
+        1,
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_conversation",
+      "name": "uk_agent_conversation_owner",
+      "type": "u",
+      "columns": [
+        1,
+        2,
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_event_id_check",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((event_id)::text) >= 1) AND (length((event_id)::text) <= 256)) AND ((event_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_event_sequence_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(event_sequence > 0)"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_event_type_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((event_type)::text) >= 1) AND (length((event_type)::text) <= 256)) AND ((event_type)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_last_record_sequence_check",
+      "type": "c",
+      "columns": [
+        11
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(last_record_sequence >= 0)"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_mutation_version_check",
+      "type": "c",
+      "columns": [
+        10
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(mutation_version > 0)"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_payload_schema_version_check",
+      "type": "c",
+      "columns": [
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(payload_schema_version > 0)"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_thread_revision_check",
+      "type": "c",
+      "columns": [
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(thread_revision > 0)"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_turn_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((turn_id)::text) >= 1) AND (length((turn_id)::text) <= 256)) AND ((turn_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "agent_event_user_id_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_event",
+      "name": "ck_agent_event_payload_json",
+      "type": "c",
+      "columns": [
+        12
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((jsonb_typeof((payload_json)::jsonb) = 'object'::text) AND (octet_length(payload_json) <= 16777216))"
+    },
+    {
+      "table": "agent_event",
+      "name": "fk_agent_event_execution",
+      "type": "f",
+      "columns": [
+        1,
+        2,
+        4,
+        5
+      ],
+      "referenceTable": "agent_execution",
+      "referenceColumns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_event",
+      "name": "pk_agent_event",
+      "type": "p",
+      "columns": [
+        1,
+        2,
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_event",
+      "name": "uk_agent_event_identity",
+      "type": "u",
+      "columns": [
+        1,
+        2,
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_admission_sequence_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(admission_sequence > 0)"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_cursor_schema_version_check",
+      "type": "c",
+      "columns": [
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(cursor_schema_version > 0)"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_last_record_sequence_check",
+      "type": "c",
+      "columns": [
+        10
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(last_record_sequence >= 0)"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_mutation_version_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(mutation_version >= 0)"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_turn_id_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((turn_id)::text) >= 1) AND (length((turn_id)::text) <= 256)) AND ((turn_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "agent_execution_user_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "ck_agent_execution_cursor_json",
+      "type": "c",
+      "columns": [
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((jsonb_typeof((cursor_json)::jsonb) = 'object'::text) AND (octet_length(cursor_json) <= 16777216))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "ck_agent_execution_state",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((state)::text = ANY ((ARRAY['QUEUED'::character varying, 'RUNNING'::character varying, 'WAITING_APPROVAL'::character varying, 'WAITING_INPUT'::character varying, 'SUSPENDED'::character varying, 'COMPLETED'::character varying, 'FAILED'::character varying, 'CANCELLED'::character varying])::text[]))"
+    },
+    {
+      "table": "agent_execution",
+      "name": "fk_agent_execution_conversation",
+      "type": "f",
+      "columns": [
+        1,
+        2,
+        4
+      ],
+      "referenceTable": "agent_conversation",
+      "referenceColumns": [
+        1,
+        2,
+        3
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_execution",
+      "name": "pk_agent_execution",
+      "type": "p",
+      "columns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_execution",
+      "name": "uk_agent_execution_admission",
+      "type": "u",
+      "columns": [
+        1,
+        2,
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_lease",
+      "name": "agent_lease_fencing_token_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(fencing_token > 0)"
+    },
+    {
+      "table": "agent_lease",
+      "name": "agent_lease_owner_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((owner_id)::text) >= 1) AND (length((owner_id)::text) <= 256)) AND ((owner_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_lease",
+      "name": "agent_lease_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_lease",
+      "name": "agent_lease_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_lease",
+      "name": "agent_lease_user_id_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_lease",
+      "name": "fk_agent_lease_conversation",
+      "type": "f",
+      "columns": [
+        1,
+        2,
+        3
+      ],
+      "referenceTable": "agent_conversation",
+      "referenceColumns": [
+        1,
+        2,
+        3
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_lease",
+      "name": "pk_agent_lease",
+      "type": "p",
+      "columns": [
+        1,
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_check",
+      "type": "c",
+      "columns": [
+        11,
+        10
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(last_event_sequence >= first_event_sequence)"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_fingerprint_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(fingerprint ~ '^[0-9a-f]{64}$'::text)"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_first_event_sequence_check",
+      "type": "c",
+      "columns": [
+        10
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(first_event_sequence >= 0)"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_mutation_version_check",
+      "type": "c",
+      "columns": [
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(mutation_version > 0)"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_operation_key_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((operation_key)::text) >= 1) AND (length((operation_key)::text) <= 256)) AND ((operation_key)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_operation_type_check",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((operation_type)::text) >= 1) AND (length((operation_type)::text) <= 256)) AND ((operation_type)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_thread_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_thread_revision_check",
+      "type": "c",
+      "columns": [
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(thread_revision > 0)"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_turn_id_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((turn_id)::text) >= 1) AND (length((turn_id)::text) <= 256)) AND ((turn_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "agent_operation_receipt_user_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "ck_agent_operation_receipt_json",
+      "type": "c",
+      "columns": [
+        12
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((jsonb_typeof((receipt_json)::jsonb) = 'object'::text) AND (octet_length(receipt_json) <= 16777216))"
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "fk_agent_operation_receipt_execution",
+      "type": "f",
+      "columns": [
+        1,
+        4,
+        5,
+        2
+      ],
+      "referenceTable": "agent_execution",
+      "referenceColumns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_operation_receipt",
+      "name": "pk_agent_operation_receipt",
+      "type": "p",
+      "columns": [
+        1,
+        2,
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_payload_schema_version_check",
+      "type": "c",
+      "columns": [
+        7
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(payload_schema_version > 0)"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_record_id_check",
+      "type": "c",
+      "columns": [
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((record_id)::text) >= 1) AND (length((record_id)::text) <= 256)) AND ((record_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_record_sequence_check",
+      "type": "c",
+      "columns": [
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(record_sequence > 0)"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_record_type_check",
+      "type": "c",
+      "columns": [
+        6
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((record_type)::text) >= 1) AND (length((record_type)::text) <= 256)) AND ((record_type)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_tenant_id_check",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((tenant_id)::text) >= 1) AND (length((tenant_id)::text) <= 256)) AND ((tenant_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_thread_id_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((thread_id)::text) >= 1) AND (length((thread_id)::text) <= 256)) AND ((thread_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_turn_id_check",
+      "type": "c",
+      "columns": [
+        3
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((turn_id)::text) >= 1) AND (length((turn_id)::text) <= 256)) AND ((turn_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "agent_record_user_id_check",
+      "type": "c",
+      "columns": [
+        4
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(((length((user_id)::text) >= 1) AND (length((user_id)::text) <= 256)) AND ((user_id)::text !~ '^[[:space:]]*$'::text))"
+    },
+    {
+      "table": "agent_record",
+      "name": "ck_agent_record_payload_json",
+      "type": "c",
+      "columns": [
+        9
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "((jsonb_typeof((payload_json)::jsonb) = 'object'::text) AND (octet_length(payload_json) <= 16777216))"
+    },
+    {
+      "table": "agent_record",
+      "name": "fk_agent_record_execution",
+      "type": "f",
+      "columns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceTable": "agent_execution",
+      "referenceColumns": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "referenceInOwnerSchema": true,
+      "updateAction": "a",
+      "deleteAction": "a",
+      "match": "s",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_record",
+      "name": "pk_agent_record",
+      "type": "p",
+      "columns": [
+        1,
+        2,
+        8
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_record",
+      "name": "uk_agent_record_identity",
+      "type": "u",
+      "columns": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_record",
+      "name": "uk_agent_record_product_reference",
+      "type": "u",
+      "columns": [
+        1,
+        2,
+        3,
+        5
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    },
+    {
+      "table": "agent_schema_version",
+      "name": "agent_schema_version_schema_version_check",
+      "type": "c",
+      "columns": [
+        2
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(schema_version > 0)"
+    },
+    {
+      "table": "agent_schema_version",
+      "name": "ck_agent_schema_singleton",
+      "type": "c",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": "(singleton_id = 1)"
+    },
+    {
+      "table": "agent_schema_version",
+      "name": "pk_agent_schema_version",
+      "type": "p",
+      "columns": [
+        1
+      ],
+      "referenceTable": null,
+      "referenceColumns": null,
+      "referenceInOwnerSchema": null,
+      "updateAction": " ",
+      "deleteAction": " ",
+      "match": " ",
+      "deferrable": false,
+      "deferred": false,
+      "validated": true,
+      "expression": null
+    }
+  ]
+}

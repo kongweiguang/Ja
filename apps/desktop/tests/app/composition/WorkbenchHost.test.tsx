@@ -4,22 +4,32 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { Profiler, type ComponentProps } from "react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkbenchHost } from "@/app/composition/WorkbenchHost";
 import { PreviewAdapterError } from "@/api/tauri/preview";
-import type { GoalController } from "@/features/goals";
-import { useTimelineStore, type TimelineSnapshot } from "@/features/conversation";
-import type { TaskReadModel, TaskSummary } from "@/features/tasks";
+import type { PlanController } from "@/features/plans";
+import {
+  useTimelineStore,
+  type TimelineRuntimeFence,
+  type TimelineSnapshot,
+} from "@/features/conversation";
+import { publishTaskHostEvent, type TaskReadModel, type TaskSummary } from "@/features/tasks";
 
 const mocks = vi.hoisted(() => ({
   queryRuntime: vi.fn(),
   previewOpenTarget: vi.fn(),
+  filesRead: vi.fn(),
   useReviewController: vi.fn(),
+  useAiReviewController: vi.fn(),
+  submitReviewTurn: vi.fn(),
+  cancelReviewTurn: vi.fn(),
   usePreviewController: vi.fn(),
   useFilesController: vi.fn(),
   useJaWorkbench: vi.fn(),
   useTerminalWorkspaceLifecycle: vi.fn(),
   useTaskController: vi.fn(),
+  taskEventListeners: new Set<(event: unknown) => void>(),
   TaskDetailPanel: vi.fn(() => null),
   Workbench: vi.fn((props: unknown) => {
     const workbenchProps = props as {
@@ -36,7 +46,7 @@ const mocks = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock("sonner", () => ({ toast: { error: vi.fn(), dismiss: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), info: vi.fn(), dismiss: vi.fn() } }));
 vi.mock("@/features/workbench", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/features/workbench")>()),
   Workbench: mocks.Workbench,
@@ -45,15 +55,26 @@ vi.mock("@/features/tasks", () => ({
   SubagentOverview: () => null,
   TaskDetailPanel: mocks.TaskDetailPanel,
   useTaskController: mocks.useTaskController,
+  subscribeTaskHostEvents: (listener: (event: unknown) => void) => {
+    mocks.taskEventListeners.add(listener);
+    return () => {
+      mocks.taskEventListeners.delete(listener);
+    };
+  },
+  publishTaskHostEvent: (event: unknown) => {
+    for (const listener of mocks.taskEventListeners) listener(event);
+  },
 }));
 vi.mock("@/app/RuntimeProvider", () => ({
   useRuntimeLifecycle: () => ({ queryRuntime: mocks.queryRuntime }),
   useRuntimeState: () => ({ boot: { status: "ready" }, turnAdmissionReady: true }),
   useRuntimeTurns: () => ({
     approvalRespond: vi.fn(),
+    cancelTurn: mocks.cancelReviewTurn,
     resumeTurn: vi.fn(),
     continueTurn: vi.fn(),
     reaskTurn: vi.fn(),
+    submitTurn: mocks.submitReviewTurn,
   }),
 }));
 vi.mock("@/features/workbench/files", () => ({
@@ -68,6 +89,7 @@ vi.mock("@/features/workbench/preview", () => ({
 vi.mock("@/features/workbench/review", () => ({
   ReviewPanelView: () => null,
   TurnReviewPanelView: () => null,
+  useAiReviewController: mocks.useAiReviewController,
   useReviewController: mocks.useReviewController,
 }));
 vi.mock("@/features/workbench/terminal", () => ({
@@ -75,7 +97,7 @@ vi.mock("@/features/workbench/terminal", () => ({
   useTerminalLayoutPersistence: () => [{ kind: "single", rootPaneId: "pane_1" }, vi.fn()],
 }));
 vi.mock("@/app/application/createNotifyingFilesOperations", () => ({
-  createNotifyingFilesOperations: () => ({}),
+  createNotifyingFilesOperations: () => ({ readFile: mocks.filesRead }),
 }));
 vi.mock("@/app/application/usePreviewWorkspaceLifecycle", () => ({
   usePreviewWorkspaceLifecycle: vi.fn(),
@@ -90,8 +112,10 @@ vi.mock("@/app/composition/filesBrowserControllerPorts", () => ({
 
 afterEach(() => {
   cleanup();
+  mocks.taskEventListeners.clear();
   useTimelineStore.getState().reset();
   vi.clearAllMocks();
+  mocks.filesRead.mockReset();
 });
 
 beforeEach(() => {
@@ -102,9 +126,25 @@ beforeEach(() => {
     },
     actions: { setSource: vi.fn(), setLayerFilter: vi.fn() },
   });
+  mocks.useAiReviewController.mockReturnValue({
+    state: { runs: [] },
+    selectedRun: undefined,
+    ready: false,
+    busy: false,
+    actions: {
+      start: vi.fn(async () => undefined),
+      retry: vi.fn(async () => undefined),
+      refresh: vi.fn(async () => undefined),
+      cancel: vi.fn(async () => undefined),
+      select: vi.fn(),
+    },
+  });
   mocks.usePreviewController.mockReturnValue({
     viewModel: {},
-    actions: { attachment: { dismiss: vi.fn() }, openTarget: mocks.previewOpenTarget },
+    actions: {
+      attachment: { dismiss: vi.fn(), closeForThreads: vi.fn(async () => undefined) },
+      openTarget: mocks.previewOpenTarget,
+    },
   });
   mocks.previewOpenTarget.mockResolvedValue(undefined);
   mocks.queryRuntime.mockResolvedValue({ items: [], truncated: false });
@@ -114,6 +154,7 @@ beforeEach(() => {
       selectNode: vi.fn(),
       toggleDirectory: vi.fn(),
       openPath: vi.fn(async () => true),
+      revealDirectory: vi.fn(async () => true),
       openExternalDocument: vi.fn(() => true),
     },
   });
@@ -192,6 +233,45 @@ function makeProps(
   };
 }
 
+/** 关闭与普通发送都依赖 Store 的权威 ready 身份；组件层 Runtime mock 不能替代真实投影边界。@author kongweiguang */
+function establishReadyTimelineRuntime(
+  serverInstanceId = "srv_workbench_test",
+  generation = 7,
+): TimelineRuntimeFence {
+  const outcome = useTimelineStore.getState().applyRuntimeStatus({
+    status: "ready",
+    serverInstanceId,
+    generation,
+  });
+  if (outcome !== "applied") throw new Error("WorkbenchHost test Runtime fixture was rejected");
+  return { serverInstanceId, generation };
+}
+
+/** 复用空侧聊创建与 ready 焦点竞态所需的最小持久摘要。@author kongweiguang */
+function idleFocusSideTask(): TaskSummary {
+  return {
+    taskThreadId: "thr_child",
+    parentThreadId: "thr_root",
+    rootThreadId: "thr_root",
+    originTurnId: null,
+    taskName: "侧边任务",
+    depth: 1,
+    taskKind: "side_task",
+    lifecycle: "independent",
+    state: "idle",
+    revision: 1,
+    latestActivitySequence: 1,
+    unreadCount: 0,
+    descendantCount: 0,
+    runningDescendantCount: 0,
+    needsAttentionCount: 0,
+    latestSafeSummary: "已创建",
+    startedAt: null,
+    completedAt: null,
+    updatedAt: "2026-09-07T10:00:00Z",
+  };
+}
+
 /** 真实 Timeline store 订阅 probe：用稳定字符串选择器和提交回调验证 snapshot 更新确实提交了重渲染。 */
 function TimelineSubscriptionProbe({
   threadId,
@@ -212,33 +292,9 @@ function TimelineSubscriptionProbe({
   );
 }
 
-/** 构造完整 Goal controller，composition 测试只替换需要断言的恢复动作。 */
-function makeGoalController(overrides: Partial<GoalController> = {}): GoalController {
+/** Plan 能力夹具只暴露 Workbench 实际接入的命令。 */
+function makePlanController(overrides: Partial<PlanController> = {}): PlanController {
   return {
-    model: {
-      goal: {
-        goalId: "goal_1",
-        ownerThreadId: "thr_one",
-        revision: 7,
-        status: "paused",
-        phase: "needs_attention",
-        objective: "验证目标恢复接线",
-        goalDefinitionRevision: 1,
-        acceptanceCriteria: [],
-        activePlanId: null,
-        activePlanRevisionId: null,
-        activePlanHash: null,
-        currentStepId: null,
-        completedRequiredSteps: 0,
-        totalRequiredSteps: 0,
-        attentionSummary: "验收仍有缺口",
-        updatedAt: "2026-09-04T10:10:00+08:00",
-      },
-      planState: null,
-      plan: null,
-      draft: null,
-      evaluation: null,
-    },
     planModel: undefined,
     revisions: [],
     evidence: [],
@@ -246,11 +302,7 @@ function makeGoalController(overrides: Partial<GoalController> = {}): GoalContro
     error: undefined,
     busyAction: undefined,
     refresh: vi.fn(async () => undefined),
-    create: vi.fn(async () => true),
     createPlan: vi.fn(async () => true),
-    pause: vi.fn(async () => true),
-    resume: vi.fn(async () => true),
-    stop: vi.fn(async () => true),
     saveDraft: vi.fn(async () => true),
     discardDraft: vi.fn(async () => true),
     propose: vi.fn(async () => true),
@@ -259,14 +311,200 @@ function makeGoalController(overrides: Partial<GoalController> = {}): GoalContro
     resumePlan: vi.fn(async () => true),
     stopPlan: vi.fn(async () => true),
     execute: vi.fn(async () => true),
-    attachPlan: vi.fn(async () => true),
-    detachPlan: vi.fn(async () => true),
     reject: vi.fn(async () => true),
     ...overrides,
   };
 }
 
 describe("WorkbenchHost capability activation", () => {
+  /** AI Review 使用 root Thread 的 gateway/取消端口，发现修复必须进入普通用户 Turn。 */
+  it("wires review capture, cancellation, and repair to the active root Thread", async () => {
+    const aiReviewGateway = {} as ComponentProps<typeof WorkbenchHost>["adapters"]["aiReview"];
+    mocks.submitReviewTurn.mockResolvedValue({
+      accepted: true,
+      turnId: "turn_fix",
+      queued: false,
+      threadRevision: 6,
+    });
+    mocks.cancelReviewTurn.mockResolvedValue(undefined);
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_root",
+          adapters: { aiReview: aiReviewGateway } as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+        })}
+      />,
+    );
+
+    const reviewOptions = mocks.useAiReviewController.mock.calls.at(-1)?.[0] as {
+      active: boolean;
+      workspaceId: string;
+      threadId: string;
+      gateway: unknown;
+      cancelTurn: (turnId: string) => Promise<void>;
+    };
+    expect(reviewOptions).toMatchObject({
+      active: true,
+      workspaceId: "ws_demo",
+      threadId: "thr_root",
+      gateway: aiReviewGateway,
+    });
+
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as {
+      views: {
+        review: {
+          props: {
+            aiReview: unknown;
+            onRepairFinding: (
+              prompt: string,
+              finding: unknown,
+              report: unknown,
+            ) => Promise<{ turnId: string; queued: boolean }>;
+          };
+        };
+      };
+    };
+    expect(workbenchProps.views.review.props.aiReview).toBe(
+      mocks.useAiReviewController.mock.results.at(-1)?.value,
+    );
+
+    await act(async () => {
+      await reviewOptions.cancelTurn("turn_review");
+      await workbenchProps.views.review.props.onRepairFinding("repair prompt", {}, {});
+    });
+    expect(mocks.cancelReviewTurn).toHaveBeenCalledWith({ turnId: "turn_review" });
+    expect(mocks.submitReviewTurn).toHaveBeenCalledWith({
+      threadId: "thr_root",
+      content: [{ type: "text", text: "repair prompt" }],
+    });
+  });
+
+  /** 预览 owner 按授权 Thread 清理；只有与 Store 当前 SID/generation 相符的关闭通知可被接受。@author kongweiguang */
+  it("routes a task close event to the matching retained attachment preview", async () => {
+    const runtimeFence = establishReadyTimelineRuntime();
+    const closeForThreads = vi.fn(async () => undefined);
+    const target = {
+      attachmentId: "att_closed",
+      displayName: "closed.txt",
+      mediaKind: "text" as const,
+      authorization: { kind: "thread" as const, threadId: "thr_closed_child" },
+    };
+    mocks.usePreviewController.mockReturnValue({
+      viewModel: {},
+      actions: {
+        attachment: { dismiss: vi.fn(), closeForThreads },
+        openTarget: mocks.previewOpenTarget,
+      },
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({ rootThreadId: "thr_other_root", attachmentTarget: target })}
+      />,
+    );
+
+    const staleCloseEvent = {
+      method: "task/closed",
+      params: {
+        serverInstanceId: "srv_stale_workbench_test",
+        generation: runtimeFence.generation,
+        eventId: "evt_closed_side_stale",
+        sequence: 4,
+        occurredAt: "2026-10-08T00:00:00Z",
+        rootThreadId: "thr_owner_root",
+        taskThreadId: "thr_closed_side_root",
+        closedThreadIds: ["thr_closed_side_root", "thr_closed_child"],
+      },
+    } as unknown as Parameters<typeof publishTaskHostEvent>[0];
+    const currentCloseEvent = {
+      method: "task/closed",
+      params: {
+        ...runtimeFence,
+        eventId: "evt_closed_side_current",
+        sequence: 5,
+        occurredAt: "2026-10-08T00:00:01Z",
+        rootThreadId: "thr_owner_root",
+        taskThreadId: "thr_closed_side_root",
+        closedThreadIds: ["thr_closed_side_root", "thr_closed_child"],
+      },
+    } as unknown as Parameters<typeof publishTaskHostEvent>[0];
+    act(() => publishTaskHostEvent(staleCloseEvent));
+    expect(closeForThreads).not.toHaveBeenCalled();
+
+    act(() => publishTaskHostEvent(currentCloseEvent));
+
+    await waitFor(() =>
+      expect(closeForThreads).toHaveBeenCalledExactlyOnceWith([
+        "thr_closed_side_root",
+        "thr_closed_child",
+      ]),
+    );
+  });
+
+  /** 同 root 关闭由 Task controller 统一处理；ACK 必须携带请求所属的 ready Runtime fence。@author kongweiguang */
+  it("leaves a closed selected task and avoids duplicate same-root preview cleanup", async () => {
+    const runtimeFence = establishReadyTimelineRuntime();
+    const closeForThreads = vi.fn(async () => undefined);
+    const onTabChange = vi.fn();
+    const closedThreadIds = ["thr_closed_side"];
+    mocks.usePreviewController.mockReturnValue({
+      viewModel: {},
+      actions: {
+        attachment: { dismiss: vi.fn(), closeForThreads },
+        openTarget: mocks.previewOpenTarget,
+      },
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          rootThreadId: "thr_root",
+          selectedTab: "side-task:thr_closed_side",
+          onTabChange,
+          attachmentTarget: {
+            attachmentId: "att_closed",
+            displayName: "closed.txt",
+            mediaKind: "text",
+            authorization: { kind: "thread", threadId: "thr_closed_side" },
+          },
+        })}
+      />,
+    );
+    const taskControllerOptions = mocks.useTaskController.mock.calls.at(-1)?.[0] as
+      | {
+          onSideTaskClosed?: (
+            threadIds: readonly string[],
+            fence: TimelineRuntimeFence,
+          ) => Promise<boolean>;
+        }
+      | undefined;
+
+    await act(async () => {
+      expect(await taskControllerOptions?.onSideTaskClosed?.(closedThreadIds, runtimeFence)).toBe(
+        true,
+      );
+    });
+
+    expect(onTabChange).toHaveBeenCalledExactlyOnceWith("agents");
+    expect(closeForThreads).toHaveBeenCalledExactlyOnceWith(closedThreadIds);
+    act(() =>
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: {
+          ...runtimeFence,
+          eventId: "evt_closed_side_duplicate",
+          sequence: 6,
+          occurredAt: "2026-10-08T00:00:02Z",
+          rootThreadId: "thr_root",
+          taskThreadId: "thr_closed_side",
+          closedThreadIds,
+        },
+      } as unknown as Parameters<typeof publishTaskHostEvent>[0]),
+    );
+    expect(closeForThreads).toHaveBeenCalledOnce();
+  });
+
   /** Preview 复制能力必须接收 Host 的统一 clipboard action，确保 Browser 菜单不会缺失入口。 */
   it("passes the host copy action into the Preview view", () => {
     const onCopyText = vi.fn(async () => undefined);
@@ -356,7 +594,7 @@ describe("WorkbenchHost capability activation", () => {
     );
 
     await waitFor(() => expect(openExternalDocument).toHaveBeenCalledOnce());
-    expect(resolveFile).toHaveBeenCalledWith("C:\\outside\\notes.txt", "ws_demo", 7, 2);
+    expect(resolveFile).toHaveBeenCalledWith("C:\\outside\\notes.txt", "ws_demo", 7, 2, "editor");
     expect(openExternalDocument).toHaveBeenCalledWith({
       path: "C:\\outside\\notes.txt",
       content: "external text",
@@ -367,6 +605,409 @@ describe("WorkbenchHost capability activation", () => {
     });
     expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
     expect(settled).toHaveBeenCalledWith(302, "opened");
+  });
+
+  /** 正文不可读与命中读取上限必须给出不同原因，并保留可用的 Explorer 恢复动作。@author kongweiguang */
+  it.each([
+    {
+      truncated: false,
+      reason: "Ja 无法读取此文本文件正文，可能是文件权限或编码不兼容。",
+      requestId: 320,
+    },
+    {
+      truncated: true,
+      reason: "文件超过 Ja 的读取上限，无法在 Ja 中显示正文。",
+      requestId: 321,
+    },
+  ])("无法读取正文时说明 $reason", async ({ truncated, reason, requestId }) => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\large-notes.txt",
+      displayName: "large-notes.txt",
+      workspaceId: null,
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: null,
+      content: null,
+      truncated,
+      line: null,
+      column: null,
+      readOnly: true,
+    }));
+    const openExternalDocument = vi.fn(() => true);
+    const onShowCapability = vi.fn();
+    const onTabChange = vi.fn();
+    const settled = vi.fn();
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath: vi.fn(async () => true),
+        openExternalDocument,
+      },
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          onShowCapability,
+          onTabChange,
+          adapters: { preview: { resolveFile, revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "file", path: "C:\\outside\\large-notes.txt" },
+          },
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(reason, expect.any(Object)));
+    expect(openExternalDocument).not.toHaveBeenCalled();
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
+    expect(onShowCapability).not.toHaveBeenCalled();
+    expect(onTabChange).not.toHaveBeenCalled();
+    expect(settled).toHaveBeenCalledWith(requestId, "failed");
+    expect(revealFile).not.toHaveBeenCalled();
+
+    const action = (
+      vi.mocked(toast.error).mock.calls.at(-1)?.[1] as
+        | { action?: { label: string; onClick: () => void } }
+        | undefined
+    )?.action;
+    expect(action?.label).toBe("在文件资源管理器中打开");
+    action?.onClick();
+    await waitFor(() =>
+      expect(revealFile).toHaveBeenCalledWith("C:\\outside\\large-notes.txt", "ws_demo"),
+    );
+  });
+
+  /** Files Markdown 的只读引用使用相同原因与 Explorer 恢复动作，并避免打开空正文 Tab。@author kongweiguang */
+  it("offers Explorer when a Markdown-linked external text file has no readable body", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\reference.txt",
+      displayName: "reference.txt",
+      workspaceId: null,
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: null,
+      content: null,
+      truncated: false,
+      line: 9,
+      column: null,
+      readOnly: true,
+    }));
+    const openExternalDocument = vi.fn(() => true);
+    const onShowCapability = vi.fn();
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath: vi.fn(async () => true),
+        openExternalDocument,
+      },
+    });
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          onShowCapability,
+          adapters: { preview: { resolveFile, revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+        })}
+      />,
+    );
+
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.[0] as
+      | {
+          views: {
+            files: {
+              props?: {
+                onOpenMarkdownFile?: (
+                  target: { path: string; line?: number; column?: number },
+                  source: HTMLElement,
+                  mode?: "explorer" | "browser",
+                ) => Promise<void>;
+              };
+            };
+          };
+        }
+      | undefined;
+    await act(async () =>
+      workbenchProps?.views.files.props?.onOpenMarkdownFile?.(
+        { path: "C:\\outside\\reference.txt", line: 9 },
+        document.createElement("a"),
+      ),
+    );
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "Ja 无法读取此文本文件正文，可能是文件权限或编码不兼容。",
+      expect.objectContaining({ action: expect.any(Object) }),
+    );
+    expect(openExternalDocument).not.toHaveBeenCalled();
+    expect(onShowCapability).not.toHaveBeenCalled();
+    const action = (
+      vi.mocked(toast.error).mock.calls.at(-1)?.[1] as
+        | { action?: { label: string; onClick: () => void } }
+        | undefined
+    )?.action;
+    expect(action?.label).toBe("在文件资源管理器中打开");
+    action?.onClick();
+    await waitFor(() =>
+      expect(revealFile).toHaveBeenCalledWith("C:\\outside\\reference.txt", "ws_demo"),
+    );
+  });
+
+  /** 超限但仍有安全片段时保留只读工作面，同时提供打开原文件的恢复动作。@author kongweiguang */
+  it("keeps a truncated text snapshot and offers Explorer for the complete file", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\large-notes.txt",
+      displayName: "large-notes.txt",
+      workspaceId: null,
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: "file:///C:/outside/large-notes.txt",
+      content: "safe excerpt",
+      truncated: true,
+      line: null,
+      column: null,
+      readOnly: true,
+    }));
+    const openExternalDocument = vi.fn(() => true);
+    const onShowCapability = vi.fn();
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath: vi.fn(async () => true),
+        openExternalDocument,
+      },
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          onShowCapability,
+          adapters: { preview: { resolveFile, revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 322,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "file", path: "C:\\outside\\large-notes.txt" },
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(openExternalDocument).toHaveBeenCalledOnce());
+    expect(openExternalDocument).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "C:\\outside\\large-notes.txt",
+        content: "safe excerpt",
+        truncated: true,
+        readOnlyReason: "只读快照，内容已截断",
+      }),
+    );
+    expect(onShowCapability).toHaveBeenCalledWith("files");
+    expect(toast.info).toHaveBeenCalledWith(
+      "文件超过 Ja 的读取上限，目前只显示部分内容。",
+      expect.objectContaining({ action: expect.any(Object) }),
+    );
+    const action = (
+      vi.mocked(toast.info).mock.calls.at(-1)?.[1] as
+        | { action?: { label: string; onClick: () => void } }
+        | undefined
+    )?.action;
+    expect(action?.label).toBe("在文件资源管理器中打开");
+    action?.onClick();
+    await waitFor(() =>
+      expect(revealFile).toHaveBeenCalledWith("C:\\outside\\large-notes.txt", "ws_demo"),
+    );
+  });
+
+  /** 项目内文件继续由 4 MiB Files reader 判定；Preview 的 1 MiB 摘要不能短路真实读取。@author kongweiguang */
+  it("offers Explorer when the in-workspace Files reader reports its own size limit", async () => {
+    const fileSize = 5 * 1024 * 1024;
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\repo\\src\\large.txt",
+      displayName: "large.txt",
+      workspaceId: "ws_demo",
+      workspaceRelativePath: "src/large.txt",
+      withinWorkspace: true,
+      kind: "text" as const,
+      mimeType: "text/plain",
+      fileUrl: null,
+      content: "bounded Preview prefix",
+      truncated: true,
+      line: null,
+      column: null,
+      readOnly: false,
+    }));
+    const readFile = mocks.filesRead;
+    readFile.mockResolvedValue({
+      path: "src/large.txt",
+      kind: "too_large",
+      content: null,
+      revision: {
+        kind: "file",
+        size: fileSize,
+        modifiedUnixMillis: null,
+        sha256: null,
+      },
+      size: fileSize,
+      encoding: null,
+      newline: "unknown",
+    });
+    const openPath = vi.fn(async () => true);
+    const onShowCapability = vi.fn();
+    mocks.useFilesController.mockReturnValue({
+      viewModel: { documents: {}, openPaths: [] },
+      actions: {
+        selectNode: vi.fn(),
+        toggleDirectory: vi.fn(),
+        openPath,
+        openExternalDocument: vi.fn(() => true),
+      },
+    });
+
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          onShowCapability,
+          adapters: {
+            preview: { resolveFile, revealFile },
+          } as unknown as ComponentProps<typeof WorkbenchHost>["adapters"],
+          openTargetRequest: {
+            requestId: 324,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "file", path: "src/large.txt" },
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(resolveFile).toHaveBeenCalledOnce());
+    await waitFor(() => expect(openPath).toHaveBeenCalledWith("src/large.txt", undefined));
+    const controllerArgs = mocks.useFilesController.mock.calls.at(-1)?.[0] as
+      | {
+          operations: {
+            readFile: (input: { workspaceId: string; relativePath: string }) => Promise<unknown>;
+          };
+        }
+      | undefined;
+    expect(controllerArgs?.operations.readFile).toBeTypeOf("function");
+    await act(async () => {
+      await controllerArgs?.operations.readFile({
+        workspaceId: "ws_demo",
+        relativePath: "src/large.txt",
+      });
+    });
+    await waitFor(() =>
+      expect(readFile).toHaveBeenCalledWith({
+        workspaceId: "ws_demo",
+        relativePath: "src/large.txt",
+      }),
+    );
+    expect(onShowCapability).toHaveBeenCalledWith("files");
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "文件超过 Ja 文件编辑器的读取上限，无法显示正文。",
+      expect.objectContaining({ action: expect.any(Object) }),
+    );
+
+    const action = (
+      vi.mocked(toast.error).mock.calls.at(-1)?.[1] as
+        | { action?: { label: string; onClick: () => void } }
+        | undefined
+    )?.action;
+    expect(action?.label).toBe("在文件资源管理器中打开");
+    action?.onClick();
+    await waitFor(() => expect(revealFile).toHaveBeenCalledWith("src/large.txt", "ws_demo"));
+  });
+
+  /** 不支持的格式不切换工作面；Explorer 动作保留用户继续处理原文件的路径。@author kongweiguang */
+  it("offers Explorer for an unsupported file without switching the current work surface", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\archive.bin",
+      displayName: "archive.bin",
+      workspaceId: null,
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "unsupported" as const,
+      mimeType: "application/octet-stream",
+      fileUrl: null,
+      content: null,
+      truncated: false,
+      line: null,
+      column: null,
+      readOnly: true,
+    }));
+    const onShowCapability = vi.fn();
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          onShowCapability,
+          adapters: { preview: { resolveFile, revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 323,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "file", path: "C:\\outside\\archive.bin" },
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "此文件类型暂不支持在 Ja 中打开。",
+        expect.objectContaining({ action: expect.any(Object) }),
+      ),
+    );
+    expect(onShowCapability).not.toHaveBeenCalled();
+    expect(revealFile).not.toHaveBeenCalled();
+    const action = (
+      vi.mocked(toast.error).mock.calls.at(-1)?.[1] as
+        | { action?: { label: string; onClick: () => void } }
+        | undefined
+    )?.action;
+    expect(action?.label).toBe("在资源管理器中打开");
+    action?.onClick();
+    await waitFor(() =>
+      expect(revealFile).toHaveBeenCalledWith("C:\\outside\\archive.bin", "ws_demo"),
+    );
   });
 
   /** 右栏隐藏时仅允许显式 Explorer intent 运行，避免无关 Preview/Files 激活。 */
@@ -402,6 +1043,52 @@ describe("WorkbenchHost capability activation", () => {
     expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
     expect(onTabChange).not.toHaveBeenCalled();
     expect(settled).toHaveBeenCalledWith(306, "opened");
+  });
+
+  /** 项目外目录的普通打开保留在当前项目，并在用户确认后才调用 Explorer。 */
+  it("offers Explorer for an external directory without opening it automatically", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const resolveFile = vi.fn(async () => ({
+      canonicalPath: "C:\\outside\\资料",
+      displayName: "资料",
+      workspaceId: "ws_demo",
+      workspaceRelativePath: null,
+      withinWorkspace: false,
+      kind: "directory" as const,
+      mimeType: null,
+      fileUrl: null,
+      content: null,
+      truncated: false,
+      line: null,
+      column: null,
+      readOnly: true,
+    }));
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: true,
+          rootThreadId: "thr_one",
+          adapters: { preview: { resolveFile, revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 307,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "file", path: "C:\\outside\\资料" },
+          },
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(toast.info).toHaveBeenCalledOnce());
+    expect(revealFile).not.toHaveBeenCalled();
+    const action = vi.mocked(toast.info).mock.calls[0]?.[1]?.action as
+      | { onClick: () => void }
+      | undefined;
+    expect(action).toBeDefined();
+    action?.onClick();
+    await waitFor(() => expect(revealFile).toHaveBeenCalledWith("C:\\outside\\资料", "ws_demo"));
   });
 
   it("passes a canonical browser file path and reveal position to the current Preview page", async () => {
@@ -444,11 +1131,12 @@ describe("WorkbenchHost capability activation", () => {
       expect(mocks.previewOpenTarget).toHaveBeenCalledWith({
         kind: "file",
         path: "C:\\repo\\assets\\map.svg",
+        previewMode: "editor",
         line: 12,
         column: 3,
       }),
     );
-    expect(resolveFile).toHaveBeenCalledWith("assets/map.svg", "ws_demo", 12, 3);
+    expect(resolveFile).toHaveBeenCalledWith("assets/map.svg", "ws_demo", 12, 3, "editor");
   });
 
   it("opens a resolved workspace text file in its writable relative Files tab", async () => {
@@ -556,7 +1244,13 @@ describe("WorkbenchHost capability activation", () => {
       screen.getByRole("button", { name: "b/notes.txt" }).click();
     });
     await waitFor(() =>
-      expect(resolveFile).toHaveBeenCalledWith("b/notes.txt", "ws_demo", undefined, undefined),
+      expect(resolveFile).toHaveBeenCalledWith(
+        "b/notes.txt",
+        "ws_demo",
+        undefined,
+        undefined,
+        "editor",
+      ),
     );
   });
 
@@ -1046,7 +1740,7 @@ describe("WorkbenchHost capability activation", () => {
     expect(onTabChange).not.toHaveBeenCalled();
   });
 
-  it("selected Subagent 的真实 snapshot 只应用一次并驱动 Timeline 订阅，不创建 Composer", async () => {
+  it("selected Subagent 的 snapshot adapter 驱动 Timeline 订阅，不创建 Composer", async () => {
     const subagentTask: TaskSummary = {
       taskThreadId: "thr_subagent",
       parentThreadId: "thr_root",
@@ -1073,6 +1767,7 @@ describe("WorkbenchHost capability activation", () => {
       revision: 12,
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_subagent",
           status: "completed",
           requestedAt: "2026-09-10T10:00:00Z",
@@ -1084,9 +1779,12 @@ describe("WorkbenchHost capability activation", () => {
       ],
       items: [
         {
+          origin: "native" as const,
           itemId: "item_subagent_answer",
           createdAt: "2026-09-10T10:00:05Z",
           turnId: "turn_subagent",
+          truncated: false,
+          totalCharacters: 13,
           kind: "final_answer",
           text: "Subagent 真实正文",
         },
@@ -1094,7 +1792,6 @@ describe("WorkbenchHost capability activation", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: null,
       nextCursor: null,
     };
@@ -1103,7 +1800,6 @@ describe("WorkbenchHost capability activation", () => {
       thread: {
         threadId: subagentTask.taskThreadId,
         workspaceId: "ws_demo",
-        activeGoalId: null,
         preferences: {
           providerId: "provider_test",
           modelId: "model_test",
@@ -1138,7 +1834,6 @@ describe("WorkbenchHost capability activation", () => {
     mocks.useTaskController.mockReturnValue({
       tasks: [subagentTask],
       detail: subagentDetail,
-      transcript: subagentSnapshot,
       loading: false,
       detailLoading: false,
       refresh: vi.fn(),
@@ -1178,6 +1873,10 @@ describe("WorkbenchHost capability activation", () => {
         />
       </>,
     );
+    const taskControllerOptions = mocks.useTaskController.mock.calls.at(-1)?.[0] as {
+      applyTranscriptSnapshot?: (snapshot: TimelineSnapshot) => boolean;
+    };
+    act(() => expect(taskControllerOptions.applyTranscriptSnapshot?.(subagentSnapshot)).toBe(true));
 
     await waitFor(() =>
       expect(screen.getByTestId("timeline-probe-thr_subagent").textContent).toBe(
@@ -1210,7 +1909,9 @@ describe("WorkbenchHost capability activation", () => {
     applySnapshot.mockRestore();
   });
 
+  /** 普通 child send 会经唯一 Timeline Store fence；RuntimeProvider mock 不构成会话就绪证明。@author kongweiguang */
   it("侧聊 Composer 的 /btw 绑定当前 child 来源而不是主 root", async () => {
+    establishReadyTimelineRuntime();
     const sideTask: TaskSummary = {
       taskThreadId: "thr_side",
       parentThreadId: "thr_root",
@@ -1251,7 +1952,6 @@ describe("WorkbenchHost capability activation", () => {
         pinned: false,
         latestTurnStatus: null,
         latestTurnSeen: true,
-        activeGoalId: null,
         revision: sideTask.revision,
         createdAt: "2026-09-10T10:00:00Z",
         updatedAt: sideTask.updatedAt,
@@ -1278,7 +1978,6 @@ describe("WorkbenchHost capability activation", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: null,
       nextCursor: null,
     };
@@ -1304,6 +2003,7 @@ describe("WorkbenchHost capability activation", () => {
       tasks: [sideTask],
       detail,
       transcript,
+      readyTaskThreadId: sideTask.taskThreadId,
       loading: false,
       detailLoading: false,
       refresh: vi.fn(),
@@ -1466,50 +2166,36 @@ describe("WorkbenchHost capability activation", () => {
     expect(close).toHaveBeenCalledExactlyOnceWith(sideTask);
   });
 
-  it("creates an idle side task before opening its stable tab", async () => {
-    const createSideTask = vi.fn(async () => ({
-      taskThreadId: "thr_child",
-      parentThreadId: "thr_root",
-      rootThreadId: "thr_root",
-      originTurnId: null,
-      taskName: "侧边任务",
-      depth: 1,
-      taskKind: "side_task" as const,
-      lifecycle: "independent" as const,
-      state: "idle" as const,
-      revision: 1,
-      latestActivitySequence: 1,
-      unreadCount: 0,
-      descendantCount: 0,
-      runningDescendantCount: 0,
-      needsAttentionCount: 0,
-      latestSafeSummary: "已创建",
-      startedAt: null,
-      completedAt: null,
-      updatedAt: "2026-09-07T10:00:00Z",
-    }));
+  /** 新侧聊先挂载无 token Composer，ready 后再发布焦点意图，保住首屏 disabled 的一次请求。@author kongweiguang */
+  it("waits for the idle side task to be ready before publishing its Composer focus token", async () => {
+    const sideTask = idleFocusSideTask();
+    let releaseReady!: () => void;
+    const taskReady = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    const waitForTaskReady = vi.fn(() => taskReady);
+    const createSideTask = vi.fn(async () => sideTask);
     const onOpenTabsChange = vi.fn();
     const onTabChange = vi.fn();
     mocks.useTaskController.mockReturnValue({
-      tasks: [],
+      tasks: [sideTask],
       loading: false,
       detailLoading: false,
       refresh: vi.fn(),
+      waitForTaskReady,
       createSideTask,
       cancel: vi.fn(),
     });
-    render(
-      <WorkbenchHost
-        {...makeProps({
-          rootThreadId: "thr_root",
-          parentThreadRevision: 4,
-          selectedTab: "agents",
-          openTabs: ["agents"],
-          onOpenTabsChange,
-          onTabChange,
-        })}
-      />,
-    );
+    const props = makeProps({
+      active: true,
+      rootThreadId: "thr_root",
+      parentThreadRevision: 4,
+      selectedTab: "agents",
+      openTabs: ["agents"],
+      onOpenTabsChange,
+      onTabChange,
+    });
+    const { rerender } = render(<WorkbenchHost {...props} />);
     const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
       onCreateSideTask: () => undefined;
     };
@@ -1521,10 +2207,193 @@ describe("WorkbenchHost capability activation", () => {
       sourceThreadRevision: undefined,
       preferences: undefined,
     });
+    await waitFor(() => expect(waitForTaskReady).toHaveBeenCalledWith(sideTask.taskThreadId));
     await waitFor(() => {
       expect(onOpenTabsChange).toHaveBeenCalledWith(["agents", "side-task:thr_child"]);
       expect(onTabChange).toHaveBeenCalledWith("side-task:thr_child");
     });
+
+    rerender(
+      <WorkbenchHost
+        {...props}
+        selectedTab="side-task:thr_child"
+        openTabs={["agents", "side-task:thr_child"]}
+      />,
+    );
+    /** 读取最后一次真实 renderTaskView 注入的 token，确认 ready 前首屏未携带意图。@author kongweiguang */
+    const latestPanelProps = (): { focusRequest?: number } | undefined => {
+      const calls = mocks.TaskDetailPanel.mock.calls as unknown as Array<
+        [{ focusRequest?: number }]
+      >;
+      return calls.at(-1)?.[0];
+    };
+    await waitFor(() => expect(latestPanelProps()).toBeDefined());
+    expect(latestPanelProps()?.focusRequest).toBeUndefined();
+
+    await act(async () => {
+      releaseReady();
+      await taskReady;
+    });
+    await waitFor(() => expect(latestPanelProps()?.focusRequest).toBe(1));
+  });
+
+  /**
+   * @author kongweiguang
+   * Controller 会随 closingTaskThreadId 更新身份；ready continuation 必须读最新 scope，即使关闭 ACK 未移除 Tab。
+   */
+  it("ignores a late ready focus after close starts while the side-task tab remains open", async () => {
+    const sideTask = idleFocusSideTask();
+    let releaseReady!: () => void;
+    const taskReady = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    const waitForTaskReady = vi.fn(() => taskReady);
+    const createSideTask = vi.fn(async () => sideTask);
+    const makeTaskController = (closingTaskThreadId?: string) => ({
+      tasks: [sideTask],
+      loading: false,
+      detailLoading: false,
+      closingTaskThreadId,
+      refresh: vi.fn(),
+      waitForTaskReady,
+      createSideTask,
+      cancel: vi.fn(),
+    });
+    const openController = makeTaskController();
+    mocks.useTaskController.mockReturnValue(openController);
+    const props = makeProps({
+      active: true,
+      rootThreadId: "thr_root",
+      parentThreadRevision: 4,
+      selectedTab: "agents",
+      openTabs: ["agents"],
+      onOpenTabsChange: vi.fn(),
+      onTabChange: vi.fn(),
+    });
+    const { rerender } = render(<WorkbenchHost {...props} />);
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
+      onCreateSideTask: () => undefined;
+    };
+    act(() => workbenchProps.onCreateSideTask());
+    await waitFor(() => expect(waitForTaskReady).toHaveBeenCalledWith(sideTask.taskThreadId));
+
+    const childProps = {
+      ...props,
+      selectedTab: "side-task:thr_child" as const,
+      openTabs: ["agents", "side-task:thr_child"] as const,
+    };
+    rerender(<WorkbenchHost {...childProps} />);
+
+    const closingController = makeTaskController(sideTask.taskThreadId);
+    expect(closingController).not.toBe(openController);
+    mocks.useTaskController.mockReturnValue(closingController);
+    rerender(<WorkbenchHost {...childProps} />);
+    const latestWorkbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
+      openTabs: readonly { key: string }[];
+    };
+    expect(latestWorkbenchProps.openTabs.some((tab) => tab.key === "side-task:thr_child")).toBe(
+      true,
+    );
+
+    const latestPanelProps = (): { focusRequest?: number } | undefined => {
+      const calls = mocks.TaskDetailPanel.mock.calls as unknown as Array<
+        [{ focusRequest?: number }]
+      >;
+      return calls.at(-1)?.[0];
+    };
+    await waitFor(() => expect(latestPanelProps()).toBeDefined());
+    expect(latestPanelProps()?.focusRequest).toBeUndefined();
+
+    await act(async () => {
+      releaseReady();
+      await taskReady;
+    });
+    await waitFor(() => expect(latestPanelProps()?.focusRequest).toBeUndefined());
+  });
+
+  /** ready 迟到时按 Host 可见 Thread、选中 Tab 与 openTabs owner 栅栏丢弃意图，不在恢复时复活。@author kongweiguang */
+  it.each([
+    {
+      label: "切换到其他标签",
+      active: true,
+      selectedTab: "agents",
+      openTabs: ["agents", "side-task:thr_child"],
+    },
+    {
+      label: "隐藏 Workbench",
+      active: false,
+      selectedTab: "side-task:thr_child",
+      openTabs: ["agents", "side-task:thr_child"],
+    },
+    {
+      label: "关闭目标标签",
+      active: true,
+      selectedTab: "agents",
+      openTabs: ["agents"],
+    },
+  ] as const)("$label 后不发布迟到的侧聊焦点 token", async (scenario) => {
+    const sideTask = idleFocusSideTask();
+    let releaseReady!: () => void;
+    const taskReady = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    const waitForTaskReady = vi.fn(() => taskReady);
+    mocks.useTaskController.mockReturnValue({
+      tasks: [sideTask],
+      loading: false,
+      detailLoading: false,
+      refresh: vi.fn(),
+      waitForTaskReady,
+      createSideTask: vi.fn(async () => sideTask),
+      cancel: vi.fn(),
+    });
+    const props = makeProps({
+      active: true,
+      rootThreadId: "thr_root",
+      parentThreadRevision: 4,
+      selectedTab: "agents",
+      openTabs: ["agents"],
+      onOpenTabsChange: vi.fn(),
+      onTabChange: vi.fn(),
+    });
+    const { rerender } = render(<WorkbenchHost {...props} />);
+    const workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
+      onCreateSideTask: () => undefined;
+    };
+    act(() => workbenchProps.onCreateSideTask());
+    await waitFor(() => expect(waitForTaskReady).toHaveBeenCalledWith(sideTask.taskThreadId));
+
+    const childProps = {
+      ...props,
+      selectedTab: "side-task:thr_child" as const,
+      openTabs: ["agents", "side-task:thr_child"] as const,
+    };
+    rerender(<WorkbenchHost {...childProps} />);
+    /** 读取最后一次真实 renderTaskView 注入的 token，覆盖创建 ACK 与 ready 两个提交边界。@author kongweiguang */
+    const latestPanelProps = (): { focusRequest?: number } | undefined => {
+      const calls = mocks.TaskDetailPanel.mock.calls as unknown as Array<
+        [{ focusRequest?: number }]
+      >;
+      return calls.at(-1)?.[0];
+    };
+    await waitFor(() => expect(latestPanelProps()).toBeDefined());
+    expect(latestPanelProps()?.focusRequest).toBeUndefined();
+
+    rerender(
+      <WorkbenchHost
+        {...props}
+        active={scenario.active}
+        selectedTab={scenario.selectedTab}
+        openTabs={scenario.openTabs}
+      />,
+    );
+    await act(async () => {
+      releaseReady();
+      await taskReady;
+    });
+
+    rerender(<WorkbenchHost {...childProps} active />);
+    await waitFor(() => expect(latestPanelProps()?.focusRequest).toBeUndefined());
   });
 
   it("routes an existing side-task tab rename through the task controller", async () => {
@@ -1580,20 +2449,20 @@ describe("WorkbenchHost capability activation", () => {
     expect(rename).toHaveBeenCalledWith(sideTask, "新名称");
   });
 
-  it("gates the Plan capability and wires needs-attention continuation to resume", () => {
-    const resume = vi.fn(async () => true);
-    const goal = makeGoalController({ resume });
-    const { rerender } = render(<WorkbenchHost {...makeProps({ goal })} />);
+  it("gates the Plan capability and wires the Plan resume command", () => {
+    const resumePlan = vi.fn(async () => true);
+    const plan = makePlanController({ resumePlan });
+    const { rerender } = render(<WorkbenchHost {...makeProps({ plan })} />);
     let workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
-      views: { plan?: { props?: { onContinue?: () => Promise<boolean> } } };
+      views: { plan?: { props?: { onResumePlan?: () => Promise<boolean> } } };
     };
     expect(workbenchProps.views.plan).toBeUndefined();
 
-    rerender(<WorkbenchHost {...makeProps({ planGoalAvailable: true, goal })} />);
+    rerender(<WorkbenchHost {...makeProps({ planAvailable: true, plan })} />);
     workbenchProps = mocks.Workbench.mock.calls.at(-1)?.at(0) as unknown as {
-      views: { plan?: { props?: { onContinue?: () => Promise<boolean> } } };
+      views: { plan?: { props?: { onResumePlan?: () => Promise<boolean> } } };
     };
     expect(workbenchProps.views.plan).toBeDefined();
-    expect(workbenchProps.views.plan?.props?.onContinue).toBe(resume);
+    expect(workbenchProps.views.plan?.props?.onResumePlan).toBe(resumePlan);
   });
 });

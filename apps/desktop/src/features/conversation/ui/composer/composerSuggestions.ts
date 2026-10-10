@@ -40,7 +40,7 @@ export interface ComposerSlashCommand {
   name: string;
   aliases: readonly string[];
   group?: string;
-  icon?: "command" | "plan" | "goal";
+  icon?: "command" | "plan";
   label: string;
   description: string;
   shortcut?: string;

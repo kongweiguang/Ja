@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.InteractionMapper">
+    <resultMap id="interaction"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionRow">
+        <constructor>
+            <idArg column="interaction_id" javaType="String"/>
+            <arg column="thread_id" javaType="String"/>
+            <arg column="turn_id" javaType="String"/>
+            <arg column="tool_call_id" javaType="String"/>
+            <arg column="plan_revision_id" javaType="String"/>
+            <arg column="run_id" javaType="String"/>
+            <arg column="operation_key" javaType="String"/>
+            <arg column="questions_json" javaType="String"/>
+            <arg column="status" javaType="String"/>
+            <arg column="answers_json" javaType="String"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="created_at_ms" javaType="String" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updated_at_ms" javaType="String" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="draft"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionDraftRow">
+        <constructor>
+            <idArg column="thread_id" javaType="String"/>
+            <arg column="interaction_id" javaType="String"/>
+            <arg column="answers_json" javaType="String"/>
+            <arg column="page" javaType="_int"/>
+            <arg column="is_collapsed" javaType="_boolean"/>
+            <arg column="operation_key" javaType="String"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="updated_at_ms" javaType="String" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="event"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$InteractionEventRow">
+        <constructor>
+            <idArg column="event_sequence" javaType="_long"/>
+            <arg column="thread_id" javaType="String"/>
+            <arg column="interaction_id" javaType="String"/>
+            <arg column="interaction_revision" javaType="_long"/>
+            <arg column="kind" javaType="String"/>
+            <arg column="occurred_at_ms" javaType="String" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+
+    <select id="selectInteraction" resultMap="interaction">
+        SELECT interaction_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,operation_key,
+        questions_json,status,answers_json,revision,created_at_ms,updated_at_ms
+        FROM ja_interaction_request WHERE thread_id=#{threadId} AND interaction_id=#{interactionId}
+    </select>
+    <select id="selectActiveInteraction" resultMap="interaction">
+        SELECT interaction_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,operation_key,
+        questions_json,status,answers_json,revision,created_at_ms,updated_at_ms
+        FROM ja_interaction_request
+        WHERE thread_id=#{threadId}
+        ORDER BY CASE WHEN status='PENDING' THEN 0 ELSE 1 END, updated_at_ms DESC LIMIT 1
+    </select>
+    <select id="selectTurnState" resultType="String">
+        SELECT state FROM ja_conversation_turn WHERE turn_id=#{turnId}
+    </select>
+    <insert id="insertInteraction">
+        INSERT INTO ja_interaction_request(interaction_id,thread_id,turn_id,tool_call_id,plan_revision_id,run_id,
+        operation_key,questions_json,status,answers_json,revision,created_at_ms,updated_at_ms)
+        VALUES(#{interactionId},#{threadId},#{turnId},#{toolCallId},#{planRevisionId},#{runId},#{operationKey},
+        #{questionsJson},#{status},#{answersJson},#{interactionRevision},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <update id="answerInteraction">
+        UPDATE ja_interaction_request SET answers_json=#{answersJson},status=#{status},revision=revision+1,
+        operation_key=#{operationKey},updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND interaction_id=#{interactionId} AND status='PENDING' AND revision=#{expectedInteractionRevision}
+    </update>
+    <update id="closeInteraction">
+        UPDATE ja_interaction_request SET status=#{status},revision=revision+1,operation_key=#{operationKey},
+        updated_at_ms=#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}
+        WHERE thread_id=#{threadId} AND interaction_id=#{interactionId} AND status='PENDING' AND revision=#{expectedInteractionRevision}
+    </update>
+    <insert id="insertEvent">
+        INSERT INTO ja_interaction_event(thread_id,interaction_id,interaction_revision,kind,occurred_at_ms)
+        VALUES(#{threadId},#{interactionId},#{interactionRevision},#{kind},#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+    </insert>
+    <select id="selectDraft" resultMap="draft">
+        SELECT thread_id,interaction_id,answers_json,page,is_collapsed,operation_key,revision,updated_at_ms
+        FROM ja_interaction_draft WHERE thread_id=#{threadId} AND interaction_id=#{interactionId}
+    </select>
+    <insert id="saveDraft">
+        INSERT INTO
+        ja_interaction_draft(thread_id,interaction_id,answers_json,page,is_collapsed,operation_key,revision,updated_at_ms)
+        VALUES(#{threadId},#{interactionId},#{answersJson},#{page},#{collapsed},#{operationKey},#{expectedDraftRevision}+1,#{occurredAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})
+        ON CONFLICT(interaction_id) DO UPDATE SET answers_json=excluded.answers_json,page=excluded.page,
+        is_collapsed=excluded.is_collapsed,operation_key=excluded.operation_key,revision=excluded.revision,
+        updated_at_ms=excluded.updated_at_ms
+        WHERE ja_interaction_draft.revision=#{expectedDraftRevision}
+    </insert>
+    <select id="selectCurrentEventSequence" resultType="long">
+        SELECT MAX(event_sequence) FROM ja_interaction_event WHERE thread_id=#{threadId}
+    </select>
+    <select id="selectEvents" resultMap="event">
+        SELECT event_sequence,thread_id,interaction_id,interaction_revision,kind,occurred_at_ms
+        FROM ja_interaction_event WHERE thread_id=#{threadId} AND event_sequence&gt;#{afterSequence}
+        ORDER BY event_sequence ASC
+    </select>
+</mapper>

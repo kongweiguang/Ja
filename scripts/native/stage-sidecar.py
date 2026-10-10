@@ -1,11 +1,10 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Stage one already-built Native Image executable for the Tauri resource bundle.
+"""将已构建的 Native Image 可执行文件暂存到 Tauri 资源包。
 
-The script is intentionally a file-and-manifest adapter only.  Native Image compilation,
-protocol validation, and Tauri bundle configuration remain owned by their existing tools; this
-step gives CI and local packaging one deterministic ``sidecars/ja-app-server-<target-triple>`` layout.
+此脚本仅负责文件与清单转换。Native Image 编译、协议验证和 Tauri 资源包配置仍由原有工具负责；
+此步骤为 CI 和本地打包提供统一的 ``sidecars/ja-app-server-<target-triple>`` 目录布局。
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 def sha256(path: Path) -> str:
-    """Hash the source and staged file in chunks so large native binaries stay bounded in memory."""
+    """分块计算源文件和暂存文件的摘要，避免大型原生二进制占用过多内存。"""
 
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -34,7 +33,7 @@ def sha256(path: Path) -> str:
 
 
 def artifact_entry(path: Path) -> dict[str, Any]:
-    """Return portable artifact facts without serializing a host-specific absolute path."""
+    """返回可移植的产物信息，不序列化特定主机上的绝对路径。"""
 
     if not path.is_file():
         raise RuntimeError(f"native artifact is missing: {path}")
@@ -46,7 +45,7 @@ def artifact_entry(path: Path) -> dict[str, Any]:
 
 
 def validate_identity(target_triple: str, source_commit: str) -> None:
-    """Reject path-like target identities before they can escape the requested staging root."""
+    """在目标身份可能逃逸暂存根目录前，拒绝其中类似路径的内容。"""
 
     if not TARGET_TRIPLE_PATTERN.fullmatch(target_triple):
         raise RuntimeError("target triple contains an unsafe character")
@@ -55,14 +54,14 @@ def validate_identity(target_triple: str, source_commit: str) -> None:
 
 
 def sidecar_file_name(target_triple: str) -> str:
-    """Use the same target-triple naming contract consumed by the Rust resource resolver."""
+    """使用与 Rust 资源解析器相同的 target triple 命名契约。"""
 
     suffix = ".exe" if target_triple.endswith("-windows-msvc") else ""
     return f"ja-app-server-{target_triple}{suffix}"
 
 
 def contained_path(root: Path, child: Path) -> Path:
-    """Resolve a destination and prove it remains below the caller-owned staging directory."""
+    """解析目标路径并确认它仍位于调用方指定的暂存目录内。"""
 
     root_resolved = root.resolve()
     child_resolved = child.resolve()
@@ -74,7 +73,7 @@ def contained_path(root: Path, child: Path) -> Path:
 
 
 def validate_build_report(report_path: Path, source: dict[str, Any], source_commit: str) -> None:
-    """Cross-check optional build evidence so staging cannot relabel another commit or binary."""
+    """交叉核对可选构建证据，避免暂存过程将其他提交或二进制标记为当前产物。"""
 
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -101,7 +100,7 @@ def manifest_for(
     source_commit: str,
     mode: str,
 ) -> dict[str, Any]:
-    """Build one portable staging record shared by copy and offline dry-run paths."""
+    """构造可供复制和离线 dry-run 共用的一条可移植暂存记录。"""
 
     return {
         "schemaVersion": 1,
@@ -124,7 +123,7 @@ def manifest_for(
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Atomically publish the manifest so consumers never observe a partially-written JSON file."""
+    """以原子方式写入清单，避免读取方看到只写入一部分的 JSON 文件。"""
 
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -132,7 +131,7 @@ def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    """Expose only explicit staging inputs; no build or protocol options are duplicated here."""
+    """只公开明确的暂存输入，不重复提供构建或协议选项。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", required=True, type=Path)
@@ -151,7 +150,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Copy one executable, verify optional evidence, and emit a deterministic sidecar manifest."""
+    """复制一个可执行文件、校验可选证据并生成确定性的 sidecar 清单。"""
 
     args = parse_args()
     try:

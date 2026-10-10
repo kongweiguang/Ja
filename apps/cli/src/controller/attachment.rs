@@ -86,22 +86,7 @@ pub fn import_paths(
     for (path, snapshot) in admitted {
         let result = (|| {
             let staged = stage_one(&path, snapshot)?;
-            let result = connection.request("attachment/import", json!({
-                "ingressToken":staged.token,"workspaceId":workspace_id,"displayName":staged.display_name,
-                "sizeBytes":staged.size,"sha256":staged.sha256
-            }))?;
-            if required_str(&result, "workspaceId")? != workspace_id
-                || required_str(&result, "displayName")? != staged.display_name
-                || result.get("sizeBytes").and_then(Value::as_u64) != Some(staged.size)
-            {
-                return Err(CliError::protocol("附件导入回执与原生文件不符"));
-            }
-            Ok(ImportedAttachment {
-                id: required_str(&result, "attachmentId")?.to_owned(),
-                name: staged.display_name.clone(),
-                size: staged.size,
-                media_kind: required_str(&result, "mediaKind")?.to_owned(),
-            })
+            import_staged(connection, workspace_id, staged)
         })();
         match result {
             Ok(item) => imported.push(item),
@@ -115,6 +100,102 @@ pub fn import_paths(
         }
     }
     Ok(imported)
+}
+
+/// 受限显示名的生成内容也走同一私有 ingress 与服务端摘要校验，不经过用户临时目录。
+pub fn import_bytes(
+    connection: &mut Connection,
+    workspace_id: &str,
+    display_name: &str,
+    bytes: &[u8],
+) -> Result<ImportedAttachment, CliError> {
+    if display_name.is_empty()
+        || display_name.len() > 128
+        || !display_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(CliError::usage("生成附件名称无效"));
+    }
+    if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES as usize {
+        return Err(CliError::usage("生成附件为空或超过 100 MiB 上限"));
+    }
+    let staged = stage_bytes(display_name, bytes)?;
+    import_staged(connection, workspace_id, staged)
+}
+
+/// 两种来源共用同一服务端导入回执边界；畸形回执若包含 draft identity 则先尝试清理。
+fn import_staged(
+    connection: &mut Connection,
+    workspace_id: &str,
+    staged: Staged,
+) -> Result<ImportedAttachment, CliError> {
+    let result = connection.request(
+        "attachment/import",
+        json!({
+            "ingressToken":staged.token,
+            "workspaceId":workspace_id,
+            "displayName":staged.display_name,
+            "sizeBytes":staged.size,
+            "sha256":staged.sha256
+        }),
+    )?;
+    let attachment_id = required_str(&result, "attachmentId")?.to_owned();
+    let valid = required_str(&result, "workspaceId")? == workspace_id
+        && required_str(&result, "displayName")? == staged.display_name
+        && result.get("sizeBytes").and_then(Value::as_u64) == Some(staged.size);
+    if !valid {
+        let _ = connection.request("attachment/discard", json!({"attachmentId":attachment_id}));
+        return Err(CliError::protocol("附件导入回执与 staging 不符"));
+    }
+    Ok(ImportedAttachment {
+        id: attachment_id,
+        name: staged.display_name.clone(),
+        size: staged.size,
+        media_kind: required_str(&result, "mediaKind")?.to_owned(),
+    })
+}
+
+/// 生成内容以 create_new + hard_link 在 Ja 私有 ingress 内原子发布，并在 RPC 结束时删除。
+fn stage_bytes(display_name: &str, bytes: &[u8]) -> Result<Staged, CliError> {
+    let root = ingress_root()?;
+    let sha256 = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    for _ in 0..8 {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let part = root.join(format!("{token}.part"));
+        let final_path = root.join(&token);
+        let mut staging = match OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(CliError::transport(error)),
+        };
+        let published = (|| {
+            staging
+                .write_all(bytes)
+                .and_then(|_| staging.flush())
+                .and_then(|_| staging.sync_all())
+                .map_err(CliError::transport)?;
+            fs::hard_link(&part, &final_path).map_err(CliError::transport)?;
+            fs::remove_file(&part).map_err(CliError::transport)?;
+            Ok::<(), CliError>(())
+        })();
+        if let Err(error) = published {
+            let _ = fs::remove_file(&part);
+            let _ = fs::remove_file(&final_path);
+            return Err(error);
+        }
+        return Ok(Staged {
+            token,
+            path: final_path,
+            display_name: display_name.to_owned(),
+            size: bytes.len() as u64,
+            sha256,
+        });
+    }
+    Err(CliError::configuration("无法分配生成附件 staging token"))
 }
 
 /// 复制期间按原句柄计算 SHA-256，发布前再比较路径句柄，禁止文件被替换后导入其他内容。

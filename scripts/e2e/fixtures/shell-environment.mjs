@@ -84,8 +84,8 @@ function shellStream(command) {
     id: itemId,
     type: "function_call",
     call_id: SHELL_CALL_ID,
-    name: "shell",
-    arguments: JSON.stringify({ command, timeout_ms: 30_000 }),
+    name: "exec_command",
+    arguments: JSON.stringify({ cmd: command, timeout_ms: 30_000 }),
   };
   const message = {
     id: messageId,

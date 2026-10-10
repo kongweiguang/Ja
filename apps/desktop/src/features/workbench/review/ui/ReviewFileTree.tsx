@@ -37,8 +37,9 @@ import {
   MenuSeparator,
   PointerContextMenu,
 } from "@/shared/ui/primitives";
+import { observeElementOffsetWhileActive } from "@/shared/ui/observeElementOffsetWhileActive";
 import type { ReviewAction } from "../domain/types";
-import { actionLabel } from "../domain/model";
+import { actionLabel, reviewLayerLabel } from "../domain/model";
 import {
   buildReviewTreeRows,
   defaultExpandedReviewTree,
@@ -63,6 +64,7 @@ export interface ReviewFileTreeProps {
   readonly initialGrouping?: ReviewTreeGrouping;
   readonly allowedGroupings?: readonly ReviewTreeGrouping[];
   readonly loading?: boolean;
+  readonly queryResultsAvailable?: boolean;
   readonly emptyMessage?: string;
   readonly fileAriaLabel?: (file: ReviewTreeFile) => string;
   readonly fileContextActions?: (file: ReviewTreeFile) => readonly ReviewAction[];
@@ -107,7 +109,7 @@ function TreeFileIcon({ file }: { file: ReviewTreeFile }): ReactElement {
   return <Icon aria-hidden="true" />;
 }
 
-/** 文件行保持稳定节奏；右键只发出被点中文件意图，不改变当前 Diff 选择。 */
+/** 文件行保持稳定节奏并复用 domain 层中文层名；右键不改变当前 Diff 选择。 */
 function FileRow({
   row,
   selected,
@@ -134,14 +136,7 @@ function FileRow({
     restoreFocus: () => void,
   ) => boolean;
 }): ReactElement {
-  const layerLabel =
-    row.file.layer === "staged"
-      ? "已暂存"
-      : row.file.layer === "unstaged"
-        ? "未暂存"
-        : row.file.layer === "untracked"
-          ? "未跟踪"
-          : "比较";
+  const layerLabel = reviewLayerLabel(row.file.layer);
   const statusMark =
     row.file.status === "conflicted"
       ? "!"
@@ -257,7 +252,8 @@ function BranchRow({
 
 /**
  * 共享文件树只投影传入快照：分组、搜索、目录压缩和虚拟化都不访问文件系统。
- * 查询期间强制展开命中祖先，清空后通过 collapsed/opened 双集合恢复原折叠状态。
+ * 查询期间强制展开命中祖先，清空后通过 collapsed/opened 双集合恢复原折叠状态；
+ * 来源数据未读取时不把空投影误报为搜索无匹配，卸载后丢弃 core debounce 尾回调。
  */
 export function ReviewFileTree({
   files,
@@ -269,6 +265,7 @@ export function ReviewFileTree({
   initialGrouping = "status",
   allowedGroupings = ["status", "directory", "flat"],
   loading = false,
+  queryResultsAvailable = true,
   emptyMessage = "当前范围没有变更。",
   fileAriaLabel,
   fileContextActions,
@@ -311,6 +308,7 @@ export function ReviewFileTree({
   const virtualizer = useVirtualizer({
     // React 19 的测量 ref 可能在 commit 生命周期内同步校正；避免 adapter 在该阶段调用 flushSync。
     useFlushSync: false,
+    observeElementOffset: observeElementOffsetWhileActive,
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 32,
@@ -590,7 +588,7 @@ export function ReviewFileTree({
           </p>
         ) : rows.length === 0 ? (
           <p className="ja-review-tree-state">
-            {query.trim().length > 0 ? "没有匹配的文件。" : emptyMessage}
+            {queryResultsAvailable && query.trim().length > 0 ? "没有匹配的文件。" : emptyMessage}
           </p>
         ) : (
           <div

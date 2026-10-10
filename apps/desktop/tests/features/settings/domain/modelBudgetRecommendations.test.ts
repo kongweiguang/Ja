@@ -11,7 +11,7 @@ describe("getModelBudgetRecommendation", () => {
       getModelBudgetRecommendation("deepseek-v4-pro", "https://api.deepseek.com"),
     ).toMatchObject({
       contextWindowTokens: 1_000_000,
-      maxOutputTokens: 8_192,
+      maxOutputTokens: 16_384,
       label: "推荐预算",
     });
     expect(
@@ -30,7 +30,7 @@ describe("getModelBudgetRecommendation", () => {
   ])("does not infer vendor limits for %s / %s", (baseUrl, model) => {
     expect(getModelBudgetRecommendation(model, baseUrl)).toMatchObject({
       contextWindowTokens: 128_000,
-      maxOutputTokens: 8_192,
+      maxOutputTokens: 16_384,
       label: "通用起始预算",
     });
   });

@@ -122,7 +122,7 @@ async function approveNextPendingTool({ page, invoke, threadId, planId, approval
 }
 
 /**
- * 只读读取独立 Plan 的 SQLite 事实；查询按 Plan/Run 过滤，不能影响正在运行的 App Server 事务。
+ * 只读读取独立 Plan 的 SQLite 事实；Turn 数由 claims 推导，不依赖已删除的执行预算列。
  */
 function readLedgerFromSqlite(directories, planId, runId) {
   const databasePath = directories?.databasePath ?? join(directories?.data ?? "", "ja.db");
@@ -134,68 +134,78 @@ function readLedgerFromSqlite(directories, planId, runId) {
     database.exec("PRAGMA busy_timeout = 5000");
     const run = database
       .prepare(
-        "SELECT run_id,plan_id,status,turns_used,used_model_rounds,used_tool_calls " +
-          "FROM execution_runs WHERE plan_id=? AND run_id=?",
+        "SELECT r.run_id,r.plan_id,r.plan_revision_id,r.plan_hash,r.status,r.completed_at_ms," +
+          "r.used_model_rounds,r.used_tool_calls FROM ja_plan_execution r JOIN ja_plan p " +
+          "ON p.plan_id=r.plan_id AND p.active_run_id=r.run_id AND p.active_plan_revision_id=r.plan_revision_id " +
+          "JOIN ja_plan_revision v ON v.plan_id=r.plan_id AND v.plan_revision_id=r.plan_revision_id " +
+          "AND v.plan_hash=r.plan_hash WHERE r.plan_id=? AND r.run_id=?",
       )
       .get(planId, runId);
     if (run === undefined) return undefined;
     const claims = database
       .prepare(
-        "SELECT run_id,turn_id,ordinal,state FROM plan_turn_claims WHERE run_id=? ORDER BY ordinal",
+        "SELECT run_id,turn_id,ordinal,state FROM ja_plan_turn_claim WHERE run_id=? ORDER BY ordinal",
       )
       .all(runId);
     const evaluations = database
       .prepare(
-        "SELECT request_id,plan_id,plan_revision_id,run_id,outcome,verdict,completed_at " +
-          "FROM plan_evaluation_requests WHERE plan_id=? AND run_id=? ORDER BY completed_at,request_id",
+        "SELECT evaluation_id,model_request_id,plan_id,plan_revision_id,run_id,outcome,verdict,criteria_json,started_at_ms,completed_at_ms " +
+          "FROM ja_plan_evaluation_attempt WHERE plan_id=? AND run_id=? AND plan_revision_id=? " +
+          "ORDER BY started_at_ms,evaluation_id",
       )
-      .all(planId, runId);
+      .all(planId, runId, run.plan_revision_id);
     const evidence = database
       .prepare(
         "SELECT evidence_id,plan_id,run_id,plan_revision_id,criterion_id,step_id,source_type,source_id " +
-          "FROM acceptance_evidence WHERE plan_id=? AND run_id=? ORDER BY created_at,evidence_id",
+          "FROM ja_plan_acceptance_evidence WHERE plan_id=? AND run_id=? AND plan_revision_id=? " +
+          "ORDER BY created_at_ms,evidence_id",
       )
-      .all(planId, runId);
+      .all(planId, runId, run.plan_revision_id);
+    const requiredSteps = database.prepare(
+      "SELECT s.step_id,e.status FROM ja_plan_step s LEFT JOIN ja_plan_step_execution e " +
+      "ON e.step_id=s.step_id AND e.plan_revision_id=s.plan_revision_id AND e.run_id=? " +
+      "WHERE s.plan_revision_id=? AND s.is_required=1 ORDER BY s.ordinal",
+    ).all(runId, run.plan_revision_id);
     const events = database
       .prepare(
-        "SELECT event_sequence,event_id,plan_id,plan_revision,activity,created_at " +
-          "FROM plan_events WHERE plan_id=? AND activity='plan_completed' ORDER BY event_sequence",
+        "SELECT event_sequence,event_id,plan_id,plan_revision,activity,created_at_ms " +
+          "FROM ja_plan_event WHERE plan_id=? AND activity='plan_completed' ORDER BY event_sequence",
       )
       .all(planId);
-    return { run, claims, evaluations, evidence, events };
+    return { run, claims, evaluations, evidence, events, requiredSteps };
   } finally {
     database.close();
   }
 }
 
 /**
- * 统一 callback 与 SQLite 账本形状；只接受同一 Plan/Run 的事实，拒绝跨运行拼接完成证据。
+ * callback 与 SQLite 使用同一字段契约；只接受精确 Plan/Run/revision，拒绝跨运行拼接事实。
  */
 function normalizeLedger(raw, planId, runId) {
   if (raw === undefined || raw === null) return undefined;
-  const evaluations = raw.evaluations ?? raw.evaluationRequests ?? raw.planEvaluationRequests ?? [];
-  const evidence = raw.evidence ?? raw.acceptanceEvidence ?? raw.planEvidence ?? [];
-  const events = raw.events ?? raw.planEvents ?? [];
+  const evaluations = raw.evaluations ?? [];
+  const evidence = raw.evidence ?? [];
+  const events = raw.events ?? [];
   const run = raw.run;
-  const claims = raw.claims ?? raw.turnClaims ?? [];
-  if (!Array.isArray(evaluations) || !Array.isArray(evidence) || !Array.isArray(events) || !Array.isArray(claims)) {
+  const claims = raw.claims ?? [];
+  const requiredSteps = raw.requiredSteps ?? [];
+  if (![evaluations,evidence,events,claims,requiredSteps].every(Array.isArray)) {
     throw new Error("Plan ledger 形状无效");
   }
   const same = (value) =>
-    (value?.planId ?? value?.plan_id) === planId &&
-    (value?.runId ?? value?.run_id) === runId;
+    value?.plan_id === planId && value?.run_id === runId &&
+    value?.plan_revision_id === run?.plan_revision_id;
   const scopedEvaluations = evaluations.filter(same);
   const scopedEvidence = evidence.filter(same);
-  const scopedEvents = events.filter((value) => (value?.planId ?? value?.plan_id) === planId);
-  const scopedClaims = claims.filter(
-    (value) => (value?.runId ?? value?.run_id) === undefined || (value?.runId ?? value?.run_id) === runId,
-  );
+  const scopedEvents = events.filter((value) => value?.plan_id === planId);
+  const scopedClaims = claims.filter((value) => value?.run_id === runId);
   return {
     run,
     claims: scopedClaims,
     evaluations: scopedEvaluations,
     evidence: scopedEvidence,
     events: scopedEvents,
+    requiredSteps,
   };
 }
 
@@ -203,32 +213,35 @@ function normalizeLedger(raw, planId, runId) {
  * 计算完成门的独立证据，不把模型文本、fixture boolean 或 Plan status 单独当作完成事实。
  */
 function completionEvidence(plan, ledger, planId, runId) {
-  const evaluations = (ledger?.evaluations ?? []).filter((value) => {
-    const outcome = value.outcome ?? value.status;
-    return outcome === undefined || ["SUCCEEDED", "COMPLETED"].includes(String(outcome).toUpperCase());
-  });
+  const evaluations = ledger?.evaluations ?? [];
   const notMet = evaluations.filter((value) => String(value.verdict ?? "").toUpperCase() === "NOT_MET");
   const met = evaluations.filter((value) => String(value.verdict ?? "").toUpperCase() === "MET");
   const ordered = evaluations.toSorted((left, right) => {
-    const a = String(left.completed_at ?? left.completedAt ?? "");
-    const b = String(right.completed_at ?? right.completedAt ?? "");
-    return a.localeCompare(b) || String(left.request_id ?? left.requestId ?? "").localeCompare(String(right.request_id ?? right.requestId ?? ""));
+    return Number(left.started_at_ms) - Number(right.started_at_ms) ||
+      String(left.evaluation_id).localeCompare(String(right.evaluation_id));
   });
   const finalEvaluation = ordered.at(-1);
   const claims = ledger?.claims ?? [];
-  const turnIds = new Set(claims.map((value) => value.turn_id ?? value.turnId).filter(Boolean));
+  const turnIds = new Set(claims.filter((value) => value.state === "SETTLED").map((value) => value.turn_id).filter(Boolean));
   const events = (ledger?.events ?? []).filter((value) =>
-    String(value.activity ?? value.kind ?? "").toLowerCase() === "plan_completed",
+    value.activity === "plan_completed",
   );
   const evidenceCount = (ledger?.evidence ?? []).filter(
-    (value) => (value.planId ?? value.plan_id) === planId && (value.runId ?? value.run_id) === runId,
+    (value) => value.plan_id === planId && value.run_id === runId,
   ).length;
+  const frozenRevisionMatches = ledger?.run?.plan_revision_id === plan.currentRevision?.planRevisionId &&
+    ledger?.run?.plan_hash === plan.currentRevision?.planHash;
+  const runCompleted = ledger?.run?.status === "COMPLETED" && Number.isSafeInteger(ledger.run.completed_at_ms);
+  const requiredStepsCompleted = ledger?.requiredSteps?.length > 0 &&
+    ledger.requiredSteps.every((step) => step.status === "SUCCEEDED");
+  const latestEvaluationCommitted = finalEvaluation?.outcome === "SUCCEEDED" &&
+    finalEvaluation.verdict === "MET" && Number.isSafeInteger(finalEvaluation.completed_at_ms) &&
+    typeof finalEvaluation.criteria_json === "string" && Array.isArray(JSON.parse(finalEvaluation.criteria_json));
   return {
     status: plan.plan.status,
     sameRun: ledger?.run === undefined
       ? false
-      : (ledger.run.run_id ?? ledger.run.runId) === runId &&
-        (ledger.run.plan_id ?? ledger.run.planId) === planId,
+      : ledger.run.run_id === runId && ledger.run.plan_id === planId,
     turnCount: turnIds.size,
     notMetEvaluationCount: notMet.length,
     metEvaluationCount: met.length,
@@ -237,12 +250,13 @@ function completionEvidence(plan, ledger, planId, runId) {
     finalEvaluationVerdict: String(finalEvaluation?.verdict ?? "").toUpperCase() || null,
     completionGateVerified:
       plan.plan.status === "completed" &&
-      (ledger?.run?.run_id ?? ledger?.run?.runId) === runId &&
-      (ledger?.run?.plan_id ?? ledger?.run?.planId) === planId &&
+      ledger?.run?.run_id === runId && ledger?.run?.plan_id === planId &&
+      frozenRevisionMatches && runCompleted && requiredStepsCompleted && latestEvaluationCommitted &&
       notMet.length >= 1 &&
       met.length >= 1 &&
       String(finalEvaluation?.verdict ?? "").toUpperCase() === "MET" &&
       turnIds.size >= 2 &&
+      claims.every((claim) => claim.state === "SETTLED") &&
       evidenceCount > 0 &&
       events.length === 1,
   };
@@ -269,14 +283,14 @@ export async function runStandalonePlanCompletion(options) {
   if (definition === null || typeof definition !== "object") throw new TypeError("definition is required");
   if (providerFixture === null || typeof providerFixture !== "object") throw new TypeError("providerFixture is required");
   if (!Number.isFinite(deadline)) throw new TypeError("deadline is required");
-  if (typeof providerFixture.resetPlanGoalContext !== "function" || typeof providerFixture.setPlanGoalContext !== "function") {
+  if (typeof providerFixture.resetPlanContext !== "function" || typeof providerFixture.setPlanContext !== "function") {
     throw new TypeError("providerFixture 缺少 Plan context API");
   }
   if (typeof readLedger !== "function" && directories === undefined) {
     throw new TypeError("readLedger or directories is required");
   }
 
-  providerFixture.resetPlanGoalContext("standalone");
+  providerFixture.resetPlanContext("standalone");
   const thread = unwrapRpc(await invoke(RPC.threadRead, { threadId, limit: 200 }), "Thread read");
   if (!Number.isSafeInteger(thread?.revision)) throw new Error("Thread read 缺少 revision");
   const created = requirePlanProjection(
@@ -330,7 +344,7 @@ export async function runStandalonePlanCompletion(options) {
   if (typeof step?.stepId !== "string" || typeof criterion?.criterionId !== "string") {
     throw new Error("Plan revision 缺少 step/criterion identity");
   }
-  providerFixture.setPlanGoalContext({
+  providerFixture.setPlanContext({
     kind: "plan",
     planId,
     planRevision: current.plan.revision,
@@ -355,7 +369,7 @@ export async function runStandalonePlanCompletion(options) {
     latestPlan = round.plan;
     if (round.completed) break;
     if (latestPlan.plan.status === "executing" && latestPlan.plan.revision !== current.plan.revision) {
-      providerFixture.setPlanGoalContext({
+      providerFixture.setPlanContext({
         kind: "plan",
         planId,
         planRevision: latestPlan.plan.revision,

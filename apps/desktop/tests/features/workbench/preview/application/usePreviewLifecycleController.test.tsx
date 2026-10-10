@@ -30,7 +30,6 @@ const RECOVERY_CLEAR = { observed: 0, recovered: 0, failed: 0, pending: 0 } as c
 const project: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_fixture",
-  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\ja",
   displayName: "ja",
   trust: "trusted",
@@ -39,7 +38,6 @@ const project: WorkspaceProjection = {
 const otherProject: WorkspaceProjection = {
   kind: "project",
   workspaceId: "ws_other",
-  legacySharedWorkspaceId: null,
   rootPath: "C:\\dev\\other",
   displayName: "other",
   trust: "trusted",
@@ -65,7 +63,7 @@ function createDeferred<T>(): {
   return { promise, resolve, reject };
 }
 
-/** native Promise 收敛后刷新 fire-and-forget Preview controller，确保断言观察终态。 */
+/** 等待原生 Promise 完成后刷新异步 Preview 控制器，确保断言观察到终态。 */
 async function flushMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -213,6 +211,52 @@ function createAdapters(): JaWorkbenchAdapters & {
 }
 
 describe("usePreviewLifecycleController", () => {
+  /** 恢复期间的最后一次几何/显隐意图决定最终布局，后台恢复不得显示原生页面。 */
+  it.each([true, false])(
+    "restores the latest viewport (visible=%s) after its native hide ACK without another resize",
+    async (visible) => {
+      const adapters = createAdapters();
+      const sessionId = "00000000-0000-4000-8000-000000000002";
+      const session = await adapters.preview.state(sessionId);
+      const restored = createDeferred<PreviewSessionSnapshot>();
+      const hidden = createDeferred<PreviewSessionSnapshot>();
+      adapters.sessionHints.remember(project.workspaceId, sessionId);
+      adapters.preview.state = vi
+        .fn()
+        .mockImplementationOnce(() => restored.promise)
+        .mockResolvedValue(session);
+      adapters.preview.layout = vi
+        .fn()
+        .mockImplementationOnce(() => hidden.promise)
+        .mockResolvedValue(session);
+      const { result } = renderHook(() => useJaWorkbench(project, adapters));
+
+      act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+      await act(async () => {
+        restored.resolve(session);
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(adapters.preview.layout).toHaveBeenCalledOnce());
+      act(() =>
+        result.current.preview.onViewportChange({ ...PREVIEW_VIEWPORT, width: 500, visible }),
+      );
+      await act(async () => {
+        hidden.resolve(session);
+        await flushMicrotasks();
+      });
+
+      await waitFor(() => expect(result.current.preview.activePageId).toBe(sessionId));
+      await waitFor(() =>
+        expect(adapters.preview.layout).toHaveBeenLastCalledWith(sessionId, {
+          ...PREVIEW_VIEWPORT,
+          width: 500,
+          visible,
+        }),
+      );
+      expect(adapters.preview.layout).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("rehydrates a reload hint only through authoritative native state", async () => {
     const adapters = createAdapters();
     const sessionId = "00000000-0000-4000-8000-000000000002";
@@ -394,6 +438,47 @@ describe("usePreviewLifecycleController", () => {
     await act(flushMicrotasks);
     expect(adapters.preview.layout).toHaveBeenCalledTimes(2);
   });
+
+  /** 用受控 ACK 固定布局回到原值的竞态，不能拿在途请求前的 applied cache 吞掉最新意图。 */
+  it.each(["hide", "resize"] as const)(
+    "restores the original viewport before the native %s completes",
+    async (operation) => {
+      const adapters = createAdapters();
+      const { result } = renderHook(() => useJaWorkbench(project, adapters));
+      act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+      await act(async () =>
+        result.current.preview.onOpenTarget({ kind: "file", path: "index.html" }),
+      );
+      const sessionId = result.current.preview.activePageId!;
+      const session = await adapters.preview.state(sessionId);
+      const hidden = createDeferred<PreviewSessionSnapshot>();
+      adapters.preview.layout = vi
+        .fn()
+        .mockImplementationOnce(() => hidden.promise)
+        .mockResolvedValue(session);
+
+      act(() =>
+        result.current.preview.onViewportChange(
+          operation === "hide"
+            ? { ...PREVIEW_VIEWPORT, visible: false }
+            : { ...PREVIEW_VIEWPORT, width: 500 },
+        ),
+      );
+      expect(adapters.preview.layout).toHaveBeenCalledOnce();
+      act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+      expect(adapters.preview.layout).toHaveBeenCalledOnce();
+      await act(async () => {
+        hidden.resolve(session);
+        await flushMicrotasks();
+      });
+
+      await waitFor(() => expect(adapters.preview.layout).toHaveBeenCalledTimes(2));
+      expect(adapters.preview.layout).toHaveBeenLastCalledWith(sessionId, PREVIEW_VIEWPORT);
+      act(() => result.current.preview.onViewportChange(PREVIEW_VIEWPORT));
+      await act(flushMicrotasks);
+      expect(adapters.preview.layout).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("reconciles an early higher-generation load event against state after open ACK", async () => {
     const adapters = createAdapters();
@@ -1040,6 +1125,7 @@ describe("usePreviewLifecycleController", () => {
       "C:\\dev\\ja\\页面\\index.html",
       project.workspaceId,
       { x: 0, y: 0, width: 1024, height: 768, visible: false },
+      "browser",
     );
     expect(result.current.preview.url).toBe(fileUrl);
     expect(result.current.preview.pages).toHaveLength(1);
@@ -1052,6 +1138,306 @@ describe("usePreviewLifecycleController", () => {
     ).rejects.toThrow("无法打开此页面，请重试。");
     expect(result.current.preview.pages).toHaveLength(1);
     expect(JSON.stringify(result.current.preview)).not.toContain("private");
+  });
+
+  /** Port 注入稳定错误文案即可验证应用生命周期；文件拒绝不应丢失原生页面事实。 */
+  it("keeps an existing page after file navigation is rejected and clears the error on retry", async () => {
+    const adapters = createAdapters();
+    const pageId = "00000000-0000-4000-8000-000000000002";
+    const base = await adapters.preview.state(pageId);
+    const original: PreviewSessionSnapshot = {
+      ...base,
+      generation: 4,
+      status: "open",
+      load_status: "finished",
+      url: "https://original.example/",
+      title: "Original page",
+      can_go_back: true,
+      can_go_forward: false,
+      window: { ...base.window, url: "https://original.example/" },
+    };
+    let nativeSnapshot = original;
+    const successful: PreviewSessionSnapshot = {
+      ...original,
+      generation: 5,
+      load_status: "finished",
+      url: "file:///C:/dev/ja/src/index.html",
+      title: "index.html",
+      can_go_back: true,
+      window: { ...original.window, url: "file:///C:/dev/ja/src/index.html" },
+    };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: original, window: original.window }));
+    adapters.preview.state = vi.fn(async () => nativeSnapshot);
+    vi.mocked(adapters.preview.navigateFile)
+      .mockRejectedValueOnce(new Error("这是一个文件夹，无法在浏览器中打开。"))
+      .mockImplementationOnce(async () => {
+        nativeSnapshot = successful;
+        return successful;
+      });
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    await act(async () => result.current.preview.onOpenTarget({ kind: "url", url: original.url }));
+    await waitFor(() => expect(result.current.preview.url).toBe(original.url));
+
+    act(() => result.current.preview.onNavigateFile("src"));
+    await waitFor(() =>
+      expect(result.current.preview.error).toBe("这是一个文件夹，无法在浏览器中打开。"),
+    );
+    expect(result.current.preview.pages).toHaveLength(1);
+    expect(result.current.preview.activePageId).toBe(pageId);
+    expect(result.current.preview.url).toBe(original.url);
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.pages[0]).toMatchObject({
+      pageId,
+      url: original.url,
+      loading: false,
+      error: "这是一个文件夹，无法在浏览器中打开。",
+      canGoBack: true,
+      canGoForward: false,
+    });
+    expect(adapters.preview.open).toHaveBeenCalledOnce();
+    expect(adapters.preview.openFile).not.toHaveBeenCalled();
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: original.generation,
+        sequence: 1,
+        kind: { type: "load_finished", url: original.url },
+      }),
+    );
+    expect(result.current.preview.error).toBe("这是一个文件夹，无法在浏览器中打开。");
+    expect(result.current.preview.url).toBe(original.url);
+
+    act(() => result.current.preview.onNavigateFile("src/index.html"));
+    await waitFor(() => expect(result.current.preview.url).toBe(successful.url));
+    expect(adapters.preview.open).toHaveBeenCalledOnce();
+    expect(adapters.preview.navigateFile).toHaveBeenNthCalledWith(
+      2,
+      pageId,
+      original.generation,
+      "src/index.html",
+      project.workspaceId,
+      "browser",
+    );
+    expect(result.current.preview.error).toBeUndefined();
+    expect(result.current.preview.pages).toHaveLength(1);
+  });
+
+  /** Port 只输入稳定失败文案；旧失败请求的 state 回读不能结束随后启动的新导航。 */
+  it("ignores a rejected navigation snapshot after a newer page navigation starts", async () => {
+    const adapters = createAdapters();
+    const pageId = "00000000-0000-4000-8000-000000000002";
+    const base = await adapters.preview.state(pageId);
+    const original: PreviewSessionSnapshot = {
+      ...base,
+      generation: 7,
+      status: "open",
+      load_status: "finished",
+      url: "https://original.example/",
+      window: { ...base.window, url: "https://original.example/" },
+    };
+    const nextNavigation = createDeferred<PreviewSessionSnapshot>();
+    const lateState = createDeferred<PreviewSessionSnapshot>();
+    let nativeSnapshot = original;
+    let deferNextState = false;
+    adapters.preview.open = vi.fn(async () => ({ snapshot: original, window: original.window }));
+    adapters.preview.state = vi.fn(async () => {
+      if (deferNextState) {
+        deferNextState = false;
+        return lateState.promise;
+      }
+      return nativeSnapshot;
+    });
+    vi.mocked(adapters.preview.navigateFile)
+      .mockRejectedValueOnce(new Error("这是一个文件夹，无法在浏览器中打开。"))
+      .mockImplementationOnce(() => nextNavigation.promise);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    await act(async () => result.current.preview.onOpenTarget({ kind: "url", url: original.url }));
+    await waitFor(() => expect(result.current.preview.url).toBe(original.url));
+
+    deferNextState = true;
+    const stateCallsBeforeFailure = vi.mocked(adapters.preview.state).mock.calls.length;
+    act(() => result.current.preview.onNavigateFile("src"));
+    await waitFor(() =>
+      expect(result.current.preview.error).toBe("这是一个文件夹，无法在浏览器中打开。"),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(adapters.preview.state).mock.calls.length).toBeGreaterThanOrEqual(
+        stateCallsBeforeFailure + 1,
+      ),
+    );
+
+    act(() => result.current.preview.onNavigateFile("src/index.html"));
+    expect(result.current.preview.error).toBeUndefined();
+    expect(result.current.preview.loading).toBe(true);
+    await act(async () => {
+      lateState.resolve(original);
+      await flushMicrotasks();
+    });
+    expect(result.current.preview.loading).toBe(true);
+    expect(result.current.preview.url).toBe(original.url);
+
+    const successful: PreviewSessionSnapshot = {
+      ...original,
+      generation: 8,
+      load_status: "finished",
+      url: "file:///C:/dev/ja/src/index.html",
+      window: { ...original.window, url: "file:///C:/dev/ja/src/index.html" },
+    };
+    nativeSnapshot = successful;
+    await act(async () => {
+      nextNavigation.resolve(successful);
+      await flushMicrotasks();
+    });
+    await waitFor(() => expect(result.current.preview.url).toBe(successful.url));
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.error).toBeUndefined();
+  });
+
+  /** ACK 前仍处在旧 native generation 时，旧 failure 不应结束新页面的导航 deadline。 */
+  it("ignores an old failed navigation ACK before the new page commits and finishes", async () => {
+    const adapters = createAdapters();
+    const pageId = "00000000-0000-4000-8000-000000000002";
+    const base = await adapters.preview.state(pageId);
+    const original: PreviewSessionSnapshot = {
+      ...base,
+      generation: 7,
+      status: "open",
+      load_status: "finished",
+      url: "https://original.example/",
+      window: { ...base.window, url: "https://original.example/" },
+    };
+    const staleFailure: PreviewSessionSnapshot = {
+      ...original,
+      load_status: "failed",
+    };
+    const nextUrl = "file:///C:/dev/ja/src/index.html";
+    const committed: PreviewSessionSnapshot = {
+      ...original,
+      generation: 8,
+      load_status: "loading",
+      url: nextUrl,
+      window: { ...original.window, url: nextUrl },
+    };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: original, window: original.window }));
+    adapters.preview.state = vi.fn(async () => original);
+    vi.mocked(adapters.preview.navigateFile).mockResolvedValue(staleFailure);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    await act(async () => result.current.preview.onOpenTarget({ kind: "url", url: original.url }));
+    await waitFor(() => expect(result.current.preview.url).toBe(original.url));
+
+    adapters.preview.state = vi.fn(async () => staleFailure);
+    act(() => result.current.preview.onNavigateFile("src/index.html"));
+    await waitFor(() => expect(adapters.preview.navigateFile).toHaveBeenCalledOnce());
+    await act(flushMicrotasks);
+    expect(result.current.preview.loading).toBe(true);
+    expect(result.current.preview.error).toBeUndefined();
+    expect(result.current.preview.url).toBe(original.url);
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: committed.generation,
+        sequence: 1,
+        kind: { type: "navigation_committed", source: "user", url: nextUrl },
+      }),
+    );
+    expect(result.current.preview.loading).toBe(true);
+    expect(result.current.preview.error).toBeUndefined();
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: committed.generation,
+        sequence: 2,
+        kind: { type: "load_finished", url: nextUrl },
+      }),
+    );
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.error).toBeUndefined();
+    expect(result.current.preview.url).toBe(nextUrl);
+  });
+
+  /** 起点代际的迟到失败要丢弃，新代际失败仍须显示且同 intent 的 finished 不能抹除诊断。 */
+  it("ignores an old load failure while preserving a real failure for the new generation", async () => {
+    const adapters = createAdapters();
+    const pageId = "00000000-0000-4000-8000-000000000002";
+    const base = await adapters.preview.state(pageId);
+    const original: PreviewSessionSnapshot = {
+      ...base,
+      generation: 7,
+      status: "open",
+      load_status: "finished",
+      url: "https://original.example/",
+      window: { ...base.window, url: "https://original.example/" },
+    };
+    const nextUrl = "file:///C:/dev/ja/src/index.html";
+    const navigation = createDeferred<PreviewSessionSnapshot>();
+    adapters.preview.open = vi.fn(async () => ({ snapshot: original, window: original.window }));
+    adapters.preview.state = vi.fn(async () => original);
+    vi.mocked(adapters.preview.navigateFile).mockImplementation(() => navigation.promise);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    await act(async () => result.current.preview.onOpenTarget({ kind: "url", url: original.url }));
+    await waitFor(() => expect(result.current.preview.url).toBe(original.url));
+
+    act(() => result.current.preview.onNavigateFile("src/index.html"));
+    await waitFor(() => expect(adapters.preview.navigateFile).toHaveBeenCalledOnce());
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: original.generation,
+        sequence: 1,
+        kind: { type: "load_failed", message: "旧页面失败" },
+      }),
+    );
+    expect(result.current.preview.loading).toBe(true);
+    expect(result.current.preview.error).toBeUndefined();
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: original.generation + 1,
+        sequence: 2,
+        kind: { type: "navigation_committed", source: "user", url: nextUrl },
+      }),
+    );
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: original.generation + 1,
+        sequence: 3,
+        kind: { type: "load_failed", message: "新页面加载失败" },
+      }),
+    );
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.error).toBe("新页面加载失败");
+
+    act(() =>
+      adapters.previewEvents({
+        session_id: pageId,
+        generation: original.generation + 1,
+        sequence: 4,
+        kind: { type: "load_finished", url: nextUrl },
+      }),
+    );
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.error).toBe("新页面加载失败");
+
+    await act(async () => {
+      navigation.resolve({
+        ...original,
+        generation: original.generation + 1,
+        load_status: "failed",
+        url: nextUrl,
+        window: { ...original.window, url: nextUrl },
+      });
+      await flushMicrotasks();
+    });
+    expect(result.current.preview.error).toBe("新页面加载失败");
   });
 
   /** 历史 capability 来自 native snapshot/event，并将后退请求发送到原生引擎。 */
@@ -1083,6 +1469,7 @@ describe("usePreviewLifecycleController", () => {
         0,
         "src/页面.html",
         project.workspaceId,
+        "browser",
       ),
     );
   });

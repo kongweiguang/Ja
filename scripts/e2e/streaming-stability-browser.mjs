@@ -242,7 +242,8 @@ async function verifyHistoryLoadingIndicator(page) {
 /**
  * 主场景验证过程/回复分区、生命信号、DOM identity、长 Markdown、阅读锚点及 terminal 收口。
  * 先确认侧栏本身的合法旋转已经开始，并比较同一动画实例的 startTime；这样不会把浏览器迟到派发的
- * 首次 animationstart 误判为流式回归，同时仍能发现流式更新重建侧栏 Spinner 的真实问题。
+ * 首次 animationstart 误判为流式回归，同时仍能发现流式更新重建侧栏 Spinner 的真实问题；
+ * 完成后只核对活动标记消失，不依赖产品已移除的“已连接”状态文案。
  */
 async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   await page.setViewportSize({ width: 1180, height: 760 });
@@ -487,7 +488,7 @@ async function verifyStreamingLifecycle(page, fixtureUrl, evidenceDirectory) {
   assert.equal(await page.getByText(finalText, { exact: true }).count(), 1);
   await page.getByRole("button", { name: "发送", exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "停止生成", exact: true }).count(), 0);
-  await page.getByText("已连接", { exact: true }).waitFor();
+  await page.locator(".ja-navigation-thread-state.is-running").waitFor({ state: "detached" });
   const trigger = process.locator(".ja-work-process__trigger");
   await trigger.getByText("查看工作过程", { exact: true }).waitFor();
   assert.equal(await trigger.getAttribute("aria-expanded"), "false");

@@ -1,0 +1,42 @@
+[
+  {
+    "name": "org.noear.solon.extend.impl.PropsLoaderExt",
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.bootstrap.SolonRuntimeComposition",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.bootstrap.SolonPersistenceComposition",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.bootstrap.SolonRuntimeComposition",
+    "methods": [
+      {
+        "name": "runtimeServicesFactory",
+        "parameterTypes": [
+          "io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase",
+          "io.github.kongweiguang.ja.workspace.application.api.WorkspacePathSearchUseCase",
+          "io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService",
+          "io.github.kongweiguang.ja.catalog.application.api.ThreadMcpUseCase",
+          "io.github.kongweiguang.ja.conversation.application.service.TurnService",
+          "io.github.kongweiguang.ja.conversation.application.api.ContextCompactionUseCase",
+          "io.github.kongweiguang.ja.conversation.application.api.ApprovalUseCase",
+          "io.github.kongweiguang.ja.catalog.application.api.CatalogUseCase",
+          "io.github.kongweiguang.ja.attachment.application.api.AttachmentUseCase",
+          "io.github.kongweiguang.ja.attachment.application.api.AttachmentPreviewUseCase",
+          "io.github.kongweiguang.ja.collaboration.application.api.TaskUseCase",
+          "io.github.kongweiguang.ja.plan.application.api.PlanUseCase",
+          "io.github.kongweiguang.ja.conversation.application.api.InteractionUseCase",
+          "io.github.kongweiguang.ja.conversation.application.api.ProcessSessionUseCase",
+          "io.github.kongweiguang.ja.review.application.api.ReviewUseCase",
+          "io.github.kongweiguang.ja.agent.application.gateway.JsonValueCodec"
+        ]
+      }
+    ]
+  }
+]

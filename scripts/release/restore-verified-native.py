@@ -1,11 +1,10 @@
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Restore a Native Image proven by a successful main CI artifact.
+"""恢复由成功的 main CI artifact 验证通过的 Native Image。
 
-The release workflow owns the assertion that ``verified-run-id`` is a successful
-main run.  This helper only checks the downloaded files and report identity,
-then copies the already-proven executable without compiling it again.
+发布工作流负责断言 ``verified-run-id`` 对应成功的 main run。此辅助脚本只检查下载文件和报告身份，
+然后直接复制已验证的可执行文件，不会重新编译。
 """
 
 from __future__ import annotations

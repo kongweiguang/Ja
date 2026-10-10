@@ -13,7 +13,7 @@ pub use commands::{
 };
 pub use dto::{
     JA_REVIEW_INVALIDATED_EVENT, ReviewApplyInput, ReviewApplyResultDto, ReviewCancelInput,
-    ReviewCancelResultDto, ReviewCatalogDto, ReviewCatalogInput, ReviewCommandError,
-    ReviewFileDiffDto, ReviewFileDiffInput, ReviewInvalidatedEventDto, ReviewInvalidatedReason,
-    ReviewSnapshotDto, ReviewSnapshotInput,
+    ReviewCancelResultDto, ReviewCaptureInput, ReviewCaptureResultDto, ReviewCatalogDto,
+    ReviewCatalogInput, ReviewCommandError, ReviewFileDiffDto, ReviewFileDiffInput,
+    ReviewInvalidatedEventDto, ReviewInvalidatedReason, ReviewSnapshotDto, ReviewSnapshotInput,
 };

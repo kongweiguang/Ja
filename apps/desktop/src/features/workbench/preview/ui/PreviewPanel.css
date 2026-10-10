@@ -190,11 +190,17 @@
   font-size: var(--ja-text-caption-size);
   line-height: var(--ja-line-caption);
 }
-.ja-preview-recovery-row {
+.ja-preview-panel .ja-preview-recovery-row {
   display: flex;
+  /* 通用 ErrorState 默认至少占满父区；预览里按内容收高，给网页 viewport 留出真实空间。 */
+  min-height: 0;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
+  padding: 0.45rem 0.65rem;
+  text-align: left;
+  flex-wrap: wrap;
 }
 .ja-preview-recovery-row button {
   flex: 0 0 auto;

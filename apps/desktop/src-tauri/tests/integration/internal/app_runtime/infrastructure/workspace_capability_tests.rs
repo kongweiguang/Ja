@@ -12,7 +12,6 @@ fn configure_source_validates_workspace_boundary() {
     let source = RuntimeConfigSource::from_input(WorkspaceOpenInput {
         cwd: root.to_string_lossy().into_owned(),
         display_name: None,
-        trust: "trusted".to_owned(),
     })
     .expect("valid workspace source");
     assert_eq!(

@@ -6,17 +6,17 @@
 use super::error::RuntimeCommandError;
 use crate::app_runtime::domain::{
     ApprovalResponseInput, AttachmentDiscardInput, AttachmentImportInput, AttachmentMetadata,
-    GoalRequest, GoalResponse, ManualRecoveryConfirmation, RuntimeRecoveryState, RuntimeStatus,
-    RuntimeStorageInfo, TaskCloseInput, TaskCloseResult, TaskCreateInput, TaskCreateResult,
-    TaskFollowupInput, TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput,
-    TaskMessageResult, TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput,
-    TaskReadResult, TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult,
-    TaskUnobserveInput, ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse,
-    ToolRecoveryResponseInput, TurnAccepted, TurnCancelInput, TurnCancelResult,
-    TurnChangeSetReadInput, TurnChangeSetReadResult, TurnContinueInput, TurnInputDelete,
-    TurnInputEnqueue, TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnReaskInput,
-    TurnResumeInput, TurnStartInput, WorkspaceDto, WorkspacePathSearchInput,
-    WorkspacePathSearchResult,
+    ManualRecoveryConfirmation, RuntimeRecoveryState, RuntimeStatus, RuntimeStorageInfo,
+    TaskCloseInput, TaskCloseResult, TaskCreateInput, TaskCreateResult, TaskFollowupInput,
+    TaskFollowupResult, TaskListInput, TaskListResult, TaskMessageInput, TaskMessageResult,
+    TaskMutationInput, TaskObserveInput, TaskObserveResult, TaskReadInput, TaskReadResult,
+    TaskSeenInput, TaskSummary, TaskTreeDeleteInput, TaskTreeDeleteResult, TaskUnobserveInput,
+    ToolArtifactReadInput, ToolArtifactReadResult, ToolRecoveryResponse, ToolRecoveryResponseInput,
+    TurnAccepted, TurnCancelInput, TurnCancelResult, TurnChangeSetReadInput,
+    TurnChangeSetReadResult, TurnContinueInput, TurnInputDelete, TurnInputEnqueue,
+    TurnInputPrioritize, TurnInputResult, TurnInputUpdate, TurnReaskInput, TurnResumeInput,
+    TurnStartInput, WorkflowRequest, WorkflowResponse, WorkspaceDto, WorkspacePathSearchInput,
+    WorkspacePathSearchResult, WorkspaceUpdateInput,
 };
 use ja_runtime::app_server_process::{
     AttachmentPreviewCloseParams, AttachmentPreviewOpenParams, AttachmentPreviewOpenResult,
@@ -69,8 +69,6 @@ define_operation_payload!(
     ConfigurationReplaceResult,
     ConfigurationResetParams,
     ConfigurationResetResult,
-    ConfigurationRestoreParams,
-    ConfigurationRestoreResult,
     CredentialSetParams,
     CredentialSetResult,
     CredentialDeleteParams,
@@ -89,8 +87,8 @@ define_operation_payload!(
     ThreadSearchResultData,
     ThreadReadParams,
     ThreadReadResultData,
-    MessageContentReadParams,
-    MessageContentReadResultData,
+    ItemContentReadParams,
+    ItemContentReadResultData,
     ThreadObserveParams,
     ThreadObserveResultData,
     ThreadUnobserveParams,
@@ -140,7 +138,6 @@ pub(crate) enum ConfigurationRequest {
     Patch(ConfigurationPatchParams),
     Replace(ConfigurationReplaceParams),
     Reset(ConfigurationResetParams),
-    Restore(ConfigurationRestoreParams),
     CredentialSet(CredentialSetParams),
     CredentialDelete(CredentialDeleteParams),
     CredentialRevealProvider(CredentialRevealProviderParams),
@@ -152,7 +149,6 @@ pub(crate) enum ConfigurationResponse {
     Patch(ConfigurationPatchResult),
     Replace(ConfigurationReplaceResult),
     Reset(ConfigurationResetResult),
-    Restore(ConfigurationRestoreResult),
     CredentialSet(CredentialSetResult),
     CredentialDelete(CredentialDeleteResult),
     CredentialRevealProvider(CredentialRevealProviderResult),
@@ -167,7 +163,7 @@ pub(crate) enum HistoryRequest {
     ThreadList(ThreadListParams),
     ThreadSearch(ThreadSearchParams),
     ThreadRead(ThreadReadParams),
-    MessageContentRead(MessageContentReadParams),
+    ItemContentRead(ItemContentReadParams),
     ThreadObserve(ThreadObserveParams),
     ThreadUnobserve(ThreadUnobserveParams),
     ThreadUsageRead(ThreadUsageReadParams),
@@ -192,7 +188,7 @@ pub(crate) enum HistoryResponse {
     ThreadList(ThreadListResultData),
     ThreadSearch(ThreadSearchResultData),
     ThreadRead(ThreadReadResultData),
-    MessageContentRead(MessageContentReadResultData),
+    ItemContentRead(ItemContentReadResultData),
     ThreadObserve(ThreadObserveResultData),
     ThreadUnobserve(ThreadUnobserveResultData),
     ThreadUsageRead(ThreadUsageReadResultData),
@@ -230,6 +226,16 @@ pub(crate) enum SettingsResponse {
 
 /// application 只观察固定 Runtime 能力；进程、Session、JSON 与事件读取均由 infrastructure 实现。
 pub(crate) trait RuntimeBridgePort: Send + Sync {
+    /// 普通首次启动可无恢复记录；生产实现必须从 Java 健康投影读取。
+    fn storage_recovery(
+        &self,
+    ) -> Result<Option<crate::app_runtime::StorageRecovery>, RuntimeCommandError> {
+        Ok(None)
+    }
+    /// 端口必须明确支持恢复，默认实现不能虚报修复成功。
+    fn retry_storage(&self) -> Result<(), RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     fn start(&self) -> Result<RuntimeStatus, RuntimeCommandError>;
     fn stop(&self) -> Result<RuntimeStatus, RuntimeCommandError>;
     fn state(&self) -> Result<RuntimeStatus, RuntimeCommandError>;
@@ -241,12 +247,30 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
         &self,
         root: PathBuf,
         display_name: String,
-        trust: String,
     ) -> Result<WorkspaceDto, RuntimeCommandError>;
-    /// 只用 Java workspace identity 重开已登记会话或旧共享根，绝不接受 WebView 路径。
+    /// 固定授信操作须在同一 actor 命令内回读 Java 投影，避免 Host 使用猜测的 revision。
+    fn workspace_set_trust(
+        &self,
+        _workspace_id: String,
+        _trust: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 只用 Java workspace identity 重开已登记会话目录，绝不接受 WebView 路径。
     fn workspace_open_by_id(
         &self,
         _workspace_id: String,
+    ) -> Result<WorkspaceDto, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 只读数据库 projection 必须能在 root 丢失时使用，因此不得在 port 层创建 native binding。
+    fn workspace_read(&self, _workspace_id: String) -> Result<WorkspaceDto, RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
+    /// 元数据更新沿用 Java revision CAS；native 目录能力由 application 在 RPC 前后协调。
+    fn workspace_update(
+        &self,
+        _input: WorkspaceUpdateInput,
     ) -> Result<WorkspaceDto, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
@@ -376,8 +400,8 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
     fn task_close(&self, _input: TaskCloseInput) -> Result<TaskCloseResult, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
-    /// Goal/Plan 默认失败关闭；只有生产 Java owner 或显式协议 fixture 可实现持久状态变更。
-    fn goal(&self, _request: GoalRequest) -> Result<GoalResponse, RuntimeCommandError> {
+    /// Plan/Interaction 默认失败关闭；只有生产 Java owner 或显式协议 fixture 可实现持久状态变更。
+    fn workflow(&self, _request: WorkflowRequest) -> Result<WorkflowResponse, RuntimeCommandError> {
         Err(RuntimeCommandError::unavailable())
     }
     /// 冻结 diff 只能通过固定 reader 读取；默认关闭可防止 fake 绕过 Java 持久化归属校验。
@@ -439,11 +463,10 @@ pub(crate) trait RuntimeBridgePort: Send + Sync {
     fn record_forced_exit(&self);
 }
 
-/// Workspace 输入经原生路径策略解析后才形成 application 可使用的受信 capability source。
+/// Workspace 输入经原生路径策略解析后才形成 application 可使用的 capability source。
 pub(crate) struct WorkspaceRuntimeSource {
     pub(crate) root: PathBuf,
     pub(crate) display_name: String,
-    pub(crate) trust: String,
 }
 
 /// Host platform 端口拥有启动配置、恢复文件、目录投影与 bridge factory。
@@ -456,10 +479,13 @@ pub(crate) trait RuntimePlatformPort: Send + Sync {
         confirmation: &ManualRecoveryConfirmation,
     ) -> Result<RuntimeRecoveryState, RuntimeCommandError>;
     fn storage_info(&self) -> RuntimeStorageInfo;
+    /// 目录由平台层推导；WebView 不能提供文件系统路径。
+    fn open_storage_backup(&self, _recovery_id: &str) -> Result<(), RuntimeCommandError> {
+        Err(RuntimeCommandError::unavailable())
+    }
     fn workspace_source(
         &self,
         cwd: &str,
         display_name: Option<&str>,
-        trust: &str,
     ) -> Result<WorkspaceRuntimeSource, RuntimeCommandError>;
 }

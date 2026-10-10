@@ -1,17 +1,40 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { selectTaskActivitiesForRoot, useTimelineStore } from "@/features/conversation";
+import type { TimelineTaskActivityEntry } from "@/features/conversation";
 import type { TaskActivity, TaskSummary } from "../domain/taskModel";
-import { subscribeTaskHostEvents } from "./taskEventBus";
 
 const TASK_ACTIVITY_LIMIT = 128;
 const EMPTY_TASK_ACTIVITIES: readonly TaskTimelineActivity[] = [];
+type TimelineStoreSnapshot = ReturnType<typeof useTimelineStore.getState>;
+const EMPTY_STORED_TASK_ACTIVITIES: readonly TimelineTaskActivityEntry[] = [];
 
-/** 未选择根任务时返回稳定引用，避免 useSyncExternalStore 把空态误判为连续外部更新。 */
-function selectEmptyTaskActivities(): readonly TaskTimelineActivity[] {
-  return EMPTY_TASK_ACTIVITIES;
+/** 隐藏时不注册 Zustand listener；恢复时 getSnapshot 直接读取最新权威切片，无需轮询或补读。 @author kongweiguang */
+function useTimelineSelectionWhenActive<T>(
+  active: boolean,
+  selector: (state: TimelineStoreSnapshot) => T,
+  inactiveValue: T,
+): T {
+  const subscribe = useCallback(
+    (onStoreChange: () => void) =>
+      active ? useTimelineStore.subscribe(() => onStoreChange()) : () => undefined,
+    [active],
+  );
+  const getSnapshot = useCallback(
+    () => (active ? selector(useTimelineStore.getState()) : inactiveValue),
+    [active, inactiveValue, selector],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/** 复用 Snapshot owner-root 索引，空 owner 不触碰全局实体表。 @author kongweiguang */
+function selectOwnerTaskActivities(
+  ownerThreadId?: string,
+): (state: TimelineStoreSnapshot) => readonly TimelineTaskActivityEntry[] {
+  if (ownerThreadId === undefined) return () => EMPTY_STORED_TASK_ACTIVITIES;
+  return selectTaskActivitiesForRoot(ownerThreadId);
 }
 
 export interface TaskTimelineActivity {
@@ -38,10 +61,13 @@ function withFirstOccurredAt(
 }
 
 /**
- * 主/侧聊 Timeline 只展示当前会话直接拥有的 Subagent；独立侧聊是平行会话，不能因为共用
- * 全局 rootThreadId 而把自身活动或旁支活动回流到来源会话。root identity 仍需和 Task 对齐。
+ * 主/侧聊只展示当前会话直接拥有的 Subagent；全局 lineage root 不能替代 owner Thread。
+ * @author kongweiguang
  */
-function isDirectSubagentActivity(entry: TaskTimelineActivity, ownerThreadId: string): boolean {
+function isDirectSubagentActivity(
+  entry: Pick<TaskTimelineActivity, "activity" | "task">,
+  ownerThreadId: string,
+): boolean {
   return (
     entry.task.taskKind === "subagent" &&
     entry.task.parentThreadId === ownerThreadId &&
@@ -50,14 +76,26 @@ function isDirectSubagentActivity(entry: TaskTimelineActivity, ownerThreadId: st
   );
 }
 
-/** Snapshot 与实时增量共用 owner 过滤，避免历史和 live 两条路径产生不同可见结果。 */
+/**
+ * Snapshot 与实时增量共用 owner 过滤；首次出现时间按 Task 的最早事实固定，避免后续摘要更新移动入口。
+ * @author kongweiguang
+ */
 function filterOwnedActivities(
-  entries: readonly TaskTimelineActivity[],
+  entries: readonly TimelineTaskActivityEntry[],
   ownerThreadId: string,
 ): readonly TaskTimelineActivity[] {
-  return entries
-    .filter((entry) => isDirectSubagentActivity(entry, ownerThreadId))
-    .map((entry) => withFirstOccurredAt(entry, entry.firstOccurredAt));
+  const ownedEntries = entries.filter((entry) => isDirectSubagentActivity(entry, ownerThreadId));
+  const firstOccurrenceByTask = new Map<string, string>();
+  for (const entry of ownedEntries) {
+    const taskThreadId = entry.task.taskThreadId;
+    const occurredAt = firstOccurredAt(entry);
+    const current = firstOccurrenceByTask.get(taskThreadId);
+    if (current === undefined || occurredAt < current)
+      firstOccurrenceByTask.set(taskThreadId, occurredAt);
+  }
+  return ownedEntries.map((entry) =>
+    withFirstOccurredAt(entry, firstOccurrenceByTask.get(entry.task.taskThreadId)),
+  );
 }
 
 /**
@@ -87,59 +125,48 @@ function mergeActivities(
 
 /**
  * Conversation Timeline 只消费当前 owner Thread 直接委派的低频 Activity。Task 的
- * rootThreadId 仍表示全局 lineage 根，不能拿它替代 owner；投影以 owner identity 隔离并有界去重。
+ * rootThreadId 仍表示全局 lineage 根，不能拿它替代 owner。隐藏时解除展示订阅，所有实时事实
+ * 已由 Runtime composition 归约到同一 TimelineStore，重新显示直接读取最新 owner slice。
+ * @author kongweiguang
  */
 export function useTaskActivityTimeline(
   ownerThreadId?: string,
   runtimeGeneration?: number,
+  active = true,
 ): readonly TaskTimelineActivity[] {
-  const storeGeneration = useTimelineStore((state) => state.handshake.generation);
-  const storedActivities = useTimelineStore(
-    ownerThreadId === undefined
-      ? selectEmptyTaskActivities
-      : selectTaskActivitiesForRoot(ownerThreadId),
-  ) as readonly TaskTimelineActivity[];
-  const snapshotActivities =
-    runtimeGeneration === storeGeneration && ownerThreadId !== undefined
-      ? filterOwnedActivities(storedActivities, ownerThreadId)
-      : EMPTY_TASK_ACTIVITIES;
+  const scopeCanSubscribe =
+    active &&
+    ownerThreadId !== undefined &&
+    runtimeGeneration !== undefined &&
+    runtimeGeneration >= 1;
+  const storeGeneration = useTimelineSelectionWhenActive(
+    scopeCanSubscribe,
+    (state) => state.handshake.generation,
+    0,
+  );
+  const activitiesActive = scopeCanSubscribe && runtimeGeneration === storeGeneration;
+  const activitySelector = useMemo(() => selectOwnerTaskActivities(ownerThreadId), [ownerThreadId]);
+  const storedActivities = useTimelineSelectionWhenActive(
+    activitiesActive,
+    activitySelector,
+    EMPTY_STORED_TASK_ACTIVITIES,
+  );
   const scopeKey =
+    !activitiesActive ||
     ownerThreadId === undefined ||
     runtimeGeneration === undefined ||
-    runtimeGeneration < 1 ||
     runtimeGeneration !== storeGeneration
       ? ""
       : `${runtimeGeneration}:${ownerThreadId}`;
-  const [projection, setProjection] = useState<{
-    scopeKey: string;
-    items: readonly TaskTimelineActivity[];
-  }>({ scopeKey: "", items: [] });
-
-  useEffect(() => {
-    if (scopeKey === "" || ownerThreadId === undefined) return undefined;
-    return subscribeTaskHostEvents((event) => {
-      if (event.method !== "task/activity") return;
-      const entry = withFirstOccurredAt({
-        activity: event.params.activity,
-        task: event.params.task,
-      });
-      if (
-        !isDirectSubagentActivity(entry, ownerThreadId) ||
-        event.params.rootThreadId !== entry.task.rootThreadId
-      )
-        return;
-      setProjection((current) => {
-        return {
-          scopeKey,
-          items: mergeActivities(current.scopeKey === scopeKey ? current.items : [], [entry]),
-        };
-      });
-    });
-  }, [ownerThreadId, scopeKey]);
-
-  if (scopeKey === "") return EMPTY_TASK_ACTIVITIES;
-  return mergeActivities(
-    snapshotActivities,
-    projection.scopeKey === scopeKey ? projection.items : EMPTY_TASK_ACTIVITIES,
+  const snapshotActivities = useMemo(
+    () =>
+      scopeKey === "" || ownerThreadId === undefined
+        ? EMPTY_TASK_ACTIVITIES
+        : filterOwnedActivities(storedActivities, ownerThreadId),
+    [ownerThreadId, scopeKey, storedActivities],
+  );
+  return useMemo(
+    () => (scopeKey === "" ? EMPTY_TASK_ACTIVITIES : mergeActivities(snapshotActivities, [])),
+    [scopeKey, snapshotActivities],
   );
 }

@@ -6,16 +6,13 @@ import type {
   ConversationCollaborationMode,
   ConversationInteractionController,
 } from "@/features/conversation";
-import type { GoalController } from "@/features/goals";
 
 interface ConversationModeCommandOptions {
   readonly available: boolean;
-  readonly threadId?: string;
   readonly interaction: Pick<
     ConversationInteractionController,
     "preferences" | "preferenceBusy" | "activeTurn" | "changeCollaborationMode"
   >;
-  readonly goal: Pick<GoalController, "model" | "busyAction" | "create">;
 }
 
 /** 主会话与侧边会话共享严格参数解析；输入错误不能意外切换当前模式。 */
@@ -32,13 +29,11 @@ function planModeFromArgument(
 
 /**
  * 命令只绑定调用方明确提供的会话 controller，不推断主任务或侧边任务身份；两处入口由同一
- * 定义保持标签、参数、可用条件和执行语义一致，Goal 与权限、Plan 批准始终相互独立。
+ * 定义保持标签、参数、可用条件和执行语义一致；模式切换不批准 Plan。
  */
 export function conversationModeCommands({
   available,
-  threadId,
   interaction,
-  goal,
 }: ConversationModeCommandOptions): ComposerSlashCommand[] {
   return [
     {
@@ -63,34 +58,6 @@ export function conversationModeCommands({
         await interaction.changeCollaborationMode(
           planModeFromArgument(preferences.collaborationMode, argument),
         );
-      },
-    },
-    {
-      id: "goal",
-      name: "goal",
-      aliases: ["目标"],
-      group: "添加",
-      icon: "goal",
-      label: "目标",
-      description: "设置要持续追求的目标",
-      available:
-        available &&
-        threadId !== undefined &&
-        threadId !== "" &&
-        goal.model === undefined &&
-        !interaction.activeTurn &&
-        goal.busyAction === undefined,
-      unavailableReason:
-        goal.model !== undefined
-          ? "当前会话已有活跃目标"
-          : interaction.activeTurn
-            ? "当前运行结束后可创建目标"
-            : "当前会话尚未就绪",
-      argument: { mode: "required", label: "目标", placeholder: "描述目标" },
-      /** Goal 的 owner 由注入的 controller 决定，ACK 失败保留用户命令供重试。 */
-      execute: async ({ argument }) => {
-        if (threadId === undefined || threadId === "" || !(await goal.create(threadId, argument)))
-          throw new Error("goal creation was not acknowledged");
       },
     },
   ];

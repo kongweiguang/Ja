@@ -7,6 +7,7 @@ import {
   Copy,
   Minus,
   PanelLeft,
+  RotateCw,
   Square,
   X,
   type LucideIcon,
@@ -105,6 +106,10 @@ export interface AppTitlebarProps {
   onBack: TitlebarAction;
   /** 请求导航到下一个应用视图，标题栏本身不维护历史栈。 */
   onForward: TitlebarAction;
+  /** 重连权限由运行时 owner 判断；未提供动作时不保留占位入口。 */
+  onReconnect?: TitlebarAction;
+  /** 等待事实由调用方持有，同一个连接请求期间禁止重复操作。 */
+  reconnectPending?: boolean;
   /** 原生 frame 由 application controller 投影，UI 不自行订阅 Tauri event。 */
   windowFrame: WindowFrameState;
   /** 任一原生动作执行期间锁住窗口控件，避免重复点击形成竞态。 */
@@ -116,6 +121,7 @@ export interface AppTitlebarProps {
 /**
  * 为桌面与浏览器预览提供同一个平台感知标题栏。macOS 为原生 traffic lights 留出空间，
  * Windows 只拥有三个真实窗口动作，其余宿主使用安全的非原生表面。
+ * 可选重连仅转发显式意图，不能从标题栏隐式恢复任何会话执行。
  */
 export function AppTitlebar({
   platform,
@@ -126,6 +132,8 @@ export function AppTitlebar({
   canGoForward,
   onBack,
   onForward,
+  onReconnect,
+  reconnectPending = false,
   windowFrame,
   windowActionPending,
   onWindowAction,
@@ -207,6 +215,21 @@ export function AppTitlebar({
         >
           <ArrowRight aria-hidden="true" focusable="false" />
         </IconButton>
+        {onReconnect === undefined ? null : (
+          <IconButton
+            className="ja-titlebar-button"
+            label="重新连接"
+            tooltip="重新连接"
+            disabled={reconnectPending}
+            aria-busy={reconnectPending || undefined}
+            data-ja-no-window-drag
+            onClick={() => safelyInvoke(onReconnect)}
+            onDoubleClick={stopEventPropagation}
+            onPointerDown={stopEventPropagation}
+          >
+            <RotateCw aria-hidden="true" focusable="false" />
+          </IconButton>
+        )}
       </div>
 
       {platform === "windows" ? (

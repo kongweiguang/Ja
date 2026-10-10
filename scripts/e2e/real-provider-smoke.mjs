@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * Production-sidecar smoke test for an explicitly authorized loopback endpoint implementing one of the
- * supported API specifications. The custom provider name never selects a wire adapter. The API key is accepted only through
- * the parent environment and is removed from the Java child's environment; it reaches the sidecar solely
- * inside the v1 credential/set request on stdin.
+ * 验证生产 sidecar 与经明确授权的 loopback 端点交互；端点须实现受支持的 API 规范之一。
+ * 自定义 Provider 名称不会决定协议适配器。API key 只从父进程环境接收，并从 Java 子进程环境中移除；
+ * 它只会通过 stdin 中的 v2 credential/set 请求传给 sidecar。
  */
 
 import { randomBytes } from "node:crypto";
@@ -21,15 +20,15 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-/** Generate the required v1 identity so transport retries cannot replay a side effect without deduplication. */
-export function createClientOperationId() {
+/** 生成 v2 操作回执键；重试复用同一键以避免重复产生副作用。 */
+export function createOperationKey() {
   return `op_${randomBytes(16).toString("hex")}`;
 }
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDirectory, "..", "..");
 const errorCatalog = JSON.parse(
-  readFileSync(join(repoRoot, "contracts", "ja-rpc", "v1", "error-catalog.json"), "utf8"),
+  readFileSync(join(repoRoot, "contracts", "ja-rpc", "v2", "error-catalog.json"), "utf8"),
 );
 const errorCategories = new Set(errorCatalog.categories);
 const errorsByNumericCode = new Map(errorCatalog.errors.map((entry) => [entry.code, entry]));
@@ -42,22 +41,28 @@ const credentialId = "cred_real_provider_smoke";
 const reasoningLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const requestTimeoutMs = 120_000;
 const exitTimeoutMs = 20_000;
+const itemContentPageLimit = 65_536;
 const methods = [
   "runtime/initialize",
   "runtime/health",
+  "runtime/storage/retry",
   "runtime/shutdown",
   "runtime/context/register",
+  "runtime/client/close",
   "operation/read",
   "workspace/open",
+  "workspace/read",
+  "workspace/update",
   "workspace/list",
   "workspace/path/search",
   "workspace/set-trust",
   "workspace/unregister",
   "thread/create",
+  "thread/fork",
   "thread/list",
   "thread/search",
   "thread/read",
-  "thread/message-content/read",
+  "thread/item-content/read",
   "history/input/search",
   "thread/observe",
   "thread/unobserve",
@@ -78,10 +83,6 @@ const methods = [
   "interaction/draft/save",
   "interaction/respond",
   "interaction/cancel",
-  "goal/read",
-  "goal/events/read",
-  "goal/observe",
-  "goal/unobserve",
   "plan/read",
   "plan/revisions/list",
   "plan/current/read",
@@ -89,13 +90,6 @@ const methods = [
   "plan/observe",
   "plan/unobserve",
   "plan/evidence/list",
-  "goal/evidence/list",
-  "goal/create",
-  "goal/plan/attach",
-  "goal/plan/detach",
-  "goal/pause",
-  "goal/resume",
-  "goal/stop",
   "plan/create",
   "plan/draft/save",
   "plan/draft/discard",
@@ -137,7 +131,6 @@ const methods = [
   "configuration/patch",
   "configuration/replace",
   "configuration/reset",
-  "configuration/restore",
   "credential/set",
   "credential/delete",
   "credential/reveal-provider",
@@ -148,6 +141,12 @@ const methods = [
   "model/discover",
   "mcp/list-tools",
   "tool/artifact/read",
+  "process/list",
+  "process/read",
+  "process/write",
+  "process/stop",
+  "review/start",
+  "review/read",
 ];
 const events = [
   "runtime/status-changed",
@@ -157,29 +156,33 @@ const events = [
   "turn/retry-started",
   "turn/messages_received",
   "assistant/model-step-committed",
+  "assistant/context-estimated",
   "assistant/text-delta",
   "assistant/reasoning-summary-delta",
   "tool/started",
   "tool/batch-committed",
+  "tool/recovery-changed",
   "approval/requested",
   "approval/resolved",
+  "approval/closed",
   "context/compaction-started",
   "context/compacted",
   "context/compaction-failed",
   "workspace/dirty",
+  "workspace/metadata-changed",
   "turn/terminal",
+  "turn/resync-required",
   "thread/metadata-changed",
   "configuration/changed",
   "task/activity",
   "task/progress",
   "task/mailbox-changed",
-  "goal/changed",
-  "goal/activity",
+  "task/closed",
   "interaction/changed",
   "plan/changed",
 ];
 
-/** Reads one mandatory environment value without ever including its value in an error. */
+/** 读取一个必需的环境变量，出错信息中绝不包含其值。 */
 export function requiredEnvironment(name) {
   const value = process.env[name];
   if (typeof value !== "string" || value.length === 0) {
@@ -188,7 +191,7 @@ export function requiredEnvironment(name) {
   return value;
 }
 
-/** Rejects ASCII controls without placing control escapes in a diagnostic-facing regex. */
+/** 拒绝 ASCII 控制字符，同时避免在面向诊断的正则中放入控制字符转义。 */
 function containsAsciiControl(value) {
   return Array.from(value).some((character) => {
     const codePoint = character.codePointAt(0);
@@ -197,9 +200,9 @@ function containsAsciiControl(value) {
 }
 
 /**
- * Restricts this secret-bearing smoke test to a loopback HTTP endpoint. This
- * prevents an inherited typo from sending the explicitly supplied key to a
- * remote host while still accepting localhost and both IP loopback forms.
+ * 将此携带凭据的 smoke 限定为 loopback HTTP 端点，
+ * 防止继承来的地址拼写错误把明确提供的 key 发往远程主机；
+ * 同时仍接受 localhost 和两种 IP loopback 地址。
  */
 export function validatedLoopbackBaseUrl(value, variableName = "provider base URL") {
   const url = new URL(value);
@@ -217,10 +220,11 @@ export function validatedLoopbackBaseUrl(value, variableName = "provider base UR
   return url.toString().replace(/\/+$/, "");
 }
 
-/** Resolves the exact freshly built sidecar artifact and rejects a missing or empty jar. */
+/** 定位刚构建的指定 sidecar 产物，并拒绝缺失或空的 JAR。 */
 async function resolveJar() {
   const jar = resolve(
-    process.env.JA_REAL_PROVIDER_JAR ?? join(repoRoot, "app-server", "target", "ja-app-server.jar"),
+    process.env.JA_REAL_PROVIDER_JAR ??
+      join(repoRoot, "ja-agent/ja-app-server", "target", "ja-app-server.jar"),
   );
   const metadata = await stat(jar);
   if (!metadata.isFile() || metadata.size === 0) {
@@ -229,7 +233,7 @@ async function resolveJar() {
   return jar;
 }
 
-/** Selects the runner-propagated Java executable before any ordinary PATH fallback. */
+/** 优先使用 runner 传入的 Java 可执行文件，之后才考虑 PATH 回退。 */
 function resolveJava() {
   if (process.env.JA_TEST_JAVA) return process.env.JA_TEST_JAVA;
   if (process.env.JA_REAL_PROVIDER_JAVA) {
@@ -241,7 +245,7 @@ function resolveJava() {
   return process.platform === "win32" ? "java.exe" : "java";
 }
 
-/** Proves the real JAR path uses Java 25 without persisting the vendor version banner. */
+/** 验证真实 JAR 使用 Java 25，同时不保存厂商版本横幅。 */
 async function assertJava25(command) {
   let output = "";
   try {
@@ -261,14 +265,14 @@ async function assertJava25(command) {
 }
 
 /**
- * Resolve the OS temporary root before creating fixtures so macOS system aliases such as
- * /var -> /private/var cannot be mistaken for a caller-supplied symlink by production path guards.
+ * 创建 fixture 前先解析操作系统临时目录，
+ * 避免生产路径检查把 macOS 的 /var -> /private/var 系统别名误判为调用方提供的符号链接。
  */
 async function physicalTemporaryDirectory() {
   return resolve(await realpath(tmpdir()));
 }
 
-/** Creates four distinct Unicode roots under a physical temp parent for canonical UTF-8 ownership. */
+/** 在实际临时父目录下创建四个不同的 Unicode 根目录，用于验证规范 UTF-8 路径归属。 */
 export async function createIsolatedDirectories() {
   const root = await mkdtemp(join(await physicalTemporaryDirectory(), temporaryPrefix));
   const home = join(root, "home-家");
@@ -281,8 +285,8 @@ export async function createIsolatedDirectories() {
 }
 
 /**
- * Uses the actual Ja home requested by an operator and keeps configuration,
- * credential state, SQLite history, and logs after the smoke completes.
+ * 使用操作人员指定的真实 Ja home，并在 smoke 结束后保留配置、
+ * 凭据状态、SQLite 历史和日志。
  */
 async function createPersistentDirectories() {
   const home = join(homedir(), ".ja");
@@ -294,8 +298,8 @@ async function createPersistentDirectories() {
 }
 
 /**
- * Removes only the exact mkdtemp child created by this script. The physical-parent
- * check matches fixture creation and keeps recursive cleanup fail closed if ownership drifts.
+ * 只删除本脚本创建的那个 mkdtemp 子目录。实际父目录检查与 fixture 创建时一致，
+ * 若归属发生变化，递归清理会拒绝继续。
  */
 async function cleanupIsolatedDirectories(root) {
   const target = resolve(root);
@@ -308,12 +312,12 @@ async function cleanupIsolatedDirectories(root) {
   await rm(target, { recursive: true, force: false });
 }
 
-/** Encodes the canonical data path with the same unpadded Base64URL contract as Rust. */
+/** 使用与 Rust 相同的无填充 Base64URL 约定编码规范数据路径。 */
 export function encodedDirectory(directory) {
   return Buffer.from(resolve(directory), "utf8").toString("base64url");
 }
 
-/** Replaces every secret-bearing value before a diagnostic can reach stderr. */
+/** 在诊断信息写入 stderr 前替换所有包含凭据的值。 */
 function redact(value, secrets) {
   let output = String(value ?? "");
   for (const secret of secrets) {
@@ -324,7 +328,7 @@ function redact(value, secrets) {
   return output;
 }
 
-/** Extracts only bounded exception classes plus Ja-owned provider codes/details from redacted stderr. */
+/** 从脱敏后的 stderr 中只提取有界的异常类型及 Ja 自有的 Provider 错误码和详情。 */
 function stderrDiagnosticSignals(value) {
   const signals = new Set();
   const providerPattern =
@@ -342,20 +346,72 @@ function stderrDiagnosticSignals(value) {
   return [...signals].join(",");
 }
 
-/** Admits only a path-free, body-free terminal summary suitable for live smoke diagnostics. */
+/** 只允许不含路径和正文的终态摘要进入实时 smoke 诊断。 */
 function safeTerminalMessage(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 256)
     return "NO_SAFE_MESSAGE";
   return /^[A-Za-z0-9 _-]+$/u.test(value) ? value : "UNSAFE_ERROR_MESSAGE";
 }
 
-/** Returns only the bounded JA-RPC method sequence for one Turn, without retaining event payloads. */
+/** 只返回单个 Turn 的有界 JA-RPC 方法序列，不保留事件载荷。 */
 function turnEventMethods(events, turnId) {
   return events
     .filter((frame) => frame?.params?.turnId === turnId && typeof frame.method === "string")
     .slice(-24)
     .map((frame) => frame.method)
     .join(",");
+}
+
+/** 按 v2 Unicode code point 游标读取公开 item 正文；任何身份、长度或进度漂移都立即失败。 */
+export async function readCompleteItemContent(session, threadId, itemId) {
+  if (
+    !/^thr_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u.test(threadId) ||
+    !/^item_[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u.test(itemId)
+  ) {
+    throw new Error("thread/item content identity is invalid");
+  }
+  let offsetCharacters = 0;
+  let totalCharacters;
+  const chunks = [];
+  for (;;) {
+    const page = assertRpcSuccess(
+      await session.request("thread/item-content/read", {
+        threadId,
+        itemId,
+        offsetCharacters,
+        limitCharacters: itemContentPageLimit,
+      }),
+      "thread/item-content/read",
+    );
+    if (
+      page?.itemId !== itemId ||
+      page.offsetCharacters !== offsetCharacters ||
+      !Number.isSafeInteger(page.totalCharacters) ||
+      page.totalCharacters < 0 ||
+      (totalCharacters !== undefined && page.totalCharacters !== totalCharacters) ||
+      typeof page.content !== "string" ||
+      typeof page.truncated !== "boolean"
+    ) {
+      throw new Error("thread/item content page identity or length is invalid");
+    }
+    const end = page.nextOffsetCharacters ?? page.totalCharacters;
+    const pageCharacters = Array.from(page.content).length;
+    if (
+      page.truncated !== (page.nextOffsetCharacters !== null) ||
+      !Number.isSafeInteger(end) ||
+      (end <= offsetCharacters && page.truncated) ||
+      end < offsetCharacters ||
+      end > page.totalCharacters ||
+      pageCharacters !== end - offsetCharacters ||
+      pageCharacters > itemContentPageLimit
+    ) {
+      throw new Error("thread/item content page cursor is invalid");
+    }
+    chunks.push(page.content);
+    offsetCharacters = end;
+    totalCharacters = page.totalCharacters;
+    if (!page.truncated) return chunks.join("");
+  }
 }
 
 /** 从完成终态读取非空答复；messageId 与 Turn 关联共同证明它不是临时 delta 或前序回合文本。 */
@@ -395,7 +451,7 @@ export function userInputContainsText(item, expectedText) {
   );
 }
 
-/** Returns only the bounded durable item-kind sequence, never message or Tool payload data. */
+/** 只返回有界的持久化条目类型序列，不包含消息或 Tool 载荷。 */
 function durableItemKinds(history) {
   if (!Array.isArray(history?.items)) return "unavailable";
   return history.items
@@ -406,7 +462,7 @@ function durableItemKinds(history) {
     .join(",");
 }
 
-/** Scans only smoke-owned ordinary files under a fixed byte budget for a persisted credential. */
+/** 在固定字节预算内，只扫描本 smoke 所有的普通文件以查找持久化凭据。 */
 async function assertSecretAbsentFromOwnedFiles(root, secret) {
   const entries = await readdir(root, { recursive: true, withFileTypes: true });
   let scannedBytes = 0;
@@ -426,9 +482,9 @@ async function assertSecretAbsentFromOwnedFiles(root, secret) {
 }
 
 /**
- * Records only JSON paths whose values have the handshake token's 32-hex
- * shape; values themselves never enter diagnostics, and the legal readyToken
- * field is excluded so production events can expose false-positive guards.
+ * 只记录值符合握手 token 的 32 位十六进制格式的 JSON 路径；
+ * 值本身不会进入诊断结果。同时排除合法的 readyToken 字段，
+ * 以便生产事件能暴露误报防护是否生效。
  */
 function tokenShapedPaths(value, path = "$", output = []) {
   if (Array.isArray(value)) {
@@ -445,7 +501,7 @@ function tokenShapedPaths(value, path = "$", output = []) {
   return output;
 }
 
-/** Creates a bounded promise without introducing arbitrary stabilization sleeps. */
+/** 创建有期限的 Promise，不引入任意的稳定等待。 */
 function withTimeout(promise, timeoutMs, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -507,13 +563,16 @@ function assertRpcSuccess(frame, label) {
 }
 
 /**
- * Owns one Java child and its JSONL correlation tables. It retains bounded
- * event projections only. The direct gate proves the Java-owned read and shell
- * path without retaining the removed reverse Host Tool protocol.
+ * 管理一个 Java 子进程及其 JSONL 关联表，只保留有界的事件摘要。
+ * 直接门禁验证 Java 所有的 read 和 shell 路径，
+ * 不再保留已移除的反向 Host Tool 协议。
  */
 export class JsonlSession {
-  /** Starts the sidecar with a sanitized environment and exact owned data directory. */
-  constructor({ command, prefixArgs, directories, apiKey, endpoint }) {
+  /** 固定隔离 profile 并显式选择服务代际，使同一 SQLite 可验证重启恢复；默认代际维持既有验收行为。 */
+  constructor({ command, prefixArgs, directories, apiKey, endpoint, runtimeGeneration = 1 }) {
+    if (!Number.isSafeInteger(runtimeGeneration) || runtimeGeneration < 1) {
+      throw new Error("runtime generation must be a positive safe integer");
+    }
     const childEnvironment = { ...process.env };
     delete childEnvironment.JA_REAL_PROVIDER_API_KEY;
     delete childEnvironment.JA_REAL_PROVIDER_BASE_URL;
@@ -528,7 +587,7 @@ export class JsonlSession {
       `--data-dir-base64=${encodedDirectory(directories.data)}`,
       `--run-dir-base64=${encodedDirectory(directories.run)}`,
       `--log-dir-base64=${encodedDirectory(directories.logs)}`,
-      "--ja-runtime-generation=1",
+      `--ja-runtime-generation=${runtimeGeneration}`,
     ];
     this.apiKey = apiKey;
     this.endpoint = endpoint;
@@ -565,8 +624,8 @@ export class JsonlSession {
   }
 
   /**
-   * Returns a bounded, already-redacted stderr tail with the exit identity so native-only
-   * failures remain actionable in CI without exposing arbitrary child output or credentials.
+   * 返回有界且已脱敏的 stderr 末尾内容及退出标识，
+   * 让 CI 中仅原生环境出现的故障仍可诊断，同时不暴露任意子进程输出或凭据。
    */
   exitDiagnostic(code) {
     const diagnostic = this.stderr.trim();
@@ -574,7 +633,7 @@ export class JsonlSession {
     return `production sidecar exited with code ${code ?? "none"}${suffix}`;
   }
 
-  /** Writes one complete JSONL frame and refuses requests after process exit. */
+  /** 写入一条完整 JSONL 帧，并在进程退出后拒绝请求。 */
   send(frame) {
     if (this.protocolFailure !== undefined) {
       throw this.protocolFailure;
@@ -585,7 +644,7 @@ export class JsonlSession {
     this.child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
 
-  /** Issues one correlated client request with a finite protocol deadline. */
+  /** 在有限协议期限内发送一条具有关联标识的客户端请求。 */
   request(method, params, timeoutMs = requestTimeoutMs) {
     const id = `c:${++this.requestSequence}`;
     const response = new Promise((resolveResponse, rejectResponse) => {
@@ -599,12 +658,12 @@ export class JsonlSession {
     return response;
   }
 
-  /** Emits the one initialized notification after the negotiated response. */
+  /** 收到协商响应后，发送唯一的 initialized 通知。 */
   notifyInitialized() {
     this.send({ jsonrpc: "2.0", method: "runtime/initialized", params: { readyToken } });
   }
 
-  /** Waits for an authoritative event predicate and first checks already buffered frames. */
+  /** 等待权威事件条件，并先检查已经缓冲的帧。 */
   waitForEvent(method, predicate = () => true, timeoutMs = requestTimeoutMs) {
     const buffered = this.events.find((frame) => frame.method === method && predicate(frame));
     if (buffered !== undefined) {
@@ -619,7 +678,7 @@ export class JsonlSession {
     });
   }
 
-  /** Waits for one of several authoritative events so a failed Turn is reported before the full deadline. */
+  /** 等待多个权威事件之一，使失败的 Turn 能在完整期限结束前报告。 */
   waitForAnyEvent(predicate = () => true, timeoutMs = requestTimeoutMs) {
     const buffered = this.events.find((frame) => predicate(frame));
     if (buffered !== undefined) {
@@ -640,7 +699,7 @@ export class JsonlSession {
     });
   }
 
-  /** Parses one bounded child frame and routes responses, requests, and notifications separately. */
+  /** 解析一条有界的子进程帧，并分别分发响应、请求和通知。 */
   acceptLine(line) {
     if (line.length === 0 || line.length > 4 * 1024 * 1024) {
       this.failOutstanding(new Error("invalid JSONL frame length"));
@@ -697,8 +756,8 @@ export class JsonlSession {
   }
 
   /**
-   * Closes on every reverse request without manufacturing an acknowledgement;
-   * any server request here proves the direct Provider boundary has drifted.
+   * 收到任何反向请求都会关闭连接，不伪造确认；
+   * 这里出现服务端请求即证明直接 Provider 边界已发生偏移。
    */
   acceptServerRequest(frame) {
     const reverseRequest =
@@ -714,13 +773,13 @@ export class JsonlSession {
     );
   }
 
-  /** Makes a protocol violation sticky so no later frame can revive the failed session. */
+  /** 将协议违规设为不可恢复状态，避免后续帧重新激活已失败的会话。 */
   failProtocol(error) {
     if (this.protocolFailure === undefined) this.protocolFailure = error;
     this.failOutstanding(this.protocolFailure);
   }
 
-  /** Rejects every blocked waiter without exposing a raw child frame or credential. */
+  /** 拒绝所有等待中的请求，且不暴露原始子进程帧或凭据。 */
   failOutstanding(error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
@@ -735,8 +794,8 @@ export class JsonlSession {
   }
 
   /**
-   * Retries only the side-effect-free INVALID_STATE refusal while a just-completed Turn finishes
-   * releasing its coordinator; all retries share the existing bounded shutdown budget.
+   * 仅当刚完成的 Turn 仍在释放协调器、服务端返回无副作用的 INVALID_STATE 拒绝时重试；
+   * 所有重试共用现有的有界关闭时限。
    */
   async shutdown() {
     const deadline = Date.now() + exitTimeoutMs;
@@ -772,7 +831,7 @@ export class JsonlSession {
     return withTimeout(this.exitPromise, exitTimeoutMs, "production sidecar exit");
   }
 
-  /** Terminates only this exact child when a failed assertion prevents graceful shutdown. */
+  /** 断言失败导致无法正常关闭时，只终止当前这个子进程。 */
   async forceClose() {
     this.lines?.close();
     if (!this.exited) {
@@ -783,9 +842,8 @@ export class JsonlSession {
 }
 
 /**
- * Rejects capability drift locally before a paid smoke can start. Exact array
- * comparison intentionally removes stale change surfaces instead of silently
- * negotiating a subset with a stale sidecar.
+ * 付费 smoke 启动前在本地拒绝能力列表偏移。通过数组精确比较移除过期变更面，
+ * 不与过期 sidecar 静默协商出一个子集。
  */
 export function assertDirectProviderCapabilities(capabilities) {
   const expectedKeys = ["accessModes", "collaborationModes", "events", "features", "methods"];
@@ -803,16 +861,16 @@ export function assertDirectProviderCapabilities(capabilities) {
       JSON.stringify(["approval_required", "full_access"]) ||
     JSON.stringify(capabilities.collaborationModes) !== JSON.stringify(["default", "plan"]) ||
     JSON.stringify(capabilities.features) !==
-      JSON.stringify(["task_threads_v1", "plan_goal_v1", "interaction_v1"])
+      JSON.stringify(["task_threads", "plan", "interaction"])
   ) {
-    throw new Error("direct provider capabilities do not match JA-RPC v1");
+    throw new Error("direct provider capabilities do not match JA-RPC v2");
   }
   return capabilities;
 }
 
 /**
- * Uses the server's complete ordered v1 vocabulary because handshake validation treats capability
- * lists as a frozen protocol contract, even when this smoke exercises only a subset of methods.
+ * 使用服务端完整且有序的 v2 词汇表，因为握手校验将能力列表视为冻结的协议合同，
+ * 即使本 smoke 只覆盖其中一部分方法也必须如此。
  */
 export function initializeParams() {
   const capabilities = assertDirectProviderCapabilities({
@@ -820,10 +878,10 @@ export function initializeParams() {
     events: [...events],
     accessModes: ["approval_required", "full_access"],
     collaborationModes: ["default", "plan"],
-    features: ["task_threads_v1", "plan_goal_v1", "interaction_v1"],
+    features: ["task_threads", "plan", "interaction"],
   });
   return {
-    protocolMajor: 1,
+    protocolMajor: 2,
     protocolMinor: 0,
     clientVersion: "real-provider-smoke",
     capabilities,
@@ -925,14 +983,18 @@ function persistentConfigurationDocument(current, selected) {
     default_access_mode:
       base.default_access_mode === "full_access" ? "full_access" : "approval_required",
     interaction:
-      base.interaction !== null && typeof base.interaction === "object" && !Array.isArray(base.interaction)
+      base.interaction !== null &&
+      typeof base.interaction === "object" &&
+      !Array.isArray(base.interaction)
         ? base.interaction
         : { clarification_enabled: true },
     default_provider_id: selected.selectedProviderId,
     default_model_id: selected.selectedModelId,
     default_reasoning_level: selected.reasoningLevel,
     subagents:
-      base.subagents !== null && typeof base.subagents === "object" && !Array.isArray(base.subagents)
+      base.subagents !== null &&
+      typeof base.subagents === "object" &&
+      !Array.isArray(base.subagents)
         ? base.subagents
         : { enabled: true, provider_id: null, model_id: null, reasoning_level: null },
     providers: [...providers, selectedDocument.providers[0]],
@@ -941,7 +1003,7 @@ function persistentConfigurationDocument(current, selected) {
   };
 }
 
-/** 构造 Read + Shell 验收，但让模型仅依据注入环境自行选择 Shell 方言。 */
+/** 构造 Read + exec_command 验收，Shell 方言仍由模型依据注入环境自行选择。 */
 export function providerToolTurnInput({ inputPath, inputMarker, shellMarker, finalMarker }) {
   for (const value of [inputPath, inputMarker, shellMarker, finalMarker]) {
     if (
@@ -956,7 +1018,7 @@ export function providerToolTurnInput({ inputPath, inputMarker, shellMarker, fin
   return [
     "Use exactly two built-in tools in this order and no others.",
     `First call read with the JSON arguments {"path":"${inputPath}"}; the file content must contain ${inputMarker}.`,
-    `Then call shell exactly once. Determine its command dialect only from the injected execution environment and the shell tool description. Use that dialect's native output primitive, not a cross-shell alias, to write exactly ${shellMarker} to stdout. Wait for the human approval request before execution.`,
+    `Then call exec_command exactly once with cmd and yield_time_ms (use 10000 for the initial wait). Determine the command dialect only from the injected execution environment and the tool description; use that dialect's native output primitive to write exactly ${shellMarker} to stdout. Wait for the human approval request before execution.`,
     `After both Tool results, reply with exactly ${finalMarker} and no other text.`,
   ].join(" ");
 }
@@ -966,15 +1028,15 @@ export function providerToolTurnInput({ inputPath, inputMarker, shellMarker, fin
  * 通用命令；只检查脱敏后的持久 command，不读取 Provider 请求或原始参数。
  */
 export function assertWindowsPowerShellSelection(history, turnId, shellMarker) {
-  const shell = history?.items?.find(
-    (item) => item.kind === "tool_call" && item.turnId === turnId && item.toolName === "shell",
+  const execCommand = history?.items?.find(
+    (item) => item.kind === "tool_call" && item.turnId === turnId && item.toolName === "exec_command",
   );
-  const command = shell?.presentation?.command;
+  const command = execCommand?.presentation?.command;
   const powerShellPrimitive =
     /\b(?:Write-Output|Write-Host|Out-String|Select-Object|Get-ChildItem)\b|\$PSVersionTable|\[Console\]::Write(?:Line)?/iu;
   const posixPrimitive = /\b(?:printf|head|tail|grep|sed|awk)\b/iu;
   if (
-    shell?.presentation?.kind !== "shell" ||
+    execCommand?.presentation?.kind !== "shell" ||
     typeof command !== "string" ||
     !command.includes(shellMarker) ||
     !powerShellPrimitive.test(command) ||
@@ -985,7 +1047,7 @@ export function assertWindowsPowerShellSelection(history, turnId, shellMarker) {
   return "powershell";
 }
 
-/** 构造一个确定失败的本机 Shell 调用，模型必须消费稳定错误后给出唯一最终回复。 */
+/** 构造一个确定失败的 exec_command 调用，模型须消费稳定错误后给出唯一最终回复。 */
 export function providerFailingToolTurnInput({ shellMarker }) {
   if (
     typeof shellMarker !== "string" ||
@@ -995,19 +1057,19 @@ export function providerFailingToolTurnInput({ shellMarker }) {
   ) {
     throw new Error("provider failing Tool fixture value is invalid");
   }
-  const shellCommand =
+  const command =
     process.platform === "win32"
       ? `Write-Error '${shellMarker}'; exit 23`
       : `printf '%s\n' '${shellMarker}' >&2; exit 23`;
   return [
     "Use exactly one built-in tool and do not use any other tool.",
-    `Call shell with the JSON arguments ${JSON.stringify({ command: shellCommand })}.`,
+    `Call exec_command with the JSON arguments ${JSON.stringify({ cmd: command, timeout_ms: 60_000, yield_time_ms: 10_000 })}.`,
     "The command is expected to fail. After receiving its Tool result, do not retry or call another tool.",
     "Give one concise user-visible final reply explaining that the command failed and what the user can do next.",
   ].join(" ");
 }
 
-/** Returns bounded public Tool projections for one Turn without retaining provider request bodies. */
+/** 返回单个 Turn 的有界公开 Tool 摘要，不保留 Provider 请求正文。 */
 export function collectToolEvidence(events, turnId) {
   if (!Array.isArray(events) || typeof turnId !== "string") {
     throw new Error("Tool evidence input is invalid");
@@ -1063,7 +1125,7 @@ export function collectToolEvidence(events, turnId) {
 async function waitForRequiredToolEvidence(
   session,
   turnId,
-  expected = ["read", "shell"],
+  expected = ["read", "exec_command"],
   expectedOutcomes = ["succeeded", "succeeded"],
   timeoutMs = requestTimeoutMs,
 ) {
@@ -1127,7 +1189,7 @@ async function approveExpectedTool(session, turnId, expectedToolName, handledApp
         ),
       );
     } catch {
-      // The original terminal remains primary; history diagnostics must never hide it.
+      // 原始 turn/terminal 事件仍是主要依据；历史诊断不得将它掩盖。
     }
     throw new Error(
       `provider Tool turn ended before all approvals: ${approvalOrTerminal.params?.state ?? "unknown"}` +
@@ -1203,7 +1265,7 @@ export function assertDurableToolHistory(history, threadId, turnId, approvalId, 
   }
   const expectedCalls = expectation.calls ?? [
     { toolName: "read", status: "success" },
-    { toolName: "shell", status: "success" },
+    { toolName: "exec_command", status: "success" },
   ];
   if (
     !Array.isArray(expectedCalls) ||
@@ -1264,7 +1326,7 @@ export function assertDurableToolHistory(history, threadId, turnId, approvalId, 
   };
 }
 
-/** Starts one sanitized production child and completes the v1 ready handshake before returning it. */
+/** 启动环境经过净化的生产子进程，并完成严格 v2 ready 握手后再返回。 */
 async function startProductionSession({ command, prefixArgs, directories, apiKey, endpoint }) {
   const session = new JsonlSession({ command, prefixArgs, directories, apiKey, endpoint });
   try {
@@ -1295,8 +1357,8 @@ async function startProductionSession({ command, prefixArgs, directories, apiKey
 }
 
 /**
- * Runs text and approved Tool Turns with unique operation identities required by v1 mutation handling,
- * then reopens the same SQLite home and checks durable recovery.
+ * 使用 v2 修改操作要求的唯一操作标识运行文本和已批准的 Tool Turn，
+ * 然后重新打开同一个 SQLite home 并检查持久化恢复。
  */
 export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   if (process.env.JA_REAL_PROVIDER_AUTHORIZED !== "1") {
@@ -1309,8 +1371,8 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
   if (apiKey.length > 8_192 || containsAsciiControl(apiKey)) {
     throw new Error(`${apiKeyName} is invalid`);
   }
-  // Minimize the inheritance window before any child is created; the local
-  // variable remains available only for the correlated stdin response.
+  // 在创建子进程前尽量缩短环境继承窗口；本地变量
+  // 只用于与请求关联的 stdin 响应。
   delete process.env.JA_REAL_PROVIDER_API_KEY;
   const endpoint = validatedLoopbackBaseUrl(requiredEnvironment(endpointName), endpointName);
   const name = (process.env.JA_REAL_PROVIDER_NAME ?? "Authorized loopback provider").trim();
@@ -1420,8 +1482,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (
       typeof workspace?.workspaceId !== "string" ||
       !workspace.workspaceId.startsWith("ws_") ||
-      workspace.kind !== "project" ||
-      workspace.legacySharedWorkspaceId !== null
+      workspace.kind !== "project"
     ) {
       throw new Error("workspace/open returned an invalid workspace identity");
     }
@@ -1442,18 +1503,14 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (typeof threadId !== "string" || !threadId.startsWith("thr_")) {
       throw new Error("thread/create returned an invalid thread identity");
     }
-    if (
-      created.workspaceId !== workspace.workspaceId ||
-      created.workspaceKind !== "project" ||
-      created.legacySharedWorkspaceId !== null
-    ) {
+    if (created.workspaceId !== workspace.workspaceId || created.workspaceKind !== "project") {
       throw new Error("thread/create did not retain Java's workspace identity");
     }
     const textMarker = `JA_REAL_PROVIDER_TEXT_${Date.now().toString(36)}`;
     const textAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
-        clientOperationId: createClientOperationId(),
+        operationKey: createOperationKey(),
         content: [{ type: "text", text: `Reply with exactly ${textMarker}. Do not call tools.` }],
       }),
       "turn/start",
@@ -1467,8 +1524,8 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       (frame) => frame.params?.turnId === textTurnId,
     );
     if (textTerminal.params?.state !== "completed") {
-      // Only the closed error code is safe to expose here; Provider messages and stderr remain
-      // bounded inside the smoke so a failed live call cannot turn diagnostics into a body leak.
+      // 此处只允许暴露封闭集合中的错误码；Provider 消息和 stderr
+      // 在 smoke 内始终有界，避免实时调用失败时诊断信息泄露正文。
       throw new Error(
         `real provider text turn ended as ${textTerminal.params?.state ?? "unknown"}` +
           ` with ${textTerminal.params?.errorCode ?? "UNKNOWN_ERROR"}` +
@@ -1485,6 +1542,14 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
         "real provider text stream did not publish one committed non-empty terminal reply",
       );
     }
+    const textFinalContent = await readCompleteItemContent(
+      session,
+      threadId,
+      textTerminal.params.finalMessage.messageId,
+    );
+    if (textFinalContent !== textFinalReply) {
+      throw new Error("thread/item content did not reproduce the committed assistant reply");
+    }
 
     const inputPath = `provider-tool-input-${Date.now().toString(36)}.txt`;
     const inputMarker = `JA_REAL_PROVIDER_TOOL_INPUT_${Date.now().toString(36)}`;
@@ -1498,7 +1563,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const toolAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
-        clientOperationId: createClientOperationId(),
+        operationKey: createOperationKey(),
         content: [
           {
             type: "text",
@@ -1519,15 +1584,15 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     }
     const approvedTools = [];
     const handledApprovalIds = new Set();
-    for (const expectedToolName of ["read", "shell"]) {
+    for (const expectedToolName of ["read", "exec_command"]) {
       approvedTools.push(
         await approveExpectedTool(session, toolTurnId, expectedToolName, handledApprovalIds),
       );
     }
-    const shellApproval = approvedTools.find((approval) => approval.toolName === "shell");
+    const shellApproval = approvedTools.find((approval) => approval.toolName === "exec_command");
     const toolEvidence = await waitForRequiredToolEvidence(session, toolTurnId);
     const readEvidence = toolEvidence.find((entry) => entry.toolName === "read");
-    const shellEvidence = toolEvidence.find((entry) => entry.toolName === "shell");
+    const shellEvidence = toolEvidence.find((entry) => entry.toolName === "exec_command");
     const toolEventsJson = JSON.stringify(session.events);
     if (
       readEvidence === undefined ||
@@ -1545,12 +1610,21 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     if (toolFinalReply === null) {
       throw new Error("provider Tool turn did not publish one committed non-empty terminal reply");
     }
+    if (
+      (await readCompleteItemContent(
+        session,
+        threadId,
+        toolTerminal.params.finalMessage.messageId,
+      )) !== toolFinalReply
+    ) {
+      throw new Error("thread/item content did not reproduce the committed Tool-turn reply");
+    }
 
     const failedShellMarker = `JA_REAL_PROVIDER_EXPECTED_FAILURE_${Date.now().toString(36)}`;
     const failedToolAccepted = assertRpcSuccess(
       await session.request("turn/start", {
         threadId,
-        clientOperationId: createClientOperationId(),
+        operationKey: createOperationKey(),
         content: [
           {
             type: "text",
@@ -1569,14 +1643,14 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
     const failedToolApproval = await approveExpectedTool(
       session,
       failedToolTurnId,
-      "shell",
+      "exec_command",
       handledApprovalIds,
     );
     approvedTools.push(failedToolApproval);
     const failedToolEvidence = await waitForRequiredToolEvidence(
       session,
       failedToolTurnId,
-      ["shell"],
+      ["exec_command"],
       ["failed"],
     );
     const failedToolTerminal = await session.waitForEvent(
@@ -1611,6 +1685,15 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
         })}`,
       );
     }
+    if (
+      (await readCompleteItemContent(
+        session,
+        threadId,
+        failedToolTerminal.params.finalMessage.messageId,
+      )) !== failedToolFinalReply
+    ) {
+      throw new Error("thread/item content did not reproduce the committed failed-Tool reply");
+    }
 
     const history = assertRpcSuccess(
       await session.request("thread/read", { threadId }),
@@ -1644,7 +1727,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       failedToolTurnId,
       failedToolApproval.approvalId,
       {
-        calls: [{ toolName: "shell", status: "error", exitCode: 23 }],
+        calls: [{ toolName: "exec_command", status: "error", exitCode: 23 }],
         finalText: failedToolFinalReply,
       },
     );
@@ -1690,7 +1773,7 @@ export async function runSmoke({ command, prefixArgs, silent = false } = {}) {
       failedToolTurnId,
       failedToolApproval.approvalId,
       {
-        calls: [{ toolName: "shell", status: "error", exitCode: 23 }],
+        calls: [{ toolName: "exec_command", status: "error", exitCode: 23 }],
         finalText: failedToolFinalReply,
       },
     );

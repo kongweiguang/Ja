@@ -64,16 +64,26 @@ export function installSessionWorkspaceProbe() {
   };
 }
 
-/** 等待 Tauri 主页面与真实 Runtime ready；无项目空白态允许没有项目按钮或 active workspace。 */
+/** 健康连接文案可隐藏；以真实 Host 身份及无项目历史列表排除空 DOM 和半初始化窗口。 */
 async function prepareApplication(page, deadline) {
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor({
     state: "visible",
     timeout: timeout(deadline),
   });
-  await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
+  await page.waitForFunction(
+    async () => {
+      try {
+        const { TauriRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+        const state = await new TauriRuntimeHostAdapter().state();
+        return (state.status === "ready" || state.status === "busy") &&
+          typeof state.serverInstanceId === "string" && state.serverInstanceId.length > 0;
+      } catch {
+        return false;
+      }
+    },
+    undefined,
+    { timeout: timeout(deadline) },
+  );
   await page.getByRole("list", { name: "最近对话列表", exact: true }).waitFor({
     state: "visible",
     timeout: timeout(deadline),
@@ -568,7 +578,7 @@ async function openThreadFolderWithoutSelecting(
   return { legacyActionVisible, folderOpenWorkspaceMatches };
 }
 
-/** 显式重启 App Server generation 并等待同一 WebView 的生产 lifecycle 投影恢复 ready。 */
+/** 显式重启后按同一 Host generation 读取 ready；不要求健康态在精简侧栏显示。 */
 async function restartRuntimeGeneration(page, previousGeneration, deadline) {
   const transition = await page.evaluate(async () => {
     const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
@@ -583,10 +593,16 @@ async function restartRuntimeGeneration(page, previousGeneration, deadline) {
   assert.equal(transition.state.status, "ready");
   assert.ok(transition.started.generation > previousGeneration);
   assert.equal(transition.state.generation, transition.started.generation);
-  await page.getByRole("status", { name: "本地运行时：已连接", exact: true }).waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
+  await page.waitForFunction(
+    async (generation) => {
+      const { TauriRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
+      const state = await new TauriRuntimeHostAdapter().state();
+      return state.status === "ready" && state.generation === generation &&
+        typeof state.serverInstanceId === "string" && state.serverInstanceId.length > 0;
+    },
+    transition.started.generation,
+    { timeout: timeout(deadline) },
+  );
   return {
     fromGeneration: previousGeneration,
     toGeneration: transition.started.generation,
@@ -594,7 +610,7 @@ async function restartRuntimeGeneration(page, previousGeneration, deadline) {
   };
 }
 
-/** 执行两个 SESSION、一项 side task 与项目切换，并记录无路径的可复核行为摘要。 */
+/** SESSION 保持原有权限语义；末段 PROJECT fixture 必须独立授信才进入项目切换验收。 */
 export async function runSessionWorkspacesWebView2({
   page,
   workspaceRoot,
@@ -620,8 +636,6 @@ export async function runSessionWorkspacesWebView2({
   assert.equal(threadB.workspaceKind, "session");
   assert.notEqual(threadA.threadId, threadB.threadId);
   assert.notEqual(threadA.workspaceId, threadB.workspaceId);
-  assert.equal(threadA.legacySharedWorkspaceId, null);
-  assert.equal(threadB.legacySharedWorkspaceId, null);
 
   const activatedA = await activateSessionWorkspace(page, threadA.workspaceId);
   const activatedB = await activateSessionWorkspace(page, threadB.workspaceId);
@@ -790,6 +804,7 @@ export async function runSessionWorkspacesWebView2({
     const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
     const history = createHistoryAdapter();
     const workspace = await history.workspaceOpen({ cwd });
+    await history.workspaceSetTrust({ workspaceId: workspace.workspaceId, trust: "trusted" });
     const thread = await history.threadCreate({
       cwd: workspace.root,
       title: "Session runner project thread",

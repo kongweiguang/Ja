@@ -30,17 +30,17 @@ function hash(value) {
  */
 export function createInteractionPlanStateFixture() {
   const threads = new Map();
-  const requests = new Map();
+  const interactions = new Map();
   const plans = new Map();
   const idempotency = new Map();
-  let requestSequence = 0;
+  let interactionSequence = 0;
   let planSequence = 0;
   let runSequence = 0;
 
   function thread(threadId) {
     let value = threads.get(threadId);
     if (value === undefined) {
-      value = { threadId, revision: 0, pendingRequestId: null };
+      value = { threadId, revision: 0, pendingInteractionId: null };
       threads.set(threadId, value);
     }
     return value;
@@ -56,39 +56,39 @@ export function createInteractionPlanStateFixture() {
 
   function ask({ threadId, questions }) {
     const owner = thread(threadId);
-    if (owner.pendingRequestId !== null) {
+    if (owner.pendingInteractionId !== null) {
       throw new InteractionPlanFixtureError("INTERACTION_ALREADY_PENDING", "another request is pending");
     }
     if (!Array.isArray(questions) || questions.length < 1 || questions.length > 3) {
       throw new InteractionPlanFixtureError("INTERACTION_INVALID", "one to three questions are required");
     }
-    const requestId = `input_fixture_${++requestSequence}`;
-    const request = {
-      requestId,
+    const interactionId = `interaction_fixture_${++interactionSequence}`;
+    const interaction = {
+      interactionId,
       threadId,
-      revision: 0,
+      interactionRevision: 0,
       state: "pending",
       questions: clone(questions),
       answers: [],
       collapsed: false,
     };
-    requests.set(requestId, request);
-    owner.pendingRequestId = requestId;
+    interactions.set(interactionId, interaction);
+    owner.pendingInteractionId = interactionId;
     owner.revision += 1;
-    return clone(request);
+    return clone(interaction);
   }
 
-  function answer({ requestId, expectedRevision, response, idempotencyKey }) {
+  function answer({ interactionId, expectedInteractionRevision, response, idempotencyKey }) {
     return replay(idempotencyKey, () => {
-      const request = requests.get(requestId);
-      if (request === undefined) throw new InteractionPlanFixtureError("INTERACTION_NOT_FOUND", "request not found");
-      if (request.revision !== expectedRevision) {
-        throw new InteractionPlanFixtureError("INTERACTION_REVISION_CONFLICT", "request revision is stale");
+      const interaction = interactions.get(interactionId);
+      if (interaction === undefined) throw new InteractionPlanFixtureError("INTERACTION_NOT_FOUND", "interaction not found");
+      if (interaction.interactionRevision !== expectedInteractionRevision) {
+        throw new InteractionPlanFixtureError("INTERACTION_REVISION_CONFLICT", "interaction revision is stale");
       }
-      if (request.state !== "pending") {
-        throw new InteractionPlanFixtureError("INTERACTION_REQUEST_STALE", "request is not pending");
+      if (interaction.state !== "pending") {
+        throw new InteractionPlanFixtureError("INTERACTION_REQUEST_STALE", "interaction is not pending");
       }
-      const question = request.questions[request.answers.length];
+      const question = interaction.questions[interaction.answers.length];
       if (question === undefined) throw new InteractionPlanFixtureError("INTERACTION_INVALID", "too many answers");
       if (response?.kind === "skip" && question.required === true) {
         throw new InteractionPlanFixtureError("INTERACTION_REQUIRED", "required question cannot be skipped");
@@ -99,37 +99,37 @@ export function createInteractionPlanStateFixture() {
       if (response?.kind === "custom" && typeof response.text !== "string") {
         throw new InteractionPlanFixtureError("INTERACTION_INVALID", "custom answer text is required");
       }
-      request.answers.push(clone(response));
-      request.revision += 1;
-      if (request.answers.length === request.questions.length) {
-        request.state = "answered";
-        thread(request.threadId).pendingRequestId = null;
+      interaction.answers.push(clone(response));
+      interaction.interactionRevision += 1;
+      if (interaction.answers.length === interaction.questions.length) {
+        interaction.state = "answered";
+        thread(interaction.threadId).pendingInteractionId = null;
       }
-      return request;
+      return interaction;
     });
   }
 
-  function collapse(requestId) {
-    const request = requireRequest(requestId);
-    request.collapsed = true;
-    return clone(request);
+  function collapse(interactionId) {
+    const interaction = requireInteraction(interactionId);
+    interaction.collapsed = true;
+    return clone(interaction);
   }
 
-  function cancel({ requestId, expectedRevision, idempotencyKey }) {
+  function cancel({ interactionId, expectedInteractionRevision, idempotencyKey }) {
     return replay(idempotencyKey, () => {
-      const request = requireRequest(requestId);
-      if (request.revision !== expectedRevision) {
-        throw new InteractionPlanFixtureError("INTERACTION_REVISION_CONFLICT", "request revision is stale");
+      const interaction = requireInteraction(interactionId);
+      if (interaction.interactionRevision !== expectedInteractionRevision) {
+        throw new InteractionPlanFixtureError("INTERACTION_REVISION_CONFLICT", "interaction revision is stale");
       }
-      request.state = "cancelled";
-      thread(request.threadId).pendingRequestId = null;
-      request.revision += 1;
-      return request;
+      interaction.state = "cancelled";
+      thread(interaction.threadId).pendingInteractionId = null;
+      interaction.interactionRevision += 1;
+      return interaction;
     });
   }
 
   function restart() {
-    return [...requests.values()].filter((request) => request.state === "pending").map(clone);
+    return [...interactions.values()].filter((interaction) => interaction.state === "pending").map(clone);
   }
 
   function createPlan({ threadId, objective }) {
@@ -143,7 +143,6 @@ export function createInteractionPlanStateFixture() {
       currentRevision: null,
       activeRunId: null,
       runCount: 0,
-      budget: { total: 8, used: 0 },
       toolLedger: [],
     };
     plans.set(planId, plan);
@@ -207,10 +206,10 @@ export function createInteractionPlanStateFixture() {
     return clone(plan);
   }
 
-  function requireRequest(requestId) {
-    const request = requests.get(requestId);
-    if (request === undefined) throw new InteractionPlanFixtureError("INTERACTION_NOT_FOUND", "request not found");
-    return request;
+  function requireInteraction(interactionId) {
+    const interaction = interactions.get(interactionId);
+    if (interaction === undefined) throw new InteractionPlanFixtureError("INTERACTION_NOT_FOUND", "interaction not found");
+    return interaction;
   }
 
   function requirePlan(planId) {
@@ -231,7 +230,7 @@ export function createInteractionPlanStateFixture() {
     execute,
     recordTool,
     recover,
-    readRequest: (requestId) => clone(requireRequest(requestId)),
+    readInteraction: (interactionId) => clone(requireInteraction(interactionId)),
     readPlan: (planId) => clone(requirePlan(planId)),
   });
 }

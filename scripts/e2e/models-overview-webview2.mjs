@@ -14,7 +14,7 @@ import { chromium, expect } from "@playwright/test";
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const javaHome = process.env.JA_E2E_JAVA_HOME?.trim() || "C:\\Users\\24052\\.jdks\\liberica-25.0.2";
 const java = join(javaHome, "bin", "java.exe");
-const jar = resolve(root, "app-server", "target", "ja-app-server.jar");
+const jar = resolve(root, "ja-agent/ja-app-server", "target", "ja-app-server.jar");
 const execFileAsync = promisify(execFile);
 
 /** 仅预留回环端口，避免测试连接到用户进程或其它外部服务。 */
@@ -140,7 +140,7 @@ async function startModelCatalogFixture() {
   };
 }
 
-/** 只生成临时 Tauri overlay，身份、配置、WebView UDF 和端口均属于本轮实例。 */
+/** 只生成临时 Tauri overlay，并把相对 beforeDevCommand 锚定回仓库根目录；身份与端口属于本轮实例。 */
 async function writeTauriConfig(directory, frontendPort) {
   const base = JSON.parse(
     await readFile(join(root, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8"),
@@ -153,7 +153,10 @@ async function writeTauriConfig(directory, frontendPort) {
   const config = {
     ...base,
     identifier: `io.github.kongweiguang.ja.e2e.models${frontendPort}`,
-    build: { beforeDevCommand: base.build.beforeDevCommand, devUrl: origin },
+    build: {
+      beforeDevCommand: { ...base.build.beforeDevCommand, cwd: root },
+      devUrl: origin,
+    },
     app: {
       ...base.app,
       windows: windows.app.windows,
@@ -271,14 +274,22 @@ async function findTauriPage(browser, frontendPort) {
   throw new Error("隔离 Ja 页面未完成初始导航");
 }
 
-/** 在真实 WebView2 中验证模型列表的菜单、确认和焦点闭环，并保存浅/深/窄屏截图。 */
+/** 真窗验证保存重开与焦点闭环；回环 header 用普通 mock 值证明传递，无需真实令牌形状。 */
 async function verify(page, evidence, catalog) {
   const openSettings = page.getByRole("button", { name: "设置", exact: true });
   await expect(openSettings).toBeEnabled();
   await openSettings.click();
-  await page
-    .getByRole("region", { name: "设置页面", exact: true })
-    .waitFor({ state: "visible", timeout: 60_000 });
+  try {
+    await page
+      .getByRole("region", { name: "设置页面", exact: true })
+      .waitFor({ state: "visible", timeout: 60_000 });
+  } catch (error) {
+    await page.screenshot({
+      path: join(evidence, "models-settings-open-failed.png"),
+      animations: "disabled",
+    });
+    throw error;
+  }
   const settings = page.locator(".ja-settings");
   await settings.waitFor({ state: "visible", timeout: 60_000 });
   await settings.getByRole("tab", { name: "模型", exact: true }).click();
@@ -321,7 +332,7 @@ async function verify(page, evidence, catalog) {
   await primary.getByRole("button", { name: /编辑模型 gpt-5\.6-sol/ }).click();
   const sheet = page.getByRole("dialog", { name: "编辑供应商" });
   await expect(sheet.getByLabel("上游模型标识").first()).toBeFocused();
-  await sheet.getByLabel("API Key", { exact: true }).fill("fixture-only");
+  await sheet.getByLabel("API Key", { exact: true }).fill("mock-key");
   await sheet.getByRole("button", { name: "保存更改", exact: true }).click();
   await expect(sheet).toBeHidden();
 
@@ -332,18 +343,50 @@ async function verify(page, evidence, catalog) {
   const discover = modelActions.getByRole("button", { name: "从上游获取", exact: true });
   await expect(discover).toBeEnabled();
   await discover.click();
+  const picker = page.getByRole("dialog", { name: "选择要添加的模型" });
+  await expect(picker).toBeVisible();
+  await expect(picker.getByRole("searchbox", { name: "搜索模型" })).toBeFocused();
+  const catalogModel = picker.getByRole("checkbox", { name: "gpt-e2e-catalog" });
+  await expect(catalogModel).toBeChecked();
+  await expect(page.locator('.ja-settings-provider-sheet input[id^="model-id-"]')).toHaveCount(2);
+  await catalogModel.uncheck();
+  await expect(picker.getByRole("button", { name: "添加所选" })).toBeDisabled();
+  await catalogModel.check();
+  await page.screenshot({
+    path: join(evidence, "models-picker-light.png"),
+    animations: "disabled",
+  });
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.screenshot({
+    path: join(evidence, "models-picker-dark.png"),
+    animations: "disabled",
+  });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 600, height: 720 });
+  await expect
+    .poll(() => picker.evaluate((element) => element.scrollWidth <= element.clientWidth))
+    .toBe(true);
+  await page.screenshot({
+    path: join(evidence, "models-picker-narrow.png"),
+    animations: "disabled",
+  });
+  await picker.getByRole("button", { name: "添加所选" }).click();
+  await expect(picker).toBeHidden();
+  await expect(reopenedSheet.getByLabel("上游模型标识").nth(2)).toBeFocused();
   await expect(reopenedSheet.getByRole("status")).toContainText(
     "已添加 1 个上游模型，保存后生效。",
   );
   await expect(reopenedSheet.getByLabel("上游模型标识")).toHaveCount(3);
+  const outputFields = reopenedSheet.getByLabel("单次最大输出 Tokens");
+  await expect(outputFields).toHaveCount(3);
+  await expect(outputFields.nth(2)).toHaveValue("16384");
   await expect
     .poll(() => catalog.requests)
-    .toEqual([{ method: "GET", path: "/v1/models", authorization: "Bearer fixture-only" }]);
+    .toEqual([{ method: "GET", path: "/v1/models", authorization: "Bearer mock-key" }]);
   await page.screenshot({
     path: join(evidence, "models-light-editor.png"),
     animations: "disabled",
   });
-  await page.setViewportSize({ width: 600, height: 720 });
   await expect
     .poll(() => reopenedSheet.evaluate((element) => element.scrollWidth <= element.clientWidth))
     .toBe(true);
@@ -351,9 +394,15 @@ async function verify(page, evidence, catalog) {
     path: join(evidence, "models-light-editor-narrow.png"),
     animations: "disabled",
   });
+  await reopenedSheet.getByRole("button", { name: "保存更改", exact: true }).click();
+  await expect(reopenedSheet).toBeHidden();
+  await expect(settings.getByText("gpt-e2e-catalog", { exact: true })).toBeVisible();
+  await primary.getByRole("button", { name: /编辑模型 gpt-5\.6-sol/ }).click();
+  const savedAgainSheet = page.getByRole("dialog", { name: "编辑供应商" });
+  await expect(savedAgainSheet.getByLabel("单次最大输出 Tokens").nth(2)).toHaveValue("16384");
   await page.keyboard.press("Escape");
   await expect(primary.getByRole("button", { name: /编辑模型 gpt-5\.6-sol/ })).toBeFocused();
-  await expect(settings.getByText("gpt-e2e-catalog", { exact: true })).toHaveCount(0);
+  await expect(settings.getByText("gpt-e2e-catalog", { exact: true })).toBeVisible();
 
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.screenshot({ path: join(evidence, "models-dark-wide.png"), animations: "disabled" });
@@ -370,7 +419,7 @@ async function verify(page, evidence, catalog) {
 
 /**
  * 恢复验收只通过用户可见入口新建 Provider 并保存，证明损坏文件没有把应用锁在错误页，
- * 且不会借助测试进程直接改写配置。回环目录和凭据均属于本次临时 profile。
+ * 且不会借助测试进程直接改写配置。回环目录和 mock 凭据均属于本次临时 profile，无真实令牌形状。
  */
 async function verifyConfigurationRecovery(page, evidence, catalog) {
   const openSettings = page.getByRole("button", { name: "设置", exact: true });
@@ -389,7 +438,7 @@ async function verifyConfigurationRecovery(page, evidence, catalog) {
   const sheet = page.getByRole("dialog", { name: "新增供应商" });
   await sheet.getByLabel("供应商名称", { exact: true }).fill("Recovery Fixture");
   await sheet.getByLabel("Base URL", { exact: true }).fill(`${catalog.baseUrl}/v1`);
-  await sheet.getByLabel("API Key", { exact: true }).fill("fixture-only");
+  await sheet.getByLabel("API Key", { exact: true }).fill("mock-key");
   await sheet.getByLabel("上游模型标识").first().fill("gpt-5.6-sol");
   await sheet.getByRole("button", { name: "保存供应商", exact: true }).click();
   await expect(sheet).toBeHidden();
@@ -413,7 +462,7 @@ async function stopOwnedProcess(child) {
   });
 }
 
-/** 将 profile、App Server、loopback Provider 和 CDP 统一限定到本轮临时根，避免验收触碰用户数据。 */
+/** 将 profile、App Server、loopback Provider 和 CDP 限定到本轮；Vite 固定 IPv4 loopback 以匹配随机 devUrl。 */
 async function main() {
   if (process.platform !== "win32" || !isAbsolute(javaHome))
     throw new Error("仅支持 Windows JDK25 真窗");
@@ -451,6 +500,7 @@ async function main() {
       JA_E2E_EXIT_TRACE_PATH: join(runtime, "exit-trace.jsonl"),
       JA_DEBUG_JAVA: java,
       JA_DEBUG_JAR: jar,
+      TAURI_DEV_HOST: "127.0.0.1",
       // Tauri 构建复用仓库 target，避免真窗验收因重复编译而超时；临时 USERPROFILE 只隔离应用配置。
       RUSTUP_HOME: process.env.RUSTUP_HOME ?? join(hostUserProfile, ".rustup"),
       CARGO_HOME: process.env.CARGO_HOME ?? join(hostUserProfile, ".cargo"),

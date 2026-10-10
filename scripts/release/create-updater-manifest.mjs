@@ -86,7 +86,7 @@ function parseMinisignPublicKey(text) {
     const wrappedText = Buffer.from(keyText, "base64").toString("utf8");
     if (wrappedText.startsWith("untrusted comment:", 0)) keyText = wrappedText;
   } catch {
-    // The direct textual form is handled below and remains the supported test form.
+    // 直接文本形式由下方逻辑处理，并继续作为受支持的测试形式。
   }
   const decoded = Buffer.from(firstBase64Line(keyText, "updater public key"), "base64");
   if (decoded.length !== 42 || decoded.subarray(0, 2).toString("ascii") !== "Ed")

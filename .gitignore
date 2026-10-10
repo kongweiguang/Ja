@@ -1,10 +1,9 @@
-# Ja is distributed with its lockfiles, license files, source resources, and
-# Native Image metadata. Build and machine-local state must stay outside the
-# source tree so a clean checkout remains reproducible.
+# Ja 分发时包含锁文件、许可证、源码资源和 Native Image 元数据。
+# 构建产物和本机状态不纳入源码，以确保全新检出后仍可复现构建。
 # @author kongweiguang
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Operating system and local editor state
+# 操作系统和本地编辑器状态
 .DS_Store
 Thumbs.db
 Desktop.ini
@@ -12,7 +11,7 @@ Desktop.ini
 *.swo
 *.swn
 
-# Node.js / Vite / pnpm outputs
+# Node.js / Vite / pnpm 生成物
 node_modules/
 .pnpm-store/
 .vite/
@@ -24,7 +23,7 @@ pnpm-debug.log*
 npm-debug.log*
 yarn-debug.log*
 
-# Test and runtime logs/results are reproducible outputs, not source fixtures.
+# 测试与运行日志、结果均可重新生成，不属于源码样例。
 /logs/
 /.tmp/
 /.tmp-*/
@@ -32,10 +31,10 @@ yarn-debug.log*
 /playwright-report/
 /blob-report/
 
-# Keep the package lockfile: it is an input to reproducible desktop builds.
+# 保留包锁文件，确保桌面端构建可复现。
 !pnpm-lock.yaml
 
-# Rust / Tauri build outputs
+# Rust / Tauri 构建产物
 target/
 target-*/
 /.codex-target/
@@ -44,25 +43,24 @@ target-*/
 *.rmeta
 *.pdb
 
-# Java / Maven / GraalVM build outputs
-app-server/target/
-app-server/build/
-app-server/native-image/
-app-server/.cifuzz-corpus/
+# Java / Maven / GraalVM 构建产物
+ja-agent/ja-app-server/target/
+ja-agent/ja-app-server/build/
+ja-agent/ja-app-server/native-image/
+ja-agent/ja-app-server/.cifuzz-corpus/
 .native-image/
 *.class
 
-# Python contract/reference validator bytecode is always disposable.
+# Python 合同校验器和参考校验器的字节码均可重新生成。
 __pycache__/
 *.py[cod]
 
-# Native desktop bundle outputs (the signed artifact manifest is tracked
-# separately when a release task creates one).
+# 原生桌面打包产物；发布任务生成的签名产物清单另行纳入版本控制。
 artifacts/
 bundle/
 release/
 # @author kongweiguang
-# Keep the checked-in release evidence scripts visible; generated release outputs remain ignored.
+# 保留已纳入版本控制的发布验证脚本，继续忽略生成的发布产物。
 !scripts/release/
 !scripts/release/sbom/
 !scripts/release/sbom/*.ps1
@@ -75,7 +73,7 @@ release/
 *.rpm
 *.exe
 
-# IDE metadata; keep the shared VS Code extension recommendations.
+# IDE 元数据；保留共享的 VS Code 扩展推荐配置。
 .idea/
 .vscode/*
 !.vscode/extensions.json
@@ -85,11 +83,11 @@ release/
 *.userosscache
 *.sln.docstates
 
-# A previously interpolated Windows environment token may create this literal machine-cache mirror.
-# Keep it out of Git and Turn baselines without deleting the user's recoverable files.
+# 先前的 Windows 环境变量展开可能生成此字面名称的本机缓存镜像。
+# 将其排除于 Git 和任务轮次基线之外，但不删除用户可恢复的文件。
 /%SystemDrive%/
 
-# Local configuration and credentials. Keep the template visible to users.
+# 本地配置与凭据；保留用户可见的模板。
 .secrets/
 secrets/
 *.secret
@@ -101,10 +99,10 @@ credentials.*
 *.keystore
 *.mobileprovision
 
-# Keep legal files and source/native metadata visible to version control.
+# 将许可证文件、源码和原生构建元数据保留在版本控制中。
 !LICENSE
-!app-server/src/main/resources/META-INF/native-image/
-!app-server/src/main/resources/META-INF/native-image/**
+!ja-agent/ja-app-server/src/main/resources/META-INF/native-image/
+!ja-agent/ja-app-server/src/main/resources/META-INF/native-image/**
 !Cargo.lock
 /.codegraph
 
@@ -120,3 +118,7 @@ credentials.*
 .env.*
 !.env.example
 # END UPDENG
+
+# Java 多模块构建的产物由各模块分别管理。
+ja-agent/**/target/
+ja-agent/**/target-*/

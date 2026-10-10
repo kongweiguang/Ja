@@ -36,19 +36,28 @@ const OpenInputSchema = z
   .object({ attachmentId: AttachmentIdSchema, authorization: AuthorizationSchema })
   .strict();
 
-/** 自定义协议 URL 必须由 Rust 整体签发；renderer 不能自行拼接 opaque token。 */
+/**
+ * 只匹配两种 native 固定 origin 和 canonical UUID token；WebView 的 UA 不是签发身份，
+ * 因此校验不依赖平台猜测，且用原串相等拒绝 URL parser 规范化出的别名。
+ */
 function isManagedAttachmentUrl(value: string, kind: "preview" | "thumbnail"): boolean {
   try {
-    const parsed = new URL(value);
+    const url = new URL(value);
+    const originIsManaged =
+      (url.protocol === "http:" && url.host === "ja-attachment.localhost") ||
+      (url.protocol === "ja-attachment:" && url.host === "localhost");
+    const prefix = `/${kind}/`;
+    const token = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : "";
     return (
-      parsed.protocol === "ja-attachment:" &&
-      parsed.hostname === "localhost" &&
-      parsed.port === "" &&
-      parsed.username === "" &&
-      parsed.password === "" &&
-      parsed.search === "" &&
-      parsed.hash === "" &&
-      new RegExp(`^/${kind}/[A-Za-z0-9_.:-]{8,192}$`).test(parsed.pathname)
+      originIsManaged &&
+      url.username === "" &&
+      url.password === "" &&
+      url.port === "" &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.href === value &&
+      token.length === 32 &&
+      /^[0-9a-f]{32}$/.test(token)
     );
   } catch {
     return false;
@@ -115,6 +124,7 @@ const ReadResultSchema = z
 
 const CloseInputSchema = z.object({ previewSessionId: PreviewSessionIdSchema }).strict();
 const CloseResultSchema = z.object({ closed: z.literal(true) }).strict();
+const NativePreviewSessionIdSchema = z.string().regex(/^prv_[0-9a-f]{32}$/);
 
 export type AttachmentPreviewAuthorization = z.infer<typeof AuthorizationSchema>;
 export type AttachmentPreviewOpenInput = z.infer<typeof OpenInputSchema>;
@@ -174,7 +184,21 @@ function parseResult<T>(schema: z.ZodType<T>, value: unknown): T {
   }
 }
 
-/** 仅识别 allow-list code；未知 rejection 一律转为可重试的静态错误。 */
+/** 只为 Host 自己签发的 prv_<UUID simple> 做失败补偿，不能把畸形回复里的任意字符串发给 close。 */
+function nativeSessionIdForCleanup(value: unknown): string | undefined {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !Object.prototype.hasOwnProperty.call(value, "previewSessionId")
+  ) {
+    return undefined;
+  }
+  const sessionId = (value as { previewSessionId?: unknown }).previewSessionId;
+  const parsed = NativePreviewSessionIdSchema.safeParse(sessionId);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** 仅识别白名单错误码；未知拒绝一律转为可重试的静态错误。 */
 function normalizeFailure(error: unknown): AttachmentPreviewAdapterError {
   if (error instanceof AttachmentPreviewAdapterError) return error;
   const code =
@@ -203,15 +227,32 @@ async function invokeAttachmentPreview(
 export class TauriAttachmentPreviewAdapter {
   constructor(private readonly bridge: AttachmentPreviewNativeBridge = defaultNativeBridge) {}
 
-  /** 打开一个已由 Java 授权的 image/text session，不接受路径或任意 URL。 */
+  /**
+   * 打开已授权 session；若 renderer DTO 投影失败，仅以 Host 固定形状的 opaque ID 尝试释放，
+   * 并保留原始响应错误，避免坏响应占用本地资源直到 TTL。
+   */
   async open(input: AttachmentPreviewOpenInput): Promise<AttachmentPreviewOpenResult> {
     const parsed = parseInput(OpenInputSchema, input);
     const value = await invokeAttachmentPreview(this.bridge, JA_ATTACHMENT_PREVIEW_COMMANDS.open, {
       input: parsed,
     });
-    const result = parseResult(OpenResultSchema, value);
-    if (result.attachmentId !== parsed.attachmentId)
-      throw new AttachmentPreviewAdapterError("invalid_response", true);
+    let result: AttachmentPreviewOpenResult;
+    try {
+      result = parseResult(OpenResultSchema, value);
+      if (result.attachmentId !== parsed.attachmentId) {
+        throw new AttachmentPreviewAdapterError("invalid_response", true);
+      }
+    } catch (error) {
+      const sessionId = nativeSessionIdForCleanup(value);
+      if (sessionId !== undefined) {
+        try {
+          await this.close(sessionId);
+        } catch {
+          // 补偿失败不能覆盖原始响应错误；native session TTL 仍提供最终兜底。
+        }
+      }
+      throw error;
+    }
     return result;
   }
 

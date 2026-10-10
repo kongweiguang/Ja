@@ -1,8 +1,15 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { Check, ChevronDown, ChevronRight, GitCompareArrows, History } from "lucide-react";
-import type { ReactElement } from "react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  GitCompareArrows,
+  History,
+  RefreshCw,
+} from "lucide-react";
+import { useRef, type ReactElement, type RefObject } from "react";
 import type {
   ReviewActions,
   ReviewLayerFilter,
@@ -13,6 +20,7 @@ import {
   Menu,
   MenuContent,
   MenuItem,
+  MenuLabel,
   MenuSub,
   MenuSubContent,
   MenuSubTrigger,
@@ -26,10 +34,11 @@ export interface ReviewSourceNavigationProps {
   readonly retainedTurnLabel?: string;
   readonly latestTurnAvailable: boolean;
   readonly viewModel: ReviewViewModel;
-  readonly actions: Pick<ReviewActions, "setSource" | "setLayerFilter">;
+  readonly actions: Pick<ReviewActions, "setSource" | "setLayerFilter" | "refresh">;
   readonly onShowRetainedTurn: () => void;
   readonly onShowLatestTurn: () => void;
   readonly onShowWorkspaceReview: () => void;
+  readonly triggerRef?: RefObject<HTMLButtonElement | null>;
 }
 
 const WORKTREE_FILTERS: readonly { value: ReviewLayerFilter; label: string }[] = [
@@ -58,6 +67,9 @@ function SelectionMark({ selected }: { selected: boolean }): ReactElement | null
 /**
  * 范围菜单只编排 Turn 与 Git controller 已有动作。选择未提交子范围时先恢复聚合来源，
  * 再设置 layer 投影；两步均不自行触发 IO，真正的读取仍受 Review 可见性门禁控制。
+ * 未取得 Catalog 时沿用 controller 的加载或错误反馈，避免空菜单被误认为没有可用来源。
+ * 失败重试沿用同一刷新动作，不切换冻结历史；controller 继续决定目录与正文各自的读取准入。
+ * Host 持有触发器引用，使范围重挂载后菜单仍能归焦到新入口，不复用已卸载的 DOM。
  */
 export function ReviewSourceNavigation({
   currentLabel,
@@ -69,7 +81,31 @@ export function ReviewSourceNavigation({
   onShowRetainedTurn,
   onShowLatestTurn,
   onShowWorkspaceReview,
+  triggerRef: retainedTriggerRef,
 }: ReviewSourceNavigationProps): ReactElement {
+  const localTriggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = retainedTriggerRef ?? localTriggerRef;
+
+  /** 替换范围会卸载旧菜单；只归还仍可见的当前入口，外部点击或用户的新焦点优先。 */
+  const restoreTriggerFocus = (event: Event): void => {
+    event.preventDefault();
+    const trigger = triggerRef.current;
+    if (
+      trigger === null ||
+      !trigger.isConnected ||
+      trigger.disabled ||
+      trigger.closest('[hidden], [inert], [aria-hidden="true"]') !== null
+    )
+      return;
+    const activeElement = trigger.ownerDocument.activeElement;
+    const closingContent = event.target;
+    if (
+      activeElement === trigger.ownerDocument.body ||
+      activeElement === trigger ||
+      (closingContent instanceof HTMLElement && closingContent.contains(activeElement))
+    )
+      trigger.focus({ preventScroll: true });
+  };
   const comparisonSources = viewModel.sourceOptions.filter(
     (source) => source.kind === "branch" || source.kind === "commit",
   );
@@ -97,6 +133,7 @@ export function ReviewSourceNavigation({
     <Menu>
       <MenuTrigger asChild>
         <button
+          ref={triggerRef}
           type="button"
           className="ja-review-source-trigger"
           aria-label={`审阅范围：${currentLabel}`}
@@ -105,7 +142,25 @@ export function ReviewSourceNavigation({
           <ChevronDown aria-hidden="true" />
         </button>
       </MenuTrigger>
-      <MenuContent className="ja-review-source-menu" align="start" aria-label="选择审阅范围">
+      <MenuContent
+        className="ja-review-source-menu"
+        align="start"
+        aria-label="选择审阅范围"
+        onCloseAutoFocus={restoreTriggerFocus}
+      >
+        {!gitAvailable ? (
+          <MenuLabel className="ja-review-source-status" role="status">
+            {viewModel.state.catalogLoading
+              ? "正在读取 Git 来源…"
+              : (viewModel.state.error?.message ?? "Git 来源尚未就绪")}
+          </MenuLabel>
+        ) : null}
+        {!gitAvailable && !viewModel.state.catalogLoading && viewModel.state.error?.retryable ? (
+          <MenuItem onSelect={actions.refresh}>
+            <RefreshCw aria-hidden="true" />
+            <span>重新读取 Git 来源</span>
+          </MenuItem>
+        ) : null}
         {gitAvailable ? (
           <MenuSub>
             <MenuSubTrigger>

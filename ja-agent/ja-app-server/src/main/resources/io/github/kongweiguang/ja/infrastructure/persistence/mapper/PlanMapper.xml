@@ -1,0 +1,474 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- @author kongweiguang -->
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanMapper">
+    <resultMap id="AcceptanceEvidenceRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$AcceptanceEvidenceRow">
+        <constructor>
+            <idArg column="evidence_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="run_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+            <arg column="criterion_id" javaType="string"/>
+            <arg column="step_id" javaType="string"/>
+            <arg column="source_type" javaType="string"/>
+            <arg column="source_id" javaType="string"/>
+            <arg column="summary" javaType="string"/>
+            <arg column="digest" javaType="string"/>
+            <arg column="observed_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanToolAttemptRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanToolAttemptRow">
+        <constructor>
+            <idArg column="tool_attempt_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="run_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+            <arg column="step_id" javaType="string"/>
+            <arg column="attempt" javaType="_int"/>
+            <arg column="turn_id" javaType="string"/>
+            <arg column="call_id" javaType="string"/>
+            <arg column="process_generation" javaType="_long"/>
+            <arg column="side_effect" javaType="_int"/>
+            <arg column="state" javaType="string"/>
+            <arg column="request_digest" javaType="string"/>
+            <arg column="result_digest" javaType="string"/>
+            <arg column="prepared_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="started_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completed_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="ExecutionRunStateRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$ExecutionRunStateRow">
+        <constructor>
+            <idArg column="status" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+            <arg column="is_pause_requested" javaType="_int"/>
+            <arg column="used_model_rounds" javaType="_long"/>
+            <arg column="used_tool_calls" javaType="_long"/>
+            <arg column="used_active_millis" javaType="_long"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="InternalTurnContextRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$InternalTurnContextRow">
+        <constructor>
+            <idArg column="origin" javaType="string"/>
+            <arg column="context_json" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanApprovalRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanApprovalRow">
+        <constructor>
+            <idArg column="approval_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+            <arg column="plan_hash" javaType="string"/>
+            <arg column="decision" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanDraftRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanDraftRow">
+        <constructor>
+            <idArg column="plan_draft_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="draft_revision" javaType="_long"/>
+            <arg column="definition_json" javaType="string"/>
+            <arg column="based_on_plan_revision_id" javaType="string"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanEventRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanEventRow">
+        <constructor>
+            <idArg column="event_sequence" javaType="_long"/>
+            <arg column="event_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="plan_revision" javaType="_long"/>
+            <arg column="activity" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanExecutionRecoveryRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanExecutionRecoveryRow">
+        <constructor>
+            <idArg column="plan_id" javaType="string"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="active_run_id" javaType="string"/>
+            <arg column="active_plan_revision_id" javaType="string"/>
+            <arg column="unsafe" javaType="_int"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanOwnerRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanOwnerRow">
+        <constructor>
+            <idArg column="owner_thread_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanRevisionRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanRevisionRow">
+        <constructor>
+            <idArg column="plan_revision_id" javaType="string"/>
+            <arg column="plan_id" javaType="string"/>
+            <arg column="revision_number" javaType="_int"/>
+            <arg column="definition_json" javaType="string"/>
+            <arg column="plan_hash" javaType="string"/>
+            <arg column="created_by" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanRow" type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanRow">
+        <constructor>
+            <idArg column="plan_id" javaType="string"/>
+            <arg column="owner_thread_id" javaType="string"/>
+            <arg column="objective" javaType="string"/>
+            <arg column="create_operation_key" javaType="string"/>
+            <arg column="status" javaType="string"/>
+            <arg column="revision" javaType="_long"/>
+            <arg column="active_plan_revision_id" javaType="string"/>
+            <arg column="active_run_id" javaType="string"/>
+            <arg column="created_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanRunBindingRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanRunBindingRow">
+        <constructor>
+            <idArg column="plan_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanStepExecutionRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanStepExecutionRow">
+        <constructor>
+            <idArg column="run_id" javaType="string"/>
+            <arg column="plan_revision_id" javaType="string"/>
+            <arg column="step_id" javaType="string"/>
+            <arg column="status" javaType="string"/>
+            <arg column="attempt_count" javaType="_int"/>
+            <arg column="failure_signature" javaType="string"/>
+            <arg column="started_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="completed_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+            <arg column="updated_at_ms" javaType="string" typeHandler="io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanStepIdRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanStepIdRow">
+        <constructor>
+            <idArg column="step_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanStepProgressRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanStepProgressRow">
+        <constructor>
+            <idArg column="step_id" javaType="string"/>
+            <arg column="title" javaType="string"/>
+            <arg column="is_required" javaType="_int"/>
+            <arg column="status" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="PlanTurnClaimRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$PlanTurnClaimRow">
+        <constructor>
+            <idArg column="ordinal" javaType="_int"/>
+            <arg column="state" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="TemporarySideChatRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$TemporarySideChatRow">
+        <constructor>
+            <idArg column="thread_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="ThreadModelRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$ThreadModelRow">
+        <constructor>
+            <idArg column="provider_id" javaType="string"/>
+            <arg column="model_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="ThreadOwnerRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$ThreadOwnerRow">
+        <constructor>
+            <idArg column="revision" javaType="_long"/>
+            <arg column="task_kind" javaType="string"/>
+            <arg column="lifecycle" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <resultMap id="TurnIdRow"
+               type="io.github.kongweiguang.ja.infrastructure.persistence.mapper.PlanRecords$TurnIdRow">
+        <constructor>
+            <idArg column="turn_id" javaType="string"/>
+        </constructor>
+    </resultMap>
+    <select id="findThreadsByThreadIdDeletedAt" resultMap="ThreadOwnerRow">
+        <![CDATA[SELECT t.revision,l.task_kind,l.lifecycle FROM ja_conversation_thread t LEFT JOIN ja_conversation_lineage l ON l.child_thread_id=t.thread_id WHERE t.thread_id=#{threadId} AND t.deleted_at_ms IS NULL]]>
+    </select>
+    <select id="findPlansByOwnerThreadIdCreateOperationKey" resultMap="PlanRow">
+        <![CDATA[SELECT plan_id,owner_thread_id,objective,create_operation_key,status,revision,active_plan_revision_id,active_run_id,created_at_ms,updated_at_ms FROM ja_plan WHERE owner_thread_id=#{ownerThreadId} AND create_operation_key=#{createOperationKey}]]>
+    </select>
+    <select id="findActiveThreadRevision" resultType="java.lang.Long">
+        <![CDATA[SELECT revision FROM ja_conversation_thread WHERE thread_id=#{threadId} AND deleted_at_ms IS NULL]]>
+    </select>
+    <select id="findPlansByOwnerThreadId" resultMap="PlanRow">
+        <![CDATA[SELECT plan_id,owner_thread_id,objective,create_operation_key,status,revision,active_plan_revision_id,active_run_id,created_at_ms,updated_at_ms FROM ja_plan WHERE owner_thread_id=#{ownerThreadId} ORDER BY updated_at_ms DESC,plan_id DESC LIMIT 1]]>
+    </select>
+    <select id="findPlanEventsByPlanId" resultMap="PlanEventRow">
+        <![CDATA[SELECT event_sequence,event_id,plan_id,plan_revision,activity,created_at_ms FROM ja_plan_event WHERE plan_id=#{planId} ORDER BY event_sequence DESC LIMIT 1]]>
+    </select>
+    <select id="findPlanDraftsByPlanId" resultMap="PlanDraftRow">
+        <![CDATA[SELECT plan_draft_id,plan_id,draft_revision,definition_json,based_on_plan_revision_id,updated_at_ms FROM ja_plan_draft WHERE plan_id=#{planId}]]>
+    </select>
+    <select id="findPlanApprovalsByPlanIdPlanRevisionIdDecision" resultType="java.lang.String">
+        <![CDATA[SELECT plan_revision_id FROM ja_plan_approval WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId} AND decision='APPROVED' ORDER BY created_at_ms DESC LIMIT 1]]>
+    </select>
+    <select id="findPlanEventsByPlanIdOperationKey" resultType="java.lang.String">
+        <![CDATA[SELECT activity FROM ja_plan_event WHERE plan_id=#{planId} AND operation_key=#{operationKey}]]>
+    </select>
+    <select id="findPlanTurnClaimsByRunIdTurnId" resultMap="PlanTurnClaimRow">
+        <![CDATA[SELECT ordinal,state FROM ja_plan_turn_claim WHERE run_id=#{runId} AND turn_id=#{turnId}]]>
+    </select>
+    <select id="findExecutionRunsByRunId" resultMap="ExecutionRunStateRow">
+        <![CDATA[SELECT status,plan_id,plan_revision_id,is_pause_requested,used_model_rounds,used_tool_calls,used_active_millis FROM ja_plan_execution WHERE run_id=#{runId}]]>
+    </select>
+    <select id="findPlanTurnClaimsByRunIdState" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_turn_claim WHERE run_id=#{runId} AND state='CLAIMED' LIMIT 1]]>
+    </select>
+    <select id="findTerminalUnsettledPlanTurnClaimByRunId" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_turn_claim c JOIN ja_conversation_turn t ON t.turn_id=c.turn_id WHERE c.run_id=#{runId} AND c.state='CLAIMED' AND t.state IN ('COMPLETED','FAILED','CANCELLED') LIMIT 1]]>
+    </select>
+    <select id="findPlanTurnClaim" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_turn_claim WHERE run_id=#{runId} AND turn_id=#{turnId}]]>
+    </select>
+    <select id="findConversationTurnStateByTurnId" resultType="java.lang.String">
+        <![CDATA[SELECT state FROM ja_conversation_turn WHERE turn_id=#{turnId}]]>
+    </select>
+    <select id="findAcceptanceEvidenceByEvidenceId" resultMap="AcceptanceEvidenceRow">
+        <![CDATA[SELECT evidence_id,plan_id,run_id,plan_revision_id,criterion_id,step_id,source_type,source_id,summary,digest,observed_at_ms,created_at_ms FROM ja_plan_acceptance_evidence WHERE evidence_id=#{evidenceId}]]>
+    </select>
+    <select id="findThreadsByThreadId" resultMap="ThreadModelRow">
+        <![CDATA[SELECT provider_id,model_id FROM ja_conversation_thread WHERE thread_id=#{threadId}]]>
+    </select>
+    <select id="findPlanRunBinding" resultMap="PlanRunBindingRow">
+        <![CDATA[SELECT plan_id,plan_revision_id FROM ja_plan_execution WHERE run_id=#{runId}]]>
+    </select>
+    <select id="findPlansByOwnerThreadIdStatus" resultMap="PlanRow">
+        <![CDATA[SELECT plan_id,owner_thread_id,objective,create_operation_key,status,revision,active_plan_revision_id,active_run_id,created_at_ms,updated_at_ms FROM ja_plan WHERE owner_thread_id=#{ownerThreadId} AND status='EXECUTING' ORDER BY updated_at_ms DESC LIMIT 1]]>
+    </select>
+    <select id="findTurnInternalContextByTurnId" resultMap="InternalTurnContextRow">
+        <![CDATA[SELECT origin,context_json FROM ja_turn_internal_context WHERE turn_id=#{turnId}]]>
+    </select>
+    <select id="findTurnInternalContextByOriginState" resultMap="TurnIdRow">
+        <![CDATA[SELECT c.turn_id FROM ja_turn_internal_context c JOIN ja_conversation_turn t ON t.turn_id=c.turn_id WHERE c.origin='PLAN_EXECUTION' AND json_extract(c.context_json,'$.planId')=#{planId} AND json_extract(c.context_json,'$.runId')=#{runId} AND (t.state IN ('QUEUED','RUNNING','WAITING_APPROVAL','WAITING_INPUT','SUSPENDED') OR (t.state IN ('COMPLETED','FAILED','CANCELLED') AND EXISTS (SELECT 1 FROM ja_plan_turn_claim claim WHERE claim.run_id=#{runId} AND claim.turn_id=c.turn_id AND claim.state='CLAIMED'))) ORDER BY t.updated_at_ms DESC,t.turn_id DESC LIMIT 1]]>
+    </select>
+    <select id="findClaimedPlanTurnMissingInternalContext" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_execution e JOIN ja_plan_turn_claim c ON c.run_id=e.run_id JOIN ja_conversation_turn t ON t.turn_id=c.turn_id LEFT JOIN ja_turn_internal_context x ON x.turn_id=t.turn_id WHERE e.plan_id=#{planId} AND e.run_id=#{runId} AND c.state='CLAIMED' AND (x.turn_id IS NULL OR x.origin<>'PLAN_EXECUTION' OR json_extract(x.context_json,'$.planId') IS NOT e.plan_id OR json_extract(x.context_json,'$.runId') IS NOT e.run_id OR json_extract(x.context_json,'$.planRevisionId') IS NOT e.plan_revision_id OR json_extract(x.context_json,'$.planHash') IS NOT e.plan_hash) LIMIT 1]]>
+    </select>
+    <select id="findNonTerminalPlanByOwner" resultMap="PlanRow">
+        <![CDATA[SELECT plan_id,owner_thread_id,objective,create_operation_key,status,revision,active_plan_revision_id,active_run_id,created_at_ms,updated_at_ms FROM ja_plan WHERE owner_thread_id=#{ownerThreadId} AND status IN ('DRAFT','AWAITING_APPROVAL','APPROVED','EXECUTING','VERIFYING','PAUSED')]]>
+    </select>
+    <select id="findPlanStepExecutionsByRunIdStatus" resultMap="PlanStepIdRow">
+        <![CDATA[SELECT x.step_id FROM ja_plan_step_execution x JOIN ja_plan_step s ON s.plan_revision_id=x.plan_revision_id AND s.step_id=x.step_id WHERE x.run_id=#{runId} AND x.status IN ('RUNNING','READY') ORDER BY CASE x.status WHEN 'RUNNING' THEN 0 ELSE 1 END,s.ordinal LIMIT 1]]>
+    </select>
+    <select id="findPlanRevisionsByPlanId" resultMap="PlanRevisionRow">
+        <![CDATA[SELECT plan_revision_id,plan_id,revision_number,definition_json,plan_hash,created_by,created_at_ms FROM ja_plan_revision WHERE plan_id=#{planId} ORDER BY revision_number DESC LIMIT 1]]>
+    </select>
+    <select id="findLatestApprovedPlanApproval" resultMap="PlanApprovalRow">
+        <![CDATA[SELECT approval_id,plan_id,plan_revision_id,plan_hash,decision,created_at_ms FROM ja_plan_approval WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId} AND decision='APPROVED' ORDER BY created_at_ms DESC LIMIT 1]]>
+    </select>
+    <select id="findPlansByPlanId" resultMap="PlanOwnerRow">
+        <![CDATA[SELECT p.owner_thread_id FROM ja_plan p JOIN ja_conversation_thread t ON t.thread_id=p.owner_thread_id WHERE p.plan_id=#{planId}]]>
+    </select>
+    <select id="findExecutionRunsByOwnerThreadIdStatus" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_execution r JOIN ja_plan p ON p.plan_id=r.plan_id WHERE p.owner_thread_id=#{ownerThreadId} AND r.status IN ('PREPARED','RUNNING','VERIFYING','PAUSED') LIMIT 1]]>
+    </select>
+    <select id="findExecutionRunsByPlanIdStatus" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_execution WHERE plan_id=#{planId} AND status IN ('PREPARED','RUNNING','VERIFYING','PAUSED') LIMIT 1]]>
+    </select>
+    <select id="findTemporarySideChatsByState" resultMap="TemporarySideChatRow">
+        <![CDATA[WITH RECURSIVE ancestors(thread_id) AS (SELECT #{threadId} UNION ALL SELECT l.parent_thread_id FROM ja_conversation_lineage l JOIN ancestors a ON l.child_thread_id=a.thread_id) SELECT c.thread_id FROM ja_conversation_thread c JOIN ancestors a ON a.thread_id=c.thread_id WHERE c.temporary_lifecycle_state='CLOSING' ORDER BY c.thread_id LIMIT 1]]>
+    </select>
+    <select id="findPlanApprovalsByPlanIdPlanRevisionIdPlanHash" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_approval WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId} AND plan_hash=#{planHash} AND decision='APPROVED']]>
+    </select>
+    <select id="findPlanRevisionsByPlanIdPlanRevisionId" resultMap="PlanRevisionRow">
+        <![CDATA[SELECT plan_revision_id,plan_id,revision_number,definition_json,plan_hash,created_by,created_at_ms FROM ja_plan_revision WHERE plan_id=#{planId} AND plan_revision_id=#{planRevisionId}]]>
+    </select>
+    <select id="findPlanById" resultMap="PlanRow">
+        <![CDATA[SELECT plan_id,owner_thread_id,objective,create_operation_key,status,revision,active_plan_revision_id,active_run_id,created_at_ms,updated_at_ms FROM ja_plan WHERE plan_id=#{planId}]]>
+    </select>
+    <select id="findPlanEventByOperationKey" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_event WHERE plan_id=#{planId} AND operation_key=#{operationKey}]]>
+    </select>
+    <select id="listPlanStepsByPlanRevisionId" resultMap="PlanStepProgressRow">
+        <![CDATA[SELECT s.step_id,s.title,s.is_required,COALESCE(x.status,'PENDING') AS status FROM ja_plan_step s LEFT JOIN ja_plan_step_execution x ON x.run_id=#{runId} AND x.step_id=s.step_id WHERE s.plan_revision_id=#{planRevisionId} ORDER BY s.ordinal]]>
+    </select>
+    <select id="listPlanEventsByPlanIdEventSequence" resultMap="PlanEventRow">
+        <![CDATA[SELECT event_sequence,event_id,plan_id,plan_revision,activity,created_at_ms FROM ja_plan_event WHERE plan_id=#{planId} AND event_sequence>#{eventSequence} ORDER BY event_sequence LIMIT #{limit}]]>
+    </select>
+    <select id="listPlanRevisionsByPlanIdRevisionNumber" resultMap="PlanRevisionRow">
+        <![CDATA[SELECT plan_revision_id,plan_id,revision_number,definition_json,plan_hash,created_by,created_at_ms FROM ja_plan_revision WHERE plan_id=#{planId} AND revision_number>#{revisionNumber} ORDER BY revision_number LIMIT #{limit}]]>
+    </select>
+    <select id="listPlanEvidencePageStart" resultMap="AcceptanceEvidenceRow">
+        <![CDATA[SELECT evidence_id,plan_id,run_id,plan_revision_id,criterion_id,step_id,source_type,source_id,summary,digest,observed_at_ms,created_at_ms FROM ja_plan_acceptance_evidence WHERE plan_id=#{planId} AND run_id=#{runId} AND plan_revision_id=#{planRevisionId} ORDER BY created_at_ms,evidence_id LIMIT #{limit}]]>
+    </select>
+    <select id="listPlanStepExecutionsByRunId" resultMap="PlanStepExecutionRow">
+        <![CDATA[SELECT x.run_id,x.plan_revision_id,x.step_id,x.status,x.attempt_count,x.failure_signature,x.started_at_ms,x.completed_at_ms,x.updated_at_ms FROM ja_plan_step_execution x JOIN ja_plan_step s ON s.plan_revision_id=x.plan_revision_id AND s.step_id=x.step_id WHERE x.run_id=#{runId} ORDER BY s.ordinal]]>
+    </select>
+    <select id="listPlanExecutionRecoveryCandidates" resultMap="PlanExecutionRecoveryRow">
+        <![CDATA[SELECT p.plan_id,p.revision,p.active_run_id,p.active_plan_revision_id,CASE WHEN EXISTS (SELECT 1 FROM ja_plan_tool_attempt a WHERE a.run_id=r.run_id AND (a.state IN ('PREPARED','UNKNOWN') OR (a.state='STARTED' AND a.side_effect=1))) OR EXISTS (SELECT 1 FROM ja_plan_evaluation_attempt e WHERE e.run_id=r.run_id AND e.outcome IN ('RUNNING','UNKNOWN')) THEN 1 ELSE 0 END AS unsafe FROM ja_plan p JOIN ja_plan_execution r ON r.run_id=p.active_run_id WHERE r.plan_id=p.plan_id AND r.process_generation<>#{processGeneration} AND p.status IN ('EXECUTING','VERIFYING') ORDER BY p.updated_at_ms,p.plan_id LIMIT #{limit}]]>
+    </select>
+    <insert id="insertPlansWithPlanId">
+        <![CDATA[INSERT INTO ja_plan(plan_id,owner_thread_id,objective,create_operation_key,status,revision,created_at_ms,updated_at_ms) VALUES(#{planId},#{ownerThreadId},#{objective},#{createOperationKey},'DRAFT',0,#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <insert id="insertPlanDraftsWithPlanDraftId">
+        <![CDATA[INSERT INTO ja_plan_draft(plan_draft_id,plan_id,draft_revision,definition_json,based_on_plan_revision_id,updated_at_ms) VALUES(#{planDraftId},#{planId},1,#{definitionJson},#{basedOnPlanRevisionId},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT}) ON CONFLICT(plan_id) DO UPDATE SET draft_revision=ja_plan_draft.draft_revision+1,definition_json=excluded.definition_json,based_on_plan_revision_id=excluded.based_on_plan_revision_id,updated_at_ms=excluded.updated_at_ms]]>
+    </insert>
+    <delete id="deletePlanDrafts">
+        <![CDATA[DELETE FROM ja_plan_draft WHERE plan_id=#{planId}]]>
+    </delete>
+    <insert id="insertPlanRevisionsWithPlanRevisionId">
+        <![CDATA[INSERT INTO ja_plan_revision(plan_revision_id,plan_id,revision_number,definition_json,plan_hash,created_by,created_at_ms) VALUES(#{planRevisionId},#{planId},#{revisionNumber},#{definitionJson},#{planHash},#{createdBy},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <insert id="insertPlanStepsWithPlanRevisionId">
+        <![CDATA[INSERT INTO ja_plan_step(plan_revision_id,step_id,ordinal,title,description,is_required,dependency_ids_json) VALUES(#{planRevisionId},#{stepId},#{ordinal},#{title},#{description},#{required},#{dependencyIdsJson})]]>
+    </insert>
+    <insert id="insertAcceptanceCriteriaWithPlanRevisionId">
+        <![CDATA[INSERT INTO ja_plan_acceptance_criterion(plan_revision_id,criterion_id,ordinal,description,is_required) VALUES(#{planRevisionId},#{criterionId},#{ordinal},#{description},#{required})]]>
+    </insert>
+    <insert id="insertPlanApprovalsWithApprovalId">
+        <![CDATA[INSERT INTO ja_plan_approval(approval_id,plan_id,plan_revision_id,plan_hash,actor,decision,created_at_ms) VALUES(#{approvalId},#{planId},#{planRevisionId},#{planHash},'USER_UI','APPROVED',#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <update id="updateExecutionRunsSettingUpdatedAtByRunId">
+        <![CDATA[UPDATE ja_plan_execution SET updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND status='RUNNING' AND is_pause_requested=0]]>
+    </update>
+    <insert id="insertPlanTurnClaimsWithRunId">
+        <![CDATA[INSERT INTO ja_plan_turn_claim(run_id,turn_id,ordinal,claimed_at_ms) VALUES(#{runId},#{turnId},#{ordinal},#{claimedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <update id="updateExecutionRunsSettingUsedModelRoundsByRunId">
+        <![CDATA[UPDATE ja_plan_execution SET used_model_rounds=#{usedModelRounds},used_tool_calls=#{usedToolCalls},used_active_millis=#{usedActiveMillis},updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND status IN ('RUNNING','PAUSED')]]>
+    </update>
+    <update id="settlePlanTurnClaim">
+        <![CDATA[UPDATE ja_plan_turn_claim SET state='SETTLED' WHERE run_id=#{runId} AND turn_id=#{turnId} AND state='CLAIMED']]>
+    </update>
+    <update id="updateExecutionRunsSettingUsedActiveMillisByRunId">
+        <![CDATA[UPDATE ja_plan_execution SET used_active_millis=#{usedActiveMillis},updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND status IN ('RUNNING','PAUSED')]]>
+    </update>
+    <update id="updateExecutionRunsSettingPauseRequestedByRunId">
+        <![CDATA[UPDATE ja_plan_execution SET is_pause_requested=1,updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND plan_id=#{planId} AND status IN ('RUNNING','VERIFYING','PAUSED')]]>
+    </update>
+    <insert id="insertRejectedPlanApproval">
+        <![CDATA[INSERT INTO ja_plan_approval(approval_id,plan_id,plan_revision_id,plan_hash,actor,decision,created_at_ms) VALUES(#{approvalId},#{planId},#{planRevisionId},#{planHash},'USER_UI','REJECTED',#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <update id="clearPlanRunPauseRequest">
+        <![CDATA[UPDATE ja_plan_execution SET is_pause_requested=0,updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId}]]>
+    </update>
+    <update id="abandonUnadmittedPlanTurnClaims">
+        <![CDATA[UPDATE ja_plan_turn_claim SET state='ABANDONED' WHERE run_id=#{runId} AND state='CLAIMED' AND NOT EXISTS (SELECT 1 FROM ja_conversation_turn t WHERE t.turn_id=ja_plan_turn_claim.turn_id)]]>
+    </update>
+    <update id="updateExecutionRunsSettingStatusByRunId">
+        <![CDATA[UPDATE ja_plan_execution SET status=#{status},completed_at_ms=CASE WHEN #{completedStatus} IN ('COMPLETED','STOPPED') THEN #{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} ELSE NULL END,updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId}]]>
+    </update>
+    <update id="updatePlanStepExecutionsSettingStatusByRunId">
+        <![CDATA[UPDATE ja_plan_step_execution SET status=#{status},attempt_count=attempt_count+CASE WHEN #{runningStatus}='RUNNING' THEN 1 ELSE 0 END,failure_signature=#{failureSignature},started_at_ms=CASE WHEN #{startedStatus}='RUNNING' THEN #{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} ELSE started_at_ms END,completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND step_id=#{stepId} AND status=#{expectedStatus}]]>
+    </update>
+    <update id="activateReadyPlanSteps">
+        <![CDATA[UPDATE ja_plan_step_execution SET status='READY',updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE run_id=#{runId} AND status='PENDING' AND NOT EXISTS(SELECT 1 FROM json_each((SELECT dependency_ids_json FROM ja_plan_step s WHERE s.plan_revision_id=ja_plan_step_execution.plan_revision_id AND s.step_id=ja_plan_step_execution.step_id)) d JOIN ja_plan_step_execution dep ON dep.run_id=ja_plan_step_execution.run_id AND dep.step_id=d.value WHERE dep.status<>'SUCCEEDED')]]>
+    </update>
+    <insert id="insertExecutionRunsWithRunId">
+        <![CDATA[INSERT INTO ja_plan_execution(run_id,plan_id,plan_revision_id,plan_hash,status,process_generation,started_at_ms,created_at_ms,updated_at_ms) VALUES(#{runId},#{planId},#{planRevisionId},#{planHash},#{status},#{processGeneration},#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <insert id="insertPlanStepExecutionsWithRunId">
+        <![CDATA[INSERT INTO ja_plan_step_execution(run_id,plan_revision_id,step_id,status,updated_at_ms) VALUES(#{runId},#{planRevisionId},#{stepId},#{status},#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <update id="updatePlansSettingStatusByPlanId">
+        <![CDATA[UPDATE ja_plan SET status=#{status},revision=revision+1,active_plan_revision_id=#{activePlanRevisionId},active_run_id=#{activeRunId},updated_at_ms=#{updatedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE plan_id=#{planId} AND revision=#{revision}]]>
+    </update>
+    <insert id="insertPlanEventsWithEventId">
+        <![CDATA[INSERT INTO ja_plan_event(event_id,plan_id,plan_revision,activity,operation_key,created_at_ms) VALUES(#{eventId},#{planId},#{planRevision},#{activity},#{operationKey},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <select id="countOpenPlansByOwner" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_plan WHERE owner_thread_id=#{ownerThreadId} AND status NOT IN ('COMPLETED','STOPPED')]]>
+    </select>
+    <select id="findTurnsByState" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_conversation_turn t JOIN ja_turn_internal_context x ON x.turn_id=t.turn_id WHERE json_extract(x.context_json,'$.runId')=#{runId} AND t.state IN ('QUEUED','RUNNING','WAITING_APPROVAL','WAITING_INPUT','SUSPENDED')]]>
+    </select>
+    <select id="findInteractionRequestsByThreadIdStatus" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_interaction_request i WHERE i.thread_id=#{threadId} AND i.status='PENDING' AND EXISTS (SELECT 1 FROM json_each(i.questions_json) q WHERE json_extract(q.value,'$.required')=1)]]>
+    </select>
+    <select id="nextPlanRevisionNumber" resultType="java.lang.Long">
+        <![CDATA[SELECT COALESCE(MAX(revision_number),0)+1 FROM ja_plan_revision WHERE plan_id=#{planId}]]>
+    </select>
+    <select id="findPlanTurnClaimsByRunId" resultType="java.lang.Long">
+        <![CDATA[SELECT COALESCE(MAX(ordinal),0)+1 FROM ja_plan_turn_claim WHERE run_id=#{runId}]]>
+    </select>
+    <select id="findUsageByTurnIdPurpose" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(DISTINCT model_round) FROM ja_turn_usage WHERE turn_id=#{turnId} AND purpose='ASSISTANT']]>
+    </select>
+    <select id="findToolsByTurnId" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_tool_call WHERE turn_id=#{turnId}]]>
+    </select>
+    <select id="latestPlanEventSequence" resultType="java.lang.Long">
+        <![CDATA[SELECT COALESCE(MAX(event_sequence),0) FROM ja_plan_event WHERE plan_id=#{planId}]]>
+    </select>
+    <select id="findPlanStepsByPlanRevisionIdRequiredRunId" resultType="java.lang.Long">
+        <![CDATA[SELECT (SELECT COUNT(*) FROM ja_plan_step s LEFT JOIN ja_plan_step_execution x ON x.run_id=#{runId} AND x.step_id=s.step_id WHERE s.plan_revision_id=#{planRevisionId} AND s.is_required=1 AND COALESCE(x.status,'')<>'SUCCEEDED')+(SELECT COUNT(*) FROM ja_plan_acceptance_criterion p WHERE p.plan_revision_id=#{planRevisionId2} AND p.is_required=1 AND NOT EXISTS(SELECT 1 FROM ja_plan_acceptance_evidence e WHERE e.run_id=#{runId2} AND e.plan_revision_id=p.plan_revision_id AND e.criterion_id=p.criterion_id))+(SELECT COUNT(*) FROM ja_plan_tool_attempt t WHERE t.run_id=#{runId3} AND t.state IN ('PREPARED','STARTED','UNKNOWN'))+(SELECT COUNT(*) FROM ja_interaction_request i WHERE i.run_id=#{runId4} AND i.status='PENDING')]]>
+    </select>
+    <select id="findPlanStepsByPlanRevisionIdRequired" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_plan_step WHERE plan_revision_id=#{planRevisionId} AND is_required=1]]>
+    </select>
+    <select id="findPlanStepExecutionsByRunIdRequiredStatus" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_plan_step_execution x JOIN ja_plan_step s ON s.plan_revision_id=x.plan_revision_id AND s.step_id=x.step_id WHERE x.run_id=#{runId} AND s.is_required=1 AND x.status='SUCCEEDED']]>
+    </select>
+    <select id="findAcceptanceCriteriaByPlanRevisionIdCriterionId" resultType="java.lang.Long">
+        <![CDATA[SELECT COUNT(*) FROM ja_plan_acceptance_criterion WHERE plan_revision_id=#{planRevisionId} AND criterion_id=#{criterionId}]]>
+    </select>
+    <select id="listPlanEvidencePageAfter" resultMap="AcceptanceEvidenceRow">
+        <![CDATA[SELECT evidence_id,plan_id,run_id,plan_revision_id,criterion_id,step_id,source_type,source_id,summary,digest,observed_at_ms,created_at_ms FROM ja_plan_acceptance_evidence WHERE plan_id=#{planId} AND run_id=#{runId} AND plan_revision_id=#{planRevisionId} AND (created_at_ms>#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} OR (created_at_ms=#{createdAt2} AND evidence_id>#{evidenceId})) ORDER BY created_at_ms,evidence_id LIMIT #{limit}]]>
+    </select>
+    <select id="findPlanToolAttemptsByRunIdCallIdState" resultMap="PlanToolAttemptRow">
+        <![CDATA[SELECT tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms FROM ja_plan_tool_attempt WHERE run_id=#{runId} AND call_id=#{callId} AND state='SUCCEEDED']]>
+    </select>
+    <select id="findUnsettledPlanToolAttemptByRunId" resultType="java.lang.Integer">
+        <![CDATA[SELECT 1 FROM ja_plan_tool_attempt WHERE run_id=#{runId} AND state IN ('PREPARED','STARTED','UNKNOWN') LIMIT 1]]>
+    </select>
+    <select id="listUnsettledPlanToolAttemptsByRunId" resultMap="PlanToolAttemptRow">
+        <![CDATA[SELECT tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms FROM ja_plan_tool_attempt WHERE run_id=#{runId} AND state IN ('PREPARED','STARTED','UNKNOWN') ORDER BY prepared_at_ms,tool_attempt_id]]>
+    </select>
+    <select id="findPlanResumeCoreExecutionSnapshot" resultType="java.lang.String">
+        <![CDATA[SELECT json_object('appTurnState',t.state,'coreState',e.state,'mutationVersion',e.mutation_version,'cursorSchemaVersion',e.cursor_schema_version,'cursorJson',e.cursor_json,'lastRecordSequence',e.last_record_sequence,'userId',e.user_id,'runPlanId',r.plan_id,'runRevisionId',r.plan_revision_id,'runHash',r.plan_hash) FROM ja_conversation_turn t JOIN ja_conversation_thread owner ON owner.thread_id=t.thread_id JOIN agent_execution e ON e.tenant_id='ja.local' AND e.thread_id=t.thread_id AND e.turn_id=t.turn_id AND e.user_id=owner.owner_user_id JOIN ja_plan_turn_claim claim ON claim.turn_id=t.turn_id AND claim.run_id=#{runId} AND claim.state='CLAIMED' JOIN ja_plan_execution r ON r.run_id=claim.run_id WHERE t.thread_id=#{threadId} AND t.turn_id=#{turnId}]]>
+    </select>
+    <select id="listPlanResumeCoreToolRecords" resultType="java.lang.String">
+        <![CDATA[SELECT json_object('recordType',record_type,'recordId',record_id,'schemaVersion',payload_schema_version,'recordSequence',record_sequence,'payloadJson',payload_json) FROM agent_record WHERE tenant_id='ja.local' AND thread_id=#{threadId} AND turn_id=#{turnId} AND user_id=#{userId} AND record_sequence<=#{lastRecordSequence} AND ((record_type='agent.assistant' AND json_extract(payload_json,'$.messageId')=#{assistantMessageId}) OR (record_type IN ('agent.tool.prepared','agent.tool.started','agent.tool.result') AND json_extract(payload_json,'$.callId')=#{callId})) ORDER BY record_sequence]]>
+    </select>
+    <select id="listPlanResumeCoreToolEvents" resultType="java.lang.String">
+        <![CDATA[SELECT json_object('eventType',event_type,'schemaVersion',payload_schema_version,'eventSequence',event_sequence,'payloadJson',payload_json) FROM agent_event WHERE tenant_id='ja.local' AND thread_id=#{threadId} AND turn_id=#{turnId} AND user_id=#{userId} AND mutation_version<=#{mutationVersion} AND last_record_sequence<=#{lastRecordSequence} AND ((event_type='agent.model.completed' AND json_extract(payload_json,'$.messageRecordId')=#{assistantRecordId}) OR (event_type IN ('agent.tool.started','agent.tool.completed') AND json_extract(payload_json,'$.callId')=#{callId})) ORDER BY event_sequence]]>
+    </select>
+    <select id="findPlanToolAttemptsByToolAttemptId" resultMap="PlanToolAttemptRow">
+        <![CDATA[SELECT tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms FROM ja_plan_tool_attempt WHERE tool_attempt_id=#{toolAttemptId}]]>
+    </select>
+    <select id="listPlanToolAttemptsByTurnIdCallId" resultMap="PlanToolAttemptRow">
+        <![CDATA[SELECT tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms FROM ja_plan_tool_attempt WHERE turn_id=#{turnId} AND call_id=#{callId} ORDER BY attempt,tool_attempt_id]]>
+    </select>
+    <select id="listStartedPlanToolAttemptsByProcessGeneration" resultMap="PlanToolAttemptRow">
+        <![CDATA[SELECT tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms FROM ja_plan_tool_attempt WHERE process_generation<>#{processGeneration} AND state='STARTED' ORDER BY prepared_at_ms,tool_attempt_id LIMIT #{limit}]]>
+    </select>
+    <insert id="insertPlanToolAttemptsWithToolAttemptId">
+        <![CDATA[INSERT INTO ja_plan_tool_attempt(tool_attempt_id,plan_id,run_id,plan_revision_id,step_id,attempt,turn_id,call_id,process_generation,side_effect,state,request_digest,result_digest,prepared_at_ms,started_at_ms,completed_at_ms) VALUES(#{toolAttemptId},#{planId},#{runId},#{planRevisionId},#{stepId},#{attempt},#{turnId},#{callId},#{processGeneration},#{sideEffect},#{state},#{requestDigest},#{resultDigest},#{preparedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+    <update id="updatePlanToolAttemptsSettingStateByToolAttemptId">
+        <![CDATA[UPDATE ja_plan_tool_attempt SET state='STARTED',started_at_ms=#{startedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE tool_attempt_id=#{toolAttemptId} AND state='PREPARED']]>
+    </update>
+    <update id="settleStartedPlanToolAttempt">
+        <![CDATA[UPDATE ja_plan_tool_attempt SET state=#{state},result_digest=#{resultDigest},completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE tool_attempt_id=#{toolAttemptId} AND state='STARTED']]>
+    </update>
+    <update id="settlePreparedPlanToolAttempt">
+        <![CDATA[UPDATE ja_plan_tool_attempt SET state=#{state},result_digest=#{resultDigest},completed_at_ms=#{completedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT} WHERE tool_attempt_id=#{toolAttemptId} AND state='PREPARED' AND started_at_ms IS NULL AND completed_at_ms IS NULL AND result_digest IS NULL]]>
+    </update>
+    <insert id="insertIfAbsentAcceptanceEvidenceWithEvidenceId">
+        <![CDATA[INSERT OR IGNORE INTO ja_plan_acceptance_evidence(evidence_id,plan_id,run_id,plan_revision_id,criterion_id,step_id,source_type,source_id,summary,digest,observed_at_ms,created_at_ms) VALUES(#{evidenceId},#{planId},#{runId},#{planRevisionId},#{criterionId},#{stepId},#{sourceType},#{sourceId},#{summary},#{digest},#{observedAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT},#{createdAt,typeHandler=io.github.kongweiguang.ja.infrastructure.persistence.mapper.EpochMillisStringTypeHandler,jdbcType=BIGINT})]]>
+    </insert>
+</mapper>

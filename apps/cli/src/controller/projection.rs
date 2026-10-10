@@ -9,10 +9,12 @@ use ja_cli::ui::{
     TimelineStatus, TurnState, UiChoice, UiSnapshot,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 每次读回全量快照都重建可见投影，以稳定 item ID 去重，避免重连后重复正文。
+/// @author kongweiguang
+/// 同一 ModelStep 的正文和公开摘要各自合并，按首段序号排列；UI 加载态不从历史投影继承，避免旧选择器状态泄漏。
 pub fn project(
     context: &ThreadContext,
     history: &Value,
@@ -29,7 +31,11 @@ pub fn project(
         .get("turns")
         .and_then(Value::as_array)
         .ok_or_else(|| CliError::protocol("thread/read 缺少 turns"))?;
-    let latest = turns.last();
+    // Frozen inherited turns remain visible, but only a native turn can describe this Thread's live controls.
+    let latest = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.get("origin").and_then(Value::as_str) != Some("inherited"));
     let latest_turn_id = latest
         .and_then(|turn| turn.get("turnId"))
         .and_then(Value::as_str);
@@ -37,21 +43,35 @@ pub fn project(
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str);
     let state = match latest_status {
-        Some("queued" | "running" | "waiting_approval" | "suspended") => TurnState::Working,
+        Some("queued" | "running" | "waiting_input" | "waiting_approval") => TurnState::Working,
+        Some("suspended") => TurnState::Paused,
         Some("failed") => TurnState::Failed,
         _ => TurnState::Idle,
     };
-    let mut timeline = Vec::with_capacity(items.len() + 2);
+    let turn_started_at = if state == TurnState::Working {
+        latest
+            .and_then(|turn| turn.get("requestedAt"))
+            .and_then(Value::as_str)
+            .and_then(parse_utc_system_time)
+    } else {
+        None
+    };
+    let mut timeline = Vec::with_capacity(items.len() + turns.len() + 4);
+    let mut turn_id_by_entry_id = HashMap::new();
     let turn_statuses: HashMap<&str, &str> = turns
         .iter()
         .filter_map(|turn| Some((turn.get("turnId")?.as_str()?, turn.get("status")?.as_str()?)))
         .collect();
     for item in items {
+        let item_turn_id = item.get("turnId").and_then(Value::as_str);
         let turn_status = item
             .get("turnId")
             .and_then(Value::as_str)
             .and_then(|id| turn_statuses.get(id).copied());
         if let Some(entry) = project_item(item, turn_status)? {
+            if let Some(turn_id) = item_turn_id {
+                turn_id_by_entry_id.insert(entry.id.clone(), turn_id.to_owned());
+            }
             timeline.push(entry);
         }
     }
@@ -65,19 +85,23 @@ pub fn project(
         if !has_answer {
             let code = latest
                 .and_then(|turn| turn.get("errorCode"))
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
+                .and_then(Value::as_str);
             let description = match code {
-                "MODEL_UNAVAILABLE" => "模型服务暂时不可用",
+                Some("MODEL_UNAVAILABLE") => "模型服务暂时不可用",
+                Some("MODEL_PROTOCOL_ERROR") => "模型返回内容无法处理",
                 _ => "任务未完成",
             };
             timeline.push(TimelineEntry {
                 id: format!("turn-error:{turn_id}"),
                 kind: TimelineKind::Commentary,
-                text: format!("{description} · {code}"),
+                text: code.map_or_else(
+                    || description.to_owned(),
+                    |code| format!("{description} · {code}"),
+                ),
                 detail: None,
                 status: Some(TimelineStatus::Failed),
             });
+            turn_id_by_entry_id.insert(format!("turn-error:{turn_id}"), turn_id.to_owned());
         }
     }
     if let Some(stream) = history.get("liveStream").filter(|value| !value.is_null()) {
@@ -86,21 +110,78 @@ pub fn project(
             .get("segments")
             .and_then(Value::as_array)
             .ok_or_else(|| CliError::protocol("liveStream 缺少 segments"))?;
-        let assistant = segments
-            .iter()
-            .filter(|part| part.get("kind").and_then(Value::as_str) == Some("assistant"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<String>();
-        if !assistant.is_empty() {
-            timeline.push(TimelineEntry {
-                id: format!("live:{turn_id}"),
-                kind: TimelineKind::Assistant,
-                text: safe_display(&assistant),
-                detail: None,
-                status: Some(TimelineStatus::Running),
-            });
+        let stream_is_open = matches!(
+            turn_statuses.get(turn_id).copied(),
+            Some("queued" | "running" | "waiting_input" | "waiting_approval" | "suspended")
+        );
+        let mut first_assistant_sequence = None;
+        let mut assistant_text = String::new();
+        let mut first_reasoning_sequence = None;
+        let mut reasoning_text = String::new();
+        for segment in segments {
+            let kind = segment.get("kind").and_then(Value::as_str);
+            if matches!(kind, Some("assistant" | "reasoningSummary")) {
+                let start = segment
+                    .get("segmentStartSeq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| CliError::protocol("liveStream 片段缺少 segmentStartSeq"))?;
+                let _end = segment
+                    .get("streamSeq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| CliError::protocol("liveStream 片段缺少 streamSeq"))?;
+                let text = segment
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CliError::protocol("liveStream 片段缺少 text"))?;
+                if kind == Some("assistant") {
+                    first_assistant_sequence.get_or_insert(start);
+                    assistant_text.push_str(text);
+                } else {
+                    first_reasoning_sequence.get_or_insert(start);
+                    reasoning_text.push_str(text);
+                }
+            }
+        }
+        let mut live_entries = Vec::with_capacity(2);
+        for (sequence, text, kind, prefix) in [
+            (
+                first_assistant_sequence,
+                assistant_text,
+                TimelineKind::Assistant,
+                "live",
+            ),
+            (
+                first_reasoning_sequence,
+                reasoning_text,
+                TimelineKind::ReasoningSummary,
+                "live-reasoning",
+            ),
+        ] {
+            if let Some(start) = sequence.filter(|_| !text.is_empty()) {
+                live_entries.push((
+                    start,
+                    TimelineEntry {
+                        id: format!("{prefix}:{turn_id}:{start}"),
+                        kind,
+                        text: safe_display(&text),
+                        detail: None,
+                        status: Some(if stream_is_open {
+                            TimelineStatus::Running
+                        } else {
+                            TimelineStatus::Complete
+                        }),
+                    },
+                ));
+            }
+        }
+        live_entries.sort_by_key(|(sequence, _)| *sequence);
+        for (_, entry) in live_entries {
+            let id = entry.id.clone();
+            turn_id_by_entry_id.insert(id.clone(), turn_id.to_owned());
+            timeline.push(entry);
         }
     }
+    append_work_summaries(turns, &mut timeline, &mut turn_id_by_entry_id);
     let mut pending_prompt = approval_prompt(
         items,
         latest_turn_id,
@@ -123,6 +204,7 @@ pub fn project(
         thread_id: Some(context.thread_id.clone()),
         thread_title: thread_title.map(str::to_owned),
         model_identifier,
+        usage: None,
         current_model_key: Some(format!("{}/{}", context.provider_id, context.model_id)),
         reasoning_label: context
             .reasoning_level
@@ -132,12 +214,15 @@ pub fn project(
         provider_name,
         permission_label: Some(permission_label(&context.access_mode).to_owned()),
         turn_state: state,
+        local_operation: None,
+        turn_started_at,
         continuation_available: matches!(latest_status, Some("failed" | "cancelled"))
             && items.iter().any(|item| {
                 item.get("turnId").and_then(Value::as_str) == latest_turn_id
                     && item.get("kind").and_then(Value::as_str) == Some("user_input")
             }),
         timeline,
+        turn_id_by_entry_id,
         attachments: Vec::new(),
         has_older_history: false,
         pending_prompt,
@@ -147,6 +232,10 @@ pub fn project(
         permission_choices: permission_choices(),
         thread_choices: Vec::new(),
         thread_next_cursor: None,
+        fork_reply_choices: Vec::new(),
+        fork_reply_next_cursor: None,
+        fork_reply_loading: false,
+        fork_reply_load_failed: false,
         input_history_choices: Vec::new(),
         input_history_next_cursor: None,
         file_choices: Vec::new(),
@@ -155,7 +244,199 @@ pub fn project(
     })
 }
 
-/// 协议历史行只投影安全 presentation；原始 Tool 参数与结果从未进入终端层。
+/// 终态摘要紧跟各自最后一条可见记录，隐藏时间损坏或逆序的 Turn 时长。
+fn append_work_summaries(
+    turns: &[Value],
+    timeline: &mut Vec<TimelineEntry>,
+    turn_id_by_entry_id: &mut HashMap<String, String>,
+) {
+    let mut summarized_turns = HashSet::new();
+    for turn in turns {
+        let Some(turn_id) = turn.get("turnId").and_then(Value::as_str) else {
+            continue;
+        };
+        if !summarized_turns.insert(turn_id) {
+            continue;
+        }
+        let Some(elapsed_seconds) = completed_elapsed_seconds(turn) else {
+            continue;
+        };
+        let Some(last_index) = timeline.iter().rposition(|entry| {
+            turn_id_by_entry_id
+                .get(&entry.id)
+                .is_some_and(|entry_turn_id| entry_turn_id == turn_id)
+        }) else {
+            continue;
+        };
+        let id = format!("turn-summary:{turn_id}");
+        timeline.insert(
+            last_index + 1,
+            TimelineEntry {
+                id: id.clone(),
+                kind: TimelineKind::WorkSummary { elapsed_seconds },
+                text: String::new(),
+                detail: None,
+                status: None,
+            },
+        );
+        turn_id_by_entry_id.insert(id, turn_id.to_owned());
+    }
+}
+
+/// 只从已确认的终态起止时间计算整秒时长，不用客户端当前时间补齐缺失事实。
+fn completed_elapsed_seconds(turn: &Value) -> Option<u64> {
+    if !matches!(
+        turn.get("status").and_then(Value::as_str),
+        Some("completed" | "failed" | "cancelled")
+    ) {
+        return None;
+    }
+    let requested_at = parse_utc_epoch_nanoseconds(turn.get("requestedAt")?.as_str()?)?;
+    let completed_at = parse_utc_epoch_nanoseconds(turn.get("completedAt")?.as_str()?)?;
+    let elapsed = completed_at.checked_sub(requested_at)?;
+    if elapsed < 0 {
+        return None;
+    }
+    u64::try_from(elapsed / 1_000_000_000).ok()
+}
+
+/// 解析 Java Instant 的固定 UTC 形式；拒绝时区偏移、非闰日、闰秒和超精度小数。
+fn parse_utc_epoch_nanoseconds(timestamp: &str) -> Option<i128> {
+    let bytes = timestamp.as_bytes();
+    if !(20..=30).contains(&bytes.len())
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || ![(0, 4), (5, 7), (8, 10), (11, 13), (14, 16), (17, 19)]
+            .iter()
+            .all(|(start, end)| bytes[*start..*end].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    let year = decimal_component(&bytes[0..4])?;
+    let month = decimal_component(&bytes[5..7])?;
+    let day = decimal_component(&bytes[8..10])?;
+    let hour = decimal_component(&bytes[11..13])?;
+    let minute = decimal_component(&bytes[14..16])?;
+    let second = decimal_component(&bytes[17..19])?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)?
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let fraction_nanos = match bytes.get(19) {
+        Some(b'Z') if bytes.len() == 20 => 0,
+        Some(b'.') if bytes.last() == Some(&b'Z') => {
+            let fraction = &bytes[20..bytes.len() - 1];
+            if fraction.is_empty() || fraction.len() > 9 || !fraction.iter().all(u8::is_ascii_digit)
+            {
+                return None;
+            }
+            decimal_component(fraction)? * 10_i128.pow((9 - fraction.len()) as u32)
+        }
+        _ => return None,
+    };
+    let year = i64::try_from(year).ok()?;
+    let month = i64::try_from(month).ok()?;
+    let day = i64::try_from(day).ok()?;
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days_since_epoch = era * 146_097 + day_of_era - 719_468;
+    let seconds_since_epoch =
+        i128::from(days_since_epoch) * 86_400 + hour * 3_600 + minute * 60 + second;
+    seconds_since_epoch
+        .checked_mul(1_000_000_000)?
+        .checked_add(fraction_nanos)
+}
+
+/// 只选权威时间最早的挂起 Turn，时间缺失或损坏时拒绝猜测，平局按 Turn ID 稳定决胜。
+pub(super) fn earliest_suspended_turn_id(history: &Value) -> Result<Option<String>, CliError> {
+    let turns = history
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("thread/read 缺少 turns"))?;
+    turns
+        .iter()
+        .filter(|turn| {
+            turn.get("origin").and_then(Value::as_str) != Some("inherited")
+                && turn.get("status").and_then(Value::as_str) == Some("suspended")
+        })
+        .map(|turn| {
+            let turn_id = required_str(turn, "turnId")?.to_owned();
+            let requested_at = required_str(turn, "requestedAt")?;
+            let requested_at = parse_utc_epoch_nanoseconds(requested_at)
+                .ok_or_else(|| CliError::protocol("挂起 Turn 的 requestedAt 无效"))?;
+            Ok((requested_at, turn_id))
+        })
+        .collect::<Result<Vec<_>, CliError>>()
+        .map(|turns| turns.into_iter().min().map(|(_, turn_id)| turn_id))
+}
+
+/// 固定宽度 ASCII 十进制字段避免宽松日期解析器归一化无效日期。
+fn decimal_component(bytes: &[u8]) -> Option<i128> {
+    bytes.iter().try_fold(0_i128, |value, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(i128::from(byte - b'0'))
+    })
+}
+
+/// 按公历闰年规则限制日数，确保 2 月 29 日不会被滚动到下个月。
+fn days_in_month(year: i128, month: i128) -> Option<i128> {
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if leap_year { 29 } else { 28 }),
+        _ => None,
+    }
+}
+
+/// 将通过严格校验的起始时间映射到本地时钟；超出平台 SystemTime 范围时保持未知。
+fn parse_utc_system_time(timestamp: &str) -> Option<SystemTime> {
+    let epoch_nanoseconds = parse_utc_epoch_nanoseconds(timestamp)?;
+    let magnitude = epoch_nanoseconds.checked_abs()?;
+    let seconds = u64::try_from(magnitude / 1_000_000_000).ok()?;
+    let nanos = u32::try_from(magnitude % 1_000_000_000).ok()?;
+    let duration = Duration::new(seconds, nanos);
+    if epoch_nanoseconds >= 0 {
+        UNIX_EPOCH.checked_add(duration)
+    } else {
+        UNIX_EPOCH.checked_sub(duration)
+    }
+}
+
+/// 终态快照已包含完整业务结果，之后出队的旧增量不能再次成为活动流；未知 Turn 仍待接续。
+pub(super) fn turn_is_terminal(history: &Value, turn_id: &str) -> bool {
+    history
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("turnId").and_then(Value::as_str) == Some(turn_id))
+        })
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"))
+}
+
+/// 工具只消费安全 presentation；缺失结果不能用输入补齐，多行命令标题保留可见分隔。
 fn project_item(
     item: &Value,
     turn_status: Option<&str>,
@@ -164,26 +445,7 @@ fn project_item(
     let kind = required_str(item, "kind")?;
     let entry = match kind {
         "user_input" => {
-            let content = item
-                .get("content")
-                .and_then(Value::as_array)
-                .ok_or_else(|| CliError::protocol("用户历史缺少 content"))?;
-            let text = content
-                .iter()
-                .filter_map(|block| match block.get("type").and_then(Value::as_str) {
-                    Some("text") => block.get("text").and_then(Value::as_str).map(str::to_owned),
-                    Some("workspace_reference") => block
-                        .get("relativePath")
-                        .and_then(Value::as_str)
-                        .map(|path| format!("@{path}")),
-                    Some("skill_reference") => block
-                        .get("skillId")
-                        .and_then(Value::as_str)
-                        .map(|id| format!("${}", id.split_once(':').map_or(id, |(_, name)| name))),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let text = user_input_display(item, None)?;
             TimelineEntry {
                 id,
                 kind: TimelineKind::User,
@@ -209,7 +471,7 @@ fn project_item(
         },
         "reasoning_summary" => TimelineEntry {
             id,
-            kind: TimelineKind::Commentary,
+            kind: TimelineKind::ReasoningSummary,
             text: safe_display(text_field(item, "text")?),
             detail: None,
             status: None,
@@ -243,7 +505,13 @@ fn project_item(
                 Some("error" | "cancelled") => Some(TimelineStatus::Failed),
                 _ => Some(TimelineStatus::Running),
             };
-            let output = ["outputPreview", "stdout", "summary"]
+            let output_fields = if presentation.get("kind").and_then(Value::as_str) == Some("shell")
+            {
+                ["stdout", "outputPreview", "summary"]
+            } else {
+                ["outputPreview", "stdout", "summary"]
+            };
+            let output = output_fields
                 .into_iter()
                 .filter_map(|key| presentation.get(key).and_then(Value::as_str))
                 .find(|text| !text.trim().is_empty());
@@ -257,13 +525,19 @@ fn project_item(
                 .filter(|text| !text.trim().is_empty() && text.trim() != target.trim());
             let detail = error
                 .or(output)
-                .or(input)
-                .map(|text| safe_display(text.trim()));
+                .map(|text| safe_display(text.trim()))
+                .or_else(|| {
+                    (status == Some(TimelineStatus::Running))
+                        .then(|| input.map(|text| format!("输入：{}", safe_display(text.trim()))))
+                        .flatten()
+                });
             TimelineEntry {
                 id,
                 kind: TimelineKind::Tool {
                     action: action.into(),
-                    target: safe_display(target),
+                    target: safe_display(target).replace('\n', " ↵ "),
+                    preview_truncated: presentation.get("truncated").and_then(Value::as_bool)
+                        == Some(true),
                 },
                 text: String::new(),
                 detail,
@@ -281,6 +555,38 @@ fn project_item(
         _ => return Err(CliError::protocol("未知历史条目类型")),
     };
     Ok(Some(entry))
+}
+
+/// 保留结构化引用，只在详情读取成功后用全文替换用户输入的有界 text 预览。
+pub(super) fn user_input_display(
+    item: &Value,
+    full_text: Option<&str>,
+) -> Result<String, CliError> {
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("用户历史缺少 content"))?;
+    let mut chunks = content
+        .iter()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("text") if full_text.is_none() => {
+                block.get("text").and_then(Value::as_str).map(str::to_owned)
+            }
+            Some("workspace_reference") => block
+                .get("relativePath")
+                .and_then(Value::as_str)
+                .map(|path| format!("@{path}")),
+            Some("skill_reference") => block
+                .get("skillId")
+                .and_then(Value::as_str)
+                .map(|id| format!("${}", id.split_once(':').map_or(id, |(_, name)| name))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(full_text) = full_text {
+        chunks.push(full_text.to_owned());
+    }
+    Ok(chunks.join(" "))
 }
 
 /// 只有最新待审批 Turn 的未裁决记录才能成为可点击审批；revision 来自同次权威读回。
@@ -397,9 +703,9 @@ fn clarification_prompt(interaction: &Value) -> Result<Option<PendingPrompt>, Cl
     }
     Ok(Some(PendingPrompt::Clarification {
         thread_id: required_str(request, "threadId")?.to_owned(),
-        request_id: required_str(request, "requestId")?.to_owned(),
-        expected_revision: required_u64(request, "revision")?,
-        idempotency_key: format!("cli-{}", uuid::Uuid::new_v4().simple()),
+        interaction_id: required_str(request, "interactionId")?.to_owned(),
+        expected_interaction_revision: required_u64(request, "interactionRevision")?,
+        operation_key: format!("cli-{}", uuid::Uuid::new_v4().simple()),
         questions,
     }))
 }

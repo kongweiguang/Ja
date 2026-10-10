@@ -4,12 +4,13 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  publishTaskHostEvent,
-  useTaskController,
+  publishTaskHostEvent as publishTaskHostEventRaw,
+  useTaskController as useTaskControllerImpl,
   type TaskPort,
   type TaskReadModel,
   type TaskSummary,
 } from "@/features/tasks";
+import type { TaskHostEvent } from "@/features/tasks/domain/taskModel";
 import type {
   TaskApprovalPort,
   TaskResumePort,
@@ -17,6 +18,48 @@ import type {
   TaskTranscriptPort,
   TaskTranscriptSnapshot,
 } from "@/features/tasks/application/ports";
+
+type TranscriptProjection = Parameters<typeof useTaskControllerImpl>[0]["applyTranscriptSnapshot"];
+type TestTaskControllerOptions = Omit<
+  Parameters<typeof useTaskControllerImpl>[0],
+  "applyTranscriptSnapshot" | "onSideTaskClosed" | "runtimeFence"
+> & {
+  applyTranscriptSnapshot?: TranscriptProjection;
+  onSideTaskClosed?: Parameters<typeof useTaskControllerImpl>[0]["onSideTaskClosed"];
+  runtimeFence?: Parameters<typeof useTaskControllerImpl>[0]["runtimeFence"] | null;
+};
+
+type TestRuntimeFence = NonNullable<Parameters<typeof useTaskControllerImpl>[0]["runtimeFence"]>;
+const TEST_RUNTIME_FENCE: TestRuntimeFence = { serverInstanceId: "srv_task_test", generation: 1 };
+
+/** Task test event wrapper retains protocol runtime identity so close regressions exercise production fencing. */
+function publishTaskHostEvent(
+  event: TaskHostEvent,
+  fence: typeof TEST_RUNTIME_FENCE = TEST_RUNTIME_FENCE,
+): void {
+  const params = {
+    ...event.params,
+    serverInstanceId: fence.serverInstanceId,
+    generation: fence.generation,
+  };
+  publishTaskHostEventRaw({ ...event, params } as TaskHostEvent);
+}
+
+/** Most tests use one ready Runtime; null explicitly models an unowned boot state without inventing a fence. @author kongweiguang */
+function useTaskController(options: TestTaskControllerOptions) {
+  return useTaskControllerImpl({
+    ...options,
+    runtimeFence:
+      options.runtimeFence === null ? undefined : (options.runtimeFence ?? TEST_RUNTIME_FENCE),
+    onSideTaskClosed: options.onSideTaskClosed ?? (async () => true),
+    applyTranscriptSnapshot: options.applyTranscriptSnapshot ?? acceptTaskTranscriptSnapshot,
+  });
+}
+
+/** Isolate unrelated controller tests from the TimelineStore adapter contract. */
+function acceptTaskTranscriptSnapshot(): boolean {
+  return true;
+}
 
 const task: TaskSummary = {
   taskThreadId: "thr_child",
@@ -47,7 +90,6 @@ function taskRead(summary: TaskSummary = task): TaskReadModel {
     thread: {
       threadId: summary.taskThreadId,
       workspaceId: "ws_root",
-      activeGoalId: null,
       preferences: {
         providerId: "provider_test",
         modelId: "model_test",
@@ -112,7 +154,6 @@ function rootThreadSnapshot(threadId: string, revision: number) {
     contextUsage: null,
     liveStream: null,
     taskActivities: [],
-    goalActivities: [],
     nextCursor: null,
   };
 }
@@ -129,6 +170,7 @@ function taskTranscriptSnapshot(
     revision,
     turns: [
       {
+        origin: "native" as const,
         turnId: "turn_child",
         status,
         requestedAt: "2026-09-10T10:00:00Z",
@@ -142,19 +184,25 @@ function taskTranscriptSnapshot(
       status === "completed"
         ? [
             {
+              origin: "native" as const,
               itemId: "item_final",
               createdAt: "2026-09-10T10:00:01Z",
               turnId: "turn_child",
               kind: "final_answer",
+              truncated: false,
+              totalCharacters: Array.from(text).length,
               text,
             },
           ]
         : [
             {
+              origin: "native" as const,
               itemId: "item_progress",
               createdAt: "2026-09-10T10:00:00Z",
               turnId: "turn_child",
               kind: "assistant_progress",
+              truncated: false,
+              totalCharacters: Array.from(text).length,
               text,
               modelRound: 1,
             },
@@ -163,7 +211,6 @@ function taskTranscriptSnapshot(
     contextUsage: null,
     liveStream: null,
     taskActivities: [],
-    goalActivities: [],
     nextCursor: null,
   };
 }
@@ -187,7 +234,7 @@ function createPorts(): {
     })),
     unobserve: vi.fn(async () => undefined),
     seen: vi.fn(async () => ({ accepted: true as const, task })),
-    close: vi.fn(async () => ({ closed: true as const })),
+    close: vi.fn(async ({ taskThreadId }) => ({ closedThreadIds: [taskThreadId] })),
     messageSend: vi.fn(async () => ({
       accepted: true as const,
       messageId: "msg_1",
@@ -219,7 +266,6 @@ function createPorts(): {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       })),
     },
@@ -460,6 +506,122 @@ describe("useTaskController", () => {
     expect(ports.port.unobserve).not.toHaveBeenCalled();
   });
 
+  /** 取消 CAS 冲突只读回一次详情与 root Task 树；下一次显式调用必须使用新 revision。 */
+  it("取消 CAS 冲突刷新最新后代树但不自动重发，显式再试使用最新 revision", async () => {
+    const ports = createPorts();
+    const latest = { ...task, revision: 7, descendantCount: 1, runningDescendantCount: 1 };
+    const latestDescendant = {
+      ...task,
+      taskThreadId: "thr_descendant_latest",
+      parentThreadId: task.taskThreadId,
+      taskName: "新后代",
+      depth: 2,
+      revision: 1,
+      unreadCount: 0,
+    };
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        parentRevision: 4,
+        activeTaskThreadId: task.taskThreadId,
+        visible: true,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+      }),
+    );
+    await waitFor(() => expect(result.current.readyTaskThreadId).toBe(task.taskThreadId));
+    const readsBeforeConflict = vi.mocked(ports.port.read).mock.calls.length;
+    const listsBeforeConflict = vi.mocked(ports.port.list).mock.calls.length;
+    const transcriptsBeforeConflict = vi.mocked(ports.transcript.read).mock.calls.length;
+    vi.mocked(ports.port.read).mockResolvedValueOnce(taskRead(latest));
+    vi.mocked(ports.port.list).mockResolvedValueOnce({ items: [latest, latestDescendant] });
+    vi.mocked(ports.port.cancel)
+      .mockRejectedValueOnce(taskRevisionConflict())
+      .mockResolvedValueOnce({
+        accepted: true,
+        task: { ...latest, state: "cancelled", revision: latest.revision + 1 },
+      });
+
+    let conflict: unknown;
+    await act(async () => {
+      conflict = await result.current.cancel(task).catch((error: unknown) => error);
+    });
+
+    expect(conflict).toMatchObject({ code: "TASK_CONTEXT_REVISION_CONFLICT" });
+    expect(vi.mocked(ports.port.cancel)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(ports.port.read)).toHaveBeenCalledTimes(readsBeforeConflict + 1);
+    expect(vi.mocked(ports.port.list)).toHaveBeenCalledTimes(listsBeforeConflict + 1);
+    expect(vi.mocked(ports.transcript.read)).toHaveBeenCalledTimes(transcriptsBeforeConflict + 1);
+    expect(result.current.detail?.task.revision).toBe(latest.revision);
+    expect(result.current.tasks).toContainEqual(latest);
+    expect(result.current.tasks).toContainEqual(latestDescendant);
+
+    await act(async () => {
+      await result.current.cancel(task);
+    });
+    expect(vi.mocked(ports.port.cancel)).toHaveBeenNthCalledWith(2, {
+      taskThreadId: task.taskThreadId,
+      expectedTaskRevision: latest.revision,
+    });
+  });
+
+  /** 切到 B 后迟到的 A 冲突不能发起恢复读取，也不能把 A 状态写进当前详情。 */
+  it("迟到的 Thread A 取消冲突不会刷新或污染当前 Thread B", async () => {
+    const ports = createPorts();
+    const nextTask = { ...task, taskThreadId: "thr_next", taskName: "下一个任务" };
+    const pendingCancel = deferred<Awaited<ReturnType<TaskPort["cancel"]>>>();
+    vi.mocked(ports.port.list).mockImplementation(async () => ({ items: [task, nextTask] }));
+    vi.mocked(ports.port.read).mockImplementation(async ({ taskThreadId }) =>
+      taskRead(taskThreadId === nextTask.taskThreadId ? nextTask : task),
+    );
+    vi.mocked(ports.transcript.read).mockImplementation(async ({ threadId }) =>
+      taskTranscriptSnapshot(threadId, 2, "running", ""),
+    );
+    vi.mocked(ports.port.observe).mockImplementation(async ({ taskThreadId }) => ({
+      observationId: `observation_${taskThreadId}`,
+      taskThreadId,
+      revision: 2,
+    }));
+    vi.mocked(ports.port.cancel).mockReturnValueOnce(pendingCancel.promise);
+    const { result, rerender } = renderHook(
+      ({ activeTaskThreadId }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          parentRevision: 4,
+          activeTaskThreadId,
+          visible: true,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+        }),
+      { initialProps: { activeTaskThreadId: task.taskThreadId } },
+    );
+    await waitFor(() => expect(result.current.readyTaskThreadId).toBe(task.taskThreadId));
+    const pending = result.current.cancel(task);
+    await waitFor(() => expect(ports.port.cancel).toHaveBeenCalledTimes(1));
+
+    rerender({ activeTaskThreadId: nextTask.taskThreadId });
+    await waitFor(() => expect(result.current.readyTaskThreadId).toBe(nextTask.taskThreadId));
+    const readsAfterSwitch = vi.mocked(ports.port.read).mock.calls.length;
+    const listsAfterSwitch = vi.mocked(ports.port.list).mock.calls.length;
+    pendingCancel.reject(taskRevisionConflict());
+    let conflict: unknown;
+    await act(async () => {
+      conflict = await pending.catch((error: unknown) => error);
+    });
+
+    expect(conflict).toMatchObject({ code: "TASK_CONTEXT_REVISION_CONFLICT" });
+    expect(vi.mocked(ports.port.cancel)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(ports.port.read)).toHaveBeenCalledTimes(readsAfterSwitch);
+    expect(vi.mocked(ports.port.list)).toHaveBeenCalledTimes(listsAfterSwitch);
+    expect(result.current.detail?.task.taskThreadId).toBe(nextTask.taskThreadId);
+  });
+
   it("详情关闭后释放迟到 observe 句柄且不重新订阅", async () => {
     const ports = createPorts();
     const pendingObservation = deferred<{
@@ -497,6 +659,91 @@ describe("useTaskController", () => {
     );
     expect(ports.port.observe).toHaveBeenCalledTimes(1);
     expect(ports.port.cancel).not.toHaveBeenCalled();
+  });
+
+  /** 关闭旧 Thread 时若 Task observe 尚未 ACK，其迟到句柄只能释放旧身份。 */
+  it("旧 Thread 关闭后迟到 observe 不会解除新 Thread 的观察", async () => {
+    const ports = createPorts();
+    const closedTask = sideTaskSummary();
+    const nextTask = sideTaskSummary({
+      taskThreadId: "thr_next_child",
+      taskName: "新侧聊",
+    });
+    const pendingObservation = deferred<{
+      observationId: string;
+      taskThreadId: string;
+      revision: number;
+    }>();
+    vi.mocked(ports.port.read).mockImplementation(async ({ taskThreadId }) =>
+      taskRead(taskThreadId === closedTask.taskThreadId ? closedTask : nextTask),
+    );
+    vi.mocked(ports.transcript.read).mockImplementation(async ({ threadId }) =>
+      taskTranscriptSnapshot(
+        threadId,
+        threadId === closedTask.taskThreadId ? closedTask.revision : nextTask.revision,
+        "running",
+        "",
+      ),
+    );
+    vi.mocked(ports.port.observe).mockImplementation(async ({ taskThreadId }) =>
+      taskThreadId === closedTask.taskThreadId
+        ? pendingObservation.promise
+        : {
+            observationId: "observation_next",
+            taskThreadId,
+            revision: nextTask.revision,
+          },
+    );
+    const { rerender } = renderHook(
+      ({ activeTaskThreadId }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          activeTaskThreadId,
+          visible: true,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+        }),
+      { initialProps: { activeTaskThreadId: closedTask.taskThreadId } },
+    );
+    await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(1));
+
+    act(() =>
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: {
+          rootThreadId: "thr_root",
+          taskThreadId: closedTask.taskThreadId,
+          closedThreadIds: [closedTask.taskThreadId],
+        },
+      }),
+    );
+    rerender({ activeTaskThreadId: nextTask.taskThreadId });
+    await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(ports.transcript.observe).toHaveBeenCalledWith({
+        threadId: nextTask.taskThreadId,
+      }),
+    );
+
+    pendingObservation.resolve({
+      observationId: "observation_late_closed",
+      taskThreadId: closedTask.taskThreadId,
+      revision: closedTask.revision,
+    });
+    await waitFor(() =>
+      expect(ports.port.unobserve).toHaveBeenCalledExactlyOnceWith({
+        observationId: "observation_late_closed",
+      }),
+    );
+    expect(ports.port.unobserve).not.toHaveBeenCalledWith({
+      observationId: "observation_next",
+    });
+    expect(ports.transcript.unobserve).toHaveBeenCalledExactlyOnceWith({
+      threadId: closedTask.taskThreadId,
+    });
   });
 
   it("首次创建与后续 follow-up 使用不同原生用例并保留显式 revision", async () => {
@@ -542,7 +789,8 @@ describe("useTaskController", () => {
     expect(ports.port.messageSend).not.toHaveBeenCalled();
   });
 
-  it("侧聊激活等待 observe 后再发送，终态 ACK 不被迟到 running 投影覆盖", async () => {
+  /** 服务端 readiness waiter 完成后，React 可见标记在后续状态提交中落定。 */
+  it("侧聊激活等待 observe 和 snapshot 投影后再发送", async () => {
     const ports = createPorts();
     const initialDetail = deferred<TaskReadModel>();
     const postObserveDetail = deferred<TaskReadModel>();
@@ -595,6 +843,11 @@ describe("useTaskController", () => {
       turnId: "turn_btw",
       task: completed,
     });
+    let projectedSnapshot: TaskTranscriptSnapshot | undefined;
+    const applyTranscriptSnapshot = vi.fn((snapshot: TaskTranscriptSnapshot): boolean => {
+      projectedSnapshot = snapshot;
+      return true;
+    });
 
     const { result, rerender } = renderHook(
       ({ activeTaskThreadId }: { activeTaskThreadId?: string }) =>
@@ -604,6 +857,7 @@ describe("useTaskController", () => {
           visible: true,
           port: ports.port,
           transcriptPort: ports.transcript,
+          applyTranscriptSnapshot,
           renamePort: ports.rename,
           approvalPort: ports.approval,
           resumePort: ports.resume,
@@ -621,6 +875,7 @@ describe("useTaskController", () => {
     initialTranscript.resolve(runningSnapshot);
     await waitFor(() => expect(ports.port.observe).toHaveBeenCalledTimes(1));
     expect(readySettled).toBe(false);
+    expect(result.current.readyTaskThreadId).toBeUndefined();
 
     observed.resolve({
       observationId: "observation_btw",
@@ -629,23 +884,24 @@ describe("useTaskController", () => {
     });
     await waitFor(() => expect(ports.port.read).toHaveBeenCalledTimes(2));
     expect(readySettled).toBe(false);
+    expect(result.current.readyTaskThreadId).toBeUndefined();
     postObserveDetail.resolve(taskRead(task));
     postObserveTranscript.resolve(runningSnapshot);
     await ready;
     expect(readySettled).toBe(true);
+    await waitFor(() => expect(result.current.readyTaskThreadId).toBe(task.taskThreadId));
+    expect(projectedSnapshot).toBe(runningSnapshot);
 
     await act(() => result.current.followup(task, [{ type: "text", text: "/btw" }]));
     expect(result.current.detail?.task.state).toBe("completed");
-    expect(result.current.transcript?.items.at(-1)).toEqual(
+    expect(projectedSnapshot?.items.at(-1)).toEqual(
       expect.objectContaining({ kind: "final_answer", text: "JA_SIDE_CHAT_BTW_DONE" }),
     );
 
     act(() => publishTaskActivity(lateRunning));
     await waitFor(() => expect(ports.port.read).toHaveBeenCalledTimes(3));
     expect(result.current.detail?.task.state).toBe("completed");
-    expect(result.current.transcript?.items.at(-1)).toEqual(
-      expect.objectContaining({ kind: "final_answer", text: "JA_SIDE_CHAT_BTW_DONE" }),
-    );
+    expect(applyTranscriptSnapshot).toHaveBeenLastCalledWith(lateRunningSnapshot);
   });
 
   it("侧聊 Composer 创建时使用当前 child 的来源、revision、偏好，并以该来源 follow-up", async () => {
@@ -792,8 +1048,8 @@ describe("useTaskController", () => {
     expect(ports.port.create).toHaveBeenCalledTimes(1);
   });
 
-  /** 关闭 ACK 前保留可重试投影，ACK 后连同已知后代一起从本地任务树移除。 */
-  it("侧聊关闭等待 ACK，成功后移除整棵已知子树并压制迟到事件", async () => {
+  /** 关闭范围必须来自持久 ACK，而不是当前有界摘要里碰巧可见的后代。 */
+  it("侧聊关闭等待权威 ACK，按完整 Thread 集合清理预览并压制迟到事件", async () => {
     const ports = createPorts();
     const sideTask = sideTaskSummary();
     const childTask: TaskSummary = {
@@ -806,8 +1062,15 @@ describe("useTaskController", () => {
       taskKind: "subagent",
       lifecycle: "attached",
     };
-    const closeAck = deferred<{ closed: true }>();
+    const hiddenDescendantId = "thr_hidden_descendant";
+    const closedThreadIds = [sideTask.taskThreadId, childTask.taskThreadId, hiddenDescendantId];
+    const closeAck = deferred<{ closedThreadIds: string[] }>();
+    const previewCleanup = deferred<void>();
     vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
+    const onSideTaskClosed = vi.fn(async () => {
+      void previewCleanup.promise;
+      return true;
+    });
     const { result } = renderHook(() =>
       useTaskController({
         rootThreadId: "thr_root",
@@ -818,6 +1081,7 @@ describe("useTaskController", () => {
         renamePort: ports.rename,
         approvalPort: ports.approval,
         resumePort: ports.resume,
+        onSideTaskClosed,
       }),
     );
 
@@ -835,14 +1099,324 @@ describe("useTaskController", () => {
     expect(result.current.tasks).toEqual(expect.arrayContaining([sideTask, childTask]));
 
     await act(async () => {
-      closeAck.resolve({ closed: true });
+      closeAck.resolve({ closedThreadIds });
       await pendingClose;
     });
     expect(result.current.tasks).toEqual([]);
     expect(result.current.closingTaskThreadId).toBeUndefined();
+    expect(onSideTaskClosed).toHaveBeenCalledWith(closedThreadIds, TEST_RUNTIME_FENCE);
 
     act(() => publishTaskActivity({ ...childTask, revision: childTask.revision + 1 }));
+    act(() =>
+      publishTaskActivity({
+        ...childTask,
+        taskThreadId: hiddenDescendantId,
+        parentThreadId: childTask.taskThreadId,
+        revision: childTask.revision + 1,
+      }),
+    );
     expect(result.current.tasks).toEqual([]);
+    previewCleanup.resolve();
+  });
+
+  /** 远端权威关闭事件按所属 root 收敛 Task，并对同一回执保持幂等。@author kongweiguang */
+  it("消费跨窗口 task/closed 完整集合并拒绝错误 root 和迟到活动", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const childTask: TaskSummary = {
+      ...task,
+      taskThreadId: "thr_closed_child",
+      parentThreadId: sideTask.taskThreadId,
+      rootThreadId: sideTask.rootThreadId,
+      taskName: "侧聊子任务",
+      taskKind: "subagent",
+      lifecycle: "attached",
+    };
+    const closedThreadIds = [sideTask.taskThreadId, childTask.taskThreadId, "thr_hidden_child"];
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+        onSideTaskClosed,
+      }),
+    );
+    act(() => {
+      publishTaskActivity(sideTask);
+      publishTaskActivity(childTask);
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: {
+          rootThreadId: "thr_other_root",
+          taskThreadId: sideTask.taskThreadId,
+          closedThreadIds,
+        },
+      });
+    });
+    expect(result.current.tasks).toEqual(expect.arrayContaining([sideTask, childTask]));
+    expect(onSideTaskClosed).not.toHaveBeenCalled();
+
+    act(() =>
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: { rootThreadId: "thr_root", taskThreadId: sideTask.taskThreadId, closedThreadIds },
+      }),
+    );
+    await waitFor(() => expect(result.current.tasks).toEqual([]));
+    expect(onSideTaskClosed).toHaveBeenCalledExactlyOnceWith(closedThreadIds, TEST_RUNTIME_FENCE);
+
+    act(() => {
+      publishTaskActivity({ ...childTask, revision: childTask.revision + 1 });
+      publishTaskActivity({
+        ...childTask,
+        taskThreadId: "thr_hidden_child",
+        parentThreadId: childTask.taskThreadId,
+        revision: childTask.revision + 1,
+      });
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: { rootThreadId: "thr_root", taskThreadId: sideTask.taskThreadId, closedThreadIds },
+      });
+    });
+    expect(result.current.tasks).toEqual([]);
+    expect(onSideTaskClosed).toHaveBeenCalledOnce();
+  });
+
+  /** 关闭事件必须释放当前 Thread 的两个观察 owner，后续 effect cleanup 不得重复释放。 */
+  it("活动侧聊收到关闭事件后恰好解除 Task 与 Transcript 观察", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    vi.mocked(ports.port.read).mockResolvedValue(taskRead(sideTask));
+    vi.mocked(ports.transcript.read).mockResolvedValue(
+      taskTranscriptSnapshot(sideTask.taskThreadId, sideTask.revision, "running", ""),
+    );
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { rerender } = renderHook(
+      ({ visible }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          activeTaskThreadId: sideTask.taskThreadId,
+          visible,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+          onSideTaskClosed,
+        }),
+      { initialProps: { visible: true } },
+    );
+
+    act(() => publishTaskActivity(sideTask));
+    await waitFor(() => {
+      expect(ports.port.observe).toHaveBeenCalledExactlyOnceWith({
+        taskThreadId: sideTask.taskThreadId,
+        expectedTaskRevision: sideTask.revision,
+      });
+      expect(ports.transcript.observe).toHaveBeenCalledExactlyOnceWith({
+        threadId: sideTask.taskThreadId,
+      });
+    });
+
+    act(() =>
+      publishTaskHostEvent({
+        method: "task/closed",
+        params: {
+          rootThreadId: "thr_root",
+          taskThreadId: sideTask.taskThreadId,
+          closedThreadIds: [sideTask.taskThreadId],
+        },
+      }),
+    );
+    await waitFor(() => {
+      expect(ports.port.unobserve).toHaveBeenCalledExactlyOnceWith({
+        observationId: "observation_child",
+      });
+      expect(ports.transcript.unobserve).toHaveBeenCalledExactlyOnceWith({
+        threadId: sideTask.taskThreadId,
+      });
+    });
+
+    rerender({ visible: false });
+    expect(ports.port.unobserve).toHaveBeenCalledOnce();
+    expect(ports.transcript.unobserve).toHaveBeenCalledOnce();
+    expect(onSideTaskClosed).toHaveBeenCalledExactlyOnceWith(
+      [sideTask.taskThreadId],
+      TEST_RUNTIME_FENCE,
+    );
+  });
+
+  /** 单资源缺失不能推导完整关闭集合；Transcript 仍成功时保留 Task 入口与重试反馈。@author kongweiguang */
+  it("active task/read 返回 TASK_NOT_FOUND 不冒充 close ACK，也不清理成功的 Transcript", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    vi.mocked(ports.port.read).mockResolvedValue(taskRead(sideTask));
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        activeTaskThreadId: sideTask.taskThreadId,
+        visible: true,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+        onSideTaskClosed,
+      }),
+    );
+    act(() => publishTaskActivity(sideTask));
+
+    await waitFor(() =>
+      expect(result.current.detail?.task.taskThreadId).toBe(sideTask.taskThreadId),
+    );
+    vi.mocked(ports.port.read).mockRejectedValueOnce({ code: "TASK_NOT_FOUND" });
+    await act(async () => result.current.refreshDetail());
+
+    expect(onSideTaskClosed).not.toHaveBeenCalled();
+    expect(ports.transcript.read).toHaveBeenCalledWith({
+      threadId: sideTask.taskThreadId,
+      limit: 200,
+    });
+    expect(ports.transcript.unobserve).not.toHaveBeenCalled();
+    expect(result.current.tasks).toEqual(
+      expect.arrayContaining([expect.objectContaining({ taskThreadId: sideTask.taskThreadId })]),
+    );
+    expect(result.current.detail?.task.taskThreadId).toBe(sideTask.taskThreadId);
+    expect(result.current.detailLoading).toBe(false);
+    expect(result.current.detailError).toBeDefined();
+    expect(result.current.transcriptError).toBeUndefined();
+    act(() => publishTaskActivity({ ...sideTask, revision: sideTask.revision + 1 }));
+    expect(result.current.tasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskThreadId: sideTask.taskThreadId,
+          revision: sideTask.revision + 1,
+        }),
+      ]),
+    );
+  });
+
+  /** 旧 Runtime 的迟到 read 404 仅属于原请求，不能用新 SID 同代的当前 close owner 清理。@author kongweiguang */
+  it("同 generation 切换 SID 后忽略旧 task/read 的 TASK_NOT_FOUND", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const oldRead = deferred<TaskReadModel>();
+    const newRuntimeFence: TestRuntimeFence = {
+      serverInstanceId: "srv_task_restarted",
+      generation: 1,
+    };
+    vi.mocked(ports.port.read).mockReturnValueOnce(oldRead.promise);
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result, rerender } = renderHook(
+      ({ runtimeFence }: { runtimeFence: TestRuntimeFence }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          activeTaskThreadId: sideTask.taskThreadId,
+          visible: true,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+          onSideTaskClosed,
+          runtimeFence,
+        }),
+      { initialProps: { runtimeFence: TEST_RUNTIME_FENCE } },
+    );
+    act(() => publishTaskActivity(sideTask));
+    await waitFor(() => expect(ports.port.read).toHaveBeenCalled());
+
+    rerender({ runtimeFence: newRuntimeFence });
+    await waitFor(() =>
+      expect(result.current.detail?.task.taskThreadId).toBe(sideTask.taskThreadId),
+    );
+
+    await act(async () => {
+      oldRead.reject({ code: "TASK_NOT_FOUND" });
+      await Promise.resolve();
+    });
+    expect(onSideTaskClosed).not.toHaveBeenCalled();
+    expect(result.current.tasks).toEqual(
+      expect.arrayContaining([expect.objectContaining({ taskThreadId: sideTask.taskThreadId })]),
+    );
+    expect(result.current.detail?.task.taskThreadId).toBe(sideTask.taskThreadId);
+  });
+
+  /** 权威 close 不随详情 epoch、Tab 或可见性撤销；finally 释放 busy 后同页仍可关闭另一侧聊。@author kongweiguang */
+  it("等待 close ACK 时切换并隐藏仍清理目标，且随后可以关闭另一侧聊", async () => {
+    const ports = createPorts();
+    const firstTask = sideTaskSummary();
+    const secondTask = sideTaskSummary({
+      taskThreadId: "thr_other_side",
+      taskName: "另一侧聊",
+    });
+    const closeAck = deferred<{ closedThreadIds: string[] }>();
+    vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
+    vi.mocked(ports.port.read).mockImplementation(async ({ taskThreadId }) =>
+      taskRead(taskThreadId === firstTask.taskThreadId ? firstTask : secondTask),
+    );
+    vi.mocked(ports.port.observe).mockImplementation(async ({ taskThreadId }) => ({
+      observationId: `observation_${taskThreadId}`,
+      taskThreadId,
+      revision: firstTask.revision,
+    }));
+    vi.mocked(ports.transcript.read).mockImplementation(async ({ threadId }) =>
+      taskTranscriptSnapshot(threadId, firstTask.revision, "running", "正在工作"),
+    );
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result, rerender } = renderHook(
+      ({ activeTaskThreadId, visible }: { activeTaskThreadId?: string; visible: boolean }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          activeTaskThreadId,
+          visible,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+          onSideTaskClosed,
+        }),
+      { initialProps: { activeTaskThreadId: firstTask.taskThreadId, visible: true } },
+    );
+    act(() => {
+      publishTaskActivity(firstTask);
+      publishTaskActivity(secondTask);
+    });
+    await waitFor(() =>
+      expect(ports.port.observe).toHaveBeenCalledWith(
+        expect.objectContaining({ taskThreadId: firstTask.taskThreadId }),
+      ),
+    );
+
+    let pendingClose!: Promise<void>;
+    act(() => {
+      pendingClose = result.current.close(firstTask);
+    });
+    await waitFor(() => expect(result.current.closingTaskThreadId).toBe(firstTask.taskThreadId));
+    rerender({ activeTaskThreadId: secondTask.taskThreadId, visible: false });
+
+    await act(async () => {
+      closeAck.resolve({ closedThreadIds: [firstTask.taskThreadId] });
+      await pendingClose;
+    });
+    expect(result.current.tasks).not.toContainEqual(firstTask);
+    expect(result.current.tasks).toContainEqual(secondTask);
+    expect(result.current.closingTaskThreadId).toBeUndefined();
+    expect(onSideTaskClosed).toHaveBeenCalledExactlyOnceWith(
+      [firstTask.taskThreadId],
+      TEST_RUNTIME_FENCE,
+    );
+
+    await act(async () => result.current.close(secondTask));
+    expect(ports.port.close).toHaveBeenCalledTimes(2);
+    expect(result.current.tasks).not.toContainEqual(secondTask);
   });
 
   /** 关闭拒绝不能清掉 Tab 所依赖的投影，用户可在原位重试。 */
@@ -870,11 +1444,173 @@ describe("useTaskController", () => {
     expect(result.current.closingTaskThreadId).toBeUndefined();
   });
 
+  /** 本地权威清理拒绝时，当前请求 scope 必须收到可重试错误，且不能消费关闭 ID。@author kongweiguang */
+  it("关闭 ACK 的清理被当前 Runtime 拒绝时保留入口并允许显式重试", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const onSideTaskClosed = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+        onSideTaskClosed,
+      }),
+    );
+    act(() => publishTaskActivity(sideTask));
+
+    let firstClose!: Promise<void>;
+    act(() => {
+      firstClose = result.current.close(sideTask);
+    });
+    await act(async () => {
+      await expect(firstClose).rejects.toEqual(new Error("侧聊关闭失败，请重试。"));
+    });
+    expect(result.current.tasks).toContainEqual(sideTask);
+    expect(ports.port.close).toHaveBeenCalledOnce();
+
+    await act(async () => result.current.close(sideTask));
+    expect(result.current.tasks).not.toContainEqual(sideTask);
+    expect(ports.port.close).toHaveBeenCalledTimes(2);
+    expect(onSideTaskClosed).toHaveBeenCalledTimes(2);
+  });
+
+  /** 请求期间切换 SID 后，旧 ACK 只能被丢弃，不能清理新 Runtime 中同名 Thread。@author kongweiguang */
+  it("关闭 ACK 跨到同 generation 的新 SID 时不调用新 Runtime 清理", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const closeAck = deferred<{ closedThreadIds: string[] }>();
+    vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
+    const newRuntimeFence: TestRuntimeFence = {
+      serverInstanceId: "srv_task_restarted",
+      generation: 1,
+    };
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result, rerender } = renderHook(
+      ({ runtimeFence }: { runtimeFence: TestRuntimeFence }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          visible: false,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+          onSideTaskClosed,
+          runtimeFence,
+        }),
+      { initialProps: { runtimeFence: TEST_RUNTIME_FENCE } },
+    );
+    act(() => publishTaskActivity(sideTask));
+
+    let pendingClose!: Promise<void>;
+    act(() => {
+      pendingClose = result.current.close(sideTask);
+    });
+    await waitFor(() => expect(result.current.closingTaskThreadId).toBe(sideTask.taskThreadId));
+    rerender({ runtimeFence: newRuntimeFence });
+
+    await act(async () => {
+      closeAck.resolve({ closedThreadIds: [sideTask.taskThreadId] });
+      await pendingClose;
+    });
+    expect(onSideTaskClosed).not.toHaveBeenCalled();
+    expect(result.current.tasks).toContainEqual(sideTask);
+  });
+
+  /** Same-ID 新 Runtime 可并发重试 close；旧请求 finally 只能释放自己捕获的 owner token。@author kongweiguang */
+  it("旧 SID 的 close 拒绝与 finally 不会释放新 SID 同 ID 的关闭锁", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const oldClose = deferred<{ closedThreadIds: string[] }>();
+    const newClose = deferred<{ closedThreadIds: string[] }>();
+    vi.mocked(ports.port.close)
+      .mockReturnValueOnce(oldClose.promise)
+      .mockReturnValueOnce(newClose.promise);
+    const newRuntimeFence: TestRuntimeFence = {
+      serverInstanceId: "srv_task_restarted",
+      generation: TEST_RUNTIME_FENCE.generation,
+    };
+    const onSideTaskClosed = vi.fn(async () => true);
+    const { result, rerender } = renderHook(
+      ({ runtimeFence }: { runtimeFence: TestRuntimeFence }) =>
+        useTaskController({
+          rootThreadId: "thr_root",
+          visible: false,
+          port: ports.port,
+          transcriptPort: ports.transcript,
+          renamePort: ports.rename,
+          approvalPort: ports.approval,
+          resumePort: ports.resume,
+          onSideTaskClosed,
+          runtimeFence,
+        }),
+      { initialProps: { runtimeFence: TEST_RUNTIME_FENCE } },
+    );
+    act(() => publishTaskActivity(sideTask));
+
+    let oldRequest!: Promise<void>;
+    act(() => {
+      oldRequest = result.current.close(sideTask);
+    });
+    rerender({ runtimeFence: newRuntimeFence });
+
+    let currentRequest!: Promise<void>;
+    act(() => {
+      currentRequest = result.current.close(sideTask);
+    });
+    await waitFor(() => expect(result.current.closingTaskThreadId).toBe(sideTask.taskThreadId));
+
+    await act(async () => {
+      oldClose.reject(new Error("old runtime close failed"));
+      await expect(oldRequest).rejects.toEqual(new Error("侧聊关闭失败，请重试。"));
+    });
+    expect(result.current.closingTaskThreadId).toBe(sideTask.taskThreadId);
+    expect(onSideTaskClosed).not.toHaveBeenCalled();
+
+    await act(async () => {
+      newClose.resolve({ closedThreadIds: [sideTask.taskThreadId] });
+      await currentRequest;
+    });
+    expect(onSideTaskClosed).toHaveBeenCalledExactlyOnceWith(
+      [sideTask.taskThreadId],
+      newRuntimeFence,
+    );
+    expect(result.current.closingTaskThreadId).toBeUndefined();
+  });
+
+  /** 没有请求起点 Runtime 身份时不能发送关闭副作用，避免 ACK 无法安全归属。@author kongweiguang */
+  it("Runtime fence 尚未建立时拒绝发起关闭 RPC", async () => {
+    const ports = createPorts();
+    const sideTask = sideTaskSummary();
+    const { result } = renderHook(() =>
+      useTaskController({
+        rootThreadId: "thr_root",
+        visible: false,
+        port: ports.port,
+        transcriptPort: ports.transcript,
+        renamePort: ports.rename,
+        approvalPort: ports.approval,
+        resumePort: ports.resume,
+        runtimeFence: null,
+      }),
+    );
+
+    await expect(result.current.close(sideTask)).rejects.toEqual(
+      new Error("侧聊关闭失败，请重试。"),
+    );
+    expect(ports.port.close).not.toHaveBeenCalled();
+  });
+
   /** 关闭进入服务端 ACK 等待后立即拒绝新的 follow-up，避免向待销毁目标排队输入。 */
   it("侧聊关闭期间拒绝 follow-up 且不调用发送端口", async () => {
     const ports = createPorts();
     const sideTask = sideTaskSummary();
-    const closeAck = deferred<{ closed: true }>();
+    const closeAck = deferred<{ closedThreadIds: string[] }>();
     vi.mocked(ports.port.close).mockReturnValueOnce(closeAck.promise);
     const { result } = renderHook(() =>
       useTaskController({
@@ -899,7 +1635,7 @@ describe("useTaskController", () => {
     expect(ports.port.followup).not.toHaveBeenCalled();
 
     await act(async () => {
-      closeAck.resolve({ closed: true });
+      closeAck.resolve({ closedThreadIds: [sideTask.taskThreadId] });
       await pendingClose;
     });
   });
@@ -926,7 +1662,6 @@ describe("useTaskController", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     });
     vi.mocked(ports.rename.rename).mockResolvedValue({
@@ -1052,13 +1787,14 @@ describe("useTaskController", () => {
     await act(() => result.current.followup(task, [{ type: "text", text: "改查迁移" }]));
 
     const calls = vi.mocked(ports.port.followup).mock.calls;
-    expect(calls[0]?.[0].idempotencyKey).toBe(calls[1]?.[0].idempotencyKey);
-    expect(calls[2]?.[0].idempotencyKey).not.toBe(calls[1]?.[0].idempotencyKey);
+    expect(calls[0]?.[0].operationKey).toBe(calls[1]?.[0].operationKey);
+    expect(calls[2]?.[0].operationKey).not.toBe(calls[1]?.[0].operationKey);
   });
 
-  it("task/read 失败时仍独立保留 thread/read Transcript 且不建立无 revision 观察", async () => {
+  it("task/read 失败时仍投影 thread/read 快照且不建立无 revision 观察", async () => {
     const ports = createPorts();
     vi.mocked(ports.port.read).mockRejectedValue(new Error("private task failure"));
+    const applyTranscriptSnapshot = vi.fn(acceptTaskTranscriptSnapshot);
     const { result } = renderHook(() =>
       useTaskController({
         rootThreadId: "thr_root",
@@ -1067,6 +1803,7 @@ describe("useTaskController", () => {
         visible: true,
         port: ports.port,
         transcriptPort: ports.transcript,
+        applyTranscriptSnapshot,
         renamePort: ports.rename,
         approvalPort: ports.approval,
         resumePort: ports.resume,
@@ -1075,13 +1812,16 @@ describe("useTaskController", () => {
 
     await waitFor(() => expect(result.current.detailError).toBeDefined());
     expect(result.current.detail).toBeUndefined();
-    expect(result.current.transcript?.threadId).toBe("thr_child");
+    expect(applyTranscriptSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "thr_child" }),
+    );
     expect(result.current.transcriptError).toBeUndefined();
     expect(ports.port.observe).not.toHaveBeenCalled();
   });
 
   it("suspended Task 使用最早 suspended Turn 与 Transcript revision 恢复并权威重读", async () => {
     const ports = createPorts();
+    const applyTranscriptSnapshot = vi.fn(acceptTaskTranscriptSnapshot);
     const suspended = { ...task, state: "suspended" as const, revision: 8 };
     vi.mocked(ports.port.read).mockResolvedValue(taskRead(suspended));
     vi.mocked(ports.transcript.read).mockResolvedValue({
@@ -1089,6 +1829,7 @@ describe("useTaskController", () => {
       revision: 11,
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_old",
           status: "suspended",
           requestedAt: "2026-09-03T07:00:00Z",
@@ -1098,6 +1839,7 @@ describe("useTaskController", () => {
           changeSet: null,
         },
         {
+          origin: "native" as const,
           turnId: "turn_latest",
           status: "suspended",
           requestedAt: "2026-09-03T08:00:00Z",
@@ -1112,7 +1854,6 @@ describe("useTaskController", () => {
       contextUsage: null,
       liveStream: null,
       taskActivities: [],
-      goalActivities: [],
       nextCursor: null,
     });
     const { result } = renderHook(() =>
@@ -1123,12 +1864,17 @@ describe("useTaskController", () => {
         visible: true,
         port: ports.port,
         transcriptPort: ports.transcript,
+        applyTranscriptSnapshot,
         renamePort: ports.rename,
         approvalPort: ports.approval,
         resumePort: ports.resume,
       }),
     );
-    await waitFor(() => expect(result.current.transcript?.revision).toBe(11));
+    await waitFor(() =>
+      expect(applyTranscriptSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({ revision: 11, threadId: suspended.taskThreadId }),
+      ),
+    );
 
     await act(() => result.current.resume(suspended));
 
@@ -1137,7 +1883,7 @@ describe("useTaskController", () => {
       expectedThreadRevision: 11,
     });
     expect(ports.port.read).toHaveBeenCalledTimes(3);
-    expect(ports.transcript.read).toHaveBeenCalledTimes(3);
+    expect(ports.transcript.read).toHaveBeenCalledTimes(4);
   });
 
   it("task/seen 提升 revision 后同步详情，后续 follow-up 不提交旧 CAS", async () => {
@@ -1311,6 +2057,6 @@ describe("useTaskController", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.[0].expectedTaskRevision).toBe(2);
     expect(calls[1]?.[0].expectedTaskRevision).toBe(4);
-    expect(calls[1]?.[0].idempotencyKey).toBe(calls[0]?.[0].idempotencyKey);
+    expect(calls[1]?.[0].operationKey).toBe(calls[0]?.[0].operationKey);
   });
 });

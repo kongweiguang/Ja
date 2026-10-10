@@ -15,6 +15,80 @@ fn active_cancellation() -> CancellationToken {
     CancellationToken::new()
 }
 
+/// A cancellation that wins before the irreversible import boundary must prevent that boundary.
+#[test]
+fn cancellation_before_commit_prevents_import_claim() {
+    let operation_id = next_operation_id();
+    let operation = crate::review::application::operation::ReviewOperation::begin(Some(
+        operation_id.clone(),
+    ))
+    .expect("operation");
+
+    assert!(
+        crate::review::application::operation::ReviewOperation::cancel(&operation_id)
+            .expect("cancel")
+    );
+    assert!(!operation.begin_commit().expect("commit claim"));
+    assert!(operation.cancellation().is_cancelled());
+}
+
+/// Once import owns the commit boundary, cancellation reports that it did not cancel the operation.
+#[test]
+fn commit_claim_rejects_late_cancellation() {
+    let operation_id = next_operation_id();
+    let operation = crate::review::application::operation::ReviewOperation::begin(Some(
+        operation_id.clone(),
+    ))
+    .expect("operation");
+
+    assert!(operation.begin_commit().expect("commit claim"));
+    assert!(
+        !crate::review::application::operation::ReviewOperation::cancel(&operation_id)
+            .expect("cancel")
+    );
+    assert!(!operation.cancellation().is_cancelled());
+}
+
+/// Concurrent cancellation and commit have one mutex-ordered winner, never both accepted.
+#[test]
+fn cancellation_and_commit_have_one_linearized_winner() {
+    let operation_id = next_operation_id();
+    let operation = crate::review::application::operation::ReviewOperation::begin(Some(
+        operation_id.clone(),
+    ))
+    .expect("operation");
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    std::thread::scope(|scope| {
+        let commit_barrier = Arc::clone(&barrier);
+        let commit_operation = &operation;
+        let commit = scope.spawn(move || {
+            commit_barrier.wait();
+            commit_operation.begin_commit().expect("commit claim")
+        });
+
+        let cancel_barrier = Arc::clone(&barrier);
+        let cancel_operation_id = operation_id.clone();
+        let cancel = scope.spawn(move || {
+            cancel_barrier.wait();
+            crate::review::application::operation::ReviewOperation::cancel(&cancel_operation_id)
+                .expect("cancel")
+        });
+
+        barrier.wait();
+        let committed = commit.join().expect("commit worker");
+        let cancelled = cancel.join().expect("cancel worker");
+        assert_ne!(committed, cancelled);
+        assert_eq!(operation.cancellation().is_cancelled(), cancelled);
+    });
+}
+
+/// Each concurrent case gets a distinct registry key so process-global state cannot couple tests.
+fn next_operation_id() -> ReviewOperationId {
+    ReviewOperationId::parse(format!("review_capture_{}", Uuid::new_v4().simple()))
+        .expect("operation identity")
+}
+
 /// fake port 只记录 application 的调用阶段，避免用真实 Git 掩盖用例层不变量。
 struct FakeReviewPort {
     snapshot: Mutex<ReviewSnapshot>,

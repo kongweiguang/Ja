@@ -185,12 +185,15 @@ describe("Files controller collaborators", () => {
       mounted: { current: true },
       lifecycleFence,
       lifecycleLease,
+      lifecycleLeaseMode: { current: undefined },
       lifecycleLeaseHolders,
       documents,
       scheduledSave: { current: vi.fn() },
       flush: { current: flush },
       inFlight: { current: new Map<string, number>() },
       externalConflictChecks: { current: new Set<string>() },
+      mutationRecoveryRequired: { current: false },
+      commitWorkspaceRebind: vi.fn(),
       setLifecycleClosing: closing.write,
     });
 
@@ -234,12 +237,15 @@ describe("Files controller collaborators", () => {
         mounted: { current: true },
         lifecycleFence,
         lifecycleLease,
+        lifecycleLeaseMode: { current: undefined },
         lifecycleLeaseHolders,
         documents,
         scheduledSave: { current: scheduledSave },
         flush: { current: (path) => coordinator.flush(path) },
         inFlight: { current: new Map<string, number>() },
         externalConflictChecks: { current: new Set<string>() },
+        mutationRecoveryRequired: { current: false },
+        commitWorkspaceRebind: vi.fn(),
         setLifecycleClosing: closing.write,
         onNotice: notice,
         workspaceChangeDeadline: { timeoutMillis: 1_000, timer: deadlineTimer },
@@ -274,5 +280,105 @@ describe("Files controller collaborators", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /** @author kongweiguang：项目协调器只接收未保存路径与状态，不跨 Files 边界读取正文。 */
+  it("Lifecycle 只投影未保存文档摘要", () => {
+    const documents = {
+      current: {
+        "draft.ts": dirtyDocument("draft.ts"),
+        "saved.ts": { ...dirtyDocument("saved.ts"), status: "clean" as const },
+        "external.txt": { ...dirtyDocument("external.txt"), readOnly: true },
+      },
+    };
+    const useCases = createLifecycleUseCases({
+      saveCoordinator: new FilesSaveCoordinator({
+        timer: { set: () => 1, clear: vi.fn() },
+        saveOnce: async () => true,
+        shouldContinue: () => false,
+      }),
+      mounted: { current: true },
+      lifecycleFence: { current: false },
+      lifecycleLease: { current: undefined },
+      lifecycleLeaseMode: { current: undefined },
+      lifecycleLeaseHolders: { current: 0 },
+      documents,
+      scheduledSave: { current: vi.fn() },
+      flush: { current: vi.fn(async () => undefined) },
+      inFlight: { current: new Map<string, number>() },
+      externalConflictChecks: { current: new Set<string>() },
+      mutationRecoveryRequired: { current: false },
+      commitWorkspaceRebind: vi.fn(),
+      setLifecycleClosing: vi.fn(),
+    });
+
+    expect(useCases.listUnsavedDocuments()).toEqual([{ path: "draft.ts", status: "dirty" }]);
+    expect(useCases.listUnsavedDocuments()[0]).not.toHaveProperty("content");
+  });
+
+  /** @author kongweiguang：放弃不启动保存，且仅服务端确认目录重绑后 commit 才清理旧投影。 */
+  it("Lifecycle discard waits for an in-flight CAS and preserves the draft until commit", async () => {
+    const documents: { current: Record<string, OpenDocument> } = {
+      current: { "main.ts": { ...dirtyDocument("main.ts"), status: "saving" } },
+    };
+    const inFlight = { current: new Map<string, number>([["main.ts", 1]]) };
+    const save = deferred<boolean>();
+    const saveOnce = vi.fn(async () => {
+      const result = await save.promise;
+      inFlight.current.delete("main.ts");
+      documents.current["main.ts"] = { ...documents.current["main.ts"]!, status: "saveError" };
+      return result;
+    });
+    const commitWorkspaceRebind = vi.fn();
+    const lifecycleFence = { current: false };
+    const coordinator = new FilesSaveCoordinator({
+      timer: { set: () => 1, clear: vi.fn() },
+      saveOnce,
+      shouldContinue: () => false,
+    });
+    const context = {
+      saveCoordinator: coordinator,
+      mounted: { current: true },
+      lifecycleFence,
+      lifecycleLease: { current: undefined as Promise<void> | undefined },
+      lifecycleLeaseMode: {
+        current: undefined as "flush" | "rebind-save" | "rebind-discard" | undefined,
+      },
+      lifecycleLeaseHolders: { current: 0 },
+      documents,
+      scheduledSave: { current: vi.fn() },
+      flush: { current: vi.fn(async () => undefined) },
+      inFlight,
+      externalConflictChecks: { current: new Set<string>() },
+      mutationRecoveryRequired: { current: false },
+      commitWorkspaceRebind,
+      setLifecycleClosing: vi.fn(),
+    };
+    const useCases = createLifecycleUseCases(context);
+    const pendingSave = coordinator.flush("main.ts");
+    let granted = false;
+    const preparing = useCases.prepareForWorkspaceRebind("discard").then((lease) => {
+      granted = true;
+      return lease;
+    });
+    await Promise.resolve();
+    expect(granted).toBe(false);
+    expect(saveOnce).toHaveBeenCalledOnce();
+    expect(lifecycleFence.current).toBe(true);
+
+    save.resolve(false);
+    await pendingSave;
+    const lease = await preparing;
+    expect(granted).toBe(true);
+    expect(saveOnce).toHaveBeenCalledOnce();
+    expect(documents.current["main.ts"]?.content).toBe("draft");
+    expect(commitWorkspaceRebind).not.toHaveBeenCalled();
+
+    lease.commit();
+    expect(commitWorkspaceRebind).toHaveBeenCalledOnce();
+    expect(lifecycleFence.current).toBe(true);
+    lease.release();
+    expect(lifecycleFence.current).toBe(false);
+    expect(documents.current["main.ts"]?.content).toBe("draft");
   });
 });

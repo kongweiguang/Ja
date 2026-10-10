@@ -1,12 +1,21 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { describe, expect, it } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { useEffect } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useShallow } from "zustand/react/shallow";
 import {
+  selectApprovalClosedAtForThread,
+  selectApprovalDecisionsForThread,
+  selectApprovalsForThread,
+  selectCommittedItemsForThread,
   selectItemsForThread,
   selectTaskActivitiesForRoot,
+  selectTurnsForThread,
   useTimelineStore,
 } from "@/features/conversation/application/timelineStore";
+import type { ConversationItemContentPage } from "@/features/conversation/application/ports";
 import type {
   TimelineEvent,
   TimelineTaskActivityEntry,
@@ -17,6 +26,17 @@ const status = {
   status: { status: "ready" as const, generation: 1, serverInstanceId: "srv_store" },
   eventId: "evt_ready",
   occurredAt: "2026-08-18T00:00:00Z",
+};
+
+const storeTurn = {
+  origin: "native" as const,
+  turnId: "turn_store",
+  status: "completed" as const,
+  requestedAt: "2026-08-18T00:00:00Z",
+  updatedAt: "2026-08-18T00:00:01Z",
+  completedAt: "2026-08-18T00:00:01Z",
+  errorCode: null,
+  changeSet: null,
 };
 
 function event(
@@ -57,7 +77,6 @@ function prepareStore(): void {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_store",
@@ -76,7 +95,387 @@ function projectionThread(threadId: string) {
   };
 }
 
+/** 给多 Thread 选择器测试提供真实 reducer 可接纳的最小终态快照。 */
+function snapshotWithTurns(threadId: string, revision: number, turnIds: readonly string[]) {
+  return {
+    threadId,
+    revision,
+    turns: turnIds.map((turnId) => ({
+      origin: "native" as const,
+      turnId,
+      status: "completed" as const,
+      requestedAt: "2026-08-18T00:00:00Z",
+      updatedAt: "2026-08-18T00:00:01Z",
+      completedAt: "2026-08-18T00:00:01Z",
+      errorCode: null,
+      changeSet: null,
+    })),
+    items: [],
+    inputQueue: null,
+    contextUsage: null,
+    liveStream: null,
+    taskActivities: [],
+    nextCursor: null,
+  };
+}
+
 describe("timeline Zustand seam", () => {
+  afterEach(cleanup);
+
+  it("hydrates a visible mailbox Item by code-point cursor and projects the body from TimelineStore", async () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(
+      store.applySnapshot(
+        {
+          threadId: "thr_store",
+          revision: 1,
+          turns: [storeTurn],
+          items: [
+            {
+              origin: "native" as const,
+              itemId: "item_mailbox",
+              turnId: "turn_store",
+              kind: "thread_message",
+              createdAt: "2026-08-18T00:00:00Z",
+              sourceThreadId: "thr_source",
+              sourceTitle: "Side chat",
+              content: "甲",
+              truncated: true,
+              totalCharacters: 3,
+            },
+          ],
+          inputQueue: null,
+          contextUsage: null,
+          liveStream: null,
+          taskActivities: [],
+          nextCursor: null,
+        },
+        "ws_store",
+      ),
+    ).toBe("applied");
+
+    const readPage = vi
+      .fn()
+      .mockResolvedValueOnce({
+        itemId: "item_mailbox",
+        offsetCharacters: 0,
+        nextOffsetCharacters: 2,
+        totalCharacters: 3,
+        truncated: true,
+        content: "甲😀",
+      })
+      .mockResolvedValueOnce({
+        itemId: "item_mailbox",
+        offsetCharacters: 2,
+        nextOffsetCharacters: null,
+        totalCharacters: 3,
+        truncated: false,
+        content: "乙",
+      });
+    await expect(
+      useTimelineStore.getState().hydrateItemContent("thr_store", "item_mailbox", readPage),
+    ).resolves.toBe("甲😀乙");
+    expect(readPage.mock.calls.map(([input]) => input.offsetCharacters)).toEqual([0, 2]);
+    const item = selectItemsForThread("thr_store")(useTimelineStore.getState()).find(
+      (candidate) => candidate.itemId === "item_mailbox",
+    );
+    expect(item?.bodyHydration).toEqual({
+      status: "complete",
+      text: "甲😀乙",
+      offsetCharacters: 3,
+      totalCharacters: 3,
+    });
+  });
+
+  /** 验证真实 Zustand/useShallow 消费在 hydration 快照重复读取时稳定，并随正文或源事实更新。 */
+  it("keeps hydrated committed item references stable for the shallow Timeline subscriber", async () => {
+    prepareStore();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_store",
+        revision: 1,
+        turns: [storeTurn],
+        items: [
+          {
+            origin: "native" as const,
+            itemId: "item_mailbox",
+            turnId: "turn_store",
+            kind: "thread_message",
+            createdAt: "2026-08-18T00:00:00Z",
+            sourceThreadId: "thr_source",
+            sourceTitle: "Side chat",
+            content: "甲",
+            truncated: true,
+            totalCharacters: 2,
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_store",
+    );
+
+    let renderCount = 0;
+    const { result, unmount } = renderHook(() => {
+      renderCount += 1;
+      return useTimelineStore(
+        useShallow((state: ReturnType<typeof useTimelineStore.getState>) =>
+          selectCommittedItemsForThread("thr_store")(state),
+        ),
+      );
+    });
+    const originalProjection = result.current;
+
+    let releasePage!: (page: ConversationItemContentPage) => void;
+    const readPage = vi.fn(
+      () => new Promise<ConversationItemContentPage>((resolve) => (releasePage = resolve)),
+    );
+    let hydration: Promise<string> | undefined;
+    await act(async () => {
+      hydration = useTimelineStore
+        .getState()
+        .hydrateItemContent("thr_store", "item_mailbox", readPage);
+      await Promise.resolve();
+    });
+    const loadingProjection = result.current;
+    expect(loadingProjection[0]?.bodyHydration?.status).toBe("loading");
+    expect(loadingProjection[0]).not.toBe(originalProjection[0]);
+
+    const loadingRenderCount = renderCount;
+    act(() => {
+      useTimelineStore.setState((state) => ({
+        resyncRequestSequenceByThread: {
+          ...state.resyncRequestSequenceByThread,
+          thr_store: 1,
+        },
+      }));
+    });
+    expect(result.current).toBe(loadingProjection);
+    expect(renderCount).toBe(loadingRenderCount);
+
+    await act(async () => {
+      releasePage({
+        itemId: "item_mailbox",
+        offsetCharacters: 0,
+        nextOffsetCharacters: null,
+        totalCharacters: 2,
+        truncated: false,
+        content: "甲乙",
+      });
+      await hydration;
+    });
+    const completedProjection = result.current;
+    expect(completedProjection[0]?.bodyHydration).toMatchObject({
+      status: "complete",
+      text: "甲乙",
+    });
+    expect(completedProjection[0]).not.toBe(loadingProjection[0]);
+    expect(renderCount).toBe(loadingRenderCount + 1);
+
+    const completedRenderCount = renderCount;
+    act(() => {
+      useTimelineStore.setState((state) => {
+        const source = state.items["item_mailbox"];
+        return source === undefined
+          ? state
+          : {
+              items: {
+                ...state.items,
+                item_mailbox: { ...source, createdAt: "2026-08-18T00:00:01Z" },
+              },
+            };
+      });
+    });
+    expect(result.current[0]).not.toBe(completedProjection[0]);
+    expect(result.current[0]?.createdAt).toBe("2026-08-18T00:00:01Z");
+    expect(renderCount).toBe(completedRenderCount + 1);
+    unmount();
+  });
+
+  /** 查看完整回复只写 answer hydration；保持 body 为空并验证 shallow 订阅与源 Item 更新。 */
+  it("keeps answer-only committed item references stable for the shallow Timeline subscriber", async () => {
+    prepareStore();
+    useTimelineStore.getState().applySnapshot(
+      {
+        threadId: "thr_store",
+        revision: 1,
+        turns: [storeTurn],
+        items: [
+          {
+            origin: "native" as const,
+            itemId: "item_mailbox",
+            turnId: "turn_store",
+            kind: "thread_message",
+            createdAt: "2026-08-18T00:00:00Z",
+            sourceThreadId: "thr_source",
+            sourceTitle: "Side chat",
+            content: "甲",
+            truncated: true,
+            totalCharacters: 2,
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_store",
+    );
+
+    let renderCount = 0;
+    const { result, unmount } = renderHook(() => {
+      renderCount += 1;
+      return useTimelineStore(
+        useShallow((state: ReturnType<typeof useTimelineStore.getState>) =>
+          selectCommittedItemsForThread("thr_store")(state),
+        ),
+      );
+    });
+    const originalProjection = result.current;
+
+    let releaseAnswer!: (text: string) => void;
+    const readAnswer = () => new Promise<string>((resolve) => (releaseAnswer = resolve));
+    let hydration: Promise<string> | undefined;
+    await act(async () => {
+      hydration = useTimelineStore
+        .getState()
+        .hydrateAnswerContent("thr_store", "item_mailbox", readAnswer);
+      await Promise.resolve();
+    });
+    const loadingProjection = result.current;
+    expect(loadingProjection[0]?.bodyHydration).toBeUndefined();
+    expect(loadingProjection[0]?.answerHydration?.status).toBe("loading");
+    expect(loadingProjection[0]).not.toBe(originalProjection[0]);
+
+    const loadingRenderCount = renderCount;
+    act(() => {
+      useTimelineStore.setState((state) => ({
+        resyncRequestSequenceByThread: {
+          ...state.resyncRequestSequenceByThread,
+          thr_store: 1,
+        },
+      }));
+    });
+    expect(result.current).toBe(loadingProjection);
+    expect(renderCount).toBe(loadingRenderCount);
+
+    await act(async () => {
+      releaseAnswer("完整回复");
+      await hydration;
+    });
+    const completedProjection = result.current;
+    expect(completedProjection[0]?.bodyHydration).toBeUndefined();
+    expect(completedProjection[0]?.answerHydration).toMatchObject({
+      status: "complete",
+      text: "完整回复",
+    });
+    expect(completedProjection[0]).not.toBe(loadingProjection[0]);
+    expect(renderCount).toBe(loadingRenderCount + 1);
+
+    const completedRenderCount = renderCount;
+    act(() => {
+      useTimelineStore.setState((state) => {
+        const source = state.items["item_mailbox"];
+        return source === undefined
+          ? state
+          : {
+              items: {
+                ...state.items,
+                item_mailbox: { ...source, createdAt: "2026-08-18T00:00:01Z" },
+              },
+            };
+      });
+    });
+    expect(result.current[0]).not.toBe(completedProjection[0]);
+    expect(result.current[0]?.createdAt).toBe("2026-08-18T00:00:01Z");
+    expect(result.current[0]?.answerHydration).toBe(completedProjection[0]?.answerHydration);
+    expect(result.current[0]?.bodyHydration).toBeUndefined();
+    expect(renderCount).toBe(completedRenderCount + 1);
+    unmount();
+  });
+
+  it("keeps the accepted cursor after a failed page and resumes from that code-point offset", async () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    store.applySnapshot(
+      {
+        threadId: "thr_store",
+        revision: 1,
+        turns: [storeTurn],
+        items: [
+          {
+            origin: "native" as const,
+            itemId: "item_long_user",
+            turnId: "turn_store",
+            kind: "user_input",
+            createdAt: "2026-08-18T00:00:00Z",
+            content: [{ type: "text", text: "甲" }],
+            attachments: [],
+            truncated: true,
+            totalCharacters: 3,
+          },
+        ],
+        inputQueue: null,
+        contextUsage: null,
+        liveStream: null,
+        taskActivities: [],
+        nextCursor: null,
+      },
+      "ws_store",
+    );
+    const failedReader = vi
+      .fn()
+      .mockResolvedValueOnce({
+        itemId: "item_long_user",
+        offsetCharacters: 0,
+        nextOffsetCharacters: 2,
+        totalCharacters: 3,
+        truncated: true,
+        content: "甲😀",
+      })
+      .mockRejectedValueOnce(new Error("connection lost"));
+    await expect(
+      useTimelineStore.getState().hydrateItemContent("thr_store", "item_long_user", failedReader),
+    ).rejects.toThrow("connection lost");
+    expect(
+      useTimelineStore.getState().itemContentByThread["thr_store"]?.["item_long_user"],
+    ).toMatchObject({ status: "error", text: "甲😀", offsetCharacters: 2, totalCharacters: 3 });
+
+    const retryReader = vi.fn(async (input: { offsetCharacters: number }) => ({
+      itemId: "item_long_user",
+      offsetCharacters: input.offsetCharacters,
+      nextOffsetCharacters: null,
+      totalCharacters: 3,
+      truncated: false,
+      content: "乙",
+    }));
+    await expect(
+      useTimelineStore.getState().hydrateItemContent("thr_store", "item_long_user", retryReader),
+    ).resolves.toBe("甲😀乙");
+    expect(retryReader).toHaveBeenCalledWith({
+      threadId: "thr_store",
+      itemId: "item_long_user",
+      offsetCharacters: 2,
+      limitCharacters: 65_536,
+    });
+  });
+
+  it("does not start an item-content read when its Thread is hidden", async () => {
+    prepareStore();
+    const readPage = vi.fn();
+    await expect(
+      useTimelineStore
+        .getState()
+        .hydrateItemContent("thr_store", "item_hidden", readPage, () => false),
+    ).rejects.toThrow("no longer visible");
+    expect(readPage).not.toHaveBeenCalled();
+  });
+
   it("同代际切换后台实例时清除旧快照与恢复状态", () => {
     prepareStore();
     const token = useTimelineStore.getState().beginRecovery("thr_store", 1, "recovery");
@@ -107,7 +506,6 @@ describe("timeline Zustand seam", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_store",
@@ -125,6 +523,71 @@ describe("timeline Zustand seam", () => {
     ).toBe("applied");
     expect(useTimelineStore.getState().turns["turn_store"]?.status).toBe("running");
     expect(useTimelineStore.getState().threadRevisionByThread["thr_store"]).toBe(1);
+  });
+
+  /** Entity selector 只触达单 Thread index；无序全局对象迭代会令隐藏/无关会话产生线性工作。 */
+  it("uses Thread-local entity indexes without enumerating global entity tables", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applySnapshot(snapshotWithTurns("thr_store", 1, ["turn_store"]), "ws_store")).toBe(
+      "applied",
+    );
+    const current = useTimelineStore.getState();
+    const turns = new Proxy(current.turns, {
+      ownKeys: () => {
+        throw new Error("selector enumerated turns for every Thread");
+      },
+    });
+    const approvalsById = new Proxy(current.approvalsById, {
+      ownKeys: () => {
+        throw new Error("selector enumerated approvals for every Thread");
+      },
+    });
+    const scopedState = { ...current, turns, approvalsById };
+
+    expect(selectTurnsForThread("thr_store")(scopedState).map((turn) => turn.turnId)).toEqual([
+      "turn_store",
+    ]);
+    expect(selectItemsForThread("thr_store")(scopedState)).toEqual([]);
+    expect(selectApprovalsForThread("thr_store")(scopedState)).toEqual([]);
+    expect(selectApprovalDecisionsForThread("thr_store")(scopedState)).toEqual({});
+    expect(selectApprovalClosedAtForThread("thr_store")(scopedState)).toEqual({});
+  });
+
+  /** 单 Thread shallow selection 必须对其它 Thread 的快照提交保持引用稳定，避免隐藏会话重渲染。 */
+  it("does not commit a Thread selector when another Thread appends Turns", async () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(store.applySnapshot(snapshotWithTurns("thr_store", 1, ["turn_store"]), "ws_store")).toBe(
+      "applied",
+    );
+    expect(
+      store.applySnapshot(snapshotWithTurns("thr_other", 0, ["turn_other_1"]), "ws_store"),
+    ).toBe("applied");
+    const onCommit = vi.fn();
+    const { unmount } = renderHook(() => {
+      const turns = useTimelineStore(useShallow(selectTurnsForThread("thr_store")));
+      useEffect(() => onCommit(turns), [turns]);
+      return turns;
+    });
+    const settledCommits = onCommit.mock.calls.length;
+
+    act(() => {
+      expect(
+        useTimelineStore
+          .getState()
+          .applySnapshot(
+            snapshotWithTurns("thr_other", 1, ["turn_other_1", "turn_other_2"]),
+            "ws_store",
+          ),
+      ).toBe("applied");
+    });
+
+    expect(onCommit).toHaveBeenCalledTimes(settledCommits);
+    expect(
+      selectTurnsForThread("thr_store")(useTimelineStore.getState()).map((turn) => turn.turnId),
+    ).toEqual(["turn_store"]);
+    unmount();
   });
 
   it("重试仅投影一条轻量状态并清除旧草稿，首个新 Delta 关闭状态提示", () => {
@@ -240,7 +703,6 @@ describe("timeline Zustand seam", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [entry],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_store",
@@ -259,6 +721,7 @@ describe("timeline Zustand seam", () => {
           revision: 1,
           turns: [
             {
+              origin: "native" as const,
               turnId: "turn_queued_history",
               status: "queued",
               requestedAt: "2026-08-18T00:00:00Z",
@@ -268,6 +731,7 @@ describe("timeline Zustand seam", () => {
               changeSet: null,
             },
             {
+              origin: "native" as const,
               turnId: "turn_running_current",
               status: "running",
               requestedAt: "2026-08-18T00:00:02Z",
@@ -282,7 +746,6 @@ describe("timeline Zustand seam", () => {
           contextUsage: null,
           liveStream: null,
           taskActivities: [],
-          goalActivities: [],
           nextCursor: null,
         },
         "ws_store",
@@ -560,6 +1023,32 @@ describe("timeline Zustand seam", () => {
     expect(useTimelineStore.getState().resyncRequired["thr_store"]).toBe("projection_fault");
   });
 
+  /** 新通知只让当前 Thread 重新读取权威快照；重复投递不能制造额外读取请求。 */
+  it("deduplicates projection resync notices while requesting one authoritative snapshot", () => {
+    prepareStore();
+    const notification = {
+      kind: "resync_required" as const,
+      event: {
+        serverInstanceId: "srv_store",
+        eventId: "evt_projection_resync",
+        sequence: 66,
+        occurredAt: "2026-09-27T00:00:00Z",
+        generation: 1,
+        workspaceId: "ws_store",
+        threadId: "thr_store",
+        turnId: "turn_store",
+        reasonCode: "projection_failed" as const,
+      },
+    };
+    const store = useTimelineStore.getState();
+    expect(store.applyHostEvent(notification)).toBe("resync_required");
+    expect(useTimelineStore.getState().resyncRequired["thr_store"]).toBe("projection_fault");
+    expect(useTimelineStore.getState().resyncRequestSequenceByThread["thr_store"]).toBe(1);
+
+    expect(useTimelineStore.getState().applyHostEvent(notification)).toBe("duplicate");
+    expect(useTimelineStore.getState().resyncRequestSequenceByThread["thr_store"]).toBe(1);
+  });
+
   it("does not reopen a terminal Turn when a late event arrives", () => {
     prepareStore();
     const store = useTimelineStore.getState();
@@ -605,8 +1094,8 @@ describe("timeline Zustand seam", () => {
           text: "run tool",
           modelRound: 1,
           usage: {
-            requestId: "request_store_1",
-            requestOrdinal: 1,
+            modelRequestId: "modelreq_store_1",
+            modelRequestOrdinal: 1,
             modelRound: 1,
             purpose: "assistant",
             certainty: "known",
@@ -746,24 +1235,32 @@ describe("timeline Zustand seam", () => {
         thr_pending: projectionThread("thr_pending"),
         thr_side: projectionThread("thr_side"),
         thr_resolved: projectionThread("thr_resolved"),
-        thr_goal: projectionThread("thr_goal"),
+        thr_extra: projectionThread("thr_extra"),
       },
       turns: {
         ...state.turns,
         turn_idle: {
+          origin: "native" as const,
           turnId: "turn_idle",
           threadId: "thr_idle",
           status: "completed" as const,
         },
         turn_active: {
+          origin: "native" as const,
           turnId: "turn_active",
           threadId: "thr_active",
           status: "running" as const,
         },
       },
+      turnIdsByThread: {
+        ...state.turnIdsByThread,
+        thr_idle: ["turn_idle"],
+        thr_active: ["turn_active"],
+      },
       items: {
         ...state.items,
         item_idle: {
+          origin: "native" as const,
           itemId: "item_idle",
           threadId: "thr_idle",
           turnId: "turn_idle",
@@ -817,22 +1314,14 @@ describe("timeline Zustand seam", () => {
           decision: "deny",
         },
       },
+      approvalIdsByThread: {
+        ...state.approvalIdsByThread,
+        thr_pending: ["approval_pending"],
+        thr_resolved: ["approval_resolved"],
+      },
       taskActivitiesByRootThread: {
         ...state.taskActivitiesByRootThread,
         thr_side: [sideTask],
-      },
-      goalActivitiesByOwnerThread: {
-        ...state.goalActivitiesByOwnerThread,
-        thr_goal: [
-          {
-            goalId: "goal_terminal",
-            objective: "terminal goal",
-            status: "achieved" as const,
-            goalRevision: 1,
-            eventSequence: 1,
-            occurredAt: "2026-09-05T00:00:00Z",
-          },
-        ],
       },
       threadRevisionByThread: {
         ...state.threadRevisionByThread,
@@ -851,7 +1340,7 @@ describe("timeline Zustand seam", () => {
         "thr_pending",
         "thr_side",
         "thr_resolved",
-        "thr_goal",
+        "thr_extra",
       ]);
 
     const next = useTimelineStore.getState();
@@ -868,7 +1357,7 @@ describe("timeline Zustand seam", () => {
     expect(next.threads["thr_side"]).toBeDefined();
     expect(next.taskActivitiesByRootThread["thr_side"]).toEqual([sideTask]);
     expect(next.threads["thr_resolved"]).toBeUndefined();
-    expect(next.threads["thr_goal"]).toBeUndefined();
+    expect(next.threads["thr_extra"]).toBeUndefined();
   });
 
   it("在恢复读取期间立即投影 live event，并在 baseline 后只重放新序号", () => {
@@ -914,6 +1403,7 @@ describe("timeline Zustand seam", () => {
       revision: 1,
       turns: [
         {
+          origin: "native" as const,
           turnId: "turn_store",
           status: "running" as const,
           requestedAt: "2026-08-18T00:00:00Z",
@@ -927,7 +1417,6 @@ describe("timeline Zustand seam", () => {
       inputQueue: null,
       contextUsage: null,
       taskActivities: [],
-      goalActivities: [],
       liveStream: {
         turnId: "turn_store",
         streamSeq: 1,
@@ -987,6 +1476,7 @@ describe("timeline Zustand seam", () => {
         revision: 1,
         turns: [
           {
+            origin: "native" as const,
             turnId: "turn_store",
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -1001,7 +1491,6 @@ describe("timeline Zustand seam", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_store",
@@ -1034,7 +1523,14 @@ describe("timeline Zustand seam", () => {
         occurredAt: "2026-08-18T00:00:02Z",
         state: "completed",
         summary: "完成",
-        finalMessage: { messageId: "item_recovery_terminal", text: "完成" },
+        summaryTotalCharacters: 2,
+        summaryTruncated: false,
+        finalMessage: {
+          messageId: "item_recovery_terminal",
+          text: "完成",
+          totalCharacters: 2,
+          truncated: false,
+        },
         changeSet: {
           state: "complete",
           incompleteReasons: [],
@@ -1071,11 +1567,46 @@ describe("timeline Zustand seam", () => {
         contextUsage: null,
         liveStream: null,
         taskActivities: [],
-        goalActivities: [],
         nextCursor: null,
       },
       "ws_store",
     );
     expect(result).toEqual({ status: "invalid", replayedEvents: 0 });
+  });
+
+  /** 关闭时 turn.threadId 是缺失 turnIdsByThread 索引后的所有权回退，迟到队列仍应被 tombstone 拒绝。@author kongweiguang */
+  it("关闭回退扫描 Thread 所属 Turn 并阻止迟到队列重建", () => {
+    prepareStore();
+    const store = useTimelineStore.getState();
+    expect(
+      store.applyTurnAccepted({
+        threadId: "thr_store",
+        turnId: "turn_store",
+        threadRevision: 1,
+        submittedText: "请求关闭前的正文",
+        submittedAt: "2026-08-18T00:00:00Z",
+      }),
+    ).toBe("applied");
+    useTimelineStore.setState((state) => ({
+      ...state,
+      turnIdsByThread: { ...state.turnIdsByThread, thr_store: [] },
+    }));
+    expect(useTimelineStore.getState().turns["turn_store"]?.threadId).toBe("thr_store");
+
+    expect(
+      useTimelineStore.getState().closeThreads(["thr_store"], {
+        serverInstanceId: "srv_store",
+        generation: 1,
+      }),
+    ).toBe(true);
+    expect(useTimelineStore.getState().turns["turn_store"]).toBeUndefined();
+    expect(
+      useTimelineStore.getState().applyInputQueue({
+        turnId: "turn_store",
+        revision: 1,
+        accepting: true,
+        items: [],
+      }),
+    ).toBe("rejected");
   });
 });

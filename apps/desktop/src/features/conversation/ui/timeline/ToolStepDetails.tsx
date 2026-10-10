@@ -10,6 +10,7 @@ import {
   CircleX,
   File,
   Folder,
+  Image as ImageIcon,
   ListTree,
   LoaderCircle,
   Minus,
@@ -28,6 +29,7 @@ import type {
   ToolPresentation,
   WorkStepAdapter,
 } from "../../domain/timelineTypes";
+import type { ConversationProcessBinding } from "../../application/processSessionTypes";
 import {
   toolResultContent,
   toolResultView,
@@ -35,9 +37,12 @@ import {
   type ToolResultView,
 } from "./toolResultView";
 import type { TimelineDisclosureCache } from "./timelineDisclosure";
+import { ProcessSessionPanel } from "./ProcessSessionPanel";
 
 export interface ToolStepDetailsProps {
   step: WorkStepAdapter;
+  /** WorkProcess 按同一 Thread/Turn 身份提供权威等待状态，不能从邻近步骤推断。 */
+  owningTurnAwaitingInput?: boolean;
   disclosureCache?: TimelineDisclosureCache;
   disclosureKey?: string;
   disclosureThreadId?: string;
@@ -47,6 +52,16 @@ export interface ToolStepDetailsProps {
     callId: string;
     artifactId: string;
   }) => Promise<string>;
+  onOpenAttachmentPreview?: (
+    attachment: {
+      attachmentId: string;
+      displayName: string;
+      mediaKind: "image" | "text";
+      threadId: string;
+      authorization: { kind: "thread"; threadId: string };
+    },
+    source: HTMLButtonElement,
+  ) => void;
   /** 当前 Turn revision 来自权威 Turn 投影；缺失时宁可不显示操作，也不能猜测 CAS。 */
   recoveryThreadRevision?: number;
   onResolveRecovery?: (input: {
@@ -56,8 +71,10 @@ export interface ToolStepDetailsProps {
     expectedThreadRevision: number;
     expectedRecoveryRevision: number;
     decision: "retry" | "skip";
-    idempotencyKey: string;
+    operationKey: string;
   }) => Promise<unknown>;
+  /** Shell 会话读取端口由 composition 注入，缺失时不展示伪造的继续操作。 */
+  processSession?: ConversationProcessBinding;
 }
 
 const PREVIEW_LINES = 10;
@@ -66,7 +83,7 @@ const PREVIEW_LINES = 10;
  * 同一 call/revision/选择必须在重绘和虚拟卸载后保持同一个幂等身份；散列只缩短 UI 传输键，
  * 真正的 Tool 归属仍由 Java 以 callId 和双 revision 校验，不能作为授权或事实来源。
  */
-function recoveryIdempotencyKey(
+function recoveryOperationKey(
   turnId: string,
   callId: string,
   recoveryRevision: number,
@@ -98,11 +115,14 @@ function presentationStatusLabel(status: ToolPresentation["status"]): string {
   }
 }
 
-/** 按真实 Tool 名称优先选择可辨识动作，未知 MCP 才回退到通用标签。 */
+/** 只为内置 Plan 使用服务端本地化标题；其它已知动作按名称映射，未知 MCP 保留通用标签。 */
 function presentationActionLabel(
   presentation: ToolPresentation,
   toolName: string | undefined,
 ): string {
+  if (isPlanToolName(toolName)) {
+    return presentation.title.trim() || "处理计划操作";
+  }
   switch (toolName) {
     case "request_user_input":
       return "询问用户";
@@ -133,29 +153,53 @@ function presentationActionLabel(
   }
 }
 
+/** 精确识别三种内置 Plan 动作，避免把任意 MCP 名称当作本地业务能力。 */
+function isPlanToolName(toolName: string | undefined): boolean {
+  return (
+    toolName === "plan_propose" ||
+    toolName === "plan_draft_update" ||
+    toolName === "plan_step_update"
+  );
+}
+
 /** 只接受 Reducer 从协议外层保留的真实 Tool 名称，缺失时不拿展示标题冒充身份。 */
 function presentationToolName(step: WorkStepAdapter): string | undefined {
   const toolName = step.metadata?.toolName?.trim();
   return toolName === undefined || toolName === "" ? undefined : toolName;
 }
 
-/** 摘要只取首个权威目标；grep/find 优先显示 query/pattern，完整输入和多路径信息留在展开内容中。 */
+/**
+ * 摘要优先显示已验证命令、路径或输入；内置 Plan 仅显示服务端的脱敏业务摘要，不能把 opaque 身份参数
+ * 冒充执行目标；问答 Turn 已权威进入 waiting_input 时只隐藏该 pending 预览的未校验输入占位，
+ * 不借邻近 Turn 状态推断；未知 MCP 仍可回退工具名，其它 Tool 类型不借名称填充空目标。
+ * @author kongweiguang
+ */
 function presentationTarget(
   presentation: ToolPresentation,
   toolName: string | undefined,
+  hideUnvalidatedInteractionPreview: boolean,
 ): string | undefined {
-  const inputTarget = presentation.inputPreview?.trim().split(/\r?\n/u)[0];
+  if (isPlanToolName(toolName)) {
+    return presentation.summary?.trim() || undefined;
+  }
+  const inputTarget = hideUnvalidatedInteractionPreview
+    ? undefined
+    : presentation.inputPreview?.trim().split(/\r?\n/u)[0];
+  const mcpNameFallback =
+    presentation.kind === "mcp" && !hideUnvalidatedInteractionPreview ? toolName : undefined;
   if (toolName === "grep" || toolName === "find") {
     return (
       inputTarget ||
       presentation.relativePaths.find((path) => path.trim() !== "")?.trim() ||
-      presentation.command?.trim()
+      presentation.command?.trim() ||
+      mcpNameFallback
     );
   }
   return (
     presentation.command?.trim() ||
     presentation.relativePaths.find((path) => path.trim() !== "")?.trim() ||
-    inputTarget
+    inputTarget ||
+    mcpNameFallback
   );
 }
 
@@ -301,18 +345,24 @@ function InteractionAnswerList({
 }
 
 /**
- * Tool 行自身就是唯一 Disclosure：常规步骤和所有失败详情默认保持紧凑，只有可恢复执行入口或已回答问答
- * 自动展开；用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留。动作、真实 Tool 名称与首个
- * 目标留在同一行，已脱敏结果留在展开区，避免用展示标题或原始参数猜测身份。
+ * Tool 行自身就是唯一 Disclosure：常规步骤保持紧凑，失败诊断、可恢复执行入口或已回答问答自动展开；
+ * 用户的手动选择按 Thread/Turn/Item identity 跨状态和虚拟卸载保留。动作与首个安全目标留在同一行，
+ * 仅未知 MCP 的无目标回退会读真实工具名；已知 Plan 的内部名不进入可见或无障碍摘要，业务摘要留在触发器而不在展开区重复。
+ * 展开区仍保留非空脱敏参数、结果和必要诊断，不重复正常状态、耗时或根目录。
+ * 同 Turn 进入 waiting_input 后，pending 问答只保留真实动作入口，不将参数校验占位误当成目标。
+ * @author kongweiguang
  */
 export function ToolStepDetails({
   step,
+  owningTurnAwaitingInput = false,
   disclosureCache,
   disclosureKey,
   disclosureThreadId,
   onReadArtifact,
+  onOpenAttachmentPreview,
   recoveryThreadRevision,
   onResolveRecovery,
+  processSession,
 }: ToolStepDetailsProps): ReactElement | null {
   const presentation = step.metadata?.presentation;
   const callId = step.metadata?.callId;
@@ -324,7 +374,8 @@ export function ToolStepDetails({
   const [error, setError] = useState<string>();
   const toolName = presentationToolName(step);
   const isInteractionTool = toolName === "request_user_input";
-  const isContextCompaction = presentation?.kind === "context";
+  const hideUnvalidatedInteractionPreview =
+    owningTurnAwaitingInput && isInteractionTool && presentation?.status === "pending";
   const answeredInteractions =
     presentation === undefined ? [] : interactionAnswers(presentation, toolName);
   const rawOutput =
@@ -336,6 +387,8 @@ export function ToolStepDetails({
   if (presentation === undefined) return null;
   const canLoad =
     presentation.artifactId !== undefined && callId !== undefined && onReadArtifact !== undefined;
+  const hasProcessPanel =
+    presentation.kind === "shell" && callId !== undefined && processSession !== undefined;
   const canResolveRecovery =
     presentation.recovery !== undefined &&
     callId !== undefined &&
@@ -352,7 +405,10 @@ export function ToolStepDetails({
     ? undefined
     : toolResultView(toolName, presentation, shownOutput);
   const showsInput =
-    !isInteractionTool && presentation.kind === "mcp" && presentation.inputPreview?.trim() !== "";
+    !isInteractionTool &&
+    presentation.kind === "mcp" &&
+    presentation.inputPreview !== undefined &&
+    presentation.inputPreview.trim() !== "";
   const cachedOpen =
     disclosureCache !== undefined && disclosureThreadId !== undefined && disclosureKey !== undefined
       ? disclosureCache.get(disclosureThreadId, "tool", disclosureKey)
@@ -360,22 +416,41 @@ export function ToolStepDetails({
   const detailsOpen =
     cachedOpen ??
     manualOpen ??
-    (presentation.recovery !== undefined ||
+    (presentation.status === "error" ||
+      (presentation.exitCode !== undefined && presentation.exitCode !== 0) ||
+      presentation.recovery !== undefined ||
       (isInteractionTool && presentation.status === "success" && answeredInteractions.length > 0));
   const actionLabel = presentationActionLabel(presentation, toolName);
-  const target = presentationTarget(presentation, toolName);
+  const target = presentationTarget(presentation, toolName, hideUnvalidatedInteractionPreview);
   const interactionResult = interactionSummary(presentation, toolName, answeredInteractions);
   const accessibleSummary = [
     actionLabel,
-    toolName,
-    target,
+    isPlanToolName(toolName) ? undefined : toolName,
+    target === toolName ? undefined : target,
     interactionResult,
     presentationStatusLabel(presentation.status),
   ]
     .filter((value): value is string => value !== undefined)
     .join("，");
 
-  /** Tool identity 稳定时保存用户选择；状态变化只影响无人工选择时的恢复或问答自动展开策略。 */
+  /** 图片引用只通过已绑定 Thread 的 Preview 授权打开，不读取路径或解码器输入。 */
+  const openToolImage = (
+    media: NonNullable<ToolPresentation["media"]>[number],
+    source: HTMLButtonElement,
+  ): void => {
+    onOpenAttachmentPreview?.(
+      {
+        attachmentId: media.attachmentId,
+        displayName: media.displayName,
+        mediaKind: "image",
+        threadId: step.threadId,
+        authorization: { kind: "thread", threadId: step.threadId },
+      },
+      source,
+    );
+  };
+
+  /** 优先保存用户阅读选择，自动失败诊断不得把手动收起的详情反复打开。 */
   const updateDetailsOpen = (open: boolean): void => {
     if (
       disclosureCache !== undefined &&
@@ -439,7 +514,7 @@ export function ToolStepDetails({
         expectedThreadRevision: recoveryThreadRevision,
         expectedRecoveryRevision: presentation.recovery.revision,
         decision,
-        idempotencyKey: recoveryIdempotencyKey(
+        operationKey: recoveryOperationKey(
           step.turnId,
           callId,
           presentation.recovery.revision,
@@ -480,7 +555,9 @@ export function ToolStepDetails({
           </span>
         </CollapsibleTrigger>
         <CollapsibleContent className="ja-tool-details__content">
-          {presentation.summary === undefined || isInteractionTool ? null : (
+          {presentation.summary === undefined ||
+          isInteractionTool ||
+          isPlanToolName(toolName) ? null : (
             <div className="ja-tool-details__overview" data-status={presentation.status}>
               <span aria-hidden="true" className="ja-tool-details__overview-icon">
                 <ToolOverviewIcon status={presentation.status} />
@@ -494,12 +571,43 @@ export function ToolStepDetails({
           {showsInput ? (
             <pre className="ja-tool-details__input">{presentation.inputPreview}</pre>
           ) : null}
-          {presentation.relativeCwd ? (
+          {presentation.relativeCwd && presentation.relativeCwd !== "." ? (
             <span className="ja-tool-details__cwd">工作目录：{presentation.relativeCwd}</span>
           ) : null}
-          {outputView === undefined ? null : (
+          {onOpenAttachmentPreview === undefined ||
+          presentation.media?.length === undefined ? null : (
+            <div className="ja-tool-media" aria-label="工具返回的图片">
+              {presentation.media.map((media) => (
+                <button
+                  key={media.attachmentId}
+                  type="button"
+                  className="ja-tool-media__item"
+                  aria-label={`预览图片：${media.displayName}`}
+                  title={media.displayName}
+                  onClick={(event) => openToolImage(media, event.currentTarget)}
+                >
+                  <ImageIcon aria-hidden="true" />
+                  <span>{media.displayName}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {outputView === undefined || hasProcessPanel ? null : (
             <ToolResultOutput view={outputView} status={presentation.status} />
           )}
+          {hasProcessPanel ? (
+            <ProcessSessionPanel
+              key={`${processSession.workspaceId}:${step.threadId}:${processSession.generation}:${callId}`}
+              enabled={detailsOpen}
+              scope={{
+                workspaceId: processSession.workspaceId,
+                threadId: step.threadId,
+              }}
+              callId={callId}
+              port={processSession.port}
+              fallbackOutput={shownOutput}
+            />
+          ) : null}
           {canResolveRecovery ? (
             <div className="ja-tool-details__recovery" role="group" aria-label="恢复此工具步骤">
               <p>这条命令已启动，但未保存结果。再次执行可能重复操作。</p>
@@ -529,20 +637,11 @@ export function ToolStepDetails({
               </div>
             </div>
           ) : null}
-          {isInteractionTool || isContextCompaction ? null : (
-            <div className="ja-tool-details__facts">
-              <span>状态：{presentationStatusLabel(presentation.status)}</span>
-              {presentation.exitCode === undefined ? null : (
-                <span>退出码 {presentation.exitCode}</span>
-              )}
-              {presentation.durationMs === undefined ? null : (
-                <span>
-                  {presentation.durationMs < 1_000
-                    ? `${presentation.durationMs} ms`
-                    : `${(presentation.durationMs / 1_000).toFixed(1)} s`}
-                </span>
-              )}
-              {presentation.truncated ? <span>预览已截断</span> : null}
+          {hasProcessPanel ||
+          presentation.exitCode === undefined ||
+          presentation.exitCode === 0 ? null : (
+            <div className="ja-tool-details__facts" role="alert">
+              <span>退出码 {presentation.exitCode}</span>
             </div>
           )}
           {locallyExpandable ? (

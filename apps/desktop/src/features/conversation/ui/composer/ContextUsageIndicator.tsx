@@ -1,7 +1,14 @@
 // @author kongweiguang
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactElement,
+} from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/primitives";
 import type { ConversationUsageReader, ConversationUsageSummary } from "../../application/ports";
 import type { ContextUsagePresentation } from "../../domain/contextUsage";
@@ -18,6 +25,8 @@ interface UsageLoadState {
 const usageCache = new Map<string, ConversationUsageSummary>();
 
 export interface ContextUsageIndicatorProps {
+  /** Hidden retained Composers preserve display state but suspend aggregate reads. */
+  active?: boolean;
   /** 圆环投影最近请求；累计数据只在展开层出现，两种口径不可互相替代。 */
   usage?: ContextUsagePresentation;
   /** 查询与缓存必须绑定 Thread 和 runtime 代际，拒绝重连后的迟到响应。 */
@@ -53,6 +62,17 @@ function rememberUsage(scopeKey: string, summary: ConversationUsageSummary): voi
   }
 }
 
+/** 请求行可能没有 Provider 用量字段；此时不要堆叠一列未知占位符。 */
+function hasReportedUsage(summary: ConversationUsageSummary): boolean {
+  return [
+    summary.newInputRequestCount,
+    summary.outputRequestCount,
+    summary.totalRequestCount,
+    summary.cacheReadRequestCount,
+    summary.cacheWriteRequestCount,
+  ].some((covered) => covered > 0);
+}
+
 /** 命中率只用服务端归一化的完整输入样本；缺失和零分母均保持横线。 */
 function cacheHitRate(summary: ConversationUsageSummary): string | undefined {
   if (summary.cacheCompleteRequestCount === 0 || summary.cacheCompleteInputTokens === 0)
@@ -62,24 +82,33 @@ function cacheHitRate(summary: ConversationUsageSummary): string | undefined {
   );
 }
 
+/** 总量与输出必须覆盖全部已计量请求才能相减；相同的部分覆盖数量不能证明来自同一组请求。 */
+function cumulativeInputTokens(summary: ConversationUsageSummary): number | undefined {
+  if (
+    summary.measuredRequestCount === 0 ||
+    summary.totalRequestCount !== summary.measuredRequestCount ||
+    summary.outputRequestCount !== summary.measuredRequestCount ||
+    summary.totalTokens < summary.outputTokens
+  )
+    return undefined;
+  return summary.totalTokens - summary.outputTokens;
+}
+
 /** 单行同时携带覆盖范围；大数使用紧凑单位，缺失计量不因聚合 SQL 的零值误导用户。 */
 function UsageMetricRow({
   label,
   value,
   covered,
-  requestCount,
 }: {
   label: string;
   value: number;
   covered: number;
-  requestCount: number;
 }): ReactElement {
   return (
     <div className="ja-context-usage-popover__row">
       <span>{label}</span>
       <span className="ja-context-usage-popover__value">
         {covered > 0 ? formatTokenCount(value) : "—"}
-        {covered > 0 && covered < requestCount ? <small>部分数据</small> : null}
       </span>
     </div>
   );
@@ -87,9 +116,11 @@ function UsageMetricRow({
 
 /**
  * 圆环仍是 Composer 的唯一入口。浮层只按需读取 Thread 账本，hover/focus 与点击固定共享受控
- * Popover；scope 与递增序号双重防止迟到响应跨 Thread，读取失败仅保留已确认旧值。
+ * Popover；累计输入包含缓存，父总量与缓存明细不重复相加。scope 与递增序号防止迟到响应跨 Thread。
+ * 缓存写入按计量覆盖决定是否展示，保留明确报告的零，避免与未报告字段混淆。
  */
 export function ContextUsageIndicator({
+  active = true,
   usage,
   threadId,
   runtimeGeneration,
@@ -104,6 +135,8 @@ export function ContextUsageIndicator({
   const currentScopeRef = useRef(scopeKey);
   const refreshedRef = useRef<string | undefined>(undefined);
   const pinnedRef = useRef(false);
+  const restoreFocusOnCloseRef = useRef(false);
+  const restoringFocusRef = useRef(false);
   const triggerHoveredRef = useRef(false);
   const contentHoveredRef = useRef(false);
   const [pinned, setPinned] = useState(false);
@@ -119,9 +152,10 @@ export function ContextUsageIndicator({
       ? state
       : { scopeKey, summary: usageCache.get(scopeKey), phase: "idle" as const };
 
-  /** 关闭统一取消固定与临时展开，外部点击、Escape 与再次点击均不留下隐藏刷新。 */
-  const close = useCallback((): void => {
+  /** 只由 Escape 请求归还入口焦点；悬停或外部点击关闭时保留用户当前焦点。 */
+  const close = useCallback((restoreTriggerFocus = false): void => {
     pinnedRef.current = false;
+    restoreFocusOnCloseRef.current = restoreTriggerFocus;
     setPinned(false);
     setTransientOpen(false);
   }, []);
@@ -145,9 +179,73 @@ export function ContextUsageIndicator({
         !contentHoveredRef.current &&
         !focused
       )
-        setTransientOpen(false);
+        close();
     }, HOVER_CLOSE_DELAY_MS);
+  }, [close]);
+
+  /** Portal 覆盖或退出会重复投递 enter；同一入口区域内的悬停只开启一次。 */
+  const handleTriggerPointerEnter = useCallback((): void => {
+    if (triggerHoveredRef.current) return;
+    triggerHoveredRef.current = true;
+    keepOpen();
+  }, [keepOpen]);
+
+  /** 入口与浮层退出共用入口区域判定，避免 Portal 覆盖造成虚假离开或残留悬停。 */
+  const handleTriggerPointerLeave = useCallback(
+    (event: ReactPointerEvent<HTMLElement>): void => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (
+        rect !== undefined &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        event.clientX >= rect.left &&
+        event.clientX < rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY < rect.bottom
+      )
+        return;
+      triggerHoveredRef.current = false;
+      scheduleClose();
+    },
+    [scheduleClose],
+  );
+
+  /** 浮层覆盖入口后真实移动只产生浮层 leave，也要结束已离开的入口悬停会话。 */
+  const handleContentPointerLeave = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      contentHoveredRef.current = false;
+      handleTriggerPointerLeave(event);
+    },
+    [handleTriggerPointerLeave],
+  );
+
+  /** 只忽略同步归还焦点这一回事件，不拦截下一次真实键盘聚焦。 */
+  const handleTriggerFocus = useCallback((): void => {
+    if (!restoringFocusRef.current) keepOpen();
+  }, [keepOpen]);
+
+  /** 在 Radix 卸载后统一恢复 Escape 焦点，避免独立 rAF 与默认恢复相互重开浮层。 */
+  const handleCloseAutoFocus = useCallback((event: Event): void => {
+    event.preventDefault();
+    const restoreTriggerFocus = restoreFocusOnCloseRef.current;
+    restoreFocusOnCloseRef.current = false;
+    if (!restoreTriggerFocus) return;
+    restoringFocusRef.current = true;
+    try {
+      triggerRef.current?.focus({ preventScroll: true });
+    } finally {
+      restoringFocusRef.current = false;
+    }
   }, []);
+
+  /** Escape 先关闭，实际焦点回归交给 Content 的卸载生命周期负责。 */
+  const handleEscapeKeyDown = useCallback(
+    (event: KeyboardEvent): void => {
+      event.preventDefault();
+      close(true);
+    },
+    [close],
+  );
 
   /** scope 切换先使旧异步请求失格，再在 commit 后复位交互状态，避免 effect 同步级联 render。 */
   useEffect(() => {
@@ -155,6 +253,7 @@ export function ContextUsageIndicator({
     requestSequenceRef.current += 1;
     refreshedRef.current = undefined;
     pinnedRef.current = false;
+    restoreFocusOnCloseRef.current = false;
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
@@ -178,7 +277,7 @@ export function ContextUsageIndicator({
 
   /** 只读调用 App Server 聚合而不读取 Timeline；失败仅显示陈旧性并保留缓存。 */
   const refresh = useCallback((): void => {
-    if (threadId === undefined) return;
+    if (!active || threadId === undefined) return;
     const cached = usageCache.get(scopeKey);
     if (usageReader === undefined) {
       setState((current) =>
@@ -220,9 +319,22 @@ export function ContextUsageIndicator({
         });
       },
     );
-  }, [scopeKey, threadId, usageReader]);
+  }, [active, scopeKey, threadId, usageReader]);
   /** 首次展开以及展开期间的结算/恢复版本变化才刷新，关闭后不轮询。 */
   useEffect(() => {
+    if (!active) {
+      refreshedRef.current = undefined;
+      requestSequenceRef.current += 1;
+      pinnedRef.current = false;
+      triggerHoveredRef.current = false;
+      contentHoveredRef.current = false;
+      restoreFocusOnCloseRef.current = false;
+      if (closeTimerRef.current !== undefined) window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = undefined;
+      setPinned(false);
+      setTransientOpen(false);
+      return;
+    }
     if (!open) {
       refreshedRef.current = undefined;
       return;
@@ -239,25 +351,47 @@ export function ContextUsageIndicator({
         cancelled = true;
       };
     }
-  }, [open, refresh, refreshRevision, scopeKey]);
+  }, [active, open, refresh, refreshRevision, scopeKey]);
 
   const summary = visibleState.summary;
-  const knownContext = usage?.certainty === "known";
+  const inputTokens = summary === undefined ? undefined : cumulativeInputTokens(summary);
+  const knownContext = usage !== undefined && usage.certainty !== "unknown";
+  const percentageValue =
+    knownContext && usage !== undefined
+      ? usage.usedTokens > 0 && usage.percentage === 0
+        ? "<0.1%"
+        : usage.percentage.toFixed(1) + "%"
+      : "待确认";
+  const contextPercentage =
+    knownContext && usage?.certainty === "estimated" ? "约 " + percentageValue : percentageValue;
   const contextLabel =
     knownContext && usage !== undefined
-      ? "已使用 " +
-        usage.percentage.toFixed(1) +
-        "%，" +
+      ? (usage.certainty === "estimated" ? "当前上下文约 " : "当前上下文 ") +
+        percentageValue +
+        "，" +
         formatContextCapacity(usage.usedTokens) +
         " / " +
         formatContextCapacity(usage.limitTokens) +
-        " tokens，最近模型请求"
+        " tokens，" +
+        (usage.certainty === "estimated" ? "本地估算" : "Provider 完整用量")
       : "上下文使用量待确认";
   const ratePartial =
     summary !== undefined &&
     summary.cacheCompleteRequestCount > 0 &&
     summary.cacheCompleteRequestCount < summary.requestCount;
   const cacheRate = summary === undefined ? undefined : cacheHitRate(summary);
+  const hasUnmeasuredRequests =
+    summary !== undefined && summary.measuredRequestCount < summary.requestCount;
+  const hasPartialUsage =
+    summary !== undefined &&
+    [
+      summary.newInputRequestCount,
+      summary.outputRequestCount,
+      summary.totalRequestCount,
+      summary.cacheReadRequestCount,
+      summary.cacheWriteRequestCount,
+      summary.cacheCompleteRequestCount,
+    ].some((covered) => covered > 0 && covered < summary.requestCount);
   const noSummaryMessage =
     visibleState.phase === "idle"
       ? "发送消息后显示用量"
@@ -275,15 +409,9 @@ export function ContextUsageIndicator({
           aria-label="上下文用量详情"
           aria-haspopup="dialog"
           aria-expanded={open}
-          onPointerEnter={() => {
-            triggerHoveredRef.current = true;
-            keepOpen();
-          }}
-          onPointerLeave={() => {
-            triggerHoveredRef.current = false;
-            scheduleClose();
-          }}
-          onFocus={keepOpen}
+          onPointerEnter={handleTriggerPointerEnter}
+          onPointerLeave={handleTriggerPointerLeave}
+          onFocus={handleTriggerFocus}
           onBlur={scheduleClose}
           onClick={(event) => {
             event.preventDefault();
@@ -333,11 +461,8 @@ export function ContextUsageIndicator({
         collisionPadding={12}
         aria-label="上下文用量详情"
         onOpenAutoFocus={(event) => event.preventDefault()}
-        onEscapeKeyDown={(event) => {
-          event.preventDefault();
-          close();
-          window.requestAnimationFrame(() => triggerRef.current?.focus());
-        }}
+        onCloseAutoFocus={handleCloseAutoFocus}
+        onEscapeKeyDown={handleEscapeKeyDown}
       >
         <div
           ref={contentRef}
@@ -345,51 +470,71 @@ export function ContextUsageIndicator({
             contentHoveredRef.current = true;
             keepOpen();
           }}
-          onPointerLeave={() => {
-            contentHoveredRef.current = false;
-            scheduleClose();
-          }}
+          onPointerLeave={handleContentPointerLeave}
           onBlur={scheduleClose}
         >
-          {summary === undefined ? (
-            <p className="ja-context-usage-popover__empty">{noSummaryMessage}</p>
-          ) : summary.requestCount === 0 ? (
-            <p className="ja-context-usage-popover__empty">发送消息后显示用量</p>
-          ) : (
-            <>
-              <section className="ja-context-usage-popover__section" aria-label="Token 本会话">
-                <h2>Token · 本会话</h2>
+          <section className="ja-context-usage-popover__section" aria-label="当前上下文">
+            <h2>
+              {usage?.certainty === "estimated"
+                ? "当前上下文 · 本地估算"
+                : usage?.certainty === "known"
+                  ? "当前上下文 · Provider 实测"
+                  : "当前上下文"}
+            </h2>
+            <div className="ja-context-usage-popover__row">
+              <span>上下文</span>
+              <span className="ja-context-usage-popover__value">{contextPercentage}</span>
+            </div>
+            <div className="ja-context-usage-popover__row">
+              <span>已用</span>
+              <span className="ja-context-usage-popover__value">
+                {knownContext && usage !== undefined
+                  ? formatContextCapacity(usage.usedTokens) +
+                    " / " +
+                    formatContextCapacity(usage.limitTokens)
+                  : "—"}
+              </span>
+            </div>
+            <p className="ja-context-usage-popover__note">
+              最近请求的占用，估算校正或压缩后可能降低。
+            </p>
+          </section>
+          <section className="ja-context-usage-popover__section" aria-label="Token 本会话">
+            <h2>Token · 本会话</h2>
+            {summary === undefined ? (
+              <p className="ja-context-usage-popover__empty">{noSummaryMessage}</p>
+            ) : summary.requestCount === 0 ? (
+              <p className="ja-context-usage-popover__empty">发送消息后显示用量</p>
+            ) : !hasReportedUsage(summary) ? (
+              <p className="ja-context-usage-popover__empty">尚无已报告的 Provider 用量</p>
+            ) : (
+              <>
                 <UsageMetricRow
-                  label="输入（未缓存）"
-                  value={summary.newInputTokens}
-                  covered={summary.newInputRequestCount}
-                  requestCount={summary.requestCount}
+                  label="输入（含缓存）"
+                  value={inputTokens ?? 0}
+                  covered={inputTokens === undefined ? 0 : summary.measuredRequestCount}
                 />
                 <UsageMetricRow
                   label="输出"
                   value={summary.outputTokens}
                   covered={summary.outputRequestCount}
-                  requestCount={summary.requestCount}
                 />
                 <UsageMetricRow
-                  label="缓存读取"
+                  label="含缓存读取"
                   value={summary.cacheReadTokens}
                   covered={summary.cacheReadRequestCount}
-                  requestCount={summary.requestCount}
                 />
-                {summary.cacheWriteTokens > 0 ? (
+                {summary.cacheWriteRequestCount > 0 ? (
                   <UsageMetricRow
-                    label="缓存写入"
+                    label="含缓存写入"
                     value={summary.cacheWriteTokens}
                     covered={summary.cacheWriteRequestCount}
-                    requestCount={summary.requestCount}
                   />
                 ) : null}
                 <UsageMetricRow
-                  label="总计"
+                  label="总计（输入 + 输出）"
                   value={summary.totalTokens}
                   covered={summary.totalRequestCount}
-                  requestCount={summary.requestCount}
                 />
                 <div className="ja-context-usage-popover__row ja-context-usage-popover__row--rate">
                   <span>缓存命中率</span>
@@ -398,31 +543,19 @@ export function ContextUsageIndicator({
                     data-rate-known={cacheRate !== undefined}
                   >
                     {cacheRate ?? "—"}
-                    {ratePartial ? <small>基于已报告数据</small> : null}
                   </span>
                 </div>
-              </section>
-              <section className="ja-context-usage-popover__section" aria-label="上下文 最近请求">
-                <h2>上下文 · 最近请求</h2>
-                <div className="ja-context-usage-popover__row">
-                  <span>上下文</span>
-                  <span className="ja-context-usage-popover__value">
-                    {knownContext && usage !== undefined ? usage.percentage.toFixed(1) + "%" : "—"}
-                  </span>
-                </div>
-                <div className="ja-context-usage-popover__row">
-                  <span>已用</span>
-                  <span className="ja-context-usage-popover__value">
-                    {knownContext && usage !== undefined
-                      ? formatContextCapacity(usage.usedTokens) +
-                        " / " +
-                        formatContextCapacity(usage.limitTokens)
-                      : "—"}
-                  </span>
-                </div>
-              </section>
-            </>
-          )}
+                <p className="ja-context-usage-popover__note">缓存已计入输入和总计，不重复累加。</p>
+                {hasPartialUsage || ratePartial || hasUnmeasuredRequests ? (
+                  <p className="ja-context-usage-popover__status">
+                    {hasUnmeasuredRequests
+                      ? "累计仅含已报告用量，仍有请求未上报用量。"
+                      : "部分请求未上报全部用量字段"}
+                  </p>
+                ) : null}
+              </>
+            )}
+          </section>
           {visibleState.phase === "stale" ? (
             <p className="ja-context-usage-popover__status" role="status">
               暂未更新

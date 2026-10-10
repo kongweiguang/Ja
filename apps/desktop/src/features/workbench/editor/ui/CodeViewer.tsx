@@ -16,18 +16,20 @@ export interface CodeViewerProps {
   content: string;
   language?: string;
   revision?: string | number;
+  lineNumberStart?: number;
   onCopyText?: (text: string) => Promise<void>;
 }
 
 /**
- * 每个选中文件创建一个不可变 CodeMirror View，并在 Unmount 时销毁；切换文件后不能遗留
- * Editor DOM 或 Event Listener。Palette 与明暗变化不属于文件变化，因此只重配 Theme Compartment。
+ * 每个选中文件创建一个不可变 CodeMirror View，并在 Unmount 时销毁；切换文件、语言或有效行号偏移后
+ * 不能遗留 Editor DOM 或 Event Listener。Palette 与明暗变化只重配 Theme Compartment。
  */
 export function CodeViewer({
   filePath,
   content,
   language,
   revision,
+  lineNumberStart = 1,
   onCopyText,
 }: CodeViewerProps): ReactElement {
   const resolvedTheme = useResolvedTheme();
@@ -38,6 +40,8 @@ export function CodeViewer({
   const initialResolvedThemeRef = useRef(resolvedTheme);
   const initialPaletteRef = useRef(palette);
   const initialContent = useRef(content);
+  const lineNumberOffset =
+    Number.isSafeInteger(lineNumberStart) && lineNumberStart > 0 ? lineNumberStart - 1 : 0;
   useEffect(() => {
     initialContent.current = content;
   }, [filePath, content]);
@@ -46,7 +50,7 @@ export function CodeViewer({
     if (host === null) return undefined;
     const extensions = [
       basicSetup,
-      lineNumbers(),
+      lineNumbers({ formatNumber: (line) => String(line + lineNumberOffset) }),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       EditorView.lineWrapping,
@@ -68,11 +72,11 @@ export function CodeViewer({
       view.destroy();
       viewRef.current = undefined;
     };
-  }, [filePath, language, themeCompartment]);
+  }, [filePath, language, lineNumberOffset, themeCompartment]);
   useEffect(() => {
     const view = viewRef.current;
     if (view === undefined) return;
-    // Read-only View 也原位重配配色与明暗，避免丢失滚动位置与已测量 Decoration。
+    // 只读视图也在原位置重新配置配色和明暗，避免丢失滚动位置及已测量的 Decoration。
     view.dispatch({
       effects: themeCompartment.reconfigure(
         semanticCodeMirrorThemeExtension(palette, resolvedTheme),

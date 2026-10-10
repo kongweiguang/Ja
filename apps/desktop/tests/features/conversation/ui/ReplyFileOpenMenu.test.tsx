@@ -21,6 +21,7 @@ function item(
   relativePaths?: string[],
 ): TimelineItemAdapter {
   return {
+    origin: "native" as const,
     itemId,
     threadId: "thr_fixture",
     turnId: `turn_${itemId}`,
@@ -29,6 +30,7 @@ function item(
     ...(relativePaths === undefined
       ? {}
       : {
+          origin: "native" as const,
           metadata: {
             presentation: {
               kind: "edit" as const,

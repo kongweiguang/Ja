@@ -4,10 +4,9 @@
 import { ErrorBoundary, type FallbackProps } from "react-error-boundary";
 import { useState, type ReactElement, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Toaster } from "sonner";
 import "@/shared/styles/tokens.css";
 import "@/shared/styles/primitives.css";
-import { useUiPreferencesStore } from "@/shared/preferences/uiPreferences";
+import { NotificationCenter } from "@/shared/ui/notifications";
 import { Button } from "@/shared/ui/primitives";
 import { RuntimeProvider, type RuntimeProviderProps } from "./RuntimeProvider";
 import { ThemeProvider } from "./ThemeProvider";
@@ -36,32 +35,6 @@ export interface AppProvidersProps extends Omit<RuntimeProviderProps, "runtime" 
   readonly runtime?: RuntimeProviderProps["runtime"];
   /** projection 测试替身只替换 Conversation owner seam，不允许 Provider 创建第二个 Store。 */
   readonly runtimeProjection?: RuntimeProviderProps["projection"];
-}
-
-/** Portal feedback 与 Shell 复用唯一 theme authority，避免引入第二个 ThemeProvider。 */
-function JaToaster(): ReactElement {
-  const theme = useUiPreferencesStore((state) => state.themeMode);
-  return (
-    <Toaster
-      className="ja-toaster"
-      theme={theme}
-      position="top-right"
-      offset={{
-        top: "calc(var(--ja-titlebar-height, 36px) + 0.75rem + env(safe-area-inset-top, 0px))",
-        right: "0.75rem",
-        bottom: "0.75rem",
-        left: "0.75rem",
-      }}
-      mobileOffset={{
-        top: "calc(var(--ja-titlebar-height, 36px) + 0.5rem + env(safe-area-inset-top, 0px))",
-        right: "0.5rem",
-        bottom: "0.5rem",
-        left: "0.5rem",
-      }}
-      visibleToasts={4}
-      closeButton
-    />
-  );
 }
 
 /**
@@ -107,10 +80,10 @@ export function AppProviders({
     <ErrorBoundary FallbackComponent={AppErrorFallback} onError={reportReactError}>
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
+          <NotificationCenter />
           <RuntimeProvider runtime={runtimeHost} projection={projection}>
             {children}
           </RuntimeProvider>
-          <JaToaster />
         </ThemeProvider>
       </QueryClientProvider>
     </ErrorBoundary>

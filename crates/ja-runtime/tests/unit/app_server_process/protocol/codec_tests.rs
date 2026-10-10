@@ -23,7 +23,7 @@ fn success_frame(id: &str) -> RpcFrame {
         &jsonl(json!({"jsonrpc":"2.0", "id":id, "result":{}})),
         Limits::default().max_frame_bytes,
     )
-    .expect("response fixture must satisfy the v1 codec")
+    .expect("response fixture must satisfy the v2 codec")
 }
 
 /// 有界协议配置必须拒绝任何无界队列或日志行，避免攻击者把协商值变成内存分配指令。
@@ -77,7 +77,7 @@ fn exact_challenge_guard_does_not_reject_business_ids() {
     );
 }
 
-/// v1 response 不接受 unknown root/error 字段或非 object result，
+/// v2 response 不接受 unknown root/error 字段或非 object result，
 /// 防止 codec 丢字段后把新旧协议混合 frame 误判为合法。
 #[test]
 fn response_envelope_is_closed_and_object_typed() {
@@ -103,10 +103,10 @@ fn response_envelope_is_closed_and_object_typed() {
     }
 }
 
-/// 生产 decode 拒绝已删除的 request/event method，同时接受 v1 event 名与唯一的
+/// 生产 decode 拒绝已删除的 request/event method，同时接受 v2 event 名与唯一的
 /// initialized notification 合同。
 #[test]
-fn decoded_method_roles_use_the_frozen_v1_closures() {
+fn decoded_method_roles_use_the_frozen_v2_closures() {
     for invalid in [
         serde_json::json!({
             "jsonrpc":"2.0", "id":"c:removed", "method":"removed/method", "params":{}
@@ -152,7 +152,7 @@ fn decoded_method_roles_use_the_frozen_v1_closures() {
             "params":{"readyToken":"0123456789abcdef0123456789abcdef"}
         }),
     ] {
-        decode_frame(&jsonl(valid), 4_096).expect("method belongs to the v1 role closure");
+        decode_frame(&jsonl(valid), 4_096).expect("method belongs to the v2 role closure");
     }
 }
 
@@ -216,7 +216,7 @@ fn codec_rejects_null_result_and_validates_hand_built_error() {
 }
 
 /// 构造 frozen error fixture，证明 code/errorCode/category/retryable 决定分类且 message
-/// 只服从 v1 的 1..512 字符边界；内容脱敏由 Java error mapper 负责。
+/// 只服从 v2 的 1..512 字符边界；内容脱敏由 Java error mapper 负责。
 #[test]
 fn codec_accepts_localized_catalog_errors_and_rejects_unsafe_messages() {
     /// fixture 只参数化允许变化的展示文本和 retryable，避免测试无意放宽冻结 error catalog。
@@ -253,6 +253,150 @@ fn codec_accepts_localized_catalog_errors_and_rejects_unsafe_messages() {
         Err(CodecError::InvalidErrorCatalog)
     );
     assert!(codec::decode_frame(&fixture(&"x".repeat(512), true), 4096).is_ok());
+}
+
+/// Exact Busy tuple 可返回已公开 Thread 标题；其它 tuple 仍使用通用诊断过滤，并且 Debug 不泄露标题。
+#[test]
+fn workspace_busy_error_allows_only_bounded_owner_prefixed_public_titles() {
+    const PREFIX: &str = "暂时无法更改项目目录：";
+
+    /// 通过生产 JSONL decoder 验证真实入站 error shape，而不是直接调用内部 predicate。
+    fn busy_frame(
+        code: i64,
+        error_code: &str,
+        category: &str,
+        retryable: bool,
+        message: &str,
+    ) -> Vec<u8> {
+        let value = json!({
+            "jsonrpc":"2.0",
+            "id":"c:workspace-busy",
+            "error":{
+                "code":code,
+                "message":message,
+                "data":{"errorCode":error_code,"category":category,"retryable":retryable,
+                    "errorId":"err_00000000000000000000000000000321"}
+            }
+        });
+        let mut bytes = serde_json::to_vec(&value).expect("busy error JSON");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    // Catalog 的固定默认消息仍经过通用 scanner，只有 owner 前缀启用公开标题例外。
+    assert!(
+        codec::decode_frame(
+            &busy_frame(
+                -32_100,
+                "WORKSPACE_BUSY",
+                "conflict",
+                true,
+                "workspace has active operations"
+            ),
+            4_096,
+        )
+        .is_ok()
+    );
+    let public_messages = [
+        format!("{PREFIX}会话「结算」正在执行 Turn。"),
+        format!("{PREFIX}会话「token」有排队输入。"),
+        format!("{PREFIX}会话「C:\\项目\\src\\README.md」有暂停 Plan。"),
+        format!("{PREFIX}会话「0123456789abcdef0123456789abcdef」正在执行 Turn。"),
+    ];
+    for message in public_messages {
+        let frame = codec::decode_frame(
+            &busy_frame(-32_100, "WORKSPACE_BUSY", "conflict", true, &message),
+            4_096,
+        )
+        .expect("exact Busy tuple may contain public Thread titles");
+        assert_eq!(frame.error().expect("Busy error").message(), message);
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains("token"));
+        assert!(!debug.contains("README.md"));
+        assert!(!debug.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    let mut byte_limit = PREFIX.to_owned();
+    while byte_limit.len() + "界".len() <= 512 {
+        byte_limit.push('界');
+    }
+    while byte_limit.len() < 512 {
+        byte_limit.push('x');
+    }
+    assert_eq!(byte_limit.len(), 512);
+    assert!(
+        codec::decode_frame(
+            &busy_frame(-32_100, "WORKSPACE_BUSY", "conflict", true, &byte_limit),
+            4_096
+        )
+        .is_ok()
+    );
+    let over_byte_limit = format!("{byte_limit}x");
+    assert_eq!(
+        over_byte_limit.chars().count(),
+        byte_limit.chars().count() + 1
+    );
+    assert_eq!(
+        codec::decode_frame(
+            &busy_frame(
+                -32_100,
+                "WORKSPACE_BUSY",
+                "conflict",
+                true,
+                &over_byte_limit
+            ),
+            4_096
+        ),
+        Err(CodecError::InvalidEnvelope)
+    );
+
+    let invalid_messages = [
+        "项目目录繁忙：会话 token 正在运行。".to_owned(),
+        format!("{PREFIX}第一行\n第二行"),
+    ];
+    for message in invalid_messages {
+        assert_eq!(
+            codec::decode_frame(
+                &busy_frame(-32_100, "WORKSPACE_BUSY", "conflict", true, &message),
+                4_096
+            ),
+            Err(CodecError::InvalidEnvelope)
+        );
+    }
+
+    let marker_message = format!("{PREFIX}会话「token」正在执行 Turn。");
+    for (code, error_code, category, retryable) in [
+        (-32_100, "WORKSPACE_BUSY", "conflict", false),
+        (-32_028, "WORKSPACE_BUSY", "conflict", true),
+        (-32_100, "CONFLICT", "conflict", true),
+    ] {
+        assert!(
+            codec::decode_frame(
+                &busy_frame(code, error_code, category, retryable, &marker_message),
+                4_096
+            )
+            .is_err(),
+            "non-canonical Busy tuple must not expose Thread titles"
+        );
+    }
+
+    let generic_with_title = json!({
+        "jsonrpc":"2.0",
+        "id":"c:generic-error",
+        "error":{
+            "code":-32_020,
+            "message":marker_message,
+            "data":{"errorCode":"SHUTTING_DOWN","category":"unavailable","retryable":true,
+                "errorId":"err_00000000000000000000000000000020"}
+        }
+    });
+    let mut generic_bytes = serde_json::to_vec(&generic_with_title).expect("generic error JSON");
+    generic_bytes.push(b'\n');
+    assert_eq!(
+        codec::decode_frame(&generic_bytes, 4_096),
+        Err(CodecError::InvalidEnvelope),
+        "other public errors retain the generic diagnostic scanner"
+    );
 }
 
 /// 锁定 readyToken 的 schema 形状与递归拒绝边界，防止伪 ready 进入 supervisor。
@@ -476,4 +620,22 @@ fn codec_limits_and_reader_keep_consecutive_frames() {
             max: 1024
         })
     );
+    let mut oversized_reader = io::BufReader::new(std::io::Cursor::new(oversized));
+    assert_eq!(
+        read_frame_with_forbidden(&mut oversized_reader, 1024, &HashSet::new()),
+        Err(CodecError::FrameTooLarge {
+            actual: 1025,
+            max: 1024
+        })
+    );
+
+    let oversized_outbound = RpcFrame::notification(
+        "assistant/text-delta",
+        json!({"turnId":"turn_one","streamSeq":1,"text":"x".repeat(1024)}),
+    )
+    .expect("valid notification envelope");
+    assert!(matches!(
+        oversized_outbound.encode(1024),
+        Err(CodecError::FrameTooLarge { actual, max: 1024 }) if actual > 1024
+    ));
 }

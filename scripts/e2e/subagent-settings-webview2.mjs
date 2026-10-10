@@ -461,7 +461,7 @@ function buildEnvironment(directories, ports, java, provider, tauriConfig, edgeD
     JAVA_HOME: java.home,
     JA_DEBUG_JAVA: java.executable,
     JA_DEBUG_JAR: resolve(
-      process.env.JA_E2E_APP_SERVER_JAR?.trim() || repoPath("app-server/target/ja-app-server.jar"),
+      process.env.JA_E2E_APP_SERVER_JAR?.trim() || repoPath("ja-agent/ja-app-server/target/ja-app-server.jar"),
     ),
     CARGO_TARGET_DIR: resolve(
       process.env.JA_E2E_CARGO_TARGET_DIR?.trim() || repoPath("target/subagent-settings"),
@@ -886,7 +886,7 @@ async function main() {
           : { ...configuredEdgeDriver, cargo: await resolveCargoCommand() };
       const jarPath = resolve(
         process.env.JA_E2E_APP_SERVER_JAR?.trim() ||
-          repoPath("app-server/target/ja-app-server.jar"),
+          repoPath("ja-agent/ja-app-server/target/ja-app-server.jar"),
       );
       if (!(await stat(jarPath)).isFile()) throw new Error(`缺少 App Server JAR：${jarPath}`);
       await writeSettings(directories, provider);

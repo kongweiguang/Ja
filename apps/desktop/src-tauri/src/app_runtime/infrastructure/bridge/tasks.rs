@@ -376,7 +376,7 @@ impl RuntimeBridge {
         parse_task_tree_delete_result(self.task_request(TaskMethod::TreeDelete, params)?)
     }
 
-    /// task/close 不携带 revision；Java 以 Thread 临时生命周期 owner 实现幂等关闭。
+    /// task/close 不携带 revision；保留请求 root 以核验 Java 返回的完整幂等关闭集合。
     pub(crate) fn task_close(
         &self,
         input: TaskCloseInput,
@@ -384,10 +384,14 @@ impl RuntimeBridge {
         input
             .validate()
             .map_err(|_| RuntimeCommandError::invalid_params())?;
-        parse_task_close_result(self.task_request(
-            TaskMethod::Close,
-            json!({"taskThreadId": input.task_thread_id}),
-        )?)
+        let expected_root_thread_id = input.task_thread_id.clone();
+        parse_task_close_result(
+            self.task_request(
+                TaskMethod::Close,
+                json!({"taskThreadId": input.task_thread_id}),
+            )?,
+            &expected_root_thread_id,
+        )
     }
 
     /// 所有 task 方法共享同一 actor/generation fence，但 method 只能来自闭集枚举。
@@ -506,7 +510,7 @@ fn task_message_params(input: &TaskMessageInput) -> Value {
         "senderThreadId": input.sender_thread_id,
         "targetThreadId": input.target_thread_id,
         "content": turn_content_value(&input.content),
-        "idempotencyKey": input.idempotency_key,
+        "operationKey": input.operation_key,
     })
 }
 
@@ -569,6 +573,7 @@ impl TaskSummaryWire {
                     | "queued"
                     | "running"
                     | "waiting_approval"
+                    | "waiting_input"
                     | "suspended"
                     | "completed"
                     | "failed"
@@ -671,6 +676,7 @@ impl TaskActivityWire {
                     | "follow_up_queued"
                     | "progress"
                     | "waiting_approval"
+                    | "waiting_input"
                     | "resumed"
                     | "completed"
                     | "failed"
@@ -989,10 +995,7 @@ fn task_thread_from_history(thread: ThreadDto) -> TaskThreadSummary {
         workspace_kind: match thread.workspace_kind {
             WorkspaceKindDto::Project => WorkspaceKind::Project,
             WorkspaceKindDto::Session => WorkspaceKind::Session,
-            WorkspaceKindDto::LegacyShared => WorkspaceKind::LegacyShared,
         },
-        legacy_shared_workspace_id: thread.legacy_shared_workspace_id,
-        active_goal_id: thread.active_goal_id,
         preferences: thread.preferences.map(|preferences| TaskThreadPreferences {
             provider_id: preferences.provider_id,
             model_id: preferences.model_id,
@@ -1229,18 +1232,27 @@ fn parse_task_tree_delete_result(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskCloseResultWire {
-    closed: bool,
+    closed_thread_ids: Vec<String>,
 }
 
-/// 关闭必须得到严格且为真的终态回执；额外字段或 false 都不能声明本地资源已释放。
+/// 桥接层校验回执形状与请求 root；集合完整范围只由服务端 purge 事务确定。
 pub(crate) fn parse_task_close_result(
     value: Value,
+    expected_root_thread_id: &str,
 ) -> Result<TaskCloseResult, RuntimeCommandError> {
     let wire: TaskCloseResultWire = strict_result(value)?;
-    if !wire.closed {
+    let mut identities = std::collections::HashSet::with_capacity(wire.closed_thread_ids.len());
+    if wire.closed_thread_ids.is_empty()
+        || !wire.closed_thread_ids.iter().all(|thread_id| {
+            valid_protocol_id(thread_id, "thr_", 100) && identities.insert(thread_id.as_str())
+        })
+        || !identities.contains(expected_root_thread_id)
+    {
         return Err(RuntimeCommandError::unavailable());
     }
-    Ok(TaskCloseResult { closed: true })
+    Ok(TaskCloseResult {
+        closed_thread_ids: wire.closed_thread_ids,
+    })
 }
 
 /// 所有 task 结果使用 deny_unknown_fields wire type 反序列化，避免新增字段静默穿过原生边界。

@@ -4,12 +4,16 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { useState, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Settings } from "@/features/settings/ui/Settings";
 import type { SettingsDesktopPort, SettingsPorts } from "@/features/settings/application/ports";
 import type { SettingsInterfacePreferences } from "@/features/settings/application/ports";
-import type { SettingsSection, SettingsSnapshot } from "@/features/settings/domain/types";
+import type {
+  ConfigurationIssue,
+  SettingsSection,
+  SettingsSnapshot,
+} from "@/features/settings/domain/types";
 
 const SNAPSHOT: SettingsSnapshot = {
   revision: 3,
@@ -39,6 +43,7 @@ const SNAPSHOT: SettingsSnapshot = {
           capabilities: {
             contextWindowTokens: 256_000,
             maxOutputTokens: 32_000,
+            supportsOutputSchema: false,
           },
           reasoningLevelMap: { low: "low", medium: "medium", high: "high" },
           defaultReasoningLevel: "high",
@@ -50,6 +55,7 @@ const SNAPSHOT: SettingsSnapshot = {
           capabilities: {
             contextWindowTokens: 128_000,
             maxOutputTokens: 8_192,
+            supportsOutputSchema: false,
           },
           reasoningLevelMap: {},
           defaultReasoningLevel: null,
@@ -107,6 +113,16 @@ function ports(overrides: Partial<SettingsPorts> = {}): SettingsPorts {
     onTestMcp: vi.fn(async () => "connected" as const),
     onToggleSkill: vi.fn(async () => undefined),
     onAccessModeChange: vi.fn(async () => undefined),
+    onInheritProjectOverride: vi.fn(async () => undefined),
+    onProjectProviderRuntimeChange: vi.fn(async () => undefined),
+    onInheritProjectProvider: vi.fn(async () => undefined),
+    onProjectProviderConnectionChange: vi.fn(async () => undefined),
+    onInheritProjectProviderConnection: vi.fn(async () => undefined),
+    onSaveProjectProviderModels: vi.fn(async () => undefined),
+    onInheritProjectProviderModels: vi.fn(async () => undefined),
+    onInheritProjectModelOverride: vi.fn(async () => undefined),
+    onHideProjectModel: vi.fn(async () => undefined),
+    onRestoreProjectModel: vi.fn(async () => undefined),
     onClarificationEnabledChange: vi.fn(async () => undefined),
     onAppearanceChange: vi.fn(async () => undefined),
     ...overrides,
@@ -153,50 +169,285 @@ describe("Settings v1 UI", () => {
     await waitFor(() => expect(selectedTab).toHaveFocus());
   });
 
-  /** 历史快照只显示紧凑提示，问题在 Sheet 中处理并在关闭后还原入口焦点。 */
-  it("shows a non-blocking snapshot notice and returns focus from the issues sheet", async () => {
+  /** 项目模型页明确展示运行参数继承与保存。 */
+  it("edits only the current project's Provider runtime parameters", async () => {
     const user = userEvent.setup();
-    const onSectionChange = vi.fn();
-    const onIssuesRestore = vi.fn(async () => undefined);
+    const actions = ports();
+    const snapshot: SettingsSnapshot = {
+      ...SNAPSHOT,
+      providers: SNAPSHOT.providers.map((provider) => ({
+        ...provider,
+        networkTimeouts: { connectTimeoutMs: 5_000, requestTimeoutMs: 60_000 },
+        agentDefaults: { context: { autoCompact: false } },
+      })),
+    };
     render(
       <Settings
-        snapshot={SNAPSHOT}
-        issues={[
-          {
-            id: "cfg_last_known_good",
-            scope: "user",
-            field: null,
-            entityId: null,
-            line: null,
-            column: null,
-            reason: "LAST_KNOWN_GOOD_IN_USE",
-            impact: "snapshot_in_use",
-            actions: ["edit", "restore"],
-          },
-        ]}
-        onIssuesRestore={onIssuesRestore}
-        ports={ports()}
+        snapshot={snapshot}
+        configScope="project"
+        projectConfigAvailable
+        projectOverrides={{
+          defaultSelection: true,
+          accessMode: true,
+          clarification: false,
+          subagents: false,
+          providerIds: ["provider_openai"],
+          providerRuntime: [
+            {
+              providerId: "provider_openai",
+              networkTimeouts: { requestTimeoutMs: 60_000 },
+              autoCompact: false,
+            },
+          ],
+          disabledSkillReferences: [],
+        }}
+        ports={actions}
         desktop={desktop()}
-        section="general"
-        onSectionChange={onSectionChange}
+        section="models"
+        onSectionChange={() => undefined}
         interfacePreferences={INTERFACE_PREFERENCES}
-        executionScope={EXECUTION_SCOPE}
+        executionScope={{ ...EXECUTION_SCOPE, projectOverride: true, workspaceKind: "project" }}
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("正在使用上次可用设置");
+    expect(screen.getByRole("button", { name: "当前项目" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("spinbutton", { name: "OpenAI 请求超时（ms）" })).toHaveValue(60_000);
+    expect(screen.getByRole("checkbox", { name: "自动压缩上下文" })).not.toBeChecked();
+    await user.clear(screen.getByRole("spinbutton", { name: "OpenAI 请求超时（ms）" }));
+    await user.type(screen.getByRole("spinbutton", { name: "OpenAI 请求超时（ms）" }), "90000");
+    await user.click(screen.getByRole("button", { name: "保存项目参数" }));
+    await waitFor(() =>
+      expect(actions.onProjectProviderRuntimeChange).toHaveBeenCalledWith("provider_openai", {
+        connectTimeoutMs: 5_000,
+        requestTimeoutMs: 90_000,
+        autoCompact: false,
+      }),
+    );
+    await user.click(
+      within(screen.getByRole("region", { name: "项目 Provider 运行参数" })).getByRole("button", {
+        name: "使用全局设置",
+      }),
+    );
+    expect(actions.onInheritProjectProvider).toHaveBeenCalledWith("provider_openai");
+  });
+
+  /** 更换项目目标时显式提交完整连接三元组；继承动作只清除项目连接覆盖。 */
+  it("saves and inherits a project's Provider connection as one unit", async () => {
+    const user = userEvent.setup();
+    const actions = ports();
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        globalProviders={SNAPSHOT.providers}
+        configScope="project"
+        projectConfigAvailable
+        projectOverrides={{
+          defaultSelection: false,
+          accessMode: false,
+          providerRuntime: [],
+          disabledSkillReferences: [],
+        }}
+        ports={actions}
+        desktop={desktop()}
+        section="models"
+        onSectionChange={() => undefined}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={{ ...EXECUTION_SCOPE, workspaceKind: "project" }}
+      />,
+    );
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "OpenAI 连接协议" }),
+      "anthropic_messages",
+    );
+    expect(screen.queryByRole("button", { name: "新增供应商" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑供应商" })).not.toBeInTheDocument();
+    await user.clear(screen.getByRole("textbox", { name: "OpenAI 项目连接地址" }));
+    await user.type(
+      screen.getByRole("textbox", { name: "OpenAI 项目连接地址" }),
+      "https://example.com/v1",
+    );
+    await user.click(screen.getByRole("button", { name: "保存项目连接" }));
+    await waitFor(() =>
+      expect(actions.onProjectProviderConnectionChange).toHaveBeenCalledWith("provider_openai", {
+        api: "anthropic_messages",
+        baseUrl: "https://example.com/v1",
+        credentialId: "cred_openai",
+      }),
+    );
+
+    const inheritedActions = ports();
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        globalProviders={SNAPSHOT.providers}
+        configScope="project"
+        projectConfigAvailable
+        projectOverrides={{
+          defaultSelection: false,
+          accessMode: false,
+          providerRuntime: [
+            {
+              providerId: "provider_openai",
+              connection: {
+                api: "anthropic_messages",
+                baseUrl: "https://example.com/v1",
+                credentialId: "cred_openai",
+              },
+            },
+          ],
+          disabledSkillReferences: [],
+        }}
+        ports={inheritedActions}
+        desktop={desktop()}
+        section="models"
+        onSectionChange={() => undefined}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={{ ...EXECUTION_SCOPE, workspaceKind: "project" }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "继承全局连接" }));
+    expect(inheritedActions.onInheritProjectProviderConnection).toHaveBeenCalledWith(
+      "provider_openai",
+    );
+  });
+
+  /** 项目模型编辑只依赖已装配的 feature 端口；app 路由在所属层验证，避免测试反向依赖组合根。 */
+  it("edits and inherits one project model without opening global credentials", async () => {
+    const user = userEvent.setup();
+    const actions = ports();
+    const projectProvider = {
+      ...SNAPSHOT.providers[0]!,
+      models: SNAPSHOT.providers[0]!.models.map((model, index) => ({
+        ...model,
+        model: index === 0 ? "project-gpt" : model.model,
+      })),
+    };
+    render(
+      <Settings
+        snapshot={{ ...SNAPSHOT, providers: [projectProvider] }}
+        globalProviders={SNAPSHOT.providers}
+        configScope="project"
+        projectConfigAvailable
+        projectOverrides={{
+          defaultSelection: false,
+          accessMode: false,
+          providerRuntime: [
+            {
+              providerId: "provider_openai",
+              models: [projectProvider.models[0]!],
+            },
+          ],
+          disabledSkillReferences: [],
+        }}
+        ports={{ ...actions, onSaveProvider: actions.onSaveProjectProviderModels! }}
+        desktop={desktop()}
+        section="models"
+        onSectionChange={() => undefined}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={{ ...EXECUTION_SCOPE, workspaceKind: "project" }}
+      />,
+    );
+
+    const inheritedModelRow = document.querySelector(
+      '[data-setting-id="model-provider_openai-model_mini"]',
+    );
+    expect(inheritedModelRow).not.toBeNull();
+    await user.click(
+      within(inheritedModelRow as HTMLElement).getByRole("button", { name: "从当前项目隐藏" }),
+    );
+    expect(actions.onHideProjectModel).toHaveBeenCalledWith("provider_openai", "model_mini");
+
+    await user.click(screen.getByRole("button", { name: /编辑项目模型 project-gpt/u }));
+    const sheet = screen.getByRole("dialog", { name: "编辑项目模型" });
+    expect(within(sheet).queryByLabelText("Base URL")).not.toBeInTheDocument();
+    expect(within(sheet).queryByLabelText("API Key")).not.toBeInTheDocument();
+    const upstreamModelInput = within(sheet).getAllByRole("textbox", { name: "上游模型标识" })[0]!;
+    expect(upstreamModelInput).toHaveFocus();
+    await user.clear(upstreamModelInput);
+    await user.type(upstreamModelInput, "project-gpt-updated");
+    await user.click(within(sheet).getByRole("button", { name: "保存项目模型" }));
+    await waitFor(() =>
+      expect(actions.onSaveProjectProviderModels).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providerId: "provider_openai",
+          models: expect.arrayContaining([
+            expect.objectContaining({ model: "project-gpt-updated" }),
+          ]),
+        }),
+      ),
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent("项目模型已保存");
+    expect(actions.onRevealProviderCredential).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "继承全局模型" }));
+    expect(actions.onInheritProjectModelOverride).toHaveBeenCalledWith(
+      "provider_openai",
+      "model_gpt",
+    );
+  });
+
+  /** 语法错误修复须先确认保留内容和备份行为，完成后关闭面板并还原入口焦点。 */
+  it("confirms a configuration repair and returns focus after the authoritative read", async () => {
+    const user = userEvent.setup();
+    const onSectionChange = vi.fn();
+    const onIssuesRepair = vi.fn(async (scope: "user" | "project") => {
+      expect(["user", "project"]).toContain(scope);
+    });
+    /** 修复后问题入口随权威状态消失，验证焦点落到仍存在的设置分类。 */
+    function RepairableSettings(): ReactElement {
+      const [issues, setIssues] = useState<ConfigurationIssue[]>([
+        {
+          id: "cfg_toml_syntax_user",
+          scope: "user",
+          field: null,
+          entityId: null,
+          line: 18,
+          column: null,
+          reason: "TOML_PARSE_FAILED",
+          impact: "valid_prefix_in_use",
+          actions: ["repair"],
+        },
+      ]);
+      return (
+        <Settings
+          snapshot={SNAPSHOT}
+          issues={issues}
+          onIssuesRepair={async (scope) => {
+            await onIssuesRepair(scope);
+            setIssues([]);
+          }}
+          ports={ports()}
+          desktop={desktop()}
+          section="general"
+          onSectionChange={onSectionChange}
+          interfacePreferences={INTERFACE_PREFERENCES}
+          executionScope={EXECUTION_SCOPE}
+        />
+      );
+    }
+    render(<RepairableSettings />);
+
     const trigger = screen.getByRole("button", { name: "配置问题" });
     await user.click(trigger);
     const sheet = screen.getByRole("dialog", { name: "配置问题" });
-    expect(within(sheet).getByText("正在使用上次可用设置。")).toBeInTheDocument();
-    sheet.focus();
-    await user.keyboard("{Escape}");
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "配置问题" })).toBeNull());
-    expect(trigger).toHaveFocus();
-
-    await user.click(trigger);
-    await user.click(screen.getByRole("button", { name: "编辑" }));
-    expect(onSectionChange).toHaveBeenCalledWith("models");
+    expect(
+      within(sheet).getByText("第 18 行之后的内容无法确认，当前只使用此前能读取的设置。"),
+    ).toBeInTheDocument();
+    await user.click(within(sheet).getByRole("button", { name: "备份并修复" }));
+    const confirmation = screen.getByRole("dialog", { name: "备份并修复配置？" });
+    expect(
+      within(confirmation).getByText(/无法识别的尾部内容将从活动配置中移除/u),
+    ).toBeInTheDocument();
+    expect(within(confirmation).getByText(/解析在第 18 行中断/u)).toBeInTheDocument();
+    await user.click(within(confirmation).getByRole("button", { name: "备份并修复" }));
+    await waitFor(() => expect(onIssuesRepair).toHaveBeenCalledWith("user"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(trigger).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "通用" })).toHaveFocus();
+    expect(onSectionChange).not.toHaveBeenCalled();
   });
 
   /** MCP 条目中的未知字段只影响该条目，详情与编辑必须按稳定 MCP 身份路由。 */
@@ -233,6 +484,57 @@ describe("Settings v1 UI", () => {
     expect(within(sheet).getByText("MCP 服务")).toBeInTheDocument();
     await user.click(within(sheet).getByRole("button", { name: "编辑" }));
     expect(onSectionChange).toHaveBeenCalledWith("mcp");
+  });
+
+  /** 高版本配置复用现有备份修复能力，并说明版本不兼容而不暴露原始文件内容。 */
+  it("explains an unsupported schema version and keeps the existing backup-repair flow", async () => {
+    const user = userEvent.setup();
+    const onIssuesRepair = vi.fn(async () => undefined);
+    render(
+      <Settings
+        snapshot={SNAPSHOT}
+        issues={[
+          {
+            id: "cfg_user_unsupported_schema_version",
+            scope: "user",
+            field: "schema_version",
+            entityId: null,
+            line: null,
+            column: null,
+            reason: "UNSUPPORTED_SCHEMA_VERSION",
+            impact: "defaults_in_use",
+            actions: ["repair"],
+          },
+        ]}
+        onIssuesRepair={onIssuesRepair}
+        ports={ports()}
+        desktop={desktop()}
+        section="general"
+        onSectionChange={vi.fn()}
+        interfacePreferences={INTERFACE_PREFERENCES}
+        executionScope={EXECUTION_SCOPE}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "配置问题" }));
+    const issues = screen.getByRole("dialog", { name: "配置问题" });
+    expect(within(issues).getByText("配置版本")).toBeInTheDocument();
+    expect(
+      within(issues).getByText(
+        "此配置声明的版本当前不受 Ja 支持，因此该层未能应用。请先备份，再使用现有修复操作恢复配置。",
+      ),
+    ).toBeInTheDocument();
+    await user.click(within(issues).getByRole("button", { name: "备份并修复" }));
+
+    const confirmation = screen.getByRole("dialog", { name: "备份并修复配置？" });
+    expect(
+      within(confirmation).getByText(
+        "Ja 会先备份当前原文件，再写入此版本可识别的配置；原文件内容保留在备份中。",
+      ),
+    ).toBeInTheDocument();
+    expect(within(confirmation).queryByText(/解析在第/u)).toBeNull();
+    await user.click(within(confirmation).getByRole("button", { name: "备份并修复" }));
+    await waitFor(() => expect(onIssuesRepair).toHaveBeenCalledWith("user"));
   });
 
   /** 搜索需要先切换供应商再聚焦真实模型；同一搜索再次执行也必须生效。 */
@@ -487,6 +789,7 @@ describe("Settings v1 UI", () => {
       "执行确认",
       "Skills",
       "MCP",
+      "数据与存储",
       "关于",
     ]);
     expect(screen.getByRole("tab", { name: "关于" })).toBeDefined();
@@ -609,12 +912,14 @@ describe("Settings v1 UI", () => {
     await waitFor(() => expect(onDeleteMcp).toHaveBeenCalledWith("mcp_local", "user"));
   });
 
+  /** 编辑 Provider 的凭据异步读取短暂禁用连接字段，焦点应在解禁后落到名称输入。 */
   it("saves multiple models, custom budgets, and provider fields as one aggregate", async () => {
     const user = userEvent.setup();
     const onSaveProvider = vi.fn(async () => undefined);
     renderSettings("models", ports({ onSaveProvider }));
     await user.click(screen.getByRole("button", { name: "编辑供应商" }));
     const dialog = screen.getByRole("dialog", { name: "编辑供应商" });
+    await waitFor(() => expect(within(dialog).getByLabelText("供应商名称")).toHaveFocus());
     await user.click(within(dialog).getByRole("button", { name: "手动添加" }));
     const rows = within(dialog).getAllByRole("article");
     expect(rows).toHaveLength(3);
@@ -638,6 +943,7 @@ describe("Settings v1 UI", () => {
         ]),
       }),
     );
+    await waitFor(() => expect(screen.getByRole("button", { name: "编辑供应商" })).toHaveFocus());
   });
 
   it("keeps the Provider draft open when the save port rejects it", async () => {
@@ -673,15 +979,18 @@ describe("Settings v1 UI", () => {
     );
   });
 
+  /** 首次创建端口负责配置与凭据完整提交，UI 不得再单独重复写凭据。 */
   it("creates a custom DeepSeek supplier with its own credential and any API specification", async () => {
     const user = userEvent.setup();
     const onCreateProvider = vi.fn<SettingsPorts["onCreateProvider"]>(async (provider) => {
       expect(provider.credentialId).toMatch(/^cred_/);
     });
     const onSaveProvider = vi.fn<SettingsPorts["onSaveProvider"]>(async () => undefined);
-    renderSettings("models", ports({ onCreateProvider, onSaveProvider }));
+    const onReplaceCredential = vi.fn<SettingsPorts["onReplaceCredential"]>(async () => undefined);
+    renderSettings("models", ports({ onCreateProvider, onSaveProvider, onReplaceCredential }));
     await user.click(screen.getByRole("button", { name: "新增供应商" }));
     const dialog = screen.getByRole("dialog", { name: "新增供应商" });
+    expect(within(dialog).getByLabelText("供应商名称")).toHaveFocus();
     const secretInput = within(dialog).getByLabelText("API Key");
     expect(secretInput.getAttribute("type")).toBe("password");
     expect(secretInput.getAttribute("autocomplete")).toBe("new-password");
@@ -710,18 +1019,42 @@ describe("Settings v1 UI", () => {
     );
     expect(onCreateProvider.mock.calls[0]![0].credentialId).not.toBe("cred_openai");
     expect(onSaveProvider).not.toHaveBeenCalled();
+    expect(onReplaceCredential).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "新增供应商" }));
+    const reopenedDialog = screen.getByRole("dialog", { name: "新增供应商" });
+    expect(within(reopenedDialog).getByLabelText("API Key")).toHaveValue("");
   });
 
-  it("keeps stable Provider and model identities when credential persistence is retried", async () => {
+  /** 取消会丢弃当前 sheet 的 Secret；重新打开新增流程不得恢复已取消的输入。 */
+  it("clears a new Provider secret when its sheet is canceled", async () => {
+    const user = userEvent.setup();
+    renderSettings("models");
+    await user.click(screen.getByRole("button", { name: "新增供应商" }));
+    let dialog = screen.getByRole("dialog", { name: "新增供应商" });
+    await user.type(within(dialog).getByLabelText("API Key"), "discarded-secret");
+    await user.click(within(dialog).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "新增供应商" })).toHaveFocus());
+
+    await user.click(screen.getByRole("button", { name: "新增供应商" }));
+    dialog = screen.getByRole("dialog", { name: "新增供应商" });
+    expect(within(dialog).getByLabelText("API Key")).toHaveValue("");
+  });
+
+  /** 凭据失败保留组件内 Secret；原样重试只补凭据，改动草稿时再提交配置。 */
+  it("preserves the secret and stable identities while retrying only unfinished persistence", async () => {
     const user = userEvent.setup();
     const failure = Object.assign(new Error("redacted"), {
       code: "provider_saved_credential_failed",
     });
     const onCreateProvider = vi
       .fn<SettingsPorts["onCreateProvider"]>()
-      .mockRejectedValueOnce(failure)
+      .mockRejectedValueOnce(failure);
+    const onSaveProvider = vi.fn<SettingsPorts["onSaveProvider"]>(async () => undefined);
+    const onReplaceCredential = vi
+      .fn<SettingsPorts["onReplaceCredential"]>()
+      .mockRejectedValueOnce(new Error("vault unavailable"))
       .mockResolvedValueOnce(undefined);
-    renderSettings("models", ports({ onCreateProvider }));
+    renderSettings("models", ports({ onCreateProvider, onSaveProvider, onReplaceCredential }));
     await user.click(screen.getByRole("button", { name: "新增供应商" }));
     const dialog = screen.getByRole("dialog", { name: "新增供应商" });
     await user.type(within(dialog).getByLabelText("供应商名称"), "DeepSeek");
@@ -737,22 +1070,44 @@ describe("Settings v1 UI", () => {
     await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
 
     await waitFor(() => expect(onCreateProvider).toHaveBeenCalledTimes(1));
-    expect(secretInput).toHaveProperty("value", "");
+    expect(secretInput).toHaveProperty("value", "first-secret");
     expect((await within(dialog).findByRole("alert")).textContent).toContain(
-      "Provider 已保存，但密钥保存失败，请重新输入后重试",
+      "供应商配置已保存，密钥操作未完成。输入已保留，可再次保存重试。",
+    );
+    await waitFor(() =>
+      expect(within(dialog).getByRole("button", { name: "保存供应商" })).toHaveFocus(),
     );
     const firstProvider = onCreateProvider.mock.calls[0]![0];
-    await user.type(secretInput, "second-secret");
     await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
 
-    await waitFor(() => expect(onCreateProvider).toHaveBeenCalledTimes(2));
-    expect(onCreateProvider.mock.calls[1]![0].providerId).toBe(firstProvider.providerId);
-    expect(onCreateProvider.mock.calls[1]![0].models.map((model) => model.modelId)).toEqual(
+    await waitFor(() => expect(onReplaceCredential).toHaveBeenCalledTimes(1));
+    expect(onCreateProvider).toHaveBeenCalledTimes(1);
+    expect(onSaveProvider).not.toHaveBeenCalled();
+    expect(onReplaceCredential).toHaveBeenLastCalledWith(
+      firstProvider.credentialId,
+      "first-secret",
+    );
+
+    await user.clear(within(dialog).getByLabelText("供应商名称"));
+    await user.type(within(dialog).getByLabelText("供应商名称"), "DeepSeek Updated");
+    await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
+
+    await waitFor(() => expect(onReplaceCredential).toHaveBeenCalledTimes(2));
+    expect(onCreateProvider).toHaveBeenCalledTimes(1);
+    expect(onSaveProvider).toHaveBeenCalledTimes(1);
+    const updatedProvider = onSaveProvider.mock.calls[0]![0];
+    expect(updatedProvider).toEqual(expect.objectContaining({ name: "DeepSeek Updated" }));
+    expect(updatedProvider.providerId).toBe(firstProvider.providerId);
+    expect(updatedProvider.models.map((model) => model.modelId)).toEqual(
       firstProvider.models.map((model) => model.modelId),
     );
-    expect(onCreateProvider.mock.calls[1]![1]).toBe("second-secret");
+    expect(onReplaceCredential).toHaveBeenLastCalledWith(
+      firstProvider.credentialId,
+      "first-secret",
+    );
+    expect(secretInput).toHaveProperty("value", "first-secret");
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "新增供应商" })).toBeNull());
-  });
+  }, 15_000);
 
   /** 保存前拒绝重复上游身份，且不调用端口、不丢失统一 sheet 草稿。 */
   it("rejects duplicate upstream model identifiers before persistence", async () => {
@@ -792,8 +1147,8 @@ describe("Settings v1 UI", () => {
     await user.type(within(row).getByLabelText("上游模型标识"), "small-context");
     await user.clear(within(row).getByLabelText("上下文 Tokens"));
     await user.type(within(row).getByLabelText("上下文 Tokens"), "4096");
-    await user.clear(within(row).getByLabelText("最大输出 Tokens"));
-    await user.type(within(row).getByLabelText("最大输出 Tokens"), "8192");
+    await user.clear(within(row).getByLabelText("单次最大输出 Tokens"));
+    await user.type(within(row).getByLabelText("单次最大输出 Tokens"), "8192");
     await user.click(within(dialog).getByRole("button", { name: "保存供应商" }));
 
     expect(onCreateProvider).not.toHaveBeenCalled();
@@ -833,7 +1188,11 @@ describe("Settings v1 UI", () => {
           expect.objectContaining({
             name: "deepseek-v4-pro",
             model: "deepseek-v4-pro",
-            capabilities: { contextWindowTokens: 1_000_000, maxOutputTokens: 8_192 },
+            capabilities: {
+              contextWindowTokens: 1_000_000,
+              maxOutputTokens: 16_384,
+              supportsOutputSchema: false,
+            },
           }),
         ],
       }),
@@ -939,7 +1298,7 @@ describe("Settings v1 UI", () => {
   it("changes the root default access mode through the real port", async () => {
     const onAccessModeChange = vi.fn(async () => undefined);
     renderSettings("permissions", ports({ onAccessModeChange }));
-    fireEvent.click(screen.getByRole("radio", { name: /需要确认/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /需要审批/ }));
     await waitFor(() => expect(onAccessModeChange).toHaveBeenCalledWith("approval_required"));
   });
 

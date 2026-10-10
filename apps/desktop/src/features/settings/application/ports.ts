@@ -3,6 +3,7 @@
 
 import type { InterfacePreferences } from "./interfacePreferences";
 import type { CloseBehavior } from "@/shared/settings/closeBehavior";
+import type { StorageRecovery } from "@/shared/runtime/storageRecovery";
 
 import type {
   DefaultModelSelection,
@@ -61,6 +62,33 @@ export interface SettingsPorts {
   /** Skill 标识始终携带来源，scope 指向唯一允许写入的用户或当前项目文档。 */
   onToggleSkill: (id: string, enabled: boolean, scope: "user" | "project") => Promise<void>;
   onAccessModeChange: (mode: AccessMode) => Promise<void>;
+  /** 删除当前项目的指定稀疏覆盖，使该字段重新继承全局设置。 */
+  onInheritProjectOverride?: (
+    field: "defaultSelection" | "accessMode" | "subagents" | "clarification",
+  ) => Promise<void>;
+  onProjectProviderRuntimeChange?: (
+    providerId: string,
+    value: {
+      connectTimeoutMs: number;
+      requestTimeoutMs: number;
+      autoCompact: boolean;
+    },
+  ) => Promise<void>;
+  onInheritProjectProvider?: (providerId: string) => Promise<void>;
+  onProjectProviderConnectionChange?: (
+    providerId: string,
+    value: {
+      api: "openai_responses" | "anthropic_messages" | "openai_chat_completions";
+      baseUrl: string;
+      credentialId: string;
+    },
+  ) => Promise<void>;
+  onInheritProjectProviderConnection?: (providerId: string) => Promise<void>;
+  onSaveProjectProviderModels?: (provider: ProviderSave) => Promise<void>;
+  onInheritProjectProviderModels?: (providerId: string) => Promise<void>;
+  onInheritProjectModelOverride?: (providerId: string, modelId: string) => Promise<void>;
+  onHideProjectModel?: (providerId: string, modelId: string) => Promise<void>;
+  onRestoreProjectModel?: (providerId: string, modelId: string) => Promise<void>;
   /** 普通模式是否允许模型发起结构化澄清；Plan 不受该开关影响。 */
   onClarificationEnabledChange: (enabled: boolean) => Promise<void>;
   onAppearanceChange: (
@@ -68,6 +96,15 @@ export interface SettingsPorts {
     changed: keyof AppearanceSettings,
   ) => Promise<void>;
 }
+
+/** 全局设置页显式绑定用户层，不能沿用承担活动 Workspace effective 配置的 controller scope。 */
+export type SettingsUserConfigurationPorts = Pick<
+  SettingsPorts,
+  | "onDefaultSelectionChange"
+  | "onSubagentSettingsChange"
+  | "onAccessModeChange"
+  | "onClarificationEnabledChange"
+>;
 
 /**
  * 设置端口只表达领域用例：读取脱敏聚合、保存完整聚合和处理配置失效提示。
@@ -102,7 +139,11 @@ export interface SettingsAdapter {
     workspaceId: string;
     expectedVersion: string;
   }): Promise<{ version: string }>;
-  restoreLastKnownGood(expectedVersion: string): Promise<string>;
+  repairConfiguration(
+    input:
+      | { scope: "user"; expectedVersion: string }
+      | { scope: "project"; workspaceId: string; expectedVersion: string },
+  ): Promise<{ version: string }>;
   setCredential(credentialId: string, secret: string, expectedVersion: string): Promise<string>;
   deleteCredential(credentialId: string, expectedVersion: string): Promise<string>;
   revealProviderCredential(providerId: string): Promise<string | null>;
@@ -154,7 +195,7 @@ export interface SettingsDesktopPort {
   relaunchAfterUpdate(): Promise<void>;
 }
 
-/** Runtime 生命周期只提供设置首次读取的 generation admission。 */
+/** 设置读取同时服从 Runtime 代际与服务端存储裁决，已鉴权连接不等于业务就绪。 */
 export interface SettingsRuntimeState {
   status:
     | "starting"
@@ -168,6 +209,7 @@ export interface SettingsRuntimeState {
     | "faulted";
   generation: number;
   serverInstanceId?: string | null;
+  storageRecovery?: StorageRecovery;
 }
 
 /** native storage 端口只返回设置页面可展示的脱敏路径和打包状态。 */
