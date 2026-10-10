@@ -354,7 +354,7 @@ jobs:
       # 两个 fuzz 方法由紧随其后的独立 Maven/JVM 步骤执行，仍是必需门禁。
       - name: Run JVM verification and build the Rust test fixture
         shell: pwsh
-        run: mvn.cmd -B -ntp -f ja-agent/pom.xml "-Dtest=!ProviderInputFuzzTest" -Dja.example.browser=true verify
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml "-Dtest=!ProviderInputFuzzTest" "-Dja.example.browser=true" verify
 
       - name: Verify the Turn Change artifact protocol against the fresh JVM JAR
         shell: pwsh

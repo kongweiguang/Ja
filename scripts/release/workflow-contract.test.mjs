@@ -115,7 +115,8 @@ function assertNativeVerificationGraph() {
   assert.match(verification, /tests\/contract\/run\.ps1/u);
   assert.match(verification, /playwright install chromium/u);
   assert.match(verification, /Run JVM verification and build the Rust test fixture/u);
-  assert.match(verification, /-Dja\.example\.browser=true/u);
+  // PowerShell 调用 .cmd 时，带点的 Maven 属性必须整体引用，不能拆为 lifecycle phase。
+  assert.match(verification, /"-Dja\.example\.browser=true"/u);
   assert.match(verification, /turn-change-artifact-rpc\.mjs/u);
   assert.match(verification, /process-session-webview2\.mjs/u);
   assert.match(verification, /cli-review-loopback\.mjs/u);
