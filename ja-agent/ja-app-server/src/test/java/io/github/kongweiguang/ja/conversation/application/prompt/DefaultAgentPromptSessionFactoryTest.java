@@ -93,6 +93,7 @@ final class DefaultAgentPromptSessionFactoryTest {
         WorkspaceRootChangePort.Change change = new WorkspaceRootChangePort.Change(3, oldRoot, newRoot);
         AtomicLong consumedRevision = new AtomicLong();
         WorkspaceRootChangePort changes = new WorkspaceRootChangePort() {
+            /** 只报告当前 Thread 尚未消费的最高根变更，避免另一会话的通知推进本会话提示基线。 */
             @Override
             public Optional<Change> pending(String workspaceId, String threadId) {
                 assertEquals("ws_prompt_change", workspaceId);
@@ -100,6 +101,7 @@ final class DefaultAgentPromptSessionFactoryTest {
                 return consumedRevision.get() >= change.revision() ? Optional.empty() : Optional.of(change);
             }
 
+            /** 请求意图成功提交后才推进已消费 revision，使失败重试仍能看到同一工作区根变更。 */
             @Override
             public void consume(String workspaceId, String threadId, long revision) {
                 assertEquals("ws_prompt_change", workspaceId);
@@ -247,6 +249,7 @@ final class DefaultAgentPromptSessionFactoryTest {
      * @param contextWindow 模型上下文窗口容量
      * @param factory 工厂
      * @param skills Skill 列表
+     * @param workspaceId 请求上下文中冻结的工作区身份
      */
     private record Fixture(Path workspace,
                            Path jaHome,

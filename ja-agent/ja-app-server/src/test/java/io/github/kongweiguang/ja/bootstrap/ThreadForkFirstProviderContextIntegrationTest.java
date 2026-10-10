@@ -216,8 +216,7 @@ final class ThreadForkFirstProviderContextIntegrationTest {
     }
 
     /**
-     * Resolves the last visible settled reply for the selected source Turn from persisted history; a Turn ID cannot
-     * substitute for the item boundary because one execution Turn may publish several independently forkable replies.
+     * 从持久历史中定位来源 Turn 最后一个已结算答复；分叉边界必须落在具体 Item，同一 Turn 可能产生多个独立可分叉的答复。
      */
     private static String finalReplyItemId(ThreadUseCase threads, String threadId, String turnId) {
         return threads.readThread(threadId, null, 256).orElseThrow().items().stream()

@@ -572,6 +572,11 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceBusyBlockerRow",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceRow",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -682,6 +687,11 @@
     "allDeclaredMethods": true
   },
   {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$WorkspaceUpdateCas",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadInsert",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -713,6 +723,11 @@
   },
   {
     "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ThreadRestore",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true
+  },
+  {
+    "name": "io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords$ForkSnapshotPage",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },

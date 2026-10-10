@@ -5,7 +5,8 @@ package io.github.kongweiguang.ja.conversation.application.api;
 
 import io.github.kongweiguang.ja.conversation.domain.model.NativeExecutionSnapshot;
 import io.github.kongweiguang.ja.foundation.lifecycle.NativeClientOwner;
-import io.github.kongweiguang.ja.platform.windows.WindowsNativeProcessObservation;
+import io.github.kongweiguang.ja.foundation.lifecycle.NativeProcessObservation;
+import io.github.kongweiguang.ja.foundation.lifecycle.NativeProcessObservationProvider;
 
 import java.util.Map;
 import java.util.Objects;
@@ -16,6 +17,7 @@ import java.lang.ref.WeakReference;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.ServiceLoader;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -76,6 +78,7 @@ public final class NativeExecutionContext {
 
     /**
      * 登记 Native Host 的唯一逻辑生命周期；PID 只用于绑定进程实例，不作为 WebSocket 对端认证。
+     * Windows 观察通过应用端口延迟发现，缺失或重复 provider 均失败关闭，不改变进程身份语义。
      * @author kongweiguang
      */
     public NativeClientOwner registerNativeClient(long processId, String lifetimeId) {
@@ -84,9 +87,9 @@ public final class NativeExecutionContext {
             throw new IllegalArgumentException("invalid native client identity");
         }
         ProcessHandle process = null;
-        WindowsNativeProcessObservation windowsProcess = null;
+        NativeProcessObservation windowsProcess = null;
         if (isWindowsPlatform()) {
-            windowsProcess = WindowsNativeProcessObservation.open(processId);
+            windowsProcess = requireWindowsProcessObservationProvider().open(processId);
         } else {
             process = ProcessHandle.of(processId)
                     .filter(ProcessHandle::isAlive)
@@ -179,6 +182,22 @@ public final class NativeExecutionContext {
      */
     private static boolean isWindowsPlatform() {
         return System.getProperty("os.name", "").startsWith("Windows");
+    }
+
+    /**
+     * 只在 Windows 分支装载平台观察 provider；缺失或重复实现显式失败，避免退回不同的 ProcessHandle 语义。
+     * @author kongweiguang
+     */
+    private static NativeProcessObservationProvider requireWindowsProcessObservationProvider() {
+        List<NativeProcessObservationProvider> providers = ServiceLoader.load(
+                NativeProcessObservationProvider.class, NativeExecutionContext.class.getClassLoader())
+                .stream()
+                .map(ServiceLoader.Provider::get)
+                .toList();
+        if (providers.size() != 1) {
+            throw new IllegalStateException("expected exactly one Windows native process observation provider");
+        }
+        return providers.getFirst();
     }
 
     /**
@@ -560,7 +579,7 @@ public final class NativeExecutionContext {
     private static final class NativeProcessGroup {
         private final ProcessIdentity identity;
         private final ProcessHandle process;
-        private final WindowsNativeProcessObservation windowsProcess;
+        private final NativeProcessObservation windowsProcess;
         private final Set<RegisteredNativeClient> owners = new LinkedHashSet<>();
         private volatile boolean exited;
         private volatile boolean stopped;
@@ -571,7 +590,7 @@ public final class NativeExecutionContext {
          * @author kongweiguang
          */
         private NativeProcessGroup(ProcessIdentity identity, ProcessHandle process,
-                                   WindowsNativeProcessObservation windowsProcess) {
+                                   NativeProcessObservation windowsProcess) {
             this.identity = identity;
             this.process = process;
             this.windowsProcess = windowsProcess;
@@ -587,7 +606,7 @@ public final class NativeExecutionContext {
          * Windows 句柄只由所属进程组持有，非 Windows 继续依赖 JDK 生命周期事件。
          * @author kongweiguang
          */
-        private WindowsNativeProcessObservation windowsProcess() { return windowsProcess; }
+        private NativeProcessObservation windowsProcess() { return windowsProcess; }
 
         /**
          * 组内 token 由外层生命周期锁统一读写，不复制为第二份授权索引。

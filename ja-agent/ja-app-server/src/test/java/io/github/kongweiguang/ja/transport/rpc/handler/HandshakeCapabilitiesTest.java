@@ -19,7 +19,8 @@ final class HandshakeCapabilitiesTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
-     * 直接断言生产能力投影的有序完整值，并固定存储恢复方法，避免客户端合同多于服务端能力。
+     * 直接断言生产能力投影的完整有序值，包含 canonical workspace metadata 事件，避免握手合同被测试冻结成旧列表。
+     * @author kongweiguang
      */
     @Test
     void advertisesPlanMethodsEventsModesAndFeatureInFrozenOrder() {
@@ -49,7 +50,8 @@ final class HandshakeCapabilitiesTest {
                 "assistant/context-estimated", "assistant/text-delta", "assistant/reasoning-summary-delta",
                 "tool/started", "tool/batch-committed", "tool/recovery-changed", "approval/requested",
                 "approval/resolved", "approval/closed", "context/compaction-started", "context/compacted",
-                "context/compaction-failed", "workspace/dirty", "turn/terminal", "turn/resync-required",
+                "context/compaction-failed", "workspace/dirty", "workspace/metadata-changed",
+                "turn/terminal", "turn/resync-required",
                 "thread/metadata-changed",
                 "configuration/changed", "task/activity", "task/progress", "task/mailbox-changed",
                 "task/closed",

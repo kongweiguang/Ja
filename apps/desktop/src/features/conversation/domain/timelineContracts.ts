@@ -491,7 +491,7 @@ const WORKSPACE_SCOPED_METHODS = new Set<TimelineEvent["method"]>([
 /**
  * 为 domain 直接调用提供 fail-closed 的最小形状 admission；终态缺失 ChangeSet 一律拒绝，
  * completed 必须携带对象，failed/cancelled 的 null 只表示没有已提交的 ChangeSet 事实。
- * Production store 在进入此处前由 canonical JA-RPC Schema 完整校验。
+ * Production store 在进入此处前由 canonical JA-RPC Schema 完整校验；live item 在此投影 native 仅用于复用 snapshot payload 校验。 @author kongweiguang
  */
 export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefined {
   if (typeof value !== "object" || value === null) return undefined;
@@ -590,7 +590,7 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
     if (
       !isQueuedInput(input) ||
       !isInputQueue(params["inputQueue"]) ||
-      !isTimelineSnapshotItem(userItem) ||
+      !isLiveUserInputItem(userItem) ||
       userItem.kind !== "user_input" ||
       input.turnId !== params["turnId"] ||
       userItem.turnId !== params["turnId"] ||
@@ -612,7 +612,7 @@ export function timelineEventFromUnknown(value: unknown): TimelineEvent | undefi
       !Array.isArray(items) ||
       items.length === 0 ||
       items.length > 256 ||
-      !items.every((item) => isThreadMessageItem(item, params["turnId"]))
+      !items.every((item) => isLiveThreadMessageItem(item, params["turnId"]))
     )
       return undefined;
     const itemIds = items.map((item) => (item as Record<string, unknown>)["itemId"]);
@@ -1283,6 +1283,63 @@ function isTimelineSnapshotItem(value: unknown): value is TimelineSnapshotItem {
   }
 }
 
+/** 对消费事件的无来源元数据 User item 投影原生来源复用 Snapshot payload 校验，并拒绝 wire 多字段。 @author kongweiguang */
+function isLiveUserInputItem(
+  value: unknown,
+): value is Extract<TimelineLiveItem, { kind: "user_input" }> {
+  if (
+    !hasExactObjectKeys(value, [
+      "itemId",
+      "createdAt",
+      "turnId",
+      "kind",
+      "content",
+      "attachments",
+      "totalCharacters",
+      "truncated",
+    ])
+  )
+    return false;
+  const snapshotProjection = { ...value, origin: "native" };
+  return isTimelineSnapshotItem(snapshotProjection) && snapshotProjection.kind === "user_input";
+}
+
+/** live 消息不携带 Snapshot origin；临时投影为 native 后复用严格的来源、正文与身份校验。 @author kongweiguang */
+function isLiveThreadMessageItem(
+  value: unknown,
+  expectedTurnId?: unknown,
+): value is Extract<TimelineLiveItem, { kind: "thread_message" }> {
+  if (
+    !hasExactObjectKeys(value, [
+      "itemId",
+      "createdAt",
+      "turnId",
+      "kind",
+      "sourceThreadId",
+      "sourceTitle",
+      "content",
+      "totalCharacters",
+      "truncated",
+    ])
+  )
+    return false;
+  return isThreadMessageItem({ ...value, origin: "native" }, expectedTurnId);
+}
+
+/** Wire item 必须和当前方法的字段集合完全一致，避免未定义字段借由 domain seam 穿入 Timeline。 @author kongweiguang */
+function hasExactObjectKeys(
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  const sortedExpectedKeys = [...expectedKeys].sort();
+  return (
+    keys.length === sortedExpectedKeys.length &&
+    keys.every((key, index) => key === sortedExpectedKeys[index])
+  );
+}
+
 /** 预览必须是正文的完整 code-point 前缀，禁止把有限预览误当全文交付。 */
 function isPublicTextPreview(
   preview: string | undefined,
@@ -1305,26 +1362,25 @@ function isPublicTextPreview(
   );
 }
 
-/** 跨会话消息保留原生/继承归属和冻结来源，精确字段集防止通信内容伪装成用户或系统输入。 */
+/** Snapshot 跨会话消息保留原生/继承归属和冻结来源，精确字段集防止消息伪装成用户或系统输入。 @author kongweiguang */
 function isThreadMessageItem(value: unknown, expectedTurnId?: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const item = value as Record<string, unknown>;
-  const keys = Object.keys(item).sort();
-  const expectedKeys = [
-    "content",
-    "createdAt",
-    "itemId",
-    "kind",
-    "origin",
-    "sourceThreadId",
-    "sourceTitle",
-    "totalCharacters",
-    "truncated",
-    "turnId",
-  ];
+  if (
+    !hasExactObjectKeys(value, [
+      "content",
+      "createdAt",
+      "itemId",
+      "kind",
+      "origin",
+      "sourceThreadId",
+      "sourceTitle",
+      "totalCharacters",
+      "truncated",
+      "turnId",
+    ])
+  )
+    return false;
+  const item = value;
   return (
-    keys.length === expectedKeys.length &&
-    keys.every((key, index) => key === expectedKeys[index]) &&
     item["kind"] === "thread_message" &&
     (item["origin"] === "native" || item["origin"] === "inherited") &&
     isThreadMessageIdentifier(item["itemId"], "item_", 101) &&

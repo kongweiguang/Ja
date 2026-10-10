@@ -695,7 +695,8 @@ public interface ModelPort {
      * @param slotId 当前响应内稳定且唯一的原生条目标识
      * @param content 已完整关闭且可用于同身份后续请求的原生块，声明阶段为 null
      */
-    record ReasoningBlockDeferred(String slotId, ReasoningContent content) implements ModelEvent {
+    record ReasoningBlockDeferred(String slotId,
+                                  ReasoningContent content) implements ModelEvent {
         /**
          * 只允许安全、有限的内部槽位标识；它不进入 UI、持久字段或诊断文本。
          */

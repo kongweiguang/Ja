@@ -193,8 +193,19 @@ public final class WorkspaceBusyMessage {
         return codePoint <= 0xffff ? 3 : 4;
     }
 
-    /** 只承载线程标题与阻塞类别的持久化摘要，不承载消息、输入或 Plan 正文。 */
-    public record Blocker(String threadTitle, String kind, String state, long occurrences) {
+    /**
+     * 只承载线程标题与阻塞类别的持久化摘要，不承载消息、输入或 Plan 正文。
+     *
+     * @param threadTitle 被阻塞会话的用户可见标题
+     * @param kind 持久化阻塞事实类别
+     * @param state 阻塞事实当前状态
+     * @param occurrences 此会话与类别组合的持久事实数量
+     * @author kongweiguang
+     */
+    public record Blocker(String threadTitle,
+                          String kind,
+                          String state,
+                          long occurrences) {
         /** SQL 聚合项至少对应一个持久阻塞事实。 */
         public Blocker {
             if (occurrences < 1) {
@@ -203,7 +214,12 @@ public final class WorkspaceBusyMessage {
         }
     }
 
-    /** 已归一化为用户中文的状态文案，不暴露持久层枚举值。 */
+    /**
+     * 已归一化为用户中文的状态文案，不暴露持久层枚举值。
+     *
+     * @param label 面向用户展示的状态说明
+     * @author kongweiguang
+     */
     private record StatusLabel(String label) {
     }
 }

@@ -25,9 +25,9 @@ final class OpenAiResponsesStateTest {
     @Test
     void completedSummaryOnlyReasoningReleasesEachTextDeltaBeforeTerminal() throws Exception {
         for (String encrypted : List.of("absent", "empty", "terminal")) {
-            var configuration = ModelAdapterTestSupport.configuration(
+            ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
                     URI.create("http://127.0.0.1:9"), ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
-            var state = new OpenAiResponsesState(configuration);
+            OpenAiResponsesState state = new OpenAiResponsesState(configuration);
             ObjectNode reasoning = AbstractStreamingModelAdapter.JSON.createObjectNode()
                     .put("id", "reason_summary_only").put("type", "reasoning");
             reasoning.putArray("summary");

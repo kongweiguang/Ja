@@ -502,8 +502,9 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
-     * Freezes the exact settled assistant message, using child-owned raw history for inherited items so later local
-     * turns and checkpoints cannot leak past an earlier fork boundary.
+     * 冻结精确的已结算助手答复；继承项从目标自有原始历史读取，避免后续本地 Turn 或检查点越过旧分叉边界。
+     *
+     * @author kongweiguang
      */
     @Override
     public TaskModels.ThreadForkContextSnapshot freezeThreadForkContext(String parentThreadId,
@@ -594,8 +595,9 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
-     * Rejects all display entries except a persisted STOP-settled answer; tool and progress records never define
-     * a branch boundary even when another reply in the same Turn was already committed.
+     * 仅接受已持久化的最终答复作为分叉边界；同一 Turn 中更早提交的工具或进度项不能替代该答复。
+     *
+     * @author kongweiguang
      */
     private static void requireForkableFinalAnswer(PersistenceRecords.SnapshotItemRow item, String itemId) {
         if (item == null || !itemId.equals(item.itemId()) || !"message".equals(item.itemKind())
@@ -606,8 +608,9 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
-     * Keeps model facts only through the exact public assistant item; completeToolPrefix cannot discard a selected
-     * Tool call because the caller also requires the item itself to be a persisted FINAL_ANSWER.
+     * 只保留至指定公开助手答复的模型事实；调用方先验证 FINAL_ANSWER，故完整工具前缀不会截掉边界答复。
+     *
+     * @author kongweiguang
      */
     private static List<ContextMessage> throughReply(List<ContextMessage> source, String sourceItemId) {
         List<ContextMessage> prefix = new ArrayList<>();
@@ -624,7 +627,9 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
-     * Snapshot item JSON is a strict serializer-owned storage representation, not client input; malformed rows fail closed.
+     * 快照项 JSON 由存储序列化器生成而非客户端提交；严格解码使损坏行在分叉前失败关闭。
+     *
+     * @author kongweiguang
      */
     private PersistenceRecords.SnapshotItemRow readFrozenItem(String jsonValue) {
         try {
@@ -1809,7 +1814,17 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
-     * Thread revision, exact public item and its already-owned raw context travel together through the read phase.
+     * 将读取阶段核验的 Thread、公开答复与其原始上下文绑定传递，避免分叉准备阶段混用不同快照。
+     *
+     * @param parent 经 revision 校验的来源 Thread 持久行
+     * @param publicItem 已验证可分叉的公开答复投影
+     * @param sourceTurnId 答复所属的来源 Turn 标识
+     * @param contextSourceThreadId 原始模型上下文的直接来源 Thread
+     * @param contextSourceItemId 原始模型上下文所截止的来源答复
+     * @param contextThroughOrdinal 继承上下文已经冻结的末尾顺序号
+     * @param contextMessages 与答复绑定的不可变中性消息前缀
+     * @param inherited 该答复是否来自本 Thread 的冻结继承历史
+     * @author kongweiguang
      */
     private record ForkSource(TaskRecords.ParentRow parent,
                               PersistenceRecords.SnapshotItemRow publicItem,
@@ -1819,6 +1834,11 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
                               Long contextThroughOrdinal,
                               List<ContextMessage> contextMessages,
                               boolean inherited) {
+        /**
+         * 复制消息列表以固定读取阶段的上下文，避免后续分叉准备意外观察到可变集合。
+         *
+         * @author kongweiguang
+         */
         private ForkSource {
             contextMessages = List.copyOf(contextMessages);
         }

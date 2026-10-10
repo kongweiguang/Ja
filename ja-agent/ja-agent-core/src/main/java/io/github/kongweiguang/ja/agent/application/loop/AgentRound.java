@@ -335,8 +335,15 @@ final class AgentRound implements ModelEventSink {
         }
     }
 
-    /** 记录内部 reasoning 槽的固定内容索引与一次性填充状态。 */
-    private record ReasoningSlot(int contentIndex, boolean filled) {
+    /**
+     * 保留 reasoning 在响应中的原位；填充标记阻止终态重复事件覆写已经确认的模型块。
+     *
+     * @param contentIndex 内容序列中预留槽位的位置
+     * @param filled 是否已由唯一的完整 reasoning 块填充
+     * @author kongweiguang
+     */
+    private record ReasoningSlot(int contentIndex,
+                                 boolean filled) {
     }
 
     /**

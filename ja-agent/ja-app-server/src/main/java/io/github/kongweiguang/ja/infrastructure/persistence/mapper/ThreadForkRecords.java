@@ -85,9 +85,11 @@ public final class ThreadForkRecords {
      * @param threadId 持有冻结 seed 的目标 Thread 标识
      * @param sourceThreadId seed 来源 Thread 标识
      * @param sourceTurnId seed 来源 Turn 标识
+     * @param sourceItemId 冻结上下文所对应的来源答复条目标识
      * @param sourceThreadRevision 冻结时核验的来源 revision
      * @param seedJson 带来源身份的规范 seed 编码
      * @param createdAt seed 持久化时间
+     * @author kongweiguang
      */
     public record SeedInsert(String threadId,
                              String sourceThreadId,
@@ -100,6 +102,20 @@ public final class ThreadForkRecords {
 
     /**
      * 目标 Thread 自有的公开历史副本；展示身份、来源身份、长正文和上下文切点不依赖来源表存续。
+     *
+     * @param threadId 接收冻结历史的目标 Thread 标识
+     * @param ordinal 目标 Thread 内连续递增的历史顺序
+     * @param itemId 目标 Thread 命名空间中的公开条目标识
+     * @param sourceThreadId 该历史行直接复制自的来源 Thread
+     * @param sourceItemId 来源 Thread 中对应的公开条目标识
+     * @param sourceTurnId 来源事实所属的 Turn 标识
+     * @param turnId 目标 Thread 命名空间中的 Turn 标识
+     * @param contextThroughOrdinal 对应答复所冻结的中性上下文末尾顺序号
+     * @param itemJson 已重映射为目标身份的公开快照项
+     * @param fullContent 分页读取所需的完整公开正文
+     * @param turnJson 在分叉边界冻结并重映射后的 Turn 投影
+     * @param createdAt 该副本写入目标存储的时间
+     * @author kongweiguang
      */
     public record HistoryItemInsert(String threadId,
                                     long ordinal,
@@ -115,7 +131,22 @@ public final class ThreadForkRecords {
                                     String createdAt) {
     }
 
-    /** 以 child-local keyset 读取的冻结公开历史项。 */
+    /**
+     * 以 child-local keyset 读取的冻结公开历史项。
+     *
+     * @param ordinal 目标 Thread 内连续递增的历史顺序
+     * @param itemId 目标 Thread 命名空间中的公开条目标识
+     * @param sourceThreadId 该历史行直接复制自的来源 Thread
+     * @param sourceItemId 来源 Thread 中对应的公开条目标识
+     * @param sourceTurnId 来源事实所属的 Turn 标识
+     * @param turnId 目标 Thread 命名空间中的 Turn 标识
+     * @param contextThroughOrdinal 对应答复所冻结的中性上下文末尾顺序号
+     * @param itemJson 目标身份下的公开快照项
+     * @param fullContent 分页读取所需的完整公开正文
+     * @param turnJson 在分叉边界冻结并重映射后的 Turn 投影
+     * @param createdAt 该副本写入目标存储的时间
+     * @author kongweiguang
+     */
     public record HistoryItemRow(long ordinal,
                                  String itemId,
                                  String sourceThreadId,
@@ -129,7 +160,17 @@ public final class ThreadForkRecords {
                                  String createdAt) {
     }
 
-    /** 将 provider-neutral ContextMessage 原样冻结在目标 owner 下，供嵌套 fork 精确截断。 */
+    /**
+     * 将 provider-neutral ContextMessage 原样冻结在目标 owner 下，供嵌套 fork 精确截断。
+     *
+     * @param threadId 持有此上下文消息副本的目标 Thread
+     * @param ordinal 消息在冻结模型前缀中的顺序号
+     * @param sourceThreadId 冻结前缀对应的来源 Thread
+     * @param sourceItemId 该前缀所截止的来源答复条目标识
+     * @param sourceMessageId 来源消息身份，用于追溯冻结边界
+     * @param messageJson 重映射附件身份后的规范消息编码
+     * @author kongweiguang
+     */
     public record ContextMessageInsert(String threadId,
                                        long ordinal,
                                        String sourceThreadId,
@@ -138,7 +179,16 @@ public final class ThreadForkRecords {
                                        String messageJson) {
     }
 
-    /** child-owned raw history row；source identity 用于审计，不作为读取依赖。 */
+    /**
+     * child-owned raw history row；source identity 用于审计，不作为读取依赖。
+     *
+     * @param ordinal 消息在目标模型前缀中的顺序号
+     * @param sourceThreadId 冻结时的来源 Thread 身份
+     * @param sourceItemId 冻结时的来源答复条目标识
+     * @param sourceMessageId 冻结时的来源消息身份
+     * @param messageJson 目标 owner 下冻结的规范消息编码
+     * @author kongweiguang
+     */
     public record ContextMessageRow(long ordinal,
                                     String sourceThreadId,
                                     String sourceItemId,

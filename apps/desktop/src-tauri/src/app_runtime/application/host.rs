@@ -1211,16 +1211,15 @@ impl RuntimeHost {
             }
         }
 
-        if root_changed {
-            if let Some(existing) = existing.as_ref()
-                && !existing
-                    .handle
-                    .freeze_and_drain(WORKSPACE_REBIND_DRAIN_TIMEOUT)
-            {
-                existing.handle.thaw_after_aborted_rebind();
-                self.finish_workspace_update(&input.workspace_id)?;
-                return Err(RuntimeCommandError::workspace_busy());
-            }
+        if root_changed
+            && let Some(existing) = existing.as_ref()
+            && !existing
+                .handle
+                .freeze_and_drain(WORKSPACE_REBIND_DRAIN_TIMEOUT)
+        {
+            existing.handle.thaw_after_aborted_rebind();
+            self.finish_workspace_update(&input.workspace_id)?;
+            return Err(RuntimeCommandError::workspace_busy());
         }
 
         let response = bridge.workspace_update(input.clone());

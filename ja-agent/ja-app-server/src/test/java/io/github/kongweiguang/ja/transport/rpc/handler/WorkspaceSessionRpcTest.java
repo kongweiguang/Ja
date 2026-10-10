@@ -36,6 +36,7 @@ import io.github.kongweiguang.ja.workspace.infrastructure.filesystem.NioWorkspac
 import io.github.kongweiguang.ja.workspace.application.service.WorkspaceService;
 import io.github.kongweiguang.ja.workspace.application.service.WorkspaceAdmissionGate;
 import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceTrustPort;
+import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceAdmissionPort;
 import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
 import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceBusyMessage;
 import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceFailure;
@@ -75,10 +76,10 @@ final class WorkspaceSessionRpcTest extends PersistenceTestSupport {
     @Test
     void mapsWorkspaceBusyToActionableChineseMessage() {
         WorkspaceAdmissionGate gate = new WorkspaceAdmissionGate();
-        try (var admission = gate.acquire("ws_gate_busy_message")) {
+        try (WorkspaceAdmissionPort.Lease admission = gate.acquire("ws_gate_busy_message")) {
             WorkspaceFailure failure = assertThrows(WorkspaceFailure.class,
                     () -> gate.acquireRebind("ws_gate_busy_message"));
-            var rpc = WorkspaceHandler.mapFailure(failure);
+            JaRpcException rpc = WorkspaceHandler.mapFailure(failure);
 
             assertEquals("WORKSPACE_BUSY", rpc.errorCode());
             assertEquals(WorkspaceBusyMessage.PREFIX + "正在启动任务，请稍后重试。", rpc.getMessage());
@@ -650,7 +651,9 @@ final class WorkspaceSessionRpcTest extends PersistenceTestSupport {
         return run(configuration, history, mapper, beforeRun, UnaryOperator.identity(), requests);
     }
 
-    /** Decorates the actual application owner only for tests that exercise RPC behavior after a durable commit. */
+    /**
+     * 仅在验证持久提交后的 RPC 结果时装饰真实 application owner，保留初始化、传输与仓储链路。
+     */
     private static RunResult run(
             SidecarConfiguration configuration,
             WorkspaceHistory history,
@@ -699,7 +702,9 @@ final class WorkspaceSessionRpcTest extends PersistenceTestSupport {
         return new RunResult(frames, prepareCalls.get());
     }
 
-    /** Calls the production update first and injects a failure afterward to model native sync failing after CAS. */
+    /**
+     * 先执行生产工作区更新，再注入提交后的同步失败，以验证 RPC 故障不掩盖已持久化的 CAS 结果。
+     */
     private static WorkspaceUseCase failAfterWorkspaceUpdate(WorkspaceUseCase delegate) {
         return (WorkspaceUseCase) Proxy.newProxyInstance(WorkspaceUseCase.class.getClassLoader(),
                 new Class<?>[]{WorkspaceUseCase.class}, (proxy, method, arguments) -> {

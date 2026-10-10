@@ -75,6 +75,9 @@
       },
       {
         "pattern": "draft/2020-12/meta/content"
+      },
+      {
+        "pattern": "META-INF/services/io\\.github\\.kongweiguang\\.ja\\.foundation\\.lifecycle\\.NativeProcessObservationProvider"
       }
     ]
   }

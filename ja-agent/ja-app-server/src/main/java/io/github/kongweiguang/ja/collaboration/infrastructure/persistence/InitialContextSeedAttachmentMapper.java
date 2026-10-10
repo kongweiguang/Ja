@@ -34,7 +34,9 @@ public final class InitialContextSeedAttachmentMapper {
     }
 
     /**
-     * Collects attachment handles from the complete raw prefix as well as its compressed effective seed.
+     * 同时收集完整原始前缀与压缩后有效 Seed 的附件句柄，避免仅复制当前可见部分而丢失后续分叉所需媒体。
+     *
+     * @author kongweiguang
      */
     public static List<String> attachmentIds(List<ContextMessage> messages) {
         LinkedHashSet<String> ids = new LinkedHashSet<>();
@@ -68,7 +70,9 @@ public final class InitialContextSeedAttachmentMapper {
     }
 
     /**
-     * Remaps each attachment and tool image through one target-thread authorization mapping.
+     * 使用同一目标 Thread 授权映射重建附件和 Tool 图片引用，未映射的来源句柄由下层失败关闭。
+     *
+     * @author kongweiguang
      */
     public static List<ContextMessage> remapMessages(List<ContextMessage> messages, Map<String, String> attachmentIdMap) {
         Map<String, String> mapping = Map.copyOf(Objects.requireNonNull(attachmentIdMap, "attachmentIdMap"));

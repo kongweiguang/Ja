@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
+import io.github.kongweiguang.ja.agent.domain.context.InitialContextSeed;
 import io.github.kongweiguang.ja.agent.application.loop.AgentExecutionRequest;
 import io.github.kongweiguang.ja.agent.domain.UserContent;
 import io.github.kongweiguang.ja.agent.domain.context.CheckpointUsage;
@@ -166,8 +167,7 @@ final class MybatisReaskPersistenceTest extends PersistenceTestSupport {
     }
 
     /**
-     * A checkpoint on a failed answer's path can fit by ordinal after reask but is semantically off-path;
-     * fork must reconstruct only the current raw path instead of carrying that summary into its seed.
+     * 重答后旧分支摘要仍可能按序号落在新路径区间内；分叉必须重建当前原始路径，不能把语义失效的摘要带进 seed。
      * @author kongweiguang
      */
     @Test
@@ -225,7 +225,7 @@ final class MybatisReaskPersistenceTest extends PersistenceTestSupport {
             ThreadUseCase.ThreadForkResult fork = history.forkThread(new ThreadUseCase.ThreadForkRequest(
                     THREAD_ID, selectedReplyId, currentPath.thread().revision(), "op_" + "9".repeat(32)));
 
-            var seed = history.findForFirstTurn(fork.thread().threadId()).orElseThrow();
+            InitialContextSeed seed = history.findForFirstTurn(fork.thread().threadId()).orElseThrow();
             String seedText = seed.messages().stream().flatMap(message -> message.blocks().stream())
                     .filter(ContextMessage.TextBlock.class::isInstance)
                     .map(ContextMessage.TextBlock.class::cast).map(ContextMessage.TextBlock::value)

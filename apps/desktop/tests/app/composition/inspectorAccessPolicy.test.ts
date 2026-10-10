@@ -29,17 +29,36 @@ function explicitInspectorOpeners(source: string): string[] {
 }
 
 describe("inspector access policy", () => {
-  /** 对象入口覆盖 Markdown 引用、文件和指定 Turn；白名单与真实组合根保持一致。 */
+  /** 直接入口与延迟 Markdown intent 分开验收；intent 必须经当前 Thread Host 回到组合根的统一开栏动作。 @author kongweiguang */
   it("only opens the inspector from approved object actions and explicit Composer commands", () => {
     const source = applicationSource();
+    const workbenchHostSource = readFileSync(
+      join(process.cwd(), "apps", "desktop", "src", "app", "composition", "WorkbenchHost.tsx"),
+      "utf8",
+    );
     expect(explicitInspectorOpeners(source)).toEqual([
-      "requestConversationOpenTarget",
       "openWorkspaceReferencePreview",
       "openAttachmentPreview",
       "openTurnReview",
       "openTaskFromTimeline",
       "showWorkbenchCapability",
     ]);
+    expect(source).toMatch(
+      /const requestConversationOpenTarget = useCallback\([\s\S]*?setOpenTargetRequest\(\{\s*requestId,\s*workspaceId,\s*threadId,/,
+    );
+    expect(source).toMatch(
+      /openTargetRequest=\{openTargetRequest\}[\s\S]*?onOpenTargetSettled=\{settleConversationOpenTarget\}/,
+    );
+    expect(source).toContain("onShowCapability={showWorkbenchCapability}");
+    expect(workbenchHostSource).toMatch(
+      /const activateWorkbenchCapability = useCallback\([\s\S]*?onShowCapability\(tab\);\s*return;/,
+    );
+    expect(workbenchHostSource).toMatch(
+      /const executeOpenTargetRequest = useCallback\([\s\S]*?if \(request\.target\.kind === "url"\) \{\s*activateWorkbenchCapability\("preview"\)/,
+    );
+    expect(workbenchHostSource).toMatch(
+      /if \(\s*resolution\.withinWorkspace &&\s*!resolution\.readOnly &&\s*resolution\.workspaceRelativePath !== null\s*\) \{\s*activateWorkbenchCapability\("files"\)/,
+    );
     expect(source).toMatch(
       /const openAttachmentPreview = useCallback\([\s\S]*?setWorkbenchTab\("preview"\);[\s\S]*?setInspectorOpen\(true\);/,
     );

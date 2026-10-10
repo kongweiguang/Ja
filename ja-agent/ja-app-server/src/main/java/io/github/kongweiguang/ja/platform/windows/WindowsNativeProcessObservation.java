@@ -3,6 +3,7 @@
 
 package io.github.kongweiguang.ja.platform.windows;
 
+import io.github.kongweiguang.ja.foundation.lifecycle.NativeProcessObservation;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemorySegment;
@@ -14,7 +15,7 @@ import java.util.Objects;
 /**
  * 以仅查询和等待权限持有一个精确进程句柄；生命周期观察不依赖 JDK 对跨完整性级别进程的枚举权限。
  */
-public final class WindowsNativeProcessObservation implements AutoCloseable {
+public final class WindowsNativeProcessObservation implements NativeProcessObservation {
     private static final int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private static final int SYNCHRONIZE = 0x00100000;
     private static final int REQUIRED_ACCESS = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;

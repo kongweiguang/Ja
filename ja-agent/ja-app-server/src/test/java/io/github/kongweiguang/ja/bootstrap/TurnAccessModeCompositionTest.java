@@ -19,6 +19,7 @@ import io.github.kongweiguang.ja.conversation.application.gateway.TurnRuntimeReq
 import io.github.kongweiguang.ja.conversation.application.gateway.TurnRuntimeResolver;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnOrigin;
 import io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase;
+import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 import org.noear.solon.Solon;
@@ -183,7 +184,7 @@ final class TurnAccessModeCompositionTest {
                         assertEquals(workspace.root(), workspaces.readWorkspace(workspace.workspaceId())
                                 .orElseThrow().root(), "busy rebind must keep the project root bound to active work");
 
-                        var renamed = workspaces.updateWorkspace(new WorkspaceUseCase.UpdateWorkspace(
+                        Workspace renamed = workspaces.updateWorkspace(new WorkspaceUseCase.UpdateWorkspace(
                                 workspace.workspaceId(), workspace.revision(), "Busy project renamed", null));
                         assertEquals(workspace.workspaceId(), renamed.workspaceId());
                         assertEquals(workspace.root(), renamed.root());

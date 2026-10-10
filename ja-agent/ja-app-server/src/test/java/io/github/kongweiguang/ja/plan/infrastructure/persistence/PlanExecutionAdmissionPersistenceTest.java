@@ -274,10 +274,10 @@ final class PlanExecutionAdmissionPersistenceTest extends PersistenceTestSupport
      * @param participant admission 阶段校验并写入 binding 的参与者
      */
     record AdmissionCase(MybatisPlanRepository plans,
-                                 Plan plan,
-                                 PlanRevision revision,
-                                 String turnId,
-                                 AgentExecutionRequest request,
-                                 AdmissionFacts facts,
-                                 JaAdmissionTransactionParticipant participant) { }
+                         Plan plan,
+                         PlanRevision revision,
+                         String turnId,
+                         AgentExecutionRequest request,
+                         AdmissionFacts facts,
+                         JaAdmissionTransactionParticipant participant) { }
 }

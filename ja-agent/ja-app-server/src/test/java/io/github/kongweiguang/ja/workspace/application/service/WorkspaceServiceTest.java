@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
 import io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase;
 import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceDirectoryPort;
+import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceAdmissionPort;
 import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceRepository;
 import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceRootChangePort;
 import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
@@ -443,7 +444,7 @@ final class WorkspaceServiceTest {
                 directories.project, null));
         Path newRoot = temporaryDirectory.resolve("busy-target").toAbsolutePath().normalize();
 
-        try (var ignored = service.acquireAdmission(opened.workspaceId())) {
+        try (WorkspaceAdmissionPort.Lease ignored = service.acquireAdmission(opened.workspaceId())) {
             WorkspaceFailure failure = assertThrows(WorkspaceFailure.class,
                     () -> service.updateWorkspace(new WorkspaceUseCase.UpdateWorkspace(
                             opened.workspaceId(), opened.revision(), null, newRoot)));

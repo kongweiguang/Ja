@@ -203,8 +203,10 @@ public final class WorkspaceHandler implements RpcHandler {
     }
 
     /**
-     * Root configuration synchronization can fail after the SQLite CAS committed; reread the single DB owner and
-     * notify only when a newer durable revision exists, while leaving the original operation error authoritative.
+     * SQLite CAS 可能已提交而根配置同步随后失败；重新读取唯一数据库 owner，仅在 revision 前进时发通知，
+     * 同时保留原同步异常作为操作结果。
+     *
+     * @author kongweiguang
      */
     private void publishCommittedWorkspaceRevisionAfterFailure(String workspaceId, long expectedRevision) {
         try {

@@ -363,7 +363,17 @@ public final class PersistenceRecords {
                                String kind) {
     }
 
-    /** 不物化正文，仅投影 Workspace 重绑忙碌摘要中的会话标题、事实类型、状态和有界计数。 */
+    /**
+     * 不物化正文，仅投影 Workspace 重绑忙碌摘要中的会话标题、事实类型、状态和有界计数。
+     *
+     * @param threadId 被阻塞会话的稳定标识
+     * @param threadTitle 用于告知用户的会话标题
+     * @param blockerKind 持久化阻塞事实类别
+     * @param blockerState 阻塞事实当前状态
+     * @param occurrences 该会话与事实类别组合的出现次数
+     * @param totalBlockers 查询范围内的阻塞事实总量
+     * @author kongweiguang
+     */
     public record WorkspaceBusyBlockerRow(String threadId,
                                           String threadTitle,
                                           String blockerKind,
@@ -561,6 +571,13 @@ public final class PersistenceRecords {
      * @param contextReferencesJson 有序引用元数据，不含正文
      * @param sourceThreadId 来源对话标识
      * @param sourceTitle 来源标题
+     * @param contextMessageId 对应的中性模型消息身份
+     * @param contextMessageOrdinal 对应消息在模型上下文中的顺序号
+     * @param timelineSequence 持久化时间线排序序号
+     * @param turnSequence 所属 Turn 的因果顺序序号
+     * @param semanticOrder 同一上下文消息内的语义子项顺序
+     * @param ordinalOrder 同一消息与语义位置内的稳定序号
+     * @author kongweiguang
      */
     public record SnapshotItemRow(String itemId,
                                   String itemKind,

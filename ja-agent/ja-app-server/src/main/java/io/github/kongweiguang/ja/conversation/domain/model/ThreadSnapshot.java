@@ -108,10 +108,17 @@ public record ThreadSnapshot(ThreadSummary thread,
      * 历史项闭集只包含当前公开合同允许回放的持久化事实。
      */
     public enum Origin {
+        /** 当前 Thread 自己写入的历史项。 */
         NATIVE,
+        /** 从来源 Thread 冻结并复制到当前 Thread 的只读历史项。 */
         INHERITED
     }
 
+    /**
+     * Thread 快照对外公开的平坦历史事实；来源标记显式区分本地执行与冻结继承内容。
+     *
+     * @author kongweiguang
+     */
     public sealed interface Item permits UserInputItem, ThreadMessageItem, TextItem, ToolItem, ApprovalItem, OriginItem {
         /**
          * 返回追加写入时生成的不透明条目身份。
@@ -148,21 +155,25 @@ public record ThreadSnapshot(ThreadSummary thread,
             }
         }
 
+        /** 冻结包装保留来源记录已重新分配的公开条目标识。 */
         @Override
         public String itemId() {
             return item.itemId();
         }
 
+        /** 继承视图沿用来源写入时间，供跨来源时间线保持原始顺序。 */
         @Override
         public Instant createdAt() {
             return item.createdAt();
         }
 
+        /** 返回快照项关联的 child-local Turn 身份，不暴露来源执行 owner。 */
         @Override
         public String turnId() {
             return item.turnId();
         }
 
+        /** 明确标记为继承事实，避免默认方法将包装项误报为当前 Thread 本地写入。 */
         @Override
         public Origin origin() {
             return Origin.INHERITED;
@@ -182,6 +193,7 @@ public record ThreadSnapshot(ThreadSummary thread,
      * @param mutationVersion 状态变更版本，用于并发提交校验
      * @param modelRound 模型调用轮次
      * @param sourceMessageId 来源消息标识
+     * @param origin 历史事实的本地或继承来源类别
      */
     public record Turn(String turnId,
                        String status,

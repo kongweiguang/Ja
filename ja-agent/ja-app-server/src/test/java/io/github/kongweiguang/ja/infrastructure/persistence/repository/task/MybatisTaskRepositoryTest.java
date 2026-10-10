@@ -49,7 +49,6 @@ import io.github.kongweiguang.ja.agent.infrastructure.json.JacksonJsonValueCodec
 import io.github.kongweiguang.ja.conversation.domain.model.TurnOrigin;
 import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceWriteClaimPort;
 import io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures;
-import io.github.kongweiguang.ja.agent.domain.error.StorageException;
 import io.github.kongweiguang.ja.agent.domain.json.JsonArray;
 import io.github.kongweiguang.ja.agent.domain.json.JsonObject;
 import io.github.kongweiguang.ja.agent.domain.json.JsonObjects;
@@ -94,7 +93,6 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -496,7 +494,8 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
     }
 
     /**
-     * 空闲侧聊关闭不能依赖模型请求；范围冲突回滚、并发重试和数据库重开都必须回放同一回执。
+     * 空闲侧聊关闭不依赖模型请求，冲突回滚及并发重试/重开仍回放同一回执；错误按 TaskRepository gateway 分类断言。
+     * @author kongweiguang
      */
     @Test
     void closesIdleTemporarySideChatWithoutModelTurn() throws Exception {
@@ -516,12 +515,9 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             assertEquals(ROOT, closing.ownerRootThreadId());
             assertEquals(List.of(sideChatId), closing.threadIds());
 
-            StorageException mismatch = assertThrows(StorageException.class,
+            TaskRepositoryException mismatch = assertThrows(TaskRepositoryException.class,
                     () -> tasks.deleteClosedSideChat(sideChatId, ROOT, List.of(sideChatId, "thr_unexpected")));
-            assertEquals(StorageException.Code.TRANSACTION, mismatch.code());
-            TaskRepositoryException mismatchCause = assertInstanceOf(TaskRepositoryException.class,
-                    mismatch.getCause());
-            assertEquals(TaskRepositoryException.Code.CAS_CONFLICT, mismatchCause.code());
+            assertEquals(TaskRepositoryException.Code.CAS_CONFLICT, mismatch.code());
             assertEquals(1, threadCount(database.sessions(), sideChatId));
             try (SqlSession session = database.sessions().openSession()) {
                 assertNull(PersistenceMappers.open(session).sideChatPurges().selectCloseReceipt(sideChatId));
@@ -913,7 +909,10 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** Activity 仍在但 projection 关系损坏时整次根 Timeline 读取失败，不能静默漏掉审计事实。 */
+    /**
+     * Activity 仍在但 projection 关系损坏时整次根 Timeline 读取失败，直接检查 repository gateway 的稳定错误。
+     * @author kongweiguang
+     */
     @Test
     void failsClosedWhenRootActivityProjectionRelationshipIsMissing() throws Exception {
         try (TestDatabase database = database("task-root-activity-corrupt");
@@ -932,15 +931,16 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
                 session.commit();
             }
 
-            StorageException transactionFailure = assertThrows(StorageException.class,
+            TaskRepositoryException failure = assertThrows(TaskRepositoryException.class,
                     () -> tasks.listRootActivities(ROOT, 20));
-            TaskRepositoryException failure = assertInstanceOf(TaskRepositoryException.class,
-                    transactionFailure.getCause());
             assertEquals(TaskRepositoryException.Code.INVALID_STATE, failure.code());
         }
     }
 
-    /** MESSAGE 与 FOLLOW_UP 使用不同准入语义；两条 USER 历史都必须由各自 Store 边界提交。 */
+    /**
+     * MESSAGE 与 FOLLOW_UP 分别提交 USER 历史并使用不同准入语义；冲突保留 TaskRepository gateway 分类。
+     * @author kongweiguang
+     */
     @Test
     void separatesQueueOnlyMessageFromFollowUpTurnAdmission() throws Exception {
         try (TestDatabase database = database("task-mailbox");
@@ -971,10 +971,8 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             TaskModels.MailboxEnvelope conflict = new TaskModels.MailboxEnvelope("msg_queue_conflict", ROOT,
                     "thr_task_mail", null, TaskModels.MailboxKind.MESSAGE, content("不同内容"),
                     "queue-key", now.plusSeconds(2));
-            StorageException transactionFailure = assertThrows(StorageException.class,
+            TaskRepositoryException idempotencyConflict = assertThrows(TaskRepositoryException.class,
                     () -> tasks.enqueueMessage(conflict));
-            TaskRepositoryException idempotencyConflict = assertInstanceOf(TaskRepositoryException.class,
-                    transactionFailure.getCause());
             assertEquals(TaskRepositoryException.Code.CAS_CONFLICT, idempotencyConflict.code());
             assertEquals(1, turnCount(database.sessions(), "thr_task_mail"));
             commitTerminal(database, terminal("thr_task_mail", "turn_task_mail", "item_task_mail_done", 15));
@@ -991,13 +989,11 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             TaskModels.FollowUpAdmissionReceipt admitted = tasks.findFollowUpByIdempotency(follow).orElseThrow();
             TaskModels.FollowUpAdmissionReceipt replayedBeforeRevision =
                     tasks.findFollowUpByIdempotency(followRetry).orElseThrow();
-            StorageException collisionTransaction = assertThrows(StorageException.class,
+            TaskRepositoryException contentCollision = assertThrows(TaskRepositoryException.class,
                     () -> tasks.findFollowUpByIdempotency(new TaskModels.MailboxEnvelope(
                             "msg_follow_collision", ROOT, "thr_task_mail", null,
                             TaskModels.MailboxKind.FOLLOW_UP, content("不同内容"), "follow-key",
                             START.plusSeconds(21))));
-            TaskRepositoryException contentCollision = assertInstanceOf(TaskRepositoryException.class,
-                    collisionTransaction.getCause());
             assertEquals(2, turnCount(database.sessions(), "thr_task_mail"));
             assertEquals("msg_follow", admitted.mailbox().messageId());
             assertEquals("turn_task_follow", admitted.admission().turnId());
@@ -1091,16 +1087,17 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** 跨 Workspace 非文本拒绝经测试 Unit of Work 回滚包装后仍保留 Task 关系错误语义。 */
+    /**
+     * 跨 Workspace 非文本拒绝保留 TaskRepository gateway 的关系错误分类，不降格为存储事务故障。
+     * @author kongweiguang
+     */
     private static void assertCrossWorkspaceContentRejected(MybatisTaskRepository tasks, String targetThreadId,
                                                             UserContent content, String operationKey) {
-        StorageException transactionFailure = assertThrows(StorageException.class,
+        TaskRepositoryException failure = assertThrows(TaskRepositoryException.class,
                 () -> tasks.enqueueMessage(new TaskModels.MailboxEnvelope(
                         "msg_" + operationKey.replace('-', '_'), "thr_task_external_root", targetThreadId,
                         null, TaskModels.MailboxKind.MESSAGE, content, operationKey,
                         START.plusSeconds(11))));
-        TaskRepositoryException failure = assertInstanceOf(TaskRepositoryException.class,
-                transactionFailure.getCause());
         assertEquals(TaskRepositoryException.Code.RELATION_INVALID, failure.code());
     }
 
@@ -1421,7 +1418,10 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         }
     }
 
-    /** 已读边界按服务端 sequence 单调推进，未来 sequence 与旧 revision 均拒绝。 */
+    /**
+     * 已读边界按服务端 sequence 单调推进，未来 sequence 与旧 revision 均拒绝；冲突用 gateway code 表达。
+     * @author kongweiguang
+     */
     @Test
     void advancesSeenBoundaryWithProjectionCas() throws Exception {
         try (TestDatabase database = database("task-seen");
@@ -1441,12 +1441,11 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             assertEquals(0, seen.projection().unreadCount());
             assertEquals(initial.projection().latestActivitySequence(),
                     seen.projection().lastSeenActivitySequence());
-            StorageException failure = assertThrows(StorageException.class, () -> tasks.markSeen("thr_task_seen",
+            TaskRepositoryException failure = assertThrows(TaskRepositoryException.class,
+                    () -> tasks.markSeen("thr_task_seen",
                     initial.projection().revision(), initial.projection().latestActivitySequence() + 1,
                     START.plusSeconds(6)));
-            assertEquals(StorageException.Code.TRANSACTION, failure.code());
-            TaskRepositoryException conflict = assertInstanceOf(TaskRepositoryException.class, failure.getCause());
-            assertEquals(TaskRepositoryException.Code.CAS_CONFLICT, conflict.code());
+            assertEquals(TaskRepositoryException.Code.CAS_CONFLICT, failure.code());
         }
     }
 

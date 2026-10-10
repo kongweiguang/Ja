@@ -77,6 +77,7 @@ final class RpcResultsTest {
         assertEquals("阶段结果", result.path("content").textValue());
         assertEquals(4, result.path("totalCharacters").intValue());
         assertFalse(result.path("truncated").booleanValue());
+        assertEquals("native", result.path("origin").textValue());
     }
 
     /** USER item 内联精确摘要且不再产生独立 attachment snapshot item。 */

@@ -1956,6 +1956,16 @@ async fn wait_for_local_media_metadata(
 }
 
 #[cfg(windows)]
+/// 将探测结果与其 session、导航代际及 URL 身份绑定，防止异步结果被提交到后续导航。
+/// @author kongweiguang
+struct LocalMediaMetadataProbeCompletion {
+    session_id: PreviewId,
+    identity: PreviewNavigationIdentity,
+    expected_url: String,
+    verified: bool,
+}
+
+#[cfg(windows)]
 /// 只在原生 WebView UI thread 最终校验并提交媒体结果，串行化 NavigationStarting；错误只完成匹配代际的 watchdog。
 /// @author kongweiguang
 fn finalize_local_media_metadata_probe_on_ui_thread(
@@ -1963,35 +1973,36 @@ fn finalize_local_media_metadata_probe_on_ui_thread(
     tracker: &Arc<Mutex<PreviewNavigationCompletionTracker>>,
     watchdog: &PreviewLoadWatchdog,
     app: &tauri::AppHandle,
-    session_id: PreviewId,
-    identity: PreviewNavigationIdentity,
-    expected_url: &str,
-    verified: bool,
+    completion: LocalMediaMetadataProbeCompletion,
 ) -> bool {
     // `with_webview` 串行运行所有同 WebView 的原生 navigation callbacks；读取 tracker 后释放锁，
     // 再读模型并提交。其它线程的导航仍由 manager generation/URL CAS 拒绝，不形成 tracker→manager 锁环。
     let tracker_is_current = tracker
         .lock()
-        .map(|tracker| tracker.is_current(identity))
+        .map(|tracker| tracker.is_current(completion.identity))
         .unwrap_or(false);
-    if !tracker_is_current || !is_local_media_preview_url(expected_url) {
+    if !tracker_is_current || !is_local_media_preview_url(&completion.expected_url) {
         return false;
     }
-    let Ok(snapshot) = manager.snapshot(session_id) else {
+    let Ok(snapshot) = manager.snapshot(completion.session_id) else {
         return false;
     };
-    if snapshot.generation != identity.generation
-        || snapshot.url.as_str() != expected_url
+    if snapshot.generation != completion.identity.generation
+        || snapshot.url.as_str() != completion.expected_url
         || snapshot.status != PreviewSessionStatus::Open
         || snapshot.load_status != PreviewLoadStatus::Loading
     {
         return false;
     }
 
-    if verified {
-        match manager.callback_load_finished(session_id, identity.generation, expected_url) {
+    if completion.verified {
+        match manager.callback_load_finished(
+            completion.session_id,
+            completion.identity.generation,
+            &completion.expected_url,
+        ) {
             Ok(Some(event)) => {
-                let _ = watchdog.complete(session_id, identity.generation);
+                let _ = watchdog.complete(completion.session_id, completion.identity.generation);
                 emit_preview_event(app, event);
                 true
             }
@@ -2006,10 +2017,10 @@ fn finalize_local_media_metadata_probe_on_ui_thread(
         }
     } else {
         // generation-scoped completion cannot remove a replacement load's watchdog.
-        let _ = watchdog.complete(session_id, identity.generation);
+        let _ = watchdog.complete(completion.session_id, completion.identity.generation);
         match manager.callback_load_error(
-            session_id,
-            identity.generation,
+            completion.session_id,
+            completion.identity.generation,
             PREVIEW_NAVIGATION_FAILED_MESSAGE,
         ) {
             Ok(event) => {
@@ -2036,26 +2047,19 @@ async fn finalize_local_media_metadata_probe(
     tracker: Arc<Mutex<PreviewNavigationCompletionTracker>>,
     watchdog: PreviewLoadWatchdog,
     app: tauri::AppHandle,
-    session_id: PreviewId,
-    identity: PreviewNavigationIdentity,
-    expected_url: String,
-    verified: bool,
+    completion: LocalMediaMetadataProbeCompletion,
 ) -> bool {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let dispatch_manager = manager.clone();
     let dispatch_tracker = tracker.clone();
     let dispatch_watchdog = watchdog.clone();
-    let dispatch_url = expected_url.clone();
     let dispatch_result = webview.with_webview(move |_| {
         let committed = finalize_local_media_metadata_probe_on_ui_thread(
             &dispatch_manager,
             &dispatch_tracker,
             &dispatch_watchdog,
             &app,
-            session_id,
-            identity,
-            &dispatch_url,
-            verified,
+            completion,
         );
         let _ = sender.send(committed);
     });
@@ -2100,16 +2104,14 @@ fn start_local_media_metadata_probe(
         let Some(verified) = verified else {
             return;
         };
-        let _ = finalize_local_media_metadata_probe(
-            webview,
-            manager,
-            tracker,
-            watchdog,
-            app,
+        let completion = LocalMediaMetadataProbeCompletion {
             session_id,
             identity,
             expected_url,
             verified,
+        };
+        let _ = finalize_local_media_metadata_probe(
+            webview, manager, tracker, watchdog, app, completion,
         )
         .await;
     });

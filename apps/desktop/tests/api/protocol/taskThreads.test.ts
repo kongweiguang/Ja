@@ -511,7 +511,7 @@ describe("JA-RPC v2 Task Threads", () => {
     ).toThrow();
   });
 
-  /** 会话消息只允许来源身份与纯文本正文；Snapshot/Event 必须共享目标 Turn，批次 identity 不能重复。 */
+  /** Snapshot 固化 ThreadOrigin；事件仍由各自 wire fixture 表达，防止快照来源元数据被误省略。 @author kongweiguang */
   it("validates thread messages in snapshots and mailbox events", () => {
     const threadMessage = {
       itemId: "item_message_one",
@@ -524,12 +524,14 @@ describe("JA-RPC v2 Task Threads", () => {
       totalCharacters: 11,
       truncated: false,
     };
+    const snapshotMessage = { ...threadMessage, origin: "native" as const };
     const snapshot = {
       threadId: "thr_target_1",
       revision: 4,
       turns: [
         {
           turnId: threadMessage.turnId,
+          origin: "native" as const,
           sourceMessageId: null,
           status: "running" as const,
           requestedAt: "2026-09-03T08:00:00Z",
@@ -539,7 +541,7 @@ describe("JA-RPC v2 Task Threads", () => {
           changeSet: null,
         },
       ],
-      items: [threadMessage],
+      items: [snapshotMessage],
       taskActivities: [],
       inputQueue: null,
       contextUsage: null,
@@ -567,7 +569,7 @@ describe("JA-RPC v2 Task Threads", () => {
     expect(() =>
       parseMethodResult("thread/read", {
         ...snapshot,
-        items: [{ ...threadMessage, turnId: "turn_other" }],
+        items: [{ ...snapshotMessage, turnId: "turn_other" }],
       }),
     ).not.toThrow();
     expect(() =>

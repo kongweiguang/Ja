@@ -773,7 +773,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Timeline cursors encode a phase before the sort key so the immutable inherited prefix always precedes native rows.
+     * 先编码时间线来源阶段再编码排序键，使不可变继承前缀始终排在本地追加历史之前。
+     *
+     * @author kongweiguang
      */
     private static String encodeTimelineCursor(TimelineCursor cursor) {
         String value = cursor.phase() == TimelinePhase.INHERITED
@@ -783,7 +785,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Decodes the stable prefix/native keyset discriminator; generic list cursors remain a separate timestamp pair.
+     * 解码继承序号或本地时间线键；通用列表仍使用独立的时间戳游标，避免两类排序规则混用。
+     *
+     * @author kongweiguang
      */
     private static TimelineCursor decodeTimelineCursor(String cursor) {
         if (cursor == null) {
@@ -876,9 +880,12 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     /**
      * 事务回调返回 Workspace 业务结果，供领域拒绝在生产事务 owner 外映射为 RPC 错误。
      *
+     * @param workspace 已提交更新后的 Workspace；业务失败时为空
+     * @param failure 在事务边界外抛出的业务拒绝；更新成功时为空
      * @author kongweiguang
      */
-    private record WorkspaceUpdateOutcome(Workspace workspace, WorkspaceFailure failure) {
+    private record WorkspaceUpdateOutcome(Workspace workspace,
+                                          WorkspaceFailure failure) {
     }
 
     /**
@@ -1042,8 +1049,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Reads only the fork ledger and validates its source owner before returning a receipt, so an operation key
-     * cannot be used to discover another Thread's newly created conversation.
+     * 只查分叉操作账本并校验来源 owner 后返回回执，防止仅凭操作键发现其他 Thread 的新会话。
+     *
+     * @author kongweiguang
      */
     @Override
     public Optional<ThreadUseCase.ThreadForkResult> readThreadForkOperation(String sourceThreadId,
@@ -1134,8 +1142,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Persists every uncompressed neutral model message under the new owner; this independent raw prefix enables
-     * another fork at any inherited answer even when the effective seed used a summary checkpoint.
+     * 将未压缩的中性模型消息写入目标 owner；即使有效 Seed 使用摘要检查点，后续分叉仍可从任一继承答复精确截断。
+     *
+     * @author kongweiguang
      */
     private void freezeForkContextMessages(PersistenceMappers mapper, String childThreadId,
                                            String sourceThreadId, String sourceItemId,
@@ -1152,7 +1161,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Reads attachment handles from the selected public prefix only; item order remains source keyset order.
+     * 只从所选公开历史前缀收集附件句柄，并保持来源 keyset 顺序以稳定授权副本顺序。
+     *
+     * @author kongweiguang
      */
     private List<String> collectForkHistoryAttachmentIds(PersistenceMappers mapper, String sourceThreadId,
                                                          String sourceItemId,
@@ -1184,8 +1195,10 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Pages the native public prefix by persistent Core causal identity; the neutral context set removes every
-     * later reply, user input, tool call, or approval even when timestamps are identical or clocks are fixed.
+     * 按 Core 持久因果身份分页扫描本地公开前缀，再用冻结模型上下文排除边界之后的消息、工具与审批，
+     * 因而不依赖可能相同或固定的时间戳判定先后。
+     *
+     * @author kongweiguang
      */
     private void forEachForkSnapshotItem(PersistenceMappers mapper, String sourceThreadId, String sourceItemId,
                                          TaskModels.ThreadForkContextSnapshot frozen,
@@ -1230,8 +1243,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Builds identity membership from the already-truncated neutral history, requiring Tool calls to be closed by
-     * a persisted result before their public presentation can be inherited.
+     * 从已截断的中性历史建立身份集合；只有在同一 Turn 中具有持久结果的 Tool 调用才允许进入继承展示。
+     *
+     * @author kongweiguang
      */
     private static ForkCutoff forkCutoff(
             List<io.github.kongweiguang.ja.agent.domain.context.ContextMessage> messages) {
@@ -1256,8 +1270,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Filters by the actual neutral prompt identities after the causal page query; only mailbox process rows without
-     * a model-message identity rely on the query's persistent turn/timeline boundary.
+     * 因果分页后再按模型上下文身份过滤；没有消息身份的 mailbox 过程项才依赖查询提供的持久 Turn 与时间线边界。
+     *
+     * @author kongweiguang
      */
     private static boolean includeForkSnapshotItem(PersistenceRecords.SnapshotItemRow row, ForkCutoff cutoff) {
         if ("message".equals(row.itemKind())) {
@@ -1271,7 +1286,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Clones a bounded page's user and Tool image references without walking text previews or tool artifacts.
+     * 仅收集公开消息与 Tool 展示中的媒体附件，不扫描文本预览或工具产物，避免扩大复制范围。
+     *
+     * @author kongweiguang
      */
     private void collectSnapshotAttachmentIds(PersistenceRecords.SnapshotItemRow row,
                                               Map<String, Boolean> references) {
@@ -1294,8 +1311,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Freezes public items in stable inherited-prefix then source-native order; each row keeps its own long body.
-     * Turn state is projected at the selected reply boundary so later source completion cannot leak into the child.
+     * 先冻结继承前缀再复制来源本地历史，并保留每项完整正文；Turn 状态按所选答复时点投影，防止来源之后完成的状态泄漏。
      *
      * @author kongweiguang
      */
@@ -1398,8 +1414,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Creates a target-safe public projection: all globally keyed item, Turn, call, and approval identities are
-     * re-owned by the child, while source order metadata remains stable for display and nested fork boundaries.
+     * 构造目标可独立读取的公开投影：条目、Turn、调用和审批身份改归目标 owner，来源顺序元数据仍用于展示及嵌套分叉截断。
+     *
+     * @author kongweiguang
      */
     private PersistenceRecords.SnapshotItemRow remapSnapshotItem(PersistenceRecords.SnapshotItemRow row,
                                                                  Map<String, String> attachmentMap,
@@ -1452,9 +1469,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Projects Turn metadata as of the selected reply: the boundary is a completed read-only branch, while earlier
-     * Turns keep their actual terminal outcome only when all lifecycle timestamps precede that boundary. Source
-     * ChangeSets and mutable activity versions are not child-owned; the tree codec remains Native Image friendly.
+     * 按所选答复时点生成 Turn 投影：边界 Turn 变为只读完成事实，较早 Turn 仅在全部生命周期时间早于边界时保留终态；
+     * ChangeSet 与可变活动版本不属于子 Thread，显式树编码也避免依赖反射元数据。
      *
      * @author kongweiguang
      */
@@ -1508,8 +1524,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Encodes the bounded frozen Turn projection as a JSON tree so Instant stays ISO text without global modules or
-     * record reflection metadata; ChangeSet is deliberately null because its source artifact is not child-owned.
+     * 将有限 Turn 投影显式编码为 JSON 树，使时间保持 ISO 文本且不依赖全局模块或 record 反射；来源 ChangeSet 不归子 Thread 所有。
+     *
+     * @author kongweiguang
      */
     private String writeFrozenTurn(ThreadSnapshot.Turn turn) {
         com.fasterxml.jackson.databind.node.ObjectNode document = objectMapper.createObjectNode();
@@ -1540,8 +1557,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Decodes only the explicit frozen fields and parses timestamps as ISO-8601, avoiding reflection and keeping the
-     * storage boundary independent of the application ObjectMapper's Java-time module configuration.
+     * 只读取明确定义的冻结字段并按 ISO-8601 解析时间，避免反射，并使持久边界不依赖应用 ObjectMapper 的 Java 时间模块配置。
+     *
+     * @author kongweiguang
      */
     private ThreadSnapshot.Turn readFrozenTurn(String serialized) {
         JsonNode document = readJsonNode(serialized);
@@ -1573,8 +1591,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Requires a JSON string for every non-null frozen scalar; accepting coercions here could silently change identity
-     * or lifecycle data when a persisted historical row is malformed.
+     * 非空冻结标量必须实际编码为 JSON 字符串；拒绝宽松强转，避免损坏历史行悄然改变身份或生命周期字段。
+     *
+     * @author kongweiguang
      */
     private static String frozenTurnText(JsonNode document, String field, boolean nullable) {
         JsonNode value = document.get(field);
@@ -1591,7 +1610,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Reads the full public body once during freezing so later pages are independent of Core or mailbox source rows.
+     * 冻结时读取一次完整公开正文，使目标后续分页不再依赖 Core 或 mailbox 来源记录仍然存在。
+     *
+     * @author kongweiguang
      */
     private String fullPublicItemContent(PersistenceMappers mapper, String sourceThreadId,
                                          PersistenceRecords.SnapshotItemRow item) {
@@ -1617,7 +1638,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Parses storage JSON with duplicate-key/trailing-token checks before attachment IDs are changed.
+     * 在重映射附件身份前拒绝重复键和尾随 token，防止解析歧义影响冻结历史的授权句柄。
+     *
+     * @author kongweiguang
      */
     private JsonNode readJsonNode(String json) {
         try {
@@ -1629,7 +1652,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Rebuilds a previously frozen public row under strict JSON parsing before the caller applies owner remapping.
+     * 严格解码此前冻结的公开行后再由调用方重映射 owner，未知字段或尾随内容均视为存储损坏。
+     *
+     * @author kongweiguang
      */
     private PersistenceRecords.SnapshotItemRow readSnapshotItemRow(String json) {
         try {
@@ -1643,7 +1668,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Serializes only stable JSON records used by child-owned frozen rows.
+     * 序列化目标自有冻结行使用的稳定 JSON 投影；编码失败视为持久状态错误而非可忽略展示问题。
+     *
+     * @author kongweiguang
      */
     private String writeJson(Object value) {
         try {
@@ -1655,7 +1682,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Attachment remapping is mandatory for every public media reference; a stale source ID must fail closed.
+     * 每个公开媒体引用都必须映射到目标授权身份；缺失映射时失败关闭，不能回退暴露旧 Thread 的句柄。
+     *
+     * @author kongweiguang
      */
     private static String requiredAttachmentMap(Map<String, String> values, String sourceId) {
         String targetId = values.get(sourceId);
@@ -2020,9 +2049,10 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Merges the immutable inherited prefix and native SQL timeline with a phase-aware keyset; latest reads page from
-     * the newest native item and only enter inherited rows after the native suffix is exhausted. Reversing the SQL
-     * result preserves its full semantic/tool-ordinal composite order, which item IDs alone cannot reconstruct.
+     * 用阶段游标合并不可变继承前缀与本地 SQL 时间线；最新读取先分页本地后缀，再回退到继承项，
+     * 并反转数据库倒序结果以保留语义位置与 Tool 序号组成的完整顺序。
+     *
+     * @author kongweiguang
      */
     private TimelinePage timelinePage(PersistenceMappers mapper, String threadId, TimelineCursor cursor,
                                       int limit, boolean latest) {
@@ -2129,8 +2159,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Restores inherited display metadata only when it is a terminal historical fact; inherited Turns have no
-     * execution owner and must never re-enter the runtime's active Turn set.
+     * 仅恢复终态的继承展示元数据；继承 Turn 没有执行 owner，不能重新进入运行时活动 Turn 集合。
      *
      * @author kongweiguang
      */
@@ -2503,7 +2532,9 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Pages native and inherited public text through one code-point boundary rule while their owner differs.
+     * 使用统一的 Unicode 码点边界分页读取正文，使本地与继承文本在 owner 不同时仍有一致偏移语义。
+     *
+     * @author kongweiguang
      */
     private static ItemContentPage itemContentPage(String itemId, String text, int expectedTotal,
                                                    int offsetCharacters, int limitCharacters) {
@@ -3014,24 +3045,34 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Distinguishes the immutable fork prefix from locally written history so each phase keeps its own keyset order.
+     * 区分不可变分叉前缀与本地写入历史，使两个阶段分别使用适合自身的 keyset 顺序。
+     *
+     * @author kongweiguang
      */
     private enum TimelinePhase {
+        /** 由来源冻结并复制到当前 Thread 的历史前缀。 */
         INHERITED,
+        /** 当前 Thread 创建后写入的本地历史后缀。 */
         NATIVE
     }
 
     /**
-     * Carries only the key belonging to the selected timeline phase; mixing ordinal and timestamp keys would make
-     * pagination unstable when the native suffix is appended.
+     * 只携带当前阶段对应的 key；混用序号和时间戳会使本地后缀追加后分页位置漂移。
+     *
+     * @param phase 当前时间线来源阶段
+     * @param time 本地阶段使用的创建时间键
+     * @param id 本地阶段使用的稳定条目标识
+     * @param ordinal 继承阶段使用的目标内顺序号
+     * @author kongweiguang
      */
     private record TimelineCursor(TimelinePhase phase,
                                   String time,
                                   String id,
                                   long ordinal) {
         /**
-         * Rejects mixed key shapes at construction so internally produced cursors obey the same invariant as decoded
-         * cursors, even if a later call site bypasses the decoder.
+         * 构造时拒绝混合键形状，使内部生成的游标即使绕过解码入口也满足对应阶段的不变量。
+         *
+         * @author kongweiguang
          */
         private TimelineCursor {
             Objects.requireNonNull(phase, "phase");
@@ -3046,27 +3087,36 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Holds a page from exactly one storage origin, preventing inherited rows from being mistaken for mutable local
-     * rows when projecting the public timeline.
+     * 页面项只引用一种存储来源，避免公开投影把冻结继承行误当成本地可变行。
+     *
+     * @param inheritedItem child-owned 的冻结继承历史行
+     * @param nativeItem 当前 Thread 的本地快照行
+     * @author kongweiguang
      */
     private record TimelineEntry(ThreadForkRecords.HistoryItemRow inheritedItem,
                                  PersistenceRecords.SnapshotItemRow nativeItem) {
         /**
-         * Builds an inherited entry while keeping the storage-origin choice explicit at each merge point.
+         * 显式建立继承来源分支，避免合并处通过空值约定猜测行来源。
+         *
+         * @author kongweiguang
          */
         private static TimelineEntry inherited(ThreadForkRecords.HistoryItemRow item) {
             return new TimelineEntry(Objects.requireNonNull(item, "item"), null);
         }
 
         /**
-         * Builds a native entry while keeping the storage-origin choice explicit at each merge point.
+         * 显式建立本地来源分支，避免合并处通过空值约定猜测行来源。
+         *
+         * @author kongweiguang
          */
         private static TimelineEntry nativeItem(PersistenceRecords.SnapshotItemRow item) {
             return new TimelineEntry(null, Objects.requireNonNull(item, "item"));
         }
 
         /**
-         * Enforces a single backing row so later projection branches cannot silently discard or double-count history.
+         * 强制且仅有一个来源行，防止后续投影分支静默漏项或重复计数。
+         *
+         * @author kongweiguang
          */
         private TimelineEntry {
             if ((inheritedItem == null) == (nativeItem == null)) {
@@ -3076,12 +3126,18 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Returns one bounded chronological slice and its phase-aware continuation token without exposing mapper rows.
+     * 返回有界的正序时间线切片和阶段续页游标，不把 mapper 行暴露给领域投影。
+     *
+     * @param entries 已按公开时间线顺序合并的条目
+     * @param nextCursor 下一页游标；无后续内容时为空
+     * @author kongweiguang
      */
     private record TimelinePage(List<TimelineEntry> entries,
                                 String nextCursor) {
         /**
-         * Copies the merge result because cursor generation and public projection must observe the same stable page.
+         * 复制合并结果，保证游标计算与公开投影观察同一稳定页面。
+         *
+         * @author kongweiguang
          */
         private TimelinePage {
             entries = List.copyOf(Objects.requireNonNull(entries, "entries"));
@@ -3089,13 +3145,20 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * Carries the selected neutral message prefix and only those Tool calls whose matching result is already frozen.
+     * 保存所选中性消息前缀及已冻结结果闭合的 Tool 调用集合，供展示项过滤与附件扫描共享。
+     *
+     * @param messageItemIds 前缀中模型消息对应的公开条目标识
+     * @param contextMessageOrdinals 消息条目标识到模型上下文顺序号的映射
+     * @param closedToolCallIds 在同一 Turn 中已有结果的 Tool 调用身份
+     * @author kongweiguang
      */
     private record ForkCutoff(Set<String> messageItemIds,
                               Map<String, Long> contextMessageOrdinals,
                               Set<ForkToolIdentity> closedToolCallIds) {
         /**
-         * Copies membership collections because the same cutoff is shared by keyset filtering and attachment scans.
+         * 复制集合使 keyset 过滤与附件扫描共用的边界不会被调用方后续修改。
+         *
+         * @author kongweiguang
          */
         private ForkCutoff {
             messageItemIds = Set.copyOf(Objects.requireNonNull(messageItemIds, "messageItemIds"));
@@ -3106,12 +3169,18 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
     }
 
     /**
-     * A provider call ID is scoped to its execution Turn; both pieces are required to prevent a reused ID in an older
-     * answer from making a later unfinished call appear complete in the frozen display projection.
+     * Provider 调用标识按执行 Turn 隔离；组合两者可防止较早答案中的复用 ID 误闭合后续未完成调用。
+     *
+     * @param turnId 调用所属的执行 Turn
+     * @param callId Provider 在该 Turn 内分配的调用标识
+     * @author kongweiguang
      */
-    private record ForkToolIdentity(String turnId, String callId) {
+    private record ForkToolIdentity(String turnId,
+                                    String callId) {
         /**
-         * Keeps malformed or absent identity components from silently widening Tool inclusion across Turns.
+         * 缺少任一身份部分都不能扩大跨 Turn 的 Tool 纳入范围。
+         *
+         * @author kongweiguang
          */
         private ForkToolIdentity {
             Objects.requireNonNull(turnId, "turnId");

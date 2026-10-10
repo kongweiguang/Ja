@@ -12,7 +12,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.github.kongweiguang.ja.collaboration.application.service.NativeHostProcessFixture;
 import io.github.kongweiguang.ja.conversation.application.api.NativeExecutionContext;
+import io.github.kongweiguang.ja.conversation.application.api.NativeExecutionContext.NativeClientProcessExitListener;
 import io.github.kongweiguang.ja.foundation.lifecycle.NativeClientOwner;
+import io.github.kongweiguang.ja.foundation.lifecycle.NativeProcessObservationProvider;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -22,7 +24,12 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.time.Instant;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Queue;
+import java.util.ServiceLoader;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -81,7 +88,22 @@ final class WindowsNativeProcessObservationTest {
     }
 
     /**
-     * 真实子进程验证 GetProcessTimes 和 WaitForSingleObject 指向同一 PID，退出后由观察器释放 HANDLE。
+     * 验证服务 descriptor 可被应用 class loader 唯一发现，避免 Windows 路径因 SPI 漏接线而静默失效。
+     * @author kongweiguang
+     */
+    @Test
+    void discoversExactlyOneWindowsObservationProviderFromServiceDescriptor() {
+        List<NativeProcessObservationProvider> providers = ServiceLoader.load(
+                NativeProcessObservationProvider.class, NativeExecutionContext.class.getClassLoader())
+                .stream()
+                .map(ServiceLoader.Provider::get)
+                .toList();
+
+        assertEquals(1, providers.size(), "exactly one platform observation provider must be registered");
+    }
+
+    /**
+     * 真实子进程验证 GetProcessTimes 和 WaitForSingleObject 指向同一 PID；close 前重取计数以隔离宿主进程句柄回收。
      * @author kongweiguang
      */
     @Test
@@ -101,11 +123,49 @@ final class WindowsNativeProcessObservationTest {
                 host.close();
                 assertTrue(observation.awaitExit(1_000));
                 assertFalse(observation.isAlive());
+
+                long handlesImmediatelyBeforeObservationClose = HandleCounter.current();
+                observation.close();
+                long handlesAfterObservationClose = HandleCounter.current();
+                assertTrue(handlesAfterObservationClose < handlesImmediatelyBeforeObservationClose,
+                        "closing observation must release its native process handle; before="
+                                + handlesImmediatelyBeforeObservationClose + ", after=" + handlesAfterObservationClose);
             } finally {
                 observation.close();
             }
-            assertTrue(HandleCounter.current() <= handlesBefore,
-                    "closing observation must return its native process handle");
+        }
+    }
+
+    /**
+     * 经 ServiceLoader 注册真实 Native Host，验证原生观察退出事件仍进入应用 owner 生命周期回调。
+     * @author kongweiguang
+     */
+    @Test
+    void notifiesRegisteredNativeClientWhenObservedHostExits() throws Exception {
+        NativeExecutionContext bridge = NativeExecutionContext.shared();
+        bridge.enableSharedMode();
+        CountDownLatch processExit = new CountDownLatch(1);
+        AtomicReference<NativeClientOwner> registeredOwner = new AtomicReference<>();
+        NativeClientProcessExitListener listener = owners -> {
+            if (owners.contains(registeredOwner.get())) {
+                processExit.countDown();
+            }
+        };
+        bridge.registerNativeClientProcessExitListener(listener);
+        try (NativeHostProcessFixture.Host host = NativeHostProcessFixture.start()) {
+            NativeClientOwner owner = bridge.registerNativeClient(host.processId(), host.lifetimeId());
+            registeredOwner.set(owner);
+            assertTrue(bridge.nativeClientAcceptsRequests(owner));
+
+            host.close();
+
+            assertTrue(processExit.await(5, TimeUnit.SECONDS), "native process exit must notify its owner listener");
+            assertFalse(bridge.nativeClientAcceptsRequests(owner));
+        } finally {
+            bridge.releaseNativeClientProcessExitListener(listener);
+            if (bridge.sharedMode()) {
+                bridge.disableSharedMode();
+            }
         }
     }
 

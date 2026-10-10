@@ -661,6 +661,7 @@ describe("timeline reducer", () => {
       revision: 4,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "completed",
           requestedAt: "2026-08-18T00:00:00Z",
@@ -672,6 +673,7 @@ describe("timeline reducer", () => {
       ],
       items: [
         {
+          origin: "native",
           itemId: "item_before_tool",
           turnId,
           kind: "assistant_progress",
@@ -681,6 +683,7 @@ describe("timeline reducer", () => {
           createdAt: "2026-08-18T00:00:01Z",
         },
         {
+          origin: "native",
           itemId: "item_tool",
           turnId,
           kind: "tool_call",
@@ -691,6 +694,7 @@ describe("timeline reducer", () => {
           createdAt: "2026-08-18T00:00:02Z",
         },
         {
+          origin: "native",
           itemId: "item_answer_part",
           turnId,
           kind: "assistant_progress",
@@ -700,6 +704,7 @@ describe("timeline reducer", () => {
           createdAt: "2026-08-18T00:00:03Z",
         },
         {
+          origin: "native",
           itemId: "item_answer_final",
           turnId,
           kind: "final_answer",
@@ -916,6 +921,7 @@ describe("timeline reducer", () => {
         turns: [],
         items: [
           {
+            origin: "native",
             itemId: "item_unknown",
             turnId,
             kind: "tool_call",
@@ -938,12 +944,14 @@ describe("timeline reducer", () => {
     expect(invalidSnapshot.items["item_unknown"]).toBeUndefined();
   });
 
+  /** 历史 Snapshot 的动态 Item 也必须携带 native 来源，保持 fixture 与持久化契约一致。 @author kongweiguang */
   it("接纳 Tool 后连续消费 Steering 与两条 FIFO 的终态快照", () => {
     const snapshot = {
       threadId,
       revision: 16,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "completed",
           requestedAt: "2026-08-18T00:00:00Z",
@@ -955,6 +963,7 @@ describe("timeline reducer", () => {
       ],
       items: [
         {
+          origin: "native",
           itemId: "item_prompt",
           turnId,
           kind: "user_input",
@@ -964,6 +973,7 @@ describe("timeline reducer", () => {
           createdAt: "2026-08-18T00:00:00Z",
         },
         {
+          origin: "native",
           itemId: "item_tool",
           turnId,
           kind: "tool_call",
@@ -981,6 +991,7 @@ describe("timeline reducer", () => {
           ] as const
         ).flatMap(([suffix, input, answer], index) => [
           {
+            origin: "native",
             itemId: `item_${suffix}_input`,
             turnId,
             kind: "user_input",
@@ -990,6 +1001,7 @@ describe("timeline reducer", () => {
             createdAt: `2026-08-18T00:00:0${index + 2}Z`,
           },
           {
+            origin: "native",
             itemId: `item_${suffix}_answer`,
             turnId,
             kind: "final_answer",
@@ -1387,6 +1399,7 @@ describe("timeline reducer", () => {
         revision: 2,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running" as const,
             requestedAt: "2026-08-18T00:00:00Z",
@@ -1398,6 +1411,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_ordered_text_reasoning",
             turnId,
             kind: "reasoning_summary" as const,
@@ -1406,6 +1420,7 @@ describe("timeline reducer", () => {
             createdAt: "2026-08-18T00:00:01Z",
           },
           {
+            origin: "native",
             itemId: "item_ordered_text",
             turnId,
             kind: "assistant_progress" as const,
@@ -1414,6 +1429,7 @@ describe("timeline reducer", () => {
             createdAt: "2026-08-18T00:00:01Z",
           },
           {
+            origin: "native",
             itemId: "call_ordered_read_call",
             turnId,
             kind: "tool_call" as const,
@@ -1603,6 +1619,7 @@ describe("timeline reducer", () => {
         revision: 16,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1637,6 +1654,7 @@ describe("timeline reducer", () => {
         revision: 17,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1671,6 +1689,7 @@ describe("timeline reducer", () => {
         revision: 21,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "completed",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1697,6 +1716,7 @@ describe("timeline reducer", () => {
         revision: 21,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1727,6 +1747,7 @@ describe("timeline reducer", () => {
         revision: 21,
         turns: [
           {
+            origin: "native",
             turnId: "turn_other",
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1779,6 +1800,7 @@ describe("timeline reducer", () => {
         revision: 17,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -1836,6 +1858,7 @@ describe("timeline reducer", () => {
         revision: 17,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:01Z",
@@ -2414,6 +2437,7 @@ describe("timeline reducer", () => {
         revision: 1,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "completed" as const,
             requestedAt: "2026-08-18T00:00:00Z",
@@ -2425,6 +2449,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_persisted_reasoning",
             turnId,
             kind: "reasoning_summary" as const,
@@ -3130,6 +3155,7 @@ describe("timeline reducer", () => {
         revision: 5,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -3168,6 +3194,7 @@ describe("timeline reducer", () => {
       revision: 1,
       turns: [
         {
+          origin: "native",
           turnId,
           sourceMessageId: null,
           status: "running" as const,
@@ -3230,6 +3257,7 @@ describe("timeline reducer", () => {
         revision: 2,
         turns: [
           {
+            origin: "native",
             turnId: "turn_new",
             status: "running",
             requestedAt: "2026-08-18T00:00:03Z",
@@ -3396,6 +3424,7 @@ describe("timeline reducer", () => {
         revision: 3,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -3407,6 +3436,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_running_tool",
             turnId,
             kind: "tool_call",
@@ -3472,6 +3502,7 @@ describe("timeline reducer", () => {
         revision: 4,
         turns: [
           {
+            origin: "native",
             turnId: "turn_snapshot",
             status: "completed",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -3483,6 +3514,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_user",
             turnId: "turn_snapshot",
             kind: "user_input",
@@ -3746,6 +3778,7 @@ describe("timeline reducer", () => {
         revision: 8,
         turns: [
           {
+            origin: "native",
             turnId: "turn_snapshot",
             status: "completed",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -3757,6 +3790,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_call",
             turnId: "turn_snapshot",
             kind: "tool_call",
@@ -3771,6 +3805,7 @@ describe("timeline reducer", () => {
             }),
           },
           {
+            origin: "native",
             itemId: "item_failed_call",
             turnId: "turn_snapshot",
             kind: "tool_call",
@@ -3784,6 +3819,7 @@ describe("timeline reducer", () => {
             }),
           },
           {
+            origin: "native",
             itemId: "item_approval",
             kind: "approval",
             createdAt: "2026-08-18T00:00:02Z",
@@ -3796,6 +3832,7 @@ describe("timeline reducer", () => {
             decision: "approve",
           },
           {
+            origin: "native",
             itemId: "item_attachment_user",
             kind: "user_input",
             createdAt: "2026-08-18T00:00:03Z",
@@ -3864,6 +3901,7 @@ describe("timeline reducer", () => {
         revision: 9,
         turns: [
           {
+            origin: "native",
             turnId: "turn_first",
             status: "completed",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -3873,6 +3911,7 @@ describe("timeline reducer", () => {
             changeSet: null,
           },
           {
+            origin: "native",
             turnId: "turn_second",
             status: "failed",
             requestedAt: "2026-08-18T00:01:00Z",
@@ -3884,6 +3923,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_first_user",
             turnId: "turn_first",
             kind: "user_input",
@@ -3893,6 +3933,7 @@ describe("timeline reducer", () => {
             attachments: [],
           },
           {
+            origin: "native",
             itemId: "item_second_user",
             turnId: "turn_second",
             kind: "user_input",
@@ -3902,6 +3943,7 @@ describe("timeline reducer", () => {
             attachments: [],
           },
           {
+            origin: "native",
             itemId: "item_first_final",
             turnId: "turn_first",
             kind: "final_answer",
@@ -3910,6 +3952,7 @@ describe("timeline reducer", () => {
             ...publicTextMetadata("第一问已完成"),
           },
           {
+            origin: "native",
             itemId: "item_second_prior_answer",
             turnId: "turn_second",
             kind: "final_answer",
@@ -3918,6 +3961,7 @@ describe("timeline reducer", () => {
             ...publicTextMetadata("此前排队输入已处理"),
           },
           {
+            origin: "native",
             itemId: "item_second_failure_reply",
             turnId: "turn_second",
             kind: "final_answer",
@@ -3947,6 +3991,7 @@ describe("timeline reducer", () => {
     expect(restored.items["item_second_failure_reply"]?.metadata?.failureReply).toBe(true);
   });
 
+  /** 消费事件 wire item 不含 Snapshot origin；domain admission 只在内部投影 native 并拒绝混入来源字段。 @author kongweiguang */
   it("按 queue revision 收敛乱序全量事件，并在消费 revision 原子迁移消息", () => {
     let state = applySnapshot(
       readyState(),
@@ -4010,7 +4055,7 @@ describe("timeline reducer", () => {
       items: [{ kind: "steering" }],
     });
 
-    state = apply(state, {
+    const inputConsumedEvent = {
       jsonrpc: "2.0",
       method: "turn/input-consumed",
       params: {
@@ -4041,7 +4086,18 @@ describe("timeline reducer", () => {
           usage: requestUsage(1, 4, 2, 6),
         },
       },
-    });
+    };
+    expect(timelineEventFromUnknown(inputConsumedEvent)).toBeDefined();
+    expect(
+      timelineEventFromUnknown({
+        ...inputConsumedEvent,
+        params: {
+          ...inputConsumedEvent.params,
+          userItem: { ...inputConsumedEvent.params.userItem, origin: "native" },
+        },
+      }),
+    ).toBeUndefined();
+    state = apply(state, inputConsumedEvent);
     expect(state.threadRevisionByThread[threadId]).toBe(3);
     expect(state.inputQueueByTurn[turnId]).toMatchObject({ revision: 4, items: [] });
     expect(state.items["item_answer_round_1"]).toMatchObject({
@@ -4114,6 +4170,7 @@ describe("timeline reducer", () => {
         revision: 3,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "failed",
             requestedAt: "2026-09-08T00:00:00Z",
@@ -4136,6 +4193,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_persisted_user",
             turnId,
             kind: "user_input",
@@ -4167,7 +4225,7 @@ describe("timeline reducer", () => {
     ).toEqual(["item_persisted_user"]);
   });
 
-  /** Mailbox 批次只进入目标 Timeline 的独立消息事实，不能伪造用户输入、Task Activity 或额外卡片。 */
+  /** Mailbox live 批次无 origin；只进入目标 Timeline 的独立消息事实，不能伪造用户输入、Task Activity 或额外卡片。 @author kongweiguang */
   it("projects received thread messages in batch order and deduplicates event identity", () => {
     const messages = [
       {
@@ -4200,6 +4258,7 @@ describe("timeline reducer", () => {
         revision: 1,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running" as const,
             requestedAt: "2026-09-09T00:00:00Z",
@@ -4218,13 +4277,35 @@ describe("timeline reducer", () => {
       },
       "ws_one",
     );
-    state = apply(
-      state,
-      event("turn/messages_received", 2, {
-        sequence: 12,
-        items: messages,
+    const messagesReceivedEvent = event("turn/messages_received", 2, {
+      sequence: 12,
+      items: messages,
+    });
+    expect(timelineEventFromUnknown(messagesReceivedEvent)).toBeDefined();
+    if (
+      typeof messagesReceivedEvent !== "object" ||
+      messagesReceivedEvent === null ||
+      Array.isArray(messagesReceivedEvent) ||
+      !("params" in messagesReceivedEvent)
+    )
+      throw new Error("消息事件 fixture 必须是携带 params 的对象");
+    const messagesReceivedParams = messagesReceivedEvent.params;
+    if (
+      typeof messagesReceivedParams !== "object" ||
+      messagesReceivedParams === null ||
+      Array.isArray(messagesReceivedParams)
+    )
+      throw new Error("消息事件 fixture params 必须是对象");
+    expect(
+      timelineEventFromUnknown({
+        ...messagesReceivedEvent,
+        params: {
+          ...messagesReceivedParams,
+          items: messages.map((message) => ({ ...message, origin: "native" })),
+        },
       }),
-    );
+    ).toBeUndefined();
+    state = apply(state, messagesReceivedEvent);
 
     expect(state.lastOutcome).toBe("applied");
     expect(state.itemIdsByThread[threadId]).toEqual(messages.map((message) => message.itemId));
@@ -4291,6 +4372,7 @@ describe("timeline reducer", () => {
       revision: 1,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "running" as const,
           requestedAt: "2026-08-18T00:00:00Z",
@@ -4368,6 +4450,7 @@ describe("timeline reducer", () => {
         revision: 1,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running" as const,
             requestedAt: "2026-08-18T00:00:00Z",
@@ -4432,6 +4515,7 @@ describe("timeline reducer", () => {
       revision: 1,
       turns: [
         {
+          origin: "native",
           turnId,
           sourceMessageId: null,
           status,
@@ -4463,6 +4547,7 @@ describe("timeline reducer", () => {
       revision: 3,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "running" as const,
           requestedAt: "2026-08-18T00:00:00Z",
@@ -4509,6 +4594,7 @@ describe("timeline reducer", () => {
       revision: 1,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "running" as const,
           requestedAt: "2026-08-18T00:00:00Z",
@@ -4553,6 +4639,7 @@ describe("timeline reducer", () => {
       revision: 1,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "running" as const,
           requestedAt: "2026-08-18T00:00:00Z",
@@ -4634,6 +4721,7 @@ describe("timeline reducer", () => {
         revision: 2,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -4645,6 +4733,7 @@ describe("timeline reducer", () => {
         ],
         items: [
           {
+            origin: "native",
             itemId: "item_committed_reply",
             turnId,
             kind: "assistant_progress",
@@ -4678,6 +4767,7 @@ describe("timeline reducer", () => {
         revision: 1,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -4744,6 +4834,7 @@ describe("timeline reducer", () => {
         revision: 2,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -4807,6 +4898,7 @@ describe("timeline reducer", () => {
         revision: 2,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running",
             requestedAt: "2026-08-18T00:00:00Z",
@@ -4909,6 +5001,7 @@ describe("timeline reducer", () => {
         revision: 1,
         turns: [
           {
+            origin: "native",
             turnId,
             status: "running" as const,
             requestedAt: "2026-08-18T00:00:00Z",
@@ -5010,6 +5103,7 @@ describe("timeline reducer", () => {
       revision: 2,
       turns: [
         {
+          origin: "native",
           turnId,
           status: "completed" as const,
           requestedAt: "2026-08-18T00:00:00Z",

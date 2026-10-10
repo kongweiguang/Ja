@@ -199,7 +199,7 @@ final class AgentModelStepSkillRestoreTest {
         assertTrue(fixture.terminalMessage().get().contains("Final response did not satisfy"));
     }
 
-    /** 组合真实 Context、Mapper 与 ModelStep，显式空输出 Schema 避免干扰 Skill 恢复的派发断言。 */
+    /** 组合真实 Context、Mapper 与 ModelStep；Prompt 代理仅验证冻结结果，提交通知沿接口默认语义保持无副作用。 */
     private static Fixture fixture() {
         return fixture(Optional.empty(), false, false, false);
     }
@@ -269,6 +269,7 @@ final class AgentModelStepSkillRestoreTest {
                         }
                         yield null;
                     }
+                    case "requestCommitted" -> null;
                     case "prepare" -> {
                         String summary = (String) arguments[0];
                         preparedSummaries.add(summary);

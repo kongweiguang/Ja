@@ -262,14 +262,26 @@ final class MybatisWorkspaceRepositoryTest extends PersistenceTestSupport {
         return new WorkspaceThreads(workspace, primaryThreadId, sideThreadId);
     }
 
+    /** 覆盖会阻止工作区根目录重绑的持久 Turn 状态，避免测试只检查运行中的状态。 */
     private enum TurnBusyState {
+        /** 等待审批期间仍占用原工作区身份，不能重绑根目录。 */
         WAITING_APPROVAL,
+        /** 用户输入排队等待处理时仍属于活动工作，不能重绑根目录。 */
         WAITING_INPUT,
+        /** 可恢复的挂起工作保留执行上下文，不能被根目录切换越过。 */
         SUSPENDED
     }
 
-    /** 保留两个 Workspace 内 Thread 身份，避免测试只验证单线程局部查询。 */
-    private record WorkspaceThreads(Workspace workspace, String primaryThreadId, String sideThreadId) {
+    /**
+     * 保留同一工作区内的主、侧 Thread 身份，避免忙碌查询只覆盖一个会话分支。
+     *
+     * @param workspace 两个会话共同绑定的持久工作区快照
+     * @param primaryThreadId 主会话标识
+     * @param sideThreadId 侧聊会话标识
+     */
+    private record WorkspaceThreads(Workspace workspace,
+                                    String primaryThreadId,
+                                    String sideThreadId) {
     }
 
     /** 同一 Workspace 的主 Thread 排队、侧聊输入队列和 paused Plan 都参与持久忙碌门禁。 */

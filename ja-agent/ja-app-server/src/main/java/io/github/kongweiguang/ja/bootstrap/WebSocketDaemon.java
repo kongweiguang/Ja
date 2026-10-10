@@ -788,22 +788,39 @@ public final class WebSocketDaemon implements AutoCloseable {
      * @author kongweiguang
      */
     private enum ClientClosePhase {
+        /** 守护进程关闭主动终止客户端连接。 */
         DAEMON_SHUTDOWN,
+        /** 客户端未在认证期限内完成握手。 */
         AUTH_TIMEOUT,
+        /** 握手凭据无效或未获授权。 */
         AUTHENTICATION_REJECTED,
+        /** 入站文本帧违反消息合同或大小限制。 */
         INBOUND_TEXT_REJECTED,
+        /** 此观察连接不接受二进制帧。 */
         BINARY_FRAME_REJECTED,
+        /** 客户端提交了无法接受的观察响应。 */
         OBSERVATION_RESPONSE_REJECTED,
+        /** 传出协议消息无法编码为帧。 */
         OUTBOUND_ENCODING_FAILURE,
+        /** 有界发送队列已满，连接无法继续可靠接收输出。 */
         OUTBOUND_QUEUE_OVERFLOW,
+        /** Writer 等待连接自身的输出资源时失败。 */
         WRITER_WAIT,
+        /** Writer 的连接保活探测失败。 */
         WRITER_PING,
+        /** Writer 发送帧时传输失败。 */
         WRITER_SEND,
+        /** 运行时输出流正常结束并关闭观察连接。 */
         RUNTIME_OUTPUT_END,
+        /** 运行时输出无法继续通过当前传输层送达。 */
         RUNTIME_TRANSPORT_FAILURE,
+        /** 底层传输回调报告对端关闭。 */
         TRANSPORT_CLOSE_CALLBACK,
+        /** 底层传输回调报告连接错误。 */
         TRANSPORT_ERROR_CALLBACK,
+        /** 新连接未能登记到运行时观察集合。 */
         CONNECTION_REGISTRATION_FAILURE,
+        /** 关闭底层 Socket 时发生失败。 */
         SOCKET_CLOSE_FAILURE
     }
 

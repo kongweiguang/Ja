@@ -15,8 +15,10 @@ registered root. Late callbacks remain fenced by Thread, root/revision and click
 新必填字段要求 Java、Rust、TypeScript 通知消费者同步更新，协议不保留旧通知形态。
 
 `turn/messages_received` publishes a non-empty `items` batch only after mailbox consumption commits.
-It uses the common Turn event envelope; each item is the same `thread_message` shape returned by
-`thread/read`. Items are ordered by mailbox sequence and belong to the event's Turn. Receiving a message
+It uses the common Turn event envelope; each item has the `thread_message` content fields returned by
+`thread/read`, without the snapshot-only `origin` field. Live items belong to the current Thread and clients
+project them as `origin="native"`; snapshots explicitly distinguish `native` and `inherited` history.
+Items are ordered by mailbox sequence and belong to the event's Turn. Receiving a message
 does not wake an idle Thread, interrupt an in-flight Provider request, or create a Task activity card.
 The next normal Provider request consumes pending messages and receives their explicit source context.
 
@@ -70,8 +72,9 @@ queue revisions without perturbing Timeline ordering.
 complete consumed `input`, the committed `userItem`, and the full post-consumption `inputQueue`. The optional
 `assistantSettlement` is exactly `{messageId,text,modelRound,usage?,reasoningSummary?}` and atomically settles
 the previous STOP-boundary Assistant message before the new user item. `input` is the pre-consumption
-`QueuedInput`; `userItem` is exactly `{itemId,createdAt,turnId,kind:"user_input",content,attachments}`. Both
+`QueuedInput`; `userItem` is exactly `{itemId,createdAt,turnId,kind:"user_input",content,attachments,totalCharacters,truncated}`. Both
 attachment arrays must preserve the same strict summaries and order as their attachment content blocks.
+The live `userItem` likewise omits snapshot-only `origin` and is projected as `native` by clients.
 Consumers must apply the event atomically so a queue row cannot coexist with its committed Timeline item.
 
 `configuration/changed` remains an invalidation hint. It contains no cwd, path, Provider/Model body, credential, or Secret; clients reissue `configuration/read` for the committed projection.

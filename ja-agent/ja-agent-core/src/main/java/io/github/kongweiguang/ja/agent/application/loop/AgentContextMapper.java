@@ -464,8 +464,9 @@ public final class AgentContextMapper {
     }
 
     /**
-     * Freezes an already item-truncated neutral history; only a checkpoint whose covered and retained ordinals fit
-     * inside that exact prefix may summarize it, preventing a later checkpoint from leaking future conversation.
+     * 冻结已经截到目标回复的中性历史；摘要检查点必须完整落在该前缀内，避免把目标回复之后的对话带入新上下文。
+     *
+     * @author kongweiguang
      */
     public InitialContextSeed freezeInitialContextSeedThroughMessages(
             List<ContextMessage> sourceMessages,

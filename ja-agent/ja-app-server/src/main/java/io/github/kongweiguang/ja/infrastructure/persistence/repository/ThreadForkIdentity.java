@@ -16,7 +16,9 @@ import java.util.Objects;
  */
 final class ThreadForkIdentity {
     /**
-     * Identity projection is stateless; callers must use the child-scoped mapping functions instead of creating instances.
+     * 投影器无状态；禁止实例化可避免调用方误以为存在需跨请求维护的映射生命周期。
+     *
+     * @author kongweiguang
      */
     private ThreadForkIdentity() {
     }

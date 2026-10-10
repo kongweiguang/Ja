@@ -19,6 +19,7 @@ import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
 import io.github.kongweiguang.ja.agent.application.gateway.store.AgentStore;
 import io.github.kongweiguang.ja.conversation.domain.model.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadPreferences;
+import io.github.kongweiguang.ja.conversation.domain.model.ThreadUsageSummary;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.domain.model.permission.AccessMode;
@@ -122,7 +123,7 @@ final class MybatisUsageProjectionPersistenceTest extends PersistenceTestSupport
                                     usages.get(index), ordinal, ordinal, UsagePurpose.ASSISTANT,
                                     UsageCertainty.KNOWN, profile(), null)), List.of(), REQUESTED_AT.plusSeconds(ordinal));
                 }
-                var summary = database.history().readThreadUsageSummary("thr_cache_complete").orElseThrow();
+                ThreadUsageSummary summary = database.history().readThreadUsageSummary("thr_cache_complete").orElseThrow();
                 assertEquals(3, summary.measuredRequestCount());
                 assertEquals(3_840, summary.newInputTokens());
                 assertEquals(51_047, summary.totalTokens());

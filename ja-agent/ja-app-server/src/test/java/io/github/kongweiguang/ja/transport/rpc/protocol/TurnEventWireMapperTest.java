@@ -320,7 +320,7 @@ final class TurnEventWireMapperTest {
         assertFalse(wire.params().path("userItem").path("attachments").get(0).has("state"));
     }
 
-    /** mailbox 提交事件只投影已落库的来源快照条目，并保留事件上下文的权威 revision。 */
+    /** mailbox 事件保留落库来源与权威 revision，严格排除快照专属 origin 以遵守实时通知字段集。 */
     @Test
     void mapsReceivedMessagesWithCommittedContext() {
         TurnEventWireMapper mapper = new TurnEventWireMapper(new ObjectMapper(), "srv_test");
@@ -339,6 +339,10 @@ final class TurnEventWireMapperTest {
         assertEquals("thr_sender", wire.params().path("items").get(0).path("sourceThreadId").textValue());
         assertEquals(4, wire.params().path("items").get(0).path("totalCharacters").intValue());
         assertFalse(wire.params().path("items").get(0).path("truncated").booleanValue());
+        assertEquals(Set.of("itemId", "createdAt", "turnId", "kind", "sourceThreadId", "sourceTitle",
+                        "content", "totalCharacters", "truncated"),
+                Set.copyOf(wire.params().path("items").get(0).propertyStream()
+                        .map(entry -> entry.getKey()).toList()));
     }
 
     /** 实时事件测试使用与历史相同的安全展示 DTO。 */

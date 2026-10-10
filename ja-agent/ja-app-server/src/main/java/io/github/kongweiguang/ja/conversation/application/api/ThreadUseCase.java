@@ -31,7 +31,11 @@ public interface ThreadUseCase {
         throw new UnsupportedOperationException("thread fork is unavailable");
     }
 
-    /** Reads a persisted fork receipt within the caller-supplied source owner scope after an uncertain response. */
+    /**
+     * 在来源 Thread 所有权范围内读取持久分叉回执，以便不确定响应后确认已提交结果。
+     *
+     * @author kongweiguang
+     */
     default Optional<ThreadForkResult> readThreadForkOperation(String sourceThreadId, String operationKey) {
         throw new UnsupportedOperationException("thread fork receipt lookup is unavailable");
     }

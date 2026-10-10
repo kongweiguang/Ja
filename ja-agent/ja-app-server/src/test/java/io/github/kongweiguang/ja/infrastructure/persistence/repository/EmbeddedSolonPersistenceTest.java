@@ -379,7 +379,13 @@ public final class EmbeddedSolonPersistenceTest {
         }
     }
 
-    /** 同时保留提交、预期业务拒绝与意外持久化失败，避免测试把锁错误误判为 CAS 冲突。 */
+    /**
+     * 同时保留提交、预期业务拒绝与意外持久化失败，避免测试把锁错误误判为 CAS 冲突。
+     *
+     * @param workspace 已提交时返回的工作区快照
+     * @param failure 预期业务拒绝，表示本次更新没有提交
+     * @param unexpectedFailure 未预期的运行时故障，用于和业务 CAS 结果区分
+     */
     private record WorkspaceUpdateAttempt(Workspace workspace,
                                           WorkspaceFailure failure,
                                           RuntimeException unexpectedFailure) {

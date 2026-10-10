@@ -51,7 +51,9 @@ public interface WorkspaceRootChangePort {
      * @param oldRoot 尚未提示区间的起始根目录
      * @param newRoot 尚未提示区间的最终根目录
      */
-    record Change(long revision, Path oldRoot, Path newRoot) {
+    record Change(long revision,
+                  Path oldRoot,
+                  Path newRoot) {
         /**
          * 规范化绝对路径并拒绝伪造的非正向重绑通知。
          */

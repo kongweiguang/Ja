@@ -49,7 +49,7 @@ public final class TurnEventWireMapper {
 
     /**
      * 只转换领域载荷；公开正文采用与快照相同的有限预览，完整消息按 itemId 单独读取。
-     * 未知 ChangeSet 保持显式 null，连接级 sequence、generation 和工作区关联由 RpcSession 补全。
+     * 未知 ChangeSet 保持显式 null，Live 通知移除快照专属 origin，连接级元数据由 RpcSession 补全。
      */
     public WireEvent map(TurnEvent event) {
         Objects.requireNonNull(event, "event");
@@ -184,7 +184,11 @@ public final class TurnEventWireMapper {
             case TurnEvent.MessagesReceived value -> {
                 method = "turn/messages_received";
                 ArrayNode items = params.putArray("items");
-                value.items().forEach(item -> items.add(RpcResults.snapshotItem(mapper, item)));
+                value.items().forEach(item -> {
+                    ObjectNode liveItem = RpcResults.snapshotItem(mapper, item);
+                    liveItem.remove("origin");
+                    items.add(liveItem);
+                });
             }
             case TurnEvent.ExtensionEvent ignored ->
                     throw new IllegalStateException("extension events are not supported by JA-RPC v2");

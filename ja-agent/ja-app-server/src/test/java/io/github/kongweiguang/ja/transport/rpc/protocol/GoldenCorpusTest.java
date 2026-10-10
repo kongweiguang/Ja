@@ -441,7 +441,7 @@ final class GoldenCorpusTest {
                 || !thread.path("latestTurnSeen").booleanValue();
     }
 
-    /** A fork receipt queried with a source owner must return that same owner, preventing cross-Thread recovery. */
+    /** 查询分叉回执时必须保留请求的来源所有者，防止借助其他 Thread 身份恢复目标会话。 */
     private static boolean rejectsOperationReadSemantics(String method, JsonNode requestParams, JsonNode result) {
         if (!"operation/read".equals(method) || requestParams == null
                 || !"committed".equals(result.path("status").textValue())) {

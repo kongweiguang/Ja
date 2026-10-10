@@ -166,7 +166,7 @@ final class PlanPreparedAttemptResumeIntegrationTest extends PersistenceTestSupp
                         AccessMode.FULL_ACCESS, "cfg_prepared_resume", preparedAt.plusSeconds(60),
                         admission.facts().workspaceId(), admission.revision().planRevisionId(),
                         admission.plan().activeRunId(), TurnOrigin.PLAN_EXECUTION);
-                var preparedAttempt = new PlanToolExecutionLedger(admission.plans(), 1)
+                AgentTool.ExtensionFact preparedAttempt = new PlanToolExecutionLedger(admission.plans(), 1)
                         .prepared(invocation, context).getFirst();
 
                 ModelMessage assistant = new ModelMessage(ModelRole.ASSISTANT, List.<ModelContent>of(
@@ -268,7 +268,7 @@ final class PlanPreparedAttemptResumeIntegrationTest extends PersistenceTestSupp
                     assertEquals("RUNNING", runStatus(database, paused.activeRunId()));
                     assertEquals(eventCountBeforeResume + 1, planEventCount(database, paused.planId()));
                 } else {
-                    var failure = assertThrows(PlanRepositoryException.class,
+                    PlanRepositoryException failure = assertThrows(PlanRepositoryException.class,
                             () -> admission.plans().resumePlan(command));
                     assertEquals(PlanRepositoryException.Code.PLAN_INVALID_STATE, failure.code());
                     assertEquals(PlanModels.PlanStatus.PAUSED,
@@ -316,7 +316,7 @@ final class PlanPreparedAttemptResumeIntegrationTest extends PersistenceTestSupp
                 AccessMode.FULL_ACCESS, "cfg_prepared_resume", at.plusSeconds(60),
                 admission.facts().workspaceId(), admission.revision().planRevisionId(),
                 admission.plan().activeRunId(), TurnOrigin.PLAN_EXECUTION);
-        var startedAttempt = new PlanToolExecutionLedger(admission.plans(), 1)
+        AgentTool.ExtensionFact startedAttempt = new PlanToolExecutionLedger(admission.plans(), 1)
                 .started(invocation, context).getFirst();
         fixture.commitRecords(TurnState.SUSPENDED, cursor, List.of(
                         fixture.record("agent.tool.started", callId,
@@ -495,13 +495,21 @@ final class PlanPreparedAttemptResumeIntegrationTest extends PersistenceTestSupp
      * @author kongweiguang
      */
     private enum ProofMutation {
+        /** 不破坏证据，恢复应接受完整且仍匹配的 Prepared proof。 */
         NONE,
+        /** 缺少工具绑定时不得仅凭事件事实恢复执行。 */
         MISSING_TOOL_BINDING,
+        /** 持久游标越过待恢复调用时不能重放旧位置。 */
         ADVANCED_CURSOR,
+        /** 助手调用身份不一致时不能把其他调用的 proof 当作当前证据。 */
         ASSISTANT_CALL_MISMATCH,
+        /** 内部计划摘要不匹配时拒绝使用被篡改的恢复证据。 */
         INTERNAL_PLAN_HASH_MISMATCH,
+        /** 重复的内部摘要键无法唯一确定持久化计划身份。 */
         DUPLICATE_INTERNAL_HASH_KEY,
+        /** 已有 ToolStarted 事实表示副作用可能发生，恢复不得再次执行。 */
         TOOL_STARTED,
+        /** 请求摘要不同表示恢复上下文不再是原冻结请求。 */
         REQUEST_DIGEST_MISMATCH
     }
 }
