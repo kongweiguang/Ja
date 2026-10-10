@@ -366,10 +366,11 @@ async function bootstrapProject(page, workspaceRoot, deadline) {
           const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
           const normalizePath = (value) =>
             value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
-          const listed = await createHistoryAdapter().workspaceList({
-            kind: "project",
-            limit: 200,
-          });
+          const listed = await Promise.race([
+            createHistoryAdapter().workspaceList({ kind: "project", limit: 200 }),
+            new Promise((resolve) => globalThis.setTimeout(() => resolve(null), 1_000)),
+          ]);
+          if (listed === null) return false;
           return listed.items.some(
             (candidate) => normalizePath(candidate.root) === normalizePath(rootPath),
           );
