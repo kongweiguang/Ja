@@ -108,11 +108,7 @@ function assertEvidencePath(path) {
   const root = resolve(repoRoot, ".tmp");
   const target = resolve(path);
   const relation = relative(root, target);
-  if (
-    relation === "" ||
-    relation.split(sep).includes("..") ||
-    isAbsolute(relation)
-  ) {
+  if (relation === "" || relation.split(sep).includes("..") || isAbsolute(relation)) {
     throw new Error("evidence directory must be a child of repository .tmp");
   }
   return target;
@@ -357,31 +353,51 @@ async function bootstrapProject(page, workspaceRoot, deadline) {
       });
   }
   await selected.waitFor({ state: "visible", timeout: timeout(deadline) });
+  const workspaceId = await selected.evaluate((element) =>
+    element.closest("[data-workspace-id]")?.getAttribute("data-workspace-id"),
+  );
+  assert.ok(workspaceId, "selected project row must expose its durable workspace identity");
+  let workspaceProbe;
+  /** 复用尚未完成的 native 读取，避免轮询超时后堆积不可取消的 RPC 请求。 */
+  const probeWorkspace = () => {
+    if (workspaceProbe === undefined) {
+      workspaceProbe = page
+        .evaluate(
+          async ({ id, rootPath }) => {
+            const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
+            const normalizePath = (value) =>
+              value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+            const history = createHistoryAdapter();
+            if (history.workspaceRead === undefined) return false;
+            const record = await Promise.race([
+              history.workspaceRead({ workspaceId: id }),
+              new Promise((resolve) => globalThis.setTimeout(() => resolve(null), 1_000)),
+            ]);
+            if (record === null) return false;
+            return (
+              record.workspaceId === id &&
+              record.kind === "project" &&
+              normalizePath(record.root) === normalizePath(rootPath)
+            );
+          },
+          { id: workspaceId, rootPath: workspaceRoot },
+        )
+        .catch(() => false)
+        .finally(() => {
+          workspaceProbe = undefined;
+        });
+    }
+    return workspaceProbe;
+  };
   await waitForCondition(
     "project workspace binding",
     async () => {
       if (!(await selected.isEnabled())) return false;
-      try {
-        const workspace = await page.evaluate(async (rootPath) => {
-          const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
-          const normalizePath = (value) =>
-            value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
-          const listed = await Promise.race([
-            createHistoryAdapter().workspaceList({ kind: "project", limit: 200 }),
-            new Promise((resolve) => globalThis.setTimeout(() => resolve(null), 1_000)),
-          ]);
-          if (listed === null) return false;
-          return listed.items.some(
-            (candidate) => normalizePath(candidate.root) === normalizePath(rootPath),
-          );
-        }, workspaceRoot);
-        return workspace;
-      } catch {
-        return false;
-      }
+      return probeWorkspace();
     },
     deadline,
   );
+  return workspaceId;
 }
 
 /** 只验证隔离 Provider 配置已被生产 Settings adapter 读到，不绕过对话控制器建 Thread。 */
@@ -503,24 +519,21 @@ async function waitForApprovalCard(page, command, deadline) {
 }
 
 /** 从同一 Thread 的历史和受控进程接口核对真实 ToolResult，避免 Provider fixture 终答掩盖执行失败。 */
-async function readFirstTurnRuntimeEvidence(page, { threadId, workspaceRoot, callId }) {
+async function readFirstTurnRuntimeEvidence(page, { threadId, workspaceId, callId }) {
   return page.evaluate(
-    async ({ selectedThreadId, rootPath, startedCallId }) => {
+    async ({ selectedThreadId, selectedWorkspaceId, startedCallId }) => {
       const [{ createHistoryAdapter }, { createProcessSessionAdapter }] = await Promise.all([
         import("/src/api/tauri/history.ts"),
         import("/src/api/tauri/process.ts"),
       ]);
       const history = createHistoryAdapter();
       const processSessions = createProcessSessionAdapter();
-      const [thread, workspaces] = await Promise.all([
+      const [thread, workspace] = await Promise.all([
         history.threadRead({ threadId: selectedThreadId, limit: 200 }),
-        history.workspaceList({ kind: "project", limit: 200 }),
+        selectedWorkspaceId === undefined || history.workspaceRead === undefined
+          ? Promise.resolve(undefined)
+          : history.workspaceRead({ workspaceId: selectedWorkspaceId }).catch(() => undefined),
       ]);
-      const normalizePath = (value) =>
-        value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
-      const workspace = workspaces.items.find(
-        (candidate) => normalizePath(candidate.root) === normalizePath(rootPath),
-      );
       const toolCalls = thread.items
         .filter((item) => item.kind === "tool_call" && item.callId === startedCallId)
         .map((item) => ({
@@ -644,7 +657,7 @@ async function readFirstTurnRuntimeEvidence(page, { threadId, workspaceRoot, cal
         };
       }
     },
-    { selectedThreadId: threadId, rootPath: workspaceRoot, startedCallId: callId },
+    { selectedThreadId: threadId, selectedWorkspaceId: workspaceId, startedCallId: callId },
   );
 }
 
@@ -653,7 +666,6 @@ async function captureFailureArtifacts(
   page,
   evidenceDirectory,
   threadId,
-  workspaceRoot,
   error,
   pageErrors,
   consoleErrors,
@@ -671,7 +683,6 @@ async function captureFailureArtifacts(
       try {
         const runtimeEvidence = await readFirstTurnRuntimeEvidence(page, {
           threadId,
-          workspaceRoot,
           callId: processCallId,
         });
         await writeFile(
@@ -782,7 +793,7 @@ export async function runProcessSessionWebView2({
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await waitForApplication(page, deadline);
-  await bootstrapProject(page, workspaceRoot, deadline);
+  const workspaceId = await bootstrapProject(page, workspaceRoot, deadline);
   await verifyFixtureProvider(page, fixture.baseUrl);
   const threadId = await createThreadFromUI(page, deadline);
   const pageIdentity = { url: page.url(), title: await page.title() };
@@ -800,7 +811,7 @@ export async function runProcessSessionWebView2({
   await waitForFinal(page, processFinalMarker, deadline);
   const firstTurnEvidence = await readFirstTurnRuntimeEvidence(page, {
     threadId,
-    workspaceRoot,
+    workspaceId,
     callId: processCallId,
   });
   await writeFile(
@@ -1430,7 +1441,9 @@ async function main() {
   await mkdir(options.evidenceDirectory, { recursive: true });
   const jarMetadata = await stat(options.jar);
   if (!jarMetadata.isFile() || jarMetadata.size === 0) {
-    throw new Error("current App Server JAR is missing or empty; build ja-agent/ja-app-server first");
+    throw new Error(
+      "current App Server JAR is missing or empty; build ja-agent/ja-app-server first",
+    );
   }
   const sourceBuildIdentity = await collectSourceBuildIdentity();
   if (jarMetadata.mtimeMs < sourceBuildIdentity.latestSourceMtimeMs) {
@@ -1467,7 +1480,6 @@ async function main() {
             driverOptions.page,
             options.evidenceDirectory,
             threadId,
-            driverOptions.workspaceRoot,
             error,
             driverOptions.page.__jaProcessSessionPageErrors ?? [],
             driverOptions.page.__jaProcessSessionConsoleErrors ?? [],
