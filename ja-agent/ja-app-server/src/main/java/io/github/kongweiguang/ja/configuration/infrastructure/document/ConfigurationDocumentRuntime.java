@@ -481,6 +481,9 @@ public final class ConfigurationDocumentRuntime {
     /**
      * 用户 Provider 目录使用 ID 稀疏操作，排序字段只控制当前请求中的顺序，不进入配置文档；
      * 项目层继续使用既有的稀疏覆盖规则。
+     * 校验后先固定节点类型，后续分支只检查空值，避免对已知子类型重复做无效 instanceof。
+     *
+     * @author kongweiguang
      */
     private ObjectNode applyScopedPatch(ObjectNode source, ConfigurationScope scope, ObjectNode patch) {
         JsonNode providerPatch = patch.get("providers");
@@ -490,13 +493,15 @@ public final class ConfigurationDocumentRuntime {
                 || providerOrder != null && !(providerOrder instanceof ArrayNode)) {
                 throw error(ConfigurationError.Code.INVALID_DOCUMENT, "user provider patch is invalid");
             }
+            ObjectNode providerOperations = providerPatch == null ? null : (ObjectNode) providerPatch;
+            ArrayNode order = providerOrder == null ? null : (ArrayNode) providerOrder;
             ObjectNode rootPatch = patch.deepCopy();
             rootPatch.remove(List.of("providers", "provider_order"));
             ObjectNode result = applyUserRootPatch(source, rootPatch);
-            if (providerPatch instanceof ObjectNode providerOperations) {
+            if (providerOperations != null) {
                 applyUserProviderPatches(result, providerOperations);
             }
-            if (providerOrder instanceof ArrayNode order) {
+            if (order != null) {
                 reorderByListedIdentity(result.withArray("providers"), order, "provider_id", "provider_");
             }
             return result;
@@ -600,6 +605,8 @@ public final class ConfigurationDocumentRuntime {
     /**
      * 模型字段按 Merge Patch 合并，显式可空值必须用哨兵；实体级 null 删除对应 ID，并清理重复
      * 原始匹配项以免被后续读投影重新显现。
+     *
+     * @author kongweiguang
      */
     private void applyUserModelPatches(ObjectNode provider, ObjectNode operations) {
         if (operations.isEmpty()) {
@@ -619,23 +626,7 @@ public final class ConfigurationDocumentRuntime {
                 throw error(ConfigurationError.Code.INVALID_DOCUMENT, "model patch is invalid");
             }
             int index = uniqueIdentityIndex(models, "model_id", modelId);
-            ObjectNode base = index >= 0 ? ((ObjectNode) models.get(index)).deepCopy()
-                    : provider.objectNode().put("model_id", modelId);
-            boolean explicitDefaultNull = isNullSentinel(fields.get("default_reasoning_level"));
-            ObjectNode modelFields = fields.deepCopy();
-            if (explicitDefaultNull) {
-                modelFields.remove("default_reasoning_level");
-            }
-            ObjectNode merged = applyMergePatch(base, modelFields);
-            if (explicitDefaultNull) {
-                merged.putNull("default_reasoning_level");
-            }
-            merged.put("model_id", modelId);
-            if (index >= 0) {
-                models.set(index, merged);
-            } else {
-                models.add(merged);
-            }
+            mergeModelPatch(models, provider, index, modelId, fields);
         });
         provider.set("models", models);
     }
@@ -765,6 +756,8 @@ public final class ConfigurationDocumentRuntime {
 
     /**
      * Model patch 也使用 model_id 作键，未触及模型和原始字段留在原数组中。
+     *
+     * @author kongweiguang
      */
     private void applyProjectModelPatches(ObjectNode provider, ObjectNode operations) {
         if (operations.isEmpty()) {
@@ -793,27 +786,36 @@ public final class ConfigurationDocumentRuntime {
             if (!(value instanceof ObjectNode fields) || fields.has("model_id")) {
                 throw error(ConfigurationError.Code.INVALID_DOCUMENT, "project model patch is invalid");
             }
-            ObjectNode base = index >= 0 ? ((ObjectNode) models.get(index)).deepCopy()
-                    : provider.objectNode().put("model_id", modelId);
-            boolean explicitDefaultNull = isNullSentinel(fields.get("default_reasoning_level"));
-            ObjectNode modelFields = fields.deepCopy();
-            if (explicitDefaultNull) {
-                modelFields.remove("default_reasoning_level");
-            }
-            ObjectNode merged = applyMergePatch(base, modelFields);
-            if (explicitDefaultNull) {
-                merged.putNull("default_reasoning_level");
-            }
-            merged.put("model_id", modelId);
-            if (index >= 0) {
-                models.set(index, merged);
-            }
-            else {
-                models.add(merged);
-            }
+            mergeModelPatch(models, provider, index, modelId, fields);
         });
         if (models.isEmpty()) {
             provider.remove("models");
+        }
+    }
+
+    /**
+     * 用户层与项目层保留各自的实体校验和删除策略，只共享模型字段的 sentinel 与 Merge Patch 语义。
+     *
+     * @author kongweiguang
+     */
+    private void mergeModelPatch(ArrayNode models, ObjectNode provider, int index,
+                                 String modelId, ObjectNode fields) {
+        ObjectNode base = index >= 0 ? ((ObjectNode) models.get(index)).deepCopy()
+                : provider.objectNode().put("model_id", modelId);
+        boolean explicitDefaultNull = isNullSentinel(fields.get("default_reasoning_level"));
+        ObjectNode modelFields = fields.deepCopy();
+        if (explicitDefaultNull) {
+            modelFields.remove("default_reasoning_level");
+        }
+        ObjectNode merged = applyMergePatch(base, modelFields);
+        if (explicitDefaultNull) {
+            merged.putNull("default_reasoning_level");
+        }
+        merged.put("model_id", modelId);
+        if (index >= 0) {
+            models.set(index, merged);
+        } else {
+            models.add(merged);
         }
     }
 

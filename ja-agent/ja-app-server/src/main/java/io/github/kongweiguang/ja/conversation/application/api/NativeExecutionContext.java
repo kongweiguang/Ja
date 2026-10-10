@@ -79,6 +79,7 @@ public final class NativeExecutionContext {
     /**
      * 登记 Native Host 的唯一逻辑生命周期；PID 只用于绑定进程实例，不作为 WebSocket 对端认证。
      * Windows 观察通过应用端口延迟发现，缺失或重复 provider 均失败关闭，不改变进程身份语义。
+     * 局部 try-with-resources owner 覆盖从 provider 打开到身份登记的全部失败窗口；仅在组登记后转移所有权。
      * @author kongweiguang
      */
     public NativeClientOwner registerNativeClient(long processId, String lifetimeId) {
@@ -86,22 +87,67 @@ public final class NativeExecutionContext {
                 || !lifetimeId.matches("native_[0-9a-f]{32}")) {
             throw new IllegalArgumentException("invalid native client identity");
         }
-        ProcessHandle process = null;
-        NativeProcessObservation windowsProcess = null;
-        if (isWindowsPlatform()) {
-            windowsProcess = requireWindowsProcessObservationProvider().open(processId);
-        } else {
-            process = ProcessHandle.of(processId)
-                    .filter(ProcessHandle::isAlive)
-                    .orElseThrow(() -> new IllegalArgumentException("native client process is unavailable"));
+        boolean windowsPlatform = isWindowsPlatform();
+        /**
+         * 将待登记观察句柄限制在当前调用作用域内，注册成功后由进程组接管其长期关闭责任。
+         * @author kongweiguang
+         */
+        class PendingNativeProcessObservation implements AutoCloseable {
+            private NativeProcessObservation observation;
+
+            /**
+             * 暂存 provider 句柄，使身份读取失败也能由外层 try-with-resources 清理。
+             * @author kongweiguang
+             */
+            PendingNativeProcessObservation(NativeProcessObservation observation) {
+                this.observation = observation;
+            }
+
+            /**
+             * 在组完成登记前提供只读观察，始终由此 owner 或已登记组之一负责关闭。
+             * @author kongweiguang
+             */
+            private NativeProcessObservation observation() {
+                return observation;
+            }
+
+            /**
+             * 只在 NativeProcessGroup 已进入进程索引后清空暂存 owner，交由 group 的 close 生命周期回收。
+             * @author kongweiguang
+             */
+            private void transferToRegisteredGroup() {
+                observation = null;
+            }
+
+            /**
+             * 关闭尚未被已登记进程组接管的句柄；无论关闭结果如何都清空字段，避免重复 close。
+             * @author kongweiguang
+             */
+            @Override
+            public void close() {
+                if (observation != null) {
+                    try {
+                        observation.close();
+                    } finally {
+                        observation = null;
+                    }
+                }
+            }
         }
-        Instant creationTime = windowsProcess == null
-                ? process.info().startInstant()
-                        .orElseThrow(() -> new IllegalArgumentException("native client process identity is unavailable"))
-                : windowsProcess.creationTime();
-        ProcessIdentity identity = new ProcessIdentity(processId, creationTime);
-        Throwable registrationFailure = null;
-        try {
+        try (PendingNativeProcessObservation pending = new PendingNativeProcessObservation(
+                windowsPlatform ? requireWindowsProcessObservationProvider().open(processId) : null)) {
+            ProcessHandle process = null;
+            if (!windowsPlatform) {
+                process = ProcessHandle.of(processId)
+                        .filter(ProcessHandle::isAlive)
+                        .orElseThrow(() -> new IllegalArgumentException("native client process is unavailable"));
+            }
+            Instant creationTime = pending.observation() == null
+                    ? process.info().startInstant()
+                            .orElseThrow(() -> new IllegalArgumentException(
+                                    "native client process identity is unavailable"))
+                    : pending.observation().creationTime();
+            ProcessIdentity identity = new ProcessIdentity(processId, creationTime);
             synchronized (nativeClientLock) {
                 RegisteredNativeClient existing = nativeClients.get(lifetimeId);
                 if (existing != null) {
@@ -110,7 +156,7 @@ public final class NativeExecutionContext {
                     }
                     return existing;
                 }
-                if (windowsProcess != null && !windowsProcess.isAlive()) {
+                if (pending.observation() != null && !pending.observation().isAlive()) {
                     throw new IllegalArgumentException("native client process is exiting");
                 }
                 long activeOwners = nativeClients.values().stream()
@@ -122,9 +168,9 @@ public final class NativeExecutionContext {
                 NativeProcessGroup group = nativeProcesses.get(identity);
                 boolean createdGroup = false;
                 if (group == null) {
-                    group = new NativeProcessGroup(identity, process, windowsProcess);
-                    windowsProcess = null;
+                    group = new NativeProcessGroup(identity, process, pending.observation());
                     nativeProcesses.put(identity, group);
+                    pending.transferToRegisteredGroup();
                     createdGroup = true;
                 } else if (!group.processAlive()) {
                     throw new IllegalArgumentException("native client process is exiting");
@@ -150,28 +196,13 @@ public final class NativeExecutionContext {
                         } catch (RuntimeException | Error closeFailure) {
                             failure.addSuppressed(closeFailure);
                         }
-                        if (failure instanceof Error error) {
-                            throw error;
+                        if (failure instanceof Error) {
+                            throw failure;
                         }
                         throw new IllegalArgumentException("native client process exit cannot be observed", failure);
                     }
                 }
                 return owner;
-            }
-        } catch (RuntimeException | Error failure) {
-            registrationFailure = failure;
-            throw failure;
-        } finally {
-            if (windowsProcess != null) {
-                try {
-                    windowsProcess.close();
-                } catch (RuntimeException | Error closeFailure) {
-                    if (registrationFailure != null) {
-                        registrationFailure.addSuppressed(closeFailure);
-                    } else {
-                        throw closeFailure;
-                    }
-                }
             }
         }
     }
@@ -469,6 +500,7 @@ public final class NativeExecutionContext {
 
     /**
      * 最后一个共享后台退出后在同一私有锁内清理快照，避免新 owner 与旧清理交错。
+     * 关闭失败保留首个错误及后续 suppressed 诊断，并以稳定生命周期异常向调用方报告。
      * @author kongweiguang
      */
     public void disableSharedMode() {
@@ -499,7 +531,7 @@ public final class NativeExecutionContext {
                     }
                 }
                 if (closeFailure != null) {
-                    throw closeFailure;
+                    throw new IllegalStateException("native client cleanup failed", closeFailure);
                 }
             }
         }

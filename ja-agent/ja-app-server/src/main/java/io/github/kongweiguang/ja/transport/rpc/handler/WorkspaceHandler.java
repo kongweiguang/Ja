@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
+import io.github.kongweiguang.ja.transport.rpc.runtime.RpcServer;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
 import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceBusyMessage;
@@ -174,7 +175,9 @@ public final class WorkspaceHandler implements RpcHandler {
 
     /**
      * 只接受名称或路径的明确更新；正常路径发布一次提交版本，后置同步失败则回读持久版本通知其它连接，
-     * 同时保留原始更新错误供发起方处理。
+     * 同时经同一个 RPC mapper 保持原错误目录，并把映射丢弃的原异常留作进程内 suppressed 诊断。
+     *
+     * @author kongweiguang
      */
     private ObjectNode update(ObjectNode params) {
         RpcParams.requireOnly(params, "workspaceId", "expectedRevision", "displayName", "cwd");
@@ -196,7 +199,12 @@ public final class WorkspaceHandler implements RpcHandler {
                     new WorkspaceUseCase.UpdateWorkspace(workspaceId, expectedRevision, displayName, root));
         } catch (RuntimeException failure) {
             publishCommittedWorkspaceRevisionAfterFailure(workspaceId, expectedRevision);
-            throw failure;
+            JaRpcException mapped = failure instanceof WorkspaceFailure workspaceFailure
+                    ? mapFailure(workspaceFailure) : RpcServer.mapFailure(failure);
+            if (mapped != failure && mapped.getCause() != failure) {
+                mapped.addSuppressed(failure);
+            }
+            throw mapped;
         }
         session.publishWorkspaceMetadataChanged(updated.workspaceId(), updated.revision());
         return RpcResults.workspace(session.mapper(), updated);

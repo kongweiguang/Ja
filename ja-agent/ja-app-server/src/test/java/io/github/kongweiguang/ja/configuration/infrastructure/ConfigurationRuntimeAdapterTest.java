@@ -18,6 +18,8 @@ import io.github.kongweiguang.ja.configuration.infrastructure.generation.ConfigG
 import io.github.kongweiguang.ja.configuration.infrastructure.generation.ConfigurationRuntimeState;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
@@ -49,6 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
 import static io.github.kongweiguang.ja.configuration.infrastructure.generation.ConfigGenerationTestAccess.isClosed;
 
 /** 验证配置运行时适配器的严格文档、CAS、凭据脱敏、Watcher 与 generation 租约语义。 */
@@ -694,6 +697,63 @@ final class ConfigurationRuntimeAdapterTest {
                     service.read(workspace).project().status());
             assertEquals("user:global-fixture", node(service.read(workspace).effective())
                     .withArray("disabled_skills").get(0).textValue());
+        }
+    }
+
+    /**
+     * Windows junction 与物理根共享信任身份，撤信须同时接受权威真实路径和原词法别名。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    void revokesWorkspaceTrustThroughCanonicalAndJunctionPaths() throws Exception {
+        Path physicalRoot = Files.createDirectory(temporaryRoot.resolve("trust-junction-target"));
+        Path junctionRoot = temporaryRoot.resolve("trust-junction-alias");
+        try {
+            Process junction = new ProcessBuilder("cmd.exe", "/d", "/c", "mklink", "/J",
+                    junctionRoot.toString(), physicalRoot.toString())
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            try {
+                assertTrue(junction.waitFor(5, TimeUnit.SECONDS), "junction fixture timed out");
+                assertEquals(0, junction.exitValue(), "Windows must create the trust identity alias");
+            } finally {
+                if (junction.isAlive()) {
+                    junction.destroyForcibly();
+                }
+            }
+            assertTrue(Files.isSameFile(junctionRoot, physicalRoot));
+
+            try (ConfigurationRuntimeAdapter service = service()) {
+                assertTrue(service.synchronizeWorkspaceTrust(junctionRoot, true));
+                assertTrue(service.synchronizeWorkspaceTrust(physicalRoot, false));
+                assertTrue(service.synchronizeWorkspaceTrust(junctionRoot, true));
+                assertTrue(service.synchronizeWorkspaceTrust(junctionRoot, false));
+                try (ConfigGeneration.Lease lease = service.acquire(physicalRoot)) {
+                    assertFalse(lease.snapshot().trusted());
+                }
+            }
+        } finally {
+            Files.deleteIfExists(junctionRoot);
+        }
+    }
+
+    /**
+     * 删除项目后仍可用原登记根撤信；此回退只适用于确定不存在的目录。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void revokesWorkspaceTrustAfterDirectoryRemoval() throws Exception {
+        Path workspace = Files.createDirectory(temporaryRoot.resolve("removed-trust-workspace"));
+        Path registeredRoot = workspace.toRealPath();
+        try (ConfigurationRuntimeAdapter service = service()) {
+            assertTrue(service.synchronizeWorkspaceTrust(workspace, true));
+            Files.delete(workspace);
+            assertTrue(service.synchronizeWorkspaceTrust(registeredRoot, false));
+            assertFalse(service.synchronizeWorkspaceTrust(registeredRoot, false));
         }
     }
 

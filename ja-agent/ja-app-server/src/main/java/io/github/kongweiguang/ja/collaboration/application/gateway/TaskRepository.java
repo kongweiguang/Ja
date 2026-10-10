@@ -4,7 +4,6 @@
 package io.github.kongweiguang.ja.collaboration.application.gateway;
 
 import io.github.kongweiguang.ja.agent.domain.context.InitialContextSeed;
-import io.github.kongweiguang.ja.agent.domain.context.ContextMessage;
 import io.github.kongweiguang.ja.conversation.application.gateway.AdmissionFacts;
 import io.github.kongweiguang.ja.conversation.domain.model.SubagentPolicy;
 import io.github.kongweiguang.ja.collaboration.domain.model.TaskModels;

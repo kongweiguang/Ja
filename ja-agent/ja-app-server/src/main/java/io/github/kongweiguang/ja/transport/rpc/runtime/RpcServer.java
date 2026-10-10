@@ -214,8 +214,11 @@ public final class RpcServer implements AutoCloseable {
      * 避免能力缺失被通用参数错误隐藏；禁止原始消息、路径、SQL 或 Secret 越界。
      * 未预期失败只保留有限代码调用位置，避免取消令牌的公共首帧掩盖真正的调用边界。
      * 异步包装仅按未重复身份解包，第三方 cause 环不得挂住响应结算。
+     * Handler 的提交后补偿路径共用此映射，保证单一 JA-RPC 边界的错误目录与脱敏语义。
+     *
+     * @author kongweiguang
      */
-    private static JaRpcException mapFailure(Throwable source) {
+    public static JaRpcException mapFailure(Throwable source) {
         Throwable failure = source;
         Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         while (visited.add(failure)
@@ -366,7 +369,10 @@ public final class RpcServer implements AutoCloseable {
     }
 
     /**
-     * 独占运行读取循环，直至 EOF、关闭、帧校验失败或输出代际失效。
+     * 独占运行读取循环，直至 EOF、关闭、帧校验失败或输出代际失效；入站与关闭失败分别记录脱敏阶段摘要，
+     * 继续返回非零退出码且不把异常消息、请求正文写入 JA-RPC stdout。
+     *
+     * @author kongweiguang
      */
     public int run() {
         int exit = 0;
@@ -384,11 +390,13 @@ public final class RpcServer implements AutoCloseable {
                 }
             }
         } catch (IOException | RuntimeException failure) {
+            logRunFailure("ingress", failure);
             exit = 1;
         } finally {
             try {
                 close(ShutdownDeadline.start());
             } catch (RuntimeException closeFailure) {
+                logRunFailure("close", closeFailure);
                 exit = 1;
             }
             if (projectionFailureCloseScheduled.get()) {
@@ -396,6 +404,19 @@ public final class RpcServer implements AutoCloseable {
             }
         }
         return exit;
+    }
+
+    /**
+     * 只输出失败阶段、异常类型与有界代码来源；消息可能含有输入正文或本机环境，不能进入诊断日志。
+     *
+     * @param stage 入站读取或运行时关闭阶段
+     * @param failure 已发生的传输边界异常
+     * @author kongweiguang
+     */
+    private static void logRunFailure(String stage, Throwable failure) {
+        FailureDiagnostics.Summary diagnostic = FailureDiagnostics.summarize(failure);
+        LOGGER.error("Ja RPC server failed stage={} type={} causeType={} origin={}",
+                stage, failure.getClass().getName(), diagnostic.type(), diagnostic.origin());
     }
 
     /**

@@ -628,6 +628,7 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
 
     /**
      * 快照项 JSON 由存储序列化器生成而非客户端提交；严格解码使损坏行在分叉前失败关闭。
+     * 解码失败保留底层 cause 供进程内诊断，RPC 继续只投影稳定 INVALID_STATE 分类。
      *
      * @author kongweiguang
      */
@@ -635,7 +636,8 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
         try {
             return objectMapper.readValue(jsonValue, PersistenceRecords.SnapshotItemRow.class);
         } catch (java.io.IOException failure) {
-            throw invalidState("frozen history item is invalid");
+            throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                    "frozen history item is invalid", failure);
         }
     }
 

@@ -1312,6 +1312,7 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
 
     /**
      * 先冻结继承前缀再复制来源本地历史，并保留每项完整正文；Turn 状态按所选答复时点投影，防止来源之后完成的状态泄漏。
+     * 两种继承分页共用单行重映射与插入边界，分页上限和来源答复身份仍由各自分支确定。
      *
      * @author kongweiguang
      */
@@ -1337,14 +1338,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                     break;
                 }
                 for (ThreadForkRecords.HistoryItemRow row : page) {
-                    PersistenceRecords.SnapshotItemRow item = remapSnapshotItem(
-                            readSnapshotItemRow(row.itemJson()), attachmentMap, true, childThreadId);
-                    requireInserted(mapper.threadForks().insertHistoryItem(new ThreadForkRecords.HistoryItemInsert(
-                                    childThreadId, ordinal++, item.itemId(), row.sourceThreadId(), row.sourceItemId(),
-                                    row.sourceTurnId(), item.turnId(), row.contextThroughOrdinal(),
-                                    writeJson(item), row.fullContent(), inheritedTurnJson(row.turnJson(), childThreadId,
-                                            row.sourceTurnId(), inheritedBoundary.sourceTurnId(), boundaryAt),
-                                    createdAt.toString())),
+                    insertInheritedForkHistoryItem(mapper, childThreadId, ordinal++, row, attachmentMap,
+                            inheritedBoundary.sourceTurnId(), boundaryAt, createdAt,
                             "inherited fork history insert lost");
                 }
                 after = page.getLast().ordinal();
@@ -1372,15 +1367,8 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                 break;
             }
             for (ThreadForkRecords.HistoryItemRow row : page) {
-                PersistenceRecords.SnapshotItemRow item = remapSnapshotItem(
-                        readSnapshotItemRow(row.itemJson()), attachmentMap, true, childThreadId);
-                requireInserted(mapper.threadForks().insertHistoryItem(new ThreadForkRecords.HistoryItemInsert(
-                                childThreadId, ordinal++, item.itemId(), row.sourceThreadId(), row.sourceItemId(),
-                                row.sourceTurnId(), item.turnId(), row.contextThroughOrdinal(),
-                                writeJson(item), row.fullContent(), inheritedTurnJson(row.turnJson(), childThreadId,
-                                        row.sourceTurnId(), frozen.sourceTurnId(), boundaryAt),
-                                createdAt.toString())),
-                        "fork inherited history insert lost");
+                insertInheritedForkHistoryItem(mapper, childThreadId, ordinal++, row, attachmentMap,
+                        frozen.sourceTurnId(), boundaryAt, createdAt, "fork inherited history insert lost");
             }
             afterOrdinal = page.getLast().ordinal();
         }
@@ -1411,6 +1399,26 @@ public final class MybatisHistoryService implements WorkspaceRepository, ThreadU
                             fullContent, turnJson, createdAt.toString())),
                     "fork history item insert lost");
         });
+    }
+
+    /**
+     * 继承行统一重映射到目标 owner 后事务写入，保留来源正文和上下文水位；边界 Turn 由调用方显式传入，
+     * 防止共享插入逻辑误用嵌套分叉或本地历史的不同截断身份。
+     *
+     * @author kongweiguang
+     */
+    private void insertInheritedForkHistoryItem(PersistenceMappers mapper, String childThreadId, long ordinal,
+                                               ThreadForkRecords.HistoryItemRow row,
+                                               Map<String, String> attachmentMap, String boundaryTurnId,
+                                               Instant boundaryAt, Instant createdAt, String failureMessage) {
+        PersistenceRecords.SnapshotItemRow item = remapSnapshotItem(
+                readSnapshotItemRow(row.itemJson()), attachmentMap, true, childThreadId);
+        requireInserted(mapper.threadForks().insertHistoryItem(new ThreadForkRecords.HistoryItemInsert(
+                        childThreadId, ordinal, item.itemId(), row.sourceThreadId(), row.sourceItemId(),
+                        row.sourceTurnId(), item.turnId(), row.contextThroughOrdinal(),
+                        writeJson(item), row.fullContent(), inheritedTurnJson(row.turnJson(), childThreadId,
+                                row.sourceTurnId(), boundaryTurnId, boundaryAt), createdAt.toString())),
+                failureMessage);
     }
 
     /**

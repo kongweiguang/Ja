@@ -83,8 +83,8 @@ public final class WindowsNativeProcessObservation implements NativeProcessObser
             return new WindowsNativeProcessObservation(api, handle, creationTime);
         } catch (RuntimeException | Error failure) {
             closeApiAfterOpenFailure(api, handle, failure);
-            if (failure instanceof Error error) {
-                throw error;
+            if (failure instanceof Error) {
+                throw failure;
             }
             throw new IllegalArgumentException("native client process is unavailable", failure);
         }
@@ -214,27 +214,26 @@ public final class WindowsNativeProcessObservation implements NativeProcessObser
         private final MethodHandle closeHandle;
 
         /**
-         * 只解析查询进程生命周期所需的四个 Kernel32 符号，部分初始化失败时关闭已创建的 Arena。
+         * API 实例在整个观察句柄生命周期内持有符号 Arena；部分初始化失败时关闭该实例已创建的 Arena。
          * @author kongweiguang
          */
         private Kernel32ProcessApi() {
-            WindowsKernel32Library candidate = new WindowsKernel32Library(
+            library = new WindowsKernel32Library(
                     "windows_native_process_symbols_unavailable");
             try {
-                openProcess = candidate.downcall("OpenProcess", FunctionDescriptor.of(
+                openProcess = library.downcall("OpenProcess", FunctionDescriptor.of(
                         ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-                getProcessTimes = candidate.downcall("GetProcessTimes", FunctionDescriptor.of(
+                getProcessTimes = library.downcall("GetProcessTimes", FunctionDescriptor.of(
                         ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                         ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-                waitForSingleObject = candidate.downcall("WaitForSingleObject", FunctionDescriptor.of(
+                waitForSingleObject = library.downcall("WaitForSingleObject", FunctionDescriptor.of(
                         ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
-                closeHandle = candidate.downcall("CloseHandle", FunctionDescriptor.of(
+                closeHandle = library.downcall("CloseHandle", FunctionDescriptor.of(
                         ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
             } catch (RuntimeException | Error failure) {
-                candidate.closeQuietly();
+                library.closeQuietly();
                 throw failure;
             }
-            library = candidate;
         }
 
         /**

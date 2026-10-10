@@ -18,6 +18,8 @@ import io.github.kongweiguang.ja.configuration.domain.model.ConfigurationScope;
 import io.github.kongweiguang.ja.configuration.application.gateway.ConfigurationRuntimePort;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -261,14 +263,16 @@ public final class ConfigurationRuntimeAdapter implements AutoCloseable, Configu
     }
 
     /**
-     * 赋予信任时固定现存真实目录；撤销信任按曾登记的规范词法根清理，使目录丢失时也能失效旧 Watcher/代际。
+     * 赋予和撤销信任使用相同真实路径身份；目录已删除时才以原词法根清理登记并失效旧 Watcher/代际。
+     *
+     * @author kongweiguang
      */
     @Override
     public synchronized boolean synchronizeWorkspaceTrust(Path cwd, boolean trusted) {
         ensureOpen();
-        Path canonical = trusted
-                ? documents.canonicalizeCwd(cwd)
-                : Objects.requireNonNull(cwd, "cwd").toAbsolutePath().normalize();
+        Path requestedRoot = Objects.requireNonNull(cwd, "cwd");
+        Path canonical = trusted ? documents.canonicalizeCwd(requestedRoot)
+                : workspaceRootForRevocation(requestedRoot);
         boolean changed = trusted
                 ? documents.trustWorkspace(canonical)
                 : documents.untrustWorkspace(canonical);
@@ -281,6 +285,26 @@ public final class ConfigurationRuntimeAdapter implements AutoCloseable, Configu
             invalidateGeneration(canonical);
         }
         return changed;
+    }
+
+    /**
+     * 撤信优先解析与授信相同的真实目录身份；仅当路径确定不存在时才回退词法键，以便清理已删除项目。
+     *
+     * @param cwd 调用方持有的工作区根
+     * @return 信任注册表使用的真实路径键，或已删除目录的规范词法键
+     * @author kongweiguang
+     */
+    private Path workspaceRootForRevocation(Path cwd) {
+        Path normalized = cwd.toAbsolutePath().normalize();
+        try {
+            return documents.canonicalizeCwd(normalized);
+        } catch (ConfigurationError failure) {
+            if (failure.code() != ConfigurationError.Code.INVALID_CWD
+                    || !Files.notExists(normalized, LinkOption.NOFOLLOW_LINKS)) {
+                throw failure;
+            }
+            return normalized;
+        }
     }
 
     /**

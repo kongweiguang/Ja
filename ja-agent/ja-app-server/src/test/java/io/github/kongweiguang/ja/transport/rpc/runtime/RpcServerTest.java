@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package io.github.kongweiguang.ja.transport.rpc.runtime;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.github.kongweiguang.ja.transport.rpc.handler.HandshakeContractTestAccess;
 import io.github.kongweiguang.ja.transport.rpc.handler.HealthShutdownHandler;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
 import io.github.kongweiguang.ja.transport.rpc.RpcServicesFactory;
+import io.github.kongweiguang.ja.transport.rpc.protocol.JaRpcCodec;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcMethod;
 import io.github.kongweiguang.ja.transport.rpc.support.RpcTestBindings;
@@ -50,6 +54,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntFunction;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -990,6 +996,78 @@ final class RpcServerTest {
     }
 
     /**
+     * 入站与关闭异常都继续失败关闭；日志只含阶段和 FailureDiagnostics 摘要，不回显环境、凭据或请求正文。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void runLogsSafeFailureStageAndPreservesNonZeroExit() {
+        String secret = "api_key=rpc-test-secret environment=rpc-test-env requestBody=rpc-test-body";
+        Logger logger = (Logger) LoggerFactory.getLogger(RpcServer.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        ByteArrayOutputStream ingressOutput = new ByteArrayOutputStream();
+        ByteArrayOutputStream closeOutput = new ByteArrayOutputStream();
+        try {
+            InputStream failingInput = new InputStream() {
+                /** 在实际读取边界抛出带敏感哨兵的异常，验证 run 只输出安全摘要。
+                 *
+                 * @author kongweiguang
+                 */
+                @Override
+                public int read() throws IOException {
+                    throw new IOException(secret);
+                }
+            };
+            RpcServer ingressServer = new RpcServer(failingInput, ingressOutput,
+                    testConfiguration(), CLOCK,
+                    ignored -> new EmptyServices(new AtomicBoolean()).bindings(),
+                    TestConfigurationPorts.unavailable());
+            assertEquals(1, ingressServer.run(), "ingress failure must retain the existing non-zero exit");
+
+            IOException cleanupFailure = new IOException(secret);
+            RpcServer closeServer = new RpcServer(new ByteArrayInputStream(new byte[0]), closeOutput,
+                    testConfiguration(), CLOCK,
+                    ignored -> new EmptyServices(new AtomicBoolean()).bindings(),
+                    TestConfigurationPorts.unavailable(), ignored -> () -> { throw cleanupFailure; });
+            assertEquals(1, closeServer.run(), "close failure must retain the existing non-zero exit");
+
+            List<String> messages = appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+            assertTrue(messages.stream().anyMatch(message -> message.contains("stage=ingress")
+                    && message.contains("type=java.io.IOException")
+                    && message.contains("causeType=java.io.IOException")));
+            assertTrue(messages.stream().anyMatch(message -> message.contains("stage=close")
+                    && message.contains("type=java.lang.IllegalStateException")
+                    && message.contains("causeType=java.io.IOException")));
+            String rendered = String.join("\n", messages);
+            assertFalse(rendered.contains("rpc-test-secret"));
+            assertFalse(rendered.contains("rpc-test-env"));
+            assertFalse(rendered.contains("rpc-test-body"));
+            String ingressWire = ingressOutput.toString(StandardCharsets.UTF_8);
+            String closeWire = closeOutput.toString(StandardCharsets.UTF_8);
+            List<JaRpcCodec.Frame> ingressFrames = decodeJaRpcStdout(ingressWire);
+            List<JaRpcCodec.Frame> closeFrames = decodeJaRpcStdout(closeWire);
+            assertTrue(ingressFrames.stream().allMatch(JaRpcCodec.Notification.class::isInstance));
+            assertTrue(closeFrames.stream().allMatch(JaRpcCodec.Notification.class::isInstance));
+            for (String wire : List.of(ingressWire, closeWire)) {
+                assertFalse(wire.contains("Ja RPC server failed"));
+                assertFalse(wire.contains("stage="));
+                assertFalse(wire.contains("java.io.IOException"));
+                assertFalse(wire.contains("\"message\""));
+                assertFalse(wire.contains("api_key=rpc-test-secret"));
+                assertFalse(wire.contains("environment=rpc-test-env"));
+                assertFalse(wire.contains("requestBody=rpc-test-body"));
+            }
+            assertTrue(appender.list.stream().allMatch(event -> event.getThrowableProxy() == null),
+                    "raw exception chains must not be attached to the log event");
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    /**
      * 验证忽略中断的 Handler 会先触发进程边界强制终止，而不会继续关闭 Session 或 Runtime。
      * 输入闸门保持读取线程存活，使测试覆盖生产中的同一关闭所有者，避免 EOF 触发第二次关闭造成竞态。
      */
@@ -1412,6 +1490,29 @@ final class RpcServerTest {
                 .put("id", "c:init").put("method", "runtime/initialize");
         request.set("params", params);
         return request;
+    }
+
+    /**
+     * 用生产严格 Codec 校验关闭仍可产生的每个 stdout 通知帧；无通知时允许零帧输出，避免依赖异步关闭投影的时序。
+     *
+     * @param wire 服务端 stdout JSONL
+     * @return 已通过严格信封解码的 v2 帧
+     * @author kongweiguang
+     */
+    private static List<JaRpcCodec.Frame> decodeJaRpcStdout(String wire) {
+        if (wire.isEmpty()) {
+            return List.of();
+        }
+        assertTrue(wire.endsWith("\n"), "each stdout frame must retain its JSONL terminator");
+        String[] lines = wire.split("\\R", -1);
+        assertEquals("", lines[lines.length - 1], "stdout must end at a frame boundary");
+        JaRpcCodec codec = new JaRpcCodec();
+        List<JaRpcCodec.Frame> frames = new ArrayList<>();
+        for (int index = 0; index < lines.length - 1; index++) {
+            assertFalse(lines[index].isBlank(), "stdout must not contain blank protocol frames");
+            frames.add(codec.decode(lines[index].getBytes(StandardCharsets.UTF_8)));
+        }
+        return List.copyOf(frames);
     }
 
     /** 创建最小独立 Plan snapshot，确保 transport fixture 不依赖聚合服务或持久层。 */

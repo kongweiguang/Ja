@@ -709,6 +709,9 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 在相同 admission 锁序下拒绝重复恢复，并保留提交后观察器相对于终态回调的原有顺序。
+     * Workspace 租约只保留同步准入屏障，退出资源作用域才释放，无需在业务体中读取租约对象。
+     *
+     * @author kongweiguang
      */
     private Accepted submit(AgentIdentity identity, ConversationTurnEventSink sink,
                             NativeExecutionSnapshot inherited,
@@ -720,7 +723,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         Objects.requireNonNull(admissionObserver, "admissionObserver");
         ThreadProjection thread = projections.readThread(identity.threadId())
                 .orElseThrow(() -> new IllegalStateException("Turn Thread projection is missing"));
-        try (WorkspaceAdmissionPort.Lease workspaceLease =
+        try (WorkspaceAdmissionPort.Lease ignored =
                      workspaceAdmissions.acquire(thread.workspaceId())) {
             Lock gate = admissionGate.readLock();
             gate.lock();
@@ -1244,10 +1247,13 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 使用同一 Turn 投影执行变更，避免校验后的输入改投到另一个执行身份。
+     * Workspace 租约只用于维持变更期间的准入屏障，由资源作用域统一释放。
+     *
+     * @author kongweiguang
      */
     private InputMutation mutate(TurnOwnerProjection turn, AgentInputCommand command) {
         AgentIdentity identity = JaTurnRequestMapper.identity(turn.threadId(), turn.turn().turnId());
-        try (WorkspaceAdmissionPort.Lease workspaceLease =
+        try (WorkspaceAdmissionPort.Lease ignored =
                      workspaceAdmissions.acquire(turn.workspaceId())) {
             AgentInputMutationReceipt receipt;
             try {

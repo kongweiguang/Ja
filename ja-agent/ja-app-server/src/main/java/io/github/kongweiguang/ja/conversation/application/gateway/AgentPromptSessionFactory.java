@@ -7,7 +7,6 @@ import io.github.kongweiguang.ja.agent.application.skill.SkillCatalog;
 import io.github.kongweiguang.ja.agent.domain.ContextBudget;
 import io.github.kongweiguang.ja.agent.domain.validation.ContractChecks;
 import io.github.kongweiguang.ja.agent.application.gateway.AgentPromptSession;
-import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceRootChangePort;
 
 import java.nio.file.Path;
 import java.util.Map;
