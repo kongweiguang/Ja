@@ -378,6 +378,18 @@ jobs:
           node scripts/e2e/process-session-webview2.mjs --java-home $env:JAVA_HOME --jar $env:JA_E2E_APP_SERVER_JAR --evidence-directory $evidence
           if ($LASTEXITCODE -ne 0) { throw "process-session WebView2 acceptance failed with exit code $LASTEXITCODE" }
 
+      # 保留 runner 已脱敏的报告与启动日志；临时 profile、凭据和实际用户目录不进入 artifact。
+      - name: Preserve isolated WebView2 acceptance evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ja-process-session-webview2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/process-session-webview2-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            .tmp/process-session-webview2-${{ github.run_id }}-${{ github.run_attempt }}/launch-diagnostic.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Run file-search acceptance against JVM App Server
         shell: pwsh
         run: |

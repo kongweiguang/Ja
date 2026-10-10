@@ -415,7 +415,8 @@ async function readProductionMainWindowConfig() {
 /**
  * @author kongweiguang 生成唯一 identifier、生产窗口和 dev origin 的私有 overlay，不修改仓库配置。
  * Native 模式只把已选 sidecar 映射到固定资源名；CDP 隐藏窗口保留可见渲染但移到屏幕外，
- * 防止宿主鼠标覆盖合成输入，同时不取得用户前台焦点。
+ * 防止宿主鼠标覆盖合成输入，同时不取得用户前台焦点。CDP 参数走 Tauri 原生 API，
+ * 避免新版 WebView2 在 elevated CI host 中忽略环境变量；参数仅写入本轮临时配置。
  */
 export async function writeTauriOverlay(
   directories,
@@ -423,6 +424,7 @@ export async function writeTauriOverlay(
   useEdgeDriver,
   hiddenWindow = false,
   nativeExecutable,
+  cdpPort,
 ) {
   const origin = `http://localhost:${frontendPort}`;
   const websocket = `ws://localhost:${frontendPort}`;
@@ -440,6 +442,9 @@ export async function writeTauriOverlay(
       windows: [
         {
           ...mainWindow,
+          ...(cdpPort === undefined || useEdgeDriver
+            ? {}
+            : { additionalBrowserArgs: directCdpArguments(cdpPort) }),
           ...(hiddenWindow
             ? {
                 visible: true,
@@ -837,7 +842,7 @@ export function buildLaunchEnvironment({
       ? {
           WEBVIEW2_USER_DATA_FOLDER: directories.webview,
           // UI Automation 在 CDP 被宿主环境阻断时仍需看到真实 DOM 控件；此标志只开启辅助功能树。
-          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --force-renderer-accessibility=complete --remote-debugging-address=127.0.0.1 --remote-debugging-port=${cdpPort}`,
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: directCdpArguments(cdpPort),
         }
       : {
           JA_E2E_CARGO_COMMAND: cargo,
@@ -869,6 +874,14 @@ export function buildLaunchEnvironment({
     if (/^JA_(?:E2E_)?REAL_PROVIDER/u.test(name)) delete env[name];
   }
   return env;
+}
+
+/** @author kongweiguang 原生配置与非 elevated 环境共用同一组 loopback 调试参数，并保留 Wry 默认禁用组件，禁止扩展到任意地址或端口。 */
+function directCdpArguments(port) {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("CDP port must be a valid local port");
+  }
+  return `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --force-renderer-accessibility=complete --remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`;
 }
 
 /**
@@ -1046,7 +1059,8 @@ async function terminateOwnedLauncher(launch) {
 
 /**
  * @author kongweiguang
- * Windows fresh UDF 首启先完成磁盘 profile 初始化，再由同一隔离 profile 开启 CDP；启动器沿用已校验的 pnpm 身份。
+ * Windows fresh UDF 首启先完成磁盘 profile 初始化；两次启动保持相同原生浏览器参数，正式阶段才连接 CDP。
+ * 启动器沿用已校验的 pnpm 身份，冷编译与 profile 就绪分别使用准备和运行时期限。
  */
 async function prewarmWebViewProfile(overlay, environment, directories, pnpmCommand) {
   const primeEnvironment = { ...environment };
@@ -1195,6 +1209,7 @@ export async function runProduction(options) {
         options.edgeDriver !== undefined,
         options.hiddenWindow === true,
         options.nativeExecutable,
+        options.edgeDriver === undefined ? automationPort : undefined,
       );
       const environment = buildLaunchEnvironment({
         directories,
@@ -1209,6 +1224,8 @@ export async function runProduction(options) {
         edgeDriverSessionPath,
         cargo,
       });
+      // 自主 launch 已通过临时 overlay 走原生 API；关闭环境变量副本，使标准权限下的真窗也验证 elevated CI 使用的同一路径。
+      delete environment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
       if (options.prewarmWebview === true) {
         assert.equal(
           options.edgeDriver,

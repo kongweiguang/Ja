@@ -1216,7 +1216,7 @@ test(
   },
 );
 
-/** @author kongweiguang 验证 sidecar 选择保持原样，并将可见 CDP 私有窗口移出宿主鼠标活动区。 */
+/** @author kongweiguang 验证 sidecar 选择和隐藏窗口边界，并确保 elevated host 使用的原生 CDP 参数只进入临时 overlay。 */
 test("writeTauriOverlay 仅映射显式选择的 Native sidecar", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "ja-review-native-overlay-"));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -1233,9 +1233,41 @@ test("writeTauriOverlay 仅映射显式选择的 Native sidecar", async (context
   const jarConfig = JSON.parse(await readFile(jarOverlay, "utf8"));
   assert.equal(jarConfig.bundle, undefined);
 
-  const hiddenOverlay = await writeTauriOverlay(directories, 1429, false, true);
+  const hiddenOverlay = await writeTauriOverlay(directories, 1429, false, true, undefined, 41002);
   const hiddenConfig = JSON.parse(await readFile(hiddenOverlay, "utf8"));
   const hiddenWindow = hiddenConfig.app.windows[0];
+  assert.match(
+    hiddenWindow.additionalBrowserArgs,
+    /--remote-debugging-address=127\.0\.0\.1 --remote-debugging-port=41002$/u,
+  );
+  assert.match(
+    hiddenWindow.additionalBrowserArgs,
+    /--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection/u,
+  );
+  assert.equal(jarConfig.app.windows[0].additionalBrowserArgs, undefined);
+  const productionConfig = JSON.parse(
+    await readFile(
+      join(
+        dirname(dirname(import.meta.filename)),
+        "..",
+        "apps",
+        "desktop",
+        "src-tauri",
+        "tauri.conf.json",
+      ),
+      "utf8",
+    ),
+  );
+  assert.equal(productionConfig.app.windows[0].additionalBrowserArgs, undefined);
+  await assert.rejects(
+    writeTauriOverlay(directories, 1429, false, true, undefined, 0),
+    /valid local port/u,
+  );
+  const edgeOverlay = await writeTauriOverlay(directories, 1429, true, true, undefined, 41002);
+  assert.equal(
+    JSON.parse(await readFile(edgeOverlay, "utf8")).app.windows[0].additionalBrowserArgs,
+    undefined,
+  );
   assert.deepEqual(
     {
       visible: hiddenWindow.visible,
