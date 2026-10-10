@@ -338,8 +338,11 @@ async function waitForApplication(page, deadline) {
   );
 }
 
-/** 在隔离空 profile 中通过“添加项目”入口选中 runner 创建的唯一 workspace。 */
-async function bootstrapProject(page, deadline) {
+/**
+ * 在隔离空 profile 中通过“添加项目”入口选中 runner 创建的唯一 workspace，
+ * 并等待 UI 与 App Server 同时确认项目绑定完成，避免首个 Turn 早于 workspace/open。
+ */
+async function bootstrapProject(page, workspaceRoot, deadline) {
   const selected = page.locator(
     '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
   );
@@ -354,6 +357,30 @@ async function bootstrapProject(page, deadline) {
       });
   }
   await selected.waitFor({ state: "visible", timeout: timeout(deadline) });
+  await waitForCondition(
+    "project workspace binding",
+    async () => {
+      if (!(await selected.isEnabled())) return false;
+      try {
+        const workspace = await page.evaluate(async (rootPath) => {
+          const { createHistoryAdapter } = await import("/src/api/tauri/history.ts");
+          const normalizePath = (value) =>
+            value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+          const listed = await createHistoryAdapter().workspaceList({
+            kind: "project",
+            limit: 200,
+          });
+          return listed.items.some(
+            (candidate) => normalizePath(candidate.root) === normalizePath(rootPath),
+          );
+        }, workspaceRoot);
+        return workspace;
+      } catch {
+        return false;
+      }
+    },
+    deadline,
+  );
 }
 
 /** 只验证隔离 Provider 配置已被生产 Settings adapter 读到，不绕过对话控制器建 Thread。 */
@@ -754,7 +781,7 @@ export async function runProcessSessionWebView2({
 
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await waitForApplication(page, deadline);
-  await bootstrapProject(page, deadline);
+  await bootstrapProject(page, workspaceRoot, deadline);
   await verifyFixtureProvider(page, fixture.baseUrl);
   const threadId = await createThreadFromUI(page, deadline);
   const pageIdentity = { url: page.url(), title: await page.title() };
