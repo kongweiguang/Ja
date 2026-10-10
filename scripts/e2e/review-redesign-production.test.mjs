@@ -7,6 +7,7 @@ import { execFile, spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import process from "node:process";
 import test from "node:test";
 import { promisify } from "node:util";
 import { createContext, runInContext } from "node:vm";
@@ -31,6 +32,7 @@ import {
 } from "./review-redesign-webview2-driver.mjs";
 import {
   assertOwnedTemporaryPath,
+  buildTauriCommandLine,
   buildLaunchEnvironment,
   classifyOwnedProcessSnapshotFailure,
   createReviewDriverHooks,
@@ -39,6 +41,7 @@ import {
   projectOwnedProcessSnapshot,
   readOwnedProcessSnapshot,
   readOwnedTauriExecutableIdentity,
+  resolvePnpmCommand,
   selectOwnedTauriProcess,
   validateToolchain,
   verifyOwnedTauriExecutableIdentity,
@@ -508,6 +511,46 @@ test("parseArguments 为 Native executable 要求固定 SHA-256 且拒绝 JAR �
         executable,
       ]),
     /requires --expected-native-sha256/u,
+  );
+});
+
+/**
+ * @author kongweiguang
+ * 固定 action 导出的 PNPM_HOME shim，并验证 cmd.exe 从仓库 cwd 启动时版本探测仍执行该绝对路径。
+ */
+test("resolvePnpmCommand pins the action-installed shim for cmd.exe launches", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "ja-pnpm shim test-"));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const previousPnpmHome = process.env.PNPM_HOME;
+  context.after(() => {
+    if (previousPnpmHome === undefined) delete process.env.PNPM_HOME;
+    else process.env.PNPM_HOME = previousPnpmHome;
+  });
+  const pnpmHome = join(root, "setup-pnpm", "node_modules", ".bin");
+  await mkdir(pnpmHome, { recursive: true });
+  const pnpmCommand = join(pnpmHome, "pnpm.cmd");
+  await writeFile(pnpmCommand, "@echo off\r\necho 10.33.0\r\n", "utf8");
+  process.env.PNPM_HOME = pnpmHome;
+
+  assert.equal(await resolvePnpmCommand(), pnpmCommand);
+  const overlay = join(root, "tauri overlay.json");
+  assert.equal(
+    buildTauriCommandLine({ overlay, pnpmCommand }),
+    `""${pnpmCommand}" tauri dev --no-watch --config "${overlay}""`,
+  );
+  const nativeExecutable = join(root, "ja-app-server.exe");
+  await writeFile(nativeExecutable, "native fixture", "utf8");
+  const expectedNativeSha256 = createHash("sha256").update("native fixture").digest("hex");
+  const toolchain = await validateToolchain({
+    nativeExecutable,
+    expectedNativeSha256,
+  });
+  assert.equal(toolchain.pnpmCommand, pnpmCommand);
+
+  await writeFile(pnpmCommand, "@echo off\r\necho 9.0.0\r\n", "utf8");
+  await assert.rejects(
+    validateToolchain({ nativeExecutable, expectedNativeSha256 }),
+    /requires pnpm 10\.33\.0/u,
   );
 });
 

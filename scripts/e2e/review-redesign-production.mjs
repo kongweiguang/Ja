@@ -14,7 +14,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import process from "node:process";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "@playwright/test";
@@ -470,17 +470,24 @@ export async function writeTauriOverlay(
   return path;
 }
 
-/** 验证本次选择的唯一运行产物与 Node 工具链；Native 模式不探测或借用 JDK/JAR。 */
+/**
+ * @author kongweiguang
+ * 验证唯一运行产物和固定工具链，并返回实际参与启动的 pnpm shim；Native 模式不探测或借用 JDK/JAR。
+ */
 export async function validateToolchain({ javaHome, jar, nativeExecutable, expectedNativeSha256 }) {
   const java = nativeExecutable === undefined ? join(javaHome, "bin", "java.exe") : undefined;
+  const pnpmCommand = await resolvePnpmCommand();
+  const comspec = process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe";
+  const pnpmCommandLine = `"${quoteWindowsToken(pnpmCommand)} --version"`;
   const [javaResult, nodeResult, pnpmResult, jarStat] = await Promise.all([
     java === undefined
       ? Promise.resolve(undefined)
       : execFileAsync(java, ["-version"], { windowsHide: true, timeout: 15_000 }),
     execFileAsync("node.exe", ["--version"], { windowsHide: true, timeout: 15_000 }),
-    execFileAsync("pwsh.exe", ["-NoProfile", "-Command", "& pnpm.cmd --version"], {
+    execFileAsync(comspec, ["/d", "/s", "/c", pnpmCommandLine], {
       windowsHide: true,
       timeout: 15_000,
+      windowsVerbatimArguments: true,
     }),
     stat(nativeExecutable ?? jar),
   ]);
@@ -501,6 +508,7 @@ export async function validateToolchain({ javaHome, jar, nativeExecutable, expec
   }
   return {
     java,
+    pnpmCommand,
     jarSize: nativeExecutable === undefined ? jarStat.size : undefined,
     nativeExecutableSize: nativeExecutable === undefined ? undefined : jarStat.size,
     nativeSha256,
@@ -863,10 +871,13 @@ export function buildLaunchEnvironment({
   return env;
 }
 
-/** 启动真实 `tauri dev --no-watch`，仅捕获有界输出尾部用于失败归因。 */
-function launchTauri({ overlay, environment }) {
+/**
+ * @author kongweiguang
+ * 以已由工具链门禁校验的绝对 pnpm shim 启动真实 Tauri；裸命令会在 cmd.exe 中受仓库 cwd 优先级影响。
+ */
+function launchTauri({ overlay, environment, pnpmCommand }) {
   const comspec = process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe";
-  const commandLine = `"${quoteWindowsToken("pnpm.cmd")} tauri dev --no-watch --config ${quoteWindowsToken(overlay)}"`;
+  const commandLine = buildTauriCommandLine({ overlay, pnpmCommand });
   const child = spawn(comspec, ["/d", "/s", "/c", commandLine], {
     cwd: repoRoot,
     env: environment,
@@ -881,6 +892,42 @@ function launchTauri({ overlay, environment }) {
   child.stdout?.on("data", (chunk) => append("stdout", chunk));
   child.stderr?.on("data", (chunk) => append("stderr", chunk));
   return { child, output };
+}
+
+/**
+ * @author kongweiguang
+ * 固定 cmd.exe /s /c 外层与两个参数 token 的引号层级，确保带空格的 pnpm 安装路径和 overlay 均按完整路径执行。
+ */
+export function buildTauriCommandLine({ overlay, pnpmCommand }) {
+  return `"${quoteWindowsToken(pnpmCommand)} tauri dev --no-watch --config ${quoteWindowsToken(overlay)}"`;
+}
+
+/**
+ * @author kongweiguang
+ * 从 pnpm/action-setup 的绝对 PNPM_HOME 取 shim；未设置时只查 PATH 中的绝对目录，避免 cmd.exe 将仓库 cwd 当作命令来源。
+ */
+export async function resolvePnpmCommand() {
+  const pnpmHome = process.env.PNPM_HOME?.trim();
+  if (pnpmHome !== undefined && pnpmHome.length > 0) {
+    if (!isAbsolute(pnpmHome)) throw new Error("PNPM_HOME must be an absolute directory");
+    const command = join(pnpmHome, "pnpm.cmd");
+    const metadata = await stat(command);
+    if (!metadata.isFile()) throw new Error("PNPM_HOME does not contain pnpm.cmd");
+    return command;
+  }
+
+  const inheritedPath = process.env.PATH ?? process.env.Path ?? "";
+  for (const directory of inheritedPath.split(delimiter).map((entry) => entry.trim())) {
+    if (directory.length === 0 || !isAbsolute(directory)) continue;
+    const command = join(directory, "pnpm.cmd");
+    try {
+      const metadata = await stat(command);
+      if (metadata.isFile()) return command;
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+  }
+  throw new Error("pnpm.cmd was not found in PNPM_HOME or absolute PATH entries");
 }
 
 /** attach 没有本地 launcher；仅 launch 模式在子进程退出时提前失败，避免误判 CDP 冷启动。 */
@@ -963,11 +1010,18 @@ async function terminateOwnedLauncher(launch) {
   }).catch(() => undefined);
 }
 
-/** fresh Windows UDF 首启先完成磁盘profile初始化，再由同一隔离profile开启CDP；不扩大等待期限。 */
-async function prewarmWebViewProfile(overlay, environment, directories) {
+/**
+ * @author kongweiguang
+ * Windows fresh UDF 首启先完成磁盘 profile 初始化，再由同一隔离 profile 开启 CDP；启动器沿用已校验的 pnpm 身份。
+ */
+async function prewarmWebViewProfile(overlay, environment, directories, pnpmCommand) {
   const primeEnvironment = { ...environment };
   delete primeEnvironment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
-  const prime = launchTauri({ overlay, environment: primeEnvironment });
+  const prime = launchTauri({
+    overlay,
+    environment: primeEnvironment,
+    pnpmCommand,
+  });
   const deadline = Date.now() + 120_000;
   try {
     while (Date.now() < deadline) {
@@ -1126,9 +1180,9 @@ export async function runProduction(options) {
           undefined,
           "profile prewarm uses direct CDP, not EdgeDriver",
         );
-        await prewarmWebViewProfile(overlay, environment, directories);
+        await prewarmWebViewProfile(overlay, environment, directories, toolchain.pnpmCommand);
       }
-      launch = launchTauri({ overlay, environment });
+      launch = launchTauri({ overlay, environment, pnpmCommand: toolchain.pnpmCommand });
       if (options.edgeDriver === undefined) {
         endpoint = `http://127.0.0.1:${automationPort}`;
         await waitForCdp(endpoint, launch);

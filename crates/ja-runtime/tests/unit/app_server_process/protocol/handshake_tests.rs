@@ -5,7 +5,8 @@
 
 use super::*;
 
-/// 锁定桌面宿主实际使用的能力闭集，确保 Workspace 元数据失效通知由协商协议正式承载。
+/// 保持精确能力闭集与 canonical 握手目录及 JA-RPC golden 顺序一致，避免测试维护出第二套通知次序。
+/// @author kongweiguang
 #[test]
 fn default_initialize_advertises_the_consumed_runtime_surface() {
     let params = default_initialize_params(&Limits::default());
@@ -35,10 +36,10 @@ fn default_initialize_advertises_the_consumed_runtime_surface() {
             "context/compacted",
             "context/compaction-failed",
             "workspace/dirty",
+            "workspace/metadata-changed",
             "turn/terminal",
             "turn/resync-required",
             "thread/metadata-changed",
-            "workspace/metadata-changed",
             "configuration/changed",
             "task/activity",
             "task/progress",
