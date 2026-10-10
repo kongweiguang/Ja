@@ -30,13 +30,15 @@ CI 前端完整测试固定为 1 个 Vitest worker，避免 jsdom 虚拟列表 t
 
 Rust 编译器、Clippy 与 rustfmt 由根 `rust-toolchain.toml` 固定为 1.98.0，保证本地与 CI 使用相同检查基线；不依赖开发机的全局默认版本，也不随 runner 镜像自动漂移。
 
-Windows Host 与 Shell 的环境白名单会转发宿主提供的绝对 `PSModuleAnalysisCachePath`。GitHub Windows 镜像预热此非敏感缓存来加速 cmdlet 发现；丢弃它会触发大型模块集合的重新分析。该项不允许配置、凭据或任意环境变量穿过 `env_clear` 边界。
+Host、App Server 与 Shell 完整继承宿主环境并加载用户 Shell Profile，包括宿主提供的 `PSModuleAnalysisCachePath`。GitHub Windows 镜像预热此缓存来加速 cmdlet 发现；不得为发布构建恢复环境白名单或丢弃用户 PATH、代理与临时目录。环境不投影给 React，也不写入普通日志。
 
 正式路径只接受 GitHub Secrets，不接受命令行参数、仓库文件或普通环境变量中的私钥：
 
 桌面更新签名：`TAURI_SIGNING_PRIVATE_KEY`，以及密钥设有密码时所需的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥必须与应用内置 updater 公钥匹配，不得为通过构建而临时替换。
 
-发布通过 `release.yml` 从指定的完整 SHA 手工触发。调用前先确认该 SHA 是当前 `main`，并且已有成功的 `native-app-server.yml` push run；任何提交漂移、未通过或缺失验证都会在签名前失败。签名 Native 矩阵通过后，汇总产物并生成 `latest.json`，从权威产品版本派生 `v<version>`，为该提交创建未公开的 GitHub draft Release。工作流不由 tag push 触发，不提前创建或移动发布 tag，也不会自动公开或覆盖同名 Release；公开时确认 tag 指向通过验收的提交。
+发布通过 `release.yml` 从指定的完整 SHA 手工触发。调用前先确认该 SHA 是当前 `main`，并且已有成功的 `native-app-server.yml` push run；任何提交漂移、未通过或缺失验证都会在签名前失败。签名 Native 矩阵通过后，汇总产物并生成 `latest.json`，从权威产品版本派生 `v<version>`，为该提交创建未公开的 GitHub draft Release。随后发布并安装验证同版本的 `@kongweiguang/ja` Windows x64 CLI 包，核对公开包与已验收候选的文件身份及实际原生运行行为；最后重新核对 GitHub 草稿的源码、更新清单和全部 SHA-256，自动公开并设为 Latest。工作流不由 tag push 触发，不提前创建或移动发布 tag，也不覆盖同名 Release；任何后续失败都保留草稿供诊断，不视为发布完成。
+
+npm 初次发布需 GitHub Secret `NPM_TOKEN`（具备包写入权限与 bypass 2FA 的 granular token）；后续可使用为调用工作流配置的 npm Trusted Publisher。预检会检查 npm 包存在性与初次发布凭据是否可用，但不打印凭据。npm 版本不可覆盖，公开上传后的重跑只允许核验与当前候选源码和文件身份一致的已有包。
 
 `package.json` 是产品版本的唯一来源。`pnpm version:sync` 和 `pnpm version:check` 同时覆盖 Cargo、Tauri、Maven 与协议 golden 中 `runtime/initialize` 响应的 `engineVersion`，不改写请求中的 `clientVersion` 示例。运行 JVM 桌面验收前还需重新打包并核对 JAR 内嵌版本，源码版本同步不会替换已有 JAR。
 

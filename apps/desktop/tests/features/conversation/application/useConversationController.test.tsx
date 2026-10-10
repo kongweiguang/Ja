@@ -4571,8 +4571,9 @@ describe("useConversationController", () => {
       nextCursor: null,
     };
     let resolveFork!: (result: ConversationThreadForkResult) => void;
-    const threadFork = vi.fn(
-      (_input: ConversationThreadForkInput) =>
+    /** 保留端口参数类型供调用断言使用，仅由测试控制迟到回执的结算时机。 */
+    const threadFork = vi.fn<NonNullable<ConversationHistoryPort["threadFork"]>>(
+      () =>
         new Promise<ConversationThreadForkResult>((resolve) => {
           resolveFork = resolve;
         }),

@@ -1190,11 +1190,7 @@ export function applySnapshot(
   }
   if (liveStream !== null) {
     const owner = snapshot.turns.find((turn) => turn.turnId === liveStream.turnId);
-    if (
-      owner === undefined ||
-      owner.origin === "inherited" ||
-      isTerminalState(owner.status)
-    )
+    if (owner === undefined || owner.origin === "inherited" || isTerminalState(owner.status))
       return outcome(state, "invalid");
   }
   if (

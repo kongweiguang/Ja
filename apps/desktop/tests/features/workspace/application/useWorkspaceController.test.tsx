@@ -4,7 +4,6 @@
 import { StrictMode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RuntimeHostError } from "@/api/tauri/runtime";
 import type {
   WorkspaceActivationRecord,
   WorkspaceHistoryPort,
@@ -14,8 +13,8 @@ import type { WorkspaceProjection } from "@/features/workspace/domain/workspace"
 import {
   WorkspaceProjectUpdateError,
   useWorkspaceController,
-  type WorkspaceRebindLease,
 } from "@/features/workspace/application/useWorkspaceController";
+import type { WorkspaceRebindLease } from "@/features/workspace";
 
 const SESSION_A: WorkspaceActivationRecord = {
   workspaceId: "ws_session_a",
@@ -50,6 +49,15 @@ const READY_RUNTIME_STATE = {
   generation: 1,
   serverInstanceId: "srv_1",
 };
+
+/** 测试只需模拟 application port 的错误投影，避免把工作区用例绑定到 Tauri 实现类。 @author kongweiguang */
+function workspacePortError(
+  code: string,
+  message: string,
+  retryable: boolean,
+): Error & { code: string; retryable: boolean } {
+  return Object.assign(new Error(message), { code, retryable });
+}
 
 /** workspace list 按 Java kind filter 模拟，避免测试掩盖 mixed page 的目录遗漏。 */
 function historyPort(): WorkspaceHistoryPort {
@@ -221,7 +229,7 @@ describe("useWorkspaceController", () => {
     history.workspaceRead = vi.fn(async () => missingRoot);
     history.workspaceOpen = vi.fn(async (input) => {
       if ("workspaceId" in input)
-        throw new RuntimeHostError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
+        throw workspacePortError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
       return missingRoot;
     });
     const { result, setRuntimeState } = renderWorkspaceController({ history });
@@ -283,7 +291,7 @@ describe("useWorkspaceController", () => {
       return missingRoot;
     });
     history.workspaceOpen = vi.fn(async () => {
-      throw new RuntimeHostError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
+      throw workspacePortError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
     });
     const beforeWorkspaceRebind = vi.fn(async () => undefined);
     const { result } = renderWorkspaceController({ history, beforeWorkspaceRebind });
@@ -320,7 +328,7 @@ describe("useWorkspaceController", () => {
     history.workspaceRead = vi.fn(async () => missingRoot);
     history.workspaceOpen = vi.fn(async (input) => {
       if ("workspaceId" in input)
-        throw new RuntimeHostError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
+        throw workspacePortError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
       return missingRoot;
     });
     const { result } = renderWorkspaceController({ history });
@@ -368,7 +376,7 @@ describe("useWorkspaceController", () => {
         return await new Promise<typeof missingRoot>((resolve) => {
           releaseOldOpen = resolve;
         });
-      throw new RuntimeHostError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
+      throw workspacePortError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
     });
     const { result, setRuntimeState } = renderWorkspaceController({ history });
     await waitFor(() => expect(result.current.projects).toHaveLength(1));
@@ -404,7 +412,7 @@ describe("useWorkspaceController", () => {
     history.workspaceRead = vi.fn(async () => persisted);
     history.workspaceOpen = vi.fn(async () => {
       if (persisted.root === "C:\\removed\\before")
-        throw new RuntimeHostError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
+        throw workspacePortError("WORKSPACE_NOT_FOUND", "项目目录不存在", false);
       return persisted;
     });
     const { result } = renderWorkspaceController({ history });
@@ -471,7 +479,7 @@ describe("useWorkspaceController", () => {
     history.workspaceList = vi.fn(async () => ({ items: [persisted], nextCursor: null }));
     history.workspaceRead = vi.fn(async () => persisted);
     history.workspaceUpdate = vi.fn(async (input) => {
-      if (input.cwd !== undefined) throw new RuntimeHostError("WORKSPACE_BUSY", busyMessage, true);
+      if (input.cwd !== undefined) throw workspacePortError("WORKSPACE_BUSY", busyMessage, true);
       persisted = {
         ...persisted,
         displayName: input.displayName ?? persisted.displayName,
@@ -1060,7 +1068,7 @@ describe("useWorkspaceController", () => {
         displayName: "另一个修改",
         revision: 2,
       };
-      throw new RuntimeHostError("CONFLICT", "revision changed", true);
+      throw workspacePortError("CONFLICT", "revision changed", true);
     });
     const lease: WorkspaceRebindLease = { commit: vi.fn(), release: vi.fn() };
     const beforeWorkspaceRebind = vi.fn(async () => lease);
@@ -1144,7 +1152,7 @@ describe("useWorkspaceController", () => {
     conflictHistory.workspaceList = vi.fn(async () => ({ items: [persisted], nextCursor: null }));
     conflictHistory.workspaceUpdate = vi.fn(async () => {
       persisted = { ...PROJECT, displayName: "其他人的修改", revision: 2 };
-      throw new RuntimeHostError("CONFLICT", "对话状态已变化，请刷新后重试", true);
+      throw workspacePortError("CONFLICT", "对话状态已变化，请刷新后重试", true);
     });
     const conflict = renderWorkspaceController({ history: conflictHistory });
     await waitFor(() => expect(conflict.result.current.projects).toHaveLength(1));
@@ -1162,7 +1170,7 @@ describe("useWorkspaceController", () => {
     conflict.unmount();
     const occupiedHistory = historyPort();
     occupiedHistory.workspaceUpdate = vi.fn(async () => {
-      throw new RuntimeHostError("CONFLICT", "对话状态已变化，请刷新后重试", true);
+      throw workspacePortError("CONFLICT", "对话状态已变化，请刷新后重试", true);
     });
     const occupied = renderWorkspaceController({ history: occupiedHistory });
     await waitFor(() => expect(occupied.result.current.projects).toHaveLength(1));

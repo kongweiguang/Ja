@@ -604,7 +604,12 @@ describe("ChatTimeline", () => {
 
   /** 流式正文必须留在工作过程；只有 terminal 才能把权威结果放入最终答复阅读位置。 */
   it("流式正文留在工作过程，并在 terminal 后显示最终答复", () => {
-    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "running" as const,
+    };
     const { rerender } = render(<ChatTimeline items={[]} turns={[runningTurn]} />);
 
     const response = screen.getByRole("article", { name: "回复状态" });
@@ -628,7 +633,7 @@ describe("ChatTimeline", () => {
               presentation: {
                 kind: "read",
                 title: "读取结果",
-            status: "waiting_approval",
+                status: "waiting_approval",
                 relativePaths: ["result.json"],
                 truncated: false,
               },
@@ -744,7 +749,12 @@ describe("ChatTimeline", () => {
 
   /** thread/read 会用持久 user item 替换 turn/start 的临时 item；同一 Turn 的 response 不能因此重建。 */
   it("保留 thread/read 替换用户条目后的 authoritative response 节点", () => {
-    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "running" as const,
+    };
     const { rerender } = render(
       <ChatTimeline
         items={[
@@ -813,7 +823,12 @@ describe("ChatTimeline", () => {
   /** 自动上下文压缩和普通 Tool 一样留在阅读顺序中，只有成功答复到位后才一并归档。 */
   it("keeps automatic context compaction in the reply reading flow before archiving", async () => {
     const user = userEvent.setup();
-    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "running" as const,
+    };
     const contextStep = baseItem({
       itemId: "item_compaction",
       kind: "tool_call",
@@ -979,7 +994,12 @@ describe("ChatTimeline", () => {
       reason: "运行测试",
       expiresAt: "2099-08-17T12:00:00+08:00",
     };
-    const waitingTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "waiting_approval" as const };
+    const waitingTurn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "waiting_approval" as const,
+    };
     const { rerender } = render(
       <ChatTimeline
         items={[]}
@@ -1087,7 +1107,9 @@ describe("ChatTimeline", () => {
     const { rerender } = render(
       <ChatTimeline
         items={[]}
-        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "waiting_input" }]}
+        turns={[
+          { origin: "native" as const, turnId, threadId: "thr_one", status: "waiting_input" },
+        ]}
       />,
     );
     expect(screen.getByRole("article", { name: "回复状态" })).toHaveTextContent("等待你的输入");
@@ -1118,7 +1140,10 @@ describe("ChatTimeline", () => {
   /** Terminal 状态只保留静态结论，失败绝不能继续伪装成最终答复。 */
   it("失败、取消和历史完成回复都不会保留活动动画标识", () => {
     const { rerender } = render(
-      <ChatTimeline items={[]} turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "failed" }]} />,
+      <ChatTimeline
+        items={[]}
+        turns={[{ origin: "native" as const, turnId, threadId: "thr_one", status: "failed" }]}
+      />,
     );
     const response = screen.getByRole("article", { name: "失败说明" });
     expect(response).toHaveAttribute("data-response-state", "failed");
@@ -1346,7 +1371,12 @@ describe("ChatTimeline", () => {
       status: "in_progress",
       metadata: { phase: "reasoning_summary" },
     });
-    const runningTurn = { origin: "native" as const, turnId, threadId: "thr_one", status: "running" as const };
+    const runningTurn = {
+      origin: "native" as const,
+      turnId,
+      threadId: "thr_one",
+      status: "running" as const,
+    };
     const { rerender } = render(<WorkProcess steps={[step]} turn={runningTurn} />);
     const trigger = screen.getByRole("button", { name: /工作过程/u });
     expect(trigger).toHaveAttribute("data-state", "open");
@@ -1521,7 +1551,12 @@ describe("ChatTimeline", () => {
 
   /** 无明细状态行不伪造可操作性，避免用户打开一个没有内容的 Disclosure。 */
   it("无明细时只显示状态，不提供空折叠操作或零步占位", () => {
-    render(<WorkProcess steps={[]} turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "queued" }} />);
+    render(
+      <WorkProcess
+        steps={[]}
+        turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "queued" }}
+      />,
+    );
 
     const region = screen.getByRole("region", { name: "工作过程" });
     expect(region.querySelector("button")).toBeNull();
@@ -1630,7 +1665,10 @@ describe("ChatTimeline", () => {
     expect(screen.queryByText("7.3秒")).not.toBeInTheDocument();
 
     rerender(
-      <WorkProcess steps={[step]} turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "completed" }} />,
+      <WorkProcess
+        steps={[step]}
+        turn={{ origin: "native" as const, turnId, threadId: "thr_one", status: "completed" }}
+      />,
     );
     expect(document.querySelector(".ja-work-process__duration")).toBeNull();
 
@@ -2096,7 +2134,13 @@ describe("ChatTimeline", () => {
     render(
       <ChatTimeline
         turns={[
-          { origin: "native" as const, turnId, threadId: "thr_one", status: "failed", error: { code, retryable: true } },
+          {
+            origin: "native" as const,
+            turnId,
+            threadId: "thr_one",
+            status: "failed",
+            error: { code, retryable: true },
+          },
         ]}
         items={[
           baseItem({ itemId: "item_terminal_failure", kind: "user_message", text: "原始问题" }),

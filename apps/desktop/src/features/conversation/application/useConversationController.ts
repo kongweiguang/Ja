@@ -564,8 +564,7 @@ export function useConversationController({
       .map((thread) => {
         const latestTurnId = state.threads[thread.threadId]?.latestTurnId;
         const latestTurn = latestTurnId === undefined ? undefined : state.turns[latestTurnId];
-        const status =
-          latestTurn?.origin !== "native" ? "none" : (latestTurn.status ?? "none");
+        const status = latestTurn?.origin !== "native" ? "none" : (latestTurn.status ?? "none");
         return `${thread.threadId}:${latestTurnId ?? "none"}:${status}`;
       })
       .join("|"),
@@ -1417,71 +1416,74 @@ export function useConversationController({
    * 尚未提交新 props 时在旧项目中创建 Thread。
    * @author kongweiguang
    */
-  const create = useCallback(async (options?: { workspaceId?: string }): Promise<void> => {
-    const targetWorkspaceId = options?.workspaceId;
-    const currentThreadId = currentThreadIdRef.current;
-    if (
-      targetWorkspaceId === undefined &&
-      currentThreadId !== undefined &&
-      isEmptyLoadedThread(currentThreadId)
-    )
-      return;
-    const pending = creationInFlightRef.current;
-    if (pending !== undefined) {
-      await pending;
-      return;
-    }
-    const selection = modelSelectionRef.current;
-    if (selection === undefined) {
-      setError("尚未选择可用模型，请先在设置中完成模型配置。");
-      return;
-    }
-    const operation = (async (): Promise<void> => {
-      if (targetWorkspaceId === undefined) {
-        await createWithSelection(selection);
+  const create = useCallback(
+    async (options?: { workspaceId?: string }): Promise<void> => {
+      const targetWorkspaceId = options?.workspaceId;
+      const currentThreadId = currentThreadIdRef.current;
+      if (
+        targetWorkspaceId === undefined &&
+        currentThreadId !== undefined &&
+        isEmptyLoadedThread(currentThreadId)
+      )
+        return;
+      const pending = creationInFlightRef.current;
+      if (pending !== undefined) {
+        await pending;
         return;
       }
-      const request = foregroundRequestRef.current + 1;
-      foregroundRequestRef.current = request;
-      manualWorkspaceTargetRef.current = targetWorkspaceId;
-      pendingWorkspaceActivationRef.current = targetWorkspaceId;
-      pendingWorkspaceActivationAdmissionRef.current = historyRuntimeAdmission;
-      setBusy(true);
-      setError(undefined);
-      let activationConfirmed = false;
-      try {
-        const selected = await activateWorkspace(targetWorkspaceId);
-        if (
-          selected === undefined ||
-          selected.workspaceId !== targetWorkspaceId ||
-          selected.kind !== "project" ||
-          !isCurrentRequest(request, targetWorkspaceId)
-        )
-          throw new Error("项目目录当前不可用，无法创建新对话。");
-        activationConfirmed = true;
-        await createWithSelection(selection, selected, targetWorkspaceId, request);
-      } catch (error) {
-        if (isCurrentRequest(request, targetWorkspaceId))
-          setError(error instanceof Error ? error.message : "新会话暂时无法创建，请重试。 ");
-      } finally {
-        if (foregroundRequestRef.current === request) {
-          manualWorkspaceTargetRef.current = undefined;
-          manualThreadTargetRef.current = undefined;
-          if (!activationConfirmed || workspaceRef.current?.workspaceId === targetWorkspaceId) {
-            pendingWorkspaceActivationRef.current = undefined;
-            pendingWorkspaceActivationAdmissionRef.current = undefined;
-          }
-          setBusy(false);
-        }
+      const selection = modelSelectionRef.current;
+      if (selection === undefined) {
+        setError("尚未选择可用模型，请先在设置中完成模型配置。");
+        return;
       }
-    })();
-    creationInFlightRef.current = operation;
-    try {
-      await operation;
-    } finally {
-      if (creationInFlightRef.current === operation) creationInFlightRef.current = undefined;
-    }
-  }, [activateWorkspace, createWithSelection, historyRuntimeAdmission, isCurrentRequest, setError]);
+      const operation = (async (): Promise<void> => {
+        if (targetWorkspaceId === undefined) {
+          await createWithSelection(selection);
+          return;
+        }
+        const request = foregroundRequestRef.current + 1;
+        foregroundRequestRef.current = request;
+        manualWorkspaceTargetRef.current = targetWorkspaceId;
+        pendingWorkspaceActivationRef.current = targetWorkspaceId;
+        pendingWorkspaceActivationAdmissionRef.current = historyRuntimeAdmission;
+        setBusy(true);
+        setError(undefined);
+        let activationConfirmed = false;
+        try {
+          const selected = await activateWorkspace(targetWorkspaceId);
+          if (
+            selected === undefined ||
+            selected.workspaceId !== targetWorkspaceId ||
+            selected.kind !== "project" ||
+            !isCurrentRequest(request, targetWorkspaceId)
+          )
+            throw new Error("项目目录当前不可用，无法创建新对话。");
+          activationConfirmed = true;
+          await createWithSelection(selection, selected, targetWorkspaceId, request);
+        } catch (error) {
+          if (isCurrentRequest(request, targetWorkspaceId))
+            setError(error instanceof Error ? error.message : "新会话暂时无法创建，请重试。 ");
+        } finally {
+          if (foregroundRequestRef.current === request) {
+            manualWorkspaceTargetRef.current = undefined;
+            manualThreadTargetRef.current = undefined;
+            if (!activationConfirmed || workspaceRef.current?.workspaceId === targetWorkspaceId) {
+              pendingWorkspaceActivationRef.current = undefined;
+              pendingWorkspaceActivationAdmissionRef.current = undefined;
+            }
+            setBusy(false);
+          }
+        }
+      })();
+      creationInFlightRef.current = operation;
+      try {
+        await operation;
+      } finally {
+        if (creationInFlightRef.current === operation) creationInFlightRef.current = undefined;
+      }
+    },
+    [activateWorkspace, createWithSelection, historyRuntimeAdmission, isCurrentRequest, setError],
+  );
 
   /** 快照无法接管目标 Thread 时，先释放其观察再清除当前身份，避免旧 Timeline 冒充可操作会话。 */
   const failCurrentThreadSelection = useCallback(
@@ -1817,7 +1819,9 @@ export function useConversationController({
         }, undefined);
         if (oldest === undefined) break;
         workspaceHistoryCacheRef.current.delete(oldest[0]);
-        useTimelineStore.getState().pruneInactiveThreads(oldest[1].threads.map((thread) => thread.threadId));
+        useTimelineStore
+          .getState()
+          .pruneInactiveThreads(oldest[1].threads.map((thread) => thread.threadId));
       }
 
       if (
@@ -1954,7 +1958,8 @@ export function useConversationController({
             historyRuntimeAdmissionRef.current === admission &&
             catalogScopeKey(workspaceRef.current) ===
               (sourceThread.workspaceKind === "session" ? "session" : sourceThread.workspaceId) &&
-            (currentThreadIdRef.current === sourceThreadId || currentThreadIdRef.current === undefined);
+            (currentThreadIdRef.current === sourceThreadId ||
+              currentThreadIdRef.current === undefined);
           if (targetOpenFailedForThisIntent) {
             if (currentThreadIdRef.current === undefined) {
               // select clears the old selection after a failed target read; restore the same source only while this

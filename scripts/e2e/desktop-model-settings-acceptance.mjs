@@ -428,9 +428,11 @@ async function readDesktopSnapshot(page) {
   });
 }
 
-/** 使用 App Server credential/set CAS 写入隔离占位密钥，避免验收 runner 伪造 auth.json。 @author kongweiguang */
+/** 使用 App Server credential/set CAS 写入隔离占位密钥，避免验收 runner 伪造 auth.json；退出异常延后报告，确保原始配置失败不会被 finally 清理覆盖。 @author kongweiguang */
 async function provisionFixtureCredential(java, jar, jaHome, directory) {
   const session = await startIndependentRpc(java, jar, jaHome, directory);
+  let operationError;
+  let operationFailed = false;
   try {
     const configuration = rpcResult(
       await session.request("configuration/read", {}),
@@ -449,11 +451,31 @@ async function provisionFixtureCredential(java, jar, jaHome, directory) {
       "configuration/read after fixture credential",
     );
     assert.equal(readback.credentials.cred_desktop_model_settings?.configured, true);
-    return true;
+  } catch (error) {
+    operationError = error;
+    operationFailed = true;
   } finally {
-    const stopped = await session.shutdown();
-    if (stopped.code !== 0) throw new Error("credential fixture App Server did not stop cleanly");
+    let cleanupError;
+    try {
+      const stopped = await session.shutdown();
+      if (stopped.code !== 0) cleanupError = new Error(`App Server exited with code ${String(stopped.code)}`);
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (cleanupError !== undefined) {
+      const cleanupMessage = `credential fixture App Server cleanup failed: ${String(cleanupError?.message ?? cleanupError).slice(0, 500)}`;
+      if (operationError instanceof Error) {
+        operationError.message = `${operationError.message}; ${cleanupMessage}`;
+      } else if (operationFailed) {
+        operationError = new Error(`${String(operationError)}; ${cleanupMessage}`, { cause: operationError });
+      } else {
+        operationError = new Error(cleanupMessage, { cause: cleanupError });
+        operationFailed = true;
+      }
+    }
   }
+  if (operationFailed) throw operationError;
+  return true;
 }
 
 /** 等待设置列表和 adapter 投影都收敛到同一版本，证明保存经过真实 React/IPC/App Server 链路。 @author kongweiguang */
@@ -618,9 +640,12 @@ function rpcResult(frame, operation) {
   return frame.result;
 }
 
-/** 使用另一条真实 JA-RPC 写入 Provider 与模型，再由现有桌面 Server/adapter 重新读取。 @author kongweiguang */
+/** 使用另一条真实 JA-RPC 写入 Provider 与模型，再由现有桌面 Server/adapter 重新读取；清理错误附加在原始读写错误后，避免 finally 改写失败原因。 @author kongweiguang */
 async function verifyIndependentRpcReadback(page, java, jar, jaHome, directory, evidenceDirectory) {
   const session = await startIndependentRpc(java, jar, jaHome, directory);
+  let operationError;
+  let operationFailed = false;
+  let acceptedSnapshot;
   try {
     let read = rpcResult(await session.request("configuration/read", {}), "configuration/read");
     const currentProvider = read.user.document.providers.find(
@@ -654,7 +679,7 @@ async function verifyIndependentRpcReadback(page, java, jar, jaHome, directory, 
       "RPC Updated Model Alias",
     );
 
-    const snapshot = await waitForDesktopSnapshot(
+    acceptedSnapshot = await waitForDesktopSnapshot(
       page,
       (value) => {
         const updated = value.providers.find((entry) => entry.providerId === providerId);
@@ -675,11 +700,31 @@ async function verifyIndependentRpcReadback(page, java, jar, jaHome, directory, 
       path: join(evidenceDirectory, "desktop-model-settings-after-independent-rpc.png"),
       animations: "disabled",
     });
-    return snapshot;
+  } catch (error) {
+    operationError = error;
+    operationFailed = true;
   } finally {
-    const stopped = await session.shutdown();
-    if (stopped.code !== 0) throw new Error("independent JA-RPC App Server did not stop cleanly");
+    let cleanupError;
+    try {
+      const stopped = await session.shutdown();
+      if (stopped.code !== 0) cleanupError = new Error(`App Server exited with code ${String(stopped.code)}`);
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (cleanupError !== undefined) {
+      const cleanupMessage = `independent JA-RPC App Server cleanup failed: ${String(cleanupError?.message ?? cleanupError).slice(0, 500)}`;
+      if (operationError instanceof Error) {
+        operationError.message = `${operationError.message}; ${cleanupMessage}`;
+      } else if (operationFailed) {
+        operationError = new Error(`${String(operationError)}; ${cleanupMessage}`, { cause: operationError });
+      } else {
+        operationError = new Error(cleanupMessage, { cause: cleanupError });
+        operationFailed = true;
+      }
+    }
   }
+  if (operationFailed) throw operationError;
+  return acceptedSnapshot;
 }
 
 /** 验证配置字段与未知 TOML 项在 UI sparse patch 后仍存在，隐藏 Provider 也不能被投影写回删除。 @author kongweiguang */

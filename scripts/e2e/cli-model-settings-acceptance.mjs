@@ -231,7 +231,7 @@ function rpcResult(frame, operation) {
   return frame.result;
 }
 
-/** 从桌面现行严格 provider 文档提取实体字段，确保三协议都使用配置合同中的默认值。 @author kongweiguang */
+/** 从桌面现行严格 provider 文档提取实体字段，确保三协议都使用配置合同中的默认值；复制字段时只剔除实体关系键，保留其余配置。 @author kongweiguang */
 function providerPatch(api, endpoint, suffix) {
   const providerId = `provider_model_settings_${suffix}`;
   const modelId = `model_model_settings_${suffix}`;
@@ -248,8 +248,11 @@ function providerPatch(api, endpoint, suffix) {
   });
   const provider = document.providers[0];
   const model = provider.models[0];
-  const { provider_id: _providerId, models: _models, ...providerFields } = provider;
-  const { model_id: _modelId, ...modelFields } = model;
+  const providerFields = { ...provider };
+  delete providerFields.provider_id;
+  delete providerFields.models;
+  const modelFields = { ...model };
+  delete modelFields.model_id;
   return {
     api,
     providerId,
@@ -274,7 +277,7 @@ function findProvider(configuration, providerId) {
 }
 
 /** 在隔离 TOML 中加入合法未知字段与被投影过滤的坏 Provider，验证稀疏写入不会抹掉原始数据。 @author kongweiguang */
-async function injectRawPreservationCases(home, providerId) {
+async function injectRawPreservationCases(home) {
   const path = join(home, "config.toml");
   let content = await readFile(path, "utf8");
   const firstProvider = content.indexOf("[[providers]]");
@@ -807,7 +810,7 @@ async function verifyConfiguredSetupRemainsEditable(
   }
 }
 
-/** 用隔离 JA_HOME 中已有凭据只改供应商名称，保存后返回 Shell；不打开或填写密钥字段。 @author kongweiguang */
+/** 用隔离 JA_HOME 中已有凭据只改供应商名称，保存后返回 Shell；不打开或填写密钥字段，并拒绝会破坏终端显示的 ASCII 控制字符。 @author kongweiguang */
 export async function verifyConfiguredProviderNameEdit(
   artifacts,
   directories,
@@ -822,10 +825,14 @@ export async function verifyConfiguredProviderNameEdit(
     ["expected provider name", expectedName],
     ["replacement provider name", newName],
   ]) {
+    const hasControlCharacter = typeof value === "string" && [...value].some((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f);
+    });
     if (
       typeof value !== "string" ||
       value.trim().length === 0 ||
-      /[\u0000-\u001f\u007f]/u.test(value)
+      hasControlCharacter
     ) {
       throw new Error(`${label} must be non-empty visible text`);
     }
@@ -1204,7 +1211,7 @@ async function cleanupIsolatedProfile(root) {
   await rm(target, { recursive: true, force: false, maxRetries: 5, retryDelay: 250 });
 }
 
-/** 运行本机模型闭环，只有 owner 与数据库 lease 结束才返回通过；失败保留隔离证据。 @author kongweiguang */
+/** 运行本机模型闭环，只有 owner 与数据库 lease 结束才返回通过；清理失败作为独立失败报告，操作失败时保留主错误并附清理诊断。 @author kongweiguang */
 export async function runAcceptance() {
   if (process.platform !== "win32")
     throw new Error("CLI model settings acceptance requires Windows");
@@ -1231,6 +1238,8 @@ export async function runAcceptance() {
   let conPtyHarness;
   let currentPhase = "artifact and isolated profile initialization";
   let acceptanceError;
+  let acceptanceResult;
+  let cleanupFailure;
   try {
     directories.leaseProbe = await compileDatabaseLeaseProbe(artifacts.javac, directories.root);
     fixture = await startProviderFixture();
@@ -1277,8 +1286,11 @@ export async function runAcceptance() {
         modelId: setupModel.model_id,
         credentialId: setupProvider.credential_id,
       };
-      const { provider_id: _providerId, models: _models, ...providerFields } = setupProvider;
-      const { model_id: _modelId, ...modelFields } = setupModel;
+      const providerFields = { ...setupProvider };
+      delete providerFields.provider_id;
+      delete providerFields.models;
+      const modelFields = { ...setupModel };
+      delete modelFields.model_id;
       entries[0].entity = {
         ...providerFields,
         models: { [setupModel.model_id]: modelFields },
@@ -1522,7 +1534,7 @@ export async function runAcceptance() {
     }
 
     currentPhase = "sparse configuration patch preserves unknown and malformed raw TOML";
-    const configPath = await injectRawPreservationCases(directories.home, first.providerId);
+    const configPath = await injectRawPreservationCases(directories.home);
     configuration = rpcResult(
       await session.request("configuration/read", {}),
       "configuration/read after raw preservation fixture",
@@ -1804,7 +1816,7 @@ export async function runAcceptance() {
 
     cliDaemonMayRun = true;
     const dialogueProtocolsCompleted = [];
-    for (const [index, selectedModel] of entries.entries()) {
+    for (const selectedModel of entries) {
       currentPhase = `ja exec ${selectedModel.api} model ${selectedModel.modelId}`;
       const observationsBeforeTurn = fixture.observations.length;
       const cli = await runCli(
@@ -1863,7 +1875,7 @@ export async function runAcceptance() {
       dialogueProtocolsCompleted.push(selectedModel.api);
     }
 
-    return {
+    acceptanceResult = {
       finalAppServerShutdown: finalShutdownEvidence,
       configurationPatch: true,
       credentialCasRecovery: true,
@@ -1893,7 +1905,6 @@ export async function runAcceptance() {
     }
     throw acceptanceError;
   } finally {
-    let cleanupFailure;
     if (session !== undefined) {
       try {
         await session.forceClose();
@@ -1950,11 +1961,13 @@ export async function runAcceptance() {
     if (cleanupFailure !== undefined) {
       if (acceptanceError === undefined) {
         cleanupFailure.message = `${cleanupFailure.message}; isolated diagnostics retained at ${directories.root}`;
-        throw cleanupFailure;
+      } else {
+        acceptanceError.message = `${acceptanceError.message}; cleanup also failed: ${cleanupFailure.message}`;
       }
-      acceptanceError.message = `${acceptanceError.message}; cleanup also failed: ${cleanupFailure.message}`;
     }
   }
+  if (cleanupFailure !== undefined && acceptanceError === undefined) throw cleanupFailure;
+  return acceptanceResult;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

@@ -23,7 +23,6 @@ import {
 } from "./cli-usage-conpty.mjs";
 import {
   initializeParams,
-  providerConfigurationDocument,
   readCompleteItemContent,
 } from "./real-provider-smoke.mjs";
 import { providerStream } from "./media-schema-loopback.mjs";

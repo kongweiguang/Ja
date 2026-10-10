@@ -27,5 +27,5 @@ mod transcript;
 #[path = "../../src/ui/usage.rs"]
 mod usage;
 
-#[path = "../support/transcript_cases.rs"]
+#[path = "transcript_cases.rs"]
 mod cases;

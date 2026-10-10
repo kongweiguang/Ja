@@ -89,7 +89,8 @@ export function createRuntimeHostPort(
     acknowledgeRecovery: (confirmation) => adapter.acknowledgeRecovery(confirmation),
     pendingOperations: () => adapter.pendingOperations(),
     recheckPendingOperations: () => adapter.recheckPendingOperations(),
-    acknowledgePendingOperation: (operationKey) => adapter.acknowledgePendingOperation(operationKey),
+    acknowledgePendingOperation: (operationKey) =>
+      adapter.acknowledgePendingOperation(operationKey),
     subscribePendingOperations: (listener) => adapter.subscribePendingOperations(listener),
     approvalRespond: (input) => adapter.approvalRespond(input),
     turnStart: (input) => adapter.turnStart(input),

@@ -5,8 +5,10 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import { z } from "zod";
 import { normalizePreviewUrl, normalizePreviewWebUrl } from "@/shared/validation/previewUrl";
-import type { PreviewMode } from "@/features/workbench/preview/domain/previewModel";
 import { invokeNativeCommand } from "./nativeInvoke";
+
+const PreviewModeSchema = z.enum(["editor", "browser"]);
+type PreviewMode = z.infer<typeof PreviewModeSchema>;
 
 /** 封闭 command/event surface，防止 Preview 页面选择任意 Tauri capability。 */
 export const JA_PREVIEW_COMMANDS = {
@@ -347,7 +349,7 @@ export class TauriPreviewAdapter {
           workspaceId: z.string().min(1).max(128).optional(),
           line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
           column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
-          previewMode: z.enum(["editor", "browser"]).default("editor"),
+          previewMode: PreviewModeSchema.default("editor"),
         })
         .strict(),
       { target, workspaceId, line, column, previewMode },
@@ -383,7 +385,7 @@ export class TauriPreviewAdapter {
           target: z.string().trim().min(1).max(4_096),
           workspaceId: z.string().min(1).max(128).optional(),
           viewport: PreviewViewportSchema,
-          previewMode: z.enum(["editor", "browser"]).default("browser"),
+          previewMode: PreviewModeSchema.default("browser"),
         })
         .strict(),
       { target, workspaceId, viewport, previewMode },
@@ -424,7 +426,7 @@ export class TauriPreviewAdapter {
           generation: GenerationSchema,
           target: z.string().trim().min(1).max(4_096),
           workspaceId: z.string().min(1).max(128).optional(),
-          previewMode: z.enum(["editor", "browser"]).default("browser"),
+          previewMode: PreviewModeSchema.default("browser"),
         })
         .strict(),
       { sessionId, generation, target, workspaceId, previewMode },

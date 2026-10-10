@@ -85,10 +85,10 @@ function javaLimitValue(expression) {
   return value;
 }
 
-/** 用同一份 Java 握手源构造 v2 initialize 请求；这只同步协议字段，不复制或放宽资源限制。 @author kongweiguang */
+/** 用同一份 Java 握手源构造 v2 initialize 请求；这只同步协议字段，不复制或放宽资源限制，缩进匹配也保持对源码边界的精确约束。 @author kongweiguang */
 export async function fullscreenInitializeParams() {
   const source = await readFile(handshakeSourcePath, "utf8");
-  const limitsMethod = source.match(/public static ObjectNode limits\([\s\S]*?\n    \}/u)?.[0];
+  const limitsMethod = source.match(/public static ObjectNode limits\([\s\S]*?\n {4}\}/u)?.[0];
   assert.ok(limitsMethod, "HandshakeHandler is missing its limits source");
   const limits = Object.fromEntries(
     [...limitsMethod.matchAll(/\.put\("([^"]+)",\s*([0-9_][0-9_\s*]*)\)/gu)]
@@ -689,7 +689,7 @@ function assertBottomLayout(cli, columns, rows, label) {
   return { composerRow, footerRow };
 }
 
-/** 在实际父 PowerShell 的同一 ConPTY 内退出 Ja 后再执行中文/普通命令，验证终端输入已交还 Shell。 @author kongweiguang */
+/** 在实际父 PowerShell 的同一 ConPTY 内退出 Ja 后再执行中文/普通命令，验证终端输入已交还 Shell；用字符串匹配核对必须完整出现的原始 VT 模式序列。 @author kongweiguang */
 async function verifyParentPowerShellRecovery(artifacts, directories, harness, threadId, completedText, runRoot) {
   const exitMarker = "JA_PARENT_SHELL_AFTER_CLI";
   const inputMarker = "JA_PARENT_SHELL_INPUT_ACCEPTED";
@@ -715,10 +715,10 @@ async function verifyParentPowerShellRecovery(artifacts, directories, harness, t
     "parent PowerShell prompt after Ja exits",
     );
     const vt = await readFile(join(runRoot, "parent-powershell.vt"), "utf8");
-    assert.ok(/\u001b\[\?1049l/u.test(vt), "Ja exits the alternate screen back into its parent PowerShell");
-    assert.ok(/\u001b\[\?2004l/u.test(vt), "Ja disables bracketed paste before returning to PowerShell");
-    assert.ok(/\u001b\[\?1003;1006l/u.test(vt), "Ja disables mouse reporting before returning to PowerShell");
-    assert.ok(/\u001b\[\?25h/u.test(vt), "Ja restores a visible cursor before returning to PowerShell");
+    assert.ok(vt.includes("\u001b[?1049l"), "Ja exits the alternate screen back into its parent PowerShell");
+    assert.ok(vt.includes("\u001b[?2004l"), "Ja disables bracketed paste before returning to PowerShell");
+    assert.ok(vt.includes("\u001b[?1003;1006l"), "Ja disables mouse reporting before returning to PowerShell");
+    assert.ok(vt.includes("\u001b[?25h"), "Ja restores a visible cursor before returning to PowerShell");
     const chineseShellText = "Ja 退出后 PowerShell 输入正常 ✅";
     shell.sendKeys(`Write-Output '${chineseShellText}'; Write-Output '${inputMarker}'\r`);
     const acceptedInput = await shell.waitForScreen((visible) => visible.includes(inputMarker), "PowerShell accepts a command after Ja exits");
@@ -750,7 +750,7 @@ async function verifyParentPowerShellRecovery(artifacts, directories, harness, t
   }
 }
 
-/** 在唯一 ConPTY 会话中验证终端模式、固定 dock、滚动状态、流式增长、缩放和正常退出恢复。 @author kongweiguang */
+/** 在唯一 ConPTY 会话中验证终端模式、固定 dock、滚动状态、流式增长、缩放和正常退出恢复；原始 VT 文件中的模式序列按完整字面量核对。 @author kongweiguang */
 async function runAcceptance() {
   const isolated = await createRunDirectories();
   const resolvedArtifacts = await resolveArtifacts();
@@ -825,9 +825,9 @@ async function runAcceptance() {
     await cli.pullVt();
     assert.equal(cli.screen.alternate, true, "Ja owns the alternate screen while interactive");
     let rawVt = await (await import("node:fs/promises")).readFile(vtLog, "utf8");
-    assert.ok(/\u001b\[\?1049h/u.test(rawVt), "alternate screen is entered");
-    assert.ok(/\u001b\[\?2004h/u.test(rawVt), "bracketed paste is enabled");
-    assert.ok(/\u001b\[\?1003;1006h/u.test(rawVt), "SGR mouse reporting is enabled");
+    assert.ok(rawVt.includes("\u001b[?1049h"), "alternate screen is entered");
+    assert.ok(rawVt.includes("\u001b[?2004h"), "bracketed paste is enabled");
+    assert.ok(rawVt.includes("\u001b[?1003;1006h"), "SGR mouse reporting is enabled");
     evidence.checks.terminalEntry = { alternateScreen: true, bracketedPaste: true, sgrMouse: true, rawMode: "input behavior verified through ConPTY" };
 
     cli.sendKeys(draftText);
@@ -1006,10 +1006,10 @@ async function runAcceptance() {
     cli = undefined;
     assert.equal(exit.forced, false, "CLI exits through its normal terminal path");
     const exitLog = await (await import("node:fs/promises")).readFile(vtLog, "utf8");
-    assert.ok(/\u001b\[\?1049l/u.test(exitLog), "normal exit restores the primary screen");
-    assert.ok(/\u001b\[\?2004l/u.test(exitLog), "normal exit disables bracketed paste");
-    assert.ok(/\u001b\[\?1003;1006l/u.test(exitLog), "normal exit disables SGR mouse reporting");
-    assert.ok(/\u001b\[\?25h/u.test(exitLog), "normal exit makes the terminal cursor visible");
+    assert.ok(exitLog.includes("\u001b[?1049l"), "normal exit restores the primary screen");
+    assert.ok(exitLog.includes("\u001b[?2004l"), "normal exit disables bracketed paste");
+    assert.ok(exitLog.includes("\u001b[?1003;1006l"), "normal exit disables SGR mouse reporting");
+    assert.ok(exitLog.includes("\u001b[?25h"), "normal exit makes the terminal cursor visible");
     assert.equal(provider.requestCount, provider.responseCount, "every local Provider request reaches a complete SSE response");
     evidence.checks.terminalExit = { forced: false, alternateScreenRestored: true, bracketedPasteDisabled: true, mouseDisabled: true };
     evidence.checks.parentPowerShellRecovery = await verifyParentPowerShellRecovery(

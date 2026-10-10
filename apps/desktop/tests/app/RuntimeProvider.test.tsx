@@ -333,7 +333,9 @@ describe("RuntimeProvider v1 lifecycle", () => {
         <WorkspaceMetadataProbe />
       </RuntimeProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("workspace-metadata-event")).toHaveTextContent("none"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-metadata-event")).toHaveTextContent("none"),
+    );
 
     act(() => {
       fake.emit({

@@ -275,8 +275,14 @@ describe("ThreadWorkbenchSessions", () => {
       expectedFocus: null,
       allowedRestoreFocus: null,
     };
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushA }));
-    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushB }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", { flushForWorkspaceChange: flushA }),
+    );
+    mocks.filesByThread.set(
+      "thread-b",
+      filesLifecycle("workspace-1", { flushForWorkspaceChange: flushB }),
+    );
     const parentClose = vi.fn(() => focusCapture);
     const notified = vi.fn();
     const view = render(
@@ -319,8 +325,18 @@ describe("ThreadWorkbenchSessions", () => {
   it("聚合 Files flush 失败时释放其它会话已取得的 lease", async () => {
     const releaseA = vi.fn();
     const flushFailure = new Error("thread-b save failed");
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })) }));
-    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => Promise.reject(flushFailure)) }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", {
+        flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })),
+      }),
+    );
+    mocks.filesByThread.set(
+      "thread-b",
+      filesLifecycle("workspace-1", {
+        flushForWorkspaceChange: vi.fn(async () => Promise.reject(flushFailure)),
+      }),
+    );
     const registerFiles = vi.fn();
     const view = render(
       <ThreadWorkbenchSessions
@@ -379,7 +395,10 @@ describe("ThreadWorkbenchSessions", () => {
 
   it("后台 A 的迟到 Files flush 只调用 A 缓存的完成通知", async () => {
     const pending = deferred<{ release: () => void }>();
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(() => pending.promise) }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(() => pending.promise) }),
+    );
     const notifyA = vi.fn();
     const notifyB = vi.fn();
     const view = render(
@@ -542,9 +561,7 @@ describe("ThreadWorkbenchSessions", () => {
     const registerRebind = vi.fn();
     const propsFor = (threadId: string, workspaceId: string) =>
       makeProps(threadId, {
-        workspace: { workspaceId } as ComponentProps<
-          typeof ThreadWorkbenchSessions
-        >["workspace"],
+        workspace: { workspaceId } as ComponentProps<typeof ThreadWorkbenchSessions>["workspace"],
         onRegisterRebindLifecycle: registerRebind,
       });
     const view = render(<ThreadWorkbenchSessions {...propsFor("thread-a", "workspace-1")} />);
@@ -612,7 +629,10 @@ describe("ThreadWorkbenchSessions", () => {
     const closePreview = vi.fn(async () => {
       order.push("preview-close");
     });
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }),
+    );
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,
@@ -672,7 +692,10 @@ describe("ThreadWorkbenchSessions", () => {
     const flushFiles = vi.fn(async () => ({ release: vi.fn() }));
     const closeTerminal = vi.fn(async () => undefined);
     const closePreview = vi.fn(async () => undefined);
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", { flushForWorkspaceChange: flushFiles }),
+    );
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,
@@ -703,8 +726,18 @@ describe("ThreadWorkbenchSessions", () => {
     const releaseA = vi.fn();
     const closeTerminal = vi.fn(async () => undefined);
     const closePreview = vi.fn(async () => undefined);
-    mocks.filesByThread.set("thread-a", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })) }));
-    mocks.filesByThread.set("thread-b", filesLifecycle("workspace-1", { flushForWorkspaceChange: vi.fn(async () => Promise.reject(new Error("save failed"))) }));
+    mocks.filesByThread.set(
+      "thread-a",
+      filesLifecycle("workspace-1", {
+        flushForWorkspaceChange: vi.fn(async () => ({ release: releaseA })),
+      }),
+    );
+    mocks.filesByThread.set(
+      "thread-b",
+      filesLifecycle("workspace-1", {
+        flushForWorkspaceChange: vi.fn(async () => Promise.reject(new Error("save failed"))),
+      }),
+    );
     mocks.terminalByThread.set("thread-a", {
       workspaceId: "workspace-1",
       closeForWorkspaceChange: closeTerminal,

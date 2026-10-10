@@ -7,7 +7,6 @@ export {
 } from "./application/useWorkspaceController";
 export type {
   WorkspaceController,
-  WorkspaceDirectoryState,
   WorkspacePickerPort,
   WorkspaceRebindLease,
 } from "./application/useWorkspaceController";

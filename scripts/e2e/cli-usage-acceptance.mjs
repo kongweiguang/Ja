@@ -189,7 +189,7 @@ async function closeUsageFixtureSession(session, stage, ready, operationFailed) 
   return evidence;
 }
 
-/** 用 Java 25 和随机 Unicode profile 创建可信 Thread；其 App Server 必须完成可核实的正常关闭。 @author kongweiguang */
+/** 用 Java 25 和随机 Unicode profile 创建可信 Thread；准备失败保留为主错误并附上清理证据，无准备失败时才报告真实关闭错误。 @author kongweiguang */
 async function seedThread(artifacts, directories, endpoint) {
   const session = new JsonlSession({
     command: artifacts.java,
@@ -201,6 +201,7 @@ async function seedThread(artifacts, directories, endpoint) {
   let ready = false;
   let result;
   let operationError;
+  let cleanupError;
   try {
     const initialized = rpcResult(
       await session.request("runtime/initialize", initializeParams()),
@@ -271,10 +272,8 @@ async function seedThread(artifacts, directories, endpoint) {
     );
     assert.match(created.threadId, /^thr_[A-Za-z0-9_.-]+$/u);
     result = { threadId: created.threadId, workspaceId: opened.workspaceId };
-    return result;
   } catch (error) {
     operationError = error;
-    throw error;
   } finally {
     try {
       const lifecycle = await closeUsageFixtureSession(session, "seed-thread", ready, operationError !== undefined);
@@ -282,9 +281,12 @@ async function seedThread(artifacts, directories, endpoint) {
       if (operationError) operationError.appServerSession = lifecycle;
     } catch (error) {
       if (operationError) operationError.appServerSession = error.sessionLifecycle ?? { cleanupErrorType: error.name };
-      else throw error;
+      else cleanupError = error;
     }
   }
+  if (operationError !== undefined) throw operationError;
+  if (cleanupError !== undefined) throw cleanupError;
+  return result;
 }
 
 /** 仅对 OpenAI Responses loopback 请求回送固定账本事实，并在发送前设置可控 gate。 @author kongweiguang */
@@ -709,7 +711,7 @@ async function waitForTerminalConsoleState(window, label, requiredState, timeout
   throw new Error(`isolated CLI native buffer did not reach ${requiredState.join("+")} within ${timeoutMs}ms; safe readiness facts: ${readinessPath}`);
 }
 
-/** 仅在 CLI launcher 已报告退出后读取 stderr；诊断只保留 Ja 行的脱敏摘要，原始文件随即删除以免证据目录携带用户或凭据内容。 @author kongweiguang */
+/** 仅在 CLI launcher 已报告退出后读取 stderr；ANSI CSI 的 ESC 字节动态构造正则，诊断保留脱敏 Ja 摘要后删除原文件以免携带正文或凭据。 @author kongweiguang */
 async function preserveSafeCliDiagnostic(window) {
   if (!window?.finished || !window.cliStderr) return undefined;
   try {
@@ -736,7 +738,7 @@ async function preserveSafeCliDiagnostic(window) {
     if (error?.code !== "ENOENT") stderrReadErrorType = error instanceof Error ? error.name : "UnknownError";
   }
   const jaLine = stderr
-    .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replaceAll(new RegExp(`${String.fromCharCode(0x1b)}\\[[0-?]*[ -/]*[@-~]`, "gu"), "")
     .split(/\r?\n/u)
     .map((line) => line.trim())
     .filter((line) => /^Ja:\s*/u.test(line))
@@ -3148,7 +3150,7 @@ export async function runCliUsageExitRecoveryAcceptance() {
     const consoleDiagnostic = JSON.parse(await waitForFile(terminal.diagnostic, "empty-thread console diagnostic", 20_000));
     const initialWindow = await waitForTerminalWindow(terminalHelper, terminal);
     const emptyComposerBuffer = await waitForNativeConsoleComposer(terminalHelper, terminal);
-    const { visibleRows, cursorPosition, cursorRow } = emptyComposerBuffer;
+    const { cursorPosition, cursorRow } = emptyComposerBuffer;
     assert.ok(cursorRow, "native console snapshot must show an empty composer row before Ctrl+D");
     assert.ok(cursorPosition.x <= 3, "empty composer cursor must remain before any draft text");
     emptyComposerVerified = true;

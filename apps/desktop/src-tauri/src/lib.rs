@@ -616,7 +616,19 @@ pub fn run() {
         let workspace_events = crate::app_runtime::WorkspaceMetadataEventRouter::default();
         let event_router = workspace_events.clone();
         let sink: EventSink = Arc::new(move |payload| {
-            event_router.observe(&payload);
+            // JA-RPC 字段名只在 interface 解码；application router 接收冻结后的身份字段。
+            if let Some(event) =
+                crate::app_runtime::interface::event_projection::workspace_metadata_changed_event(
+                    &payload,
+                )
+            {
+                event_router.observe(
+                    &event.server_instance_id,
+                    &event.workspace_id,
+                    event.revision,
+                    event.generation,
+                );
+            }
             app_handle
                 .emit(RPC_FRAME_EVENT, payload)
                 .map_err(|_| EventEmitError::DeliveryFailed)

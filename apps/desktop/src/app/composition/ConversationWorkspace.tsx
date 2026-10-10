@@ -215,27 +215,24 @@ export function ConversationWorkspace({
   const threadId = conversation.currentThreadId ?? "";
   const noticeScope = `${workspace.workspace?.workspaceId ?? ""}:${threadId}`;
   const workspaceNoticeScope = `${workspace.workspace?.workspaceId ?? ""}:directory-unavailable`;
-  const [unavailableNoticeWorkspaceId, setUnavailableNoticeWorkspaceId] =
-    useState<string | undefined>(undefined);
+  const [unavailableNoticeWorkspaceId, setUnavailableNoticeWorkspaceId] = useState<
+    string | undefined
+  >(undefined);
   const currentWorkspaceId = workspace.workspace?.workspaceId;
   const projectWorkspaceId =
     workspace.workspace?.kind === "project" ? workspace.workspace.workspaceId : undefined;
-  /** 重新检查沿用原提示 owner，让快速失败更新同一 toast 并保留既有退出动画。 @author kongweiguang */
-  useEffect(() => {
-    if (projectWorkspaceId !== undefined && workspace.directoryState === "unavailable") {
-      setUnavailableNoticeWorkspaceId(projectWorkspaceId);
-    } else if (
-      workspace.directoryState === "available" ||
-      currentWorkspaceId !== unavailableNoticeWorkspaceId
-    ) {
-      setUnavailableNoticeWorkspaceId(undefined);
-    }
-  }, [
-    currentWorkspaceId,
-    projectWorkspaceId,
-    unavailableNoticeWorkspaceId,
-    workspace.directoryState,
-  ]);
+  // checking 保留上一不可用 owner；受控 props 改变时在当前组件内同步重算，
+  // 避免 effect 提交一帧旧提示后再更新，也保留原 toast 的重试与退出动画。
+  const nextUnavailableNoticeWorkspaceId =
+    projectWorkspaceId !== undefined && workspace.directoryState === "unavailable"
+      ? projectWorkspaceId
+      : workspace.directoryState === "available" ||
+          currentWorkspaceId !== unavailableNoticeWorkspaceId
+        ? undefined
+        : unavailableNoticeWorkspaceId;
+  if (nextUnavailableNoticeWorkspaceId !== unavailableNoticeWorkspaceId) {
+    setUnavailableNoticeWorkspaceId(nextUnavailableNoticeWorkspaceId);
+  }
   const showUnavailableNotice =
     workspace.workspace?.kind === "project" &&
     (workspace.directoryState === "unavailable" ||
@@ -680,15 +677,16 @@ export function ConversationWorkspace({
     return () => onConversationFocusAvailabilityChange(false);
   }, [active, interaction.disabled, onConversationFocusAvailabilityChange]);
 
-  /** 打开新 Thread 后聚焦目标 Composer；若首次打开失败则控制器恢复来源，再聚焦以保住原草稿操作路径。 @author kongweiguang */
+  const forkConversationReply = conversation.forkReply;
+  /** 打开新 Thread 后聚焦目标 Composer；依赖稳定用例函数，保留来源草稿而不订阅整个控制器对象。 @author kongweiguang */
   const forkReply = useCallback(
     async (anchor: { threadId: string; itemId: string }) => {
-      const outcome = await conversation.forkReply(anchor);
+      const outcome = await forkConversationReply(anchor);
       if (outcome === "opened" || outcome === "open_failed")
         setComposerFocusRequest((value) => value + 1);
       return outcome;
     },
-    [conversation.forkReply],
+    [forkConversationReply],
   );
 
   // 空 Thread 与有内容 Thread 共用同一受控 Composer，视觉 dock 迁移不会丢失 Thread draft。

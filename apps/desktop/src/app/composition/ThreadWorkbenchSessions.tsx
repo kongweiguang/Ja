@@ -10,8 +10,12 @@ import {
   type ReactElement,
 } from "react";
 import { toast } from "sonner";
-import type { FilesWorkspaceCloseLease, FilesWorkspaceLifecycle } from "@/features/workbench/files";
-import type { FilesUnsavedDocumentSummary } from "@/features/workbench/files/application/types";
+import type {
+  FilesUnsavedDocumentSummary,
+  FilesWorkspaceCloseLease,
+  FilesWorkspaceLifecycle,
+  FilesWorkspaceRebindLease,
+} from "@/features/workbench/files";
 import type { PreviewWorkspaceLifecycle } from "../useJaWorkbench";
 import { createThreadWorkbenchAdapters } from "../application/threadWorkbenchAdapters";
 import type { TerminalWorkspaceLifecycle } from "../application/workbenchLifecyclePorts";
@@ -52,7 +56,7 @@ export interface RetainedWorkspaceRebindLifecycle {
   prepareWorkspaceRebind(
     workspaceId: string,
     disposition: "save" | "discard",
-  ): Promise<{ commit(): void; release(): void }>;
+  ): Promise<FilesWorkspaceRebindLease>;
 }
 
 interface ThreadLifecycleRegistry {

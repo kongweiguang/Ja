@@ -144,8 +144,9 @@ describe("shared notifications", () => {
 
     await screen.findByText("项目目录不可用");
     await waitFor(() => {
-      const activeToasts = Array.from(document.querySelectorAll<HTMLElement>("[data-sonner-toast]"))
-        .filter((toast) => toast.dataset["removed"] === "false");
+      const activeToasts = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-sonner-toast]"),
+      ).filter((toast) => toast.dataset["removed"] === "false");
       expect(activeToasts).toHaveLength(1);
       expect(activeToasts[0]?.getAttribute("data-sonner-toast")).toBe(originalId);
     });

@@ -577,6 +577,23 @@ fn workspace_metadata_event(revision: u64) -> serde_json::Value {
     })
 }
 
+/// 测试沿生产 interface 解码后再调用 application，固定协议 JSON 不越过边界进入 router。
+fn observe_workspace_metadata_event(
+    router: &crate::app_runtime::WorkspaceMetadataEventRouter,
+    revision: u64,
+) {
+    let event = crate::app_runtime::interface::event_projection::workspace_metadata_changed_event(
+        &workspace_metadata_event(revision),
+    )
+    .expect("metadata event has the required typed fields");
+    router.observe(
+        &event.server_instance_id,
+        &event.workspace_id,
+        event.revision,
+        event.generation,
+    );
+}
+
 /// 通过 Host 可观察的激活结果与 handle 身份验证授信保留 Workspace，不穿透私有 binding。
 #[test]
 fn workspace_trust_refresh_preserves_active_binding() {
@@ -623,7 +640,7 @@ fn workspace_metadata_name_change_preserves_active_handle() {
         .expect("configured workspace handle");
     *bridge.metadata_name.lock().expect("metadata name lock") = "Renamed project".to_owned();
     bridge.metadata_revision.store(2, Ordering::Release);
-    router.observe(&workspace_metadata_event(2));
+    observe_workspace_metadata_event(&router, 2);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -807,7 +824,7 @@ fn workspace_metadata_root_change_revokes_old_handle() {
     *bridge.metadata_root.lock().expect("metadata root lock") =
         std::fs::canonicalize(&new_root).expect("canonicalize replacement root");
     bridge.metadata_revision.store(2, Ordering::Release);
-    router.observe(&workspace_metadata_event(2));
+    observe_workspace_metadata_event(&router, 2);
 
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {

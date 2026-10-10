@@ -119,7 +119,7 @@ function withSessionDiagnostic(error, session, endpoint) {
   return new Error(`${message}\nApp Server stderr (redacted by JsonlSession):\n${stderr}`, { cause: original });
 }
 
-/** 在 loopback Provider ready 后初始化隔离 Thread，并等待 seed owner 正常退出后才让 CLI 复用 SQLite；忽略 shutdown 会把未释放的存储误诊为恢复失败。 @author kongweiguang */
+/** 在 loopback Provider ready 后初始化隔离 Thread，并等待 seed owner 正常退出后才让 CLI 复用 SQLite；把关闭诊断附加到主错误，避免清理异常掩盖准备失败。 @author kongweiguang */
 export async function seedThread(artifacts, directories, endpoint) {
   const session = new JsonlSession({
     command: artifacts.java,
@@ -131,6 +131,7 @@ export async function seedThread(artifacts, directories, endpoint) {
   let ready = false;
   let primaryFailure;
   let seededThread;
+  let cleanupFailure;
   try {
     const initialized = rpcResult(
       await session.request("runtime/initialize", initializeParams()),
@@ -202,10 +203,8 @@ export async function seedThread(artifacts, directories, endpoint) {
     );
     assert.match(thread.threadId, /^thr_[A-Za-z0-9_.-]+$/u);
     seededThread = { threadId: thread.threadId, workspaceId: workspace.workspaceId, seedAppServerExitCode: null };
-    return seededThread;
   } catch (error) {
     primaryFailure = withSessionDiagnostic(error, session, endpoint);
-    throw primaryFailure;
   } finally {
     if (ready) {
       try {
@@ -214,16 +213,35 @@ export async function seedThread(artifacts, directories, endpoint) {
         if (seededThread) seededThread.seedAppServerExitCode = result.code;
       } catch (error) {
         const shutdownFailure = withSessionDiagnostic(error, session, endpoint);
-        await session.forceClose();
+        try {
+          await session.forceClose();
+        } catch (forceCloseError) {
+          const forceCloseFailure = withSessionDiagnostic(forceCloseError, session, endpoint);
+          shutdownFailure.message = `${shutdownFailure.message}\nSeed App Server force close failed: ${forceCloseFailure.message}`;
+        }
         if (primaryFailure) {
           primaryFailure.message = `${primaryFailure.message}\nSeed App Server shutdown failed: ${shutdownFailure.message}`;
         } else {
-          throw shutdownFailure;
+          cleanupFailure = shutdownFailure;
         }
       }
     }
-    await session.forceClose();
+    try {
+      await session.forceClose();
+    } catch (error) {
+      const forceCloseFailure = withSessionDiagnostic(error, session, endpoint);
+      if (primaryFailure) {
+        primaryFailure.message = `${primaryFailure.message}\nSeed App Server force close failed: ${forceCloseFailure.message}`;
+      } else if (cleanupFailure) {
+        cleanupFailure.message = `${cleanupFailure.message}\nSeed App Server force close failed: ${forceCloseFailure.message}`;
+      } else {
+        cleanupFailure = forceCloseFailure;
+      }
+    }
   }
+  if (primaryFailure) throw primaryFailure;
+  if (cleanupFailure) throw cleanupFailure;
+  return seededThread;
 }
 
 /** 只接收 loopback Responses 请求；助手完整用量与独立标题小样本分开，hold/release 暴露估算态。 @author kongweiguang */
@@ -1495,13 +1513,15 @@ async function runAcceptance() {
   process.stdout.write(`${JSON.stringify({ status: evidence.status, evidenceDirectory: isolated.runRoot, artifactFingerprint: evidence.artifactFingerprint, usage: evidence.expectedUsage, cleanup: evidence.cleanup }, null, 2)}\n`);
 }
 
-/** 仅轮询原始 VT 文件文本，供 /status/F5 人类反馈断言使用；正式画面断言使用 VtScreen。 @author kongweiguang */
+/** 仅轮询原始 VT 文件文本，供 /status/F5 人类反馈断言使用；ANSI CSI 的 ESC 字节动态构造正则，正式画面断言使用 VtScreen。 @author kongweiguang */
 export async function waitForRawText(path, pattern, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const bytes = await readFile(path);
-      const text = bytes.toString("utf8").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+      const text = bytes
+        .toString("utf8")
+        .replace(new RegExp(`${String.fromCharCode(0x1b)}\\[[0-?]*[ -/]*[@-~]`, "gu"), "");
       if (pattern.test(text)) return text.match(pattern)?.[0] ?? "matched";
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;

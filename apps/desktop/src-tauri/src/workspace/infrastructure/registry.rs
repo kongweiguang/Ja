@@ -494,6 +494,23 @@ impl WorkspaceRegistry {
         Ok(WorkspaceInfo { id })
     }
 
+    /// 路径准入和存在性检查由 Workspace registry 持有；只有确认目录缺失时才按原 canonical spelling 保留旧绑定。
+    pub(crate) fn matches_root_or_missing_spelling(
+        &self,
+        root: &Path,
+        handle: &WorkspaceHandle,
+    ) -> bool {
+        match self.register(root) {
+            Ok(info) => self
+                .get(info.id)
+                .is_ok_and(|candidate| handle.same_physical_root(&candidate)),
+            Err(_) => {
+                fs::metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    && root == handle.root_path()
+            }
+        }
+    }
+
     /// 返回操作期 canonical root 不可变的 handle，避免相同目录 remove/re-add 竞争。
     pub fn get(&self, id: WorkspaceId) -> Result<WorkspaceHandle, WorkspaceError> {
         self.workspaces

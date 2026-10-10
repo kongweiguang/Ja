@@ -999,7 +999,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     await waitFor(() =>
       expect(screen.queryByText("项目目录不可用", { exact: true })).not.toBeInTheDocument(),
     );
-    expect(document.querySelectorAll("[data-sonner-toast]")).toHaveLength(0);
+    await waitFor(() => expect(document.querySelectorAll("[data-sonner-toast]")).toHaveLength(0));
     await user.click(screen.getByRole("button", { name: "取消" }));
     await waitFor(() => {
       const restoredToast = screen
@@ -2627,9 +2627,9 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       await waitFor(() =>
         expect(pendingFrames.length).toBeGreaterThan(pendingFramesBeforeReferenceOpen),
       );
-      const referenceOpenFrame = pendingFrames[pendingFramesBeforeReferenceOpen];
-      expect(referenceOpenFrame).toBeDefined();
-      await act(async () => referenceOpenFrame?.(0));
+      const referenceOpenFrames = pendingFrames.splice(pendingFramesBeforeReferenceOpen);
+      expect(referenceOpenFrames.length).toBeGreaterThan(0);
+      await act(async () => referenceOpenFrames.forEach((frame) => frame(0)));
       await waitFor(() => expect(referencedFileTab).toHaveFocus());
 
       await user.click(composer);

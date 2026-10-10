@@ -673,7 +673,9 @@ export function useConversationInteractionController({
       : (() => {
           const latestTurnId = currentThreads[threadId]?.latestTurnId;
           const latestTurn = latestTurnId === undefined ? undefined : currentTurns[latestTurnId];
-          return latestTurn !== undefined && latestTurn.origin === "native" && ["failed", "cancelled"].includes(latestTurn.status)
+          return latestTurn !== undefined &&
+            latestTurn.origin === "native" &&
+            ["failed", "cancelled"].includes(latestTurn.status)
             ? latestTurn
             : undefined;
         })();

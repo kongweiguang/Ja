@@ -196,7 +196,8 @@ function StepIcon({ step }: { step: WorkStepAdapter }): ReactElement {
  */
 function projectWorkStepForDisplay(step: WorkStepAdapter): WorkStepAdapter {
   if (step.origin !== "inherited") return step;
-  const status = step.status === "started" || step.status === "in_progress" ? "completed" : step.status;
+  const status =
+    step.status === "started" || step.status === "in_progress" ? "completed" : step.status;
   const presentation = step.metadata?.presentation;
   const presentationStatus =
     presentation?.status === "pending" ||
@@ -784,7 +785,10 @@ export function WorkProcess({
                 : undefined;
             const hasPresentation = displayStep.metadata?.presentation !== undefined;
             return (
-              <li key={displayStep.itemId} className={cn("ja-work-step", `ja-work-step-${displayStep.status}`)}>
+              <li
+                key={displayStep.itemId}
+                className={cn("ja-work-step", `ja-work-step-${displayStep.status}`)}
+              >
                 <span className="ja-work-step__icon" aria-hidden="true">
                   <StepIcon step={displayStep} />
                 </span>
@@ -810,15 +814,19 @@ export function WorkProcess({
                       owningTurnAwaitingInput={
                         step.origin === "native" &&
                         turnStatusByIdentity.get(JSON.stringify([step.threadId, step.turnId])) ===
-                        "waiting_input"
+                          "waiting_input"
                       }
                       disclosureCache={disclosureCache}
                       disclosureKey={`${disclosureKey ?? step.turnId}:${step.itemId}`}
                       disclosureThreadId={disclosureThreadId ?? step.threadId}
                       onReadArtifact={onReadToolArtifact}
                       onOpenAttachmentPreview={onOpenAttachmentPreview}
-                      recoveryThreadRevision={step.origin === "native" ? turn?.threadRevision : undefined}
-                      onResolveRecovery={step.origin === "native" ? onResolveToolRecovery : undefined}
+                      recoveryThreadRevision={
+                        step.origin === "native" ? turn?.threadRevision : undefined
+                      }
+                      onResolveRecovery={
+                        step.origin === "native" ? onResolveToolRecovery : undefined
+                      }
                       processSession={step.origin === "native" ? processSession : undefined}
                     />
                   )}

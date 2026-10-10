@@ -43,6 +43,30 @@ const TASK_COMMON_FIELDS: [&str; 8] = [
     "taskRevision",
 ];
 
+/// 界面层解码后的 JA-RPC metadata 失效通知；协议字段名不进入 application。
+pub(crate) struct WorkspaceMetadataChangedEvent {
+    pub(crate) server_instance_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) revision: u64,
+    pub(crate) generation: u64,
+}
+
+/// 设计原因：application 不应依赖动态 JSON 或协议字段名；只在 interface 解出既有必需字段，缺失/类型错误时保持原先忽略行为。
+pub(crate) fn workspace_metadata_changed_event(
+    value: &Value,
+) -> Option<WorkspaceMetadataChangedEvent> {
+    if value.get("method").and_then(Value::as_str) != Some("workspace/metadata-changed") {
+        return None;
+    }
+    let params = value.get("params").and_then(Value::as_object)?;
+    Some(WorkspaceMetadataChangedEvent {
+        server_instance_id: params.get("serverInstanceId")?.as_str()?.to_owned(),
+        workspace_id: params.get("workspaceId")?.as_str()?.to_owned(),
+        revision: params.get("revision")?.as_u64()?,
+        generation: params.get("generation")?.as_u64()?,
+    })
+}
+
 /// 设计原因：该函数先完成身份与大小校验再脱敏投影，防止跨 generation 或私密字段进入 WebView。
 /// 消费私有 ready challenge 后发送一个 response/event frame，确保 challenge 不跨越 IPC。
 pub(crate) fn emit_frame(sink: &EventSink, frame: &RpcFrame) -> Result<(), RuntimeCommandError> {

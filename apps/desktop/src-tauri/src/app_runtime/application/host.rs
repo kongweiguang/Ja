@@ -209,28 +209,14 @@ impl WorkspaceMetadataEventRouter {
         }
     }
 
-    /// 只消费已通过 JA-RPC projection 的较新 revision；回读在独立线程完成，区分仅改名与换 root。
-    pub(crate) fn observe(&self, event: &serde_json::Value) {
-        if event.get("method").and_then(serde_json::Value::as_str)
-            != Some("workspace/metadata-changed")
-        {
-            return;
-        }
-        let Some(params) = event.get("params").and_then(serde_json::Value::as_object) else {
-            return;
-        };
-        let (Some(server_id), Some(workspace_id), Some(revision), Some(generation)) = (
-            params
-                .get("serverInstanceId")
-                .and_then(serde_json::Value::as_str),
-            params
-                .get("workspaceId")
-                .and_then(serde_json::Value::as_str),
-            params.get("revision").and_then(serde_json::Value::as_u64),
-            params.get("generation").and_then(serde_json::Value::as_u64),
-        ) else {
-            return;
-        };
+    /// application 只消费 interface 已提取的身份字段，避免协议 JSON 渗入用例层；迟到 revision 仍由运行时身份围栏拒绝。
+    pub(crate) fn observe(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+        revision: u64,
+        generation: u64,
+    ) {
         let Ok(mut bindings) = self.workspace.lock() else {
             return;
         };
@@ -2052,14 +2038,7 @@ fn workspace_handle_for_root(root: &str) -> Result<WorkspaceHandle, RuntimeComma
 
 /// Java projection 与 handle 可能使用 Windows 大小写/扩展前缀别名；优先比较物理身份，缺失 root 时只接受原 canonical spelling。
 fn workspace_root_matches_handle(root: &str, handle: &WorkspaceHandle) -> bool {
-    match workspace_handle_for_root(root) {
-        Ok(candidate) => handle.same_physical_root(&candidate),
-        Err(_) => {
-            // Missing directories can only match by the original spelling; an existing but unsafe/replaced root fails closed.
-            std::fs::metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                && Path::new(root) == handle.root_path()
-        }
-    }
+    WorkspaceRegistry::default().matches_root_or_missing_spelling(Path::new(root), handle)
 }
 
 /// RPC 结果或不确定回读只有与用户补丁一致才可视为已提交；目录以物理 identity 比较而非字符串拼写。

@@ -30,6 +30,12 @@
     "scripts/e2e/cli-review-loopback.mjs",
     "scripts/e2e/sse-webview2.mjs",
     "scripts/e2e/storage-recovery-webview2.mjs",
+    // 独立 CLI/Windows Terminal 验收从仓库根直接运行；其余 fixture 仍由依赖图检查。
+    "scripts/e2e/cli-diff-acceptance.mjs",
+    "scripts/e2e/cli-fullscreen-acceptance.mjs",
+    "scripts/e2e/cli-model-settings-acceptance.mjs",
+    "scripts/e2e/cli-usage-acceptance.mjs",
+    "scripts/e2e/desktop-model-settings-acceptance.mjs",
     // Settings/Workbench 真窗验收由维护者直接按 CLI 启动；fixture 由 MCP STDIO 参数再启动。
     "scripts/e2e/mcp-settings-webview2.mjs",
     "scripts/e2e/models-overview-webview2.mjs",
@@ -90,6 +96,8 @@
     "/src/api/tauri/history.ts",
     // 进程会话验收在 Vite page.evaluate 中动态加载生产适配器，Node 不解析该浏览器绝对路径。
     "/src/api/tauri/process.ts",
+    // 浏览器文件链接真窗验收在 page.evaluate 内加载预览 adapter。
+    "/src/api/tauri/preview.ts",
     "/src/api/tauri/settings.ts",
     "/src/api/tauri/runtime.ts",
     "/src/features/conversation/application/timelineStore.ts",
@@ -104,6 +112,7 @@
     "taskkill.exe",
     // Fail-fast 回归直接启动系统 PowerShell 7；它不是 npm 依赖，删除条件是改用 Node 原生 shell runner。
     "pwsh",
+    "pwsh.exe",
     // Windows 监听端口快照从系统 netstat.exe 读取，不属于仓库 npm 依赖。
     "netstat.exe",
   ],

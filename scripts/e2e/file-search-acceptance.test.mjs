@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { realpath, rm, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   agentLoopFixtureMarkers,
@@ -584,8 +585,9 @@ test("isolated acceptance roots use the physical temporary parent", async () => 
   }
 });
 
-/** 用明确 mock 值验证脱敏和帧体积边界，夹具不需要真实令牌形状。 */
+/** 仓库路径取自当前检出，搬迁目录后仍验证真实路径脱敏，而非固定开发机路径。 */
 test("file search failure evidence is redacted and bounded", () => {
+  const repositoryPath = fileURLToPath(new URL("../../", import.meta.url)).replaceAll("\\", "/");
   const evidence = buildFileSearchFailureEvidence({
     error: new Error("terminal failed for token=mock-value in C:\\private\\profile"),
     phase: "validating_final_reply",
@@ -599,7 +601,7 @@ test("file search failure evidence is redacted and bounded", () => {
           text: `frame-${index} at http://127.0.0.1:3333`,
         },
       })),
-      stderr: `Authorization: Bearer mock-value C:\\private\\profile file:/C:/dev/rust/ja/app-server.jar`,
+      stderr: `Authorization: Bearer mock-value C:\\private\\profile file:/${repositoryPath}ja-agent/ja-app-server/target/ja-app-server.jar`,
     },
     fixtureSnapshot: {
       attempts: [{ kind: "continuation", toolNames: ["find"], callIds: ["call-1"] }],
@@ -624,5 +626,5 @@ test("file search failure evidence is redacted and bounded", () => {
   assert.ok(!serialized.includes("mock-value"));
   assert.ok(!serialized.includes("C:\\\\private"));
   assert.ok(!serialized.includes("127.0.0.1:3333"));
-  assert.ok(!serialized.includes("/C:/dev/rust/ja/"));
+  assert.ok(!serialized.includes(repositoryPath));
 });
