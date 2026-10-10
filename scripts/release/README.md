@@ -24,7 +24,7 @@ Native 复用通过三个独立的 `ja-native-reuse-<platform>-<arch>` Actions a
 
 JVM 常规验证与 Jazzer fuzz 使用独立 Maven/JVM 调用：常规 `verify` 排除 `ProviderInputFuzzTest`，紧随其后的两个必需 fuzz 步骤分别执行该类的全部两个方法，防止全局插桩状态传播到后续 FFM/Win32 测试。任何一步失败均阻止原生构建。
 
-多命令 PowerShell 验证步骤显式启用原生命令失败传播，非零退出码会立即中止，不允许后续成功命令覆盖失败结果。Rust 外层测试 worker 串行运行，隔离真实 JVM/Git/Shell 用例的宿主资源争用；测试内部的显式并发场景和产品 deadline 保持不变。前端源码通过 Git attributes 固定 LF，保证 Windows 干净检出与 Prettier 的检查规则一致。
+多命令 PowerShell 验证步骤显式启用原生命令失败传播，非零退出码会立即中止，不允许后续成功命令覆盖失败结果。Rust 外层测试 worker 串行运行，隔离真实 JVM/Git/Shell 用例的宿主资源争用；测试内部的显式并发场景和产品 deadline 保持不变。前端源码与 Node 验收脚本通过 Git attributes 固定 LF，保证 Windows 干净检出与 Prettier、源码接线断言使用相同的换行基线。
 
 CI 前端完整测试固定为 1 个 Vitest worker，避免 jsdom 虚拟列表 teardown 与延迟回调互相争用；独立 job 的并行不改变测试内部的并发场景、断言和产品超时，也不通过重试或跳过用例获得通过结果。
 

@@ -8,3 +8,6 @@
 apps/desktop/**/*.ts text eol=lf
 apps/desktop/**/*.tsx text eol=lf
 apps/desktop/**/*.css text eol=lf
+
+# Node 验收脚本按源码行边界核对接线，Windows 干净检出也须保持同一 LF 基线。
+scripts/**/*.mjs text eol=lf
