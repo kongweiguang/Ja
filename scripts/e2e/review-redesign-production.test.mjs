@@ -45,11 +45,74 @@ import {
   selectOwnedTauriProcess,
   validateToolchain,
   verifyOwnedTauriExecutableIdentity,
+  waitForTauriApplication,
   writeIsolatedSettings,
   writeTauriOverlay,
 } from "./review-redesign-production.mjs";
 
 const execFileAsync = promisify(execFile);
+
+/** @author kongweiguang 用虚拟时间证明超过 WebView 窗口的冷编译仍可准备完成，且外部同名进程不能提前开启运行时验收。 */
+test("Tauri preparation waits for the owned application beyond the WebView startup budget", async () => {
+  let elapsed = 0;
+  const launch = { child: { pid: 100, exitCode: null }, output: { stderr: "Compiling" } };
+  const application = {
+    ProcessId: 102,
+    ParentProcessId: 101,
+    ExecutablePath: "C:\\target\\debug\\ja-desktop.exe",
+  };
+  const result = await waitForTauriApplication(launch, {
+    now: () => elapsed,
+    pause: async () => {
+      elapsed += 90_000;
+    },
+    readSnapshot: async () => [
+      { ProcessId: 101, ParentProcessId: 100, ExecutablePath: "C:\\cargo.exe" },
+      { ProcessId: 200, ParentProcessId: 199, ExecutablePath: "C:\\other\\ja-desktop.exe" },
+      ...(elapsed >= 180_000 ? [application] : []),
+    ],
+  });
+  assert.equal(elapsed, 180_000);
+  assert.deepEqual(result, application);
+});
+
+/** @author kongweiguang 准备阶段必须保留退出、编译超时、快照错误和并列进程歧义的真实失败，不能将其误报为 WebView 启动超时。 */
+test("Tauri preparation fails closed on exit, timeout and invalid ownership", async () => {
+  const launch = { child: { pid: 100, exitCode: null }, output: { stderr: "compiler diagnostic" } };
+  await assert.rejects(
+    waitForTauriApplication({ ...launch, child: { pid: 100, exitCode: 1 } }),
+    /preparation exited.*compiler diagnostic/u,
+  );
+  let elapsed = 0;
+  await assert.rejects(
+    waitForTauriApplication(launch, {
+      now: () => elapsed,
+      preparationTimeoutMs: 10,
+      pause: async () => {
+        elapsed = 10;
+      },
+      readSnapshot: async () => [],
+    }),
+    /preparation timed out.*compiler diagnostic/u,
+  );
+  await assert.rejects(
+    waitForTauriApplication(launch, {
+      readSnapshot: async () => {
+        throw new Error("owned_tauri_process_snapshot_query_failed");
+      },
+    }),
+    /snapshot_query_failed/u,
+  );
+  await assert.rejects(
+    waitForTauriApplication(launch, {
+      readSnapshot: async () => [
+        { ProcessId: 101, ParentProcessId: 100, ExecutablePath: "C:\\one\\ja-desktop.exe" },
+        { ProcessId: 102, ParentProcessId: 100, ExecutablePath: "C:\\two\\ja-desktop.exe" },
+      ],
+    }),
+    /owned_tauri_process_ambiguous/u,
+  );
+});
 
 /** @author kongweiguang 构造可控 Node 子树并可将一层替换成临时同名 Desktop 副本，以真进程验证扫描边界且不启动产品。 */
 function startOwnedProcessTree(

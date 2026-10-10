@@ -904,6 +904,40 @@ export function buildTauriCommandLine({ overlay, pnpmCommand }) {
 
 /**
  * @author kongweiguang
+ * Tauri dev 先编译再启动；冷构建使用独立准备期限，只有本轮 launcher 的唯一桌面后代出现后才开始 WebView 运行时门禁。
+ * 复用已有进程所有权投影，不依赖 Cargo 日志文案或旧 target 文件；快照错误与进程歧义直接失败。
+ */
+export async function waitForTauriApplication(
+  launch,
+  {
+    now = Date.now,
+    readSnapshot = readOwnedProcessSnapshot,
+    pause = () => new Promise((done) => setTimeout(done, 1_000)),
+    preparationTimeoutMs = 20 * 60_000,
+  } = {},
+) {
+  const deadline = now() + preparationTimeoutMs;
+  while (now() < deadline) {
+    if (launch.child.exitCode !== null || launch.child.signalCode != null) {
+      throw new Error(
+        `Tauri preparation exited before application launch: ${launch.output.stderr.slice(-2_000)}`,
+      );
+    }
+    const snapshot = await readSnapshot(launch.child.pid);
+    try {
+      return selectOwnedTauriProcess(snapshot, launch.child.pid);
+    } catch (error) {
+      if (error.message !== "owned_tauri_process_missing") throw error;
+    }
+    await pause();
+  }
+  throw new Error(
+    `Tauri build/application preparation timed out: ${launch.output.stderr.slice(-2_000)}`,
+  );
+}
+
+/**
+ * @author kongweiguang
  * 从 pnpm/action-setup 的绝对 PNPM_HOME 取 shim；未设置时只查 PATH 中的绝对目录，避免 cmd.exe 将仓库 cwd 当作命令来源。
  */
 export async function resolvePnpmCommand() {
@@ -1022,8 +1056,9 @@ async function prewarmWebViewProfile(overlay, environment, directories, pnpmComm
     environment: primeEnvironment,
     pnpmCommand,
   });
-  const deadline = Date.now() + 120_000;
   try {
+    await waitForTauriApplication(prime);
+    const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {
       if (prime.child.exitCode !== null)
         throw new Error(`WebView2 profile prime exited: ${prime.output.stderr.slice(-1000)}`);
@@ -1183,6 +1218,7 @@ export async function runProduction(options) {
         await prewarmWebViewProfile(overlay, environment, directories, toolchain.pnpmCommand);
       }
       launch = launchTauri({ overlay, environment, pnpmCommand: toolchain.pnpmCommand });
+      await waitForTauriApplication(launch);
       if (options.edgeDriver === undefined) {
         endpoint = `http://127.0.0.1:${automationPort}`;
         await waitForCdp(endpoint, launch);
