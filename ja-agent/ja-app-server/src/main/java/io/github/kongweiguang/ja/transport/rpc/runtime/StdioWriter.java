@@ -38,6 +38,7 @@ public final class StdioWriter implements AutoCloseable {
     private final int maxFrameBytes;
     private final long maxControlBytes;
     private final long maxDataBytes;
+    private final boolean closeOutputOnOwnerExit;
     private final ArrayBlockingQueue<Frame> control = new ArrayBlockingQueue<>(MAX_CONTROL_FRAMES);
     private final ArrayBlockingQueue<Frame> data = new ArrayBlockingQueue<>(MAX_DATA_FRAMES);
     private final Semaphore completionPermits = new Semaphore(MAX_COMPLETION_CALLBACKS);
@@ -57,7 +58,7 @@ public final class StdioWriter implements AutoCloseable {
      * 启动唯一平台 Writer 所有者，禁止请求或 Turn 工作线程直接写 stdout。
      */
     public StdioWriter(OutputStream output, ObjectMapper mapper, int maxFrameBytes) {
-        this(output, mapper, maxFrameBytes, MAX_CONTROL_BYTES, MAX_DATA_BYTES);
+        this(output, mapper, maxFrameBytes, MAX_CONTROL_BYTES, MAX_DATA_BYTES, false);
     }
 
     /**
@@ -65,6 +66,14 @@ public final class StdioWriter implements AutoCloseable {
      */
     StdioWriter(OutputStream output, ObjectMapper mapper, int maxFrameBytes,
                 long maxControlBytes, long maxDataBytes) {
+        this(output, mapper, maxFrameBytes, maxControlBytes, maxDataBytes, false);
+    }
+
+    /**
+     * 为由 RPC Server 独占创建的内部管道选择输出所有权；标准输入输出仍由宿主拥有，避免关闭 System.out。
+     */
+    StdioWriter(OutputStream output, ObjectMapper mapper, int maxFrameBytes,
+                long maxControlBytes, long maxDataBytes, boolean closeOutputOnOwnerExit) {
         this.output = Objects.requireNonNull(output, "output");
         this.mapper = Objects.requireNonNull(mapper, "mapper");
         if (maxFrameBytes < 1_024 || maxControlBytes < 1 || maxDataBytes < 1) {
@@ -73,6 +82,7 @@ public final class StdioWriter implements AutoCloseable {
         this.maxFrameBytes = maxFrameBytes;
         this.maxControlBytes = maxControlBytes;
         this.maxDataBytes = maxDataBytes;
+        this.closeOutputOnOwnerExit = closeOutputOnOwnerExit;
         this.completionExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(MAX_COMPLETION_CALLBACKS),
                 Thread.ofPlatform().daemon().name("ja-rpc-completion-", 0).factory(),
@@ -321,7 +331,7 @@ public final class StdioWriter implements AutoCloseable {
     }
 
     /**
-     * 严格优先写控制帧，同时继续排空有界草稿流量。
+     * 严格优先写控制帧，同时继续排空有界草稿流量；独占输出在本线程退场前关闭，避免读端误判死写者。
      */
     private void run() {
         try {
@@ -348,6 +358,33 @@ public final class StdioWriter implements AutoCloseable {
                 ownerFailure.compareAndSet(null, failure);
             }
             failQueued(failure);
+        } finally {
+            closeOwnedOutput();
+        }
+    }
+
+    /**
+     * 由唯一 Writer 线程发布内部管道 EOF，消除 Writer 先退出而读端观察到 Write end dead 的窗口。
+     * 关闭失败保留为 owner failure，仍由 RpcServer 的关闭结果传播，不把真实 I/O 错误伪装成正常 EOF。
+     */
+    private void closeOwnedOutput() {
+        if (!closeOutputOnOwnerExit) {
+            return;
+        }
+        try {
+            output.close();
+        } catch (IOException | RuntimeException failure) {
+            RuntimeException closeFailure = failure instanceof RuntimeException runtime
+                    ? runtime : new IllegalStateException("stdio owned output close failed", failure);
+            RuntimeException prior = ownerFailure.get();
+            if (prior == null) {
+                ownerFailure.compareAndSet(null, closeFailure);
+            } else if (prior != closeFailure) {
+                prior.addSuppressed(closeFailure);
+            }
+            failed.set(true);
+            accepting.set(false);
+            failQueued(closeFailure);
         }
     }
 

@@ -14,6 +14,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -21,6 +23,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -31,6 +34,73 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证唯一 stdout 写入所有者同时强制帧大小与控制队列上限。 */
 final class StdioWriterTest {
+    /**
+     * 独占管道的 Writer 必须在自身线程退出前关闭写端，使读端得到 EOF 而不是 JDK 的 Write end dead。
+     */
+    @Test
+    void ownedOutputClosesBeforeWriterOwnerExits() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        AtomicReference<Thread> outputCloser = new AtomicReference<>();
+        try (PipedInputStream input = new PipedInputStream(4096)) {
+            PipedOutputStream output = new PipedOutputStream(input) {
+                /** 记录实际关闭线程，避免外层清理恰好补发 EOF 掩盖 Writer 退场的竞态。 */
+                @Override
+                public void close() throws IOException {
+                    outputCloser.set(Thread.currentThread());
+                    super.close();
+                }
+            };
+            try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024,
+                    StdioWriter.MAX_CONTROL_BYTES, StdioWriter.MAX_DATA_BYTES, true)) {
+                writer.notification("runtime/status-changed", mapper.createObjectNode()
+                        .put("status", "stopped")).join();
+            }
+            byte[] frame = input.readAllBytes();
+            assertEquals("stopped", mapper.readTree(frame).path("params").path("status").asText());
+            assertEquals(-1, input.read());
+            assertEquals("ja-rpc-writer", outputCloser.get().getName());
+            assertFalse(outputCloser.get().isAlive());
+        }
+    }
+
+    /** 借用标准输出的默认构造不能替宿主关闭流，后续宿主输出仍须可用。 */
+    @Test
+    void borrowedOutputRemainsOpenAfterWriterClose() {
+        AtomicBoolean outputClosed = new AtomicBoolean();
+        ByteArrayOutputStream output = new ByteArrayOutputStream() {
+            /** 记录借用输出的关闭副作用，ByteArrayOutputStream 原生 close 无效果不足以检验所有权。 */
+            @Override
+            public void close() {
+                outputClosed.set(true);
+            }
+        };
+        ObjectMapper mapper = new ObjectMapper();
+        try (StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024)) {
+            writer.response("c:borrowed", mapper.createObjectNode().put("accepted", true)).join();
+        }
+        assertFalse(outputClosed.get());
+        output.write('x');
+    }
+
+    /** 所有权转移只修复正常 EOF，真实关闭错误仍需从 Writer close 传播并保留原始 cause。 */
+    @Test
+    void ownedOutputCloseFailureRemainsNonSuccessful() {
+        IOException expected = new IOException("owned output close failure");
+        ByteArrayOutputStream output = new ByteArrayOutputStream() {
+            /** 注入只发生在关闭边界的错误，以区别正常帧刷写与最终 EOF 失败。 */
+            @Override
+            public void close() throws IOException {
+                throw expected;
+            }
+        };
+        ObjectMapper mapper = new ObjectMapper();
+        StdioWriter writer = new StdioWriter(output, mapper, 4 * 1024 * 1024,
+                StdioWriter.MAX_CONTROL_BYTES, StdioWriter.MAX_DATA_BYTES, true);
+        writer.response("c:close", mapper.createObjectNode().put("accepted", true)).join();
+        RuntimeException failure = assertThrows(RuntimeException.class, writer::close);
+        assertSame(expected, failure.getCause().getCause());
+    }
+
     /** 已协商的来源消息通知必须能真正写出 stdout，不能只通过 mapper/schema 的静态校验。 */
     @Test
     void flushesNegotiatedThreadMessagesNotification() throws Exception {

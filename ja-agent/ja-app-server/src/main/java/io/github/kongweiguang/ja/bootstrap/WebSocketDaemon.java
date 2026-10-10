@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.bootstrap;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.kongweiguang.ja.agent.application.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.configuration.application.api.ConfigurationUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.NativeExecutionContext;
 import io.github.kongweiguang.ja.foundation.error.FailureDiagnostics;
@@ -132,6 +133,7 @@ public final class WebSocketDaemon implements AutoCloseable {
     private final CompletableFuture<ObjectNode> ready = new CompletableFuture<>();
     private final CompletableFuture<Void> listenerReady = new CompletableFuture<>();
     private final CompletableFuture<Integer> runtimeExit = new CompletableFuture<>();
+    private final CompletableFuture<Void> outputPumpStopped = new CompletableFuture<>();
     private final AtomicReference<Throwable> transportFailure = new AtomicReference<>();
     private final Path endpointPath;
     private final IntSupplier portCandidates;
@@ -183,7 +185,10 @@ public final class WebSocketDaemon implements AutoCloseable {
                 : configuration::listenPort);
     }
 
-    /** 注入候选端口仅供冲突测试；生产端口仍由 FeatHTTP 自身完成绑定裁决。 */
+    /**
+     * 注入候选端口仅供冲突测试；生产端口仍由 FeatHTTP 自身完成绑定裁决。
+     * 内部输出管道的所有权转移给唯一 Writer，以在线程退出前发布物理 EOF；不借用宿主 stdout。
+     */
     WebSocketDaemon(SidecarConfiguration configuration, RpcServicesFactory factory,
                     ConfigurationUseCase configurationUseCase, RpcServer.SessionBinding binding,
                     Duration idleTimeout, Duration pingInterval, Duration connectionIdleTimeout,
@@ -212,7 +217,7 @@ public final class WebSocketDaemon implements AutoCloseable {
             configurationUseCase, session -> {
             ownerSession = session;
             return binding.bind(session);
-        });
+        }, true);
         TOKEN_RANDOM.nextBytes(token);
     }
 
@@ -290,6 +295,13 @@ public final class WebSocketDaemon implements AutoCloseable {
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Ja WebSocket daemon interrupted", interrupted);
+                }
+            }
+            if (transportFailure.get() == null && runtimeExit.getNow(1) == 0) {
+                try {
+                    runtime.shutdownDeadline().await(outputPumpStopped, "websocket runtime output");
+                } catch (RuntimeException failure) {
+                    failTransport(failure);
                 }
             }
             return transportFailure.get() == null ? runtimeExit.getNow(1) : 1;
@@ -513,7 +525,8 @@ public final class WebSocketDaemon implements AutoCloseable {
 
     /**
      * 持续排空唯一 Writer，并按内部请求标识将响应送回正确连接。
-     * EOF 和异常关闭使用不同 phase，保留实际观察到的来源且不把连接断开映射为任务取消。
+     * EOF 和异常关闭使用不同 phase；正常关机使用 RPC 的剩余预算排空 WebSocket 尾帧，避免丢失关闭确认。
+     * 连接断开不映射为任务取消，真实输出故障仍由 transportFailure 传播。
      *
      * @author kongweiguang
      */
@@ -541,7 +554,20 @@ public final class WebSocketDaemon implements AutoCloseable {
                 && !transportClosed.get()) {
                 failTransport(new IOException("Ja runtime output ended before owner stopped"));
             }
-            connections.forEach(client -> client.close(ClientClosePhase.RUNTIME_OUTPUT_END, null));
+            try {
+                if (orderlyEof && stopRequested.get() && !transportClosed.get()
+                    && transportFailure.get() == null) {
+                    ShutdownDeadline deadline = runtime.shutdownDeadline();
+                    for (Client client : List.copyOf(connections)) {
+                        client.awaitOutbound(deadline);
+                    }
+                }
+            } catch (RuntimeException failure) {
+                failTransport(failure);
+            } finally {
+                connections.forEach(client -> client.close(ClientClosePhase.RUNTIME_OUTPUT_END, null));
+                outputPumpStopped.complete(null);
+            }
         }
     }
 
@@ -1375,11 +1401,14 @@ public final class WebSocketDaemon implements AutoCloseable {
                         }
                         continue;
                     }
-                    synchronized (this) {
-                        queuedBytes -= frame.length;
-                    }
                     failurePhase = ClientClosePhase.WRITER_SEND;
                     socket.send(new String(frame, StandardCharsets.UTF_8)).get();
+                    synchronized (this) {
+                        if (!closed) {
+                            queuedBytes -= frame.length;
+                        }
+                        notifyAll();
+                    }
                     lastSend = System.nanoTime();
                 }
             } catch (InterruptedException | ExecutionException | RuntimeException failure) {
@@ -1387,6 +1416,25 @@ public final class WebSocketDaemon implements AutoCloseable {
                     Thread.currentThread().interrupt();
                 }
                 close(failurePhase, failure);
+            }
+        }
+
+        /**
+         * 编码字节配额持续覆盖在途发送；正常 EOF 只能在已准入尾帧发送完成后关闭连接，并沿用 RPC 的期限。
+         * 已断开的客户端没有可交付通道，可直接撤销观察；慢发送耗尽预算仍报告失败而非静默丢弃 ACK。
+         */
+        private synchronized void awaitOutbound(ShutdownDeadline deadline) {
+            while (!closed && queuedBytes > 0) {
+                long remaining = deadline.remainingMillis();
+                if (remaining == 0) {
+                    throw ShutdownDeadline.forced("websocket outbound drain timed out", null);
+                }
+                try {
+                    wait(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw ShutdownDeadline.forced("websocket outbound drain interrupted", interrupted);
+                }
             }
         }
 
@@ -1424,6 +1472,7 @@ public final class WebSocketDaemon implements AutoCloseable {
                 context = contextId;
                 outbound.clear();
                 queuedBytes = 0;
+                notifyAll();
             }
             logClientClose(phase, observedTextMessageSequence, failure);
             try {

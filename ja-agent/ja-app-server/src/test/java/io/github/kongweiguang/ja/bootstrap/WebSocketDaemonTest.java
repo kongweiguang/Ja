@@ -1022,6 +1022,46 @@ final class WebSocketDaemonTest {
     }
 
     /**
+     * 物理管道 EOF 不能抢先清空客户端尾帧；真实客户端须先得到 shutdown ACK 和 stopped，再观察后台退出。
+     */
+    @Test
+    void orderlyOutputEofDeliversShutdownAckAndFinalStatus() throws Exception {
+        SidecarConfiguration configuration = new SidecarConfiguration(root.resolve("home-tail"),
+                root.resolve("data-tail"), root.resolve("run-tail"), root.resolve("logs-tail"), 44L);
+        TurnUseCase turns = (TurnUseCase) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{TurnUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "awaitQuiescence", "stopAcceptingIfQuiescent" -> true;
+                    case "stopAccepting" -> null;
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        WebSocketDaemon daemon = new WebSocketDaemon(configuration,
+                ignored -> RpcTestBindings.create(null, null, turns, null, null, () -> { }),
+                TestConfigurationPorts.unavailable(), ignored -> () -> { });
+        CompletableFuture<Integer> stopped = new CompletableFuture<>();
+        Thread.ofVirtual().name("ja-shutdown-tail-test").start(() -> {
+            try {
+                stopped.complete(daemon.run());
+            } catch (IOException failure) {
+                stopped.completeExceptionally(failure);
+            }
+        });
+        try {
+            ObjectNode endpoint = waitForEndpoint(configuration.runDirectory().resolve("app-server.endpoint.json"));
+            try (Client client = connect(endpoint, "shutdown-tail")) {
+                send(client, "c:stop-tail", "runtime/shutdown", mapper.createObjectNode().put("force", true));
+                assertTrue(response(client, "c:stop-tail").path("result").path("accepted").booleanValue());
+                ObjectNode finalStatus = (ObjectNode) mapper.readTree(client.reader().readLine());
+                assertNotNull(finalStatus, "final status was dropped before transport close");
+                assertEquals("runtime/status-changed", finalStatus.path("method").asText());
+                assertEquals("stopped", finalStatus.path("params").path("status").asText());
+            }
+            assertEquals(0, stopped.get(5, TimeUnit.SECONDS));
+        } finally {
+            daemon.close();
+        }
+    }
+
+    /**
      * 无客户端的定时退出先经过业务保活检查；活跃 Turn 让原子准入屏障拒绝关闭并重新计时，
      * 结算后才移除端点和释放唯一 owner。
      */

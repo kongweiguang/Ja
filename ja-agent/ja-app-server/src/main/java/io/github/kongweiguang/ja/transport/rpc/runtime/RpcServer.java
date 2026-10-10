@@ -84,6 +84,7 @@ public final class RpcServer implements AutoCloseable {
     private final AtomicBoolean failedIngressCloseStarted = new AtomicBoolean();
     private final AtomicReference<RuntimeException> failedIngressCloseFailure = new AtomicReference<>();
     private final DeadlineCloseCoordinator closeCoordinator = new DeadlineCloseCoordinator();
+    private final AtomicReference<ShutdownDeadline> ownedShutdownDeadline = new AtomicReference<>();
     private final Object ingressMonitor = new Object();
     private final Runnable beforeDispatch;
     private final AutoCloseable sessionBinding;
@@ -112,6 +113,16 @@ public final class RpcServer implements AutoCloseable {
         this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase,
                 () -> {
                 }, configuration.runtimeGeneration(), sessionBinding);
+    }
+
+    /**
+     * 为独占的内部 WebSocket 管道转移输出流所有权；宿主标准输出仍使用借用模式。
+     */
+    public RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration,
+                     RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
+                     SessionBinding sessionBinding, boolean closeOutputOnOwnerExit) {
+        this(input, output, configuration, Clock.systemUTC(), factory, configurationUseCase,
+                () -> { }, configuration.runtimeGeneration(), sessionBinding, closeOutputOnOwnerExit);
     }
 
     /**
@@ -160,10 +171,22 @@ public final class RpcServer implements AutoCloseable {
     /**
      * 构造时固定连接资源；成功绑定的句柄转交 sessionBinding 字段并由 close 释放，绑定失败则关闭 Writer。
      */
-    @SuppressWarnings("PMD.CloseResource")
     RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
               RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
               Runnable beforeDispatch, long runtimeGeneration, SessionBinding binding) {
+        this(input, output, configuration, clock, factory, configurationUseCase, beforeDispatch,
+                runtimeGeneration, binding, false);
+    }
+
+    /**
+     * 固定连接级输出所有权，保证内部管道在 Writer owner 退场前收到 EOF。
+     * 绑定句柄成功后转交 sessionBinding 字段，失败时仍由构造器关闭 Writer，不在局部提前释放句柄。
+     */
+    @SuppressWarnings("PMD.CloseResource")
+    RpcServer(InputStream input, OutputStream output, SidecarConfiguration configuration, Clock clock,
+              RpcServicesFactory factory, ConfigurationUseCase configurationUseCase,
+              Runnable beforeDispatch, long runtimeGeneration, SessionBinding binding,
+              boolean closeOutputOnOwnerExit) {
         this.input = Objects.requireNonNull(input, "input");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(configuration, "configuration");
@@ -173,7 +196,8 @@ public final class RpcServer implements AutoCloseable {
         this.beforeDispatch = Objects.requireNonNull(beforeDispatch, "beforeDispatch");
         SessionBinding sessionBindingOwner = Objects.requireNonNull(binding, "binding");
         this.writer = new StdioWriter(Objects.requireNonNull(output, "output"), codec.mapper(),
-                JaRpcCodec.DEFAULT_MAX_FRAME_BYTES);
+                JaRpcCodec.DEFAULT_MAX_FRAME_BYTES, StdioWriter.MAX_CONTROL_BYTES,
+                StdioWriter.MAX_DATA_BYTES, closeOutputOnOwnerExit);
         this.session = new RpcSession(configuration, codec.mapper(), clock, writer, factory,
                 configurationUseCase, runtimeGeneration);
         AutoCloseable boundSession;
@@ -607,10 +631,18 @@ public final class RpcServer implements AutoCloseable {
     }
 
     /**
+     * 允许外层传输 owner 排空已经准入的尾帧，继续消费同一次 RPC 关闭的剩余预算，不刷新期限。
+     */
+    public ShutdownDeadline shutdownDeadline() {
+        return Objects.requireNonNull(ownedShutdownDeadline.get(), "rpc shutdown has not started");
+    }
+
+    /**
      * 整体关闭先取消独立压缩源，再排空请求；取消回调失败仍须尝试后续清理。
      * 普通 WebSocket 断线只撤销客户端观察，不调用 RpcServer.close。
      */
     private void closeOwnedConnection(ShutdownDeadline deadline) {
+        ownedShutdownDeadline.set(deadline);
         RuntimeException failure = null;
         accepting.set(false);
         try {
