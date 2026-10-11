@@ -5863,12 +5863,12 @@ async function readProductionMainWindowConfig() {
 /**
  * 写入本轮私有 Tauri overlay；按已独占的前端端口派生测试 identifier，避免 single-instance
  * mutex 与用户或其它隔离验收窗口共享。这里只继承产品窗口事实与 dev origin，WebView2 的
- * UDF 和调试端口仍由同一个子进程环境 owner 注入，避免形成两套 browser 参数。本轮修改
+ * UDF 由环境隔离，调试参数由 Tauri 官方窗口配置注入；不依赖启动链未传递的环境参数。本轮修改
  * focused mode 额外把已验明身份的 Native Image 映射到 production resource 相对路径；显式隐藏
  * 模式只用于无需原生前台输入的 CDP 门禁，避免测试窗口抢占用户桌面且不改变生产窗口配置。
  * @author kongweiguang
  */
-async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
+export async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver, cdpPort) {
   const hideCdpWindow = process.env.JA_E2E_HIDDEN_WINDOW_ONLY === "1";
   if (
     hideCdpWindow &&
@@ -5932,6 +5932,9 @@ async function writeE2eTauriConfig(directories, frontendPort, useEdgeDriver) {
       windows: [
         {
           ...productionWindow,
+          ...(cdpPort === undefined || useEdgeDriver
+            ? {}
+            : { additionalBrowserArgs: directCdpBrowserArgumentsForPort(cdpPort) }),
           ...(hideCdpWindow ? { visible: false, focus: false } : {}),
         },
       ],
@@ -7327,14 +7330,13 @@ async function validateConfiguredEdgeDriver(signal) {
 }
 
 /**
- * 构造唯一的 Tauri 启动环境；隔离目录、UDF 与 Direct CDP 参数由子进程环境单点注入，
- * 让 WebView 数据目录和 CDP 参数保持同一 browser 参数 owner。
+ * 构造隔离启动环境；UDF 使用官方环境覆盖，CDP 参数只由窗口 overlay 管理，
+ * 清除继承的 browser 参数以避免宿主设置与本轮端口形成两个 owner。
  * @author kongweiguang
  */
 function buildTauriEnv(
   directories,
   frontendPort,
-  cdpPort,
   exitTracePath,
   edgeDriver,
   edgeDriverPort,
@@ -7343,7 +7345,6 @@ function buildTauriEnv(
   pnpmCommand,
   cargoCommand,
   productionRuntime,
-  enableDirectCdp,
 ) {
   const env = {
     ...rootProcessEnv,
@@ -7373,22 +7374,14 @@ function buildTauriEnv(
       rootProcessEnv.JA_E2E_CARGO_TARGET_DIR?.trim() || join(repoRoot, "target", "e2e"),
     ),
     // Chrome 136+ 只在非默认 UDF 上接受 remote-debugging；Tauri 2.11 当前配置转换
-    // 会丢弃 dataDirectory，因此 direct 模式通过同一组官方环境 override 绑定 UDF 与端口。
+    // 会丢弃 dataDirectory，因此 direct 模式通过官方环境 override 绑定 UDF。
     ...(edgeDriver === undefined
       ? {
           WEBVIEW2_USER_DATA_FOLDER: directories.webview,
-          ...(enableDirectCdp
-            ? {
-                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: directCdpBrowserArgumentsForPort(cdpPort),
-              }
-            : {}),
         }
       : {}),
   };
-  if (edgeDriver === undefined && !enableDirectCdp) {
-    // Prime 只初始化 UDF；不要继承宿主或前一 phase 的端口专属 CDP browser arguments。
-    delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
-  }
+  delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
   if (edgeDriver !== undefined) {
     env.JA_E2E_CARGO_COMMAND = cargoCommand;
     env.JA_E2E_EDGEDRIVER_PATH = edgeDriver.path;
@@ -7472,7 +7465,6 @@ function quoteWindowsCommandToken(value) {
 function startTauri(
   directories,
   frontendPort,
-  cdpPort,
   tauriConfigPath,
   exitTracePath,
   edgeDriver,
@@ -7482,12 +7474,10 @@ function startTauri(
   pnpmCommand,
   cargoCommand,
   productionRuntime,
-  enableDirectCdp,
 ) {
   const env = buildTauriEnv(
     directories,
     frontendPort,
-    cdpPort,
     exitTracePath,
     edgeDriver,
     edgeDriverPort,
@@ -7496,7 +7486,6 @@ function startTauri(
     pnpmCommand,
     cargoCommand,
     productionRuntime,
-    enableDirectCdp,
   );
   const commandInterpreter = rootProcessEnv.ComSpec ?? rootProcessEnv.COMSPEC ?? "cmd.exe";
   // `/s /c` 在命令与后续参数都带引号时需要最外层引号，否则 cmd.exe 会剥离错误的一对。
@@ -16358,7 +16347,6 @@ async function primeWebViewProfile({
   const launch = startTauri(
     directories,
     frontendPort,
-    0,
     configPath,
     exitTracePath,
     undefined,
@@ -16368,7 +16356,6 @@ async function primeWebViewProfile({
     pnpmCommand,
     cargoCommand,
     productionRuntime,
-    false,
   );
   if (!launch.child.pid) throw new Error("profilePrime Tauri launcher 没有 PID");
   const observed = new Map();
@@ -39242,13 +39229,13 @@ function assertCdpDiscoveryContract() {
   const envSource = String(buildTauriEnv);
   const envContractSource = envSource.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/.*$/gmu, "");
   if (
-    configSource.includes("additionalBrowserArgs") ||
+    !configSource.includes("additionalBrowserArgs: directCdpBrowserArgumentsForPort(cdpPort)") ||
     configSource.includes("dataDirectory") ||
     !configSource.includes("io.github.kongweiguang.ja.e2e.run${frontendPort}") ||
     configSource.includes('identifier: "io.github.kongweiguang.ja.e2e"') ||
     !envContractSource.includes("WEBVIEW2_USER_DATA_FOLDER") ||
     !envContractSource.includes("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") ||
-    !envContractSource.includes("directCdpBrowserArgumentsForPort") ||
+    envContractSource.includes("directCdpBrowserArgumentsForPort") ||
     !directCdpBrowserArguments.includes("--remote-debugging-port=0") ||
     !directCdpBrowserArguments.includes(
       "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
@@ -39259,7 +39246,7 @@ function assertCdpDiscoveryContract() {
     directCdpBrowserArguments.includes("--enable-automation") ||
     directCdpBrowserArguments.includes("--test-type=webdriver")
   ) {
-    throw new Error("WebView2 环境级动态 CDP 启动合同漂移");
+    throw new Error("WebView2 窗口配置级动态 CDP 启动合同漂移");
   }
   if (
     !envSource.includes("JA_E2E_WEBVIEW_DATA_DIR") ||
@@ -39287,7 +39274,7 @@ function assertCdpDiscoveryContract() {
     !String(waitForCdp).includes("portArgMatch=${portArgumentMatches}") ||
     !String(waitForCdp).includes("addressArgMatch=${addressArgumentMatches}") ||
     !String(waitForCdp).includes("listenerQuery=failed") ||
-    !String(buildTauriEnv).includes("directCdpBrowserArgumentsForPort(cdpPort)")
+    !configSource.includes("directCdpBrowserArgumentsForPort(cdpPort)")
   ) {
     throw new Error("WebView2 动态端口 owner 复验合同漂移");
   }
@@ -41181,6 +41168,7 @@ async function main() {
         directories,
         frontendPort,
         edgeDriver !== undefined,
+        cdpPort,
       );
       if (phase === "first") {
         evidence.setup.config = { ready: true, path: redact(tauriConfigPath, directories) };
@@ -41189,7 +41177,6 @@ async function main() {
       const launch = startTauri(
         directories,
         frontendPort,
-        cdpPort,
         tauriConfigPath,
         exitTracePath,
         edgeDriver,
@@ -41199,7 +41186,6 @@ async function main() {
         pnpmCommand,
         cargoCommand,
         providerConfig !== undefined,
-        true,
       );
       if (!launch.child.pid) {
         throw new Error(`${phase} Tauri launcher 没有 PID`);

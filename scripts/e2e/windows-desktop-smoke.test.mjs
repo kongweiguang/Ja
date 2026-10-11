@@ -44,6 +44,7 @@ import {
   assertNativeViewportGeometry,
   combineProfilePrimeFailures,
   createRunDirectories,
+  writeE2eTauriConfig,
   windowsPathMatches,
   writeRunSummary,
   assertRuntimeIsolation,
@@ -8007,13 +8008,37 @@ test("binds JA_HOME to the current E2E profile instead of inheriting the user's 
 
   assert.match(environment, /USERPROFILE: directories\.settings/u);
   assert.match(environment, /JA_HOME: directories\.home/u);
-  assert.match(
-    environment,
-    /if \(edgeDriver === undefined && !enableDirectCdp\)[\s\S]*?delete env\.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS/u,
-  );
+  assert.match(environment, /delete env\.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS/u);
   assert.ok(
     environment.indexOf("...rootProcessEnv") < environment.indexOf("JA_HOME: directories.home"),
   );
+});
+
+/** 检查实际落盘的窗口配置，确保正式端口由官方配置传递且预热与 EdgeDriver 不抢占 CDP。
+ * @author kongweiguang
+ */
+test("writes direct CDP arguments only into the formal Tauri window overlay", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "ja-cdp-overlay-"));
+  try {
+    const directories = { runtime };
+    for (const [useEdgeDriver, cdpPort] of [
+      [false, undefined],
+      [false, 32145],
+      [true, 32145],
+    ]) {
+      const path = await writeE2eTauriConfig(directories, 32144, useEdgeDriver, cdpPort);
+      const config = JSON.parse(await readFile(path, "utf8"));
+      const args = config.app.windows[0].additionalBrowserArgs;
+      if (cdpPort === undefined || useEdgeDriver) {
+        assert.equal(args, undefined);
+      } else {
+        assert.match(args, /--remote-debugging-port=32145(?:\s|$)/u);
+        assert.match(args, /--remote-debugging-address=127\.0\.0\.1(?:\s|$)/u);
+      }
+    }
+  } finally {
+    await rm(runtime, { recursive: true, force: true });
+  }
 });
 
 /** 隐藏 CDP overlay 只覆盖四个明确的无原生前台门禁，避免扩散到需要真实窗口输入的场景。
