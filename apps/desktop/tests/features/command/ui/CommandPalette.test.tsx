@@ -69,6 +69,7 @@ afterEach(() => {
 });
 
 describe("CommandPalette UI", () => {
+  /** 等待 Dialog 的动画帧焦点交接，确保连续按键都发给命令输入框而非原触发控件。 */
   it("exposes listbox semantics and translates keyboard navigation into narrow actions", async () => {
     const user = userEvent.setup();
     const execute = vi.fn();
@@ -77,6 +78,7 @@ describe("CommandPalette UI", () => {
     await user.click(screen.getByRole("button", { name: "打开命令面板" }));
     const input = screen.getByRole("textbox", { name: "搜索命令" });
     const list = screen.getByRole("listbox", { name: "可用命令" });
+    await waitFor(() => expect(input).toHaveFocus());
     expect(input).toHaveAttribute("aria-controls", list.id);
     expect(input).toHaveAttribute("aria-activedescendant", "ja-command-first");
     expect(screen.getAllByRole("option")).toHaveLength(2);
