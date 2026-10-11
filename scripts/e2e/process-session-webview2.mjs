@@ -844,7 +844,7 @@ function installAdmissionInvokeProbe() {
   };
 }
 
-/** 复用真实 Thread 和隔离 Provider；诊断先观察准入，拒绝场景核对 ProcessSessionPanel 保留的 ToolResult。 */
+/** 复用真实 Thread 和隔离 Provider；执行证据限定真实输出区域，避免命令参数中的同名标记冒充 stdout。 */
 export async function runProcessSessionWebView2({
   page,
   workspaceRoot,
@@ -1068,10 +1068,10 @@ export async function runProcessSessionWebView2({
   await waitForFinal(page, approvalFinalMarker, deadline);
   const { details: approvedDetails } = await expandTool(page, "exec_command", deadline);
   assert.equal(await approvedDetails.getAttribute("data-status"), "success");
-  await approvedDetails.getByText("JA_APPROVAL_COMMAND_EXECUTED", { exact: false }).waitFor({
-    state: "visible",
-    timeout: timeout(deadline),
-  });
+  await approvedDetails
+    .locator(".ja-process-session__output, .ja-tool-details__output")
+    .filter({ hasText: "JA_APPROVAL_COMMAND_EXECUTED" })
+    .waitFor({ state: "visible", timeout: timeout(deadline) });
   await approvalCard.scrollIntoViewIfNeeded();
   assert.equal(
     await approvedStatus.isVisible(),
