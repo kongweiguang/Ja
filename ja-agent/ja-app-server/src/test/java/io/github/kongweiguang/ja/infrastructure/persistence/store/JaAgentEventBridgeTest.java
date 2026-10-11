@@ -997,6 +997,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /** Child Timeline 可先于 Core Conversation 创建完成 attachment；本地 ModelPort 不联网，首个 durable 状态仍须唯一投影。
+     * Fixture 持有 SQLite 临时文件，必须等借用 Store 的投影线程实际退出，而不能把 detach 的停止请求当作资源释放。
      * @author kongweiguang
      */
     @Test
@@ -1053,8 +1054,12 @@ final class JaAgentEventBridgeTest {
                     .build();
             CountDownLatch watchRegisteredBeforeAdmission = new CountDownLatch(1);
             AtomicReference<Boolean> conversationWasAbsentAtWatch = new AtomicReference<>();
+            AtomicReference<Thread> projectionWorker = new AtomicReference<>();
             AgentEngine observingEngine = (AgentEngine) Proxy.newProxyInstance(
                     AgentEngine.class.getClassLoader(), new Class<?>[]{AgentEngine.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("watchEvents")) {
+                            projectionWorker.set(Thread.currentThread());
+                        }
                         try {
                             Object result = method.invoke(engine, args);
                             if (method.getName().equals("watchEvents")) {
@@ -1084,7 +1089,8 @@ final class JaAgentEventBridgeTest {
                     return CompletableFuture.completedFuture(null);
                 }
             };
-            try (engine; bridge; AutoCloseable attachment = bridge.attach(identity,
+            try (AutoCloseable projectionExited = () -> awaitProjectionWorkerExit(projectionWorker);
+                    engine; bridge; AutoCloseable attachment = bridge.attach(identity,
                     ConversationTurnEventSink.turnEventsOnly(timeline))) {
                 assertTrue(store.loadConversation(conversation).isEmpty(),
                         "new Child Thread must have no Core Conversation before first admission");
@@ -1104,6 +1110,17 @@ final class JaAgentEventBridgeTest {
                         .count();
                 assertEquals(1, initialRunningStates, "the first durable state must be delivered exactly once");
             }
+        }
+    }
+
+    /** 正常关闭只解除订阅并中断 worker；等待真实线程退出后才能释放本 fixture 的 SQLite 文件所有权。
+     * @author kongweiguang
+     */
+    private static void awaitProjectionWorkerExit(AtomicReference<Thread> projectionWorker) throws InterruptedException {
+        Thread worker = projectionWorker.get();
+        if (worker != null) {
+            assertTrue(worker.join(Duration.ofSeconds(3)),
+                    "closed projection worker must exit before SQLite temporary directory cleanup");
         }
     }
 

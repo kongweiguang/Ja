@@ -4,10 +4,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { realpath } from "node:fs";
 import { lstat, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { runProduction } from "./review-redesign-production.mjs";
 import { providerStream } from "./media-schema-loopback.mjs";
 
@@ -337,8 +339,10 @@ async function waitForApplication(page, deadline) {
 /**
  * 在隔离空 profile 中通过“添加项目”入口选中 runner 创建的唯一 workspace，
  * 并等待 UI 与 App Server 同时确认项目绑定完成，避免首个 Turn 早于 workspace/open。
+ * 原生 realpath 与 Java 的 toRealPath 对齐 Windows 8.3 路径；普通 Node realpath 不会展开短名称。
  */
 async function bootstrapProject(page, workspaceRoot, deadline) {
+  const canonicalRoot = await promisify(realpath.native)(workspaceRoot);
   const selected = page.locator(
     '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
   );
@@ -369,18 +373,14 @@ async function bootstrapProject(page, workspaceRoot, deadline) {
               value.replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
             const history = createHistoryAdapter();
             if (history.workspaceRead === undefined) return false;
-            const record = await Promise.race([
-              history.workspaceRead({ workspaceId: id }),
-              new Promise((resolve) => globalThis.setTimeout(() => resolve(null), 1_000)),
-            ]);
-            if (record === null) return false;
+            const record = await history.workspaceRead({ workspaceId: id });
             return (
               record.workspaceId === id &&
               record.kind === "project" &&
               normalizePath(record.root) === normalizePath(rootPath)
             );
           },
-          { id: workspaceId, rootPath: workspaceRoot },
+          { id: workspaceId, rootPath: canonicalRoot },
         )
         .catch(() => false)
         .finally(() => {
@@ -393,7 +393,11 @@ async function bootstrapProject(page, workspaceRoot, deadline) {
     "project workspace binding",
     async () => {
       if (!(await selected.isEnabled())) return false;
-      return probeWorkspace();
+      // 超时只结束这一轮等待；native 请求真正完成前仍复用同一个 probe。
+      return Promise.race([
+        probeWorkspace(),
+        new Promise((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
+      ]);
     },
     deadline,
   );
@@ -681,8 +685,14 @@ async function captureFailureArtifacts(
       runtimeEvidenceStatus = "preserved_before_failure";
     } catch {
       try {
+        const workspaceId = await page
+          .locator('[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]')
+          .evaluate((element) =>
+            element.closest("[data-workspace-id]")?.getAttribute("data-workspace-id"),
+          );
         const runtimeEvidence = await readFirstTurnRuntimeEvidence(page, {
           threadId,
+          workspaceId,
           callId: processCallId,
         });
         await writeFile(
