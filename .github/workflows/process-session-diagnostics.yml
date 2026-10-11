@@ -49,6 +49,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # 只比较身份关系，不读取文件正文或输出实际 SID；验证旧手写夹具在 elevated token 下的 owner 差异。
+          $aclFixture = Join-Path $env:RUNNER_TEMP "ja-owner-fixture-$env:GITHUB_RUN_ID.json"
+          [IO.File]::WriteAllText($aclFixture, '{}')
+          $fixtureAccount = "$env:USERDOMAIN\$env:USERNAME"
+          icacls.exe $aclFixture /inheritance:r /grant:r "$($fixtureAccount):(F)" | Out-Null
+          $fixtureAcl = Get-Acl -LiteralPath $aclFixture
+          $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $ownerSid = $fixtureAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+          $fixtureEntries = @($fixtureAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+          @{ ownerMatchesCurrent = ($ownerSid -eq $currentSid); aceMatchesCurrent = ($fixtureEntries.Count -eq 1 -and $fixtureEntries[0].IdentityReference.Value -eq $currentSid); entryCount = $fixtureEntries.Count; protected = $fixtureAcl.AreAccessRulesProtected } | ConvertTo-Json -Compress
+          Remove-Item -LiteralPath $aclFixture
           $jar = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
           node scripts/e2e/process-session-webview2.mjs --java-home $env:JAVA_HOME --jar $jar --evidence-directory .tmp/process-session-diagnostics
       - name: Preserve fixed-field failure evidence

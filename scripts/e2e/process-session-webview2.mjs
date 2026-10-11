@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { realpath } from "node:fs";
-import { lstat, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -404,12 +404,17 @@ async function bootstrapProject(page, workspaceRoot, deadline) {
   return workspaceId;
 }
 
-/** 只验证隔离 Provider 配置已被生产 Settings adapter 读到，不绕过对话控制器建 Thread。 */
+/**
+ * @author kongweiguang
+ * 占位凭据由生产 Settings/Java owner 创建并回读，避免手写 auth.json 的 ACL 在 elevated runner 上失效。
+ * Provider 与模型仍来自隔离配置，Thread 继续通过真实对话控件创建。
+ */
 async function verifyFixtureProvider(page, endpoint) {
   return page.evaluate(async (providerEndpoint) => {
     const { TauriSettingsAdapter } = await import("/src/api/tauri/settings.ts");
-    const settings = await new TauriSettingsAdapter().snapshot();
-    const provider = settings.document.providers.find(
+    const settings = new TauriSettingsAdapter();
+    const snapshot = await settings.snapshot();
+    const provider = snapshot.document.providers.find(
       (candidate) => candidate.providerId === "provider_e2e",
     );
     if (provider === undefined || provider.baseUrl !== providerEndpoint) {
@@ -417,6 +422,18 @@ async function verifyFixtureProvider(page, endpoint) {
     }
     if (provider.models[0]?.modelId === undefined) {
       throw new Error("isolated loopback model is unavailable");
+    }
+    await settings.setCredential(
+      provider.credentialId,
+      "unused-review-fixture",
+      snapshot.cas.credentialVersion,
+    );
+    const verified = await settings.snapshot();
+    if (
+      verified.document.providers.find((candidate) => candidate.providerId === provider.providerId)
+        ?.credentialConfigured !== true
+    ) {
+      throw new Error("isolated loopback credential is unavailable after owner provisioning");
     }
     return { providerId: provider.providerId, modelId: provider.models[0].modelId };
   }, endpoint);
@@ -1517,6 +1534,10 @@ async function main() {
       hiddenWindow: true,
       prewarmWebview: true,
       preserveFailedProfile: true,
+      /** 本轮一次性 home 移除通用 runner 手写的占位凭据，由上面的 Java lifecycle 负责创建受保护文件。 */
+      prepareIsolatedHome: async ({ home }) => {
+        await unlink(join(home, "auth.json"));
+      },
       driver: async (driverOptions) => {
         let threadId;
         try {
