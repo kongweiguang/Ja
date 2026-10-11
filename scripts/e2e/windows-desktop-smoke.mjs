@@ -23901,6 +23901,93 @@ async function openNarrowTerminalPaneMenu(page, pane, deadline, signal) {
   return { trigger, menu, width };
 }
 
+/**
+ * 根据目标 pane 当前实际可见的响应式按钮选择关闭路径；只要求唯一控件可见，
+ * 不从 border-box 宽度复算 CSS container query 的 content-box 断点。
+ */
+export function terminalPaneCloseRoute({ paneWidth, moreVisible, toolbarCloseVisible }) {
+  if (!Number.isFinite(paneWidth) || paneWidth < 0)
+    throw new Error("终端 pane 关闭路由缺少有效几何");
+  if (moreVisible === toolbarCloseVisible) throw new Error("终端 pane 关闭入口必须恰有一个可见");
+  return moreVisible ? "more" : "toolbar";
+}
+
+/**
+ * 关闭指定 pane 时遵循其实际 container-query 入口；DOM/ARIA 与可见状态都纳入闭集证据，
+ * 任一不一致即停止，避免对另一个 pane 的窄状态作推断或回退到隐藏控件。
+ */
+async function closeTerminalPaneWithResponsiveControl(page, pane, deadline, signal) {
+  const more = pane.locator("button.ja-terminal-pane-menu-trigger");
+  const directClose = pane.locator('button[aria-label="关闭终端窗格"]');
+  const moreDomCount = await more.count();
+  const closeDomCount = await directClose.count();
+  const moreRole = pane.getByRole("button", { name: /^终端窗格操作：/u });
+  const closeRole = pane.getByRole("button", { name: "关闭终端窗格", exact: true });
+  const moreRoleCount = await moreRole.count();
+  const closeRoleCount = await closeRole.count();
+  const moreVisible = moreDomCount === 1 && (await more.isVisible());
+  const toolbarCloseVisible = closeDomCount === 1 && (await directClose.isVisible());
+  const paneFacts = await pane.evaluate((element) => {
+    const style = globalThis.getComputedStyle(element);
+    return {
+      paneId: element.getAttribute("data-pane-id"),
+      paneWidth: Number(element.getBoundingClientRect().width.toFixed(2)),
+      paneDisplay: style.display === "none" ? "none" : "shown",
+      paneVisibility: style.visibility === "hidden" ? "hidden" : "shown",
+    };
+  });
+  const evidence = {
+    ...paneFacts,
+    moreDomCount,
+    moreRoleCount,
+    moreVisible,
+    closeDomCount,
+    closeRoleCount,
+    toolbarCloseVisible,
+  };
+  // 失败只投影本地窗格几何与按钮状态，避免把页面文案写入 E2E summary。
+  const fail = (reason) => new Error(`${reason}：${JSON.stringify(evidence)}`);
+
+  let route;
+  try {
+    if (moreDomCount !== 1 || closeDomCount !== 1)
+      throw new Error("目标 pane 工具栏 DOM 控件数量异常");
+    route = terminalPaneCloseRoute({
+      paneWidth: paneFacts.paneWidth,
+      moreVisible,
+      toolbarCloseVisible,
+    });
+    if (route === "more" && moreRoleCount !== 1)
+      throw new Error("窄 pane More 缺少唯一可访问按钮语义");
+    if (route === "toolbar" && closeRoleCount !== 1)
+      throw new Error("宽 pane 直接关闭缺少唯一可访问按钮语义");
+  } catch (error) {
+    throw fail(error instanceof Error ? error.message : "目标 pane 关闭入口状态无效");
+  }
+
+  if (route === "toolbar") {
+    await clickVerifiedControl(page, closeRole, deadline);
+    return { route, evidence };
+  }
+
+  if ((await more.getAttribute("aria-haspopup")) !== "menu")
+    throw fail("窄 pane More 未声明 menu 弹出语义");
+  await clickVerifiedControl(page, moreRole, deadline);
+  const menu = page.getByRole("menu", { name: "终端窗格操作", exact: true });
+  await menu.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
+  await waitForRenderedSurface(menu, "终端窗格操作菜单", deadline, signal);
+  if ((await more.getAttribute("aria-expanded")) !== "true")
+    throw fail("窄 pane More 展开后 aria-expanded 未更新");
+  const closeAction = menu.getByRole("menuitem", {
+    name: "关闭终端窗格",
+    exact: true,
+  });
+  if (!(await closeAction.isEnabled())) throw fail("窄 pane 菜单关闭动作不可用");
+  await clickVerifiedControl(page, closeAction, deadline);
+  await menu.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
+  return { route, evidence };
+}
+
 /** 拆分 pane 并返回新分配的 identity；窄窗格走同一 PointerContextMenu，宽窗格保留原 toolbar 动作。 */
 async function splitTerminalPane(page, panel, paneId, orientation, deadline, signal) {
   const before = await panel
@@ -24717,14 +24804,17 @@ async function exerciseTerminalWorkspace(
     const closingPane = first.panel.locator(
       `.ja-terminal-pane[data-pane-id="${closedByMenuPaneId}"]`,
     );
-    const closeMenuState = await openNarrowTerminalPaneMenu(page, closingPane, deadline, signal);
-    const closeMenuAction = closeMenuState.menu.getByRole("menuitem", {
-      name: "关闭终端窗格",
-      exact: true,
-    });
-    if (!(await closeMenuAction.isEnabled())) throw new Error("新建窄 pane 的菜单关闭动作不可用");
-    await clickVerifiedControl(page, closeMenuAction, deadline);
-    await closeMenuState.menu.waitFor({ state: "detached", timeout: timeout() });
+    const closeControl = await closeTerminalPaneWithResponsiveControl(
+      page,
+      closingPane,
+      deadline,
+      signal,
+    );
+    terminalWorkspaceLastObservation = {
+      stage: "responsive_pane_close_control_selected",
+      ...closeControl.evidence,
+      route: closeControl.route,
+    };
     await closingPane.waitFor({ state: "detached", timeout: timeout() });
     await page.waitForFunction(
       ({ panelId, expected }) =>
@@ -24741,7 +24831,7 @@ async function exerciseTerminalWorkspace(
       first.panel,
       survivingPaneSessions,
       3,
-      "More 菜单关闭窄 pane",
+      "响应式关闭入口关闭 pane",
     );
     closeFocus = await waitForTerminalTabFocusAfterPaneClose(page, first.panelId, deadline, signal);
 

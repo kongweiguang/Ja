@@ -67,6 +67,7 @@ import {
   waitForWorkbenchTabClosed,
   waitForStableTerminalPaneWidth,
   deriveTerminalPaneRatioFromPointerEvidence,
+  terminalPaneCloseRoute,
   terminalWorkspaceFailureSummary,
   workbenchCloseFocusEvidenceInPage,
   waitForWorkbenchCloseFocus,
@@ -1101,6 +1102,9 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
     /if \(resized\.paneWidth >= 64\)[\s\S]*?JSON\.stringify\(\{ current, resized \}\)/u,
   );
   assert.match(narrow, /geometry: resized\.geometry/u);
+  assert.match(workflow, /openNarrowTerminalPaneMenu\([\s\S]*?narrowPaneId/u);
+  assert.match(workflow, /closeTerminalPaneWithResponsiveControl\([\s\S]*?closingPane/u);
+  assert.match(workflow, /responsive_pane_close_control_selected/u);
   assert.match(filesWait, /waitForCondition\(/u);
   assert.match(filesWait, /references\.evaluate\(readFilesTreeGeometryFromReferences\)/u);
   assert.match(filesWait, /identityChanged[\s\S]*?stableSamples = 0/u);
@@ -1114,6 +1118,52 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
   assert.match(workflow, /createDeadline\("Terminal 窄窗恢复清理", 5_000\)/u);
   assert.match(workflow, /cleanupDeadline\.cancel\(\)/u);
   assert.match(workflow, /new AggregateError\([\s\S]*?\{ cause: workflowFailure \}/u);
+});
+
+/** 关闭新 pane 依目标自己的响应式控件；无控件或双控件可见都必须作为 UI 回归失败。 */
+test("routes Terminal pane close through one visible responsive control", async () => {
+  assert.equal(
+    terminalPaneCloseRoute({
+      paneWidth: 43.7,
+      moreVisible: true,
+      toolbarCloseVisible: false,
+    }),
+    "more",
+  );
+  assert.equal(
+    terminalPaneCloseRoute({
+      paneWidth: 70.4,
+      moreVisible: true,
+      toolbarCloseVisible: false,
+    }),
+    "more",
+  );
+  assert.equal(
+    terminalPaneCloseRoute({
+      paneWidth: 160,
+      moreVisible: false,
+      toolbarCloseVisible: true,
+    }),
+    "toolbar",
+  );
+  assert.throws(
+    () =>
+      terminalPaneCloseRoute({
+        paneWidth: 160,
+        moreVisible: false,
+        toolbarCloseVisible: false,
+      }),
+    /恰有一个可见/u,
+  );
+  assert.throws(
+    () =>
+      terminalPaneCloseRoute({
+        paneWidth: 43.7,
+        moreVisible: true,
+        toolbarCloseVisible: true,
+      }),
+    /恰有一个可见/u,
+  );
 });
 
 /** 期望比例必须来自本次 release 事件和 pointerdown 抓取偏移，而非 runner 的目标坐标。 */
