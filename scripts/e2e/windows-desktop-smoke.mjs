@@ -2520,11 +2520,19 @@ function combineSignals(signals) {
 }
 
 /**
- * 保证测试临时目录树仅供一次调用使用；随机后缀还使其 workspace identity
- * 与开发者现有 Ja 历史数据库彼此独立。
+ * 先规范化刚创建的随机根，再派生各目录；Rust 会在 sidecar 参数中编码规范路径，必须与 E2E owner 比较共用同一拼写。
+ * 随机后缀还使 workspace identity 与开发者现有 Ja 历史数据库彼此独立。
+ * @author kongweiguang
  */
-async function createRunDirectories() {
-  const root = await mkdtemp(join(tmpdir(), "ja-desktop-e2e-"));
+export async function createRunDirectories(temporaryDirectory = tmpdir()) {
+  const createdRoot = await mkdtemp(join(temporaryDirectory, "ja-desktop-e2e-"));
+  let root;
+  try {
+    root = realpathSync.native(createdRoot);
+  } catch (error) {
+    Object.defineProperty(error, "e2eRoot", { value: createdRoot, enumerable: false });
+    throw error;
+  }
   const workspace = join(root, "workspace");
   const settings = join(root, "settings");
   // 生产 Host 从隔离 USERPROFILE 解析唯一 Ja Home；fixture 必须写入同一个目录，不能另造
@@ -8012,8 +8020,9 @@ export async function readRuntimeEndpointMetadata(directories) {
 }
 
 /**
- * 每次运行断言先冻结私有 endpoint 的监听 owner，再重读文件与 CIM 验证竞态；证明仅保存在
- * 本轮 directories 的非枚举字段中，后续共享后台复用也必须复验同一 endpoint 与完整身份。
+ * 每次运行断言先冻结私有 endpoint 的监听 owner，再重读文件与 CIM 验证竞态；失败诊断只投影本 launcher 后代或已冻结 owner。
+ * 证明仅保存在本轮 directories 的非枚举字段中，后续共享后台复用也必须复验同一 endpoint 与完整身份。
+ * @author kongweiguang
  */
 async function captureRuntimeIsolation(
   nativeScope,
@@ -8049,8 +8058,26 @@ async function captureRuntimeIsolation(
     await ownedTcpListeners(new Set(candidates.map((entry) => entry.pid)), signal)
   ).filter((listener) => listener.address === endpoint.host && listener.port === endpoint.port);
   const ownerPids = [...new Set(listeners.map((listener) => listener.ownerPid))];
-  if (ownerPids.length !== 1)
-    rejectRuntimeIsolation("endpoint_listener_owner_not_unique", nativeScope);
+  if (ownerPids.length !== 1) {
+    const tree = processTree(nativeScope?.rootIdentity, before, nativeScope?.incompleteObserved);
+    const scopedEntries = before.filter(
+      (entry) =>
+        hasProcessIdentity(entry) &&
+        names.has(String(entry.name).toLowerCase()) &&
+        ((tree !== undefined && sameProcessIdentity(tree.get(entry.pid), entry)) ||
+          (saved !== undefined && sameProcessIdentity(saved.ownerIdentity, entry))),
+    );
+    const diagnosticEntries = [
+      ...new Map(
+        [...scopedEntries, ...candidates].map((entry) => [runtimeProcessIdentityKey(entry), entry]),
+      ).values(),
+    ];
+    const candidateFacts = diagnosticEntries.map((entry) => ({
+      entry,
+      arguments: runtimeSidecarArguments(entry, expected, directories),
+    }));
+    rejectRuntimeIsolation("endpoint_listener_owner_not_unique", nativeScope, candidateFacts);
+  }
   const ownerIdentity = candidates.find((entry) => entry.pid === ownerPids[0]);
   if (sameEndpoint && !sameProcessIdentity(saved.ownerIdentity, ownerIdentity)) {
     rejectRuntimeIsolation("saved_endpoint_listener_owner_changed", nativeScope);
@@ -18226,11 +18253,13 @@ async function exerciseNativeReviewFlow(
 /**
  * 只关闭文件夹与本轮随机 workspace 完全匹配的 Explorer 窗口。
  * 这里通过 Windows PowerShell 5.1 使用 Shell.Application，因为它是所有受支持机器上
- * 均可用的操作系统原生 COM host。
+ * 均可用的操作系统原生 COM host；归属前把临时根规范化，确保与已规范化的 E2E root 拼写一致。
+ * @author kongweiguang
  */
 async function closeWorkspaceExplorerWindow(workspace, signal) {
   const resolvedWorkspace = resolve(workspace);
-  const tempPrefix = `${resolve(tmpdir()).replace(/[\\/]$/u, "")}\\ja-desktop-e2e-`.toLowerCase();
+  const canonicalTemp = realpathSync.native(resolve(tmpdir()));
+  const tempPrefix = `${canonicalTemp.replace(/[\\/]$/u, "")}\\ja-desktop-e2e-`.toLowerCase();
   if (!resolvedWorkspace.toLowerCase().startsWith(tempPrefix)) {
     throw new Error("拒绝关闭非 E2E 工作区的 Explorer 窗口");
   }
@@ -38756,8 +38785,9 @@ export async function writeRunSummary(runId, evidence, status, error, directorie
 }
 
 /**
- * 只移除 runner 创建的临时根；部分 setup 失败可能只提供该根路径，
- * 因此防护逻辑不得假设目录对象完整。
+ * 只移除 runner 创建的临时根；部分 setup 失败可能只提供该根路径，因此不依赖完整目录对象。
+ * 临时根和目标根都先按物理拼写比较，避免 8.3 alias 让安全边界检查误拒绝或误判。
+ * @author kongweiguang
  */
 async function cleanupRunRoot(root) {
   if (typeof root !== "string" || root.trim() === "") {
@@ -38768,7 +38798,12 @@ async function cleanupRunRoot(root) {
     return;
   }
   const resolvedRoot = resolve(root);
-  const resolvedTemp = resolve(tmpdir()).replace(/[\\/]$/, "");
+  let resolvedTemp;
+  try {
+    resolvedTemp = realpathSync.native(resolve(tmpdir())).replace(/[\\/]$/, "");
+  } catch {
+    return;
+  }
   const prefix = `${resolvedTemp}\\ja-desktop-e2e-`.toLowerCase();
   if (
     resolvedRoot.toLowerCase() === resolvedTemp.toLowerCase() ||

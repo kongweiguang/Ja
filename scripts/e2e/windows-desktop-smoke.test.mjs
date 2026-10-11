@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
@@ -42,6 +43,7 @@ import {
   attachMaximizedWindowEvidence,
   assertNativeViewportGeometry,
   combineProfilePrimeFailures,
+  createRunDirectories,
   windowsPathMatches,
   writeRunSummary,
   assertRuntimeIsolation,
@@ -2223,15 +2225,8 @@ test("writes nested profile prime failures into the redacted run summary", async
 });
 
 /** @author kongweiguang 使用 Win32 真实短名与完整路径验证 profile 归属匹配，不模拟 native realpath 语义。 */
-test("matches WebView2 profile paths across Windows 8.3 aliases", async (t) => {
-  if (process.platform !== "win32") {
-    t.skip("Windows short-path alias regression requires Win32");
-    return;
-  }
-
-  const longPath = await mkdtemp(join(tmpdir(), "ja webview profile "));
-  try {
-    const powershell = String.raw`
+function getWindowsShortPath(longPath) {
+  const powershell = String.raw`
 $path = $env:JA_E2E_LONG_PATH
 Add-Type -TypeDefinition @'
 using System.Text;
@@ -2246,10 +2241,22 @@ $length = [JaProfileShortPathProbe]::GetShortPathName($path, $buffer, [uint32]$b
 if ($length -eq 0 -or $length -ge $buffer.Capacity) { exit 2 }
 $buffer.ToString()
 `;
-    const shortPath = execFileSync("pwsh", ["-NoProfile", "-Command", powershell], {
-      encoding: "utf8",
-      env: { ...process.env, JA_E2E_LONG_PATH: longPath },
-    }).trim();
+  return execFileSync("pwsh", ["-NoProfile", "-Command", powershell], {
+    encoding: "utf8",
+    env: { ...process.env, JA_E2E_LONG_PATH: longPath },
+  }).trim();
+}
+
+/** @author kongweiguang 使用 Win32 真实短名与完整路径验证 profile 归属匹配，不模拟 native realpath 语义。 */
+test("matches WebView2 profile paths across Windows 8.3 aliases", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows short-path alias regression requires Win32");
+    return;
+  }
+
+  const longPath = await mkdtemp(join(tmpdir(), "ja webview profile "));
+  try {
+    const shortPath = getWindowsShortPath(longPath);
     if (shortPath.toLowerCase() === longPath.toLowerCase() || !shortPath.includes("~")) {
       t.skip("8.3 short paths are disabled for the temporary volume");
       return;
@@ -2261,6 +2268,33 @@ $buffer.ToString()
     );
   } finally {
     await rm(longPath, { recursive: true, force: true });
+  }
+});
+
+/** @author kongweiguang 将 8.3 父目录传给真实目录工厂，验证 sidecar 期望路径由同一规范 root 派生。 */
+test("canonicalizes the E2E root before deriving runtime sidecar directories", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows short-path root regression requires Win32");
+    return;
+  }
+
+  const longParent = await mkdtemp(join(tmpdir(), "ja e2e root parent "));
+  try {
+    const shortParent = getWindowsShortPath(longParent);
+    if (shortParent.toLowerCase() === longParent.toLowerCase() || !shortParent.includes("~")) {
+      t.skip("8.3 short paths are disabled for the temporary volume");
+      return;
+    }
+
+    const directories = await createRunDirectories(shortParent);
+    const canonicalParent = realpathSync.native(longParent);
+    assert.equal(directories.root, realpathSync.native(directories.root));
+    assert.ok(directories.root.toLowerCase().startsWith(`${canonicalParent.toLowerCase()}\\`));
+    assert.equal(directories.home, join(directories.settings, ".ja"));
+    assert.equal(directories.data, join(directories.home, "data"));
+    assert.equal(directories.runtime, join(directories.root, "runtime"));
+  } finally {
+    await rm(longParent, { recursive: true, force: true });
   }
 });
 
