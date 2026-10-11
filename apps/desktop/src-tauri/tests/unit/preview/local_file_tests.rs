@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::preview::local_file::{
-    browser_document_extension, html_document_extension, normalize_workspace_relative_target,
-    is_local_media_preview_url, parse_absolute_or_file_target, validate_target,
+    browser_document_extension, browser_target_error_code, html_document_extension,
+    normalize_workspace_relative_target, is_local_media_preview_url, parse_absolute_or_file_target,
+    validate_target,
 };
 use crate::preview::{PreviewErrorCode, PreviewMode, PreviewResolveFileInput};
 use std::path::PathBuf;
@@ -90,6 +91,28 @@ fn common_browser_document_extensions_are_recognized() {
     assert!(html_document_extension("xhtml"));
     assert!(!browser_document_extension("unknown"));
     assert!(!html_document_extension("unknown"));
+}
+
+/// A resolved directory has a distinct browser rejection while all non-browser file kinds stay unsupported.
+/// @author kongweiguang
+#[test]
+fn browser_target_rejection_preserves_directory_and_unsupported_kinds() {
+    assert_eq!(
+        browser_target_error_code(crate::preview::PreviewFileKind::Directory),
+        Some(PreviewErrorCode::FileIsDirectory),
+    );
+    assert_eq!(
+        browser_target_error_code(crate::preview::PreviewFileKind::Unsupported),
+        Some(PreviewErrorCode::LocalFileUnsupported),
+    );
+    assert_eq!(
+        browser_target_error_code(crate::preview::PreviewFileKind::Text),
+        Some(PreviewErrorCode::LocalFileUnsupported),
+    );
+    assert_eq!(
+        browser_target_error_code(crate::preview::PreviewFileKind::Browser),
+        None,
+    );
 }
 
 /// 媒体 abort 豁免只接受 file URI 中已有 MIME 映射的本地音视频，覆盖中文、空格与大小写扩展名。

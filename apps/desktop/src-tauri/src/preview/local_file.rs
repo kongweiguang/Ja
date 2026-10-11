@@ -250,7 +250,8 @@ struct WorkspaceBindingGuard {
     resolved: ResolvedPath,
 }
 
-/// 在最终打开边界重新解析，防止过期 UI DTO 授权一个已被替换的路径。
+/// 在最终打开边界重新解析，防止过期 UI DTO 授权一个已被替换的路径；目录与其它非 Browser 类型
+/// 使用各自稳定的拒绝类别，让地址栏错误准确说明目标类型而不改变路径或权限失败语义。
 pub(crate) fn resolve_browser_target(
     runtime: &RuntimeHost,
     target: &str,
@@ -267,10 +268,22 @@ pub(crate) fn resolve_browser_target(
             preview_mode,
         },
     )?;
-    if resolution.kind != PreviewFileKind::Browser {
-        return Err(PreviewError::new(PreviewErrorCode::LocalFileUnsupported));
+    if let Some(code) = browser_target_error_code(resolution.kind) {
+        return Err(PreviewError::new(code));
     }
     Ok(resolution)
+}
+
+/// Keep directory rejection specific while unsupported resolved files retain the generic browser error.
+/// @author kongweiguang
+pub(crate) fn browser_target_error_code(kind: PreviewFileKind) -> Option<PreviewErrorCode> {
+    match kind {
+        PreviewFileKind::Browser => None,
+        PreviewFileKind::Directory => Some(PreviewErrorCode::FileIsDirectory),
+        PreviewFileKind::Text | PreviewFileKind::Unsupported => {
+            Some(PreviewErrorCode::LocalFileUnsupported)
+        }
+    }
 }
 
 /// 相对路径在一个 handle 锁内解析并记录内部 identity；Markdown 的 Windows 分隔符归一为协议 slash，

@@ -4,6 +4,11 @@ name: Ja native smoke diagnostics
 on:
   workflow_dispatch:
     inputs:
+      run_macos:
+        description: Run macOS diagnostics only when source reuse remains valid
+        required: true
+        default: true
+        type: boolean
       run_windows:
         description: Run Windows diagnostics in addition to both macOS targets
         required: true
@@ -83,6 +88,7 @@ jobs:
           retention-days: 3
 
   macos-file-search:
+    if: ${{ inputs.run_macos }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
