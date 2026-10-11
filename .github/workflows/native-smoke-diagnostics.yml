@@ -4,6 +4,11 @@ name: Ja native smoke diagnostics
 on:
   workflow_dispatch:
     inputs:
+      run_windows:
+        description: Run Windows diagnostics in addition to both macOS targets
+        required: true
+        default: true
+        type: boolean
       native_run_id:
         description: Native artifact run ID for source 15af5bc38a1684bcd4da7b63d343eae9787e222d
         required: true
@@ -13,6 +18,7 @@ permissions:
   actions: read
 jobs:
   windows-desktop:
+    if: ${{ inputs.run_windows }}
     runs-on: windows-2025
     # The smoke retains its 30-minute deadline; setup and a cold Rust build use only the job's outer budget.
     timeout-minutes: 60
@@ -101,7 +107,7 @@ jobs:
         with:
           node-version: 24.10.0
           cache: pnpm
-      - uses: actions/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           python-version: "3.13"
       - name: Guard exact native source and diagnostics-only changes
