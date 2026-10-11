@@ -5226,9 +5226,20 @@ test("bounds Thread reselect and still requires the enabled real Composer to own
   const { dom } = nativeReviewFixture();
   try {
     const threadId = "thr_focus_bounded";
+    const retainedSideChat = dom.window.document.createElement("section");
+    retainedSideChat.hidden = true;
+    retainedSideChat.setAttribute("inert", "");
+    const sideChatComposer = dom.window.document.createElement("textarea");
+    sideChatComposer.setAttribute("aria-label", "消息");
+    retainedSideChat.append(sideChatComposer);
+    dom.window.document.body.append(retainedSideChat);
+
+    const conversation = dom.window.document.createElement("main");
+    conversation.id = "conversation";
     const textarea = dom.window.document.createElement("textarea");
     textarea.setAttribute("aria-label", "消息");
-    dom.window.document.body.append(textarea);
+    conversation.append(textarea);
+    dom.window.document.body.append(conversation);
     const list = dom.window.document.createElement("div");
     list.setAttribute("aria-label", "最近对话列表");
     const selected = dom.window.document.createElement("button");
@@ -5237,6 +5248,15 @@ test("bounds Thread reselect and still requires the enabled real Composer to own
     list.append(selected);
     dom.window.document.body.append(list);
     textarea.focus();
+    assert.equal(
+      dom.window.document.querySelector('textarea[aria-label="消息"]'),
+      sideChatComposer,
+    );
+    assert.equal(dom.window.document.activeElement, textarea);
+    assert.notEqual(
+      dom.window.document.activeElement,
+      dom.window.document.querySelector('textarea[aria-label="消息"]'),
+    );
 
     const waitTimeouts = [];
     const page = {

@@ -27567,13 +27567,16 @@ async function clickVerifiedControl(page, locator, deadline) {
 }
 
 /**
- * 等待真实 WebView2 把焦点交给当前可编辑 Composer；用 activeElement 验证最终键盘落点，
- * 避免仅凭 textarea 可见就把侧栏或 Dialog 仍持有焦点误报为通过。
+ * 等待真实 WebView2 把焦点交给主正文中可编辑的 Composer；主会话与保留侧聊共用无障碍名称，
+ * 因而必须跟随应用导航的 #conversation 所有权，不能被更早挂载的隐藏侧聊 textarea 误导。
+ * @author kongweiguang
  */
 async function waitForComposerFocus(page, deadline) {
   await page.waitForFunction(
     () => {
-      const composer = globalThis.document.querySelector('textarea[aria-label="消息"]');
+      const composer = globalThis.document.querySelector(
+        '#conversation textarea[aria-label="消息"]',
+      );
       return (
         composer instanceof globalThis.HTMLTextAreaElement &&
         !composer.disabled &&
