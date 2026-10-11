@@ -46,6 +46,98 @@ const START_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SAFE_RPC_INTEGER: u64 = 9_007_199_254_740_991;
+const RUNTIME_STARTUP_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.runtime_startup";
+
+/// 启动诊断仅保存闭集阶段与经过计时的相对耗时，不携带 host 数据或协议内容。
+struct RuntimeStartupDiagnostics {
+    started_at: Instant,
+    current_phase: &'static str,
+    reported_phases: Vec<&'static str>,
+}
+
+impl RuntimeStartupDiagnostics {
+    /// 在启动入口创建一次计时上下文，使跨锁、进程启动与 RPC 握手共用同一预算坐标。
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            current_phase: "initial_connect",
+            reported_phases: Vec::new(),
+        }
+    }
+
+    /// 只记录每个阶段首次进入，循环轮询不会放大日志；字段保持为编译期阶段名与整数时间。
+    fn enter(&mut self, phase: &'static str) {
+        self.current_phase = phase;
+        if self.reported_phases.contains(&phase) {
+            return;
+        }
+        self.reported_phases.push(phase);
+        tracing::info!(
+            target: RUNTIME_STARTUP_DIAGNOSTIC_TARGET,
+            phase,
+            variant = "entered",
+            elapsed_ms = self.elapsed_ms(),
+            "runtime startup phase"
+        );
+    }
+
+    /// 失败日志仅输出阶段与 AppServerProcessError 的稳定类别，避免底层错误文本泄漏宿主信息。
+    fn fail(&self, error: &AppServerProcessError) {
+        tracing::warn!(
+            target: RUNTIME_STARTUP_DIAGNOSTIC_TARGET,
+            phase = self.current_phase,
+            variant = startup_error_variant(error),
+            elapsed_ms = self.elapsed_ms(),
+            "runtime startup failed"
+        );
+    }
+
+    /// 启动成功只产生一条完成事件，给诊断尾部提供可对照的整体耗时。
+    fn complete(&self) {
+        tracing::info!(
+            target: RUNTIME_STARTUP_DIAGNOSTIC_TARGET,
+            phase = "complete",
+            variant = "success",
+            elapsed_ms = self.elapsed_ms(),
+            "runtime startup completed"
+        );
+    }
+
+    /// 将 elapsed 转为有界整数，避免依赖格式化自由文本或溢出诊断字段。
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// 将进程错误压缩为 formatter 可审核的闭集类别，原始错误和路径不进入事件字段。
+fn startup_error_variant(error: &AppServerProcessError) -> &'static str {
+    match error {
+        AppServerProcessError::InvalidConfig => "invalid_config",
+        AppServerProcessError::InvalidTimeout => "invalid_timeout",
+        AppServerProcessError::Codec(_) => "protocol_fault",
+        AppServerProcessError::QueueFull(_) => "queue_full",
+        AppServerProcessError::QueueClosed(_) => "queue_closed",
+        AppServerProcessError::PendingLimit => "pending_limit",
+        AppServerProcessError::RpcRequestLedgerExhausted => "request_ledger_exhausted",
+        AppServerProcessError::DuplicateRequest => "duplicate_request",
+        AppServerProcessError::DeadlineExceeded => "deadline_exceeded",
+        AppServerProcessError::Cancelled => "cancelled",
+        AppServerProcessError::SessionClosed => "session_closed",
+        AppServerProcessError::NotReady => "not_ready",
+        AppServerProcessError::Incompatible => "incompatible",
+        AppServerProcessError::InvalidState => "invalid_state",
+        AppServerProcessError::Spawn => "spawn",
+        AppServerProcessError::ProcessTree => "process_tree",
+        AppServerProcessError::ProcessExited => "process_exited",
+        AppServerProcessError::ShuttingDown => "shutting_down",
+        AppServerProcessError::HandshakeFailed => "handshake_failed",
+        AppServerProcessError::ProtocolFault => "protocol_fault",
+        AppServerProcessError::InvalidErrorCatalog => "invalid_error_catalog",
+        AppServerProcessError::ShutdownTimeout => "shutdown_timeout",
+        AppServerProcessError::Backoff { .. } => "backoff",
+        AppServerProcessError::Faulted => "faulted",
+    }
+}
 
 /// Java 原子发布的唯一端点形状；令牌只留在连接建立栈上，不进入公开状态或诊断。
 #[derive(Deserialize)]
@@ -144,34 +236,76 @@ impl SharedAppServerClient {
         let deadline = Instant::now()
             .checked_add(config.ready_timeout)
             .ok_or(AppServerProcessError::InvalidTimeout)?;
-        match Self::connect_existing_until(&config, identity, deadline) {
-            Ok(client) => return Ok(client),
+        let mut diagnostics = RuntimeStartupDiagnostics::new();
+        diagnostics.enter("initial_connect");
+        match Self::connect_existing_until(&config, identity, deadline, Some(&mut diagnostics)) {
+            Ok(client) => {
+                diagnostics.complete();
+                return Ok(client);
+            }
             Err(AppServerProcessError::NotReady) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                diagnostics.fail(&error);
+                return Err(error);
+            }
         }
-        let lock = acquire_start_lock(&config.run_dir, deadline)?;
-        match Self::connect_existing_until(&config, identity, deadline) {
-            Ok(client) => return Ok(client),
+        diagnostics.enter("start_lock");
+        let lock = match acquire_start_lock(&config.run_dir, deadline) {
+            Ok(lock) => lock,
+            Err(error) => {
+                diagnostics.fail(&error);
+                return Err(error);
+            }
+        };
+        diagnostics.enter("post_lock_connect");
+        match Self::connect_existing_until(&config, identity, deadline, Some(&mut diagnostics)) {
+            Ok(client) => {
+                diagnostics.complete();
+                return Ok(client);
+            }
             Err(AppServerProcessError::NotReady) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                diagnostics.fail(&error);
+                return Err(error);
+            }
         }
-        let process_exit = spawn_detached(&config, host_generation)?;
+        diagnostics.enter("spawn");
+        let process_exit = match spawn_detached(&config, host_generation) {
+            Ok(process_exit) => process_exit,
+            Err(error) => {
+                diagnostics.fail(&error);
+                return Err(error);
+            }
+        };
+        diagnostics.enter("endpoint_wait");
         loop {
-            match Self::connect_existing_until(&config, identity, deadline) {
+            match Self::connect_existing_until(&config, identity, deadline, Some(&mut diagnostics))
+            {
                 Ok(client) => {
                     drop(lock);
+                    diagnostics.complete();
                     return Ok(client);
                 }
                 Err(AppServerProcessError::NotReady) if process_exit.try_recv().is_ok() => {
-                    return Err(AppServerProcessError::ProcessExited);
+                    diagnostics.enter("endpoint_wait");
+                    let error = AppServerProcessError::ProcessExited;
+                    diagnostics.fail(&error);
+                    return Err(error);
                 }
                 Err(AppServerProcessError::NotReady) if Instant::now() < deadline => {
+                    diagnostics.enter("endpoint_wait");
                     thread::sleep(START_POLL_INTERVAL);
                 }
                 Err(AppServerProcessError::NotReady) => {
-                    return Err(AppServerProcessError::DeadlineExceeded);
+                    diagnostics.enter("endpoint_wait");
+                    let error = AppServerProcessError::DeadlineExceeded;
+                    diagnostics.fail(&error);
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    diagnostics.fail(&error);
+                    return Err(error);
+                }
             }
         }
     }
@@ -186,23 +320,42 @@ impl SharedAppServerClient {
         let deadline = Instant::now()
             .checked_add(config.ready_timeout)
             .ok_or(AppServerProcessError::InvalidTimeout)?;
-        Self::connect_existing_until(config, identity, deadline)
+        Self::connect_existing_until(config, identity, deadline, None)
     }
 
     /// 从服务端权威端点读取实例与 generation 后再建立会话，避免重连时沿用
-    /// 本地新分配的 generation 误拒绝旧后台的合法事件。
+    /// 本地新分配的 generation 误拒绝旧后台的合法事件；可选诊断仅用于一次启动尝试。
     fn connect_existing_until(
         config: &SidecarConfig,
         identity: &NativeClientIdentity,
         deadline: Instant,
+        mut diagnostics: Option<&mut RuntimeStartupDiagnostics>,
     ) -> Result<Self, AppServerProcessError> {
-        let endpoint = read_endpoint(&config.run_dir)?;
+        let endpoint = match read_endpoint(&config.run_dir) {
+            Ok(endpoint) => {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.enter("endpoint_read");
+                }
+                endpoint
+            }
+            Err(error) => {
+                if !matches!(error, AppServerProcessError::NotReady)
+                    && let Some(diagnostics) = diagnostics.as_deref_mut()
+                {
+                    diagnostics.enter("endpoint_read");
+                }
+                return Err(error);
+            }
+        };
         let address = SocketAddrV4::new(endpoint.host, endpoint.port);
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .min(CONNECT_TIMEOUT);
         if timeout.is_zero() {
             return Err(AppServerProcessError::DeadlineExceeded);
+        }
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.enter("tcp_connect");
         }
         let socket = TcpStream::connect_timeout(&address.into(), timeout).map_err(|error| {
             match error.kind() {
@@ -222,6 +375,9 @@ impl SharedAppServerClient {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(config.limits.max_frame_bytes))
             .max_frame_size(Some(config.limits.max_frame_bytes));
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.enter("websocket_handshake");
+        }
         let (mut connection, _) =
             tungstenite::client::client_with_config(url, socket, Some(ws_config))
                 .map_err(|_| AppServerProcessError::HandshakeFailed)?;
@@ -256,6 +412,9 @@ impl SharedAppServerClient {
         if remaining.is_zero() {
             return Err(AppServerProcessError::DeadlineExceeded);
         }
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.enter("runtime_initialize");
+        }
         let response = session.request(
             "runtime/initialize",
             default_initialize_params(&config.limits),
@@ -277,6 +436,9 @@ impl SharedAppServerClient {
             return Err(AppServerProcessError::HandshakeFailed);
         }
         session.notify("runtime/initialized", session.initialized_params()?)?;
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.enter("runtime_ready");
+        }
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -296,6 +458,9 @@ impl SharedAppServerClient {
                         return Err(AppServerProcessError::HandshakeFailed);
                     }
                     session.with_ready_promotion(&frame, || Ok(()))?;
+                    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                        diagnostics.enter("context_register");
+                    }
                     register_native_context(&session, &config.env, identity, deadline)?;
                     let stopping = session.admission_gate();
                     return Ok(Self {
@@ -471,7 +636,8 @@ impl SharedAppServerClient {
             Ok(acknowledged) => Ok(acknowledged),
             Err(_error) if self.state() == LifecycleState::Exited && Instant::now() < deadline => {
                 tracing::debug!("native owner close will retry over a fresh existing connection");
-                let mut retry = Self::connect_existing_until(config, &self.identity, deadline)?;
+                let mut retry =
+                    Self::connect_existing_until(config, &self.identity, deadline, None)?;
                 match retry.close_native_client_on_session_until(deadline) {
                     Ok(true) => {
                         self.owner_close_acknowledged = true;

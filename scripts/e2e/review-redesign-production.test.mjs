@@ -36,6 +36,7 @@ import {
   buildLaunchEnvironment,
   classifyOwnedProcessSnapshotFailure,
   collectIsolatedJavaFailures,
+  collectIsolatedNativeStartupDiagnostics,
   createReviewDriverHooks,
   createReviewGitFixture,
   parseArguments,
@@ -52,6 +53,36 @@ import {
 } from "./review-redesign-production.mjs";
 
 const execFileAsync = promisify(execFile);
+
+/** 原生失败证据仅接受固定字段，日志缺失、额外载荷和未知类别均不能泄露到报告。 */
+test("isolated native diagnostics retain startup phase without arbitrary payloads", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "ja-native-diagnostic-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  assert.deepEqual(await collectIsolatedNativeStartupDiagnostics(home), []);
+  const logs = join(home, "logs");
+  await mkdir(logs, { recursive: true });
+  const prefix = "2026-10-11T00:00:00Z level=WARN target=ja.diagnostics.runtime_startup";
+  await writeFile(
+    join(logs, "ja-native.log.2026-10-11"),
+    [
+      `${prefix} phase=supervisor_start variant=deadline_exceeded generation=1`,
+      `${prefix} phase=ready_token_echo variant=handshake_failed generation=2`,
+      `${prefix} phase=runtime_ready variant=entered elapsed_ms=9500`,
+      `${prefix} phase=supervisor_start variant=secret generation=3`,
+      `${prefix} phase=supervisor_start variant=deadline_exceeded generation=4 secret=do-not-export`,
+      `${prefix} phase=supervisor_start variant=deadline_exceeded generation=999999999999999999999`,
+    ].join("\n"),
+  );
+  await writeFile(
+    join(logs, "other.log"),
+    `${prefix} phase=supervisor_start variant=deadline_exceeded generation=5`,
+  );
+  assert.deepEqual(await collectIsolatedNativeStartupDiagnostics(home), [
+    { phase: "supervisor_start", variant: "deadline_exceeded", generation: 1 },
+    { phase: "ready_token_echo", variant: "handshake_failed", generation: 2 },
+    { phase: "runtime_ready", variant: "entered", elapsedMs: 9500 },
+  ]);
+});
 
 /** @author kongweiguang 失败证据必须保留代码位置而拒绝任何日志正文，重复日志文件不能重复同一关联 ID。 */
 test("isolated Java diagnostics extract bounded fixed fields without log payloads", async (t) => {

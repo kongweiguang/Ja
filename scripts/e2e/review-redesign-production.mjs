@@ -10,7 +10,17 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import process from "node:process";
@@ -1146,6 +1156,54 @@ export async function collectIsolatedJavaFailures(home) {
   return failures;
 }
 
+/** 只读取本轮原生日志的有界尾部；保留最后阶段与耗时，不导出消息、路径或协议载荷。 */
+export async function collectIsolatedNativeStartupDiagnostics(home) {
+  const failures = [];
+  const logs = join(home, "logs");
+  const names = await readdir(logs).catch(() => []);
+  for (const name of names
+    .filter((value) => /^ja-native\.log\.\d{4}-\d{2}-\d{2}$/u.test(value))
+    .slice(-8)) {
+    let file;
+    try {
+      file = await open(join(logs, name), "r");
+      const metadata = await file.stat();
+      if (!metadata.isFile()) continue;
+      const bytes = Buffer.alloc(Math.min(metadata.size, 65_536));
+      const { bytesRead } = await file.read(
+        bytes,
+        0,
+        bytes.length,
+        Math.max(0, metadata.size - bytes.length),
+      );
+      const pattern =
+        / level=(?:INFO|WARN) target=ja\.diagnostics\.runtime_startup phase=(supervisor_start|ready_token_echo|event_pump_take|initial_connect|start_lock|post_lock_connect|spawn|endpoint_wait|endpoint_read|tcp_connect|websocket_handshake|runtime_initialize|runtime_ready|context_register|complete) variant=(entered|success|invalid_config|invalid_timeout|queue_full|queue_closed|pending_limit|request_ledger_exhausted|duplicate_request|deadline_exceeded|cancelled|session_closed|not_ready|incompatible|invalid_state|spawn|process_tree|process_exited|shutting_down|handshake_failed|protocol_fault|invalid_error_catalog|shutdown_timeout|backoff|faulted|codec_handshake_failed|codec_unexpected_eof|codec_io)(?: generation=(\d+))?(?: elapsed_ms=(\d+))?\r?$/gmu;
+      for (const match of bytes.subarray(0, bytesRead).toString("utf8").matchAll(pattern)) {
+        if (match[3] === undefined && match[4] === undefined) continue;
+        const generation = match[3] === undefined ? undefined : Number(match[3]);
+        const elapsedMs = match[4] === undefined ? undefined : Number(match[4]);
+        if (
+          (generation !== undefined && !Number.isSafeInteger(generation)) ||
+          (elapsedMs !== undefined && !Number.isSafeInteger(elapsedMs))
+        )
+          continue;
+        failures.push({
+          phase: match[1],
+          variant: match[2],
+          ...(generation === undefined ? {} : { generation }),
+          ...(elapsedMs === undefined ? {} : { elapsedMs }),
+        });
+        if (failures.length > 32) failures.shift();
+      }
+    } catch {
+      // 诊断读取失败不能替代原始失败，且不得输出 IO 异常中的宿主路径。
+    } finally {
+      await file?.close().catch(() => undefined);
+    }
+  }
+  return failures;
+}
+
 /**
  * @author kongweiguang
  * 阶段与页面诊断仅属于默认 Review driver；专用注入 driver 的既有参数和副作用保持不变。
@@ -1332,6 +1390,10 @@ export async function runProduction(options) {
       nativeImage: nativeImageIdentity,
       fixture: options.fixture,
       fixtureFacts,
+      nativeStartupDiagnostics:
+        directories.home === undefined
+          ? []
+          : await collectIsolatedNativeStartupDiagnostics(directories.home),
       ...(driverStage === undefined ? {} : { driverStage }),
       ...(tauriExecutableIdentity === undefined ? {} : { tauri: tauriExecutableIdentity }),
       edgeDriver:
@@ -1389,6 +1451,10 @@ export async function runProduction(options) {
       error: safeFailure(error, directories?.root),
       javaFailures:
         directories?.home === undefined ? [] : await collectIsolatedJavaFailures(directories.home),
+      nativeStartupDiagnostics:
+        directories?.home === undefined
+          ? []
+          : await collectIsolatedNativeStartupDiagnostics(directories.home),
     };
     if (options.preserveFailedProfile === true && directories?.root !== undefined) {
       await writeFile(

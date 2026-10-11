@@ -36,9 +36,26 @@ const SAFE_EVENT_QUEUE_METRICS: &[&str] = &[
 const SAFE_EVENT_QUEUE_LANES: &[&str] = &["control", "data"];
 const RUNTIME_STARTUP_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.runtime_startup";
 pub(crate) const PREVIEW_NAVIGATION_DIAGNOSTIC_TARGET: &str = "ja.diagnostics.preview_navigation";
-const SAFE_RUNTIME_STARTUP_PHASES: &[&str] =
-    &["supervisor_start", "ready_token_echo", "event_pump_take"];
+const SAFE_RUNTIME_STARTUP_PHASES: &[&str] = &[
+    "supervisor_start",
+    "ready_token_echo",
+    "event_pump_take",
+    "initial_connect",
+    "start_lock",
+    "post_lock_connect",
+    "spawn",
+    "endpoint_wait",
+    "endpoint_read",
+    "tcp_connect",
+    "websocket_handshake",
+    "runtime_initialize",
+    "runtime_ready",
+    "context_register",
+    "complete",
+];
 const SAFE_RUNTIME_STARTUP_VARIANTS: &[&str] = &[
+    "entered",
+    "success",
     "invalid_config",
     "invalid_timeout",
     "codec_unexpected_eof",
@@ -337,16 +354,17 @@ impl Visit for SafeEventQueueMetricVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 }
 
-/// 握手失败诊断仅承载阶段、枚举分类和 generation；其它调用者字段一律丢弃。
+/// 启动诊断只承载阶段、枚举分类、代际和整数耗时；其它调用者字段一律丢弃。
 #[derive(Default)]
 struct SafeRuntimeStartupVisitor {
     phase: Option<&'static str>,
     variant: Option<&'static str>,
     generation: Option<u64>,
+    elapsed_ms: Option<u64>,
 }
 
 impl SafeRuntimeStartupVisitor {
-    /// 固定字段顺序输出已通过闭集校验的分类，确保错误载荷不会借 formatter 回流。
+    /// 固定字段顺序输出闭集分类和整数耗时，确保错误载荷不会借 formatter 回流。
     fn write_to(&self, writer: &mut Writer<'_>) -> fmt::Result {
         if let Some(phase) = self.phase {
             write!(writer, " phase={phase}")?;
@@ -356,6 +374,9 @@ impl SafeRuntimeStartupVisitor {
         }
         if let Some(generation) = self.generation {
             write!(writer, " generation={generation}")?;
+        }
+        if let Some(elapsed_ms) = self.elapsed_ms {
+            write!(writer, " elapsed_ms={elapsed_ms}")?;
         }
         Ok(())
     }
@@ -381,10 +402,12 @@ impl Visit for SafeRuntimeStartupVisitor {
         }
     }
 
-    /// 只输出 typed u64 generation，避免错误文本或任意 Debug 值伪装成生命周期标识。
+    /// 只输出 typed u64 generation 和耗时，避免错误文本或任意 Debug 值伪装成诊断数字。
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "generation" {
-            self.generation = Some(value);
+        match field.name() {
+            "generation" => self.generation = Some(value),
+            "elapsed_ms" => self.elapsed_ms = Some(value),
+            _ => {}
         }
     }
 

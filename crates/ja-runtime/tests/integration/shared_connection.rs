@@ -8,6 +8,7 @@ use ja_runtime::app_server_process::{
 };
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -15,7 +16,27 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_subscriber::prelude::*;
 use tungstenite::{Message, WebSocket};
+
+#[derive(Clone)]
+struct StartupDiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for StartupDiagnosticWriter {
+    /// Retain rendered events in memory so the startup-stage contract can be asserted without files.
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("startup diagnostic sink poisoned")
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    /// An in-memory sink has no external buffer to flush.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// 同一个受信配置必须向 CLI 与桌面构造完全一致的四个 Java 目录参数。
 #[test]
@@ -102,6 +123,63 @@ fn early_daemon_exit_is_reported_without_waiting_for_timeout() {
     assert!(matches!(result, Err(AppServerProcessError::ProcessExited)));
     assert!(started.elapsed() < Duration::from_secs(5));
     fs::remove_dir_all(root).expect("fixture cleanup");
+}
+
+/// 启动失败时保留阶段与相对耗时，且可审核的事件不携带 endpoint、路径或进程参数。
+#[test]
+fn startup_failure_reports_closed_stage_and_elapsed_time() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(move || StartupDiagnosticWriter(Arc::clone(&writer_output)));
+    let subscriber = tracing_subscriber::registry().with(subscriber);
+    tracing::subscriber::with_default(subscriber, || {
+        let root = temporary_root("startup-diagnostics");
+        let mut config = fixture_config(&root);
+        config.ready_timeout = Duration::from_secs(5);
+        let identity = NativeClientIdentity::new_current_process().expect("native identity");
+        let result = SharedAppServerClient::connect_or_start(config, 7, &identity);
+        assert!(matches!(result, Err(AppServerProcessError::ProcessExited)));
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    });
+
+    let rendered = String::from_utf8(output.lock().expect("test log sink poisoned").clone())
+        .expect("formatter must emit UTF-8");
+    let startup_events = rendered
+        .lines()
+        .filter(|line| line.contains("ja.diagnostics.runtime_startup"))
+        .collect::<Vec<_>>();
+    assert!(
+        startup_events.iter().any(|line| {
+            line.contains("phase=\"initial_connect\" variant=\"entered\" elapsed_ms=")
+        }),
+        "expected startup events in rendered output: {rendered}"
+    );
+    assert!(
+        startup_events
+            .iter()
+            .any(|line| { line.contains("phase=\"start_lock\" variant=\"entered\" elapsed_ms=") })
+    );
+    assert!(
+        startup_events
+            .iter()
+            .any(|line| line.contains("phase=\"spawn\" variant=\"entered\" elapsed_ms="))
+    );
+    assert!(
+        startup_events.iter().any(|line| {
+            line.contains("phase=\"endpoint_wait\" variant=\"entered\" elapsed_ms=")
+        })
+    );
+    assert!(startup_events.iter().any(|line| {
+        line.contains("phase=\"endpoint_wait\" variant=\"process_exited\" elapsed_ms=")
+    }));
+    assert!(!startup_events.iter().any(|line| {
+        line.contains("app-server.endpoint.json")
+            || line.contains("ja-shared-connection")
+            || line.contains("ja-runtime-generation")
+    }));
 }
 
 /// 仅在显式提供隔离 Java 25 fat JAR 时运行，验证 Rust 真实启动、认证、

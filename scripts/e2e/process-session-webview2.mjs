@@ -314,7 +314,7 @@ async function handleProviderRequest(request, response, observations, recordFail
   }
 }
 
-/** 等待 Runtime Ready，并验证对话输入框属于生产 Tauri composition 页面。 */
+/** 等待真实 Ready；终态启动故障无法靠轮询恢复，立即失败以保留启动证据并避免耗尽整轮预算。 */
 async function waitForApplication(page, deadline) {
   await page.locator('.ja-shell[data-app-ready="true"]').waitFor({
     state: "visible",
@@ -330,6 +330,9 @@ async function waitForApplication(page, deadline) {
       page.evaluate(async () => {
         const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
         const state = await createRuntimeHostAdapter().state();
+        if (["crashed", "incompatible", "faulted", "recovery_required"].includes(state.status)) {
+          throw new Error(`native runtime startup failed: ${state.status}`);
+        }
         return state.status === "ready" && state.generation > 0;
       }),
     deadline,

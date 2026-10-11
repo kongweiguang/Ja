@@ -102,6 +102,7 @@ fn formatter_keeps_allowlisted_runtime_startup_diagnostics_only() {
             phase = "supervisor_start",
             variant = "codec_invalid_envelope",
             generation = 41_u64,
+            elapsed_ms = 12_u64,
             path = %r"C:\private\prompt.txt",
             ready_token = %"0123456789abcdef0123456789abcdef",
             command = %"java --secret argument",
@@ -113,17 +114,37 @@ fn formatter_keeps_allowlisted_runtime_startup_diagnostics_only() {
             phase = "unlisted_stage",
             variant = "unlisted_variant",
             generation = 42_u64,
+            elapsed_ms = 99_u64,
             path = %r"C:\private\unknown.txt",
             "unknown startup classification"
+        );
+        tracing::info!(
+            target: "ja.diagnostics.runtime_startup",
+            phase = "spawn",
+            variant = "entered",
+            elapsed_ms = 84_u64,
+            path = %r"C:\private\runtime.exe",
+            "runtime startup phase"
+        );
+        tracing::info!(
+            target: "ja.diagnostics.runtime_startup",
+            phase = "complete",
+            variant = "success",
+            elapsed_ms = 910_u64,
+            token = "private-token-sentinel",
+            "runtime startup completed"
         );
     });
     let rendered = String::from_utf8(output.lock().expect("test log sink poisoned").clone())
         .expect("formatter must emit UTF-8");
 
-    assert!(
-        rendered.contains("phase=supervisor_start variant=codec_invalid_envelope generation=41")
-    );
+    assert!(rendered.contains(
+        "phase=supervisor_start variant=codec_invalid_envelope generation=41 elapsed_ms=12"
+    ));
     assert!(rendered.contains("generation=42"));
+    assert!(rendered.contains("phase=spawn variant=entered elapsed_ms=84"));
+    assert!(rendered.contains("phase=complete variant=success elapsed_ms=910"));
+    assert!(rendered.contains("elapsed_ms=99"));
     assert!(!rendered.contains("unlisted_stage"));
     assert!(!rendered.contains("unlisted_variant"));
     assert!(!rendered.contains("private"));
@@ -131,6 +152,10 @@ fn formatter_keeps_allowlisted_runtime_startup_diagnostics_only() {
     assert!(!rendered.contains("java --secret"));
     assert!(!rendered.contains("API_KEY"));
     assert!(!rendered.contains("runtime startup failed"));
+    assert!(!rendered.contains("runtime startup phase"));
+    assert!(!rendered.contains("runtime startup completed"));
+    assert!(!rendered.contains("runtime.exe"));
+    assert!(!rendered.contains("private-token-sentinel"));
 }
 
 /// 验证 WebSocket pump 的真实 tracing formatter 只输出安全类别与合法关闭码。
