@@ -42,6 +42,7 @@ const ENDPOINT_FILE: &str = "app-server.endpoint.json";
 const START_LOCK_FILE: &str = "app-server.start.lock";
 const MAX_ENDPOINT_BYTES: u64 = 1_024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOOPBACK_TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -325,6 +326,8 @@ impl SharedAppServerClient {
 
     /// 从服务端权威端点读取实例与 generation 后再建立会话，避免重连时沿用
     /// 本地新分配的 generation 误拒绝旧后台的合法事件；可选诊断仅用于一次启动尝试。
+    /// Loopback TCP 可达性由内核处理，单独短探测以免强杀遗留端点消耗启动预算；
+    /// WebSocket 握手和读写仍使用原两秒上限，整体 ready deadline 仍由调用方约束。
     fn connect_existing_until(
         config: &SidecarConfig,
         identity: &NativeClientIdentity,
@@ -348,28 +351,38 @@ impl SharedAppServerClient {
             }
         };
         let address = SocketAddrV4::new(endpoint.host, endpoint.port);
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .min(CONNECT_TIMEOUT);
-        if timeout.is_zero() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let tcp_timeout = remaining.min(if endpoint.host.is_loopback() {
+            LOOPBACK_TCP_CONNECT_TIMEOUT
+        } else {
+            CONNECT_TIMEOUT
+        });
+        if tcp_timeout.is_zero() {
             return Err(AppServerProcessError::DeadlineExceeded);
         }
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.enter("tcp_connect");
         }
-        let socket = TcpStream::connect_timeout(&address.into(), timeout).map_err(|error| {
-            match error.kind() {
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
-                    AppServerProcessError::NotReady
-                }
-                _ => AppServerProcessError::HandshakeFailed,
-            }
-        })?;
+        let socket =
+            TcpStream::connect_timeout(&address.into(), tcp_timeout).map_err(
+                |error| match error.kind() {
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut => {
+                        AppServerProcessError::NotReady
+                    }
+                    _ => AppServerProcessError::HandshakeFailed,
+                },
+            )?;
+        let stream_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(CONNECT_TIMEOUT);
+        if stream_timeout.is_zero() {
+            return Err(AppServerProcessError::DeadlineExceeded);
+        }
         socket
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(stream_timeout))
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
         socket
-            .set_write_timeout(Some(timeout))
+            .set_write_timeout(Some(stream_timeout))
             .map_err(|_| AppServerProcessError::HandshakeFailed)?;
         let url = format!("ws://{}:{}/ja-rpc", endpoint.host, endpoint.port);
         let ws_config = WebSocketConfig::default()

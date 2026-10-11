@@ -330,10 +330,18 @@ async function waitForApplication(page, deadline) {
       page.evaluate(async () => {
         const { createRuntimeHostAdapter } = await import("/src/api/tauri/runtime.ts");
         const state = await createRuntimeHostAdapter().state();
+        if (state.status === "ready" && state.generation > 0) return true;
+        const start = globalThis.__jaProcessSessionAdmissionInvokes?.findLast(
+          (record) => record.command === "ja_runtime_start",
+        );
+        if (start?.state === "rejected") {
+          const code = /^[A-Z_]{1,64}$/u.test(start.errorCode) ? start.errorCode : "native_error";
+          throw new Error(`native runtime startup failed: ${code}`);
+        }
         if (["crashed", "incompatible", "faulted", "recovery_required"].includes(state.status)) {
           throw new Error(`native runtime startup failed: ${state.status}`);
         }
-        return state.status === "ready" && state.generation > 0;
+        return false;
       }),
     deadline,
   );

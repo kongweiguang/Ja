@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +21,8 @@ use tungstenite::{Message, WebSocket};
 
 #[derive(Clone)]
 struct StartupDiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+static STARTUP_DIAGNOSTIC_OUTPUT: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
 
 impl Write for StartupDiagnosticWriter {
     /// Retain rendered events in memory so the startup-stage contract can be asserted without files.
@@ -36,6 +38,26 @@ impl Write for StartupDiagnosticWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Install one target-filtered process subscriber so parallel tests cannot race scoped dispatch caches.
+fn startup_diagnostic_output() -> Arc<Mutex<Vec<u8>>> {
+    Arc::clone(STARTUP_DIAGNOSTIC_OUTPUT.get_or_init(|| {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(move || StartupDiagnosticWriter(Arc::clone(&writer_output)))
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target() == "ja.diagnostics.runtime_startup"
+            }));
+        let subscriber = tracing_subscriber::registry().with(subscriber);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install startup diagnostic capture subscriber");
+        tracing::callsite::rebuild_interest_cache();
+        output
+    }))
 }
 
 /// 同一个受信配置必须向 CLI 与桌面构造完全一致的四个 Java 目录参数。
@@ -68,9 +90,9 @@ fn shared_config_uses_frozen_directory_arguments() {
     fs::remove_dir_all(root).expect("fixture cleanup");
 }
 
-/// 崩溃遗留端点的闭合端口返回 NotReady，让 connect_or_start 能在启动锁内重新启动。
+/// 闭合回环端口须快速返回 NotReady，避免崩溃遗留端点挤占整体 ready deadline。
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn stale_endpoint_port_is_recoverable() {
     let root = temporary_root("stale");
     let config = fixture_config(&root);
@@ -80,8 +102,13 @@ fn stale_endpoint_port_is_recoverable() {
     drop(listener);
     write_endpoint(&root, "127.0.0.1", port, "a".repeat(64));
     let identity = NativeClientIdentity::new_current_process().expect("native identity");
+    let started = Instant::now();
     let result = SharedAppServerClient::connect_existing(&config, 1, &identity);
     assert!(matches!(result, Err(AppServerProcessError::NotReady)));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stale loopback endpoint probe exceeded the short kernel-connect budget"
+    );
     fs::remove_dir_all(root).expect("fixture cleanup");
 }
 
@@ -128,25 +155,19 @@ fn early_daemon_exit_is_reported_without_waiting_for_timeout() {
 /// 启动失败时保留阶段与相对耗时，且可审核的事件不携带 endpoint、路径或进程参数。
 #[test]
 fn startup_failure_reports_closed_stage_and_elapsed_time() {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer_output = Arc::clone(&output);
-    let subscriber = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_target(true)
-        .with_writer(move || StartupDiagnosticWriter(Arc::clone(&writer_output)));
-    let subscriber = tracing_subscriber::registry().with(subscriber);
-    tracing::subscriber::with_default(subscriber, || {
-        let root = temporary_root("startup-diagnostics");
-        let mut config = fixture_config(&root);
-        config.ready_timeout = Duration::from_secs(5);
-        let identity = NativeClientIdentity::new_current_process().expect("native identity");
-        let result = SharedAppServerClient::connect_or_start(config, 7, &identity);
-        assert!(matches!(result, Err(AppServerProcessError::ProcessExited)));
-        fs::remove_dir_all(root).expect("fixture cleanup");
-    });
+    let output = startup_diagnostic_output();
+    let start_offset = output.lock().expect("test log sink poisoned").len();
+    let root = temporary_root("startup-diagnostics");
+    let mut config = fixture_config(&root);
+    config.ready_timeout = Duration::from_secs(5);
+    let identity = NativeClientIdentity::new_current_process().expect("native identity");
+    let result = SharedAppServerClient::connect_or_start(config, 7, &identity);
+    assert!(matches!(result, Err(AppServerProcessError::ProcessExited)));
+    fs::remove_dir_all(root).expect("fixture cleanup");
 
-    let rendered = String::from_utf8(output.lock().expect("test log sink poisoned").clone())
-        .expect("formatter must emit UTF-8");
+    let rendered =
+        String::from_utf8(output.lock().expect("test log sink poisoned")[start_offset..].to_vec())
+            .expect("formatter must emit UTF-8");
     let startup_events = rendered
         .lines()
         .filter(|line| line.contains("ja.diagnostics.runtime_startup"))
