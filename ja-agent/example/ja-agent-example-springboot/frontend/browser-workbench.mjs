@@ -337,7 +337,8 @@ async function exerciseRecords(page, usageRequests, artifacts) {
 }
 
 /**
- * 在隔离 Chromium 中验证业务闭环并旁观既有事件；诊断不得增加请求或改变等待预算。
+ * 在隔离 Chromium 中验证业务闭环并旁观既有事件；页面可能持续发起后台请求，因此以 DOM 与
+ * Composer 的实际可用状态判定就绪，避免把 network idle 当成应用启动条件，也不改变业务等待预算。
  * @author kongweiguang
  */
 async function main() {
@@ -508,13 +509,15 @@ async function main() {
       });
     });
 
-    await page.goto(`http://127.0.0.1:${address.port}`, { waitUntil: "networkidle" });
+    await page.goto(`http://127.0.0.1:${address.port}`, { waitUntil: "domcontentloaded" });
     if ((await page.title()) !== "Ja") throw new Error("The browser opened the wrong page.");
-    if (!(await page.locator("#root").evaluate((root) => root.childElementCount > 0))) {
-      throw new Error("The workbench root rendered no application content.");
-    }
+    const root = page.locator("#root");
+    await root.locator(":scope > *").first().waitFor({ state: "attached" });
     const composer = page.getByRole("textbox", { name: "消息" });
     await composer.waitFor({ state: "visible" });
+    if (!(await root.evaluate((element) => element.childElementCount > 0))) {
+      throw new Error("The workbench root rendered no application content.");
+    }
 
     await composer.fill("浏览器普通回复");
     const send = page.getByRole("button", { name: "发送" });

@@ -1131,6 +1131,13 @@ export async function runProcessSessionWebView2({
 
   const exportMenu = page.getByRole("button", { name: "打开对话操作", exact: true });
   await exportMenu.waitFor({ state: "visible", timeout: timeout(deadline) });
+  // 自动标题允许按真实超时保留首问短标题；导出必须对应当前会话显示标题，不能依赖后台标题生成必然成功。
+  const exportTitle = await page
+    .locator(
+      `[aria-label="最近对话列表"] button[aria-current="page"][data-thread-id="${threadId}"]`,
+    )
+    .getAttribute("aria-label");
+  assert.ok(exportTitle?.trim(), "the exported Thread must expose its current title");
   await exportMenu.click({ timeout: timeout(deadline) });
   const exportItem = page.getByRole("menuitem", { name: "导出对话 Markdown", exact: true });
   await exportItem.waitFor({ state: "visible", timeout: timeout(deadline) });
@@ -1303,8 +1310,8 @@ export async function runProcessSessionWebView2({
     pickerBoundary = "browser_download";
   }
   const markdown = markdownBytes.toString("utf8");
-  assert.match(markdown, /^# Process Session WebView2\r?$/mu);
-  assert.match(markdown, /^Thread: .+$/mu);
+  assert.equal(markdown.split(/\r?\n/u)[0], `# ${exportTitle}`);
+  assert.ok(markdown.split(/\r?\n/u).includes(`Thread: ${threadId}`));
   assert.match(markdown, /^Revision: \d+$/mu);
   const messageHeadings = [...markdown.matchAll(/^## (用户|助手) · [^\r\n]*\r?\n\r?\n/gmu)];
   assert.deepEqual(
