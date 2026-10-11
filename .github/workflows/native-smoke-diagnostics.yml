@@ -92,7 +92,6 @@ jobs:
     env:
       JA_NATIVE_SOURCE_COMMIT: 15af5bc38a1684bcd4da7b63d343eae9787e222d
       JA_NATIVE_RUN_ID: ${{ inputs.native_run_id }}
-      JA_NATIVE_EVIDENCE: ${{ runner.temp }}/ja-native-diagnostic-evidence
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
@@ -212,6 +211,7 @@ jobs:
       - name: Run Native file-search acceptance
         shell: bash
         env:
+          JA_NATIVE_EVIDENCE: ${{ runner.temp }}/ja-native-diagnostic-evidence
           JA_NATIVE_EXECUTABLE: ${{ runner.temp }}/ja-native-download/_temp/ja-native-stage/sidecars/ja-app-server-${{ matrix.targetTriple }}
         run: |
           set -euo pipefail
@@ -221,6 +221,8 @@ jobs:
           node scripts/e2e/file-search-acceptance.mjs --executable "$JA_NATIVE_EXECUTABLE" --evidence-directory "$JA_NATIVE_EVIDENCE" --stress-files 10000 --silent
       - name: Scan bounded Native acceptance evidence
         id: macos_evidence_scan
+        env:
+          JA_NATIVE_EVIDENCE: ${{ runner.temp }}/ja-native-diagnostic-evidence
         if: always()
         shell: bash
         run: |
@@ -233,6 +235,6 @@ jobs:
         if: ${{ always() && steps.macos_evidence_scan.conclusion == 'success' }}
         with:
           name: ja-macos-file-search-diagnostics-${{ matrix.arch }}-${{ github.run_id }}
-          path: ${{ env.JA_NATIVE_EVIDENCE }}/*.json
+          path: ${{ runner.temp }}/ja-native-diagnostic-evidence/*.json
           if-no-files-found: ignore
           retention-days: 3
