@@ -10458,6 +10458,25 @@ async function waitForWebViewProfileReady(
 }
 
 /**
+ * 在不重置绝对启动期限的前提下等待 probe 给出已验证 owner；undefined 只表示尚未就绪，身份错误立即失败。
+ * @author kongweiguang
+ */
+export async function waitForRuntimeOwnerProof(probe, deadline, signal, intervalMs = pollMs) {
+  if (typeof probe !== "function" || !Number.isFinite(deadline)) {
+    throw new TypeError("runtime owner probe 与绝对 deadline 必须有效");
+  }
+  const delayMs = Number.isFinite(intervalMs) ? Math.max(1, Math.trunc(intervalMs)) : pollMs;
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const proof = await probe();
+    if (Date.now() >= deadline) break;
+    if (proof !== undefined) return proof;
+    await waitForDelay(Math.min(delayMs, Math.max(1, deadline - Date.now())), signal);
+  }
+  throw new Error("profilePrime App Server endpoint owner 在既定启动期限内未就绪");
+}
+
+/**
  * 预热与 owner-verified cleanup 可同时失败；保留启动异常为主因，并把清理证据作为次因，避免诊断被覆盖。
  * @author kongweiguang
  */
@@ -16098,7 +16117,8 @@ async function cleanupPhase(
 /**
  * 使用与正式 Gate 相同的生产 binary、窗口配置、Java sidecar 和隔离目录预热 WebView2 UDF，
  * 但不开放 CDP。调用方显式选择 cleanup mode：完整 Gate 保持真实托盘退出，聚焦性能 Gate
- * 只验收 owner-verified tree cleanup；两者都要求进程归零与既有 Ja 守卫。
+ * 只验收 owner-verified tree cleanup；两者都要求进程归零与既有 Ja 守卫。profile ACK 与 endpoint owner 共用
+ * 同一个绝对 startup deadline，owner 探测只写入 phase-local 目录副本，避免预热身份污染正式 run binding。
  * 初始化和 cleanup 同时失败时保留两项原始错误，避免清理诊断覆盖 profile ACK 的根因。
  * @author kongweiguang
  */
@@ -16158,13 +16178,50 @@ async function primeWebViewProfile({
     for (const [pid, entry] of initialTree) observed.set(pid, entry);
     evidence[phase].stage = `${phase}:watcher`;
     watcher = startProcessWatcher(rootIdentity, observed, incompleteObserved, runDeadline.signal);
+    const startupDeadline = Math.min(runDeadline.deadline, Date.now() + cdpStartupDeadlineMs);
     evidence[phase].stage = `${phase}:profile_ack`;
     evidence[phase].profile = await waitForWebViewProfileReady(
       rootIdentity,
       incompleteObserved,
       directories,
-      Math.min(runDeadline.deadline, Date.now() + cdpStartupDeadlineMs),
+      startupDeadline,
       launch,
+      runDeadline.signal,
+    );
+    evidence[phase].stage = `${phase}:runtime_owner`;
+    /**
+     * 只在 phase-local 副本上冻结 endpoint owner；正式 directories 保持未绑定，清理阶段仍独立复验身份。
+     * @author kongweiguang
+     */
+    const probeProfilePrimeRuntimeOwner = async () => {
+      const endpoint = await readRuntimeEndpointMetadata(directories);
+      if (endpoint === undefined) return undefined;
+      const probeDirectories = { ...directories };
+      delete probeDirectories.runtimeEndpointOwner;
+      const isolation = await captureRuntimeIsolation(
+        { rootIdentity, incompleteObserved },
+        probeDirectories,
+        runDeadline.signal,
+        expectedExecutableNames,
+      );
+      if (
+        probeDirectories.runtimeEndpointOwner === undefined ||
+        isolation.endpoint?.host !== endpoint.host ||
+        isolation.endpoint?.port !== endpoint.port ||
+        isolation.endpoint?.serverInstanceId !== endpoint.serverInstanceId ||
+        isolation.endpoint?.runtimeGeneration !== endpoint.runtimeGeneration
+      ) {
+        throw new Error("profilePrime App Server endpoint owner proof 不完整");
+      }
+      return {
+        appServerPid: isolation.appServerPid,
+        serverInstanceId: endpoint.serverInstanceId,
+        runtimeGeneration: endpoint.runtimeGeneration,
+      };
+    };
+    evidence[phase].runtimeOwner = await waitForRuntimeOwnerProof(
+      probeProfilePrimeRuntimeOwner,
+      startupDeadline,
       runDeadline.signal,
     );
     evidence[phase].status = "ready";

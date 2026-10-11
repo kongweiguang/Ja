@@ -47,6 +47,7 @@ import {
   windowsPathMatches,
   writeRunSummary,
   assertRuntimeIsolation,
+  waitForRuntimeOwnerProof,
   assertRuntimeRestartEvidence,
   assertRuntimePhaseHandoffEvidence,
   assertRuntimeHandoffBoundary,
@@ -6109,6 +6110,91 @@ function runtimeEndpointProof(fixture, ownerIdentity) {
     ownerIdentity: { ...ownerIdentity },
   };
 }
+
+/** profile ACK 后允许 owner 尚未登记，只有完整隔离目录唯一匹配后才结束等待。 @author kongweiguang */
+test("waits for the exact runtime owner after profile acknowledgment", async () => {
+  const fixture = runtimeIsolationFixture();
+  const owner = runtimeSidecarProcess(fixture);
+  let probes = 0;
+  const proof = await waitForRuntimeOwnerProof(
+    async () => {
+      probes += 1;
+      if (probes === 1) return undefined;
+      return assertRuntimeIsolation(
+        [fixture.launcher, owner],
+        fixture.directories,
+        fixture.nativeScope,
+      );
+    },
+    Date.now() + 1_000,
+    undefined,
+    1,
+  );
+
+  assert.equal(probes, 2);
+  assert.equal(proof.appServerPid, owner.pid);
+  assert.equal(proof.appServerIdentity, owner);
+});
+
+/** 缺失 endpoint/owner 只能在原期限内等待，期限耗尽必须失败并交给 owner-verified cleanup。 @author kongweiguang */
+test("rejects runtime owner that does not become ready before the shared deadline", async () => {
+  await assert.rejects(
+    waitForRuntimeOwnerProof(async () => undefined, Date.now() + 12, undefined, 1),
+    /既定启动期限内未就绪/u,
+  );
+});
+
+/** 已发现但目录角色不匹配的 sidecar 属于身份错误，不能伪装成待就绪状态继续轮询。 @author kongweiguang */
+test("rejects a wrong runtime owner immediately", async () => {
+  const fixture = runtimeIsolationFixture();
+  const wrongOwner = runtimeSidecarProcess(
+    fixture,
+    {},
+    {
+      home: win32.join(fixture.directories.home, "wrong-owner"),
+    },
+  );
+
+  await assert.rejects(
+    waitForRuntimeOwnerProof(
+      async () =>
+        assertRuntimeIsolation(
+          [fixture.launcher, wrongOwner],
+          fixture.directories,
+          fixture.nativeScope,
+        ),
+      Date.now() + 1_000,
+      undefined,
+      1,
+    ),
+    /owner_not_found/u,
+  );
+});
+
+/** profilePrime 必须在相同 deadline 下先等 WebView ACK 与隔离 owner，且探测身份不得进入正式目录 binding。 @author kongweiguang */
+test("profilePrime waits for runtime ownership before reporting readiness", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function primeWebViewProfile(");
+  const end = source.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start);
+  const prime = source.slice(start, end);
+  const profileAck = prime.indexOf("await waitForWebViewProfileReady(");
+  const ownerWait = prime.indexOf("await waitForRuntimeOwnerProof(");
+  const ready = prime.indexOf('evidence[phase].status = "ready";');
+
+  assert.ok(profileAck >= 0 && ownerWait > profileAck && ready > ownerWait);
+  assert.equal((prime.match(/const startupDeadline = Math\.min\(/gu) ?? []).length, 1);
+  assert.match(prime, /waitForWebViewProfileReady\([\s\S]*?startupDeadline/u);
+  assert.match(prime, /waitForRuntimeOwnerProof\([\s\S]*?startupDeadline/u);
+  assert.match(prime, /const probeProfilePrimeRuntimeOwner = async/u);
+  assert.match(
+    prime,
+    /captureRuntimeIsolation\(\s*\{\s*rootIdentity,\s*incompleteObserved\s*\}\s*,/u,
+  );
+  assert.match(prime, /const probeDirectories = \{ \.\.\.directories \}/u);
+  assert.match(prime, /delete probeDirectories\.runtimeEndpointOwner/u);
+  assert.doesNotMatch(prime, /Object\.defineProperty\(directories, "runtimeEndpointOwner"/u);
+});
 
 /** 无关同名进程即使先出现且恰有相同目录参数，也不能替代本 launcher 的后代。 */
 test("selects the exact owned sidecar regardless of global snapshot order", () => {
