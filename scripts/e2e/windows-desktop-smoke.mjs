@@ -17729,13 +17729,21 @@ async function waitForWorkbenchCollapsed(workbench, deadline, signal) {
 }
 
 /**
- * 在单个有界循环中观察当前 MergeView 与有界 Diff；选中 fileId、路径、布局和可见正文必须一致，
- * 不能把仅挂载的虚拟化根当作 ready。MergeView 也是当前统一布局的文本回退，不限制为 split。
- * 结束前保留最后一次有效结构诊断；页面读受局部超时与父取消约束，绝不复制 diff/editor payload。
+ * 在单个有界循环中观察当前 MergeView 与有界 Diff；宽布局要求所选行可见，窄详情布局则允许
+ * 由可见“返回变更文件”入口证明的树/详情互斥状态，同时仍核对挂载行与 Diff root 身份。
+ * 结束前保留各身份与可见性子项，页面读受局部超时与父取消约束，绝不复制 diff/editor payload。
+ * @author kongweiguang
  */
 export async function waitForReviewDiff(review, path, deadline, signal) {
   let lastDiagnostic = {
     state: "not_observed",
+    targetEqualsSelected: false,
+    selectedVisible: false,
+    narrowDetailVisibility: false,
+    selectedFileIdPresent: false,
+    diffRootCount: 0,
+    rootFileMatches: false,
+    rootLayerMatches: false,
     safeVisibleText: "",
     targetRow: null,
     selectedRow: null,
@@ -17817,15 +17825,40 @@ export async function waitForReviewDiff(review, path, deadline, signal) {
               );
               const targetRow = targets.length === 1 ? targets[0] : undefined;
               const selectedRow = selected.length === 1 ? selected[0] : undefined;
+              const targetEqualsSelected = targetRow !== undefined && targetRow === selectedRow;
+              const selectedVisible = isVisible(selectedRow);
+              const tree = reviewElement.querySelector(".ja-review-shell-tree");
+              const diffPanel = reviewElement.querySelector(".ja-review-shell-diff");
+              const backToTree = reviewElement.querySelector(
+                '.ja-review-shell-mobile-bar [aria-label="返回变更文件"]',
+              );
+              const narrowDetailVisibility =
+                reviewElement.getAttribute("data-review-layout") === "narrow" &&
+                reviewElement.classList.contains("is-detail-open") &&
+                tree !== null &&
+                selectedRow !== undefined &&
+                tree.contains(selectedRow) &&
+                !isVisible(tree) &&
+                isVisible(diffPanel) &&
+                isVisible(backToTree);
+              const selectedVisibleForLayout = selectedVisible || narrowDetailVisibility;
+              const selectedFileId = selectedRow?.getAttribute("data-review-file-id");
+              const selectedLayer = selectedRow?.getAttribute("data-review-layer");
+              const selectedFileIdPresent = Boolean(selectedFileId);
+              const rootFileMatches =
+                diffRoot !== null &&
+                selectedFileIdPresent &&
+                diffRoot.getAttribute("data-review-selected-file-id") === selectedFileId;
+              const rootLayerMatches =
+                diffRoot !== null &&
+                Boolean(selectedLayer) &&
+                diffRoot.getAttribute("data-review-selected-layer") === selectedLayer;
               const selectionMatches =
-                targetRow !== undefined &&
-                targetRow === selectedRow &&
-                isVisible(selectedRow) &&
-                Boolean(selectedRow.getAttribute("data-review-file-id")) &&
-                diffRoot?.getAttribute("data-review-selected-file-id") ===
-                  selectedRow.getAttribute("data-review-file-id") &&
-                diffRoot?.getAttribute("data-review-selected-layer") ===
-                  selectedRow.getAttribute("data-review-layer");
+                targetEqualsSelected &&
+                selectedVisibleForLayout &&
+                selectedFileIdPresent &&
+                rootFileMatches &&
+                rootLayerMatches;
               // 布局选择已进入更多菜单，准备就绪必须以当前实际渲染的 Diff 为依据。
               const modeViewer = diffRoot?.querySelector("[data-review-diff-mode]");
               const renderedMode = modeViewer?.getAttribute("data-review-diff-mode");
@@ -17947,6 +17980,13 @@ export async function waitForReviewDiff(review, path, deadline, signal) {
               return {
                 state,
                 selectionMatches,
+                targetEqualsSelected,
+                selectedVisible,
+                narrowDetailVisibility,
+                selectedFileIdPresent,
+                diffRootCount: diffRoots.length,
+                rootFileMatches,
+                rootLayerMatches,
                 viewMode,
                 regionFound: region !== undefined,
                 regionVisible,
@@ -17992,6 +18032,13 @@ export async function waitForReviewDiff(review, path, deadline, signal) {
       lastDiagnostic = {
         state: observation.state,
         selectionMatches: observation.selectionMatches,
+        targetEqualsSelected: observation.targetEqualsSelected,
+        selectedVisible: observation.selectedVisible,
+        narrowDetailVisibility: observation.narrowDetailVisibility,
+        selectedFileIdPresent: observation.selectedFileIdPresent,
+        diffRootCount: observation.diffRootCount,
+        rootFileMatches: observation.rootFileMatches,
+        rootLayerMatches: observation.rootLayerMatches,
         viewMode: observation.viewMode,
         regionFound: observation.regionFound,
         regionVisible: observation.regionVisible,
@@ -18566,8 +18613,22 @@ async function exerciseNativeReviewFlow(
       unstaged: worktree.stdout.trim() === expectedPath,
     };
   };
+  /** 窄布局详情页会隐藏文件树；只通过真实返回按钮恢复树，避免向隐藏搜索框填值或强制点击。
+   * @author kongweiguang
+   */
+  const revealReviewTreeForSelection = async () => {
+    const tree = review.locator(".ja-review-shell-tree");
+    const back = review.getByRole("button", { name: "返回变更文件", exact: true });
+    if (!(await tree.isVisible())) {
+      await back.waitFor({ state: "visible", timeout: timeout() });
+      await clickVerifiedControl(page, back, deadline);
+      await tree.waitFor({ state: "visible", timeout: timeout() });
+    }
+    if (!(await tree.isVisible())) throw new Error("窄布局 Review 文件树未通过返回入口恢复");
+  };
   /** 夹具通过 query 展开真实虚拟树，再选择唯一 fileId；读取 ACK 与可见 Diff 都必须属于该文件。 */
   const selectFixture = async (layer) => {
+    await revealReviewTreeForSelection();
     await review
       .getByPlaceholder("筛选文件…", { exact: true })
       .fill(expectedPath, { timeout: timeout() });

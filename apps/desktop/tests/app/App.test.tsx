@@ -857,7 +857,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
 
   /**
    * 项目提示属于可见 Workspace owner；本用例串联多 Thread 切换、隐藏与恢复、项目编辑及失败重试，
-   * 20 秒只覆盖多次完整 App 状态转换的累计 jsdom 开销，不代表任何产品单步 deadline。
+   * 20 秒覆盖累计 jsdom 开销，不代表产品单步 deadline；Sonner 的退出动画保留 DOM 200ms，Portal 断言只计活动通知。
    * @author kongweiguang
    */
   it("keeps one visible directory notice across Thread changes, hidden views, and retry", async () => {
@@ -1003,7 +1003,11 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     await waitFor(() =>
       expect(screen.queryByText("项目目录不可用", { exact: true })).not.toBeInTheDocument(),
     );
-    await waitFor(() => expect(document.querySelectorAll("[data-sonner-toast]")).toHaveLength(0));
+    await waitFor(() =>
+      expect(
+        document.querySelectorAll('[data-sonner-toast]:not([data-removed="true"])'),
+      ).toHaveLength(0),
+    );
     await user.click(screen.getByRole("button", { name: "取消" }));
     await waitFor(() => {
       const restoredToast = screen

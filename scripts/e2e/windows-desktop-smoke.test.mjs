@@ -4013,10 +4013,27 @@ function reviewDiffFixture(viewMode = "split") {
   const reviewElement = dom.window.document.querySelector(
     '[data-thread-workbench-scope="ws-current:thr-current"] [data-ja-review-shell]',
   );
-  reviewElement.insertAdjacentHTML(
+  const document = dom.window.document;
+  reviewElement.classList.add("ja-review-shell");
+  reviewElement.setAttribute("data-review-layout", "wide");
+  const tree = reviewElement.querySelector("[data-ja-review-tree]");
+  const treePanel = document.createElement("aside");
+  treePanel.className = "ja-review-shell-tree";
+  tree.replaceWith(treePanel);
+  treePanel.append(tree);
+  const diffPanel = document.createElement("main");
+  diffPanel.className = "ja-review-shell-diff";
+  const mobileBar = document.createElement("div");
+  mobileBar.className = "ja-review-shell-mobile-bar";
+  const backToTree = document.createElement("button");
+  backToTree.setAttribute("aria-label", "返回变更文件");
+  mobileBar.append(backToTree);
+  diffPanel.append(mobileBar);
+  reviewElement.append(diffPanel);
+  reviewElement.insertAdjacentHTML("beforeend", '<header class="ja-review-shell-header"></header>');
+  diffPanel.insertAdjacentHTML(
     "beforeend",
     `
-    <header class="ja-review-shell-header"></header>
     <div class="ja-review-diff" aria-label="变更 Diff" data-review-selected-file-id="file-current" data-review-selected-layer="unstaged">
       <section class="ja-review-unified-diff" data-review-unified-diff data-review-diff-mode="${viewMode}" data-review-diff-path="sample.ts" data-review-row-count="300" data-review-syntax="plain" aria-label="${viewMode === "split" ? "双栏" : "统一"} Diff sample.ts">
         <div class="ja-review-unified-diff-viewport"><div class="ja-review-unified-diff-spacer">
@@ -4060,6 +4077,13 @@ test("accepts current split and unified Review content and the live MergeView fa
       let evidence = await waitForReviewDiff(review, "sample.ts", Date.now() + 1_000);
       assert.equal(evidence.state, "success");
       assert.equal(evidence.selectionMatches, true);
+      assert.equal(evidence.targetEqualsSelected, true);
+      assert.equal(evidence.selectedVisible, true);
+      assert.equal(evidence.narrowDetailVisibility, false);
+      assert.equal(evidence.selectedFileIdPresent, true);
+      assert.equal(evidence.diffRootCount, 1);
+      assert.equal(evidence.rootFileMatches, true);
+      assert.equal(evidence.rootLayerMatches, true);
       assert.equal(evidence.viewMode, viewMode);
       assert.equal(evidence.unifiedVisible, true);
       assert.equal(/SECRET_/u.test(JSON.stringify(evidence)), false);
@@ -4069,6 +4093,90 @@ test("accepts current split and unified Review content and the live MergeView fa
       evidence = await waitForReviewDiff(review, "sample.ts", Date.now() + 1_000);
       assert.equal(evidence.mergeVisible, true);
       assert.equal(/SECRET_/u.test(JSON.stringify(evidence)), false);
+    } finally {
+      dom.window.close();
+    }
+  }
+});
+
+/** 窄详情按生产互斥布局隐藏树，但只在树行仍挂载、身份匹配且可见返回入口存在时允许就绪。 */
+test("accepts selected Review identity in the real narrow detail visibility contract", async () => {
+  const { dom, review, reviewElement } = reviewDiffFixture("split");
+  try {
+    reviewElement.setAttribute("data-review-layout", "narrow");
+    reviewElement.classList.add("is-detail-open");
+    reviewElement.querySelector(".ja-review-shell-tree").style.display = "none";
+    reviewElement.querySelector(".ja-review-shell-diff").style.display = "flex";
+
+    const evidence = await waitForReviewDiff(review, "sample.ts", Date.now() + 1_000);
+    assert.equal(evidence.state, "success");
+    assert.equal(evidence.selectionMatches, true);
+    assert.equal(evidence.targetEqualsSelected, true);
+    assert.equal(evidence.selectedVisible, false);
+    assert.equal(evidence.narrowDetailVisibility, true);
+    assert.equal(evidence.diffRootCount, 1);
+    assert.equal(evidence.rootFileMatches, true);
+    assert.equal(evidence.rootLayerMatches, true);
+  } finally {
+    dom.window.close();
+  }
+});
+
+/** 宽布局隐藏选中行不能借窄详情规则放行；诊断须指出精确失败的可见性子项。 */
+test("reports the selected-row visibility failure outside narrow detail", async () => {
+  const { dom, review, reviewElement } = reviewDiffFixture("split");
+  try {
+    reviewElement.querySelector(".ja-review-shell-tree").style.display = "none";
+    await assert.rejects(waitForReviewDiff(review, "sample.ts", Date.now() + 80), (error) => {
+      const diagnostic = JSON.parse(error.message.slice(error.message.indexOf("{")));
+      assert.equal(diagnostic.selectionMatches, false);
+      assert.equal(diagnostic.targetEqualsSelected, true);
+      assert.equal(diagnostic.selectedVisible, false);
+      assert.equal(diagnostic.narrowDetailVisibility, false);
+      assert.equal(diagnostic.selectedFileIdPresent, true);
+      assert.equal(diagnostic.diffRootCount, 1);
+      assert.equal(diagnostic.rootFileMatches, true);
+      assert.equal(diagnostic.rootLayerMatches, true);
+      return true;
+    });
+  } finally {
+    dom.window.close();
+  }
+});
+
+/** 窄布局豁免仍要求详情页返回入口、可见 Diff 和精确的文件层身份同时成立。 */
+test("keeps narrow detail visibility bound to its back control and exact layer", async () => {
+  for (const mismatch of ["missing-back", "wrong-layer", "hidden-diff"]) {
+    const { dom, review, reviewElement } = reviewDiffFixture("split");
+    try {
+      reviewElement.setAttribute("data-review-layout", "narrow");
+      reviewElement.classList.add("is-detail-open");
+      reviewElement.querySelector(".ja-review-shell-tree").style.display = "none";
+      reviewElement.querySelector(".ja-review-shell-diff").style.display = "flex";
+      if (mismatch === "missing-back")
+        reviewElement.querySelector('[aria-label="返回变更文件"]').remove();
+      if (mismatch === "wrong-layer")
+        reviewElement
+          .querySelector(".ja-review-diff")
+          .setAttribute("data-review-selected-layer", "staged");
+      if (mismatch === "hidden-diff")
+        reviewElement.querySelector(".ja-review-shell-diff").style.display = "none";
+
+      await assert.rejects(waitForReviewDiff(review, "sample.ts", Date.now() + 80), (error) => {
+        const diagnostic = JSON.parse(error.message.slice(error.message.indexOf("{")));
+        assert.equal(diagnostic.selectionMatches, false);
+        assert.equal(diagnostic.targetEqualsSelected, true);
+        assert.equal(diagnostic.selectedVisible, false);
+        assert.equal(diagnostic.diffRootCount, 1);
+        if (mismatch === "wrong-layer") {
+          assert.equal(diagnostic.narrowDetailVisibility, true);
+          assert.equal(diagnostic.rootLayerMatches, false);
+        } else {
+          assert.equal(diagnostic.narrowDetailVisibility, false);
+          assert.equal(diagnostic.rootLayerMatches, true);
+        }
+        return true;
+      });
     } finally {
       dom.window.close();
     }
