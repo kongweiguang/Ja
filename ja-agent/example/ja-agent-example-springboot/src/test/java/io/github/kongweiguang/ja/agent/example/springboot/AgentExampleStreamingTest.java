@@ -46,6 +46,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -171,7 +172,7 @@ class AgentExampleStreamingTest {
     }
 
     /**
-     * 只验证真实 Spring 池的物理连接复用与关闭边界；调用方仍拥有 EmbeddedPostgres，不把应用池生命周期外溢。
+     * 用 backend PID 集合证明真实 Spring 池在多物理连接配置下仍会复用；随后分别核对应用池与调用方数据库的关闭边界。
      */
     @Test
     void usesBootManagedPoolAndClosesOnlyTheApplicationDataSource() throws Exception {
@@ -182,13 +183,19 @@ class AgentExampleStreamingTest {
             try (ConfigurableApplicationContext application = start(postgres, model)) {
                 managedDataSource = application.getBean(DataSource.class);
                 assertEquals("com.zaxxer.hikari.HikariDataSource", managedDataSource.getClass().getName());
-                assertEquals(Integer.valueOf(10), application.getEnvironment()
+                int maximumPoolSize = 10;
+                assertEquals(Integer.valueOf(maximumPoolSize), application.getEnvironment()
                         .getProperty("spring.datasource.hikari.maximum-pool-size", Integer.class));
 
-                int backendPid = postgresBackendPid(managedDataSource);
-                for (int borrow = 0; borrow < 20; borrow++) {
-                    assertEquals(backendPid, postgresBackendPid(managedDataSource));
+                int borrowCount = maximumPoolSize * 2;
+                Set<Integer> backendPids = new HashSet<>(maximumPoolSize);
+                for (int borrow = 0; borrow < borrowCount; borrow++) {
+                    backendPids.add(postgresBackendPid(managedDataSource));
                 }
+                assertTrue(backendPids.size() <= maximumPoolSize,
+                        "observed backend connections must stay within the configured pool capacity");
+                assertTrue(backendPids.size() < borrowCount,
+                        "sequential borrows must reuse at least one physical backend connection");
             }
 
             assertThrows(SQLException.class, managedDataSource::getConnection);
