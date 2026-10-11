@@ -806,11 +806,12 @@ test("createReviewGitFixture 构造真实分层 Git 状态", async (context) => 
   assert.match(stdout, /src\/空 格\/delta\.ts/u);
 });
 
-/** Debug launch 环境隔离应用数据并让 Java 25 解析优先于宿主 PATH。 */
+/** Debug launch 显式覆盖 Ja home，避免宿主 JA_HOME 绕过隔离；Java 25 解析优先于宿主 PATH。 */
 test("buildLaunchEnvironment 固定隔离目录和 JDK 25", () => {
   const root = join(tmpdir(), "ja-review-env");
   const directories = {
     settings: join(root, "profile"),
+    home: join(root, "profile", ".ja"),
     roaming: join(root, "roaming"),
     local: join(root, "local"),
     runtime: join(root, "runtime"),
@@ -827,6 +828,7 @@ test("buildLaunchEnvironment 固定隔离目录和 JDK 25", () => {
     cargoTargetDirectory: join(root, "cargo-target"),
   });
   assert.equal(env.USERPROFILE, directories.settings);
+  assert.equal(env.JA_HOME, directories.home);
   assert.equal(env.JA_E2E_RUNTIME_ROOT, directories.runtime);
   assert.equal(env.JAVA_HOME, dirname(dirname(java)));
   assert.ok(env.PATH.startsWith(`${dirname(java)};`));

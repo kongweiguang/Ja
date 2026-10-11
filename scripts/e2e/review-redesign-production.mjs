@@ -842,6 +842,7 @@ export function buildLaunchEnvironment({
     APPDATA: directories.roaming,
     LOCALAPPDATA: directories.local,
     USERPROFILE: directories.settings,
+    JA_HOME: directories.home,
     CARGO_HOME: process.env.CARGO_HOME?.trim() || join(process.env.USERPROFILE, ".cargo"),
     RUSTUP_HOME: process.env.RUSTUP_HOME?.trim() || join(process.env.USERPROFILE, ".rustup"),
     JA_E2E_RUNTIME_ROOT: directories.runtime,
@@ -1069,11 +1070,19 @@ async function terminateOwnedLauncher(launch) {
 
 /**
  * @author kongweiguang
- * Windows fresh UDF 首启先完成磁盘 profile 初始化；两次启动保持相同原生浏览器参数，正式阶段才连接 CDP。
+ * Windows fresh UDF 首启先完成磁盘 profile 初始化；只复用浏览器目录，预热使用独立 Ja home/run，
+ * 避免强杀预热进程遗留的端点消耗正式启动预算；正式阶段才连接 CDP。
  * 启动器沿用已校验的 pnpm 身份，冷编译与 profile 就绪分别使用准备和运行时期限。
  */
 async function prewarmWebViewProfile(overlay, environment, directories, pnpmCommand) {
-  const primeEnvironment = { ...environment };
+  const primeHome = join(directories.root, "webview-prime-home");
+  const primeRuntime = join(primeHome, "run");
+  await mkdir(primeRuntime, { recursive: true });
+  const primeEnvironment = {
+    ...environment,
+    JA_HOME: primeHome,
+    JA_E2E_RUNTIME_ROOT: primeRuntime,
+  };
   delete primeEnvironment.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
   const prime = launchTauri({
     overlay,
