@@ -2147,26 +2147,31 @@ test("owned-tree shutdown acknowledgement is recorded before CDP disconnect and 
   const cleanupStart = source.indexOf("async function cleanupPhase(");
   const profilePrimeShutdown = source.indexOf('phase === "profilePrime"', cleanupStart);
   const profilePrimeProcessCleanup = source.indexOf("await stopProcessTree(", profilePrimeShutdown);
+  const primeShutdownHelper = source.indexOf(
+    "const shutdownProfilePrimeOwner = async",
+    cleanupStart,
+  );
+  const primeShutdownHelperEnd = source.indexOf(
+    "const switchProfilePrimeToOwnerShutdown = async",
+    primeShutdownHelper,
+  );
   assert.ok(cleanupStart >= 0 && profilePrimeShutdown > cleanupStart);
   assert.ok(profilePrimeProcessCleanup > profilePrimeShutdown);
+  assert.ok(primeShutdownHelper > cleanupStart && primeShutdownHelperEnd > primeShutdownHelper);
+  const primeShutdownHelperSource = source.slice(primeShutdownHelper, primeShutdownHelperEnd);
   const profilePrimeShutdownSource = source.slice(profilePrimeShutdown, profilePrimeProcessCleanup);
+  assert.match(primeShutdownHelperSource, /Object\.create\(directories\)/u);
+  assert.match(primeShutdownHelperSource, /sharedRuntimeFreeze = runtimeFreeze/u);
+  assert.match(primeShutdownHelperSource, /await shutdownRunScopedRuntime\(/u);
   assert.match(
-    profilePrimeShutdownSource,
-    /const shutdownDirectories = Object\.create\(directories\)/u,
-  );
-  assert.match(
-    profilePrimeShutdownSource,
-    /shutdownDirectories\.sharedRuntimeFreeze = runtimeFreeze/u,
-  );
-  assert.match(profilePrimeShutdownSource, /await shutdownRunScopedRuntime\(/u);
-  assert.match(
-    profilePrimeShutdownSource,
+    primeShutdownHelperSource,
     /runtimeShutdownPhaseAcknowledged\(phaseEvidence, phase\)/u,
   );
   assert.match(
-    profilePrimeShutdownSource,
+    primeShutdownHelperSource,
     /Object\.defineProperty\(directories, "sharedRuntimeIdentityHistory"/u,
   );
+  assert.match(profilePrimeShutdownSource, /await shutdownProfilePrimeOwner\("initial cleanup"\)/u);
   const profilePrimeCall = source.indexOf("await primeWebViewProfile(");
   const formalLaunch = source.indexOf("const launch = startTauri(", profilePrimeCall);
   assert.ok(profilePrimeCall >= 0 && formalLaunch > profilePrimeCall);
@@ -6154,6 +6159,46 @@ test("profilePrime readiness does not depend on an App Server endpoint", async (
   const fallbackKill = stop.indexOf("await Promise.all(survivors.map");
   assert.ok(currentSnapshot >= 0 && beforeAnyKill > currentSnapshot);
   assert.ok(treeKill > beforeAnyKill && fallbackKill > beforeAnyKill);
+});
+
+/** @author kongweiguang endpoint 在无服务证明后出现时，先完成严格 owner shutdown，再用新快照恢复窗口清理。 */
+test("profilePrime endpoint appearance transitions to owner shutdown before tree cleanup", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const cleanupStart = source.indexOf("async function cleanupPhase(");
+  const cleanupEnd = source.indexOf("\n}\n", cleanupStart);
+  assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+  const cleanup = source.slice(cleanupStart, cleanupEnd);
+  const transitionStart = cleanup.indexOf("const switchProfilePrimeToOwnerShutdown = async");
+  const transitionEnd = cleanup.indexOf("const graceful = createDeadline", transitionStart);
+  const transition = cleanup.slice(transitionStart, transitionEnd);
+  const verifierStart = source.indexOf("async function verifyProfilePrimeNoEndpointCleanup(");
+  const verifierEnd = source.indexOf("\n}\n", verifierStart);
+  const verifier = source.slice(verifierStart, verifierEnd);
+  const forcePreflight = cleanup.indexOf("const forcePreflight = createDeadline");
+  const preflightTransition = cleanup.indexOf("switchProfilePrimeToOwnerShutdown(", forcePreflight);
+  const killCallback = cleanup.indexOf(
+    "profilePrimeNoEndpointCleanup\n            ? async (snapshot)",
+  );
+  const killTransition = cleanup.indexOf("switchProfilePrimeToOwnerShutdown(", killCallback);
+  const retrySnapshot = cleanup.indexOf(
+    "processTree(rootIdentity, transitioned, incompleteObserved)",
+    killTransition,
+  );
+  const retryKill = cleanup.indexOf("await stopProcessTree(", retrySnapshot);
+
+  assert.match(
+    transition,
+    /readRuntimeEndpointMetadata\(directories\)[\s\S]*?freezeSharedRuntimeForCleanup\(/u,
+  );
+  assert.match(
+    transition,
+    /await shutdownProfilePrimeOwner\([\s\S]*?await processSnapshot\(signal\)/u,
+  );
+  assert.equal((verifier.match(/throw profilePrimeEndpointAppeared/gu) ?? []).length, 2);
+  assert.match(cleanup, /if \(error !== profilePrimeEndpointAppeared\) throw error/u);
+  assert.ok(forcePreflight >= 0 && preflightTransition > forcePreflight);
+  assert.ok(killCallback >= 0 && killTransition > killCallback);
+  assert.ok(retrySnapshot > killTransition && retryKill > retrySnapshot);
 });
 
 /** profilePrime 只复用 UDF，其余配置和 Runtime 必须落在随机物理子根。 @author kongweiguang */

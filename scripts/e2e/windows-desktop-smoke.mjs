@@ -149,6 +149,7 @@ const closeDeadlineMs = 20_000;
 const pollMs = 1_000;
 const snapshotTimeoutMs = 15_000;
 const verifiedRuntimeCleanupForce = Symbol("verified-runtime-cleanup-force");
+const profilePrimeEndpointAppeared = Symbol("profile-prime-endpoint-appeared");
 const failureVisualMetadataTimeoutMs = 2_000;
 // 多个同名托盘项需要逐个打开菜单并复验 owner；该预算只包围有界 UIA 脚本，不扩大产品关闭期限。
 const trayExitTimeoutMs = 30_000;
@@ -8122,7 +8123,7 @@ async function verifyProfilePrimeNoEndpointCleanup(
   snapshot,
 ) {
   if ((await readRuntimeEndpointMetadata(directories)) !== undefined) {
-    throw new Error("profilePrime endpoint 已出现，必须走 owner-verified 自然关闭");
+    throw profilePrimeEndpointAppeared;
   }
   const current = snapshot ?? (await processSnapshot(signal));
   const ownership = assertProfilePrimeNoEndpointOwnership(
@@ -8132,7 +8133,7 @@ async function verifyProfilePrimeNoEndpointCleanup(
     expectedExecutableNames,
   );
   if ((await readRuntimeEndpointMetadata(directories)) !== undefined) {
-    throw new Error("profilePrime endpoint 在 owned-tree 验证期间出现");
+    throw profilePrimeEndpointAppeared;
   }
   return { ...ownership, snapshot: current };
 }
@@ -15774,6 +15775,7 @@ async function cleanupPhase(
   let runtimeFreezeFailed = false;
   let profilePrimeNoEndpointCleanup = false;
   let profilePrimeNoEndpointSidecarCount;
+  let profilePrimeCleanupPath = "not_used";
   let preservedRuntimeIdentities = [];
   const runtimeShutdownCompletedForPhase =
     directories.runtimeShutdownState?.phase === phase &&
@@ -15799,6 +15801,65 @@ async function cleanupPhase(
       });
       return false;
     }
+  };
+  /** 只对 profilePrime 当前冻结的 owner 执行一次 RPC ACK 与自然退出，供初始和迟到 endpoint 共用。 @author kongweiguang */
+  const shutdownProfilePrimeOwner = async (stage) => {
+    const shutdownDirectories = Object.create(directories);
+    shutdownDirectories.sharedRuntimeFreeze = runtimeFreeze;
+    const phaseEvidence = { [phase]: {} };
+    try {
+      await shutdownRunScopedRuntime(
+        shutdownDirectories,
+        phaseEvidence,
+        expectedExecutableNames,
+        phase,
+      );
+      if (!runtimeShutdownPhaseAcknowledged(phaseEvidence, phase)) {
+        throw new Error("profilePrime App Server shutdown 缺少 ACK 或自然退出证据");
+      }
+    } catch (error) {
+      runtimeFreezeFailed = true;
+      directories.runtimeCleanupIsolationFailed = true;
+      failure ??= new Error(`${phase} ${stage} App Server shutdown 未确认，保留本轮 runtime`, {
+        cause: error,
+      });
+    } finally {
+      if (shutdownDirectories.sharedRuntimeIdentityHistory !== undefined) {
+        Object.defineProperty(directories, "sharedRuntimeIdentityHistory", {
+          value: shutdownDirectories.sharedRuntimeIdentityHistory,
+          writable: true,
+          configurable: true,
+        });
+      }
+      evidence[phase].runtimeShutdown = phaseEvidence[phase].runtimeShutdown;
+    }
+    return !runtimeFreezeFailed;
+  };
+  /** endpoint 在无服务证明后出现时，先冻结准确 owner、完成自然关闭，再刷新快照后才允许窗口树清理。 @author kongweiguang */
+  const switchProfilePrimeToOwnerShutdown = async (signal, stage) => {
+    if ((await readRuntimeEndpointMetadata(directories)) === undefined) return undefined;
+    runtimeFreeze = await freezeSharedRuntimeForCleanup(
+      { rootIdentity, incompleteObserved },
+      directories,
+      signal,
+      expectedExecutableNames,
+      undefined,
+      false,
+    );
+    if (runtimeFreeze.endpoint === undefined) {
+      throw new Error(`${phase} endpoint 出现后未能冻结 owner`);
+    }
+    profilePrimeNoEndpointCleanup = false;
+    profilePrimeCleanupPath = "endpoint_appeared_owner_shutdown";
+    if (!(await shutdownProfilePrimeOwner(stage))) return undefined;
+    const snapshot = await processSnapshot(signal);
+    if (!refreshRuntimeIdentities(snapshot, stage)) return undefined;
+    for (const [pid, entry] of observed) {
+      if (preservedRuntimeIdentities.some((preserved) => sameProcessIdentity(entry, preserved))) {
+        observed.delete(pid);
+      }
+    }
+    return snapshot;
   };
   const graceful = createDeadline(`${phase} graceful cleanup`, closeDeadlineMs);
   try {
@@ -15828,15 +15889,32 @@ async function cleanupPhase(
           cleanupMode === "owned_tree" &&
           (await readRuntimeEndpointMetadata(directories)) === undefined
         ) {
-          const proof = await verifyProfilePrimeNoEndpointCleanup(
-            { rootIdentity, incompleteObserved },
-            directories,
-            expectedExecutableNames,
-            graceful.signal,
-          );
-          for (const [pid, entry] of proof.tree) observed.set(pid, entry);
-          profilePrimeNoEndpointCleanup = true;
-          profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
+          try {
+            const proof = await verifyProfilePrimeNoEndpointCleanup(
+              { rootIdentity, incompleteObserved },
+              directories,
+              expectedExecutableNames,
+              graceful.signal,
+            );
+            for (const [pid, entry] of proof.tree) observed.set(pid, entry);
+            profilePrimeNoEndpointCleanup = true;
+            profilePrimeCleanupPath = "no_endpoint_owned_tree";
+            profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
+          } catch (error) {
+            if (error !== profilePrimeEndpointAppeared) throw error;
+            runtimeFreeze = await freezeSharedRuntimeForCleanup(
+              { rootIdentity, incompleteObserved },
+              directories,
+              graceful.signal,
+              expectedExecutableNames,
+              undefined,
+              false,
+            );
+            if (runtimeFreeze.endpoint === undefined) {
+              throw new Error(`${phase} endpoint 出现后未能冻结 owner`, { cause: error });
+            }
+            profilePrimeCleanupPath = "endpoint_appeared_owner_shutdown";
+          }
         } else {
           runtimeFreeze = await freezeSharedRuntimeForCleanup(
             { rootIdentity, incompleteObserved },
@@ -15846,6 +15924,13 @@ async function cleanupPhase(
             bindRunLevel ? directories.sharedRuntimeFreeze.runtimeIdentity : undefined,
             bindRunLevel,
           );
+          if (
+            phase === "profilePrime" &&
+            cleanupMode === "owned_tree" &&
+            runtimeFreeze.endpoint !== undefined
+          ) {
+            profilePrimeCleanupPath = "endpoint_present_owner_shutdown";
+          }
         }
       }
       preservedRuntimeIdentities = refreshRuntimeIdentityHistory(directories, runtimeFreeze, [
@@ -15857,34 +15942,7 @@ async function cleanupPhase(
         !runtimeFreezeFailed &&
         runtimeFreeze?.endpoint !== undefined
       ) {
-        const shutdownDirectories = Object.create(directories);
-        shutdownDirectories.sharedRuntimeFreeze = runtimeFreeze;
-        const phaseEvidence = { [phase]: {} };
-        try {
-          await shutdownRunScopedRuntime(
-            shutdownDirectories,
-            phaseEvidence,
-            expectedExecutableNames,
-            phase,
-          );
-          if (!runtimeShutdownPhaseAcknowledged(phaseEvidence, phase)) {
-            throw new Error("profilePrime App Server shutdown 缺少 ACK 或自然退出证据");
-          }
-        } catch (error) {
-          runtimeFreezeFailed = true;
-          directories.runtimeCleanupIsolationFailed = true;
-          failure ??= new Error(`${phase} App Server shutdown 未确认，保留本轮 runtime`, {
-            cause: error,
-          });
-        }
-        if (shutdownDirectories.sharedRuntimeIdentityHistory !== undefined) {
-          Object.defineProperty(directories, "sharedRuntimeIdentityHistory", {
-            value: shutdownDirectories.sharedRuntimeIdentityHistory,
-            writable: true,
-            configurable: true,
-          });
-        }
-        evidence[phase].runtimeShutdown = phaseEvidence[phase].runtimeShutdown;
+        await shutdownProfilePrimeOwner("initial cleanup");
       }
       if (runtimeFreeze !== undefined) {
         for (const [pid, entry] of observed) {
@@ -15999,7 +16057,7 @@ async function cleanupPhase(
   const forcePreflight = createDeadline(`${phase} force preflight`, snapshotTimeoutMs);
   try {
     await stopSnapshotHelpers(forcePreflight.signal);
-    const afterGrace = await processSnapshot(forcePreflight.signal);
+    let afterGrace = await processSnapshot(forcePreflight.signal);
     if (profilePrimeNoEndpointCleanup) {
       try {
         const proof = await verifyProfilePrimeNoEndpointCleanup(
@@ -16011,11 +16069,35 @@ async function cleanupPhase(
         );
         profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
       } catch (error) {
-        runtimeFreezeFailed = true;
-        directories.runtimeCleanupIsolationFailed = true;
-        failure ??= new Error(`${phase} 无 endpoint ownership proof 失效，保留本轮 runtime`, {
-          cause: error,
-        });
+        if (error !== profilePrimeEndpointAppeared) {
+          runtimeFreezeFailed = true;
+          directories.runtimeCleanupIsolationFailed = true;
+          failure ??= new Error(`${phase} 无 endpoint ownership proof，保留本轮 runtime`, {
+            cause: error,
+          });
+        } else {
+          try {
+            const transitioned = await switchProfilePrimeToOwnerShutdown(
+              forcePreflight.signal,
+              "force preflight transition",
+            );
+            if (transitioned === undefined) {
+              if (!runtimeFreezeFailed) {
+                throw new Error(`${phase} endpoint 在 ownership proof 后消失，不能清理窗口`, {
+                  cause: error,
+                });
+              }
+            } else {
+              afterGrace = transitioned;
+            }
+          } catch (transitionError) {
+            runtimeFreezeFailed = true;
+            directories.runtimeCleanupIsolationFailed = true;
+            failure ??= new Error(`${phase} 无 endpoint ownership proof 失效，保留本轮 runtime`, {
+              cause: transitionError,
+            });
+          }
+        }
       }
     }
     refreshRuntimeIdentities(afterGrace, "force preflight");
@@ -16127,11 +16209,50 @@ async function cleanupPhase(
             : undefined,
         );
       } catch (error) {
-        runtimeFreezeFailed = true;
-        directories.runtimeCleanupIsolationFailed = true;
-        failure ??= new Error(`${phase} 强制清理前无法刷新 App Server 子树身份`, {
-          cause: error,
-        });
+        if (error === profilePrimeEndpointAppeared && profilePrimeNoEndpointCleanup) {
+          try {
+            const transitioned = await switchProfilePrimeToOwnerShutdown(
+              force.signal,
+              "pre-kill transition",
+            );
+            if (transitioned === undefined) {
+              if (!runtimeFreezeFailed) {
+                throw new Error(`${phase} endpoint 在 ownership proof 后消失，不能清理窗口`);
+              }
+            } else {
+              const retryTree = processTree(rootIdentity, transitioned, incompleteObserved);
+              for (const [pid, entry] of retryTree ?? []) {
+                if (
+                  !preservedRuntimeIdentities.some((preserved) =>
+                    sameProcessIdentity(entry, preserved),
+                  )
+                ) {
+                  observed.set(pid, entry);
+                }
+              }
+              await stopProcessTree(
+                rootIdentity,
+                observed,
+                preexistingJaIdentities,
+                force.signal,
+                runtimeFreeze,
+                directories,
+              );
+            }
+          } catch (transitionError) {
+            runtimeFreezeFailed = true;
+            directories.runtimeCleanupIsolationFailed = true;
+            failure ??= new Error(`${phase} endpoint transition 后无法安全清理本轮窗口`, {
+              cause: transitionError,
+            });
+          }
+        } else {
+          runtimeFreezeFailed = true;
+          directories.runtimeCleanupIsolationFailed = true;
+          failure ??= new Error(`${phase} 强制清理前无法刷新 App Server 子树身份`, {
+            cause: error,
+          });
+        }
       }
       if (runtimeFreezeFailed) {
         finalTree = await captureFreshTreeState(
@@ -16201,12 +16322,25 @@ async function cleanupPhase(
     },
     ...(phase === "profilePrime"
       ? {
-          noEndpointOwnedTreeProof: profilePrimeNoEndpointCleanup
-            ? {
-                status: runtimeFreezeFailed ? "failed" : "passed",
-                sidecarCount: profilePrimeNoEndpointSidecarCount,
-              }
-            : { status: "not_used" },
+          noEndpointOwnedTreeProof: {
+            status:
+              profilePrimeCleanupPath === "endpoint_appeared_owner_shutdown"
+                ? runtimeFreezeFailed
+                  ? "endpoint_appeared_owner_shutdown_failed"
+                  : "endpoint_appeared_owner_shutdown"
+                : profilePrimeCleanupPath === "endpoint_present_owner_shutdown"
+                  ? runtimeFreezeFailed
+                    ? "endpoint_present_owner_shutdown_failed"
+                    : "endpoint_present_owner_shutdown"
+                  : profilePrimeNoEndpointCleanup
+                    ? runtimeFreezeFailed
+                      ? "failed"
+                      : "passed"
+                    : "not_used",
+            ...(profilePrimeNoEndpointSidecarCount === undefined
+              ? {}
+              : { sidecarCount: profilePrimeNoEndpointSidecarCount }),
+          },
         }
       : {}),
     root:
