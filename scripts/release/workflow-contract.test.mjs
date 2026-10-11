@@ -154,6 +154,12 @@ function assertNativeReuseContract() {
     assert.match(reuseStep, /native-reuse/u);
     assert.match(reuseStep, /build-report\.json/u);
     assert.match(reuseStep, /ja-app-server\.json/u);
+    assert.match(reuseStep, /native\/ja-agent\/ja-app-server\/target/u);
+    assert.match(reuseStep, /native\/native-evidence/u);
+  }
+  for (const platform of ["Windows", "macOS"]) {
+    const restore = stepBody(source, `Restore verified native executable (${platform})`);
+    assert.match(restore, /\$inputRoot = Join-Path \$env:RUNNER_TEMP 'ja-verified-native\/native'/u);
   }
   assert.match(source, /run-id: \$\{\{ inputs\.verified_run_id \}\}/u);
   assert.match(source, /github-token: \$\{\{ github\.token \}\}/u);
@@ -211,7 +217,7 @@ function assertCoordinatedPublication() {
 
 test("release publishes npm before the verified GitHub draft", assertCoordinatedPublication);
 
-/** npm 必须复用已验证产物，携带搜索依赖，并回读 registry 中的真实包才算完成。 */
+/** npm 必须复用通过验收的持久 staging 依赖，不能读取打包后已清理的临时副本，并回读 registry 中的真实包。 */
 function assertNpmPublicationContract() {
   const source = readWorkflow(NPM_WORKFLOW_PATH);
   assert.match(source, /workflow_call:[\s\S]*NPM_TOKEN:[\s\S]*required: false/u);
@@ -221,6 +227,15 @@ function assertNpmPublicationContract() {
   assert.match(source, /\$run\.event -cne 'push'/u);
   assert.match(source, /run-id: \$\{\{ inputs\.native_run_id \}\}/u);
   assert.match(source, /--search-tools \(Join-Path \$reuse 'tools'\)/u);
+  const nativeSource = readWorkflow(NATIVE_WORKFLOW_PATH);
+  for (const candidateStep of [
+    stepBody(source, "Stage, inspect, and install the npm tarball"),
+    stepBody(nativeSource, "Pack, install offline, and exercise the installed npm runtime"),
+  ]) {
+    assert.match(candidateStep, /--app-server \(Join-Path \$reuse 'native\/ja-agent\/ja-app-server\/target\/ja-app-server\.exe'\)/u);
+    assert.match(candidateStep, /--native-report \(Join-Path \$reuse 'native\/native-evidence\/build-report\.json'\)/u);
+    assert.match(candidateStep, /--search-tools \(Join-Path \$reuse 'tools'\)/u);
+  }
   assert.match(source, /name: ja-npm-windows-x64/u);
   const candidate = stepBody(source, "Stage, inspect, and install the npm tarball");
   assert.match(candidate, /verify-runtime\.mjs[\s\S]*ja-npm-candidate-smoke/u);
@@ -232,7 +247,8 @@ function assertNpmPublicationContract() {
   assert.match(publication, /verify-published\.mjs \$package \$stage/u);
   assert.match(publication, /verify-runtime\.mjs[\s\S]*ja-npm-published-smoke/u);
   const native = stepBody(readWorkflow(NATIVE_WORKFLOW_PATH), "Prepare native reuse artifact (Windows)");
-  assert.match(native, /Copy-Item -Path 'apps\/desktop\/src-tauri\/sidecars\/tools\/\*'/u);
+  assert.match(native, /Copy-Item -Path \(Join-Path \$env:RUNNER_TEMP 'ja-native-stage\/sidecars\/tools\/\*'\)/u);
+  assert.doesNotMatch(native, /Copy-Item -Path 'apps\/desktop\/src-tauri\/sidecars\/tools\/\*'/u);
 }
 
 test("npm publishes and verifies the installed registry package", assertNpmPublicationContract);

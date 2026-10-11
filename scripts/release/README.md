@@ -14,7 +14,7 @@ Ja 沿用 Kerminal/GMark 的分发策略：不要求 Windows Authenticode 或 ma
 
 普通 CI 先执行脚本、版本、格式、类型、架构及未使用代码等快速检查。通过后，前端完整测试与生产构建独立运行，与合同/JVM/Rust 验证并行；JVM 与 Rust 保持在同一个 job 中，确保 Rust 测试使用本轮生成的 App Server JAR。两条验证链全部通过后才启动三个平台的原生矩阵，任何检查失败都不能被签名或聚合步骤绕过。
 
-Native 复用通过三个独立的 `ja-native-reuse-<platform>-<arch>` Actions artifact 传递，每份只包含原始可执行文件、Native build report 和 Maven SBOM。发布使用固定 run ID 下载，恢复脚本核对提交、平台/架构、NIK 版本及分发包哈希、`--no-fallback`、成功 smoke、可执行文件与 SBOM 的大小和 SHA-256。macOS 下载后恢复执行权限；原始构建报告及来源 run 单独留在发布证据中，随后重新检查运行行为，不把复用描述成新编译。
+Native 复用通过三个独立的 `ja-native-reuse-<platform>-<arch>` Actions artifact 传递，每份的 `native/` 子目录只包含原始可执行文件、Native build report 和 Maven SBOM。Windows artifact 另有兄弟目录 `tools/`，保存通过文件搜索验收的搜索工具及其 manifest、许可证，供 npm 校验和打包。发布使用固定 run ID 下载，恢复脚本只扫描 `native/`，核对提交、平台/架构、NIK 版本及分发包哈希、`--no-fallback`、成功 smoke、可执行文件与 SBOM 的大小和 SHA-256，仍拒绝 Native 子树内的额外文件。macOS 下载后恢复执行权限；原始构建报告及来源 run 单独留在发布证据中，随后重新检查运行行为，不把复用描述成新编译。
 
 发布预检还会在矩阵前检查版本投影、对应版本的非空发布说明、更新签名密钥，以及同名 Release/tag 冲突。复用 artifact 缺失、过期或不匹配时立即失败；应对同一候选重新运行完整 CI，获得新的成功 run 后再发布。旧工作流没有生成这些精简 artifact，不能直接作为新流程的候选；不回退到临时重编或跳过校验。
 

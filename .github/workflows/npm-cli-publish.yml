@@ -106,8 +106,8 @@ jobs:
           $reuse = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
           node packages/ja-npm/scripts/stage.mjs `
             --cli 'target/release/ja.exe' `
-            --app-server (Join-Path $reuse 'ja-agent/ja-app-server/target/ja-app-server.exe') `
-            --native-report (Join-Path $reuse 'native-evidence/build-report.json') `
+            --app-server (Join-Path $reuse 'native/ja-agent/ja-app-server/target/ja-app-server.exe') `
+            --native-report (Join-Path $reuse 'native/native-evidence/build-report.json') `
             --search-tools (Join-Path $reuse 'tools') `
             --source-commit $env:JA_SOURCE_COMMIT `
             --out $stage

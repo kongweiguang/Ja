@@ -677,7 +677,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native/native'
           python -B scripts/release/restore-verified-native.py `
             --input $inputRoot `
             --artifact 'ja-agent/ja-app-server/target/ja-app-server.exe' `
@@ -697,7 +697,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native'
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'ja-verified-native/native'
           python3 -B scripts/release/restore-verified-native.py `
             --input $inputRoot `
             --artifact 'ja-agent/ja-app-server/target/ja-app-server' `
@@ -1236,15 +1236,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $env:RUNNER_TEMP 'ja-native-reuse'
-          $target = Join-Path $root 'ja-agent/ja-app-server/target'
-          $evidence = Join-Path $root 'native-evidence'
+          # Native 恢复器只扫描三项身份文件；工具在独立兄弟目录中由 npm 校验。
+          $target = Join-Path $root 'native/ja-agent/ja-app-server/target'
+          $evidence = Join-Path $root 'native/native-evidence'
           $tools = Join-Path $root 'tools'
           New-Item -ItemType Directory -Force -Path $target,$evidence,$tools | Out-Null
           Copy-Item -LiteralPath 'ja-agent/ja-app-server/target/ja-app-server.exe' -Destination (Join-Path $target 'ja-app-server.exe')
           Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'build-report.json') -Destination (Join-Path $evidence 'build-report.json')
           Copy-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'ja-app-server.json') -Destination (Join-Path $evidence 'ja-app-server.json')
           # npm 与桌面复用同一组已通过文件搜索验收的原生依赖。
-          Copy-Item -Path 'apps/desktop/src-tauri/sidecars/tools/*' -Destination $tools
+          Copy-Item -Path (Join-Path $env:RUNNER_TEMP 'ja-native-stage/sidecars/tools/*') -Destination $tools
 
       - name: Prepare native reuse artifact (macOS)
         if: success() && inputs.release != true && matrix.platform == 'macos'
@@ -1252,8 +1253,8 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/ja-native-reuse"
-          target="$root/ja-agent/ja-app-server/target"
-          evidence="$root/native-evidence"
+          target="$root/native/ja-agent/ja-app-server/target"
+          evidence="$root/native/native-evidence"
           mkdir -p "$target" "$evidence"
           cp -- 'ja-agent/ja-app-server/target/ja-app-server' "$target/ja-app-server"
           cp -- "$JA_NATIVE_EVIDENCE/build-report.json" "$evidence/build-report.json"
@@ -1334,8 +1335,8 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'ja-npm-ci-stage'
           node packages/ja-npm/scripts/stage.mjs `
             --cli 'target/release/ja.exe' `
-            --app-server (Join-Path $reuse 'ja-agent/ja-app-server/target/ja-app-server.exe') `
-            --native-report (Join-Path $reuse 'native-evidence/build-report.json') `
+            --app-server (Join-Path $reuse 'native/ja-agent/ja-app-server/target/ja-app-server.exe') `
+            --native-report (Join-Path $reuse 'native/native-evidence/build-report.json') `
             --search-tools (Join-Path $reuse 'tools') `
             --source-commit $env:JA_SOURCE_COMMIT `
             --out $stage

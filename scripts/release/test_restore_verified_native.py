@@ -175,6 +175,25 @@ class RestoreVerifiedNativeTest(unittest.TestCase):
         _result, destination, _evidence = self.run_restore(fixture, platform="macos", arch="arm64")
         self.assertTrue(destination.stat().st_mode & stat.S_IXUSR)
 
+    def test_native_subroot_restores_without_scanning_sibling_tools(self) -> None:
+        """下载布局隔离工具与三项 Native 身份文件，保持恢复器拒绝额外文件的严格边界。"""
+
+        fixture = make_fixture(self.temp_root, "windows", "x86_64")
+        download = Path(str(fixture["root"]))
+        native_root = download / "native"
+        native_root.mkdir()
+        for directory in ("ja-agent", "native-evidence"):
+            shutil.move(str(download / directory), str(native_root / directory))
+        tools = download / "tools"
+        tools.mkdir()
+        (tools / "fd.exe").write_bytes(b"separately verified search tool")
+        fixture["root"] = native_root
+        expected = (native_root / "ja-agent/app-server/target/ja-app-server.exe").read_bytes()
+        _result, destination, _evidence = self.run_restore(fixture, platform="windows", arch="x86_64")
+        self.assertEqual(expected, destination.read_bytes())
+        with self.assertRaises(RESTORE.RestoreError):
+            RESTORE.scan_input(download, "ja-app-server.exe")
+
     def test_wrong_nik_sha_is_rejected(self) -> None:
         """NIK archive 摘要错配时必须在任何目标写入前失败。"""
 
