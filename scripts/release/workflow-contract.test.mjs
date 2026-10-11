@@ -135,9 +135,16 @@ function assertNativeVerificationGraph() {
 
 test("native matrix waits for both verification jobs", assertNativeVerificationGraph);
 
-/** 固定成功主 CI 的精简 artifact、恢复 CLI 与仅跳过 Native Image 编译的边界。 */
+/** 固定成功主 CI 的精简 artifact 与恢复边界，并约束 SBOM 生产名称，避免原生编译成功后才发现缺文件。 */
 function assertNativeReuseContract() {
   const source = readWorkflow(NATIVE_WORKFLOW_PATH);
+  for (const platform of ["Windows", "macOS"]) {
+    const producer = stepBody(source, `Generate CycloneDX SBOM (${platform})`);
+    const report = stepBody(source, `Write checksum and build report (${platform})`);
+    assert.match(producer, /-DoutputName=ja-app-server(?:\s|$)/u);
+    assert.match(producer, /-DoutputFormat=json(?:\s|$)/u);
+    assert.match(report, /ja-app-server\.json/u);
+  }
   assert.match(source, /verified_run_id:[\s\S]*required: true[\s\S]*type: string/u);
   assert.match(source, /name: ja-native-reuse-\$\{\{ matrix\.platform \}\}-\$\{\{ matrix\.arch \}\}/u);
   assert.match(source, /ja-agent\/ja-app-server\/target\/ja-app-server\.exe/u);

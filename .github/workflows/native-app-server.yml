@@ -716,12 +716,12 @@ jobs:
       - name: Generate CycloneDX SBOM (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
-        run: mvn.cmd -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom -DoutputDirectory="$env:JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server -DoutputDirectory="$env:JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
 
       - name: Generate CycloneDX SBOM (macOS)
         if: matrix.platform == 'macos'
         shell: bash
-        run: mvn -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server-bom -DoutputDirectory="$JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
+        run: mvn -B -ntp -f ja-agent/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DskipTests -DoutputFormat=json -DoutputName=ja-app-server -DoutputDirectory="$JA_NATIVE_EVIDENCE" -DoutputReactorProjects=false -DexcludeTestProject
 
       - name: Build App Server Native Image (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
