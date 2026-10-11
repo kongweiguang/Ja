@@ -1,0 +1,57 @@
+# @author kongweiguang
+# Temporary diagnostic: reuse the failed candidate binary without changing release gates.
+name: Ja native smoke diagnostics
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ac3938b64b2e9c3ca1af03c0ce804d6942a2ddfd
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ja-native-app-server-macos-arm64
+          run-id: 38145833844
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/diagnostic-input
+      - name: Run unchanged smoke and retain redacted failure evidence
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/diagnostic-evidence"
+          mapfile_placeholder=unused
+          artifact=$(python3 -c 'import pathlib,os; p=list(pathlib.Path(os.environ["RUNNER_TEMP"],"diagnostic-input").rglob("ja-app-server")); assert len(p)==1,p; print(p[0])')
+          chmod +x "$artifact"
+          identity=$(python3 -c 'import pathlib,sys,hashlib; p=pathlib.Path(sys.argv[1]); s=p.stat(); print(hashlib.sha256(p.read_bytes()).hexdigest(),s.st_size,s.st_mtime_ns)' "$artifact")
+          read -r sha size mtime <<< "$identity"
+          uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B scripts/native/run-sidecar-smoke.py \
+            --executable "$artifact" --data-dir "$RUNNER_TEMP/diagnostic-profile" \
+            --output "$RUNNER_TEMP/diagnostic-evidence/smoke.json" \
+            --expected-sha256 "$sha" --expected-size "$size" --expected-mtime-ns "$mtime" --keep-failed-profile
+      - name: Collect only redacted diagnostic documents
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib,os,json
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          out=root/'diagnostic-evidence'
+          out.mkdir(exist_ok=True)
+          for i,p in enumerate((root/'diagnostic-profile').rglob('failure-diagnostics.json')):
+              d=json.loads(p.read_text())
+              safe={k:d[k] for k in ('stage','stderrRedacted','protocolFrames') if k in d}
+              (out/f'failure-{i}.json').write_text(json.dumps(safe,ensure_ascii=False,indent=2))
+              print(json.dumps({'stage':safe.get('stage'),'stderrRedacted':safe.get('stderrRedacted')},ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: ja-arm64-smoke-diagnostics
+          path: ${{ runner.temp }}/diagnostic-evidence
+          retention-days: 3
