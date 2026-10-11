@@ -143,11 +143,18 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
-     * 已闭合 SSE 事件中的 JSON 损坏属于协议错误；网络 EOF 的缺失终态由状态机另行判断。
+     * 已闭合 SSE 事件中的 JSON 损坏属于协议错误；Jackson 数值超出 BigDecimal 解析边界时会抛出 unchecked
+     * NumberFormatException，因此只在 readTree 调用处归一化，避免吞掉后续校验或调用方的其它运行时故障。
      */
     protected static JsonNode providerObject(String data, String providerCode) {
         try (JsonParser parser = JSON.createParser(data)) {
-            JsonNode root = JSON.readTree(parser);
+            JsonNode root;
+            try {
+                root = JSON.readTree(parser);
+            } catch (NumberFormatException invalidNumber) {
+                throw new ProviderProtocolException(
+                        providerCode, "provider event payload is invalid", false, invalidNumber);
+            }
             if (root == null || !root.isObject() || parser.nextToken() != null) {
                 throw new ProviderProtocolException(providerCode, "provider event payload is invalid", false);
             }

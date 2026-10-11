@@ -360,8 +360,20 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tests/contract/run.ps1
 
-      # Jazzer 会在进程内安装全局 instrumentation；FFM/Win32 用例必须使用未插桩 JVM。
-      # 两个 fuzz 方法由紧随其后的独立 Maven/JVM 步骤执行，仍是必需门禁。
+      # 先暴露 Provider 的随机输入缺陷，避免等完整 JVM 与真窗验收之后才失败。
+      # Jazzer instrumentation 只作用于各自独立 Maven/JVM；后续 FFM/Win32 用例保持未插桩。
+      - name: Fuzz Provider Retry-After parsing
+        shell: pwsh
+        env:
+          JAZZER_FUZZ: "1"
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
+
+      - name: Fuzz Provider event JSON parsing
+        shell: pwsh
+        env:
+          JAZZER_FUZZ: "1"
+        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#providerJsonFailsClosedForArbitraryBytes" test
+
       - name: Run JVM verification and build the Rust test fixture
         shell: pwsh
         run: mvn.cmd -B -ntp -f ja-agent/pom.xml "-Dtest=!ProviderInputFuzzTest" "-Dja.example.browser=true" verify
@@ -414,18 +426,6 @@ jobs:
           $report = Join-Path $evidence 'file-search-acceptance.json'
           if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'JVM file-search acceptance report is missing' }
           Get-Content -Raw -LiteralPath $report | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
-
-      - name: Fuzz Provider Retry-After parsing
-        shell: pwsh
-        env:
-          JAZZER_FUZZ: "1"
-        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#retryAfterAlwaysStaysWithinTransportBudget" test
-
-      - name: Fuzz Provider event JSON parsing
-        shell: pwsh
-        env:
-          JAZZER_FUZZ: "1"
-        run: mvn.cmd -B -ntp -f ja-agent/pom.xml -pl :ja-agent-core -am "-Dtest=ProviderInputFuzzTest#providerJsonFailsClosedForArbitraryBytes" test
 
       - name: Run the Rust workspace gates
         shell: pwsh

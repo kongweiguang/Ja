@@ -11,3 +11,6 @@ apps/desktop/**/*.css text eol=lf
 
 # Node 验收脚本按源码行边界核对接线，Windows 干净检出也须保持同一 LF 基线。
 scripts/**/*.mjs text eol=lf
+
+# Jazzer reads these files as exact regression bytes; line-ending conversion would change the fuzz inputs.
+ja-agent/ja-agent-core/src/test/resources/io/github/kongweiguang/ja/agent/infrastructure/model/shared/ProviderInputFuzzTestInputs/** binary

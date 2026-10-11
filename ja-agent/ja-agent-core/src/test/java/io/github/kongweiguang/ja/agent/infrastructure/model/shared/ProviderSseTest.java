@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -79,6 +80,32 @@ final class ProviderSseTest {
             assertEquals("TEST_EVENT", failure.code());
             assertFalse(failure.retryable());
         }
+    }
+
+    /** 超范围指数在根、对象和数组位置都必须闭合为协议错误，而不是泄漏 Jackson 的 unchecked 异常。 */
+    @Test
+    void rejectsNumbersBeyondJacksonDecimalRangeAsProtocolFailure() {
+        String oversizedExponent = "111111111111E" + "1".repeat(90);
+        for (String payload : List.of(oversizedExponent,
+                "{\"value\":" + oversizedExponent + "}",
+                "{\"value\":[" + oversizedExponent + "]}")) {
+            ProviderProtocolException failure = assertThrows(ProviderProtocolException.class,
+                    () -> AbstractStreamingModelAdapter.providerObject(payload, "TEST_EVENT"));
+            assertEquals("TEST_EVENT", failure.code());
+            assertFalse(failure.retryable());
+            org.junit.jupiter.api.Assertions.assertInstanceOf(NumberFormatException.class, failure.getCause());
+        }
+    }
+
+    /** Provider 数值节点使用 BigDecimal 且保留输入精度，解析边界修复不能把合法小数降为 double。 */
+    @Test
+    void preservesProviderDecimalPrecision() {
+        String decimal = "0.123456789012345678901234567890";
+        JsonNode value = AbstractStreamingModelAdapter.providerObject(
+                "{\"value\":" + decimal + "}", "TEST_EVENT").path("value");
+
+        assertEquals(new BigDecimal(decimal), value.decimalValue());
+        assertEquals(decimal, value.toString());
     }
 
     /** 扩展事件不改变业务状态，但已知事件仍要求 JSON type 与事件名一致。 */
