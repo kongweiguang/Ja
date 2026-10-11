@@ -2263,7 +2263,11 @@ test("matches WebView2 profile paths across Windows 8.3 aliases", async (t) => {
     }
 
     assert.equal(
-      windowsPathMatches(`msedgewebview2.exe --user-data-dir=${longPath}`, shortPath),
+      // CI 的 tmpdir 自身也可能是短名；命令行必须使用真实完整路径，不能构造混合别名。
+      windowsPathMatches(
+        `msedgewebview2.exe --user-data-dir=${realpathSync.native(longPath)}`,
+        shortPath,
+      ),
       true,
     );
   } finally {
