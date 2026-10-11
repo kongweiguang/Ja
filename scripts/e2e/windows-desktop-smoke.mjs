@@ -141,6 +141,8 @@ const runDeadlineMs = interactionPlanAcceptanceMode
   ? configuredInteractionPlanSoakMinutes * 60_000 + defaultRunDeadlineMs
   : defaultRunDeadlineMs;
 const cdpStartupDeadlineMs = 120_000;
+const ownedWindowBootstrapDeadlineMs = 30_000;
+const ownedWindowReadTimeoutMs = 10_000;
 const turnDeadlineMs = realProviderMode ? 180_000 : 30_000;
 // Codex shell 结构矩阵包含两个真实 pointer drag、键盘焦点与视觉采样，不与模型 Turn 共用预算；
 // 单个 DOM/原生动作仍由同一绝对期限约束，避免逐断言重置造成无界扩张。
@@ -6402,6 +6404,58 @@ async function waitForRootIdentity(rootPid, deadline, signal) {
 }
 
 /**
+ * 等待严格归属于本轮 launcher 的唯一 Ja 主进程出生，再启动 profile ACK 的独立 120 秒预算；
+ * 冷构建继续受全局 deadline 约束，launcher 丢失或身份变化则立即失败。
+ * @author kongweiguang
+ */
+export async function waitForOwnedJaDesktopProcess(
+  rootIdentity,
+  observed,
+  incompleteObserved,
+  deadline,
+  launch,
+  signal,
+  dependencies = {},
+) {
+  const readSnapshot = dependencies.readSnapshot ?? processSnapshot;
+  const delay = dependencies.delay ?? waitForDelay;
+  const now = dependencies.now ?? Date.now;
+  while (now() < deadline) {
+    throwIfAborted(signal);
+    if (
+      (launch.child.exitCode !== null && launch.child.exitCode !== undefined) ||
+      (launch.child.signalCode !== null && launch.child.signalCode !== undefined)
+    ) {
+      throw new Error(
+        `profilePrime Tauri launcher 在 Ja 主进程出现前退出: ${launcherDiagnostic(launch)}`,
+      );
+    }
+    const snapshot = await readSnapshot(signal);
+    const tree = processTree(rootIdentity, snapshot, incompleteObserved);
+    if (tree === undefined) {
+      throw new Error("profilePrime 等待期间 launcher root 身份丢失或变化");
+    }
+    for (const [pid, entry] of tree) observed.set(pid, entry);
+    const appProcesses = [...tree.values()].filter(
+      (entry) => entry.name.toLowerCase() === "ja-desktop.exe",
+    );
+    if (appProcesses.length > 1) {
+      throw new Error(`profilePrime launcher 下 Ja 主进程不唯一：${appProcesses.length}`);
+    }
+    if (appProcesses.length === 1) {
+      const appProcess = appProcesses[0];
+      if (!hasProcessIdentity(appProcess)) {
+        throw new Error("profilePrime Ja 主进程缺少完整身份");
+      }
+      return appProcess;
+    }
+    const remainingMs = deadline - now();
+    if (remainingMs > 0) await delay(Math.min(pollMs, remainingMs), signal);
+  }
+  throw new Error("profilePrime launcher 在全局期限内未启动 Ja 主进程");
+}
+
+/**
  * 要求 cleanup 使用的全部身份字段齐备；不完整 CIM 行会被视为不安全，
  * 而不会转换为可终止的占位进程。
  */
@@ -7507,10 +7561,14 @@ function buildTauriEnv(
 }
 
 /**
- * 在选择 CDP 端口前完成与真窗完全相同的 Rust feature 编译；这样固定端口不会跨越冷编译
- * 窗口暴露给其它进程，同时仍由后续 Tauri CLI 负责 dev server、配置 overlay 与真实启动。
+ * 在选择 CDP 端口前完成与真窗完全相同的 Rust feature 编译；冷构建占用整轮运行期限的剩余预算，
+ * 避免局部 5 分钟上限把尚有全局预算的有效构建误判为失败。
+ * @author kongweiguang
  */
-async function warmTauriBinary(directories, rootProcessEnv, cargoCommand, signal) {
+async function warmTauriBinary(directories, rootProcessEnv, cargoCommand, runDeadline) {
+  throwIfAborted(runDeadline.signal);
+  const remainingMs = Math.floor(runDeadline.deadline - Date.now());
+  if (remainingMs <= 0) throw new Error("E2E 全局期限已耗尽，无法完成 Tauri 预编译");
   const inheritedPath = rootProcessEnv.PATH ?? rootProcessEnv.Path ?? "";
   const env = {
     ...rootProcessEnv,
@@ -7531,8 +7589,8 @@ async function warmTauriBinary(directories, rootProcessEnv, cargoCommand, signal
     env,
     windowsHide: true,
     maxBuffer: 4 * 1024 * 1024,
-    timeout: Math.min(300_000, runDeadlineMs),
-    signal,
+    timeout: remainingMs,
+    signal: runDeadline.signal,
   });
 }
 
@@ -16548,7 +16606,9 @@ async function cleanupPhase(
 }
 
 /**
- * 使用独立 Ja Home/runtime 与正式窗口共用 WebView2 UDF 做轻量预热，不开放 CDP；profile ACK 只证明 UDF。
+ * 使用独立 Ja Home/runtime 与正式窗口共用 WebView2 UDF 做轻量预热，不开放 CDP；先等严格归属的
+ * ja-desktop 进程出现，再启动 profile ACK 预算，避免把冷构建和进程出生时间算进 UDF 初始化。
+ * profile ACK 只证明 UDF。
  * 若临时 App Server endpoint 已出现，仍要求 owner 验证、协议 ACK 和自然关闭；没有 endpoint 时，
  * 只有完整 launcher 树和精确 sidecar 目录归属证明允许 owned-tree cleanup。正式目录身份不被预热污染。
  * 初始化和 cleanup 同时失败时保留两项原始错误，避免清理诊断覆盖 profile ACK 的根因。
@@ -16609,6 +16669,15 @@ async function primeWebViewProfile({
     for (const [pid, entry] of initialTree) observed.set(pid, entry);
     evidence[phase].stage = `${phase}:watcher`;
     watcher = startProcessWatcher(rootIdentity, observed, incompleteObserved, runDeadline.signal);
+    evidence[phase].stage = `${phase}:app_process`;
+    await waitForOwnedJaDesktopProcess(
+      rootIdentity,
+      observed,
+      incompleteObserved,
+      runDeadline.deadline,
+      launch,
+      runDeadline.signal,
+    );
     const startupDeadline = Math.min(runDeadline.deadline, Date.now() + cdpStartupDeadlineMs);
     evidence[phase].stage = `${phase}:profile_ack`;
     evidence[phase].profile = await waitForWebViewProfileReady(
@@ -19145,11 +19214,51 @@ export function readOwnedJaWindowPostcheck(identity, stdout) {
 }
 
 /**
+ * 让两次只读 HWND 探测共享同一个绝对 bootstrap deadline；只有 exec timeout 的 SIGTERM 回执
+ * 可以重读一次，语义退出码、普通 SIGTERM 与全局取消均立即失败。
+ * @author kongweiguang
+ */
+export async function readOwnedJaWindowWithBootstrapRetry(
+  readAttempt,
+  deadline,
+  signal,
+  timeoutBudgetMs = ownedWindowReadTimeoutMs,
+) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    throwIfAborted(signal);
+    const remainingMs = Math.floor(deadline - Date.now());
+    if (remainingMs <= 0) throw new Error("native Ja HWND bootstrap deadline 已耗尽");
+    const attemptBudgetMs = attempt === 0 ? timeoutBudgetMs : remainingMs;
+    const timeoutMs = Math.max(1, Math.min(attemptBudgetMs, remainingMs));
+    let execTimeoutElapsed = false;
+    const timeoutMarker = globalThis.setTimeout(() => {
+      execTimeoutElapsed = true;
+    }, timeoutMs);
+    try {
+      return await readAttempt(timeoutMs);
+    } catch (error) {
+      const wasExecTimeout =
+        execTimeoutElapsed &&
+        !signal?.aborted &&
+        error?.code === null &&
+        error?.killed === true &&
+        error?.signal === "SIGTERM" &&
+        (error?.exitCode === undefined || error.exitCode === null);
+      if (attempt === 0 && wasExecTimeout && Date.now() < deadline) continue;
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeoutMarker);
+    }
+  }
+  throw new Error("native Ja HWND bootstrap read attempts exhausted");
+}
+
+/**
  * 通过精确 native title 与 owner PID 唯一查找 Ja 主窗口；隐藏 CDP 验收跳过可见性要求，
  * 但仍绑定唯一顶层 HWND 与完整进程身份，不扫描或操作其它窗口。
  * @author kongweiguang
  */
-async function resolveOwnedJaWindowHandle(identity, signal) {
+async function resolveOwnedJaWindowHandle(identity, signal, bootstrapDeadline) {
   const allowHiddenWindow = process.env.JA_E2E_HIDDEN_WINDOW_ONLY === "1";
   const creationMillis = parseWindowsCreationDate(identity?.creationDate);
   if (!hasProcessIdentity(identity) || creationMillis === undefined) {
@@ -19197,23 +19306,28 @@ async function resolveOwnedJaWindowHandle(identity, signal) {
   ].join("\n");
   let stdout;
   try {
-    ({ stdout } = await execFileAsync(
-      nativeInputPowerShell,
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-      {
-        windowsHide: true,
-        timeout: 10_000,
-        maxBuffer: 128 * 1024,
-        signal,
-        env: {
-          ...process.env,
-          JA_E2E_WINDOW_PID: String(identity.pid),
-          JA_E2E_WINDOW_NAME: identity.name,
-          JA_E2E_WINDOW_COMMAND: identity.commandLine,
-          JA_E2E_WINDOW_CREATED_MS: String(creationMillis),
-          JA_E2E_WINDOW_TITLE: nativeJaWindowTitle,
-        },
-      },
+    ({ stdout } = await readOwnedJaWindowWithBootstrapRetry(
+      (timeout) =>
+        execFileAsync(
+          nativeInputPowerShell,
+          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+          {
+            windowsHide: true,
+            timeout,
+            maxBuffer: 128 * 1024,
+            signal,
+            env: {
+              ...process.env,
+              JA_E2E_WINDOW_PID: String(identity.pid),
+              JA_E2E_WINDOW_NAME: identity.name,
+              JA_E2E_WINDOW_COMMAND: identity.commandLine,
+              JA_E2E_WINDOW_CREATED_MS: String(creationMillis),
+              JA_E2E_WINDOW_TITLE: nativeJaWindowTitle,
+            },
+          },
+        ),
+      bootstrapDeadline,
+      signal,
     ));
   } catch (error) {
     throw new Error("native Ja HWND 首次绑定失败", { cause: error });
@@ -19238,7 +19352,11 @@ async function resolveOwnedJaWindowHandle(identity, signal) {
   return observation.hwnd;
 }
 
-/** 刷新准确的 spawned closure，并在本 phase 固定唯一 native Ja 主窗口 HWND。 */
+/**
+ * 刷新准确的 spawned closure，并在本 phase 固定唯一 native Ja 主窗口 HWND；首次只读绑定最多共享
+ * 一个受 session deadline 限制的 30 秒 bootstrap，后续操作继续使用原绑定不重复初始化。
+ * @author kongweiguang
+ */
 async function resolveOwnedJaWindow(scope, signal) {
   const snapshot = await processSnapshot(signal);
   const tree = processTree(scope.rootIdentity, snapshot, scope.incompleteObserved);
@@ -19250,9 +19368,19 @@ async function resolveOwnedJaWindow(scope, signal) {
   if (candidates.length !== 1)
     throw new Error(`本次 launcher 下 Ja 窗口进程数量异常：${candidates.length}`);
   const identity = candidates[0];
+  if (scope.windowBindingBootstrapDeadline === undefined) {
+    scope.windowBindingBootstrapDeadline = Math.min(
+      scope.deadline ?? Number.POSITIVE_INFINITY,
+      Date.now() + ownedWindowBootstrapDeadlineMs,
+    );
+  }
   const binding =
     scope.windowBinding === undefined
-      ? bindOwnedJaWindowHandle(scope, identity, await resolveOwnedJaWindowHandle(identity, signal))
+      ? bindOwnedJaWindowHandle(
+          scope,
+          identity,
+          await resolveOwnedJaWindowHandle(identity, signal, scope.windowBindingBootstrapDeadline),
+        )
       : bindOwnedJaWindowHandle(scope, identity);
   return { ...identity, windowBinding: binding };
 }
@@ -41339,7 +41467,7 @@ async function main() {
       locateCargoCommand(runDeadline.signal),
       locateCommand("git.exe", runDeadline.signal),
     ]);
-    await warmTauriBinary(directories, baseEnv, cargoCommand, runDeadline.signal);
+    await warmTauriBinary(directories, baseEnv, cargoCommand, runDeadline);
     evidence.setup.compile = "ready";
     const workspaceFixture = await initializeWorkspaceFixture(
       directories.workspace,
@@ -41653,7 +41781,12 @@ async function main() {
             () => waitForRuntimeReady(page, sessionDeadline, runDeadline.signal),
             runDeadline.signal,
           );
-          const runtimeNativeScope = { rootIdentity, observed, incompleteObserved };
+          const runtimeNativeScope = {
+            rootIdentity,
+            observed,
+            incompleteObserved,
+            deadline: sessionDeadline,
+          };
           let runtimeBinding;
           if (phase === "first") {
             if (directories.sharedRuntimeFreeze !== undefined) {

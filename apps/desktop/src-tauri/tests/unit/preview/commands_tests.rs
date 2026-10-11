@@ -24,13 +24,17 @@ fn visible_viewport() -> PreviewViewportInput {
 #[cfg(windows)]
 #[test]
 fn preview_child_inherits_additional_browser_args_from_main_window() {
-    let mut secondary = tauri::utils::config::WindowConfig::default();
-    secondary.label = "secondary".into();
-    secondary.additional_browser_args = Some("--secondary-only".into());
+    let secondary = tauri::utils::config::WindowConfig {
+        label: "secondary".into(),
+        additional_browser_args: Some("--secondary-only".into()),
+        ..Default::default()
+    };
 
-    let mut main = tauri::utils::config::WindowConfig::default();
-    main.label = "main".into();
-    main.additional_browser_args = Some("--remote-debugging-port=9222".into());
+    let mut main = tauri::utils::config::WindowConfig {
+        label: "main".into(),
+        additional_browser_args: Some("--remote-debugging-port=9222".into()),
+        ..Default::default()
+    };
 
     assert_eq!(
         main_window_additional_browser_args(&[secondary.clone(), main.clone()]),

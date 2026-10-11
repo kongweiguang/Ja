@@ -36,7 +36,9 @@ import {
   openReviewPortalMenu,
   bindOwnedJaWindowHandle,
   assertOwnedJaWindowBinding,
+  readOwnedJaWindowWithBootstrapRetry,
   readOwnedJaWindowPostcheck,
+  waitForOwnedJaDesktopProcess,
   ConditionTimeoutError,
   runNativeShortcutEventAttempts,
   assertMaximizedWindowEvidence,
@@ -6369,6 +6371,257 @@ test("profilePrime readiness does not depend on an App Server endpoint", async (
   const fallbackKill = stop.indexOf("await Promise.all(survivors.map");
   assert.ok(currentSnapshot >= 0 && beforeAnyKill > currentSnapshot);
   assert.ok(treeKill > beforeAnyKill && fallbackKill > beforeAnyKill);
+});
+
+/** @author kongweiguang 冷编译走全局剩余期限；120 秒 UDF ACK 只从严格归属的桌面进程出现后计时。 */
+test("uses the global build deadline and starts profile ACK after owned app process birth", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const warmStart = source.indexOf("async function warmTauriBinary(");
+  const warmEnd = source.indexOf("\n}\n", warmStart);
+  const primeStart = source.indexOf("async function primeWebViewProfile(");
+  const primeEnd = source.indexOf("\n}\n", primeStart);
+  assert.ok(warmStart >= 0 && warmEnd > warmStart && primeStart >= 0 && primeEnd > primeStart);
+  const warm = source.slice(warmStart, warmEnd);
+  const prime = source.slice(primeStart, primeEnd);
+  const appWait = prime.indexOf("await waitForOwnedJaDesktopProcess(");
+  const deadlineStart = prime.indexOf("const startupDeadline = Math.min(");
+  const profileAck = prime.indexOf("await waitForWebViewProfileReady(");
+
+  assert.match(warm, /runDeadline\.deadline - Date\.now\(\)/u);
+  assert.match(warm, /timeout: remainingMs/u);
+  assert.match(warm, /signal: runDeadline\.signal/u);
+  assert.doesNotMatch(warm, /300_000/u);
+  assert.ok(appWait >= 0 && deadlineStart > appWait && profileAck > deadlineStart);
+  assert.match(prime, /runDeadline\.deadline,[\s\S]*?runDeadline\.signal/u);
+});
+
+/** @author kongweiguang 验证等待仅接受完整身份且位于本轮 launcher closure 内的唯一主进程。 */
+test("waits for one fully identified Ja process inside the current launcher tree", async () => {
+  const root = {
+    pid: 11,
+    parentPid: 1,
+    name: "cmd.exe",
+    commandLine: "cmd.exe /c e2e-launcher",
+    creationDate: "2026-10-12T01:00:00.000Z",
+  };
+  const app = {
+    pid: 12,
+    parentPid: root.pid,
+    name: "ja-desktop.exe",
+    commandLine: "C:\\ja\\ja-desktop.exe",
+    creationDate: "2026-10-12T01:00:01.000Z",
+  };
+  const launch = { child: { exitCode: null, signalCode: null } };
+  const observed = new Map();
+  const incompleteObserved = { current: new Map(), history: [], dropped: 0 };
+  let now = Date.now();
+  let reads = 0;
+  const result = await waitForOwnedJaDesktopProcess(
+    root,
+    observed,
+    incompleteObserved,
+    now + 5_000,
+    launch,
+    undefined,
+    {
+      now: () => now,
+      readSnapshot: async () => (reads++ === 0 ? [root] : [root, app]),
+      delay: async (duration) => {
+        now += duration;
+      },
+    },
+  );
+  assert.equal(result.pid, app.pid);
+  assert.equal(observed.get(app.pid).commandLine, app.commandLine);
+  assert.equal(reads, 2);
+
+  let duplicateNow = Date.now();
+  await assert.rejects(
+    waitForOwnedJaDesktopProcess(
+      root,
+      new Map(),
+      { current: new Map(), history: [], dropped: 0 },
+      duplicateNow + 1_000,
+      launch,
+      undefined,
+      {
+        now: () => duplicateNow,
+        readSnapshot: async () => [
+          root,
+          app,
+          { ...app, pid: 14, commandLine: `${app.commandLine} --duplicate` },
+        ],
+      },
+    ),
+    /不唯一/u,
+  );
+
+  let changedRootNow = Date.now();
+  await assert.rejects(
+    waitForOwnedJaDesktopProcess(
+      root,
+      new Map(),
+      { current: new Map(), history: [], dropped: 0 },
+      changedRootNow + 1_000,
+      launch,
+      undefined,
+      {
+        now: () => changedRootNow,
+        readSnapshot: async () => [{ ...root, creationDate: "2026-10-12T01:00:00.100Z" }, app],
+      },
+    ),
+    /root 身份丢失或变化/u,
+  );
+
+  let exitedSnapshots = 0;
+  await assert.rejects(
+    waitForOwnedJaDesktopProcess(
+      root,
+      new Map(),
+      { current: new Map(), history: [], dropped: 0 },
+      Date.now() + 1_000,
+      {
+        child: { exitCode: 1, signalCode: null },
+        output: { stdout: [], stderr: [] },
+      },
+      undefined,
+      { readSnapshot: async () => (exitedSnapshots += 1) },
+    ),
+    /launcher 在 Ja 主进程出现前退出/u,
+  );
+  assert.equal(exitedSnapshots, 0);
+
+  const detached = { ...app, pid: 13, parentPid: 2 };
+  now = Date.now();
+  await assert.rejects(
+    waitForOwnedJaDesktopProcess(
+      root,
+      new Map(),
+      { current: new Map(), history: [], dropped: 0 },
+      now + 1,
+      launch,
+      undefined,
+      {
+        now: () => now,
+        readSnapshot: async () => [root, detached],
+        delay: async (duration) => {
+          now += duration;
+        },
+      },
+    ),
+    /未启动 Ja 主进程/u,
+  );
+});
+
+/** @author kongweiguang 仅将本 runner 的 exec timeout SIGTERM 视为可重读，其他失败与总期限都故障关闭。 */
+test("retries only a timed out native-window read within one bootstrap deadline", async () => {
+  let attempts = 0;
+  const timeouts = [];
+  const result = await readOwnedJaWindowWithBootstrapRetry(
+    async (timeoutMs) => {
+      attempts += 1;
+      timeouts.push(timeoutMs);
+      if (attempts === 1) {
+        assert.equal(timeoutMs, 5);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, timeoutMs + 2));
+        throw Object.assign(new Error("exec timeout"), {
+          code: null,
+          killed: true,
+          signal: "SIGTERM",
+        });
+      }
+      assert.ok(timeoutMs > 5 && timeoutMs <= 2_000);
+      return "owned-window-evidence";
+    },
+    Date.now() + 2_000,
+    undefined,
+    5,
+  );
+  assert.equal(result, "owned-window-evidence");
+  assert.equal(attempts, 2);
+  assert.equal(timeouts.length, 2);
+
+  let semanticAttempts = 0;
+  const semanticFailure = Object.assign(new Error("PowerShell identity failure"), {
+    code: 1,
+    killed: false,
+    signal: null,
+  });
+  await assert.rejects(
+    readOwnedJaWindowWithBootstrapRetry(
+      async () => {
+        semanticAttempts += 1;
+        throw semanticFailure;
+      },
+      Date.now() + 2_000,
+      undefined,
+      5,
+    ),
+    (error) => error === semanticFailure,
+  );
+  assert.equal(semanticAttempts, 1);
+
+  let nonTimeoutAttempts = 0;
+  const nonTimeoutKill = Object.assign(new Error("external process termination"), {
+    code: null,
+    killed: true,
+    signal: "SIGTERM",
+  });
+  await assert.rejects(
+    readOwnedJaWindowWithBootstrapRetry(
+      async () => {
+        nonTimeoutAttempts += 1;
+        throw nonTimeoutKill;
+      },
+      Date.now() + 2_000,
+      undefined,
+      5,
+    ),
+    (error) => error === nonTimeoutKill,
+  );
+  assert.equal(nonTimeoutAttempts, 1);
+
+  let remainingBudget;
+  await readOwnedJaWindowWithBootstrapRetry(
+    async (timeoutMs) => {
+      remainingBudget = timeoutMs;
+      return "within-deadline";
+    },
+    Date.now() + 20,
+    undefined,
+    5_000,
+  );
+  assert.ok(remainingBudget > 0 && remainingBudget <= 20);
+
+  let expiredAttempts = 0;
+  await assert.rejects(
+    readOwnedJaWindowWithBootstrapRetry(
+      async () => {
+        expiredAttempts += 1;
+      },
+      Date.now() - 1,
+      undefined,
+      5,
+    ),
+    /deadline 已耗尽/u,
+  );
+  assert.equal(expiredAttempts, 0);
+
+  const controller = new AbortController();
+  controller.abort(new Error("global run cancelled"));
+  let abortedAttempts = 0;
+  await assert.rejects(
+    readOwnedJaWindowWithBootstrapRetry(
+      async () => {
+        abortedAttempts += 1;
+      },
+      Date.now() + 2_000,
+      controller.signal,
+      5,
+    ),
+    /global run cancelled/u,
+  );
+  assert.equal(abortedAttempts, 0);
 });
 
 /** @author kongweiguang endpoint 在无服务证明后出现时，先完成严格 owner shutdown，再用新快照恢复窗口清理。 */
