@@ -2,8 +2,81 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { chromium } from "@playwright/test";
 import { createServer } from "vite";
+
+/**
+ * Release only a thumbnail 404 whose image read began before the matching discard and completed after it.
+ * @author kongweiguang
+ */
+export function isReleasedDraftThumbnail404(evidence) {
+  return (
+    evidence.status === 404 &&
+    evidence.resourceType === "image" &&
+    typeof evidence.attachmentId === "string" &&
+    evidence.attachmentId.length > 0 &&
+    evidence.requestAttachmentId === evidence.attachmentId &&
+    evidence.discardAttachmentId === evidence.attachmentId &&
+    evidence.requestStartedBeforeDiscard === true &&
+    evidence.responseObservedAfterDiscardRequest === true &&
+    evidence.discardAcknowledged === true &&
+    evidence.draftDetached === true
+  );
+}
+
+/**
+ * Resolve deferred image 404s only after the matching delete receipt and detached draft are observed.
+ * @author kongweiguang
+ */
+function finalizeDiscardedThumbnail404s(
+  pendingResponses,
+  acknowledgedDiscardIds,
+  detachedDraftIds,
+  releasedDraftThumbnailResponses,
+  failedResponses,
+) {
+  for (const candidate of pendingResponses.splice(0)) {
+    const { detail, requestEvidence } = candidate;
+    if (
+      isReleasedDraftThumbnail404({
+        status: detail.status,
+        resourceType: requestEvidence.resourceType,
+        attachmentId: detail.attachmentId,
+        requestAttachmentId: requestEvidence.attachmentId,
+        discardAttachmentId: detail.attachmentId,
+        requestStartedBeforeDiscard: requestEvidence.startedBeforeDiscard,
+        responseObservedAfterDiscardRequest: requestEvidence.responseObservedAfterDiscardRequest,
+        discardAcknowledged: acknowledgedDiscardIds.has(detail.attachmentId),
+        draftDetached: detachedDraftIds.has(detail.attachmentId),
+      })
+    ) {
+      requestEvidence.classification = "released";
+      releasedDraftThumbnailResponses.push({
+        ...detail,
+        cancellation:
+          "image read began before discard and returned 404 after confirmed deletion and draft detach",
+      });
+    } else {
+      requestEvidence.classification = "failed";
+      failedResponses.push(detail);
+    }
+  }
+}
+
+/** Bound the route handshake so a missing browser read fails clearly instead of hanging the workflow. */
+function waitForObservedDropThumbnail(observed) {
+  let timeout;
+  return Promise.race([
+    observed,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("The dropped attachment thumbnail request was not observed.")),
+        15_000,
+      );
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
 
 /**
  * Read durable records without touching the live SSE; timing callbacks receive fixed names and status only.
@@ -215,12 +288,12 @@ async function dispatchFileInput(page, selector, mode, fileName, mediaType, byte
   );
 }
 
-/** Wait for discard to remove the visible draft before treating any late thumbnail read as released. */
+/** Record detach only after the delete receipt has removed the draft, preserving a strict late-read boundary. */
 async function removeUploadedDraft(
   page,
   fileName,
   composer,
-  discardedDraftIds,
+  detachedDraftIds,
   attachmentFileNames,
 ) {
   const draft = page.locator(".attachment-draft").filter({ hasText: fileName });
@@ -236,7 +309,7 @@ async function removeUploadedDraft(
   attachmentFileNames.set(decodeURIComponent(attachmentId), fileName);
   await draft.getByRole("button", { name: `移除附件 ${fileName}` }).click();
   await draft.waitFor({ state: "detached" });
-  discardedDraftIds.add(decodeURIComponent(attachmentId));
+  detachedDraftIds.add(decodeURIComponent(attachmentId));
   if (!(await composer.evaluate((element) => globalThis.document.activeElement === element))) {
     throw new Error(`Removing ${fileName} did not return focus to the message composer.`);
   }
@@ -527,7 +600,7 @@ function verifyDurableWorkflow(diagnostics, submission, approvalAnswers, approva
 }
 
 /**
- * Exercise the isolated enterprise workflow; only an image 404 after matching discard and detach is released.
+ * Exercise the isolated enterprise workflow; only a pre-discard image read returning after confirmed delete and detach is released.
  * @author kongweiguang
  */
 async function main() {
@@ -563,10 +636,21 @@ async function main() {
   const approvalStatuses = [];
   const attachmentUploadResponses = [];
   const attachmentFileNames = new Map();
+  const discardRequestedIds = new Set();
   const acknowledgedDiscardIds = new Set();
   const detachedDraftIds = new Set();
+  const pendingDiscardThumbnail404Responses = [];
   const releasedDraftThumbnailResponses = [];
-  const releasedDraftThumbnailIds = new Set();
+  const attachmentContentRequestEvidence = new WeakMap();
+  const attachmentContentRequestsByUrl = new Map();
+  const attachmentContentRequestEvidenceList = [];
+  const discardThumbnailRouteWaiters = new Map();
+  let observedDropThumbnailResolve;
+  const observedDropThumbnail = new Promise((resolve) => {
+    observedDropThumbnailResolve = resolve;
+  });
+  let forcedDropThumbnailEvidence;
+  let discardThumbnail404sFinalized = false;
   const faviconResponses = [];
   const phaseTimings = [];
   const pendingPdfBlobAborts = [];
@@ -604,6 +688,39 @@ async function main() {
   let stage = "startup";
   let attachmentInteractionEvidence;
   let focusAuditEvidence;
+  /**
+   * Release the deterministic browser route only after the matching discard response is observable.
+   * @author kongweiguang
+   */
+  const releaseDiscardThumbnailRoutes = (attachmentIds, status) => {
+    for (const id of attachmentIds) {
+      const waiters = discardThumbnailRouteWaiters.get(id) ?? [];
+      discardThumbnailRouteWaiters.delete(id);
+      for (const release of waiters) release(status);
+    }
+  };
+  /**
+   * Keep a thumbnail 404 pending until both server deletion and visible draft removal are proven.
+   * @author kongweiguang
+   */
+  const finalizeDiscardThumbnail404s = () => {
+    if (discardThumbnail404sFinalized) return;
+    finalizeDiscardedThumbnail404s(
+      pendingDiscardThumbnail404Responses,
+      acknowledgedDiscardIds,
+      detachedDraftIds,
+      releasedDraftThumbnailResponses,
+      failedResponses,
+    );
+    for (const evidence of attachmentContentRequestEvidenceList) {
+      if (evidence.classification === "pending") evidence.classification = "failed";
+      if (evidence.consoleErrors.length > 0) {
+        if (evidence.classification !== "released") consoleErrors.push(...evidence.consoleErrors);
+        evidence.consoleErrors.length = 0;
+      }
+    }
+    discardThumbnail404sFinalized = true;
+  };
 
   try {
     await vite.listen();
@@ -659,14 +776,21 @@ async function main() {
         const attachmentId = attachmentContent
           ? decodeURIComponent(attachmentContent[1])
           : undefined;
-        if (
-          attachmentId &&
-          /status of 404\b/.test(detail.text) &&
-          releasedDraftThumbnailIds.has(attachmentId) &&
-          acknowledgedDiscardIds.has(attachmentId) &&
-          detachedDraftIds.has(attachmentId)
-        ) {
-          return;
+        if (attachmentId && /status of 404\b/.test(detail.text)) {
+          const requests = attachmentContentRequestsByUrl.get(detail.location.url) ?? [];
+          const requestEvidence = requests.find(
+            (candidate) =>
+              !candidate.consoleAssociated &&
+              (candidate.responseStatus === null || candidate.responseStatus === 404),
+          );
+          if (requestEvidence) {
+            requestEvidence.consoleAssociated = true;
+            if (requestEvidence.classification === "released") return;
+            if (requestEvidence.classification === "failed" || discardThumbnail404sFinalized)
+              consoleErrors.push(detail);
+            else requestEvidence.consoleErrors.push(detail);
+            return;
+          }
         }
         if (
           stage === "upload-response-loss" &&
@@ -681,6 +805,8 @@ async function main() {
       activeRequests.delete(request);
       const pathname = new URL(request.url()).pathname;
       const failure = request.failure()?.errorText;
+      if (pathname === "/api/chat/attachments/discard")
+        releaseDiscardThumbnailRoutes(discardAttachmentIds.get(request) ?? [], null);
       if (waitReadStartedAt.has(request)) {
         recordTiming("wait_read", "request_failed", {
           durationMs: performance.now() - waitReadStartedAt.get(request),
@@ -751,12 +877,14 @@ async function main() {
         );
       }
       const discardedIds = discardAttachmentIds.get(request);
-      if (
-        pathname === "/api/chat/attachments/discard" &&
-        response.status() >= 200 &&
-        response.status() < 300
-      ) {
-        for (const id of discardedIds ?? []) acknowledgedDiscardIds.add(id);
+      if (pathname === "/api/chat/attachments/discard") {
+        const ids = discardedIds ?? [];
+        for (const id of ids) {
+          if (response.status() >= 200 && response.status() < 300) acknowledgedDiscardIds.add(id);
+          if (forcedDropThumbnailEvidence?.attachmentId === id)
+            forcedDropThumbnailEvidence.discardResponseStatus = response.status();
+        }
+        releaseDiscardThumbnailRoutes(ids, response.status());
       }
       if (pathname.endsWith("/answers")) approvalStatuses.push(response.status());
       if (response.status() >= 400) {
@@ -772,20 +900,24 @@ async function main() {
             ? { attachmentId, fileName: attachmentFileNames.get(attachmentId) ?? null }
             : {}),
         };
+        const requestEvidence = attachmentContentRequestEvidence.get(request);
+        if (requestEvidence) requestEvidence.responseStatus = response.status();
+        if (attachmentId && response.status() >= 400) {
+          if (forcedDropThumbnailEvidence?.attachmentId === attachmentId)
+            forcedDropThumbnailEvidence.responseStatus = response.status();
+        }
         if (
           response.status() === 404 &&
           request.resourceType() === "image" &&
           attachmentId &&
-          acknowledgedDiscardIds.has(attachmentId) &&
-          detachedDraftIds.has(attachmentId)
+          requestEvidence?.startedBeforeDiscard &&
+          discardRequestedIds.has(attachmentId)
         ) {
-          releasedDraftThumbnailIds.add(attachmentId);
-          releasedDraftThumbnailResponses.push({
-            ...detail,
-            cancellation:
-              "discard acknowledged and draft card detached before the late thumbnail response",
-          });
+          requestEvidence.responseObservedAfterDiscardRequest = true;
+          requestEvidence.classification = "pending";
+          pendingDiscardThumbnail404Responses.push({ detail, requestEvidence });
         } else {
+          if (requestEvidence) requestEvidence.classification = "failed";
           failedResponses.push(detail);
         }
       }
@@ -797,6 +929,26 @@ async function main() {
       if (pathname === "/api/chat/attachments/discard") {
         const attachmentIds = request.postDataJSON()?.attachmentIds ?? [];
         discardAttachmentIds.set(request, attachmentIds);
+        for (const id of attachmentIds) discardRequestedIds.add(id);
+      }
+      const attachmentContent = pathname.match(/^\/api\/chat\/attachments\/([^/]+)\/content$/);
+      if (attachmentContent && request.resourceType() === "image") {
+        const attachmentId = decodeURIComponent(attachmentContent[1]);
+        const requestEvidence = {
+          attachmentId,
+          resourceType: request.resourceType(),
+          startedBeforeDiscard: !discardRequestedIds.has(attachmentId),
+          responseObservedAfterDiscardRequest: false,
+          responseStatus: null,
+          classification: "pending",
+          consoleAssociated: false,
+          consoleErrors: [],
+        };
+        attachmentContentRequestEvidence.set(request, requestEvidence);
+        attachmentContentRequestEvidenceList.push(requestEvidence);
+        const requests = attachmentContentRequestsByUrl.get(request.url()) ?? [];
+        requests.push(requestEvidence);
+        attachmentContentRequestsByUrl.set(request.url(), requests);
       }
       if (pathname === "/api/chat/stream") {
         submissions.push(request.postDataJSON());
@@ -819,6 +971,50 @@ async function main() {
           durationMs: performance.now() - waitReadStartedAt.get(request),
         });
       }
+    });
+    // Force one in-flight draft image read to finish only after deletion, keeping the 404 race deterministic.
+    await page.route(/\/api\/chat\/attachments\/[^/]+\/content(?:\?.*)?$/, async (route) => {
+      const request = route.request();
+      const attachmentContent = new URL(request.url()).pathname.match(
+        /^\/api\/chat\/attachments\/([^/]+)\/content$/,
+      );
+      if (
+        stage !== "attachment-drop" ||
+        request.resourceType() !== "image" ||
+        !attachmentContent ||
+        forcedDropThumbnailEvidence
+      ) {
+        await route.continue();
+        return;
+      }
+      const attachmentId = decodeURIComponent(attachmentContent[1]);
+      forcedDropThumbnailEvidence = {
+        attachmentId,
+        routeIntercepted: true,
+        discardResponseStatus: null,
+        continuedAfterDiscardResponse: false,
+        responseStatus: null,
+      };
+      observedDropThumbnailResolve(attachmentId);
+      const responseStatus = await new Promise((resolve) => {
+        const waiters = discardThumbnailRouteWaiters.get(attachmentId) ?? [];
+        let timeout;
+        waiters.push((status) => {
+          clearTimeout(timeout);
+          resolve(status);
+        });
+        discardThumbnailRouteWaiters.set(attachmentId, waiters);
+        timeout = setTimeout(() => {
+          const remaining = discardThumbnailRouteWaiters.get(attachmentId) ?? [];
+          discardThumbnailRouteWaiters.set(
+            attachmentId,
+            remaining.filter((waiter) => waiter !== waiters.at(-1)),
+          );
+          resolve(null);
+        }, 15_000);
+      });
+      forcedDropThumbnailEvidence.continuedAfterDiscardResponse = Number.isInteger(responseStatus);
+      await route.continue();
     });
     await page.goto(`http://127.0.0.1:${address.port}`, { waitUntil: "networkidle" });
     if (
@@ -878,6 +1074,10 @@ async function main() {
       "image/png",
       imageBytes,
     );
+    const observedDropThumbnailId = await waitForObservedDropThumbnail(observedDropThumbnail);
+    if (observedDropThumbnailId !== forcedDropThumbnailEvidence?.attachmentId) {
+      throw new Error("The delayed draft thumbnail route did not retain its attachment identity.");
+    }
     await removeUploadedDraft(
       page,
       "browser-drop.png",
@@ -1681,6 +1881,25 @@ async function main() {
       pdfBlobAbortsClassified = true;
     }
 
+    finalizeDiscardThumbnail404s();
+    if (
+      !forcedDropThumbnailEvidence?.routeIntercepted ||
+      !forcedDropThumbnailEvidence.continuedAfterDiscardResponse ||
+      forcedDropThumbnailEvidence.discardResponseStatus < 200 ||
+      forcedDropThumbnailEvidence.discardResponseStatus >= 300 ||
+      forcedDropThumbnailEvidence.responseStatus !== 404 ||
+      !releasedDraftThumbnailResponses.some(
+        (response) =>
+          response.attachmentId === forcedDropThumbnailEvidence.attachmentId &&
+          response.fileName === "browser-drop.png" &&
+          response.status === 404,
+      )
+    ) {
+      throw new Error(
+        `The deterministic discard/thumbnail race was not observed and classified: ${JSON.stringify(forcedDropThumbnailEvidence)}`,
+      );
+    }
+
     if (
       pageErrors.length ||
       consoleErrors.length ||
@@ -1740,6 +1959,7 @@ async function main() {
       mobileSidebar: { open: mobileSidebarOpen, closed: mobileSidebarClosed },
       abortedRequests,
       releasedDraftThumbnailResponses,
+      forcedDropThumbnailEvidence,
       unexpectedErrors: {
         page: pageErrors,
         console: consoleErrors,
@@ -1809,6 +2029,7 @@ async function main() {
         approvalFormTiming = { status: "unavailable", firstVisibleAfterSubmitMs: null };
       }
     }
+    finalizeDiscardThumbnail404s();
     const reportPath = path.join(artifacts, "failure.json");
     await writeFile(
       reportPath,
@@ -1820,6 +2041,8 @@ async function main() {
           failedRequests,
           abortedRequests,
           failedResponses,
+          releasedDraftThumbnailResponses,
+          forcedDropThumbnailEvidence,
           attachmentInteractionEvidence,
           focusAuditEvidence,
           lostResponseRetryEvidence,
@@ -1850,7 +2073,9 @@ async function main() {
   }
 }
 
-main().catch((failure) => {
-  process.stderr.write(`${failure instanceof Error ? failure.stack : String(failure)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((failure) => {
+    process.stderr.write(`${failure instanceof Error ? failure.stack : String(failure)}\n`);
+    process.exitCode = 1;
+  });
+}
