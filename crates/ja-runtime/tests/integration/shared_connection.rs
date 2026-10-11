@@ -742,7 +742,7 @@ fn write_endpoint(root: &std::path::Path, host: &str, port: u16, token: String) 
     protect_endpoint_windows_acl(&path).expect("private endpoint ACL");
 }
 
-/// Windows endpoint fixtures must satisfy the same owner-only DACL that production clients enforce.
+/// Align fixture owner and DACL with the process token; inherited temp-root ownership can differ on elevated CI.
 #[cfg(windows)]
 fn protect_endpoint_windows_acl(path: &std::path::Path) -> std::io::Result<()> {
     use std::ffi::c_void;
@@ -838,17 +838,17 @@ fn protect_endpoint_windows_acl(path: &std::path::Path) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         let file = std::fs::OpenOptions::new()
-            .access_mode(0x0002_0000 | 0x0004_0000)
+            .access_mode(0x0002_0000 | 0x0004_0000 | 0x0008_0000)
             .open(path)?;
-        // Owner is inherited from the test's private temp root; replace inherited ACEs with one
-        // non-inheriting current-user ACE, matching WebSocketDaemon.protectCurrentUser.
+        // Java explicitly sets the endpoint owner to ProcessHandle.current().user(); do not rely on
+        // temp-root inheritance, which may name an elevated runner group instead of TokenUser.
         // SAFETY: the handle, SID, and ACL all remain live for the synchronous Win32 call.
         let status = unsafe {
             SetSecurityInfo(
                 file.as_raw_handle(),
                 1,
-                0x0000_0004 | 0x8000_0000,
-                std::ptr::null_mut(),
+                0x0000_0001 | 0x0000_0004 | 0x8000_0000,
+                sid,
                 std::ptr::null_mut(),
                 acl.as_mut_ptr().cast(),
                 std::ptr::null_mut(),

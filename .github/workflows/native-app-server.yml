@@ -330,6 +330,16 @@ jobs:
           & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "Write-Output 'JA_SYSTEM_POWERSHELL_READY'; exit 0"
           if ($LASTEXITCODE -ne 0) { throw "System Windows PowerShell failed: exit=$LASTEXITCODE" }
 
+      # mock endpoint 的 owner/DACL 取决于 runner 身份；先在同一 runner 验证，
+      # 避免本机普通用户通过后，等完整 JVM/WebView2 阶段结束才暴露 elevated owner 差异。
+      # 后续 workspace/all-targets 仍覆盖这组测试，真实 Java 会话测试继续使用新鲜 JAR。
+      - name: Verify Windows endpoint fixtures before JVM acceptance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked -p ja-runtime --test int_shared_connection -- --test-threads=1
+
       - name: Stage pinned search tools for JVM tests (Windows)
         shell: pwsh
         run: |
