@@ -170,7 +170,8 @@ final class WindowsNativeProcessObservationTest {
     }
 
     /**
-     * 共享模式关闭必须释放组内句柄并停掉 watcher，即使被观察的 Native Host 仍在正常运行。
+     * 共享模式关闭必须释放组内句柄并停掉 watcher，即使被观察的 Native Host 仍在正常运行；
+     * 进程级句柄总数会受期间其它句柄波动影响，因此只比较紧邻关闭的前后快照。
      * @author kongweiguang
      */
     @Test
@@ -184,12 +185,15 @@ final class WindowsNativeProcessObservationTest {
             assertTrue(handlesOpened > handlesBefore);
             assertTrue(bridge.nativeClientAcceptsRequests(owner));
 
+            long handlesImmediatelyBeforeDisable = HandleCounter.current();
             bridge.disableSharedMode();
+            long handlesImmediatelyAfterDisable = HandleCounter.current();
 
             assertTrue(ProcessHandle.of(host.processId()).orElseThrow().isAlive());
             assertFalse(bridge.nativeClientAcceptsRequests(owner));
-            assertTrue(HandleCounter.current() < handlesOpened,
-                    "shared mode shutdown must close the observation handle");
+            assertTrue(handlesImmediatelyAfterDisable < handlesImmediatelyBeforeDisable,
+                    "shared mode shutdown must close the observation handle; before="
+                            + handlesImmediatelyBeforeDisable + ", after=" + handlesImmediatelyAfterDisable);
         } finally {
             if (bridge.sharedMode()) {
                 bridge.disableSharedMode();

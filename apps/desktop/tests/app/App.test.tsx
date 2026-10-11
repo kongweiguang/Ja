@@ -855,7 +855,11 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     );
   });
 
-  /** 项目提示属于可见 Workspace owner；Thread 切换与快速重试复用一张提示卡，隐藏时不留 Portal。 @author kongweiguang */
+  /**
+   * 项目提示属于可见 Workspace owner；本用例串联多 Thread 切换、隐藏与恢复、项目编辑及失败重试，
+   * 20 秒只覆盖多次完整 App 状态转换的累计 jsdom 开销，不代表任何产品单步 deadline。
+   * @author kongweiguang
+   */
   it("keeps one visible directory notice across Thread changes, hidden views, and retry", async () => {
     const user = userEvent.setup();
     const projectWorkspace = {
@@ -1037,7 +1041,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       ).toBeEnabled();
     });
     expect(screen.getAllByText("项目目录不可用", { exact: true })).toHaveLength(1);
-  });
+  }, 20_000);
 
   /** 人工恢复仍由 Settings 的 RecoveryPanel 提供，移除侧栏状态不触发自动确认。 */
   it("keeps manual recovery available from Settings", async () => {
