@@ -6,7 +6,7 @@ import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import test from "node:test";
@@ -47,7 +47,9 @@ import {
   windowsPathMatches,
   writeRunSummary,
   assertRuntimeIsolation,
-  waitForRuntimeOwnerProof,
+  assertProfilePrimeNoEndpointOwnership,
+  createProfilePrimeDirectories,
+  collectRuntimeStartupDiagnostics,
   assertRuntimeRestartEvidence,
   assertRuntimePhaseHandoffEvidence,
   assertRuntimeHandoffBoundary,
@@ -6111,89 +6113,216 @@ function runtimeEndpointProof(fixture, ownerIdentity) {
   };
 }
 
-/** profile ACK 后允许 owner 尚未登记，只有完整隔离目录唯一匹配后才结束等待。 @author kongweiguang */
-test("waits for the exact runtime owner after profile acknowledgment", async () => {
-  const fixture = runtimeIsolationFixture();
-  const owner = runtimeSidecarProcess(fixture);
-  let probes = 0;
-  const proof = await waitForRuntimeOwnerProof(
-    async () => {
-      probes += 1;
-      if (probes === 1) return undefined;
-      return assertRuntimeIsolation(
-        [fixture.launcher, owner],
-        fixture.directories,
-        fixture.nativeScope,
-      );
-    },
-    Date.now() + 1_000,
-    undefined,
-    1,
-  );
-
-  assert.equal(probes, 2);
-  assert.equal(proof.appServerPid, owner.pid);
-  assert.equal(proof.appServerIdentity, owner);
-});
-
-/** 缺失 endpoint/owner 只能在原期限内等待，期限耗尽必须失败并交给 owner-verified cleanup。 @author kongweiguang */
-test("rejects runtime owner that does not become ready before the shared deadline", async () => {
-  await assert.rejects(
-    waitForRuntimeOwnerProof(async () => undefined, Date.now() + 12, undefined, 1),
-    /既定启动期限内未就绪/u,
-  );
-});
-
-/** 已发现但目录角色不匹配的 sidecar 属于身份错误，不能伪装成待就绪状态继续轮询。 @author kongweiguang */
-test("rejects a wrong runtime owner immediately", async () => {
-  const fixture = runtimeIsolationFixture();
-  const wrongOwner = runtimeSidecarProcess(
-    fixture,
-    {},
-    {
-      home: win32.join(fixture.directories.home, "wrong-owner"),
-    },
-  );
-
-  await assert.rejects(
-    waitForRuntimeOwnerProof(
-      async () =>
-        assertRuntimeIsolation(
-          [fixture.launcher, wrongOwner],
-          fixture.directories,
-          fixture.nativeScope,
-        ),
-      Date.now() + 1_000,
-      undefined,
-      1,
-    ),
-    /owner_not_found/u,
-  );
-});
-
-/** profilePrime 必须在相同 deadline 下先等 WebView ACK 与隔离 owner，且探测身份不得进入正式目录 binding。 @author kongweiguang */
-test("profilePrime waits for runtime ownership before reporting readiness", async () => {
+/** profile ACK 是 UDF readiness；App Server 身份只在清理分支按 endpoint 是否存在独立验证。 @author kongweiguang */
+test("profilePrime readiness does not depend on an App Server endpoint", async () => {
   const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
   const start = source.indexOf("async function primeWebViewProfile(");
   const end = source.indexOf("\n}\n", start);
   assert.ok(start >= 0 && end > start);
   const prime = source.slice(start, end);
   const profileAck = prime.indexOf("await waitForWebViewProfileReady(");
-  const ownerWait = prime.indexOf("await waitForRuntimeOwnerProof(");
   const ready = prime.indexOf('evidence[phase].status = "ready";');
 
-  assert.ok(profileAck >= 0 && ownerWait > profileAck && ready > ownerWait);
+  assert.ok(profileAck >= 0 && ready > profileAck);
   assert.equal((prime.match(/const startupDeadline = Math\.min\(/gu) ?? []).length, 1);
   assert.match(prime, /waitForWebViewProfileReady\([\s\S]*?startupDeadline/u);
-  assert.match(prime, /waitForRuntimeOwnerProof\([\s\S]*?startupDeadline/u);
-  assert.match(prime, /const probeProfilePrimeRuntimeOwner = async/u);
-  assert.match(
-    prime,
-    /captureRuntimeIsolation\(\s*\{\s*rootIdentity,\s*incompleteObserved\s*\}\s*,/u,
+  assert.doesNotMatch(prime, /runtime_owner|waitForRuntimeOwnerProof/u);
+  const cleanup = source.slice(
+    source.indexOf("async function cleanupPhase("),
+    source.indexOf("async function cleanupPhase(") + 28_000,
   );
-  assert.match(prime, /const probeDirectories = \{ \.\.\.directories \}/u);
-  assert.match(prime, /delete probeDirectories\.runtimeEndpointOwner/u);
-  assert.doesNotMatch(prime, /Object\.defineProperty\(directories, "runtimeEndpointOwner"/u);
+  assert.match(
+    cleanup,
+    /if \(\s*phase === "profilePrime"[\s\S]*?readRuntimeEndpointMetadata\(directories\)/u,
+  );
+  assert.match(
+    cleanup,
+    /verifyProfilePrimeNoEndpointCleanup\([\s\S]*?profilePrimeNoEndpointCleanup = true/u,
+  );
+  assert.match(
+    cleanup,
+    /await shutdownRunScopedRuntime\([\s\S]*?runtimeShutdownPhaseAcknowledged/u,
+  );
+  assert.match(cleanup, /profilePrimeNoEndpointCleanup\s*\?\s*async \(snapshot\)/u);
+  const stopStart = source.indexOf("async function stopProcessTree(");
+  const stopEnd = source.indexOf("\n}\n", stopStart);
+  const stop = source.slice(stopStart, stopEnd);
+  const currentSnapshot = stop.indexOf("const current = await processSnapshot(signal)");
+  const beforeAnyKill = stop.indexOf("await beforeTreeKill?.(current, currentTree)");
+  const treeKill = stop.indexOf("await kill(currentRoot.pid, true)");
+  const fallbackKill = stop.indexOf("await Promise.all(survivors.map");
+  assert.ok(currentSnapshot >= 0 && beforeAnyKill > currentSnapshot);
+  assert.ok(treeKill > beforeAnyKill && fallbackKill > beforeAnyKill);
+});
+
+/** profilePrime 只复用 UDF，其余配置和 Runtime 必须落在随机物理子根。 @author kongweiguang */
+test("profilePrime directories isolate Ja state while sharing only the WebView profile", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "ja-profile-prime-directories-"));
+  try {
+    const formal = await createRunDirectories(parent);
+    const prime = await createProfilePrimeDirectories(formal);
+    assert.equal(prime.webview, formal.webview);
+    for (const key of [
+      "root",
+      "settings",
+      "home",
+      "data",
+      "runtime",
+      "appData",
+      "roaming",
+      "local",
+    ]) {
+      assert.notEqual(prime[key], formal[key]);
+      assert.ok(prime.root.toLowerCase().startsWith(formal.root.toLowerCase()));
+    }
+    assert.match(prime.root, /ja-desktop-e2e-profile-prime$/u);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+/** 无 endpoint 强制回收要求完整根树和每个 sidecar 的四个目录参数均可归属。 @author kongweiguang */
+test("profilePrime no-endpoint cleanup accepts only an exact, complete owned tree", () => {
+  const fixture = runtimeIsolationFixture("C:\\temp\\ja-desktop-e2e-profile-prime");
+  const expectedNames = ["java.exe"];
+  assert.equal(
+    assertProfilePrimeNoEndpointOwnership(
+      [fixture.launcher],
+      fixture.nativeScope,
+      fixture.directories,
+      expectedNames,
+    ).sidecarCount,
+    0,
+  );
+  const sidecar = runtimeSidecarProcess(fixture);
+  assert.equal(
+    assertProfilePrimeNoEndpointOwnership(
+      [fixture.launcher, sidecar],
+      fixture.nativeScope,
+      fixture.directories,
+      expectedNames,
+    ).sidecarCount,
+    1,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [
+          fixture.launcher,
+          runtimeSidecarProcess(
+            fixture,
+            {},
+            { home: win32.join(fixture.directories.home, "wrong") },
+          ),
+        ],
+        fixture.nativeScope,
+        fixture.directories,
+        expectedNames,
+      ),
+    /sidecar 参数未精确绑定/u,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [fixture.launcher, sidecar, { ...sidecar, pid: 33, parentPid: 2 }],
+        fixture.nativeScope,
+        fixture.directories,
+        expectedNames,
+      ),
+    /不属于本轮 launcher 子树/u,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [fixture.launcher, sidecar, { ...sidecar, pid: 23 }],
+        fixture.nativeScope,
+        fixture.directories,
+        expectedNames,
+      ),
+    /多个 runtime sidecar/u,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [
+          fixture.launcher,
+          {
+            pid: 22,
+            parentPid: fixture.launcher.pid,
+            name: "java.exe",
+            commandLine: "",
+            creationDate: "",
+          },
+        ],
+        {
+          ...fixture.nativeScope,
+          incompleteObserved: { current: new Map(), history: [], dropped: 0 },
+        },
+        fixture.directories,
+        expectedNames,
+      ),
+    /身份不完整/u,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [sidecar],
+        fixture.nativeScope,
+        fixture.directories,
+        expectedNames,
+      ),
+    /缺少完整 launcher 身份/u,
+  );
+  assert.throws(
+    () =>
+      assertProfilePrimeNoEndpointOwnership(
+        [fixture.launcher],
+        fixture.nativeScope,
+        fixture.directories,
+        [],
+      ),
+    /缺少 sidecar executable 白名单/u,
+  );
+});
+
+/** 复用既有 bounded collectors，只输出固定阶段与异常类型，不泄漏日志正文或临时路径。 @author kongweiguang */
+test("startup failure diagnostics separate formal and profilePrime closed projections", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "ja-startup-diagnostics-"));
+  try {
+    const directories = await createRunDirectories(parent);
+    const prime = await createProfilePrimeDirectories(directories);
+    directories.profilePrime = prime;
+    for (const target of [directories, prime]) {
+      const javaLogs = win32.join(target.home, "logs", "java");
+      await mkdir(javaLogs, { recursive: true });
+      await writeFile(
+        join(javaLogs, "app-server-error.log"),
+        "Unexpected JA-RPC failure errorId=err_0123456789abcdef0123456789abcdef type=io.github.kongweiguang.ja.rpc.RpcException causeType=java.lang.IllegalStateException origin=io.github.kongweiguang.ja.server.App#start:42\n",
+      );
+      await writeFile(
+        join(javaLogs, "app-server.log"),
+        `2026-10-12 WARN startup root=${target.root}\n`,
+      );
+      await mkdir(join(target.home, "logs"), { recursive: true });
+      await writeFile(
+        join(target.home, "logs", "ja-native.log.2026-10-12"),
+        "2026-10-12 level=INFO target=ja.diagnostics.runtime_startup phase=spawn variant=success elapsed_ms=17\n",
+      );
+    }
+    const result = await collectRuntimeStartupDiagnostics(directories);
+    assert.equal(result.formal.javaFailures.length, 1);
+    assert.equal(result.profilePrime.javaFailures.length, 1);
+    assert.deepEqual(result.profilePrime.nativeStartupDiagnostics, [
+      { phase: "spawn", variant: "success", elapsedMs: 17 },
+    ]);
+    assert.equal(result.profilePrime.managedJavaDiagnostics.status, "captured");
+    assert.equal(result.formal.managedJavaDiagnostics.lines.length, 1);
+    assert.equal(result.profilePrime.managedJavaDiagnostics.status, "captured");
+    assert.equal(JSON.stringify(result).includes(prime.root), false);
+    assert.equal(JSON.stringify(result).includes("Unexpected JA-RPC failure"), false);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 /** 无关同名进程即使先出现且恰有相同目录参数，也不能替代本 launcher 的后代。 */
@@ -7878,6 +8007,10 @@ test("binds JA_HOME to the current E2E profile instead of inheriting the user's 
 
   assert.match(environment, /USERPROFILE: directories\.settings/u);
   assert.match(environment, /JA_HOME: directories\.home/u);
+  assert.match(
+    environment,
+    /if \(edgeDriver === undefined && !enableDirectCdp\)[\s\S]*?delete env\.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS/u,
+  );
   assert.ok(
     environment.indexOf("...rootProcessEnv") < environment.indexOf("JA_HOME: directories.home"),
   );

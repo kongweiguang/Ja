@@ -32,6 +32,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { queryOwnedTcpListeners } from "./owned-tcp-listeners.mjs";
 import { initializeParams } from "./real-provider-smoke.mjs";
+import {
+  collectIsolatedJavaFailures,
+  collectIsolatedNativeStartupDiagnostics,
+} from "./review-redesign-production.mjs";
 import { chromium } from "@playwright/test";
 import {
   classifyContextSummaryRequest,
@@ -2535,8 +2539,8 @@ export async function createRunDirectories(temporaryDirectory = tmpdir()) {
   }
   const workspace = join(root, "workspace");
   const settings = join(root, "settings");
-  // 生产 Host 从隔离 USERPROFILE 解析唯一 Ja Home；fixture 必须写入同一个目录，不能另造
-  // root/home 让测试配置与真实 App Server owner 分叉。SQLite 同样跟随 Ja Home 的 data 子目录。
+  // 正式运行 Host 从隔离 USERPROFILE 解析唯一 Ja Home；正式 fixture 写入同一目录。
+  // UDF prime 另用随机子根，避免其未就绪的 sidecar 与正式 App Server 共享 owner/endpoint。
   const home = join(settings, ".ja");
   const data = join(home, "data");
   const webview = join(root, "webview");
@@ -2574,6 +2578,44 @@ export async function createRunDirectories(temporaryDirectory = tmpdir()) {
     roaming,
     local,
   };
+}
+
+/**
+ * 为 UDF 预热建立与正式运行分离的配置、数据、日志和 Runtime 根；只复用同一轮 WebView2 profile，
+ * 使预热期间未发布 endpoint 的 sidecar 仍可由随机 prime 子树严格归属并回收。
+ * @author kongweiguang
+ */
+export async function createProfilePrimeDirectories(directories) {
+  const createdRoot = join(directories.root, "ja-desktop-e2e-profile-prime");
+  await mkdir(createdRoot);
+  const root = realpathSync.native(createdRoot);
+  const settings = join(root, "settings");
+  const home = join(settings, ".ja");
+  const prime = {
+    root,
+    workspace: join(root, "workspace"),
+    settings,
+    home,
+    data: join(home, "data"),
+    webview: directories.webview,
+    runtime: join(root, "runtime"),
+    appData: join(root, "appdata"),
+    roaming: join(root, "appdata", "roaming"),
+    local: join(root, "appdata", "local"),
+    desktop: join(settings, "Desktop"),
+  };
+  await Promise.all([
+    mkdir(prime.workspace),
+    mkdir(prime.desktop, { recursive: true }),
+    mkdir(prime.home, { recursive: true }),
+    mkdir(prime.data, { recursive: true }),
+    mkdir(prime.runtime),
+    mkdir(prime.roaming, { recursive: true }),
+    mkdir(prime.local, { recursive: true }),
+  ]);
+  assertLaunchRuntimeRoot(prime);
+  runtimeIsolationDirectories(prime);
+  return prime;
 }
 
 /**
@@ -7285,8 +7327,9 @@ async function validateConfiguredEdgeDriver(signal) {
 }
 
 /**
- * 构造唯一的 Tauri 启动环境；这里只注入隔离目录与受信工具路径，调试端口由私有
- * overlay 经 Wry API 传递，避免环境变量与窗口配置形成两个 browser 参数 owner。
+ * 构造唯一的 Tauri 启动环境；隔离目录、UDF 与 Direct CDP 参数由子进程环境单点注入，
+ * 让 WebView 数据目录和 CDP 参数保持同一 browser 参数 owner。
+ * @author kongweiguang
  */
 function buildTauriEnv(
   directories,
@@ -7308,7 +7351,7 @@ function buildTauriEnv(
     LOCALAPPDATA: directories.local,
     USERPROFILE: directories.settings,
     HOME: directories.settings,
-    // 显式压过宿主可能继承的 JA_HOME；Ja 数据库与 profilePrime fixture 共用本轮 settings\.ja。
+    // 显式压过宿主可能继承的 JA_HOME；profilePrime 使用自己的 settings\.ja，正式窗口只绑定正式 Home。
     JA_HOME: directories.home,
     // 应用配置必须隔离，但 Rust registry/toolchain 是构建输入；复用宿主缓存避免每轮 smoke
     // 在私有 HOME 中重新联网下载，同时不让 Tauri 读取真实应用数据。
@@ -7342,6 +7385,10 @@ function buildTauriEnv(
         }
       : {}),
   };
+  if (edgeDriver === undefined && !enableDirectCdp) {
+    // Prime 只初始化 UDF；不要继承宿主或前一 phase 的端口专属 CDP browser arguments。
+    delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
+  }
   if (edgeDriver !== undefined) {
     env.JA_E2E_CARGO_COMMAND = cargoCommand;
     env.JA_E2E_EDGEDRIVER_PATH = edgeDriver.path;
@@ -7833,6 +7880,61 @@ function runtimeSidecarArguments(entry, expected, directories) {
   );
 }
 
+/**
+ * 验证无 endpoint 的 profilePrime 是否仍能安全回收：launcher 树须完整，树内所有目标 sidecar
+ * 必须精确指向 prime 的物理目录，且不能有树外进程引用该随机 prime 根。
+ * @author kongweiguang
+ */
+export function assertProfilePrimeNoEndpointOwnership(
+  snapshot,
+  nativeScope,
+  directories,
+  expectedExecutableNames = ["java.exe"],
+) {
+  const tree = processTree(nativeScope?.rootIdentity, snapshot, nativeScope?.incompleteObserved);
+  if (tree === undefined) {
+    throw new Error("profilePrime 无 endpoint cleanup 缺少完整 launcher 身份");
+  }
+  if (
+    nativeScope?.incompleteObserved?.current?.size > 0 ||
+    nativeScope?.incompleteObserved?.dropped > 0
+  ) {
+    throw new Error("profilePrime 无 endpoint cleanup 存在身份不完整的后代");
+  }
+
+  const expected = runtimeIsolationDirectories(directories);
+  if (!Array.isArray(expectedExecutableNames) || expectedExecutableNames.length === 0) {
+    throw new Error("profilePrime 无 endpoint cleanup 缺少 sidecar executable 白名单");
+  }
+  const executableNames = new Set(
+    expectedExecutableNames.map((name) => String(name).toLowerCase()),
+  );
+  const sidecars = [];
+  for (const entry of snapshot) {
+    if (!executableNames.has(String(entry.name).toLowerCase())) continue;
+    const argumentsByDirectory = runtimeSidecarArguments(entry, expected, directories);
+    const referencesPrimeDirectory = Object.values(argumentsByDirectory).some(
+      (fact) => fact.matches,
+    );
+    const owned = sameProcessIdentity(tree.get(entry.pid), entry);
+    if (owned) {
+      if (
+        !hasProcessIdentity(entry) ||
+        !Object.values(argumentsByDirectory).every((fact) => fact.matches)
+      ) {
+        throw new Error("profilePrime sidecar 参数未精确绑定隔离目录");
+      }
+      sidecars.push(entry);
+    } else if (referencesPrimeDirectory) {
+      throw new Error("profilePrime sidecar 不属于本轮 launcher 子树");
+    }
+  }
+  if (sidecars.length > 1) {
+    throw new Error("profilePrime launcher 子树包含多个 runtime sidecar");
+  }
+  return { tree, sidecarCount: sidecars.length };
+}
+
 /** 失败诊断仅包含本 launcher 或私有 endpoint 关联的 PID 和目录参数；无关进程正文始终留在快照内部。 */
 function rejectRuntimeIsolation(reason, nativeScope, candidates = []) {
   throw new Error(
@@ -8016,6 +8118,60 @@ export async function readRuntimeEndpointMetadata(directories) {
     port: value.port,
     serverInstanceId: value.serverInstanceId,
     runtimeGeneration: value.runtimeGeneration,
+  };
+}
+
+/**
+ * 只有 endpoint 在快照前后都不存在且 launcher 闭包与 sidecar 目录参数完整时，才授权 prime 的 owned-tree 回收。
+ * @author kongweiguang
+ */
+async function verifyProfilePrimeNoEndpointCleanup(
+  nativeScope,
+  directories,
+  expectedExecutableNames,
+  signal,
+  snapshot,
+) {
+  if ((await readRuntimeEndpointMetadata(directories)) !== undefined) {
+    throw new Error("profilePrime endpoint 已出现，必须走 owner-verified 自然关闭");
+  }
+  const current = snapshot ?? (await processSnapshot(signal));
+  const ownership = assertProfilePrimeNoEndpointOwnership(
+    current,
+    nativeScope,
+    directories,
+    expectedExecutableNames,
+  );
+  if ((await readRuntimeEndpointMetadata(directories)) !== undefined) {
+    throw new Error("profilePrime endpoint 在 owned-tree 验证期间出现");
+  }
+  return { ...ownership, snapshot: current };
+}
+
+/**
+ * 失败摘要只把既有隔离日志解析器的闭集阶段与 Java RPC 错误事实分 formal/prime 两组保存，不复制原始日志。
+ * @author kongweiguang
+ */
+export async function collectRuntimeStartupDiagnostics(directories) {
+  /** 缺少隔离 Home 时返回空事实；只读取调用方已建立的私有日志目录。 */
+  const collect = async (target) => {
+    if (target?.home === undefined) {
+      return {
+        nativeStartupDiagnostics: [],
+        javaFailures: [],
+        managedJavaDiagnostics: { status: "missing", lines: [] },
+      };
+    }
+    const [nativeStartupDiagnostics, javaFailures, managedJavaDiagnostics] = await Promise.all([
+      collectIsolatedNativeStartupDiagnostics(target.home),
+      collectIsolatedJavaFailures(target.home),
+      captureManagedJavaDiagnostics(target),
+    ]);
+    return { nativeStartupDiagnostics, javaFailures, managedJavaDiagnostics };
+  };
+  return {
+    formal: await collect(directories),
+    profilePrime: await collect(directories?.profilePrime),
   };
 }
 
@@ -10473,25 +10629,6 @@ async function waitForWebViewProfileReady(
     await waitForDelay(pollMs, signal);
   }
   throw new Error(`WebView2 隔离 profile 在期限内未完成预热 (${lastObservation})`);
-}
-
-/**
- * 在不重置绝对启动期限的前提下等待 probe 给出已验证 owner；undefined 只表示尚未就绪，身份错误立即失败。
- * @author kongweiguang
- */
-export async function waitForRuntimeOwnerProof(probe, deadline, signal, intervalMs = pollMs) {
-  if (typeof probe !== "function" || !Number.isFinite(deadline)) {
-    throw new TypeError("runtime owner probe 与绝对 deadline 必须有效");
-  }
-  const delayMs = Number.isFinite(intervalMs) ? Math.max(1, Math.trunc(intervalMs)) : pollMs;
-  while (Date.now() < deadline) {
-    throwIfAborted(signal);
-    const proof = await probe();
-    if (Date.now() >= deadline) break;
-    if (proof !== undefined) return proof;
-    await waitForDelay(Math.min(delayMs, Math.max(1, deadline - Date.now())), signal);
-  }
-  throw new Error("profilePrime App Server endpoint owner 在既定启动期限内未就绪");
 }
 
 /**
@@ -15240,7 +15377,8 @@ function assertTrayExitContract() {
 
 /**
  * graceful close deadline 后回收本 runner 已验证的进程；每次快照刷新 run 历史保护集，
- * 冻结 daemon 与已观察后代跳过 /T 和逐个终止。
+ * 冻结 daemon 与已观察后代跳过 /T，profilePrime 无 endpoint 时则在任何终止分支前重新验证隔离归属。
+ * @author kongweiguang
  */
 async function stopProcessTree(
   rootIdentity,
@@ -15249,6 +15387,7 @@ async function stopProcessTree(
   signal,
   runtimeFreeze,
   directories,
+  beforeTreeKill,
 ) {
   const kill = async (pid, tree) => {
     try {
@@ -15280,6 +15419,7 @@ async function stopProcessTree(
   const treeIncomplete = createIncompleteObserved();
   const currentTree =
     currentRoot === undefined ? undefined : processTree(rootIdentity, current, treeIncomplete);
+  await beforeTreeKill?.(current, currentTree);
   const hasPreservedDescendant =
     currentTree !== undefined &&
     [...currentTree.values()].some(
@@ -15643,6 +15783,8 @@ async function cleanupPhase(
   let exitTrace;
   let runtimeFreeze;
   let runtimeFreezeFailed = false;
+  let profilePrimeNoEndpointCleanup = false;
+  let profilePrimeNoEndpointSidecarCount;
   let preservedRuntimeIdentities = [];
   const runtimeShutdownCompletedForPhase =
     directories.runtimeShutdownState?.phase === phase &&
@@ -15692,14 +15834,30 @@ async function cleanupPhase(
       } else {
         const bindRunLevel =
           phase !== "profilePrime" && directories.sharedRuntimeFreeze !== undefined;
-        runtimeFreeze = await freezeSharedRuntimeForCleanup(
-          { rootIdentity, incompleteObserved },
-          directories,
-          graceful.signal,
-          expectedExecutableNames,
-          bindRunLevel ? directories.sharedRuntimeFreeze.runtimeIdentity : undefined,
-          bindRunLevel,
-        );
+        if (
+          phase === "profilePrime" &&
+          cleanupMode === "owned_tree" &&
+          (await readRuntimeEndpointMetadata(directories)) === undefined
+        ) {
+          const proof = await verifyProfilePrimeNoEndpointCleanup(
+            { rootIdentity, incompleteObserved },
+            directories,
+            expectedExecutableNames,
+            graceful.signal,
+          );
+          for (const [pid, entry] of proof.tree) observed.set(pid, entry);
+          profilePrimeNoEndpointCleanup = true;
+          profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
+        } else {
+          runtimeFreeze = await freezeSharedRuntimeForCleanup(
+            { rootIdentity, incompleteObserved },
+            directories,
+            graceful.signal,
+            expectedExecutableNames,
+            bindRunLevel ? directories.sharedRuntimeFreeze.runtimeIdentity : undefined,
+            bindRunLevel,
+          );
+        }
       }
       preservedRuntimeIdentities = refreshRuntimeIdentityHistory(directories, runtimeFreeze, [
         ...(runtimeFreeze?.identities.values() ?? []),
@@ -15853,6 +16011,24 @@ async function cleanupPhase(
   try {
     await stopSnapshotHelpers(forcePreflight.signal);
     const afterGrace = await processSnapshot(forcePreflight.signal);
+    if (profilePrimeNoEndpointCleanup) {
+      try {
+        const proof = await verifyProfilePrimeNoEndpointCleanup(
+          { rootIdentity, incompleteObserved },
+          directories,
+          expectedExecutableNames,
+          forcePreflight.signal,
+          afterGrace,
+        );
+        profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
+      } catch (error) {
+        runtimeFreezeFailed = true;
+        directories.runtimeCleanupIsolationFailed = true;
+        failure ??= new Error(`${phase} 无 endpoint ownership proof 失效，保留本轮 runtime`, {
+          cause: error,
+        });
+      }
+    }
     refreshRuntimeIdentities(afterGrace, "force preflight");
     const afterGraceTree =
       runtimeFreezeFailed || rootIdentity === undefined
@@ -15948,6 +16124,18 @@ async function cleanupPhase(
           force.signal,
           runtimeFreeze,
           directories,
+          profilePrimeNoEndpointCleanup
+            ? async (snapshot) => {
+                const proof = await verifyProfilePrimeNoEndpointCleanup(
+                  { rootIdentity, incompleteObserved },
+                  directories,
+                  expectedExecutableNames,
+                  force.signal,
+                  snapshot,
+                );
+                profilePrimeNoEndpointSidecarCount = proof.sidecarCount;
+              }
+            : undefined,
         );
       } catch (error) {
         runtimeFreezeFailed = true;
@@ -16022,6 +16210,16 @@ async function cleanupPhase(
       preservedProcessCount: preservedRuntimeIdentities.length,
       endpointBound: runtimeFreeze?.endpoint !== undefined,
     },
+    ...(phase === "profilePrime"
+      ? {
+          noEndpointOwnedTreeProof: profilePrimeNoEndpointCleanup
+            ? {
+                status: runtimeFreezeFailed ? "failed" : "passed",
+                sidecarCount: profilePrimeNoEndpointSidecarCount,
+              }
+            : { status: "not_used" },
+        }
+      : {}),
     root:
       rootIdentity === undefined ? undefined : summarizeProcessIdentity(rootIdentity, directories),
     observed: [...observed.values()].map((entry) => summarizeProcessIdentity(entry, directories)),
@@ -16133,16 +16331,16 @@ async function cleanupPhase(
 }
 
 /**
- * 使用与正式 Gate 相同的生产 binary、窗口配置、Java sidecar 和隔离目录预热 WebView2 UDF，
- * 但不开放 CDP。调用方显式选择 cleanup mode：完整 Gate 保持真实托盘退出，聚焦性能 Gate
- * 只验收 owner-verified tree cleanup；两者都要求进程归零与既有 Ja 守卫。profile ACK 与 endpoint owner 共用
- * 同一个绝对 startup deadline，owner 探测只写入 phase-local 目录副本，避免预热身份污染正式 run binding。
+ * 使用独立 Ja Home/runtime 与正式窗口共用 WebView2 UDF 做轻量预热，不开放 CDP；profile ACK 只证明 UDF。
+ * 若临时 App Server endpoint 已出现，仍要求 owner 验证、协议 ACK 和自然关闭；没有 endpoint 时，
+ * 只有完整 launcher 树和精确 sidecar 目录归属证明允许 owned-tree cleanup。正式目录身份不被预热污染。
  * 初始化和 cleanup 同时失败时保留两项原始错误，避免清理诊断覆盖 profile ACK 的根因。
  * @author kongweiguang
  */
 async function primeWebViewProfile({
   runId,
   directories,
+  runDirectories,
   frontendPort,
   baseEnv,
   pnpmCommand,
@@ -16206,42 +16404,6 @@ async function primeWebViewProfile({
       launch,
       runDeadline.signal,
     );
-    evidence[phase].stage = `${phase}:runtime_owner`;
-    /**
-     * 只在 phase-local 副本上冻结 endpoint owner；正式 directories 保持未绑定，清理阶段仍独立复验身份。
-     * @author kongweiguang
-     */
-    const probeProfilePrimeRuntimeOwner = async () => {
-      const endpoint = await readRuntimeEndpointMetadata(directories);
-      if (endpoint === undefined) return undefined;
-      const probeDirectories = { ...directories };
-      delete probeDirectories.runtimeEndpointOwner;
-      const isolation = await captureRuntimeIsolation(
-        { rootIdentity, incompleteObserved },
-        probeDirectories,
-        runDeadline.signal,
-        expectedExecutableNames,
-      );
-      if (
-        probeDirectories.runtimeEndpointOwner === undefined ||
-        isolation.endpoint?.host !== endpoint.host ||
-        isolation.endpoint?.port !== endpoint.port ||
-        isolation.endpoint?.serverInstanceId !== endpoint.serverInstanceId ||
-        isolation.endpoint?.runtimeGeneration !== endpoint.runtimeGeneration
-      ) {
-        throw new Error("profilePrime App Server endpoint owner proof 不完整");
-      }
-      return {
-        appServerPid: isolation.appServerPid,
-        serverInstanceId: endpoint.serverInstanceId,
-        runtimeGeneration: endpoint.runtimeGeneration,
-      };
-    };
-    evidence[phase].runtimeOwner = await waitForRuntimeOwnerProof(
-      probeProfilePrimeRuntimeOwner,
-      startupDeadline,
-      runDeadline.signal,
-    );
     evidence[phase].status = "ready";
   } catch (error) {
     initializationFailure = error;
@@ -16265,6 +16427,9 @@ async function primeWebViewProfile({
       cleanupFailure = error;
     } finally {
       evidence[phase].launcher = launcherOutputSummary(launch, directories);
+      if (directories.runtimeCleanupIsolationFailed === true) {
+        runDirectories.runtimeCleanupIsolationFailed = true;
+      }
     }
   }
   const failure = combineProfilePrimeFailures(initializationFailure, cleanupFailure);
@@ -40923,7 +41088,7 @@ async function main() {
       if (composerContextAcceptanceMode) {
         await writeComposerContextSkill(directories.home);
       }
-      await writeSettings(directories.home, providerConfig, {
+      const settingsOptions = {
         defaultAccessMode:
           toolLifecycleAcceptanceMode ||
           toolFailureAcceptanceMode ||
@@ -40934,13 +41099,23 @@ async function main() {
             : "approval_required",
         turnWallTimeoutMs:
           taskThreadsAcceptanceMode || turnChangeReviewAcceptanceMode ? 180_000 : 30_000,
-      });
+      };
+      await writeSettings(directories.home, providerConfig, settingsOptions);
       evidence.setup.settings = "ready";
     }
     assertLaunchRuntimeRoot(directories);
+    const profilePrimeDirectories = await createProfilePrimeDirectories(directories);
+    directories.profilePrime = profilePrimeDirectories;
+    if (providerConfig?.configureViaUi !== true) {
+      await writeSettings(profilePrimeDirectories.home, providerConfig, {
+        defaultAccessMode: "approval_required",
+        turnWallTimeoutMs: 30_000,
+      });
+    }
     tauriConfigPath = await primeWebViewProfile({
       runId,
-      directories,
+      directories: profilePrimeDirectories,
+      runDirectories: directories,
       frontendPort,
       baseEnv,
       pnpmCommand,
@@ -42625,6 +42800,22 @@ async function main() {
           { cause: reportError },
         );
       }
+    }
+    try {
+      evidence.runtimeStartupDiagnostics = await collectRuntimeStartupDiagnostics(directories);
+    } catch {
+      evidence.runtimeStartupDiagnostics = {
+        formal: {
+          nativeStartupDiagnostics: [],
+          javaFailures: [],
+          managedJavaDiagnostics: { status: "unavailable", lines: [] },
+        },
+        profilePrime: {
+          nativeStartupDiagnostics: [],
+          javaFailures: [],
+          managedJavaDiagnostics: { status: "unavailable", lines: [] },
+        },
+      };
     }
     const summaryPath = await writeRunSummary(runId, evidence, "failed", reportError, directories);
     const diagnostic = formatErrorDiagnostics(reportError, directories);
