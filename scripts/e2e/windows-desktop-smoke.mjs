@@ -17607,16 +17607,19 @@ async function assertGeneralConversationScope(page, deadline) {
 
 /**
  * 证明当前 Thread 真实绑定项目且 Composer 使用 profile 的逐次审批权限；
- * 审批 fixture 不能在无项目只读线程中伪造 ASK 路径。
+ * gate 只接受 `#conversation` 主正文 Composer，避免保留侧聊的同名输入冒充当前项目会话准入。
+ * @author kongweiguang
  */
-async function assertProjectConversationScope(page, deadline) {
+export async function assertProjectConversationScope(page, deadline) {
   const scopeDeadline = Math.min(deadline, Date.now() + turnDeadlineMs);
   await page.waitForFunction(
     () => {
       const selectedProject = globalThis.document.querySelector(
         '[aria-label="项目列表"] button[data-scope-kind="project"][aria-current="page"]',
       );
-      const composer = globalThis.document.querySelector('textarea[aria-label="消息"]');
+      const composer = globalThis.document.querySelector(
+        '#conversation textarea[aria-label="消息"]',
+      );
       return (
         selectedProject !== null &&
         composer instanceof globalThis.HTMLTextAreaElement &&
@@ -27567,25 +27570,139 @@ async function clickVerifiedControl(page, locator, deadline) {
 }
 
 /**
+ * 在失败时收集有界、闭集的焦点证据；不读取正文、路径或输入内容，超出短预算就明确标记 unavailable。
+ * @author kongweiguang
+ */
+async function captureComposerFocusFailureEvidence(page) {
+  const captureDeadline = createDeadline("Composer 焦点失败诊断", 750);
+  try {
+    return await raceWithSignal(
+      () =>
+        page.evaluate(() => {
+          const document = globalThis.document;
+          const safeThreadId = (value) =>
+            typeof value === "string" && /^(?:thr|thread)_[A-Za-z0-9._-]{1,96}$/u.test(value)
+              ? value
+              : null;
+          const safeDomId = (value) =>
+            typeof value === "string" && /^[A-Za-z][A-Za-z0-9:_-]{0,80}$/u.test(value)
+              ? value
+              : null;
+          const safeAriaLabel = (value) =>
+            value === null
+              ? null
+              : ["消息", "发送", "取消", "添加项目"].includes(value)
+                ? value
+                : "other";
+          const isHiddenOrInert = (node) =>
+            node.closest('[hidden], [inert], [aria-hidden="true"]') !== null;
+          const isRendered = (node) => node.getClientRects().length > 0;
+          const composers = Array.from(document.querySelectorAll('textarea[aria-label="消息"]'));
+          const mainComposer = document.querySelector('#conversation textarea[aria-label="消息"]');
+          const selectedThread = document.querySelector(
+            '[aria-label="最近对话列表"] button[aria-current="page"][data-thread-id]',
+          );
+          const selectedThreadId = safeThreadId(selectedThread?.getAttribute("data-thread-id"));
+          const activeElement =
+            document.activeElement instanceof globalThis.HTMLElement
+              ? document.activeElement
+              : null;
+          const threadNode = activeElement?.closest("[data-thread-id]");
+          const workbenchScope = activeElement
+            ?.closest("[data-thread-workbench-scope]")
+            ?.getAttribute("data-thread-workbench-scope");
+          const workbenchThreadId =
+            typeof workbenchScope === "string"
+              ? safeThreadId(workbenchScope.slice(workbenchScope.lastIndexOf(":") + 1))
+              : null;
+          const activeThreadId = safeThreadId(threadNode?.getAttribute("data-thread-id"));
+          const activeOwnerKind =
+            activeElement?.closest("#conversation") !== null && activeElement !== null
+              ? "main"
+              : activeElement?.closest(".ja-task-composer") !== null && activeElement !== null
+                ? "side"
+                : workbenchScope !== undefined
+                  ? "workbench"
+                  : activeThreadId !== null
+                    ? "thread_row"
+                    : "other";
+
+          return {
+            status: "captured",
+            documentHasFocus: document.hasFocus(),
+            selectedThreadId,
+            mainComposer: {
+              present: mainComposer instanceof globalThis.HTMLTextAreaElement,
+              disabled:
+                mainComposer instanceof globalThis.HTMLTextAreaElement
+                  ? mainComposer.disabled
+                  : null,
+              hiddenOrInert:
+                mainComposer instanceof globalThis.HTMLElement
+                  ? isHiddenOrInert(mainComposer)
+                  : null,
+              rendered:
+                mainComposer instanceof globalThis.HTMLElement ? isRendered(mainComposer) : null,
+            },
+            matchingComposers: {
+              total: composers.length,
+              main: composers.filter((composer) => composer.closest("#conversation") !== null)
+                .length,
+              side: composers.filter((composer) => composer.closest(".ja-task-composer") !== null)
+                .length,
+              other: composers.filter(
+                (composer) => composer.closest("#conversation, .ja-task-composer") === null,
+              ).length,
+              hiddenOrInert: composers.filter(isHiddenOrInert).length,
+              notRendered: composers.filter((composer) => !isRendered(composer)).length,
+            },
+            activeElement: {
+              tag: activeElement?.tagName.toLowerCase() ?? null,
+              ariaLabel: safeAriaLabel(activeElement?.getAttribute("aria-label") ?? null),
+              id: safeDomId(activeElement?.id ?? null),
+              ownerKind: activeOwnerKind,
+              ownerThreadId:
+                activeOwnerKind === "main"
+                  ? selectedThreadId
+                  : (activeThreadId ?? workbenchThreadId),
+            },
+          };
+        }),
+      captureDeadline.signal,
+    );
+  } catch {
+    return { status: "unavailable" };
+  } finally {
+    captureDeadline.cancel();
+  }
+}
+
+/**
  * 等待真实 WebView2 把焦点交给主正文中可编辑的 Composer；主会话与保留侧聊共用无障碍名称，
  * 因而必须跟随应用导航的 #conversation 所有权，不能被更早挂载的隐藏侧聊 textarea 误导。
+ * 失败时只追加独立 750ms 的脱敏 DOM 采样，不改变成功谓词或主动抢焦点。
  * @author kongweiguang
  */
 async function waitForComposerFocus(page, deadline) {
-  await page.waitForFunction(
-    () => {
-      const composer = globalThis.document.querySelector(
-        '#conversation textarea[aria-label="消息"]',
-      );
-      return (
-        composer instanceof globalThis.HTMLTextAreaElement &&
-        !composer.disabled &&
-        globalThis.document.activeElement === composer
-      );
-    },
-    undefined,
-    { timeout: Math.max(1, deadline - Date.now()) },
-  );
+  try {
+    await page.waitForFunction(
+      () => {
+        const composer = globalThis.document.querySelector(
+          '#conversation textarea[aria-label="消息"]',
+        );
+        return (
+          composer instanceof globalThis.HTMLTextAreaElement &&
+          !composer.disabled &&
+          globalThis.document.activeElement === composer
+        );
+      },
+      undefined,
+      { timeout: Math.max(1, deadline - Date.now()) },
+    );
+  } catch (error) {
+    const evidence = await captureComposerFocusFailureEvidence(page);
+    throw new Error(`主 Composer 焦点门禁失败：${JSON.stringify(evidence)}`, { cause: error });
+  }
 }
 
 /**

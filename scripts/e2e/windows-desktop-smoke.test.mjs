@@ -29,6 +29,7 @@ import {
   captureNativeReviewEvidence,
   attachPageDiagnostics,
   captureAriaHiddenFocusSnapshot,
+  assertProjectConversationScope,
   projectFailureOwnerPresence,
   projectWrapperLifecycle,
   waitForReviewDiff,
@@ -5272,6 +5273,8 @@ test("bounds Thread reselect and still requires the enabled real Composer to own
         )(argument);
         if (result !== true) throw new Error("native focus predicate did not pass");
       },
+      evaluate: async (callback, argument) =>
+        dom.window.Function("argument", `return (${callback.toString()})(argument);`)(argument),
     };
     const deadline = Date.now() + 30 * 60_000;
     await selectThreadById(page, threadId, deadline, new AbortController().signal);
@@ -5284,13 +5287,101 @@ test("bounds Thread reselect and still requires the enabled real Composer to own
     textarea.disabled = true;
     await assert.rejects(
       selectThreadById(page, threadId, deadline, new AbortController().signal),
-      /native focus predicate did not pass/u,
+      (error) => {
+        const prefix = "主 Composer 焦点门禁失败：";
+        assert.match(error.message, /^主 Composer 焦点门禁失败：/u);
+        const evidence = JSON.parse(error.message.slice(prefix.length));
+        assert.equal(evidence.status, "captured");
+        assert.equal(evidence.mainComposer.disabled, true);
+        assert.equal(evidence.matchingComposers.total, 2);
+        assert.equal(evidence.matchingComposers.hiddenOrInert, 1);
+        return true;
+      },
     );
     textarea.disabled = false;
     textarea.blur();
     await assert.rejects(
       selectThreadById(page, threadId, deadline, new AbortController().signal),
-      /native focus predicate did not pass/u,
+      /主 Composer 焦点门禁失败：/u,
+    );
+    const unavailablePage = {
+      ...page,
+      evaluate: async () => {
+        throw new Error("sensitive diagnostic detail");
+      },
+    };
+    await assert.rejects(
+      selectThreadById(unavailablePage, threadId, deadline, new AbortController().signal),
+      (error) => {
+        const prefix = "主 Composer 焦点门禁失败：";
+        const evidence = JSON.parse(error.message.slice(prefix.length));
+        assert.deepEqual(evidence, { status: "unavailable" });
+        assert.equal(error.message.includes("sensitive diagnostic detail"), false);
+        return true;
+      },
+    );
+  } finally {
+    dom.window.close();
+  }
+});
+
+/** 项目范围 gate 必须读取主会话 Composer，不能用更早保留且已禁用的侧聊输入框代替。 @author kongweiguang */
+test("project scope checks the enabled main Composer when a retained side Composer has the same label", async () => {
+  const { dom } = nativeReviewFixture();
+  try {
+    const document = dom.window.document;
+    const sideSurface = document.createElement("section");
+    sideSurface.className = "ja-task-composer";
+    sideSurface.hidden = true;
+    sideSurface.setAttribute("inert", "");
+    const sideComposer = document.createElement("textarea");
+    sideComposer.setAttribute("aria-label", "消息");
+    sideComposer.disabled = true;
+    sideSurface.append(sideComposer);
+    document.body.prepend(sideSurface);
+
+    const projectList = document.createElement("div");
+    projectList.setAttribute("aria-label", "项目列表");
+    const selectedProject = document.createElement("button");
+    selectedProject.setAttribute("data-scope-kind", "project");
+    selectedProject.setAttribute("aria-current", "page");
+    projectList.append(selectedProject);
+    document.body.append(projectList);
+    const addProject = document.createElement("button");
+    addProject.setAttribute("aria-label", "添加项目");
+    document.body.append(addProject);
+
+    const conversation = document.createElement("main");
+    conversation.id = "conversation";
+    const mainComposer = document.createElement("textarea");
+    mainComposer.setAttribute("aria-label", "消息");
+    conversation.append(mainComposer);
+    document.body.append(conversation);
+
+    const page = {
+      waitForFunction: async (callback, argument) => {
+        const result = dom.window.Function(
+          "argument",
+          `return (${callback.toString()})(argument);`,
+        )(argument);
+        if (result !== true) throw new Error("project scope predicate did not pass");
+      },
+      getByRole: (_role, { name }) => ({
+        waitFor: async () => {
+          assert.equal(name, "添加项目");
+          assert.equal(addProject.isConnected, true);
+        },
+      }),
+    };
+
+    assert.equal(document.querySelector('textarea[aria-label="消息"]'), sideComposer);
+    await assertProjectConversationScope(page, Date.now() + 30_000);
+
+    mainComposer.remove();
+    sideComposer.disabled = false;
+    await assert.rejects(
+      assertProjectConversationScope(page, Date.now() + 30_000),
+      /project scope predicate did not pass/u,
     );
   } finally {
     dom.window.close();
