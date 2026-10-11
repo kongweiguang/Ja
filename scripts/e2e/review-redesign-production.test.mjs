@@ -35,6 +35,7 @@ import {
   buildTauriCommandLine,
   buildLaunchEnvironment,
   classifyOwnedProcessSnapshotFailure,
+  collectIsolatedJavaFailures,
   createReviewDriverHooks,
   createReviewGitFixture,
   parseArguments,
@@ -51,6 +52,32 @@ import {
 } from "./review-redesign-production.mjs";
 
 const execFileAsync = promisify(execFile);
+
+/** @author kongweiguang 失败证据必须保留代码位置而拒绝任何日志正文，重复日志文件不能重复同一关联 ID。 */
+test("isolated Java diagnostics extract bounded fixed fields without log payloads", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "ja-java-diagnostic-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const logs = join(home, "logs", "java");
+  await mkdir(logs, { recursive: true });
+  const errorId = `err_${"a".repeat(32)}`;
+  const origin =
+    "io.github.kongweiguang.ja.conversation.TurnService#admit:716 <- io.github.kongweiguang.ja.transport.RpcServer#dispatch:96";
+  const diagnostic = `Unexpected JA-RPC failure errorId=${errorId} type=java.lang.IllegalStateException causeType=none origin=${origin}`;
+  await writeFile(
+    join(logs, "app-server-error.log"),
+    `secret=do-not-export\n${diagnostic}\n${diagnostic} secret=do-not-export\n`,
+  );
+  await writeFile(join(logs, "app-server.log"), `${diagnostic}\n`);
+  assert.deepEqual(await collectIsolatedJavaFailures(home), [
+    {
+      errorId,
+      type: "java.lang.IllegalStateException",
+      causeType: "none",
+      origin,
+    },
+  ]);
+  assert.deepEqual(await collectIsolatedJavaFailures(join(home, "missing")), []);
+});
 
 /** @author kongweiguang 用虚拟时间证明超过 WebView 窗口的冷编译仍可准备完成，且外部同名进程不能提前开启运行时验收。 */
 test("Tauri preparation waits for the owned application beyond the WebView startup budget", async () => {

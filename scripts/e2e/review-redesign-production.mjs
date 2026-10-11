@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import process from "node:process";
@@ -1111,6 +1111,43 @@ function safeFailure(error, runRoot) {
 
 /**
  * @author kongweiguang
+ * 只从本轮隔离日志末尾提取 RPC 固定诊断字段；不导出日志正文、异常消息、路径或请求载荷。
+ * 文件读取与条目数均有上限，日志缺失不能遮蔽原始验收失败。
+ */
+export async function collectIsolatedJavaFailures(home) {
+  const failures = [];
+  for (const name of ["app-server-error.log", "app-server.log"]) {
+    let file;
+    try {
+      file = await open(join(home, "logs", "java", name), "r");
+      const metadata = await file.stat();
+      if (!metadata.isFile()) continue;
+      const bytes = Buffer.alloc(Math.min(metadata.size, 65_536));
+      const { bytesRead } = await file.read(
+        bytes,
+        0,
+        bytes.length,
+        Math.max(0, metadata.size - bytes.length),
+      );
+      const text = bytes.subarray(0, bytesRead).toString("utf8");
+      const pattern =
+        /Unexpected JA-RPC failure errorId=(err_[a-f0-9]{32}) type=([A-Za-z0-9.$]+) causeType=([A-Za-z0-9.$]+) origin=(io\.github\.kongweiguang\.ja\.[A-Za-z0-9.$]+#[A-Za-z0-9_$<>]+:-?\d+(?: <- io\.github\.kongweiguang\.ja\.[A-Za-z0-9.$]+#[A-Za-z0-9_$<>]+:-?\d+){0,7}|unknown)(?=\r?$)/gmu;
+      for (const match of text.matchAll(pattern)) {
+        if (failures.some(({ errorId }) => errorId === match[1])) continue;
+        failures.push({ errorId: match[1], type: match[2], causeType: match[3], origin: match[4] });
+        if (failures.length >= 32) return failures;
+      }
+    } catch {
+      // 不把 IO 异常中的实际路径写入报告；无匹配记录仍保留上层验收错误。
+    } finally {
+      await file?.close().catch(() => undefined);
+    }
+  }
+  return failures;
+}
+
+/**
+ * @author kongweiguang
  * 阶段与页面诊断仅属于默认 Review driver；专用注入 driver 的既有参数和副作用保持不变。
  */
 export function createReviewDriverHooks(
@@ -1350,6 +1387,8 @@ export async function runProduction(options) {
         ? {}
         : { execution: { tauri: tauriExecutableIdentity } }),
       error: safeFailure(error, directories?.root),
+      javaFailures:
+        directories?.home === undefined ? [] : await collectIsolatedJavaFailures(directories.home),
     };
     if (options.preserveFailedProfile === true && directories?.root !== undefined) {
       await writeFile(
