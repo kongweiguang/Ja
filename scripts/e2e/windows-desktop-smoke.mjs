@@ -19924,8 +19924,16 @@ export async function waitForAuthoritativePreviewState(
   }
 }
 
-/** 建立真实网页 child WebView 基线，供附件模式返回后核对 URL、target 与导航状态未丢失。 */
+/**
+ * 建立真实网页 child WebView 基线；原生拒绝立即报告稳定错误码，避免把创建失败拖到请求等待超时。
+ * 成功仍要求真实 HTTP 请求与 child target、权威导航状态全部一致。
+ * @author kongweiguang
+ */
 async function prepareAttachmentWebPreview(page, previewFixture, deadline, signal) {
+  const previewCommands = ["ja_preview_open", "ja_preview_navigate"];
+  const traceOffsets = await Promise.all(
+    previewCommands.map(async (command) => (await tauriInvokeTrace(page, command)).length),
+  );
   const workbench = await ensureWorkbenchVisible(page, deadline);
   await chooseWorkbenchTool(page, "浏览器", deadline);
   const url = `${previewFixture.url}attachment-state`;
@@ -19939,7 +19947,20 @@ async function prepareAttachmentWebPreview(page, previewFixture, deadline, signa
   );
   await waitForCondition(
     "附件验收网页 Preview 真实请求",
-    () => previewFixture.requestCount() > requests,
+    async () => {
+      for (const [index, command] of previewCommands.entries()) {
+        const rejection = (await tauriInvokeTrace(page, command))
+          .slice(traceOffsets[index])
+          .findLast((entry) => entry.phase === "rejected");
+        if (rejection !== undefined) {
+          const code = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(rejection.errorCode ?? "")
+            ? rejection.errorCode
+            : "unknown";
+          throw new Error(`附件网页 Preview 原生调用拒绝 (${command}, ${code})`);
+        }
+      }
+      return previewFixture.requestCount() > requests;
+    },
     deadline,
     signal,
   );

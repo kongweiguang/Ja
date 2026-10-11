@@ -671,7 +671,21 @@ pub async fn ja_preview_open(
     open_native_preview(opened, input.viewport, app, &state).await
 }
 
+/// 只继承 `main` 窗口的浏览器参数，确保共享 WebView2 用户数据目录的环境选项一致。
+/// @author kongweiguang
+#[cfg(windows)]
+pub(crate) fn main_window_additional_browser_args(
+    windows: &[tauri::utils::config::WindowConfig],
+) -> Option<&str> {
+    windows
+        .iter()
+        .find(|window| window.label == "main")
+        .and_then(|window| window.additional_browser_args.as_deref())
+}
+
 /// 所有 Preview 初始目标共用同一套 callback、watchdog、原生 ACK 回滚与焦点可见性生命周期。
+/// Windows child 复用主窗口的 WebView2 browser arguments，避免共享用户数据目录时环境选项不匹配。
+/// @author kongweiguang
 async fn open_native_preview(
     opened: PreviewOpenResult,
     viewport: PreviewViewportInput,
@@ -825,6 +839,13 @@ async fn open_native_preview(
                 }
             }
         });
+    #[cfg(windows)]
+    let webview_builder = match main_window_additional_browser_args(&app.config().app.windows) {
+        Some(additional_browser_args) => {
+            webview_builder.additional_browser_args(additional_browser_args)
+        }
+        None => webview_builder,
+    };
     let parent = app
         .get_window("main")
         .ok_or(PreviewError::new(PreviewErrorCode::DependencyRequest));
@@ -854,6 +875,11 @@ async fn open_native_preview(
     let webview = match webview_result {
         Ok(webview) => webview,
         Err(_) => {
+            tracing::warn!(
+                phase = "child_webview_creation",
+                code = ?PreviewErrorCode::DependencyRequest,
+                "preview native request failed"
+            );
             let _ = state.load_watchdog.cancel(id);
             let _ = state.manager.finalize_absent(id);
             return Err(PreviewError::new(PreviewErrorCode::DependencyRequest));

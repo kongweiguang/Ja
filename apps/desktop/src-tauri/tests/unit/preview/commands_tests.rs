@@ -19,6 +19,32 @@ fn visible_viewport() -> PreviewViewportInput {
     }
 }
 
+/// 共享数据目录时必须按 `main` 标签读取启动参数，不能依赖窗口配置的数组顺序。
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn preview_child_inherits_additional_browser_args_from_main_window() {
+    let mut secondary = tauri::utils::config::WindowConfig::default();
+    secondary.label = "secondary".into();
+    secondary.additional_browser_args = Some("--secondary-only".into());
+
+    let mut main = tauri::utils::config::WindowConfig::default();
+    main.label = "main".into();
+    main.additional_browser_args = Some("--remote-debugging-port=9222".into());
+
+    assert_eq!(
+        main_window_additional_browser_args(&[secondary.clone(), main.clone()]),
+        Some("--remote-debugging-port=9222")
+    );
+    assert_eq!(
+        main_window_additional_browser_args(&[secondary]),
+        None,
+        "secondary window arguments must not be applied to the Preview child"
+    );
+    main.additional_browser_args = None;
+    assert_eq!(main_window_additional_browser_args(&[main]), None);
+}
+
 /// 将首次回滚的占用身份转为待恢复状态，模拟 renderer 未接管 WebView 的真实失败窗口。
 fn queue_unowned_identity(host: &PreviewCommandHost, id: PreviewId) {
     host.unowned_recovery
