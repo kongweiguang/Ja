@@ -18823,6 +18823,8 @@ async function exerciseNativeReviewFlow(
       ) {
         throw new Error("Review Revert 未恢复确定性的 before image 与干净 Git 状态");
       }
+      checkpoint.name = "review.reveal-tree-before-empty-filter";
+      await revealReviewTreeForSelection();
       const filter = review.getByPlaceholder("筛选文件…", { exact: true });
       checkpoint.name = "review.filter-expect-empty-result";
       await filter.fill(expectedPath, { timeout: timeout() });

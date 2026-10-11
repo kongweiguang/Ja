@@ -5624,6 +5624,54 @@ test("preserves the native Review checkpoint when browser diagnostics are unavai
   });
 });
 
+/** Revert 后的空筛选仍走真实返回入口；回归同时锁定调用顺序与窄屏返回身份门禁。 @author kongweiguang */
+test("returns Review to its file tree after revert before the empty-filter check", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const flowStart = source.indexOf("async function exerciseNativeReviewFlow(");
+  const flowEnd = source.indexOf("\n}\n", flowStart);
+  assert.ok(flowStart >= 0 && flowEnd > flowStart);
+  const flow = source.slice(flowStart, flowEnd);
+  const strictRevertCheck = flow.indexOf("reverted.staged ||");
+  const revertCheck = flow.indexOf(
+    "Review Revert 未恢复确定性的 before image 与干净 Git 状态",
+    strictRevertCheck,
+  );
+  const revealCheckpoint = flow.indexOf(
+    'checkpoint.name = "review.reveal-tree-before-empty-filter";',
+    revertCheck,
+  );
+  const revealCall = flow.indexOf("await revealReviewTreeForSelection();", revealCheckpoint);
+  const filterFill = flow.indexOf(
+    "await filter.fill(expectedPath, { timeout: timeout() });",
+    revealCall,
+  );
+
+  assert.ok(strictRevertCheck >= 0);
+  assert.ok(revertCheck >= 0);
+  assert.ok(revertCheck > strictRevertCheck);
+  assert.ok(revealCheckpoint > revertCheck);
+  assert.ok(revealCall > revealCheckpoint && filterFill > revealCall);
+
+  const helperStart = source.indexOf("const revealReviewTreeForSelection = async () => {");
+  const helperEnd = source.indexOf("const selectFixture = async (layer) => {", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helper = source.slice(helperStart, helperEnd);
+  const exactBack = 'review.getByRole("button", { name: "返回变更文件", exact: true })';
+  const waitForBack = 'await back.waitFor({ state: "visible", timeout: timeout() });';
+  const verifiedClick = "await clickVerifiedControl(page, back, deadline);";
+  const waitForTree = 'await tree.waitFor({ state: "visible", timeout: timeout() });';
+
+  assert.ok(helper.includes(exactBack));
+  assert.ok(helper.indexOf(waitForBack) < helper.indexOf(verifiedClick));
+  assert.ok(helper.indexOf(verifiedClick) < helper.indexOf(waitForTree));
+  assert.ok(helper.includes("if (!(await tree.isVisible()))"));
+  assert.ok(
+    helper.includes(
+      'if (!(await tree.isVisible())) throw new Error("窄布局 Review 文件树未通过返回入口恢复")',
+    ),
+  );
+});
+
 /** 当前请求失败必须由同 ID 保留，旧 resolved 晚到也不能把它改成成功。 */
 test("keeps the latest Review read rejection after an older resolution arrives", async () => {
   for (const command of ["ja_review_catalog", "ja_review_snapshot", "ja_review_file_diff"]) {

@@ -110,6 +110,7 @@ jobs:
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           python-version: "3.13"
+          enable-cache: false
       - name: Guard exact native source and diagnostics-only changes
         shell: bash
         run: |
