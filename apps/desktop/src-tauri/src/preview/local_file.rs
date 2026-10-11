@@ -274,7 +274,7 @@ pub(crate) fn resolve_browser_target(
     Ok(resolution)
 }
 
-/// Keep directory rejection specific while unsupported resolved files retain the generic browser error.
+/// 目录保留专用拒绝码，让用户能区分文件夹与普通不支持文件；已解析的其他类型沿用原分类。
 /// @author kongweiguang
 pub(crate) fn browser_target_error_code(kind: PreviewFileKind) -> Option<PreviewErrorCode> {
     match kind {
