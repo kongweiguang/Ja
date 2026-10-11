@@ -65,6 +65,7 @@ import {
   currentThreadWorkbenchHost,
   currentThreadWorkbenchInspector,
   waitForWorkbenchTabClosed,
+  terminalTabFocusEvidenceInPage,
   waitForStableTerminalPaneWidth,
   deriveTerminalPaneRatioFromPointerEvidence,
   terminalPaneCloseRoute,
@@ -1164,6 +1165,51 @@ test("routes Terminal pane close through one visible responsive control", async 
       }),
     /恰有一个可见/u,
   );
+});
+
+/** 关闭焦点失败只记录闭集 DOM/焦点事实，不将标签或 pane 文案带入 CI 诊断。 */
+test("projects privacy-safe focus evidence while preserving the selected-tab acceptance predicate", () => {
+  const dom = new JSDOM(
+    `<section class="ja-terminal-workspace">
+      <div class="ja-terminal-tabs"><button type="button" role="tab" aria-selected="true" aria-label="private tab title">Tab</button></div>
+      <div id="terminal-panel" role="tabpanel" class="ja-terminal-tab-panel">
+        <div class="ja-terminal-pane"><button id="pane-close" type="button">private pane title</button></div>
+      </div>
+    </section>`,
+    { runScripts: "outside-only", pretendToBeVisual: true },
+  );
+  Object.defineProperty(dom.window.HTMLElement.prototype, "getClientRects", {
+    configurable: true,
+    value: () => [{ width: 80, height: 24 }],
+  });
+  Object.defineProperty(dom.window.HTMLElement.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 80, height: 24, top: 0, right: 80, bottom: 24, left: 0 }),
+  });
+  const projectEvidence = dom.window.eval(`(${terminalTabFocusEvidenceInPage.toString()})`);
+  dom.window.document.getElementById("pane-close").focus();
+  const paneFocused = JSON.parse(JSON.stringify(projectEvidence("terminal-panel")));
+
+  assert.deepEqual(paneFocused, {
+    panelPresent: true,
+    panelHidden: false,
+    workspacePresent: true,
+    selectedTabCount: 1,
+    selectedTabButton: true,
+    selectedTabDisabled: false,
+    selectedTabVisible: true,
+    activeState: "pane_control",
+    activeVisible: true,
+    restored: false,
+  });
+  assert.doesNotMatch(JSON.stringify(paneFocused), /private tab title|private pane title/u);
+
+  dom.window.document.querySelector('[role="tab"]').focus();
+  const tabFocused = JSON.parse(JSON.stringify(projectEvidence("terminal-panel")));
+  assert.equal(tabFocused.activeState, "selected_tab");
+  assert.equal(tabFocused.restored, true);
+  assert.deepEqual(Object.keys(tabFocused).sort(), Object.keys(paneFocused).sort());
+  dom.window.close();
 });
 
 /** 期望比例必须来自本次 release 事件和 pointerdown 抓取偏移，而非 runner 的目标坐标。 */

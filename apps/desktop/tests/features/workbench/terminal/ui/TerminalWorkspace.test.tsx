@@ -4,7 +4,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useCallback, useEffect, useRef, type ReactElement } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   useTerminalWorkspaceController,
@@ -18,6 +18,7 @@ import {
   addTerminalTab,
   canAddTerminalTab,
   createDefaultTerminalLayout,
+  removeTerminalPane,
   splitTerminalPane,
 } from "@/features/workbench/terminal/domain";
 import { TerminalWorkspaceView } from "@/features/workbench/terminal/ui";
@@ -474,6 +475,71 @@ describe("TerminalWorkspace", () => {
       expect(rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`)).toBeNull(),
     );
     await waitFor(() => expect(selectedTab).toHaveFocus());
+    expect(bridge.adapter.close).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * @author kongweiguang
+   * 原生 ACK 可早于 React 布局投影卸载；选中标签必须先获得焦点，不能先聚焦即将消失的 pane 工具栏。
+   */
+  it("restores the selected tab before a delayed pane projection unmounts the old toolbar", async () => {
+    const user = userEvent.setup();
+    const bridge = fakeAdapter();
+    const initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const tabId = initialLayout.activeTabId as string;
+    const originalPaneId = initialLayout.tabs[0]!.activePaneId;
+    const splitLayout = splitTerminalPane(initialLayout, tabId, originalPaneId, "horizontal");
+    const closingPaneId = splitLayout.tabs[0]!.activePaneId;
+
+    /**
+     * 只延迟 UI layout projection；真实 controller 仍负责打开和关闭 native terminal session。
+     * @author kongweiguang
+     */
+    function DelayedProjectionTerminalWorkspace(): ReactElement {
+      const rootRef = useRef<HTMLElement>(null);
+      const nativeController = useTerminalWorkspaceController({
+        workspaceId: "ws_fixture",
+        adapter: bridge.adapter,
+        initialLayout: splitLayout,
+        active: true,
+        resolveNativeDropPane: () => undefined,
+      });
+      const [layout, setLayout] = useState(nativeController.layout);
+      const controller = {
+        ...nativeController,
+        layout,
+        removePane: async (requestedTabId: string, requestedPaneId: string): Promise<void> => {
+          await nativeController.closePane(requestedPaneId);
+          window.setTimeout(() => {
+            setLayout((current) => removeTerminalPane(current, requestedTabId, requestedPaneId));
+          }, 160);
+        },
+      };
+      return <TerminalWorkspaceView active controller={controller} rootRef={rootRef} />;
+    }
+
+    const rendered = render(<DelayedProjectionTerminalWorkspace />);
+    await waitFor(() => expect(bridge.adapter.open).toHaveBeenCalledTimes(2));
+    const selectedTab = rendered.getByRole("tab", { selected: true });
+    const closeButton = rendered.container.querySelector<HTMLButtonElement>(
+      `[data-pane-id="${closingPaneId}"] button[aria-label="关闭终端窗格"]`,
+    );
+    expect(closeButton).not.toBeNull();
+
+    await user.click(closeButton!);
+
+    expect(
+      rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(selectedTab).toHaveFocus(), { timeout: 120 });
+    expect(
+      rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`),
+    ).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`)).toBeNull(),
+    );
+    expect(selectedTab).toHaveFocus();
     expect(bridge.adapter.close).toHaveBeenCalledOnce();
   });
 

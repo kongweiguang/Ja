@@ -13072,37 +13072,74 @@ async function waitForTerminalPaneToolbarFocus(page, panelId, paneId, deadline, 
   return evidence;
 }
 
-/** 关闭窄 pane 后等待焦点落到仍可见的当前终端 Tab，避免焦点留在已卸载菜单项。 */
+/**
+ * 只投影关闭后焦点验收所需的有限 DOM 状态，不把标签文案或 pane 身份写入失败证据。
+ * @author kongweiguang
+ */
+export function terminalTabFocusEvidenceInPage(expectedPanelId) {
+  const panel = globalThis.document.getElementById(expectedPanelId);
+  const workspace = panel?.closest(".ja-terminal-workspace");
+  const selectedTabs = workspace?.querySelectorAll(
+    '.ja-terminal-tabs [role="tab"][aria-selected="true"]',
+  );
+  const selectedTab = workspace?.querySelector(
+    '.ja-terminal-tabs [role="tab"][aria-selected="true"]',
+  );
+  const active = globalThis.document.activeElement;
+  const activeRect =
+    active instanceof globalThis.HTMLElement ? active.getBoundingClientRect() : null;
+  const selectedTabIsButton = selectedTab instanceof globalThis.HTMLButtonElement;
+  const selectedTabVisible = selectedTabIsButton && selectedTab.getClientRects().length > 0;
+  let activeState = "none";
+  if (active instanceof globalThis.HTMLElement) {
+    if (active === selectedTab) activeState = "selected_tab";
+    else if (active === globalThis.document.body || active === globalThis.document.documentElement)
+      activeState = "body";
+    else if (active.closest(".ja-terminal-pane")) activeState = "pane_control";
+    else if (active.closest(".ja-terminal-workspace")) activeState = "workspace_control";
+    else activeState = "other";
+  }
+  return {
+    panelPresent: panel instanceof globalThis.HTMLElement,
+    panelHidden: panel instanceof globalThis.HTMLElement && panel.hasAttribute("hidden"),
+    workspacePresent: workspace instanceof globalThis.HTMLElement,
+    selectedTabCount: Math.min(selectedTabs?.length ?? 0, 2),
+    selectedTabButton: selectedTabIsButton,
+    selectedTabDisabled: selectedTabIsButton && selectedTab.disabled,
+    selectedTabVisible,
+    activeState,
+    activeVisible:
+      active instanceof globalThis.HTMLElement &&
+      active.getClientRects().length > 0 &&
+      activeRect !== null &&
+      activeRect.width > 0 &&
+      activeRect.height > 0,
+    restored:
+      panel instanceof globalThis.HTMLElement &&
+      !panel.hasAttribute("hidden") &&
+      selectedTabIsButton &&
+      active === selectedTab &&
+      selectedTab.getClientRects().length > 0 &&
+      activeRect !== null &&
+      activeRect.width > 0 &&
+      activeRect.height > 0,
+  };
+}
+
+/**
+ * 关闭窗格后必须把焦点落到当前可见 Tab，失败时保留闭集焦点与 DOM 事实。
+ * @author kongweiguang
+ */
 async function waitForTerminalTabFocusAfterPaneClose(page, panelId, deadline, signal) {
   let evidence;
   await waitForCondition(
     "关闭窄终端窗格后焦点恢复",
     async () => {
-      evidence = await page.evaluate((expectedPanelId) => {
-        const panel = globalThis.document.getElementById(expectedPanelId);
-        const workspace = panel?.closest(".ja-terminal-workspace");
-        const selectedTab = workspace?.querySelector(
-          '.ja-terminal-tabs [role="tab"][aria-selected="true"]',
-        );
-        const active = globalThis.document.activeElement;
-        const activeRect =
-          active instanceof globalThis.HTMLElement ? active.getBoundingClientRect() : null;
-        return {
-          restored:
-            panel instanceof globalThis.HTMLElement &&
-            !panel.hasAttribute("hidden") &&
-            selectedTab instanceof globalThis.HTMLButtonElement &&
-            active === selectedTab &&
-            selectedTab.getClientRects().length > 0 &&
-            activeRect !== null &&
-            activeRect.width > 0 &&
-            activeRect.height > 0,
-          selectedTabLabel:
-            selectedTab instanceof globalThis.HTMLButtonElement
-              ? selectedTab.getAttribute("aria-label")
-              : null,
-        };
-      }, panelId);
+      evidence = await page.evaluate(terminalTabFocusEvidenceInPage, panelId);
+      terminalWorkspaceLastObservation = {
+        stage: "pane_close_focus_wait",
+        ...evidence,
+      };
       return evidence.restored;
     },
     deadline,

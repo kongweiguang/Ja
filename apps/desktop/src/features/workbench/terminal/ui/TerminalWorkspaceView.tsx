@@ -897,7 +897,7 @@ function TerminalPaneView({
     });
   };
   /**
-   * toolbar 与 More 共用原生 close ACK 和焦点收尾；先捕获 root，避免 pane 卸载后丢失 tab 目标。
+   * toolbar 与 More 共用 close ACK；直接恢复到选中标签，避免 React 延迟卸载时先聚焦旧 pane 按钮。
    * @author kongweiguang
    */
   const removePaneAndRestoreFocus = (): void => {
@@ -911,7 +911,9 @@ function TerminalPaneView({
       .catch(() => {
         // controller 会在关闭失败时保留窗格并投影 runtime 错误。
       })
-      .finally(() => window.requestAnimationFrame(() => restorePaneFocus(workspaceRoot)));
+      .finally(() =>
+        window.requestAnimationFrame(() => restoreTerminalWorkspaceFocus(workspaceRoot)),
+      );
   };
   /** 仅对当前失败或退出的 generation 开放重启，防止旧菜单重启活跃 PTY。 */
   const restartPaneFromContextMenu = (): void => {
