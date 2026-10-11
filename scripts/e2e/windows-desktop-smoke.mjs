@@ -13717,6 +13717,8 @@ async function captureAuthoritativeThreadSnapshot(page, expectedThreadId) {
 /**
  * 按捕获的真实 DOM 节点同步读取 Files 几何；固定节点身份可区分重排与替换，避免用新树数据
  * 伪装旧树稳定。Arborist 的 `role=tree` 是固定高的键盘容器，唯一 overflow 应归 react-window 子节点。
+ * 布局填充比较使用 scrollport 的 border-box；clientHeight 会排除横向滚动条，不能直接与 viewport 高度比较。
+ * @author kongweiguang
  */
 function readFilesTreeGeometryFromReferences(references) {
   const { workspace, body, explorer, host, toolbar, viewport, tree, scrollport } = references;
@@ -13770,8 +13772,11 @@ function readFilesTreeGeometryFromReferences(references) {
         tagName: candidate.tagName,
         className: candidate.className,
         clientHeight: candidate.clientHeight,
+        clientWidth: candidate.clientWidth,
         scrollHeight: candidate.scrollHeight,
+        scrollWidth: candidate.scrollWidth,
         overflowY: globalThis.getComputedStyle(candidate).overflowY,
+        overflowX: globalThis.getComputedStyle(candidate).overflowX,
       })),
     };
   }
@@ -13780,6 +13785,8 @@ function readFilesTreeGeometryFromReferences(references) {
   const hostRect = host.getBoundingClientRect();
   const toolbarRect = toolbar.getBoundingClientRect();
   const viewportRect = viewport.getBoundingClientRect();
+  const scrollportRect = scrollport.getBoundingClientRect();
+  const scrollportStyle = globalThis.getComputedStyle(scrollport);
   return {
     valid: true,
     bodyHeight: bodyRect.height,
@@ -13791,10 +13798,15 @@ function readFilesTreeGeometryFromReferences(references) {
     viewportBottom: viewportRect.bottom,
     treeClientHeight: tree.clientHeight,
     treeScrollHeight: tree.scrollHeight,
+    scrollportHeight: scrollportRect.height,
+    scrollportBottom: scrollportRect.bottom,
     scrollportClientHeight: scrollport.clientHeight,
     scrollportScrollHeight: scrollport.scrollHeight,
+    scrollportClientWidth: scrollport.clientWidth,
+    scrollportScrollWidth: scrollport.scrollWidth,
     scrollportScrollTop: scrollport.scrollTop,
-    scrollportOverflowY: globalThis.getComputedStyle(scrollport).overflowY,
+    scrollportOverflowX: scrollportStyle.overflowX,
+    scrollportOverflowY: scrollportStyle.overflowY,
     overflowY: scrollport.scrollHeight > scrollport.clientHeight + 1,
   };
 }
@@ -13827,7 +13839,8 @@ async function captureFilesTreeGeometry(filesWorkspace) {
 
 /**
  * 在共享 deadline 与取消信号内轮询同一 Files surface 的同步几何；节点替换时释放并重新绑定，
- * 同时清除稳定计数，持续存在的 scrollHeight 溢出仍由原断言明确归因。
+ * 同时清除稳定计数，包含 border-box 与横向滚动尺寸以识别布局变化；纵向 client 溢出仍由原断言明确归因。
+ * @author kongweiguang
  */
 async function waitForStableFilesTreeGeometry(filesWorkspace, deadline, signal) {
   let measurement;
@@ -13838,11 +13851,17 @@ async function waitForStableFilesTreeGeometry(filesWorkspace, deadline, signal) 
   let references;
   const stableKeys = [
     "viewportHeight",
+    "viewportBottom",
     "treeClientHeight",
     "treeScrollHeight",
+    "scrollportHeight",
+    "scrollportBottom",
     "scrollportClientHeight",
     "scrollportScrollHeight",
+    "scrollportClientWidth",
+    "scrollportScrollWidth",
     "scrollportScrollTop",
+    "scrollportOverflowX",
     "scrollportOverflowY",
     "overflowY",
   ];
@@ -22616,7 +22635,8 @@ async function hasRecycleRecordFor(originalPath, deletedAfterUnixMillis, expecte
 /**
  * 仅针对磁盘上的随机 E2E workspace 检验类型化 Files mutation、CAS autosave、
  * watcher 冲突恢复与焦点协调。Rename 逐键保留原 DOM 节点并回读焦点/选区，
- * 避免重新定位输入框掩盖 renderer 重挂载；提交仍以文件树与磁盘的现有事实为准。
+ * 避免重新定位输入框掩盖 renderer 重挂载；填充高度按 border-box 比较，clientHeight 另用于真实纵向溢出。
+ * 提交仍以文件树与磁盘的现有事实为准。
  * @author kongweiguang
  */
 async function exerciseFilesWorkspace(
@@ -22645,7 +22665,8 @@ async function exerciseFilesWorkspace(
     Math.abs(initialGeometry.viewportHeight - expectedViewportHeight) > 4 ||
     Math.abs(initialGeometry.viewportBottom - initialGeometry.hostBottom) > 4 ||
     Math.abs(initialGeometry.treeClientHeight - initialGeometry.viewportHeight) > 4 ||
-    Math.abs(initialGeometry.scrollportClientHeight - initialGeometry.viewportHeight) > 4
+    Math.abs(initialGeometry.scrollportHeight - initialGeometry.viewportHeight) > 4 ||
+    Math.abs(initialGeometry.scrollportBottom - initialGeometry.viewportBottom) > 4
   ) {
     throw new Error(`Files 文件树没有占满可用高度：${JSON.stringify(initialGeometry)}`);
   }
