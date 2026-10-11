@@ -6130,25 +6130,114 @@ async function replaceRuntimeRefreshConfiguration(jaHome, document) {
 }
 
 /**
- * 为启动前凭据 fixture 显式设置当前账户 owner 与唯一受保护 FullControl ACE；提权 CI 的新文件
- * 默认 owner 可能是 Administrators，而 App Server 只接受当前 token SID 的精确 ACL。
+ * 用当前 token SID 重建启动前凭据 fixture 的 owner、protected DACL 与唯一 FullControl ACE，并回读安全投影；
+ * owner 单独由 icacls 设置，FileSystemAclExtensions 只持久化 FileSecurity 标记过的 DACL，避免 Set-Acl
+ * 隐式写入 owner/group 并要求当前进程没有的 restore 权限。
+ * 不继承 elevated runner 的默认 owner/ACE，也不把 Windows 异常消息或路径写进 E2E 诊断。
  * @author kongweiguang
  */
 export async function writeProtectedAuthFixture(authPath, credentials) {
-  const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
-  if (account.endsWith("\\")) throw new Error("无法确定当前 Windows ACL 用户");
+  await writeFile(authPath, "", "utf8");
+  const aclScript = String.raw`
+$ErrorActionPreference = 'Stop'
+$projection = [ordered]@{ ownerMatches = $false; protected = $false; aceCount = 0; aceMatches = $false; stage = 'token'; exceptionType = 'none' }
+$stage = 'token'
+try {
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  $stage = 'set_owner'
+  $ownerArgument = '*' + $sid.Value
+  & icacls.exe $env:JA_E2E_AUTH_PATH /setowner $ownerArgument *> $null
+  if ($LASTEXITCODE -ne 0) { throw [System.Security.SecurityException]::new() }
+
+  $stage = 'build_acl'
+  $security = [System.Security.AccessControl.FileSecurity]::new()
+  $security.SetAccessRuleProtection($true, $false)
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+  [void]$security.AddAccessRule($rule)
+  $stage = 'set_acl'
+  [System.IO.FileSystemAclExtensions]::SetAccessControl(
+    [System.IO.FileInfo]::new($env:JA_E2E_AUTH_PATH), $security)
+
+  $stage = 'read_owner'
+  $actual = Get-Acl -LiteralPath $env:JA_E2E_AUTH_PATH
+  $ownerSid = ([System.Security.Principal.NTAccount]$actual.Owner).Translate(
+    [System.Security.Principal.SecurityIdentifier]).Value
+  $projection.ownerMatches = $ownerSid -eq $sid.Value
+  $projection.protected = $actual.AreAccessRulesProtected
+  $stage = 'read_aces'
+  $rules = @($actual.Access)
+  $projection.aceCount = $rules.Count
+  if ($rules.Count -eq 1) {
+    $entry = $rules[0]
+    $entrySid = $entry.IdentityReference.Translate(
+      [System.Security.Principal.SecurityIdentifier]).Value
+    $projection.aceMatches = $entrySid -eq $sid.Value -and
+      $entry.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+      $entry.FileSystemRights -eq [System.Security.AccessControl.FileSystemRights]::FullControl -and
+      -not $entry.IsInherited -and
+      $entry.InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and
+      $entry.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None
+  }
+  $stage = 'complete'
+  $projection.stage = 'complete'
+} catch {
+  $projection.stage = $stage
+  $projection.exceptionType = $_.Exception.GetType().Name
+  $projection.aceCount = -1
+}
+$projection | ConvertTo-Json -Compress | Write-Output
+if ($projection.ownerMatches -and $projection.protected -and
+    $projection.aceCount -eq 1 -and $projection.aceMatches -and
+    $projection.stage -eq 'complete') { exit 0 }
+exit 21
+`;
+  let proof;
+  try {
+    const result = await execFileAsync(
+      "pwsh.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", aclScript],
+      {
+        windowsHide: true,
+        maxBuffer: 1 * 1024 * 1024,
+        timeout: snapshotTimeoutMs,
+        env: { ...process.env, JA_E2E_AUTH_PATH: authPath },
+      },
+    );
+    proof = JSON.parse(result.stdout.trim());
+  } catch (error) {
+    try {
+      proof = JSON.parse(String(error?.stdout ?? "").trim());
+    } catch {
+      proof = {
+        ownerMatches: false,
+        protected: false,
+        aceCount: -1,
+        aceMatches: false,
+        stage: "process",
+        exceptionType:
+          error?.code === "ENOENT"
+            ? "ExecutableNotFound"
+            : error?.code === "ETIMEDOUT"
+              ? "Timeout"
+              : "ProcessFailure",
+      };
+    }
+  }
+  if (
+    proof?.ownerMatches !== true ||
+    proof.protected !== true ||
+    proof.aceCount !== 1 ||
+    proof.aceMatches !== true ||
+    proof.stage !== "complete" ||
+    proof.exceptionType !== "none"
+  ) {
+    throw new Error(`auth fixture Windows ACL contract mismatch ${JSON.stringify(proof)}`);
+  }
   await writeFile(authPath, `${JSON.stringify(credentials)}\n`, "utf8");
-  const aclOptions = {
-    windowsHide: true,
-    maxBuffer: 1 * 1024 * 1024,
-    timeout: snapshotTimeoutMs,
-  };
-  await execFileAsync(
-    "icacls.exe",
-    [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`],
-    aclOptions,
-  );
-  await execFileAsync("icacls.exe", [authPath, "/setowner", account], aclOptions);
+  return proof;
 }
 
 /**
