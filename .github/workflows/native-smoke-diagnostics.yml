@@ -25,8 +25,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/diagnostic-evidence"
-          mapfile_placeholder=unused
-          artifact=$(python3 -c 'import pathlib,os; p=list(pathlib.Path(os.environ["RUNNER_TEMP"],"diagnostic-input").rglob("ja-app-server")); assert len(p)==1,p; print(p[0])')
+          artifact=$(python3 -c 'import pathlib,os; p=[p for p in pathlib.Path(os.environ["RUNNER_TEMP"],"diagnostic-input").rglob("ja-app-server") if p.is_file()]; assert len(p)==1,p; print(p[0])')
           chmod +x "$artifact"
           identity=$(python3 -c 'import pathlib,sys,hashlib; p=pathlib.Path(sys.argv[1]); s=p.stat(); print(hashlib.sha256(p.read_bytes()).hexdigest(),s.st_size,s.st_mtime_ns)' "$artifact")
           read -r sha size mtime <<< "$identity"
