@@ -74,7 +74,10 @@ async function captureDurableTurnState(backend, turn, recordId) {
   };
 }
 
-/** 等待指定 Turn 的持久终态，避免把恢复受理后的 SUSPENDED 瞬态报告为最终结果。 */
+/**
+ * 等待指定 Turn 的持久终态；短暂的尚未准入响应继续按同一身份轮询，不把 SUSPENDED 当成完成。
+ * @author kongweiguang
+ */
 async function waitForTurnState(backend, turn, expectedState) {
   const deadline = Date.now() + 15_000;
   let latest;
@@ -85,6 +88,10 @@ async function waitForTurnState(backend, turn, expectedState) {
       body: JSON.stringify({ threadId: turn.threadId, turnId: turn.turnId }),
       signal: AbortSignal.timeout(1_000),
     });
+    if (response.status === 404) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      continue;
+    }
     if (!response.ok) throw new Error(`Turn status returned HTTP ${response.status}.`);
     latest = await response.json();
     if (latest.state === expectedState) return latest;
@@ -97,13 +104,15 @@ async function waitForTurnState(backend, turn, expectedState) {
 }
 
 /**
- * 记录既有终态定位器的自然结果，不改变 Playwright 默认等待预算。
+ * 以持久 Turn 身份等待终态，避免上一轮的全局状态标记提前满足本轮检查。
  * @author kongweiguang
  */
-async function waitForCompletedStatus(page, completedWaits) {
+async function waitForCompletedStatus(backend, turn, completedWaits) {
   const startedAt = new Date().toISOString();
   const startedMonotonicAt = performance.now();
   const observation = {
+    threadId: turn.threadId,
+    turnId: turn.turnId,
     startedAt,
     settledAt: null,
     failedAt: null,
@@ -113,7 +122,8 @@ async function waitForCompletedStatus(page, completedWaits) {
   completedWaits.push(observation);
 
   try {
-    await page.locator('.status-line[data-state="COMPLETED"]').waitFor({ state: "attached" });
+    const status = await waitForTurnState(backend, turn, "COMPLETED");
+    observation.state = status.state;
     observation.outcome = "resolved";
   } catch (failure) {
     observation.outcome = "rejected";
@@ -126,15 +136,113 @@ async function waitForCompletedStatus(page, completedWaits) {
 }
 
 /**
- * 先记录原有终态等待，再核对答复只呈现一次；观测不得改变既有时限。
+ * 先确认指定持久 Turn 已完成，再只在该用户消息所属卡片中核对唯一答复。
  * @author kongweiguang
  */
-async function expectCompletedAnswer(page, text, completedWaits) {
-  await waitForCompletedStatus(page, completedWaits);
-  const answer = page.getByText(text, { exact: true });
+async function expectCompletedAnswer(page, text, completedWaits, backend, turn, expectation) {
+  const submittedText = turn.content?.text;
+  if (!submittedText) throw new Error(`Turn ${turn.turnId} has no submitted user message.`);
+  expectation.current = {
+    threadId: turn.threadId,
+    turnId: turn.turnId,
+    submittedText,
+    expectedAnswer: text,
+  };
+  await waitForCompletedStatus(backend, turn, completedWaits);
+  const turnCard = page.locator(".turn-block").filter({ hasText: submittedText });
+  await turnCard.first().waitFor({ state: "visible" });
+  if ((await turnCard.count()) !== 1)
+    throw new Error(`Expected one rendered turn for submission ${turn.turnId}.`);
+  const answer = turnCard.getByText(text, { exact: true });
   await answer.first().waitFor({ state: "visible" });
   if ((await answer.count()) !== 1)
     throw new Error(`The completed answer rendered more than once: ${text}`);
+}
+
+/**
+ * 输出有界的测试故障证据，以区分当前持久 Turn、模型记录和 React 可见内容；仅投影字段白名单。
+ * @author kongweiguang
+ */
+function summarizeBrowserFailure({
+  failure,
+  expectation,
+  apiResponses,
+  durableState,
+  visibleText,
+}) {
+  const turn = expectation.submittedTurn ?? expectation.current;
+  const bodyFor = (action) =>
+    durableState?.results?.find((result) => result.action === action)?.body;
+  const status = bodyFor("status");
+  const eventPage = bodyFor("events");
+  const events = Array.isArray(eventPage?.events) ? eventPage.events : [];
+  const currentApi = turn
+    ? apiResponses.filter(
+        (response) =>
+          response.payload?.threadId === turn.threadId && response.payload?.turnId === turn.turnId,
+      )
+    : [];
+  const eventTrail = events.slice(-24).map((event) => {
+    let payload = {};
+    try {
+      payload = event.payloadJson ? JSON.parse(event.payloadJson) : {};
+    } catch {
+      payload = {};
+    }
+    return {
+      sequence: event.sequence,
+      eventType: event.eventType,
+      state: payload.state ?? payload.to,
+      callId: payload.callId,
+      messageRecordId: payload.messageRecordId,
+      resultRecordId: payload.resultRecordId,
+      summary: typeof payload.summary === "string" ? payload.summary.slice(0, 500) : undefined,
+      error:
+        typeof payload.errorMessage === "string" ? payload.errorMessage.slice(0, 500) : undefined,
+    };
+  });
+  const messageReads = currentApi
+    .filter((response) => response.action === "message")
+    .slice(-12)
+    .map((response) => {
+      let body;
+      try {
+        body = response.body ? JSON.parse(response.body) : undefined;
+      } catch {
+        body = undefined;
+      }
+      return {
+        status: response.status,
+        recordId: response.payload?.recordId,
+        modelRequestId: body?.modelRequestId,
+        text: typeof body?.text === "string" ? body.text.slice(0, 500) : undefined,
+        calls: Array.isArray(body?.calls) ? body.calls.map((call) => call.name).slice(0, 8) : [],
+      };
+    });
+  return {
+    error:
+      failure instanceof Error ? failure.message.slice(0, 1_200) : String(failure).slice(0, 1_200),
+    submittedTurn: turn,
+    answerExpectation: expectation.current,
+    currentStatus: status
+      ? {
+          state: status.state,
+          resumeRequired: status.resumeRequired,
+          turnMutationVersion: status.turnMutationVersion,
+        }
+      : undefined,
+    currentApi: currentApi.slice(-24).map((response) => ({
+      action: response.action,
+      status: response.status,
+      afterSequence: response.payload?.afterSequence,
+      recordId: response.payload?.recordId,
+      answerOptionIds: response.payload?.answers?.flatMap((answer) => answer.optionIds ?? []),
+    })),
+    modelEvents: eventTrail.filter((event) => event.eventType?.startsWith("agent.model.")),
+    eventTrail,
+    messageReads,
+    visibleText: visibleText.slice(-5_000),
+  };
 }
 
 /** 立即收敛响应等待的拒绝，避免后续点击等待期间 Node 将其作为未处理 Promise 退出。 */
@@ -377,6 +485,7 @@ async function main() {
   const usageRequests = [];
   const responseBodyReads = [];
   const apiRequestTimings = new WeakMap();
+  const answerExpectation = { current: undefined };
   let durableStateAtFailure;
   let reconnectAdmission;
   let recordsEvidence;
@@ -522,30 +631,57 @@ async function main() {
     await composer.fill("浏览器普通回复");
     const send = page.getByRole("button", { name: "发送" });
     await send.click();
+    const firstTurn = submissions.at(-1);
+    if (!firstTurn) throw new Error("The first browser reply was not submitted.");
     if (!(await send.isDisabled()))
       throw new Error("The composer remained enabled after clearing an accepted draft.");
     await send.click({ timeout: 300 }).catch(() => undefined);
-    await expectCompletedAnswer(page, "浏览器首轮答复", completedWaits);
+    await expectCompletedAnswer(
+      page,
+      "浏览器首轮答复",
+      completedWaits,
+      backend,
+      firstTurn,
+      answerExpectation,
+    );
     if (submissions.length !== 1)
       throw new Error(`Repeated send created ${submissions.length} submissions.`);
 
     await page.reload({ waitUntil: "networkidle" });
     await page.getByText("浏览器首轮答复", { exact: true }).waitFor({ state: "visible" });
-    await waitForCompletedStatus(page, completedWaits);
+    await waitForCompletedStatus(backend, firstTurn, completedWaits);
 
     await composer.fill("验证工具失败后继续");
     await page.getByRole("button", { name: "发送" }).click();
+    const correctedTurn = submissions.at(-1);
+    if (!correctedTurn) throw new Error("The tool-failure scenario was not submitted.");
     await page.getByText("unknown_tool", { exact: true }).waitFor({ state: "visible" });
-    await expectCompletedAnswer(page, "工具失败后已纠正", completedWaits);
+    await expectCompletedAnswer(
+      page,
+      "工具失败后已纠正",
+      completedWaits,
+      backend,
+      correctedTurn,
+      answerExpectation,
+    );
 
     await composer.fill("验证审批拒绝");
     await page.getByRole("button", { name: "发送" }).click();
+    const approvalTurn = submissions.at(-1);
+    if (!approvalTurn) throw new Error("The approval refusal scenario was not submitted.");
     const approval = page.locator(".wait-form");
     const approvalPrompt = approval.locator("legend").first();
     await approvalPrompt.getByText("允许执行 approval_probe？").waitFor({ state: "visible" });
     await approval.locator('input[type="radio"]').nth(1).check();
     await approval.getByRole("button", { name: "确认并继续" }).click();
-    await expectCompletedAnswer(page, "用户拒绝，未执行", completedWaits);
+    await expectCompletedAnswer(
+      page,
+      "用户拒绝，未执行",
+      completedWaits,
+      backend,
+      approvalTurn,
+      answerExpectation,
+    );
 
     await composer.fill("验证澄清后继续");
     await page.getByRole("button", { name: "发送" }).click();
@@ -559,7 +695,14 @@ async function main() {
       .waitFor({ state: "visible" });
     await clarification.locator('input[type="radio"]').first().check();
     await clarification.getByRole("button", { name: "确认并继续" }).click();
-    await expectCompletedAnswer(page, "已按你的选择回答", completedWaits);
+    await expectCompletedAnswer(
+      page,
+      "已按你的选择回答",
+      completedWaits,
+      backend,
+      clarificationTurn,
+      answerExpectation,
+    );
     clarificationDurableStatus = await waitForTurnState(backend, clarificationTurn, "COMPLETED");
 
     await composer.fill("验证断线重连");
@@ -595,7 +738,14 @@ async function main() {
     ) {
       throw new Error("Reload did not reconnect to the existing Thread and Turn.");
     }
-    await expectCompletedAnswer(page, "迟到的回答", completedWaits);
+    await expectCompletedAnswer(
+      page,
+      "迟到的回答",
+      completedWaits,
+      backend,
+      reconnectTurn,
+      answerExpectation,
+    );
     if (submissions.filter((request) => request?.turnId === reconnectTurn.turnId).length !== 1) {
       throw new Error("Reload submitted the active Turn more than once.");
     }
@@ -985,6 +1135,27 @@ async function main() {
     durableStateAtFailure = latestTurn
       ? await captureDurableTurnState(backend, latestTurn, latestWait?.payload?.recordId)
       : undefined;
+    process.stdout.write(
+      `SPRING_BROWSER_EVIDENCE ${JSON.stringify(
+        summarizeBrowserFailure({
+          failure,
+          expectation: {
+            current: answerExpectation.current,
+            submittedTurn: latestTurn
+              ? {
+                  threadId: latestTurn.threadId,
+                  turnId: latestTurn.turnId,
+                  operationKey: latestTurn.operationKey,
+                  submittedText: latestTurn.content?.text,
+                }
+              : undefined,
+          },
+          apiResponses,
+          durableState: durableStateAtFailure,
+          visibleText,
+        }),
+      )}\n`,
+    );
     await writeFile(
       path.join(artifacts, "report.json"),
       JSON.stringify(

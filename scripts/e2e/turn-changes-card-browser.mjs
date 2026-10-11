@@ -305,7 +305,103 @@ async function revealTimelineCard(page, targetTurnId) {
   );
 }
 
-/** 真实 ChatTimeline 验证上滚锚点、焦点、缓存卸载恢复和 Review 冻结读取边界。 */
+/**
+ * 虚拟行重测可能在一次 scrollTop 写入后改写 spacer 高度；每帧重算真实边界，
+ * 直到目标离开/重新进入虚拟范围。5 秒截止避免吞掉真实失败，并保留实际 range 诊断。
+ */
+async function synchronizeTimelineVirtualRange(
+  page,
+  targetTurnId,
+  targetRowIndex,
+  targetScrollTop,
+) {
+  const result = await page.evaluate(
+    async ({ turnId, rowIndex, scrollTop }) => {
+      const startedAt = globalThis.performance.now();
+      const deadline = startedAt + 5_000;
+      const selector = `[data-turn-id="${turnId}"] .ja-turn-changes`;
+      const element = globalThis.document.querySelector(".ja-chat-timeline__scroll");
+      if (!(element instanceof globalThis.HTMLElement)) {
+        throw new Error("timeline scroll container is unavailable");
+      }
+      let stableFrames = 0;
+      let boundaryCorrections = 0;
+      let snapshot = null;
+      while (globalThis.performance.now() < deadline) {
+        const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+        const requestedTop = scrollTop === null ? maxScrollTop : Math.min(scrollTop, maxScrollTop);
+        element.scrollTop = requestedTop;
+        await new Promise((resolveFrame) => globalThis.requestAnimationFrame(resolveFrame));
+
+        const currentTarget = globalThis.document.querySelector(selector);
+        const currentMaxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+        if (scrollTop === null && Math.abs(requestedTop - currentMaxScrollTop) > 1) {
+          boundaryCorrections += 1;
+        }
+        const atEnd = Math.abs(element.scrollTop - currentMaxScrollTop) <= 1;
+        const atRequestedOffset =
+          scrollTop !== null &&
+          Math.abs(element.scrollTop - Math.min(scrollTop, currentMaxScrollTop)) <= 1;
+        const virtualized = currentTarget === null;
+        const inRange = currentTarget !== null;
+        const synchronized =
+          scrollTop === null ? virtualized && atEnd : inRange && atRequestedOffset;
+        stableFrames = synchronized ? stableFrames + 1 : 0;
+        const rows = [
+          ...globalThis.document.querySelectorAll(".ja-chat-timeline__row[data-index]"),
+        ].map((row) => Number(row.getAttribute("data-index")));
+        const viewport = element.getBoundingClientRect();
+        const targetRow = currentTarget?.closest(".ja-chat-timeline__row[data-index]");
+        snapshot = {
+          ready: stableFrames >= 2,
+          phase: scrollTop === null ? "scroll-to-end" : "restore-target-range",
+          elapsedMs: Math.round(globalThis.performance.now() - startedAt),
+          targetTurnId: turnId,
+          targetRowIndex: rowIndex,
+          targetMounted: currentTarget !== null,
+          targetRenderedIndex:
+            targetRow === null || targetRow === undefined
+              ? null
+              : Number(targetRow.getAttribute("data-index")),
+          viewport: { top: viewport.top, bottom: viewport.bottom, height: viewport.height },
+          scroll: {
+            top: element.scrollTop,
+            requestedTop,
+            height: element.scrollHeight,
+            clientHeight: element.clientHeight,
+            maxTop: currentMaxScrollTop,
+            atEnd,
+            boundaryCorrections,
+          },
+          renderedIndices: rows,
+          renderedRange:
+            rows.length === 0 ? null : { first: Math.min(...rows), last: Math.max(...rows) },
+        };
+        if (stableFrames >= 2) return snapshot;
+      }
+      return (
+        snapshot ?? {
+          ready: false,
+          phase: scrollTop === null ? "scroll-to-end" : "restore-target-range",
+          targetTurnId: turnId,
+          targetRowIndex: rowIndex,
+        }
+      );
+    },
+    { turnId: targetTurnId, rowIndex: targetRowIndex, scrollTop: targetScrollTop },
+  );
+  assert.equal(
+    result.ready,
+    true,
+    `timeline virtual range did not synchronize: ${JSON.stringify(result)}`,
+  );
+  return result;
+}
+
+/**
+ * 在真实 ChatTimeline 布局中验收锚点、焦点、缓存恢复和 Review 读取边界；使用浏览器实测的
+ * scroll 与虚拟行，避免固定几何的单测替身掩盖 ResizeObserver 与 React commit 的时序差异。
+ */
 export async function verifyTimelineWorkflow(page, fixtureUrl, evidenceDirectory) {
   await page.setViewportSize({ width: 1_200, height: 820 });
   await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
@@ -325,7 +421,7 @@ export async function verifyTimelineWorkflow(page, fixtureUrl, evidenceDirectory
   const targetTurnId = "turn_timeline_target";
   const targetPath = "src/features/conversation/turn-changes/reviewed-file-08.tsx";
   const target = page.locator(`[data-turn-id="${targetTurnId}"] .ja-turn-changes`);
-  const { scroller } = await revealTimelineCard(page, targetTurnId);
+  await revealTimelineCard(page, targetTurnId);
   await target.waitFor({ state: "visible" });
   await page.screenshot({
     path: join(evidenceDirectory, "timeline-760-dark-before.png"),
@@ -389,21 +485,22 @@ export async function verifyTimelineWorkflow(page, fixtureUrl, evidenceDirectory
   assert.equal(after.focusIsDisclosure, true, "keyboard focus must remain on the disclosure");
   assert.equal(await readCount(), 0, "expanding file rows must not read Review content");
 
-  const targetScrollTop = await scroller.evaluate((element) =>
-    Math.min(element.scrollHeight - element.clientHeight, element.scrollTop + 1_000_000),
+  const targetRowIndex = await target.evaluate((element) =>
+    Number(element.closest(".ja-chat-timeline__row[data-index]")?.getAttribute("data-index")),
   );
-  await scroller.evaluate((element, value) => {
-    element.scrollTop = value;
-  }, targetScrollTop);
-  await page.waitForFunction(
-    (turnId) =>
-      globalThis.document.querySelector(`[data-turn-id="${turnId}"] .ja-turn-changes`) === null,
+  assert.ok(Number.isSafeInteger(targetRowIndex), "timeline target row index is unavailable");
+  const unmounted = await synchronizeTimelineVirtualRange(page, targetTurnId, targetRowIndex, null);
+  /**
+   * 用已经实际显示过目标行的 scrollTop 复位；按滚动范围取半程会受异步测量的行高影响，
+   * 可能落在 overscan 边缘之外，使“恢复缓存”断言在浏览器里偶发超时。
+   */
+  const returnScrollTop = before.scrollTop;
+  const restored = await synchronizeTimelineVirtualRange(
+    page,
     targetTurnId,
+    targetRowIndex,
+    returnScrollTop,
   );
-  const returnScrollTop = Math.max(0, Math.floor(targetScrollTop / 2));
-  await scroller.evaluate((element, value) => {
-    element.scrollTop = value;
-  }, returnScrollTop);
   await target.waitFor({ state: "visible" });
   assert.equal(
     await target.locator(".ja-turn-changes__expand").getAttribute("aria-expanded"),
@@ -477,6 +574,8 @@ export async function verifyTimelineWorkflow(page, fixtureUrl, evidenceDirectory
     scrollDelta: Math.round((after.scrollTop - before.scrollTop) * 10) / 10,
     anchorDelta: Math.round((after.cardTop - before.cardTop) * 10) / 10,
     focusRetained: after.focusIsDisclosure,
+    virtualUnmount: unmounted,
+    virtualRemount: restored,
     disclosureRestoredAfterUnmount: true,
     retryFocusRestored: true,
   };
