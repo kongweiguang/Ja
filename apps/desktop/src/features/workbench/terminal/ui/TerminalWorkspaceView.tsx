@@ -874,8 +874,11 @@ function TerminalPaneView({
       ? undefined
       : "已达到每标签 4 个或工作区 8 个终端窗格上限";
   const splitDisabled = splitBlockedReason !== undefined;
-  /** 窗格仍存在时回到第一个可见操作；极窄窗格隐藏的按钮不能接收焦点。 */
-  const restorePaneFocus = (): void => {
+  /**
+   * 关闭后优先聚焦仍在场的窗格操作；pane 已卸载时使用调用前捕获的工作区恢复标签焦点。
+   * @author kongweiguang
+   */
+  const restorePaneFocus = (workspaceRoot = contextMenu?.workspaceRoot ?? null): void => {
     const toolbarAction = Array.from(
       toolbarRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [],
     ).find((button) => button.getClientRects().length > 0);
@@ -883,8 +886,7 @@ function TerminalPaneView({
       toolbarAction.focus();
       return;
     }
-    const root = contextMenu?.workspaceRoot ?? null;
-    restoreTerminalWorkspaceFocus(root);
+    restoreTerminalWorkspaceFocus(workspaceRoot);
   };
   /** 菜单绑定当前窗格 ID 和所属工作区，键盘入口按标题区域中心定位。 */
   const openContextMenu = (event: ReactMouseEvent<HTMLElement>): void => {
@@ -894,15 +896,22 @@ function TerminalPaneView({
       workspaceRoot: event.currentTarget.closest<HTMLElement>(".ja-terminal-workspace"),
     });
   };
-  /** 异步关闭完成后再次校正焦点，避免被卸载的最后一个 pane 留在 document.activeElement。 */
-  const removePaneFromContextMenu = (): void => {
+  /**
+   * toolbar 与 More 共用原生 close ACK 和焦点收尾；先捕获 root，避免 pane 卸载后丢失 tab 目标。
+   * @author kongweiguang
+   */
+  const removePaneAndRestoreFocus = (): void => {
     if (closing || controller.closeAllPending) return;
+    const workspaceRoot =
+      toolbarRef.current?.closest<HTMLElement>(".ja-terminal-workspace") ??
+      contextMenu?.workspaceRoot ??
+      null;
     void controller
       .removePane(tab.tabId, pane.paneId)
       .catch(() => {
         // controller 会在关闭失败时保留窗格并投影 runtime 错误。
       })
-      .finally(() => window.requestAnimationFrame(restorePaneFocus));
+      .finally(() => window.requestAnimationFrame(() => restorePaneFocus(workspaceRoot)));
   };
   /** 仅对当前失败或退出的 generation 开放重启，防止旧菜单重启活跃 PTY。 */
   const restartPaneFromContextMenu = (): void => {
@@ -912,7 +921,7 @@ function TerminalPaneView({
       .catch(() => {
         // controller 将重启失败保留为可见的 pane runtime 错误。
       })
-      .finally(() => window.requestAnimationFrame(restorePaneFocus));
+      .finally(() => window.requestAnimationFrame(() => restorePaneFocus()));
   };
   return (
     <div
@@ -977,7 +986,7 @@ function TerminalPaneView({
             disabled={closing}
             onClick={(event) => {
               event.stopPropagation();
-              runTerminalAction(() => controller.removePane(tab.tabId, pane.paneId));
+              removePaneAndRestoreFocus();
             }}
           >
             <X aria-hidden="true" size={14} />
@@ -1001,9 +1010,9 @@ function TerminalPaneView({
             onOpenChange={(open) => {
               if (open) return;
               setContextMenu(undefined);
-              window.requestAnimationFrame(restorePaneFocus);
+              window.requestAnimationFrame(() => restorePaneFocus());
             }}
-            onRestoreFocus={restorePaneFocus}
+            onRestoreFocus={() => restorePaneFocus()}
           >
             <MenuItem
               disabled={splitDisabled}
@@ -1034,7 +1043,7 @@ function TerminalPaneView({
               </MenuItem>
             ) : null}
             <MenuSeparator />
-            <MenuItem disabled={closing} onSelect={removePaneFromContextMenu}>
+            <MenuItem disabled={closing} onSelect={removePaneAndRestoreFocus}>
               <X aria-hidden="true" size={14} />
               <span>关闭终端窗格</span>
             </MenuItem>

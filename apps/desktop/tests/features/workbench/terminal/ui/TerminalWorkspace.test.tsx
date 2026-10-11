@@ -440,6 +440,80 @@ describe("TerminalWorkspace", () => {
     await waitFor(() => expect(rendered.getByText("没有打开的终端标签页。")).toBeInTheDocument());
   });
 
+  /**
+   * @author kongweiguang
+   * Toolbar 关闭必须等原生 close ACK 后再聚焦仍存在的标签，避免浏览器把焦点留在卸载按钮上。
+   */
+  it("restores selected tab focus after a toolbar pane close is acknowledged", async () => {
+    const user = userEvent.setup();
+    const bridge = fakeAdapter();
+    const initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const tabId = initialLayout.activeTabId as string;
+    const originalPaneId = initialLayout.tabs[0]!.activePaneId;
+    const splitLayout = splitTerminalPane(initialLayout, tabId, originalPaneId, "horizontal");
+    const closingPaneId = splitLayout.tabs[0]!.activePaneId;
+    const rendered = render(
+      <TerminalWorkspace
+        workspaceId="ws_fixture"
+        adapter={bridge.adapter}
+        initialLayout={splitLayout}
+        active
+      />,
+    );
+
+    await waitFor(() => expect(bridge.adapter.open).toHaveBeenCalledTimes(2));
+    const selectedTab = rendered.getByRole("tab", { selected: true });
+    const closeButton = rendered.container.querySelector<HTMLButtonElement>(
+      `[data-pane-id="${closingPaneId}"] button[aria-label="关闭终端窗格"]`,
+    );
+    expect(closeButton).not.toBeNull();
+
+    await user.click(closeButton!);
+
+    await waitFor(() =>
+      expect(rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`)).toBeNull(),
+    );
+    await waitFor(() => expect(selectedTab).toHaveFocus());
+    expect(bridge.adapter.close).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * @author kongweiguang
+   * More 关闭继续走同一 native ACK 与焦点收尾，保留窄 pane 的现有入口语义。
+   */
+  it("keeps More-menu pane close focused on the selected tab", async () => {
+    const user = userEvent.setup();
+    const bridge = fakeAdapter();
+    const initialLayout = createDefaultTerminalLayout("ws_fixture");
+    const tabId = initialLayout.activeTabId as string;
+    const originalPaneId = initialLayout.tabs[0]!.activePaneId;
+    const splitLayout = splitTerminalPane(initialLayout, tabId, originalPaneId, "horizontal");
+    const closingPaneId = splitLayout.tabs[0]!.activePaneId;
+    const rendered = render(
+      <TerminalWorkspace
+        workspaceId="ws_fixture"
+        adapter={bridge.adapter}
+        initialLayout={splitLayout}
+        active
+      />,
+    );
+
+    await waitFor(() => expect(bridge.adapter.open).toHaveBeenCalledTimes(2));
+    const selectedTab = rendered.getByRole("tab", { selected: true });
+    const pane = rendered.container.querySelector<HTMLElement>(`[data-pane-id="${closingPaneId}"]`);
+    const moreButton = pane?.querySelector<HTMLButtonElement>(".ja-terminal-pane-menu-trigger");
+    expect(moreButton).not.toBeNull();
+
+    await user.click(moreButton!);
+    await user.click(await rendered.findByRole("menuitem", { name: "关闭终端窗格" }));
+
+    await waitFor(() =>
+      expect(rendered.container.querySelector(`[data-pane-id="${closingPaneId}"]`)).toBeNull(),
+    );
+    await waitFor(() => expect(selectedTab).toHaveFocus());
+    expect(bridge.adapter.close).toHaveBeenCalledOnce();
+  });
+
   /** 达到八个叶子后，加载完成的创建入口必须给出明确且可检查的禁用原因。 */
   it("disables add-tab at the workspace pane budget", async () => {
     let layout = createDefaultTerminalLayout("ws_fixture");
