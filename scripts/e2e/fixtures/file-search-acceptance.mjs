@@ -4,6 +4,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 
+/** 固定与生产 Shell 相同的宿主方言，避免 POSIX 把 PowerShell 命令失败误当成可取消的长进程。 */
+export function sleepCommand(platform = process.platform) {
+  return platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30";
+}
+
 const CALLS = Object.freeze([
   Object.freeze({ callId: "call_file_search_ls", name: "ls", arguments: { path: ".", maxEntries: 200 } }),
   Object.freeze({
@@ -35,7 +40,7 @@ const AGENT_LOOP_MARKERS = Object.freeze({
   approval: Object.freeze({
     user: "JA_APPROVAL_ACCEPTANCE_USER",
     callId: "call_approval_acceptance",
-    command: "Start-Sleep -Seconds 30",
+    command: sleepCommand(),
   }),
   mailbox: Object.freeze({
     user: "JA_MAILBOX_ACCEPTANCE_TURN_START",

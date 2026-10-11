@@ -1,0 +1,238 @@
+# @author kongweiguang
+# Manual smoke diagnostics reuse approved, source-bound native artifacts without publishing them.
+name: Ja native smoke diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      native_run_id:
+        description: Native artifact run ID for source 15af5bc38a1684bcd4da7b63d343eae9787e222d
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  windows-desktop:
+    runs-on: windows-2025
+    # The smoke retains its 30-minute deadline; setup and a cold Rust build use only the job's outer budget.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: liberica
+          java-version: "25"
+          cache: maven
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
+        with:
+          workspaces: ". -> target"
+          shared-key: ja-native-windows-x86_64
+          cache-on-failure: true
+      - name: Build fresh JVM fixture with JDK 25
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = "$env:JAVA_HOME/bin;$env:PATH"
+          java -version
+          mvn.cmd -version
+          pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+          mvn.cmd -B -ntp -f ja-agent/pom.xml -pl ja-app-server -am -DskipTests package
+      - name: Run real Windows desktop smoke
+        shell: pwsh
+        env:
+          JA_E2E_REAL_PROVIDER: "0"
+          JA_E2E_KEEP_TEMP: "0"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:JA_E2E_CARGO_TARGET_DIR = Join-Path $PWD 'target'
+          $env:JA_E2E_APP_SERVER_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
+          "JA_DESKTOP_DIAGNOSTICS=$env:TEMP/ja-e2e-results" | Add-Content -Path $env:GITHUB_ENV
+          node scripts/e2e/windows-desktop-smoke.mjs
+      - name: Scan redacted Windows summaries
+        id: windows_summary_scan
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path -LiteralPath $env:JA_DESKTOP_DIAGNOSTICS) {
+            python -B scripts/release/check-evidence-secrets.py $env:JA_DESKTOP_DIAGNOSTICS
+            if ($LASTEXITCODE -ne 0) { throw 'desktop smoke summary credential scan failed' }
+            "safe=true" | Add-Content -Path $env:GITHUB_OUTPUT
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.windows_summary_scan.conclusion == 'success' }}
+        with:
+          name: ja-windows-desktop-diagnostics-${{ github.run_id }}
+          path: ${{ env.JA_DESKTOP_DIAGNOSTICS }}/*.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  macos-file-search:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            targetTriple: x86_64-apple-darwin
+            runner: macos-26-intel
+          - arch: arm64
+            targetTriple: aarch64-apple-darwin
+            runner: macos-26
+    env:
+      JA_NATIVE_SOURCE_COMMIT: 15af5bc38a1684bcd4da7b63d343eae9787e222d
+      JA_NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+      JA_NATIVE_EVIDENCE: ${{ runner.temp }}/ja-native-diagnostic-evidence
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+      - uses: actions/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          python-version: "3.13"
+      - name: Guard exact native source and diagnostics-only changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JA_NATIVE_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'native run ID must be numeric' >&2; exit 1; }
+          git fetch --no-tags --depth=1 origin "$JA_NATIVE_SOURCE_COMMIT"
+          git cat-file -e "$JA_NATIVE_SOURCE_COMMIT^{commit}"
+          changed="$(git diff --name-only "$JA_NATIVE_SOURCE_COMMIT" HEAD)"
+          allowed=$(cat <<'EOF'
+          .github/workflows/native-smoke-diagnostics.yml
+          scripts/e2e/file-search-acceptance.mjs
+          scripts/e2e/file-search-acceptance.test.mjs
+          scripts/e2e/fixtures/file-search-acceptance.mjs
+          scripts/e2e/windows-desktop-smoke.mjs
+          scripts/e2e/windows-desktop-smoke.test.mjs
+          EOF
+          )
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if ! grep -Fxq -- "$path" <<< "$allowed"; then
+              echo "Native artifact reuse rejected: unexpected source change: $path" >&2
+              exit 1
+            fi
+          done <<< "$changed"
+      - name: Download source-bound Native artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ja-native-app-server-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ja-native-download
+          run-id: ${{ inputs.native_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Verify artifact identity and stage search tools
+        shell: bash
+        env:
+          JA_NATIVE_ARCH: ${{ matrix.arch }}
+          JA_NATIVE_TRIPLE: ${{ matrix.targetTriple }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "ja-native-download" / "_temp"
+          source = os.environ["JA_NATIVE_SOURCE_COMMIT"]
+          arch = os.environ["JA_NATIVE_ARCH"]
+          triple = os.environ["JA_NATIVE_TRIPLE"]
+          evidence = root / "ja-native-evidence"
+          stage = root / "ja-native-stage"
+          report = json.loads((evidence / "build-report.json").read_text(encoding="utf-8"))
+          manifest = json.loads((stage / "sidecar-manifest.json").read_text(encoding="utf-8"))
+          tools_manifest = json.loads((stage / "sidecars" / "tools" / "tools-manifest.json").read_text(encoding="utf-8"))
+
+          expected_target = {"platform": "macos", "arch": arch}
+          if report.get("product") != "Ja" or report.get("sourceCommit") != source or report.get("target", {}).get("platform") != expected_target["platform"] or report.get("target", {}).get("arch") != arch:
+              raise SystemExit("Native build report source or target identity mismatch")
+          if report.get("toolchain", {}).get("nativeImageOnly") is not True or report.get("toolchain", {}).get("noFallback") is not True:
+              raise SystemExit("Native build report does not prove Native Image without fallback")
+          if report.get("smoke", {}).get("status") != "passed" or report.get("smoke", {}).get("runtime", {}).get("engineVersion") != "0.2.0" or report.get("smoke", {}).get("executable", {}).get("expectedIdentityMatched") is not True:
+              raise SystemExit("Native build report does not prove the 0.2.0 smoke identity")
+          if manifest.get("product") != "Ja" or manifest.get("sourceCommit") != source or manifest.get("target") != {"platform": "macos", "arch": arch, "targetTriple": triple}:
+              raise SystemExit("sidecar manifest source or target identity mismatch")
+          if manifest.get("nativeImageOnly") is not True or manifest.get("noFallback") is not True:
+              raise SystemExit("sidecar manifest does not prove Native Image without fallback")
+          if tools_manifest.get("product") != "Ja" or tools_manifest.get("sourceCommit") != source or tools_manifest.get("target") != {"platform": "macos", "arch": arch, "targetTriple": triple}:
+              raise SystemExit("search tools manifest source or target identity mismatch")
+
+          expected_relative = f"sidecars/ja-app-server-{triple}"
+          if manifest.get("sidecar", {}).get("relativePath") != expected_relative:
+              raise SystemExit("sidecar manifest path mismatch")
+          report_artifact = report.get("artifacts", {}).get("nativeExecutable", {})
+          staged_artifact = manifest.get("sidecar", {}).get("stagedArtifact", {})
+          source_artifact = manifest.get("sidecar", {}).get("sourceArtifact", {})
+          executable = stage / expected_relative
+          digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+          size = executable.stat().st_size
+          for identity in (report_artifact, staged_artifact, source_artifact):
+              if identity.get("sha256") != digest or identity.get("sizeBytes") != size:
+                  raise SystemExit("Native sidecar digest or size does not match its source manifests")
+
+          tools = stage / "sidecars" / "tools"
+          entries = {entry.get("name"): entry for entry in tools_manifest.get("tools", [])}
+          for name in ("fd", "rg"):
+              item = entries.get(name, {}).get("binary", {})
+              relative = item.get("relativePath")
+              if relative != f"tools/{name}":
+                  raise SystemExit(f"{name} manifest path mismatch")
+              binary = tools / name
+              if binary.stat().st_size != item.get("sizeBytes") or hashlib.sha256(binary.read_bytes()).hexdigest() != item.get("sha256"):
+                  raise SystemExit(f"{name} digest or size does not match tools manifest")
+          print(f"Verified {source} Native artifact for macOS {arch} ({triple}), Ja 0.2.0")
+          PY
+          stage="$RUNNER_TEMP/ja-native-download/_temp/ja-native-stage"
+          sidecars="$stage/sidecars"
+          tools="$sidecars/tools"
+          executable="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
+          test -f "$executable"
+          test -d "$tools"
+          test "$(dirname "$executable")" = "$(dirname "$tools")"
+          chmod u+x "$executable" "$tools/fd" "$tools/rg"
+          "$tools/fd" --version
+          "$tools/rg" --version
+      - name: Run Native file-search acceptance
+        shell: bash
+        env:
+          JA_NATIVE_EXECUTABLE: ${{ runner.temp }}/ja-native-download/_temp/ja-native-stage/sidecars/ja-app-server-${{ matrix.targetTriple }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$JA_NATIVE_EVIDENCE"
+          tools="$(dirname "$JA_NATIVE_EXECUTABLE")/tools"
+          export PATH="$tools:$PATH"
+          node scripts/e2e/file-search-acceptance.mjs --executable "$JA_NATIVE_EXECUTABLE" --evidence-directory "$JA_NATIVE_EVIDENCE" --stress-files 10000 --silent
+      - name: Scan bounded Native acceptance evidence
+        id: macos_evidence_scan
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$JA_NATIVE_EVIDENCE" ]; then
+            python3 -B scripts/release/check-evidence-secrets.py "$JA_NATIVE_EVIDENCE"
+            echo 'safe=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.macos_evidence_scan.conclusion == 'success' }}
+        with:
+          name: ja-macos-file-search-diagnostics-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ env.JA_NATIVE_EVIDENCE }}/*.json
+          if-no-files-found: ignore
+          retention-days: 3

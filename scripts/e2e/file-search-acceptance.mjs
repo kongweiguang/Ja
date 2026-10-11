@@ -560,7 +560,48 @@ export async function respondToClarification(
   );
 }
 
-/** 审批用唯一操作 ID取得幂等回执；仅在同一 Tool 真正启动后取消，避免把受理当作执行。 */
+/** Tool started 是持久投影，仍须用精确调用身份等待真实进程，避免对已退出的错误命令请求取消。 */
+export async function waitForRunningApprovalProcess(
+  session,
+  { workspaceId, threadId, turnId, callId },
+  timeoutMs = requestTimeoutMs,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const page = rpcResult(
+      await session.request(
+        "process/list",
+        { workspaceId, threadId, startedCallId: callId, limit: 200, cursor: null },
+        Math.max(1, deadline - Date.now()),
+      ),
+      "process/list approval cancellation",
+    );
+    assert.ok(
+      !session.events?.some(
+        (frame) => frame.method === "turn/terminal" && frame.params?.turnId === turnId,
+      ),
+      "approval Turn must remain active until its running process is verified",
+    );
+    if (page.sessions.length > 0) {
+      assert.equal(page.sessions.length, 1, "approval call must identify exactly one process");
+      const running = page.sessions[0];
+      assert.equal(running.startedTurnId, turnId);
+      assert.equal(running.startedCallId, callId);
+      assert.equal(
+        running.state,
+        "running",
+        "approval process must be running before cancellation",
+      );
+      return running.sessionId;
+    }
+    await new Promise((resolvePromise) =>
+      setTimeout(resolvePromise, Math.min(50, Math.max(0, deadline - Date.now()))),
+    );
+  }
+  throw new Error("approval process did not start before cancellation deadline");
+}
+
+/** 审批用唯一操作 ID取得幂等回执；真实进程 running 后才取消，保持 accepted 与终态的严格验收。 */
 async function runApprovalCancellationScenario(session, workspaceRoot) {
   const markers = agentLoopFixtureMarkers.approval;
   const created = rpcResult(
@@ -620,6 +661,12 @@ async function runApprovalCancellationScenario(session, workspaceRoot) {
     requestTimeoutMs,
   );
   assert.equal(started.params.callId, markers.callId);
+  const runningSessionId = await waitForRunningApprovalProcess(session, {
+    workspaceId: started.params.workspaceId,
+    threadId,
+    turnId: accepted.turnId,
+    callId: approval.callId,
+  });
   const cancelled = rpcResult(
     await session.request("turn/cancel", { turnId: accepted.turnId }),
     "turn/cancel approval acceptance",
@@ -645,7 +692,7 @@ async function runApprovalCancellationScenario(session, workspaceRoot) {
     ),
     "thread/read must persist the approval preceding cancellation",
   );
-  return { threadId, turnId: accepted.turnId, approvalId: approval.approvalId };
+  return { threadId, turnId: accepted.turnId, approvalId: approval.approvalId, runningSessionId };
 }
 
 /** 验证空闲消息只排队、followup 才启动 Child，运行中消息在下一次 Provider 请求消费。 */

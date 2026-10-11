@@ -18599,17 +18599,21 @@ async function selectReviewSource(review, optionName, deadline, signal) {
 
 /**
  * 从当前 owner 的“比较”子菜单选择 native Catalog 已发布的 Branch/Commit，并要求新的对应 snapshot ACK。
- * 父子 Portal 继承冻结 Thread，不混入未提交 layer 或历史 Turn；重复可访问名称直接失败。
+ * 父子 Portal 继承冻结 Thread，不混入未提交 layer 或历史 Turn；固定步骤名只用于阶段超时诊断。
+ * @author kongweiguang
  */
-async function selectReviewSourceByKind(review, kind, deadline, signal) {
+async function selectReviewSourceByKind(review, kind, deadline, signal, checkpoint) {
+  checkpoint.name = `comparison.${kind}.observe-current-native-state`;
   const before = await captureNativeReviewEvidence(review.page(), deadline, signal);
   if (before.native.status !== "available") throw new Error("Review native probe 不可观测");
   const minSnapshotCallId = before.native.commands.ja_review_snapshot.counts.start + 1;
+  checkpoint.name = `comparison.${kind}.open-source-menu`;
   const { menu, ownerScope } = await openReviewPortalMenu(
     review.locator(".ja-review-source-trigger"),
     deadline,
     signal,
   );
+  checkpoint.name = `comparison.${kind}.open-compare-submenu`;
   const { menu: submenu } = await openReviewPortalMenu(
     menu.getByRole("menuitem", { name: "比较", exact: true }),
     deadline,
@@ -18617,6 +18621,7 @@ async function selectReviewSourceByKind(review, kind, deadline, signal) {
     ownerScope,
   );
   const options = submenu.getByRole("menuitem");
+  checkpoint.name = `comparison.${kind}.read-option-labels`;
   const labels = await options.allTextContents();
   const optionIndex = labels.findIndex((label) => {
     const normalized = label.trim();
@@ -18625,12 +18630,15 @@ async function selectReviewSourceByKind(review, kind, deadline, signal) {
   });
   if (optionIndex < 0) throw new Error(`审查 catalog 缺少 ${kind} identity`);
   const selectedLabel = labels[optionIndex].trim();
+  checkpoint.name = `comparison.${kind}.click-native-catalog-option`;
   await clickVerifiedControl(
     review.page(),
     submenu.getByRole("menuitem", { name: selectedLabel, exact: true }),
     deadline,
   );
+  checkpoint.name = `comparison.${kind}.wait-source-menu-close`;
   await menu.waitFor({ state: "hidden", timeout: Math.max(1, deadline - Date.now()) });
+  checkpoint.name = `comparison.${kind}.wait-native-snapshot`;
   await waitForNativeReviewReady(
     review,
     { sourceKind: kind, rangeLabel: selectedLabel, minSnapshotCallId },
@@ -18641,10 +18649,24 @@ async function selectReviewSourceByKind(review, kind, deadline, signal) {
 }
 
 /**
+ * 保留固定子步骤和既有失败投影；靠近 deadline 时不再依赖额外页面读取来定位卡住点。
+ * @author kongweiguang
+ */
+export function nativeReviewFailureProjection(checkpoint, diagnostic, failure) {
+  return {
+    checkpoint,
+    diagnostic,
+    failure: redact(failure?.message ?? failure).slice(0, 2_000),
+  };
+}
+
+/**
  * 四个范围按当前生产菜单验收：未暂存/已暂存是 uncommitted 的层投影，Branch/Commit 使用 native Catalog identity。
  * 文件动作走选中文件的真实菜单，并同时核验 native ACK、Git index/worktree 和 Revert before image。
  * Git executable 显式沿调用链传入，与 setup 构造夹具使用同一个已解析命令，不依赖跨函数局部变量。
  * 整段受父取消与阶段 deadline 约束；失败只报告真实 DOM/probe，不把缺失节点包装成 Rust 响应。
+ * 固定 checkpoint 在 catch 中先于诊断读取投影，页面诊断耗尽预算也不会丢失最后步骤。
+ * @author kongweiguang
  */
 async function exerciseNativeReviewFlow(
   page,
@@ -18663,6 +18685,7 @@ async function exerciseNativeReviewFlow(
   );
   const expectedPath = "sample.ts";
   const timeout = () => Math.max(1, deadline - Date.now());
+  const checkpoint = { name: "review.wait-for-visible-shell" };
   /** 固定夹具只读 Git 校验与 UI/native 完成相互独立，不能以成功通知代替真实 index/worktree 状态。 */
   const gitState = async () => {
     throwIfAborted(signal);
@@ -18763,11 +18786,16 @@ async function exerciseNativeReviewFlow(
   };
   try {
     return await raceWithSignal(async () => {
+      checkpoint.name = "review.wait-for-visible-shell";
       await review.waitFor({ state: "visible", timeout: timeout() });
       if ((await review.count()) !== 1) throw new Error("当前 Thread 的审阅 Shell 不唯一");
+      checkpoint.name = "review.wait-for-initial-native-snapshot";
       await waitForNativeReviewReady(review, { sourceKind: "uncommitted" }, deadline, signal);
+      checkpoint.name = "review.select-initial-unstaged-range";
       await selectReviewSource(review, "未暂存", deadline, signal);
+      checkpoint.name = "review.select-initial-unstaged-file";
       const firstFileId = await selectFixture("unstaged");
+      checkpoint.name = "review.capture-native-visual";
       await prepareCapture?.();
       await captureNativeMaximizedVisualEvidence(
         page,
@@ -18785,6 +18813,7 @@ async function exerciseNativeReviewFlow(
         throw new Error("Review Unstage 未把夹具恢复为真实 worktree 变更");
       await selectReviewSource(review, "未暂存", deadline, signal);
       const unstagedFileId = await selectFixture("unstaged");
+      checkpoint.name = "review.apply-revert-and-verify-git-state";
       const reverted = await applyFile("revert", "撤销文件", "已撤销。", unstagedFileId);
       if (
         reverted.staged ||
@@ -18795,22 +18824,29 @@ async function exerciseNativeReviewFlow(
         throw new Error("Review Revert 未恢复确定性的 before image 与干净 Git 状态");
       }
       const filter = review.getByPlaceholder("筛选文件…", { exact: true });
+      checkpoint.name = "review.filter-expect-empty-result";
       await filter.fill(expectedPath, { timeout: timeout() });
+      checkpoint.name = "review.filter-wait-for-empty-result";
       await review
         .getByText("没有匹配的文件。", { exact: true })
         .waitFor({ state: "visible", timeout: timeout() });
+      checkpoint.name = "review.filter-clear";
       await filter.fill("", { timeout: timeout() });
       for (const kind of ["branch", "commit"]) {
-        await selectReviewSourceByKind(review, kind, deadline, signal);
+        await selectReviewSourceByKind(review, kind, deadline, signal, checkpoint);
+        checkpoint.name = `comparison.${kind}.open-mutation-menu`;
         const { menu } = await openReviewPortalMenu(
           review.getByRole("button", { name: "审查更多操作", exact: true }),
           deadline,
           signal,
         );
+        checkpoint.name = `comparison.${kind}.verify-mutations-disabled`;
         if ((await menu.getByRole("menuitem", { name: /暂存|撤销/u }).count()) !== 0) {
           throw new Error(`Review ${kind} 比较范围意外允许 mutation`);
         }
+        checkpoint.name = `comparison.${kind}.close-mutation-menu`;
         await menu.press("Escape", { timeout: timeout() });
+        checkpoint.name = `comparison.${kind}.wait-mutation-menu-close`;
         await menu.waitFor({ state: "hidden", timeout: timeout() });
       }
       return {
@@ -18827,7 +18863,7 @@ async function exerciseNativeReviewFlow(
   } catch (failure) {
     const diagnostic = await captureNativeReviewEvidence(page, deadline, parentSignal);
     throw new Error(
-      `真实 Review 流程失败：${JSON.stringify({ diagnostic, failure: redact(failure?.message ?? failure).slice(0, 2_000) })}`,
+      `真实 Review 流程失败：${JSON.stringify(nativeReviewFailureProjection(checkpoint.name, diagnostic, failure))}`,
       { cause: failure },
     );
   } finally {

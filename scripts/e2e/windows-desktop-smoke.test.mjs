@@ -25,6 +25,7 @@ import {
   installTaskThreadsExitProbe,
   nativeReviewEvidenceInPage,
   nativeReviewEvidenceReady,
+  nativeReviewFailureProjection,
   captureNativeReviewEvidence,
   attachPageDiagnostics,
   captureAriaHiddenFocusSnapshot,
@@ -5601,6 +5602,26 @@ test("waits for the latest started Review read when an older rejection arrives l
       dom.window.close();
     }
   }
+});
+
+/** 阶段诊断剩余时间不足时，仍须保留失败前固定的 native Review 子步骤。 @author kongweiguang */
+test("preserves the native Review checkpoint when browser diagnostics are unavailable", () => {
+  const diagnostic = {
+    status: "unavailable",
+    observationError: "Review 诊断 超过 1ms",
+    native: { status: "unavailable", commands: null },
+  };
+  const projection = nativeReviewFailureProjection(
+    "comparison.branch.read-option-labels",
+    diagnostic,
+    new Error("Review menu observation timed out"),
+  );
+
+  assert.deepEqual(projection, {
+    checkpoint: "comparison.branch.read-option-labels",
+    diagnostic,
+    failure: "Review menu observation timed out",
+  });
 });
 
 /** 当前请求失败必须由同 ID 保留，旧 resolved 晚到也不能把它改成成功。 */

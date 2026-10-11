@@ -12,6 +12,7 @@ import {
   assertFileSearchOutputs,
   fileSearchFixtureMarkers,
   parseFileSearchOutputs,
+  sleepCommand,
   startFileSearchFixture,
 } from "./fixtures/file-search-acceptance.mjs";
 import {
@@ -23,9 +24,120 @@ import {
   sendMailboxMessage,
   startAcceptanceTurn,
   validateFileSearchReport,
+  waitForRunningApprovalProcess,
   withInteractionObservation,
 } from "./file-search-acceptance.mjs";
 import { createIsolatedDirectories as createProviderSmokeDirectories } from "./real-provider-smoke.mjs";
+
+/** 覆盖所有发布平台方言，防止 Windows 开发机的 fixture 再把 PowerShell 文本发送给 zsh。 */
+function approvalSleepUsesHostDialect() {
+  assert.equal(sleepCommand("win32"), "Start-Sleep -Seconds 30");
+  assert.equal(sleepCommand("darwin"), "sleep 30");
+  assert.equal(sleepCommand("linux"), "sleep 30");
+  assert.equal(agentLoopFixtureMarkers.approval.command, sleepCommand(process.platform));
+}
+
+test("approval cancellation fixture uses the host shell dialect", approvalSleepUsesHostDialect);
+
+/** 进程登记允许晚于 Tool 投影，但取消前的 running 证据必须绑定同一个 Turn 和调用。 */
+async function approvalWaitsForRealProcessRegistration() {
+  const requests = [];
+  const scope = {
+    workspaceId: "ws_approval",
+    threadId: "thr_approval",
+    turnId: "turn_approval",
+    callId: "call_approval",
+  };
+  const session = {
+    events: [],
+    /** 首次列表为空，第二次返回实际身份，复现冷启动期间真实进程尚未登记的窗口。 */
+    async request(method, params, timeoutMs) {
+      requests.push({ method, params, timeoutMs });
+      return {
+        result: {
+          sessions:
+            requests.length === 1
+              ? []
+              : [
+                  {
+                    startedTurnId: scope.turnId,
+                    startedCallId: scope.callId,
+                    state: "running",
+                    sessionId: "proc_approval",
+                  },
+                ],
+        },
+      };
+    },
+  };
+  assert.equal(await waitForRunningApprovalProcess(session, scope, 1_000), "proc_approval");
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.equal(request.method, "process/list");
+    assert.deepEqual(request.params, {
+      workspaceId: scope.workspaceId,
+      threadId: scope.threadId,
+      startedCallId: scope.callId,
+      limit: 200,
+      cursor: null,
+    });
+    assert.ok(request.timeoutMs > 0 && request.timeoutMs <= 1_000);
+  }
+}
+
+test(
+  "approval cancellation waits for the exact running process",
+  approvalWaitsForRealProcessRegistration,
+);
+
+/** 已结束或身份不匹配的进程不能代替真实取消对象，Turn 提前完成也必须立即拒绝。 */
+async function approvalRejectsPrematureExitAndWrongIdentity() {
+  const scope = {
+    workspaceId: "ws_approval",
+    threadId: "thr_approval",
+    turnId: "turn_approval",
+    callId: "call_approval",
+  };
+  for (const changes of [
+    { state: "exited" },
+    { startedTurnId: "turn_other" },
+    { startedCallId: "call_other" },
+  ]) {
+    const session = {
+      events: [],
+      /** 返回同形响应但篡改单一进程事实，确认 runner 不会只接受非空列表。 */
+      async request() {
+        return {
+          result: {
+            sessions: [
+              {
+                startedTurnId: scope.turnId,
+                startedCallId: scope.callId,
+                state: "running",
+                sessionId: "proc_approval",
+                ...changes,
+              },
+            ],
+          },
+        };
+      },
+    };
+    await assert.rejects(waitForRunningApprovalProcess(session, scope), assert.AssertionError);
+  }
+  const finished = {
+    events: [{ method: "turn/terminal", params: { turnId: scope.turnId, state: "completed" } }],
+    /** 空列表与已终止 Turn 一起返回，不能继续耗尽整个验收期限。 */
+    async request() {
+      return { result: { sessions: [] } };
+    },
+  };
+  await assert.rejects(waitForRunningApprovalProcess(finished, scope), /remain active/u);
+}
+
+test(
+  "approval cancellation rejects exited or unrelated processes",
+  approvalRejectsPrematureExitAndWrongIdentity,
+);
 
 /** 以精确字段集锁定真实澄清响应合同，避免旧 idempotencyKey 再次混入验收 runner。 */
 async function clarificationRespondUsesOperationKey() {
@@ -345,7 +457,16 @@ test("Agent Loop approval routes by the current user turn despite old search res
       [{ name: "exec_command" }],
     );
     assert.equal(first.status, 200);
-    assert.match(await first.text(), new RegExp(markers.callId, "u"));
+    const stream = await first.text();
+    assert.match(stream, new RegExp(markers.callId, "u"));
+    const completed = stream
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)))
+      .find((event) => event.type === "response.completed");
+    const invocation = completed.response.output.find((item) => item.type === "function_call");
+    assert.equal(invocation.name, "exec_command");
+    assert.deepEqual(JSON.parse(invocation.arguments), { cmd: sleepCommand(process.platform) });
 
     const continuationResponse = await postFixture(
       fixture,
