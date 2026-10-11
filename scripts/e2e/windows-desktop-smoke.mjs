@@ -19645,7 +19645,11 @@ async function completeOwnedFileDialog(identity, ownedRoot, filePath, signal) {
 
 /**
  * 只打开本轮临时工作区的 Explorer，通过 UI Automation 定位真实文件项，再用 Win32
- * mouse input 拖到 phase 已绑定的 Ja HWND。整个过程不创建 DOM DragEvent，也不向 WebView 传路径。
+ * mouse input 拖到 phase 已绑定的 Ja HWND。Windows 不保证 SetForegroundWindow 的即时返回值；
+ * 因此通过短暂附加输入队列请求激活，并以 GetForegroundWindow 的精确 HWND 结果作为门禁。
+ * 先恢复并验证 Ja 前台，再换算落点坐标；只恢复最小化窗口，保留已最大化的工作区几何。
+ * 整个过程不创建 DOM DragEvent，也不向 WebView 传路径。
+ * @author kongweiguang
  */
 async function dragOwnedExplorerFileToComposer(
   page,
@@ -19736,10 +19740,17 @@ async function dragOwnedExplorerFileToComposer(
     '[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);',
     '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
     '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h,int command);',
+    '[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+    '[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,IntPtr processId);',
     '[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);',
     '[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint flags);',
     '[DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);',
     '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);',
+    '[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint source,uint target,bool attach);',
+    '[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);',
     '[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);',
     '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
     '[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint command);',
@@ -19748,6 +19759,9 @@ async function dragOwnedExplorerFileToComposer(
     "static INPUT M(uint flags,int dx,int dy){return new INPUT{type=0,value=new U{mouse=new MI{flags=flags,dx=dx,dy=dy}}};}",
     "public static string Title(IntPtr h){var s=new System.Text.StringBuilder(256);GetWindowText(h,s,s.Capacity);return s.ToString();}",
     "public static bool MatchesBound(IntPtr h,uint pid,string title){if(h==IntPtr.Zero||!IsWindow(h)||!IsWindowVisible(h)||GetWindow(h,4)!=IntPtr.Zero||GetAncestor(h,2)!=h)return false;uint owner;GetWindowThreadProcessId(h,out owner);return owner==pid&&String.Equals(Title(h),title,StringComparison.Ordinal);}",
+    "/// <summary>SetForegroundWindow can refuse an immediate request across input queues; attach only for activation and detach in finally. Restore only minimized windows so precomputed coordinates remain valid; success is the observed exact foreground HWND.</summary>",
+    "/// @author kongweiguang",
+    "public static bool FocusOwned(IntPtr h){uint current=GetCurrentThreadId();uint target=GetWindowThreadProcessId(h,IntPtr.Zero);IntPtr foreground=GetForegroundWindow();uint foregroundThread=foreground==IntPtr.Zero?0:GetWindowThreadProcessId(foreground,IntPtr.Zero);bool targetAttached=current!=target&&AttachThreadInput(current,target,true);bool foregroundAttached=foregroundThread!=0&&foregroundThread!=current&&foregroundThread!=target&&AttachThreadInput(current,foregroundThread,true);try{if(IsIconic(h))ShowWindowAsync(h,9);BringWindowToTop(h);SetForegroundWindow(h);SetFocus(h);return GetForegroundWindow()==h;}finally{if(foregroundAttached)AttachThreadInput(current,foregroundThread,false);if(targetAttached)AttachThreadInput(current,target,false);}}",
     "static void S(uint flags,int dx,int dy){var input=new[]{M(flags,dx,dy)};if(SendInput(1,input,Marshal.SizeOf(typeof(INPUT)))!=1)throw new Win32Exception(Marshal.GetLastWin32Error());}",
     "// Explorer 的 OLE drag threshold 只接受完整鼠标输入轨迹；统一用虚拟桌面绝对 SendInput，避免 SetCursorPos 移动被当成非输入定位。",
     'static void Move(int x,int y){int vx=GetSystemMetrics(76),vy=GetSystemMetrics(77),vw=GetSystemMetrics(78),vh=GetSystemMetrics(79);if(vw<2||vh<2)throw new InvalidOperationException("virtual desktop unavailable");int dx=(int)Math.Round((x-vx)*65535d/(vw-1)),dy=(int)Math.Round((y-vy)*65535d/(vh-1));S(0xC001,dx,dy);}',
@@ -19760,13 +19774,11 @@ async function dragOwnedExplorerFileToComposer(
     "}",
     "'@",
     "if(-not [JaE2eExplorerDrag]::MatchesBound($jaHandle,[uint32]$pidValue,$expectedTitle)){throw 'owned Ja HWND missing or changed'}",
+    "$jaForegroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{[void][JaE2eExplorerDrag]::FocusOwned($jaHandle);if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $jaHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $jaForegroundDeadline)",
+    "if([JaE2eExplorerDrag]::GetForegroundWindow()-ne $jaHandle){throw 'Ja is not foreground before Explorer layering'}",
     "$target=[JaE2eExplorerDrag]::Target($jaHandle,[double][Environment]::GetEnvironmentVariable('JA_E2E_TARGET_X'),[double][Environment]::GetEnvironmentVariable('JA_E2E_TARGET_Y'),[double][Environment]::GetEnvironmentVariable('JA_E2E_RENDERER_WIDTH'),[double][Environment]::GetEnvironmentVariable('JA_E2E_RENDERER_HEIGHT'))",
     "$explorerRect=[JaE2eExplorerDrag]::ExposeTarget($explorerHandle,$target);Start-Sleep -Milliseconds 300",
-    "if(-not [JaE2eExplorerDrag]::SetForegroundWindow($jaHandle)){throw 'Ja did not accept foreground before drag'}",
-    "$jaForegroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $jaHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $jaForegroundDeadline)",
-    "if([JaE2eExplorerDrag]::GetForegroundWindow()-ne $jaHandle){throw 'Ja is not foreground before Explorer layering'}",
-    "if(-not [JaE2eExplorerDrag]::SetForegroundWindow($explorerHandle)){throw 'Explorer did not accept foreground'}",
-    "$foregroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $explorerHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $foregroundDeadline)",
+    "$foregroundDeadline=[DateTime]::UtcNow.AddSeconds(3);do{[void][JaE2eExplorerDrag]::FocusOwned($explorerHandle);if([JaE2eExplorerDrag]::GetForegroundWindow()-eq $explorerHandle){break};Start-Sleep -Milliseconds 50}while([DateTime]::UtcNow -lt $foregroundDeadline)",
     "if([JaE2eExplorerDrag]::GetForegroundWindow()-ne $explorerHandle){throw 'Explorer is not foreground'}",
     '$source=$item.GetClickablePoint();$sourceX=[int][Math]::Round($source.X);$sourceY=[int][Math]::Round($source.Y);$sourceWindow=[JaE2eExplorerDrag]::WindowFromPoint(([JaE2eExplorerDrag+POINT]@{X=$sourceX;Y=$sourceY}));$sourceRoot=[JaE2eExplorerDrag]::GetAncestor($sourceWindow,2);[uint32]$sourcePid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($sourceRoot,[ref]$sourcePid);[uint32]$explorerPid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($explorerHandle,[ref]$explorerPid);if($sourcePid-ne$explorerPid){throw "Explorer source point is covered by pid $sourcePid"}',
     '$targetWindow=[JaE2eExplorerDrag]::WindowFromPoint($target);$targetClassChain=[JaE2eExplorerDrag]::ClassChain($targetWindow);$targetRoot=[JaE2eExplorerDrag]::GetAncestor($targetWindow,2);[uint32]$targetPid=0;[void][JaE2eExplorerDrag]::GetWindowThreadProcessId($targetRoot,[ref]$targetPid);if($targetPid-ne[uint32]$pidValue){throw "Ja drop target is covered by pid $targetPid"}',

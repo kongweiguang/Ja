@@ -2736,6 +2736,45 @@ test("validates window action, SendInput, and Explorer postcheck receipts agains
   }
 });
 
+/** Explorer 激活只接受精确 HWND 的真实前台证据，并总在结束时解除临时输入队列关联。 @author kongweiguang */
+test("activates the bound Explorer HWND through bounded native foreground evidence", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function dragOwnedExplorerFileToComposer(");
+  const end = source.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start);
+  const helper = source.slice(start, end);
+
+  assert.match(
+    helper,
+    /public static bool FocusOwned\(IntPtr h\).*AttachThreadInput.*GetForegroundWindow\(\)==h.*finally.*AttachThreadInput/su,
+  );
+  assert.match(helper, /if\(IsIconic\(h\)\)ShowWindowAsync\(h,9\)/u);
+  assert.doesNotMatch(helper, /try\{ShowWindowAsync\(h,9\);BringWindowToTop/u);
+  assert.match(helper, /\$jaForegroundDeadline=\[DateTime\]::UtcNow\.AddSeconds\(3\)/u);
+  assert.match(
+    helper,
+    /\[JaE2eExplorerDrag\]::FocusOwned\(\$jaHandle\).*GetForegroundWindow\(\)-eq \$jaHandle/su,
+  );
+  assert.match(helper, /\$foregroundDeadline=\[DateTime\]::UtcNow\.AddSeconds\(3\)/u);
+  assert.match(
+    helper,
+    /\[JaE2eExplorerDrag\]::FocusOwned\(\$explorerHandle\).*GetForegroundWindow\(\)-eq \$explorerHandle/su,
+  );
+  assert.ok(
+    helper.indexOf("[JaE2eExplorerDrag]::FocusOwned($jaHandle)") <
+      helper.indexOf("[JaE2eExplorerDrag]::Target($jaHandle"),
+    "restore must settle before translating the renderer drop target to screen coordinates",
+  );
+  assert.doesNotMatch(
+    helper,
+    /SetForegroundWindow\(\$explorerHandle\)\)\{throw 'Explorer did not accept foreground'/u,
+  );
+  assert.match(helper, /Folder\.Self\.Path/);
+  assert.match(helper, /MatchesBound\(\$jaHandle,\[uint32\]\$pidValue,\$expectedTitle\)/u);
+  assert.match(helper, /sourcePid-ne\$explorerPid/);
+  assert.match(helper, /targetPid-ne\[uint32\]\$pidValue/);
+});
+
 /** 测试真实重试协调器的固定输入顺序，并证明第三次 deadline 仍失败且保留原始超时与成功输入回执。 */
 test("orders each native shortcut retry and retains third condition-timeout evidence", async () => {
   const calls = [];
