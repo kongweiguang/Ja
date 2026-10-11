@@ -7071,6 +7071,35 @@ function redact(text, directories = {}) {
 }
 
 /**
+ * AggregateError 的外层 stack 不含子错误；递归保留受脱敏限制的 cause/errors，供摘要与 CI 控制台定位首因。
+ * @author kongweiguang
+ */
+export function formatErrorDiagnostics(error, directories = {}) {
+  const seen = new Set();
+  const diagnostics = [];
+  // 限制递归深度与输出节点数，并按对象身份去重，防止循环 cause 或大 errors 列表淹没首因。
+  const visit = (current, depth) => {
+    if (current === undefined || current === null || diagnostics.length >= 12) return;
+    if (typeof current === "object") {
+      if (seen.has(current)) return;
+      seen.add(current);
+    }
+    const stack = typeof current?.stack === "string" ? current.stack : undefined;
+    const description =
+      stack ??
+      `${typeof current?.name === "string" ? current.name : "Error"}: ${String(current?.message ?? current)}`;
+    diagnostics.push(redact(description, directories));
+    if (depth >= 6) return;
+    if (current?.cause !== undefined) visit(current.cause, depth + 1);
+    if (Array.isArray(current?.errors)) {
+      for (const nested of current.errors) visit(nested, depth + 1);
+    }
+  };
+  visit(error, 0);
+  return diagnostics.join(" | ");
+}
+
+/**
  * Windows 分隔符、大小写或扩展路径脱敏一旦回归便快速失败；
  * 这里使用内联合同检查，避免引入第二套测试框架。
  */
@@ -10343,7 +10372,6 @@ async function waitForWebViewProfileReady(
   signal,
 ) {
   const profileRoot = join(directories.webview, "EBWebView");
-  const expectedProfileKey = windowsPathKey(profileRoot);
   let lastObservation = "profile process tree not observed";
   while (Date.now() < deadline) {
     throwIfAborted(signal);
@@ -10362,7 +10390,7 @@ async function waitForWebViewProfileReady(
       const browser = browsers.find(
         (entry) =>
           !entry.commandLine.includes("--type=") &&
-          windowsPathKey(entry.commandLine).includes(expectedProfileKey),
+          windowsPathMatches(entry.commandLine, profileRoot),
       );
       const renderer = browsers.find((entry) => entry.commandLine.includes("--type=renderer"));
       const app = products.find((entry) => entry.name.toLowerCase() === "ja-desktop.exe");
@@ -10400,6 +10428,20 @@ async function waitForWebViewProfileReady(
     await waitForDelay(pollMs, signal);
   }
   throw new Error(`WebView2 隔离 profile 在期限内未完成预热 (${lastObservation})`);
+}
+
+/**
+ * 预热与 owner-verified cleanup 可同时失败；保留启动异常为主因，并把清理证据作为次因，避免诊断被覆盖。
+ * @author kongweiguang
+ */
+export function combineProfilePrimeFailures(initializationFailure, cleanupFailure) {
+  if (initializationFailure === undefined) return cleanupFailure;
+  if (cleanupFailure === undefined) return initializationFailure;
+  return new AggregateError(
+    [initializationFailure, cleanupFailure],
+    "profilePrime 初始化与 App Server 清理均失败",
+    { cause: initializationFailure },
+  );
 }
 
 /**
@@ -15459,6 +15501,21 @@ function windowsPathKey(value) {
 }
 
 /**
+ * WebView2 可将同一 UDF 报告为 8.3 别名或完整路径；仅规范化已存在的期望目录，避免字符串差异误判。
+ * @author kongweiguang
+ */
+export function windowsPathMatches(candidate, expectedPath) {
+  const candidateKey = windowsPathKey(candidate);
+  const expectedKeys = new Set([windowsPathKey(expectedPath)]);
+  try {
+    expectedKeys.add(windowsPathKey(realpathSync.native(expectedPath)));
+  } catch {
+    // 初始化早期 profile 尚未创建时仍可按原始路径继续观察。
+  }
+  return [...expectedKeys].some((key) => key !== "" && candidateKey.includes(key));
+}
+
+/**
  * 只选择已在本 launcher 下观察到的产品进程；dev wrapper 不进入该 graceful gate，
  * 而是在后续强制回收。
  */
@@ -16015,6 +16072,8 @@ async function cleanupPhase(
  * 使用与正式 Gate 相同的生产 binary、窗口配置、Java sidecar 和隔离目录预热 WebView2 UDF，
  * 但不开放 CDP。调用方显式选择 cleanup mode：完整 Gate 保持真实托盘退出，聚焦性能 Gate
  * 只验收 owner-verified tree cleanup；两者都要求进程归零与既有 Ja 守卫。
+ * 初始化和 cleanup 同时失败时保留两项原始错误，避免清理诊断覆盖 profile ACK 的根因。
+ * @author kongweiguang
  */
 async function primeWebViewProfile({
   runId,
@@ -16053,6 +16112,7 @@ async function primeWebViewProfile({
   const incompleteObserved = createIncompleteObserved();
   let rootIdentity;
   let watcher;
+  let initializationFailure;
   let cleanupFailure;
   evidence[phase].stage = `${phase}:launch`;
   try {
@@ -16081,6 +16141,8 @@ async function primeWebViewProfile({
       runDeadline.signal,
     );
     evidence[phase].status = "ready";
+  } catch (error) {
+    initializationFailure = error;
   } finally {
     try {
       cleanupFailure = await cleanupPhase(
@@ -16097,11 +16159,14 @@ async function primeWebViewProfile({
         cleanupMode,
         expectedExecutableNames,
       );
+    } catch (error) {
+      cleanupFailure = error;
     } finally {
       evidence[phase].launcher = launcherOutputSummary(launch, directories);
     }
   }
-  if (cleanupFailure !== undefined) throw cleanupFailure;
+  const failure = combineProfilePrimeFailures(initializationFailure, cleanupFailure);
+  if (failure !== undefined) throw failure;
   return configPath;
 }
 
@@ -38673,17 +38738,18 @@ async function assertAppServerJar(signal) {
 }
 
 /**
- * 为 setup 与 runtime 失败写入同一份有界、已脱敏产物；
- * 将其置于生命周期循环之外，保证 setup 错误可见。
+ * 为 setup 与 runtime 失败写入有界、脱敏的单字段摘要，并递归保留 cause/errors，供 CI 产物与控制台共用；
+ * 函数位于生命周期循环之外，以确保 setup 错误可见。
+ * @author kongweiguang
  */
-async function writeRunSummary(runId, evidence, status, error, directories) {
+export async function writeRunSummary(runId, evidence, status, error, directories) {
   const summaryRoot = join(tmpdir(), "ja-e2e-results");
   await mkdir(summaryRoot, { recursive: true });
   const summaryPath = join(summaryRoot, `${runId}.json`);
   const payload = {
     ...evidence,
     status,
-    ...(error === undefined ? {} : { error: redact(error?.stack ?? error, directories) }),
+    ...(error === undefined ? {} : { error: formatErrorDiagnostics(error, directories) }),
   };
   await writeFile(summaryPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   return summaryPath;
@@ -42442,7 +42508,8 @@ async function main() {
       }
     }
     const summaryPath = await writeRunSummary(runId, evidence, "failed", reportError, directories);
-    process.stderr.write(`JA_E2E_FAILED run=${runId} summary=${summaryPath}\n`);
+    const diagnostic = formatErrorDiagnostics(reportError, directories);
+    process.stderr.write(`JA_E2E_FAILED run=${runId} summary=${summaryPath} error=${diagnostic}\n`);
     throw reportError;
   } finally {
     runDeadline.cancel();

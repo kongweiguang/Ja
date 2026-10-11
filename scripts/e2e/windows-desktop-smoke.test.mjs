@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
@@ -40,6 +41,9 @@ import {
   assertMaximizedWindowEvidence,
   attachMaximizedWindowEvidence,
   assertNativeViewportGeometry,
+  combineProfilePrimeFailures,
+  windowsPathMatches,
+  writeRunSummary,
   assertRuntimeIsolation,
   assertRuntimeRestartEvidence,
   assertRuntimePhaseHandoffEvidence,
@@ -2160,6 +2164,104 @@ test("owned-tree shutdown acknowledgement is recorded before CDP disconnect and 
   const profilePrimeCall = source.indexOf("await primeWebViewProfile(");
   const formalLaunch = source.indexOf("const launch = startTauri(", profilePrimeCall);
   assert.ok(profilePrimeCall >= 0 && formalLaunch > profilePrimeCall);
+});
+
+/** @author kongweiguang 双重失败时保留 profile ACK 主因与 owner-verified cleanup 次因，避免后者覆盖根错误。 */
+test("preserves the profile prime failure when owner-verified cleanup also fails", () => {
+  const initializationFailure = new Error("WebView2 profile ACK timed out");
+  const cleanupFailure = new Error("endpoint listener owner was not unique");
+
+  const combined = combineProfilePrimeFailures(initializationFailure, cleanupFailure);
+
+  assert.ok(combined instanceof AggregateError);
+  assert.equal(combined.cause, initializationFailure);
+  assert.deepEqual(combined.errors, [initializationFailure, cleanupFailure]);
+  assert.equal(
+    combineProfilePrimeFailures(initializationFailure, undefined),
+    initializationFailure,
+  );
+  assert.equal(combineProfilePrimeFailures(undefined, cleanupFailure), cleanupFailure);
+  assert.equal(combineProfilePrimeFailures(undefined, undefined), undefined);
+});
+
+/** @author kongweiguang 汇总和控制台使用同一脱敏递归投影，确保外层 AggregateError 不会吞掉 profile ACK 主因。 */
+test("writes nested profile prime failures into the redacted run summary", async () => {
+  const privateRoot = "C:\\runner\\private-profile-root";
+  const initializationFailure = new Error(
+    `WebView2 profile ACK timed out; lastObservation=browser=0/1 under ${privateRoot} api_key=init-secret`,
+  );
+  const cleanupFailure = new Error(
+    `endpoint listener owner cleanup failed at ${privateRoot} token=cleanup-secret`,
+  );
+  const combined = combineProfilePrimeFailures(initializationFailure, cleanupFailure);
+  const runId = `windows-profile-summary-${createHash("sha1")
+    .update(randomBytes(16))
+    .digest("hex")}`;
+  let summaryPath;
+
+  try {
+    summaryPath = await writeRunSummary(
+      runId,
+      { phase: { status: "failed" } },
+      "failed",
+      combined,
+      { root: privateRoot },
+    );
+    const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+    assert.equal(typeof summary.error, "string");
+    assert.match(summary.error, /WebView2 profile ACK timed out/u);
+    assert.match(summary.error, /lastObservation=browser=0\/1/u);
+    assert.match(summary.error, /endpoint listener owner cleanup failed/u);
+    assert.doesNotMatch(summary.error, /private-profile-root|init-secret|cleanup-secret/u);
+  } finally {
+    if (summaryPath !== undefined) await rm(summaryPath, { force: true });
+  }
+
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  assert.match(source, /error=\$\{diagnostic\}/u);
+  assert.match(source, /formatErrorDiagnostics\(reportError, directories\)/u);
+});
+
+/** @author kongweiguang 使用 Win32 真实短名与完整路径验证 profile 归属匹配，不模拟 native realpath 语义。 */
+test("matches WebView2 profile paths across Windows 8.3 aliases", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows short-path alias regression requires Win32");
+    return;
+  }
+
+  const longPath = await mkdtemp(join(tmpdir(), "ja webview profile "));
+  try {
+    const powershell = String.raw`
+$path = $env:JA_E2E_LONG_PATH
+Add-Type -TypeDefinition @'
+using System.Text;
+using System.Runtime.InteropServices;
+public static class JaProfileShortPathProbe {
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint bufferSize);
+}
+'@
+$buffer = New-Object System.Text.StringBuilder 32768
+$length = [JaProfileShortPathProbe]::GetShortPathName($path, $buffer, [uint32]$buffer.Capacity)
+if ($length -eq 0 -or $length -ge $buffer.Capacity) { exit 2 }
+$buffer.ToString()
+`;
+    const shortPath = execFileSync("pwsh", ["-NoProfile", "-Command", powershell], {
+      encoding: "utf8",
+      env: { ...process.env, JA_E2E_LONG_PATH: longPath },
+    }).trim();
+    if (shortPath.toLowerCase() === longPath.toLowerCase() || !shortPath.includes("~")) {
+      t.skip("8.3 short paths are disabled for the temporary volume");
+      return;
+    }
+
+    assert.equal(
+      windowsPathMatches(`msedgewebview2.exe --user-data-dir=${longPath}`, shortPath),
+      true,
+    );
+  } finally {
+    await rm(longPath, { recursive: true, force: true });
+  }
 });
 
 /** 进程祖先消失后仍保留已观察后代；部分 CIM 身份不能被当作自然退出证据。 */

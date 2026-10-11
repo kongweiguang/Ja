@@ -559,11 +559,85 @@ class NativeSmokeV2Test(unittest.TestCase):
                 "approval/requested",
             )
 
-    def test_shell_cancellation_fixture_uses_declared_powershell_dialect(self) -> None:
-        """锁定 Tool 只提交 PowerShell 7 命令文本，不在参数中选择或猜测可执行文件。"""
+    def test_shell_cancellation_fixture_uses_host_dialect(self) -> None:
+        """同时锁定 Windows 与 POSIX 的长命令，防止跨平台门禁以命令失败替代取消。"""
 
-        self.assertEqual("Start-Sleep -Seconds 30", SMOKE.SHELL_COMMAND)
+        self.assertEqual("Start-Sleep -Seconds 30", SMOKE.shell_cancellation_command("nt"))
+        self.assertEqual("sleep 30", SMOKE.shell_cancellation_command("posix"))
+        self.assertEqual(SMOKE.shell_cancellation_command(SMOKE.os.name), SMOKE.SHELL_COMMAND)
         self.assertNotEqual(SMOKE.SHELL_CANCEL_CALL_ID, SMOKE.SHELL_STDIN_EOF_CALL_ID)
+
+    def test_cancellation_waits_for_running_process_from_exact_tool(self) -> None:
+        """模拟 started 投影先于真实启动，要求 runner 持续查询同一个调用身份再取消。"""
+
+        lines: Queue[bytes | None] = Queue()
+        collector = SimpleNamespace(lines=lines, error=None, overflow=False)
+        sent = []
+
+        def send(frame: dict[str, object]) -> None:
+            """第一次没有进程，第二次才发布真实 running 身份，保留请求关联和过滤条件。"""
+
+            sent.append(frame)
+            sessions = [] if len(sent) == 1 else [{
+                "startedTurnId": "turn_fixture", "startedCallId": SMOKE.SHELL_CANCEL_CALL_ID,
+                "state": "running", "sessionId": "proc_fixture",
+            }]
+            lines.put(json.dumps({"jsonrpc": "2.0", "id": frame["id"],
+                                  "result": {"sessions": sessions}}).encode("utf-8") + b"\n")
+
+        session = SMOKE.await_running_shell(
+            send, collector, [], time.monotonic() + 1, None,
+            "ws_fixture", "thr_fixture", "turn_fixture",
+        )
+        self.assertEqual("proc_fixture", session)
+        self.assertEqual(2, len(sent))
+        for frame in sent:
+            self.assertEqual("process/list", frame["method"])
+            self.assertEqual(SMOKE.SHELL_CANCEL_CALL_ID, frame["params"]["startedCallId"])
+
+    def test_cancellation_rejects_settled_or_mismatched_process(self) -> None:
+        """立即退出或其它调用的进程均不能充当运行中取消证据。"""
+
+        for changes, failure in (({"state": "exited"}, "settled"),
+                                 ({"startedTurnId": "turn_other"}, "identity"),
+                                 ({"startedCallId": "call_other"}, "identity")):
+            with self.subTest(changes=changes):
+                lines: Queue[bytes | None] = Queue()
+                collector = SimpleNamespace(lines=lines, error=None, overflow=False)
+
+                def send(frame: dict[str, object]) -> None:
+                    """返回关联 RPC 响应，同时把被篡改的进程事实保留给严格身份断言。"""
+
+                    session = {"startedTurnId": "turn_fixture", "startedCallId": SMOKE.SHELL_CANCEL_CALL_ID,
+                               "state": "running", "sessionId": "proc_fixture", **changes}
+                    lines.put(json.dumps({"jsonrpc": "2.0", "id": frame["id"],
+                                          "result": {"sessions": [session]}}).encode("utf-8") + b"\n")
+
+                with self.assertRaisesRegex(RuntimeError, failure):
+                    SMOKE.await_running_shell(
+                        send, collector, [], time.monotonic() + 1, None,
+                        "ws_fixture", "thr_fixture", "turn_fixture",
+                    )
+
+    def test_cancellation_stops_waiting_when_turn_finishes_before_process_registration(self) -> None:
+        """不存在真实进程时，已经完成的 Turn 应立即失败，不能等待耗尽整个 smoke deadline。"""
+
+        lines: Queue[bytes | None] = Queue()
+        collector = SimpleNamespace(lines=lines, error=None, overflow=False)
+
+        def send(frame: dict[str, object]) -> None:
+            """交错投递 Turn 终止和空列表响应，复现事件先于 RPC 回执的真实顺序。"""
+
+            for response in ({"jsonrpc": "2.0", "method": "turn/terminal",
+                              "params": {"turnId": "turn_fixture", "state": "completed"}},
+                             {"jsonrpc": "2.0", "id": frame["id"], "result": {"sessions": []}}):
+                lines.put(json.dumps(response).encode("utf-8") + b"\n")
+
+        with self.assertRaisesRegex(RuntimeError, "Turn settled"):
+            SMOKE.await_running_shell(
+                send, collector, [], time.monotonic() + 1, None,
+                "ws_fixture", "thr_fixture", "turn_fixture",
+            )
 
     @unittest.skipUnless(SMOKE.os.name == "nt" and shutil.which("pwsh"), "requires Windows PowerShell 7")
     def test_stdin_eof_probe_decodes_utf8_independently_of_console_code_page(self) -> None:

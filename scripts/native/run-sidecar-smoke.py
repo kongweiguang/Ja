@@ -116,7 +116,13 @@ SKILL_ID = "skill_native_workspace"
 SKILL_NAME = "native-smoke"
 SKILL_DESCRIPTION = "Workspace Skill used by the Native activation gate"
 SMOKE_TEXT = "JA_NATIVE_PROVIDER_TEXT"
-SHELL_COMMAND = "Start-Sleep -Seconds 30"
+def shell_cancellation_command(platform_name: str) -> str:
+    """使用生产宿主的原生方言保持进程存活，避免 POSIX 将 PowerShell 命令立即执行失败。"""
+
+    return "Start-Sleep -Seconds 30" if platform_name == "nt" else "sleep 30"
+
+
+SHELL_COMMAND = shell_cancellation_command(os.name)
 SHELL_CANCEL_CALL_ID = "call_shell_cancel"
 SHELL_STDIN_EOF_CALL_ID = "call_shell_stdin_eof"
 # 进程接口发送 UTF-8 bytes；探针显式解码，不依赖宿主 PowerShell 的 Console code page。
@@ -1260,6 +1266,45 @@ def require_success(document: dict[str, Any], operation: str) -> dict[str, Any]:
     raise NativeRpcRejection(operation, error_code)
 
 
+def await_running_shell(
+    send: Callable[[dict[str, Any]], None],
+    collector: BinaryStreamCollector,
+    documents: list[dict[str, Any]],
+    deadline: float,
+    validator: Any,
+    workspace_id: str,
+    thread_id: str,
+    turn_id: str,
+) -> str:
+    """Tool started 仅表示投影已提交；按真实调用身份等到进程启动，才允许验证运行中的取消。"""
+
+    while time.monotonic() < deadline:
+        frame_id = f"c:process-running-{uuid.uuid4().hex}"
+        send({"jsonrpc": "2.0", "id": frame_id, "method": "process/list", "params": {
+            "workspaceId": workspace_id, "threadId": thread_id, "limit": 200,
+            "cursor": None, "startedCallId": SHELL_CANCEL_CALL_ID,
+        }})
+        page = require_success(
+            read_until(collector, documents, deadline, validator=validator, frame_id=frame_id),
+            "running shell probe",
+        )
+        if any(frame.get("method") == "turn/terminal"
+               and isinstance(frame.get("params"), dict)
+               and frame["params"].get("turnId") == turn_id for frame in documents):
+            raise RuntimeError("shell cancellation Turn settled before its running process was verified")
+        sessions = page.get("sessions", [])
+        if sessions:
+            if len(sessions) != 1 or sessions[0].get("startedTurnId") != turn_id \
+                    or sessions[0].get("startedCallId") != SHELL_CANCEL_CALL_ID:
+                raise RuntimeError("shell cancellation process identity did not match its Tool")
+            session = sessions[0]
+            if session.get("state") != "running":
+                raise RuntimeError("shell cancellation process settled before cancellation")
+            return session["sessionId"]
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    raise RuntimeError("shell cancellation process did not start before its deadline")
+
+
 def verify_persistent_stdin(
     send: Callable[[dict[str, Any]], None],
     collector: BinaryStreamCollector,
@@ -1964,6 +2009,10 @@ def run_smoke(
                         or started_params.get("ordinal") != 0 \
                         or not isinstance(cancel_revision, int):
                     raise RuntimeError("shell started projection is incomplete")
+                running_session_id = await_running_shell(
+                    send, stdout_collector, documents, deadline, schema_validator,
+                    workspace_id, thread["threadId"], shell_turn_id,
+                )
                 send(turn_cancel_frame(shell_turn_id))
                 cancel_result = require_success(
                     read_until(stdout_collector, documents, deadline, validator=schema_validator, frame_id="c:turn-cancel"),
@@ -1980,6 +2029,7 @@ def run_smoke(
                 shell_cancel_evidence = probe_passed(
                     turnId=shell_turn_id, approvalId=approval_id,
                     startedRevision=cancel_revision,
+                    runningSessionId=running_session_id,
                     cancelAccepted=cancel_result.get("accepted") is True,
                     terminalState=state,
                 ) if cancel_result.get("accepted") is True and state == "cancelled" else probe_failed(

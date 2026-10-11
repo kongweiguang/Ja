@@ -766,7 +766,7 @@ jobs:
           $unixEpochTicks = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
           $mtimeNs = [int64](($artifact.LastWriteTimeUtc.Ticks - $unixEpochTicks) * 100L)
           $smokePath = Join-Path $env:JA_NATIVE_EVIDENCE 'smoke.json'
-          $smokeArguments = @('-B', 'scripts/native/run-sidecar-smoke.py', '--executable', $artifactPath, '--data-dir', $data, '--output', $smokePath, '--expected-sha256', $sha256, '--expected-size', [string]$artifact.Length, '--expected-mtime-ns', [string]$mtimeNs)
+          $smokeArguments = @('-B', 'scripts/native/run-sidecar-smoke.py', '--executable', $artifactPath, '--data-dir', $data, '--output', $smokePath, '--expected-sha256', $sha256, '--expected-size', [string]$artifact.Length, '--expected-mtime-ns', [string]$mtimeNs, '--keep-failed-profile')
           & uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python @smokeArguments
           if ($LASTEXITCODE -ne 0) { throw "native sidecar smoke failed with exit code $LASTEXITCODE" }
           $report = Get-Content -LiteralPath $smokePath -Raw | ConvertFrom-Json
@@ -801,7 +801,7 @@ jobs:
             exit 1
           fi
           smoke="$JA_NATIVE_EVIDENCE/smoke.json"
-          uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B scripts/native/run-sidecar-smoke.py --executable "$artifact" --data-dir "$data" --output "$smoke" --expected-sha256 "$sha256" --expected-size "$size_bytes" --expected-mtime-ns "$mtime_ns"
+          uv run --python 3.13 --with 'jsonschema[format]==4.26.0' python -B scripts/native/run-sidecar-smoke.py --executable "$artifact" --data-dir "$data" --output "$smoke" --expected-sha256 "$sha256" --expected-size "$size_bytes" --expected-mtime-ns "$mtime_ns" --keep-failed-profile
           python3 - "$smoke" <<'PY'
           import json
           from pathlib import Path
@@ -811,6 +811,26 @@ jobs:
           if report.get('status') != 'passed' or not isinstance(executable, dict) or executable.get('expectedIdentityMatched') is not True:
               raise SystemExit('native smoke report did not prove expected executable identity')
           PY
+
+      # 只提取现有 redactor 的有界摘要；隔离 home、数据库与原始日志绝不上传。
+      - name: Preserve redacted native smoke failure
+        if: always()
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'Ja App Server/unicode 空格 data'
+          if (-not (Test-Path -LiteralPath $root)) { exit 0 }
+          $reports = @(Get-ChildItem -LiteralPath $root -Directory | ForEach-Object { Join-Path $_.FullName 'failure-diagnostics.json' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+          if ($reports.Count -gt 1) { throw 'native failure profile identity is ambiguous' }
+          if ($reports.Count -eq 1) {
+            $diagnostic = Get-Content -LiteralPath $reports[0] -Raw | ConvertFrom-Json
+            $safe = @{stage=$diagnostic.stage; stderrRedacted=$diagnostic.stderrRedacted}
+            $safe | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'native-failure.json') -Encoding utf8
+            python -B scripts/release/check-evidence-secrets.py $env:JA_NATIVE_EVIDENCE
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item -LiteralPath (Join-Path $env:JA_NATIVE_EVIDENCE 'native-failure.json')
+              throw 'native failure diagnostic credential scan failed'
+            }
+          }
 
       - name: Write checksum and build report (Windows)
         if: matrix.platform == 'windows'
@@ -869,6 +889,25 @@ jobs:
           $env:JA_E2E_SCREENSHOT_DIR = Join-Path $env:RUNNER_TEMP 'ja-windows-desktop-smoke'
           node scripts/e2e/windows-desktop-smoke.mjs
           if ($LASTEXITCODE -ne 0) { throw "Windows desktop WebView2 smoke failed with exit code $LASTEXITCODE" }
+
+      # runner 已将目录与凭据脱敏；保留失败 summary，避免下一次只能看到 cleanup 的末级异常。
+      - name: Scan Windows desktop smoke summaries
+        id: desktop_summary_scan
+        if: ${{ always() && matrix.platform == 'windows' && env.JA_RELEASE != 'true' }}
+        shell: pwsh
+        run: |
+          "JA_DESKTOP_SUMMARY=$env:TEMP/ja-e2e-results" | Add-Content $env:GITHUB_ENV
+          python -B scripts/release/check-evidence-secrets.py "$env:TEMP/ja-e2e-results"
+          if ($LASTEXITCODE -ne 0) { throw 'desktop summary credential scan failed' }
+
+      - name: Preserve Windows desktop smoke summaries
+        if: ${{ always() && steps.desktop_summary_scan.conclusion == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ja-windows-desktop-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.JA_DESKTOP_SUMMARY }}/*.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Run file-search acceptance against Native App Server (Windows)
         if: matrix.platform == 'windows'
