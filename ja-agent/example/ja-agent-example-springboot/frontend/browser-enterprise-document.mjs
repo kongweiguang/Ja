@@ -215,15 +215,28 @@ async function dispatchFileInput(page, selector, mode, fileName, mediaType, byte
   );
 }
 
-/** Confirm an upload reached a removable draft card, then await its server discard before continuing. */
-async function removeUploadedDraft(page, fileName, composer) {
+/** Wait for discard to remove the visible draft before treating any late thumbnail read as released. */
+async function removeUploadedDraft(
+  page,
+  fileName,
+  composer,
+  discardedDraftIds,
+  attachmentFileNames,
+) {
   const draft = page.locator(".attachment-draft").filter({ hasText: fileName });
   await draft.getByText("已上传", { exact: true }).waitFor({ state: "visible" });
   if (!(await composer.evaluate((element) => globalThis.document.activeElement === element))) {
     throw new Error(`Uploading ${fileName} did not preserve focus in the message composer.`);
   }
+  const thumbnailSource = await draft.locator("img.attachment-thumb").getAttribute("src");
+  const attachmentPath = thumbnailSource && new URL(thumbnailSource, "http://127.0.0.1").pathname;
+  const attachmentId = attachmentPath?.match(/^\/api\/chat\/attachments\/([^/]+)\/content$/)?.[1];
+  if (!attachmentId)
+    throw new Error(`The ${fileName} draft did not expose its uploaded attachment ID.`);
+  attachmentFileNames.set(decodeURIComponent(attachmentId), fileName);
   await draft.getByRole("button", { name: `移除附件 ${fileName}` }).click();
   await draft.waitFor({ state: "detached" });
+  discardedDraftIds.add(decodeURIComponent(attachmentId));
   if (!(await composer.evaluate((element) => globalThis.document.activeElement === element))) {
     throw new Error(`Removing ${fileName} did not return focus to the message composer.`);
   }
@@ -514,7 +527,7 @@ function verifyDurableWorkflow(diagnostics, submission, approvalAnswers, approva
 }
 
 /**
- * Exercise the isolated enterprise workflow; monotonic network/UI evidence stays separate from live SSE data.
+ * Exercise the isolated enterprise workflow; only an image 404 after matching discard and detach is released.
  * @author kongweiguang
  */
 async function main() {
@@ -549,6 +562,11 @@ async function main() {
   const approvalAnswers = [];
   const approvalStatuses = [];
   const attachmentUploadResponses = [];
+  const attachmentFileNames = new Map();
+  const acknowledgedDiscardIds = new Set();
+  const detachedDraftIds = new Set();
+  const releasedDraftThumbnailResponses = [];
+  const releasedDraftThumbnailIds = new Set();
   const faviconResponses = [];
   const phaseTimings = [];
   const pendingPdfBlobAborts = [];
@@ -563,6 +581,7 @@ async function main() {
   const cancellationReasons = new WeakMap();
   const waitReadStartedAt = new WeakMap();
   const waitReadStatuses = new WeakMap();
+  const discardAttachmentIds = new WeakMap();
   const submissionStreamRequests = new WeakSet();
   const timingOrigin = performance.now();
   /**
@@ -632,6 +651,23 @@ async function main() {
     page.on("console", (message) => {
       if (message.type() === "error") {
         const detail = { text: message.text(), location: message.location() };
+        const attachmentContent = detail.location.url
+          ? new URL(detail.location.url).pathname.match(
+              /^\/api\/chat\/attachments\/([^/]+)\/content$/,
+            )
+          : null;
+        const attachmentId = attachmentContent
+          ? decodeURIComponent(attachmentContent[1])
+          : undefined;
+        if (
+          attachmentId &&
+          /status of 404\b/.test(detail.text) &&
+          releasedDraftThumbnailIds.has(attachmentId) &&
+          acknowledgedDiscardIds.has(attachmentId) &&
+          detachedDraftIds.has(attachmentId)
+        ) {
+          return;
+        }
         if (
           stage === "upload-response-loss" &&
           detail.text === "Failed to load resource: net::ERR_FAILED" &&
@@ -706,19 +742,62 @@ async function main() {
       if (pathname === "/favicon.png")
         faviconResponses.push({ url: response.url(), status: response.status() });
       if (pathname.endsWith("/attachments/upload") && response.status() < 400) {
-        attachmentUploadResponses.push(response.json());
+        attachmentUploadResponses.push(
+          response.json().then((metadata) => {
+            if (metadata.id && metadata.fileName)
+              attachmentFileNames.set(metadata.id, metadata.fileName);
+            return metadata;
+          }),
+        );
+      }
+      const discardedIds = discardAttachmentIds.get(request);
+      if (
+        pathname === "/api/chat/attachments/discard" &&
+        response.status() >= 200 &&
+        response.status() < 300
+      ) {
+        for (const id of discardedIds ?? []) acknowledgedDiscardIds.add(id);
       }
       if (pathname.endsWith("/answers")) approvalStatuses.push(response.status());
-      if (response.status() >= 400)
-        failedResponses.push({
+      if (response.status() >= 400) {
+        const attachmentContent = pathname.match(/^\/api\/chat\/attachments\/([^/]+)\/content$/);
+        const attachmentId = attachmentContent
+          ? decodeURIComponent(attachmentContent[1])
+          : undefined;
+        const detail = {
           status: response.status(),
           url: response.url(),
-        });
+          stage: requestStages.get(request),
+          ...(attachmentId
+            ? { attachmentId, fileName: attachmentFileNames.get(attachmentId) ?? null }
+            : {}),
+        };
+        if (
+          response.status() === 404 &&
+          request.resourceType() === "image" &&
+          attachmentId &&
+          acknowledgedDiscardIds.has(attachmentId) &&
+          detachedDraftIds.has(attachmentId)
+        ) {
+          releasedDraftThumbnailIds.add(attachmentId);
+          releasedDraftThumbnailResponses.push({
+            ...detail,
+            cancellation:
+              "discard acknowledged and draft card detached before the late thumbnail response",
+          });
+        } else {
+          failedResponses.push(detail);
+        }
+      }
     });
     page.on("request", (request) => {
       activeRequests.add(request);
       requestStages.set(request, stage);
       const pathname = new URL(request.url()).pathname;
+      if (pathname === "/api/chat/attachments/discard") {
+        const attachmentIds = request.postDataJSON()?.attachmentIds ?? [];
+        discardAttachmentIds.set(request, attachmentIds);
+      }
       if (pathname === "/api/chat/stream") {
         submissions.push(request.postDataJSON());
         if (requestStages.get(request) === "message-submit") {
@@ -741,7 +820,6 @@ async function main() {
         });
       }
     });
-
     await page.goto(`http://127.0.0.1:${address.port}`, { waitUntil: "networkidle" });
     if (
       !faviconResponses.some((response) => response.status === 200) ||
@@ -800,7 +878,13 @@ async function main() {
       "image/png",
       imageBytes,
     );
-    await removeUploadedDraft(page, "browser-drop.png", composer);
+    await removeUploadedDraft(
+      page,
+      "browser-drop.png",
+      composer,
+      detachedDraftIds,
+      attachmentFileNames,
+    );
     stage = "attachment-paste";
     await composer.focus();
     await dispatchFileInput(
@@ -811,7 +895,13 @@ async function main() {
       "image/png",
       imageBytes,
     );
-    await removeUploadedDraft(page, "browser-paste.png", composer);
+    await removeUploadedDraft(
+      page,
+      "browser-paste.png",
+      composer,
+      detachedDraftIds,
+      attachmentFileNames,
+    );
     await composer.focus();
     const lostResponseFileName = "browser-lost-response.png";
     const lostResponseFileBytes = await readFile(fixture);
@@ -924,7 +1014,13 @@ async function main() {
     if (lostResponseRetryEvidence.retryAttachmentId !== lostResponseRetryMetadata.id) {
       throw new Error("The browser and upstream retry receipts returned different attachment IDs.");
     }
-    await removeUploadedDraft(page, lostResponseFileName, composer);
+    await removeUploadedDraft(
+      page,
+      lostResponseFileName,
+      composer,
+      detachedDraftIds,
+      attachmentFileNames,
+    );
 
     const pdfBytes = await readFile(pdfFixture);
     stage = "attachment-upload";
@@ -1643,6 +1739,7 @@ async function main() {
       narrowLayout,
       mobileSidebar: { open: mobileSidebarOpen, closed: mobileSidebarClosed },
       abortedRequests,
+      releasedDraftThumbnailResponses,
       unexpectedErrors: {
         page: pageErrors,
         console: consoleErrors,

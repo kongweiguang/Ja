@@ -665,7 +665,7 @@ async function readFirstTurnRuntimeEvidence(page, { threadId, workspaceId, callI
   );
 }
 
-/** 失败时保存首次运行时回执、受限 Tool DOM 和截图；不覆盖更早的运行中快照或落盘完整正文。 */
+/** 失败时保存准入阶段与受限 Tool DOM，区分乐观消息和真实回执；不覆盖更早快照或落盘完整正文。 */
 async function captureFailureArtifacts(
   page,
   evidenceDirectory,
@@ -717,6 +717,14 @@ async function captureFailureArtifacts(
       activeThreadId: globalThis.document
         .querySelector('[aria-label="最近对话列表"] button[aria-current="page"][data-thread-id]')
         ?.getAttribute("data-thread-id"),
+      composerState: globalThis.document
+        .querySelector('[aria-label="消息"]')
+        ?.closest("[data-state]")
+        ?.getAttribute("data-state"),
+      alerts: Array.from(globalThis.document.querySelectorAll('[role="alert"]'))
+        .slice(0, 8)
+        .map((element) => (element.textContent ?? "").trim().slice(0, 500)),
+      nativeInvokes: globalThis.__jaProcessSessionAdmissionInvokes ?? [],
       workProcesses: Array.from(
         globalThis.document.querySelectorAll("section.ja-work-process"),
       ).map((process) => ({
@@ -785,7 +793,41 @@ function observePageErrors(page, pageErrors, consoleErrors) {
   });
 }
 
-/** 复用真实 Thread 和隔离 Provider；会话读快照，拒绝场景核对 ProcessSessionPanel 保留的 ToolResult。 */
+/**
+ * 只在 E2E delegate 接缝记录有界命令身份与回执阶段，区分乐观消息和真实准入；
+ * 请求正文、配置与原生错误全文不进入诊断，原始结果和异常仍交给生产 adapter。
+ */
+function installAdmissionInvokeProbe() {
+  const previous = globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__;
+  const records = [];
+  globalThis.__jaProcessSessionAdmissionInvokes = records;
+  /** 前置保留首批请求，避免后续轮询覆盖导致首轮未受理的证据。 */
+  globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__ = async (request, delegate) => {
+    const input = request?.args?.input;
+    const record = {
+      command: request?.command,
+      threadId: typeof input?.threadId === "string" ? input.threadId : undefined,
+      workspaceId: typeof input?.workspaceId === "string" ? input.workspaceId : undefined,
+      startedAt: performance.now(),
+      state: "pending",
+    };
+    if (records.length < 128) records.push(record);
+    try {
+      const result = previous === undefined ? await delegate() : await previous(request, delegate);
+      record.state = "resolved";
+      record.completedAt = performance.now();
+      record.turnId = typeof result?.turnId === "string" ? result.turnId : undefined;
+      return result;
+    } catch (error) {
+      record.state = "rejected";
+      record.completedAt = performance.now();
+      record.errorCode = typeof error?.code === "string" ? error.code : "native_error";
+      throw error;
+    }
+  };
+}
+
+/** 复用真实 Thread 和隔离 Provider；诊断先观察准入，拒绝场景核对 ProcessSessionPanel 保留的 ToolResult。 */
 export async function runProcessSessionWebView2({
   page,
   workspaceRoot,
@@ -801,6 +843,7 @@ export async function runProcessSessionWebView2({
   observePageErrors(page, pageErrors, consoleErrors);
   const deadline = Date.now() + 10 * 60_000;
 
+  await page.addInitScript(installAdmissionInvokeProbe);
   await page.reload({ waitUntil: "domcontentloaded", timeout: timeout(deadline) });
   await waitForApplication(page, deadline);
   const workspaceId = await bootstrapProject(page, workspaceRoot, deadline);
