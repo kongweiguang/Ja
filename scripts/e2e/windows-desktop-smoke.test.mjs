@@ -120,12 +120,62 @@ import {
   attachmentOwnershipFact,
   taskThreadMessageFact,
   summarizeTauriEventContractIssues,
+  writeProtectedAuthFixture,
 } from "./windows-desktop-smoke.mjs";
 
 /** 真窗前的纯源码门禁必须能从 Node 定向测试独立运行。 */
 test("static smoke contracts pass without starting the desktop runner", () => {
   assert.doesNotThrow(assertStaticContracts);
 });
+
+/**
+ * 启动 fixture 必须符合 App Server 的当前 token owner、受保护 DACL 与单 ACE 合约，覆盖提权 CI 的默认 owner 差异。
+ * @author kongweiguang
+ */
+test(
+  "auth fixture uses the current Windows owner and one protected FullControl ACE",
+  {
+    skip: process.platform !== "win32",
+  },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "ja-auth-fixture-"));
+    try {
+      const authPath = join(directory, "auth.json");
+      const credentials = {
+        cred_e2e: "DUMMY_ONLY_NOT_A_SECRET",
+        cred_refresh: "DUMMY_ONLY_NOT_A_SECRET",
+      };
+      await writeProtectedAuthFixture(authPath, credentials);
+      assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")), credentials);
+
+      const aclResult = execFileSync(
+        "pwsh",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          [
+            "$ErrorActionPreference = 'Stop'",
+            "$acl = Get-Acl -LiteralPath $env:JA_E2E_AUTH_PATH",
+            "$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            "$ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value",
+            "$rules = @($acl.Access)",
+            "$valid = $ownerSid -eq $currentSid -and $acl.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $currentSid -and $rules[0].AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $rules[0].FileSystemRights -eq [System.Security.AccessControl.FileSystemRights]::FullControl -and -not $rules[0].IsInherited -and $rules[0].InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and $rules[0].PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None",
+            "if (-not $valid) { throw 'auth fixture ACL contract mismatch' }",
+            "'auth-acl-ok'",
+          ].join("; "),
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, JA_E2E_AUTH_PATH: authPath },
+        },
+      );
+      assert.equal(aclResult.trim(), "auth-acl-ok");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 /** 失败 Tool 不证明请求中的状态已入账，下一轮仍须尝试 READY→RUNNING。 */
 test("Plan fixture keeps the durable step status after a failed tool result", () => {

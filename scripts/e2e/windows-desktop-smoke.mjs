@@ -6130,7 +6130,30 @@ async function replaceRuntimeRefreshConfiguration(jaHome, document) {
 }
 
 /**
+ * 为启动前凭据 fixture 显式设置当前账户 owner 与唯一受保护 FullControl ACE；提权 CI 的新文件
+ * 默认 owner 可能是 Administrators，而 App Server 只接受当前 token SID 的精确 ACL。
+ * @author kongweiguang
+ */
+export async function writeProtectedAuthFixture(authPath, credentials) {
+  const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
+  if (account.endsWith("\\")) throw new Error("无法确定当前 Windows ACL 用户");
+  await writeFile(authPath, `${JSON.stringify(credentials)}\n`, "utf8");
+  const aclOptions = {
+    windowsHide: true,
+    maxBuffer: 1 * 1024 * 1024,
+    timeout: snapshotTimeoutMs,
+  };
+  await execFileAsync(
+    "icacls.exe",
+    [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`],
+    aclOptions,
+  );
+  await execFileAsync("icacls.exe", [authPath, "/setowner", account], aclOptions);
+}
+
+/**
  * 首次写入完整配置、Skill 和 ACL 收紧的凭据文件；后续更新只替换 config.toml，不接触 Secret。
+ * @author kongweiguang
  */
 async function writeRuntimeRefreshSettings(
   jaHome,
@@ -6150,17 +6173,9 @@ async function writeRuntimeRefreshSettings(
     buildRuntimeRefreshSettingsDocument(providerConfig.baseUrl, controlPath, reportPath, 1),
   );
   const authPath = join(jaHome, "auth.json");
-  await writeFile(
-    authPath,
-    `${JSON.stringify({ cred_e2e: providerConfig.apiKey, cred_refresh: providerConfig.apiKey })}\n`,
-    "utf8",
-  );
-  const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
-  if (account.endsWith("\\")) throw new Error("无法确定当前 Windows ACL 用户");
-  await execFileAsync("icacls.exe", [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`], {
-    windowsHide: true,
-    maxBuffer: 1 * 1024 * 1024,
-    timeout: snapshotTimeoutMs,
+  await writeProtectedAuthFixture(authPath, {
+    cred_e2e: providerConfig.apiKey,
+    cred_refresh: providerConfig.apiKey,
   });
 }
 
@@ -6193,6 +6208,7 @@ async function writeComposerContextSkill(jaHome) {
  * 在本轮私有 user Home 下写入当前拆分后的 config/auth schema。
  * 离线 UI 模式使用非敏感占位值且不发起 Turn；真实 loopback 模式只在临时且受 ACL 保护的
  * auth 文件中保存密钥。默认保持需审批，只有必须执行 Shell 的受控场景显式放宽。
+ * @author kongweiguang
  */
 async function writeSettings(jaHome, providerConfig, options) {
   // Ja App Server sidecar 通过 --home-dir-base64 接收这个精确目录。
@@ -6202,19 +6218,8 @@ async function writeSettings(jaHome, providerConfig, options) {
   const configPath = join(jaHome, "config.toml");
   const authPath = join(jaHome, "auth.json");
   await writeFile(configPath, config, "utf8");
-  await writeFile(
-    authPath,
-    `${JSON.stringify({
-      cred_e2e: providerConfig?.apiKey ?? "DUMMY_ONLY_NOT_A_SECRET",
-    })}\n`,
-    "utf8",
-  );
-  const account = `${process.env.USERDOMAIN ?? "."}\\${process.env.USERNAME ?? ""}`;
-  if (account.endsWith("\\")) throw new Error("无法确定当前 Windows ACL 用户");
-  await execFileAsync("icacls.exe", [authPath, "/inheritance:r", "/grant:r", `${account}:(F)`], {
-    windowsHide: true,
-    maxBuffer: 1 * 1024 * 1024,
-    timeout: snapshotTimeoutMs,
+  await writeProtectedAuthFixture(authPath, {
+    cred_e2e: providerConfig?.apiKey ?? "DUMMY_ONLY_NOT_A_SECRET",
   });
   return { configPath, authPath };
 }
