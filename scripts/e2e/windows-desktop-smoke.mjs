@@ -151,7 +151,7 @@ const trayExitTimeoutMs = 30_000;
 const incompleteObservationLimit = 64;
 const stablePortRange = Object.freeze({ start: 41_000, size: 8_000 });
 const directCdpBrowserArguments =
-  "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --remote-debugging-port=0";
+  "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --force-renderer-accessibility=complete --remote-debugging-address=127.0.0.1 --remote-debugging-port=0";
 
 /**
  * 把 Wry 生产默认参数与官方 attach 所需的调试参数绑定到预留回环端口。Direct CDP
@@ -10270,8 +10270,10 @@ function isLoopbackDebuggerHostname(hostname) {
 
 /**
  * 从本轮已重验的 WebView2 进程树发现精确的非零调试 listener，再把 `/json/version` 与
- * 进程 owner 交叉复验。选择端口与 WebView2 bind 之间若被抢占，只会超时失败，绝不连接
- * 到不属于本轮 WebView2 身份的服务。
+ * 进程 owner 交叉复验。失败摘要只投影主 browser 对预期 loopback 参数的匹配数量与 listener 数，
+ * 便于区分启动参数未到达、browser 未 bind 与 listener 查询失败，不保存命令行原文。
+ * 选择端口与 WebView2 bind 之间若被抢占，只会超时失败，绝不连接到不属于本轮 WebView2 身份的服务。
+ * @author kongweiguang
  */
 async function waitForCdp(
   expectedPort,
@@ -10333,11 +10335,27 @@ async function waitForCdp(
           ? []
           : [...tree.values()].filter((entry) => entry.name.toLowerCase() === "msedgewebview2.exe");
       const identities = new Map(browsers.map((entry) => [entry.pid, entry]));
-      const listeners = await ownedTcpListeners(identities.keys(), signal);
+      const mainBrowsers = browsers.filter((entry) => !entry.commandLine.includes("--type="));
+      const expectedPortArgument = `--remote-debugging-port=${expectedPort}`;
+      const expectedAddressArgument = "--remote-debugging-address=127.0.0.1";
+      const portArgumentMatches = mainBrowsers.filter((entry) =>
+        entry.commandLine.split(/\s+/u).includes(expectedPortArgument),
+      ).length;
+      const addressArgumentMatches = mainBrowsers.filter((entry) =>
+        entry.commandLine.split(/\s+/u).includes(expectedAddressArgument),
+      ).length;
+      const argumentObservation = `webview2=${browsers.length} mainBrowsers=${mainBrowsers.length} portArgMatch=${portArgumentMatches} addressArgMatch=${addressArgumentMatches}`;
+      let listeners;
+      try {
+        listeners = await ownedTcpListeners(identities.keys(), signal);
+      } catch (error) {
+        lastObservation = `${argumentObservation} listenerQuery=failed`;
+        throw error;
+      }
       const candidates = listeners.filter(
         (candidate) => expectedPort === 0 || candidate.port === expectedPort,
       );
-      lastObservation = `webview2=${browsers.length} loopbackListeners=${listeners.length} candidateListeners=${candidates.length}`;
+      lastObservation = `${argumentObservation} listenerQuery=ok loopbackListeners=${listeners.length} candidateListeners=${candidates.length}`;
       for (const listener of candidates) {
         const host = listener.address === "::1" ? "[::1]" : "127.0.0.1";
         const endpoint = `http://${host}:${listener.port}`;
@@ -39017,7 +39035,9 @@ function assertNativeInputContract() {
 
 /**
  * 用允许/拒绝 fixture 固定动态 CDP 与 owner 发现边界；原生查询保留同一 deadline 和 parser。
- * 端口 0 只作为分配请求，最终连接仍须来自精确进程身份持有的非零 loopback listener。
+ * 明确要求 debugger 只监听 127.0.0.1，并覆盖成功 runner 已验证的调试启动参数；端口 0 只作为分配请求，
+ * 最终连接仍须来自精确进程身份持有的非零 loopback listener。
+ * @author kongweiguang
  */
 function assertCdpDiscoveryContract() {
   const owners = new Set([101, 202]);
@@ -39069,6 +39089,8 @@ function assertCdpDiscoveryContract() {
       "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
     ) ||
     !directCdpBrowserArguments.includes("--autoplay-policy=no-user-gesture-required") ||
+    !directCdpBrowserArguments.includes("--force-renderer-accessibility=complete") ||
+    !directCdpBrowserArguments.includes("--remote-debugging-address=127.0.0.1") ||
     directCdpBrowserArguments.includes("--enable-automation") ||
     directCdpBrowserArguments.includes("--test-type=webdriver")
   ) {
@@ -39095,6 +39117,11 @@ function assertCdpDiscoveryContract() {
   if (
     !String(waitForCdp).includes("expectedPort === 0") ||
     !String(waitForCdp).includes("candidate.port === expectedPort") ||
+    !String(waitForCdp).includes("expectedPortArgument") ||
+    !String(waitForCdp).includes("expectedAddressArgument") ||
+    !String(waitForCdp).includes("portArgMatch=${portArgumentMatches}") ||
+    !String(waitForCdp).includes("addressArgMatch=${addressArgumentMatches}") ||
+    !String(waitForCdp).includes("listenerQuery=failed") ||
     !String(buildTauriEnv).includes("directCdpBrowserArgumentsForPort(cdpPort)")
   ) {
     throw new Error("WebView2 动态端口 owner 复验合同漂移");

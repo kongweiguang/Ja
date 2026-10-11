@@ -1,0 +1,64 @@
+# @author kongweiguang
+# Temporary Windows diagnosis uses the current source and keeps release gates intact.
+name: Ja Windows desktop diagnostics
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  windows-desktop:
+    runs-on: windows-2025
+    # Allow fixture/build setup before the smoke's unchanged 30-minute run deadline.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903
+        with:
+          node-version: 24.10.0
+          cache: pnpm
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: liberica
+          java-version: "25"
+          cache: maven
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: ". -> target"
+          shared-key: ja-native-windows-x86_64
+          cache-on-failure: true
+      - name: Build JVM fixture with JDK 25
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = "$env:JAVA_HOME/bin;$env:PATH"
+          java -version
+          mvn.cmd -version
+          pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+          mvn.cmd -B -ntp -f ja-agent/pom.xml -pl ja-app-server -am -DskipTests package
+      - name: Run real Windows desktop smoke
+        shell: pwsh
+        env:
+          JA_E2E_REAL_PROVIDER: "0"
+          JA_E2E_KEEP_TEMP: "0"
+        run: |
+          $env:JA_E2E_APP_SERVER_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
+          $env:JA_E2E_CARGO_TARGET_DIR = Join-Path $PWD 'target'
+          "JA_DESKTOP_DIAGNOSTICS=$env:TEMP/ja-e2e-results" | Add-Content $env:GITHUB_ENV
+          node scripts/e2e/windows-desktop-smoke.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'desktop smoke failed' }
+      - name: Scan redacted summaries
+        id: summary_scan
+        if: always()
+        shell: pwsh
+        run: python -B scripts/release/check-evidence-secrets.py "$env:TEMP/ja-e2e-results"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.summary_scan.conclusion == 'success' }}
+        with:
+          name: ja-windows-desktop-diagnostics
+          path: ${{ env.JA_DESKTOP_DIAGNOSTICS }}/*.json
+          retention-days: 3
