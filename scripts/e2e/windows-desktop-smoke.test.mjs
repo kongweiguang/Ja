@@ -2992,6 +2992,47 @@ test("validates window action, SendInput, and Explorer postcheck receipts agains
   }
 });
 
+/** 原生输入失败只投影可归因的前台身份与 HWND 关系，诊断失败降级而不进入准入判断。 @author kongweiguang */
+test("projects closed-set foreground ownership evidence without command lines or foreground titles", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function buildOwnedNativeInputScript()");
+  const end = source.indexOf("\n}\n", start);
+  assert.ok(start >= 0 && end > start);
+  const helper = source.slice(start, end);
+  const projectionStart = helper.indexOf("$foregroundProcess=$null;$foregroundWindow=$null");
+  assert.ok(projectionStart >= 0);
+  const projection = helper.slice(projectionStart);
+  const compactProjection = projection.replaceAll(/\s+/gu, "");
+
+  assert.match(
+    compactProjection,
+    /if\(\$foregroundHandle-ne\$handle-and\$foregroundPid-ne0\)/u,
+    "process details are queried only when focus left the bound Ja HWND",
+  );
+  for (const field of [
+    "foregroundProcess=$foregroundProcess",
+    "foregroundWindow=$foregroundWindow",
+    "foregroundRow.Name",
+    "foregroundRow.ParentProcessId",
+    "foregroundRow.CreationDate",
+    "ClassName($foregroundHandle)",
+    "IsChild($handle,$foregroundHandle)",
+    "GetAncestor($foregroundHandle,2)-eq$handle",
+    "GetAncestor($foregroundHandle,3)-eq$handle",
+    "GetWindow($foregroundHandle,4)-eq$handle",
+  ]) {
+    assert.ok(projection.includes(field), `missing safe foreground projection: ${field}`);
+  }
+  assert.match(projection, /catch\{\$foregroundProcess=\$null\}/u);
+  assert.match(projection, /catch\{\$foregroundWindow=\$null\}/u);
+  assert.match(projection, /title=\[JaE2eNativeInput\]::Title\(\$handle\)/u);
+  assert.doesNotMatch(projection, /foregroundRow\.CommandLine|foregroundTitle|foregroundBody/u);
+  assert.doesNotMatch(
+    projection,
+    /GetWindowText\(\$foregroundHandle\)|Title\(\$foregroundHandle\)/u,
+  );
+});
+
 /** Explorer 激活只接受精确 HWND 的真实前台证据，并总在结束时解除临时输入队列关联。 @author kongweiguang */
 test("activates the bound Explorer HWND through bounded native foreground evidence", async () => {
   const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");

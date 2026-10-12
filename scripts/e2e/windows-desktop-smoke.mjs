@@ -19275,9 +19275,7 @@ export function assertOwnedJaWindowBinding(identity, observation) {
   return binding.hwnd;
 }
 
-/**
- * 验证原生 helper 动作后的完整进程身份与 phase HWND 回执；只接受显式逐字段匹配结果，避免仅凭 PID 或窗口标题继续操作。
- */
+/** 验证原生 helper 动作后的完整进程身份与 phase HWND 回执；只接受显式逐字段匹配结果，避免仅凭 PID 或窗口标题继续操作。 */
 export function assertOwnedJaWindowPostcheck(identity, evidence) {
   const identityAfter = evidence?.identityAfter;
   const observation = evidence?.after ?? evidence;
@@ -19748,7 +19746,9 @@ function normalizeOwnedNativeInput(operation) {
  * DPI-safe 坐标。显式 modifier reset 只发送 key-up，用于隔离先前 CDP 或
  * SendInput 动作遗留的逻辑按键状态；输入后的 foreground 只做有界观察，
  * 容忍 child HWND 焦点切换产生的瞬时空 handle，但绝不主动抢回或接受其它进程。
- * helper 失败只返回异常类型、HRESULT 与固定原因，不回显环境变量、路径或输入正文。
+ * 焦点失败时只投影前台进程 basename/父 PID/创建时间与 HWND 类及归属关系；诊断查询失败降为 null，
+ * 不读取前台命令行、标题或正文，也不改变现有输入准入条件；绑定 Ja 窗口仍沿用原有精确标题回执。
+ * @author kongweiguang
  */
 function buildOwnedNativeInputScript() {
   return [
@@ -19778,6 +19778,8 @@ function buildOwnedNativeInputScript() {
     '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
     '[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint c);',
     '[DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n);',
+    '[DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n);',
+    '[DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent,IntPtr child);',
     '[DllImport("user32.dll",EntryPoint="GetWindowThreadProcessId")] public static extern uint GetWindowThreadProcessIdWithPid(IntPtr h,out uint p);',
     '[DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint count, INPUT[] inputs, int size);',
     '[DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x,int y);',
@@ -19798,6 +19800,8 @@ function buildOwnedNativeInputScript() {
     "static INPUT W(char c,uint f){return new INPUT{type=1,value=new U{key=new KI{scan=c,flags=f|4}}};}",
     "static INPUT M(uint f){return new INPUT{type=0,value=new U{mouse=new MI{flags=f}}};}",
     "public static string Title(IntPtr h){var s=new System.Text.StringBuilder(256);GetWindowText(h,s,s.Capacity);return s.ToString();}",
+    "/// <summary>窗口类用于有界焦点诊断；不读取窗口标题，以免包含用户内容。</summary>",
+    "public static string ClassName(IntPtr h){if(h==IntPtr.Zero||!IsWindow(h))return null;var s=new System.Text.StringBuilder(128);int n=GetClassName(h,s,s.Capacity);return n>0?s.ToString():null;}",
     "public static bool MatchesBound(IntPtr h,uint pid,string title){if(h==IntPtr.Zero||!IsWindow(h)||!IsWindowVisible(h)||GetWindow(h,4)!=IntPtr.Zero||GetAncestor(h,2)!=h)return false;uint owner;GetWindowThreadProcessId(h,out owner);return owner==pid&&String.Equals(Title(h),title,StringComparison.Ordinal);}",
     "static void S(List<INPUT> v){var a=v.ToArray();if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=(uint)a.Length)throw new Win32Exception(Marshal.GetLastWin32Error());}",
     "public static void ResetModifiers(){var v=new List<INPUT>();foreach(var k in new ushort[]{0x10,0x11,0x12,0x5B,0x5C,0xA0,0xA1,0xA2,0xA3,0xA4,0xA5})v.Add(K(k,2));S(v);}",
@@ -19826,7 +19830,10 @@ function buildOwnedNativeInputScript() {
     "$identityAfter=[ordered]@{pid=$identityAfterActualPid;pidMatches=$identityAfterPidMatches;nameMatches=$identityAfterNameMatches;commandLineMatches=$identityAfterCommandMatches;creationDateMatches=$identityAfterCreationMatches;valid=$identityAfterPidMatches-and$identityAfterNameMatches-and$identityAfterCommandMatches-and$identityAfterCreationMatches}",
     "if(-not $identityAfter.valid){throw 'owned window identity changed'}",
     "$foregroundDeadline=[DateTime]::UtcNow.AddMilliseconds(750);do{$foregroundHandle=[JaE2eNativeInput]::GetForegroundWindow();[uint32]$foregroundPid=0;if($foregroundHandle -ne [IntPtr]::Zero){[void][JaE2eNativeInput]::GetWindowThreadProcessIdWithPid($foregroundHandle,[ref]$foregroundPid)};if($foregroundHandle -eq $handle){break};Start-Sleep -Milliseconds 25}while([DateTime]::UtcNow -lt $foregroundDeadline)",
-    "[pscustomobject]@{pid=$pidValue;kind=[string]$operation.kind;identityAfter=$identityAfter;foreground=$foregroundHandle -eq $handle;foregroundPid=$foregroundPid;foregroundHandle=$foregroundHandle.ToInt64();hwnd=$handle.ToInt64();ownedHandle=$handle.ToInt64();processId=$pidValue;isWindow=[JaE2eNativeInput]::IsWindow($handle);title=[JaE2eNativeInput]::Title($handle);left=$rect.Left;top=$rect.Top;width=$rect.Right-$rect.Left;height=$rect.Bottom-$rect.Top}|ConvertTo-Json -Compress",
+    "$foregroundProcess=$null;$foregroundWindow=$null",
+    'if($foregroundHandle -ne $handle -and $foregroundPid -ne 0){try{$foregroundRow=Get-CimInstance Win32_Process -Filter "ProcessId = $foregroundPid" -ErrorAction Stop;if($null-ne$foregroundRow-and[int]$foregroundRow.ProcessId-eq$foregroundPid){$foregroundProcess=[ordered]@{pid=[int]$foregroundRow.ProcessId;name=[string]$foregroundRow.Name;parentPid=[int]$foregroundRow.ParentProcessId;creationTimeMs=([DateTimeOffset]$foregroundRow.CreationDate).ToUnixTimeMilliseconds()}}}catch{$foregroundProcess=$null}}',
+    "if($foregroundHandle -ne [IntPtr]::Zero){try{if([JaE2eNativeInput]::IsWindow($foregroundHandle)){$foregroundWindow=[ordered]@{className=[JaE2eNativeInput]::ClassName($foregroundHandle);isChildOfOwnedWindow=[JaE2eNativeInput]::IsChild($handle,$foregroundHandle);rootIsOwnedWindow=[JaE2eNativeInput]::GetAncestor($foregroundHandle,2)-eq$handle;rootOwnerIsOwnedWindow=[JaE2eNativeInput]::GetAncestor($foregroundHandle,3)-eq$handle;ownerIsOwnedWindow=[JaE2eNativeInput]::GetWindow($foregroundHandle,4)-eq$handle}}}catch{$foregroundWindow=$null}}",
+    "[pscustomobject]@{pid=$pidValue;kind=[string]$operation.kind;identityAfter=$identityAfter;foreground=$foregroundHandle -eq $handle;foregroundPid=$foregroundPid;foregroundHandle=$foregroundHandle.ToInt64();foregroundProcess=$foregroundProcess;foregroundWindow=$foregroundWindow;hwnd=$handle.ToInt64();ownedHandle=$handle.ToInt64();processId=$pidValue;isWindow=[JaE2eNativeInput]::IsWindow($handle);title=[JaE2eNativeInput]::Title($handle);left=$rect.Left;top=$rect.Top;width=$rect.Right-$rect.Left;height=$rect.Bottom-$rect.Top}|ConvertTo-Json -Compress",
     "} catch { $failure=$_.Exception.GetBaseException();$nativeError=if($failure -is [System.ComponentModel.Win32Exception]){$failure.NativeErrorCode}else{0};$rawReason=[string]$failure.Message;$fixedReasons=@('owned window process vanished','owned window identity changed','owned window HWND missing or changed','owned window is not foreground','unsupported input');$reason=if($fixedReasons -contains $rawReason){$rawReason}elseif($rawReason -match 'error CS[0-9]+'){'native_input_helper_compile_failed'}elseif($nativeError -ne 0){'native_input_win32_failed'}else{'native_input_helper_failed'};[pscustomobject]@{errorType=$failure.GetType().Name;reason=$reason;hresult=[int]$failure.HResult;nativeError=[int]$nativeError}|ConvertTo-Json -Compress;exit 1 }",
   ].join("\n");
 }
