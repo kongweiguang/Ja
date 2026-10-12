@@ -24811,10 +24811,88 @@ async function terminalUrlPoints(terminal, url) {
 }
 
 /**
+ * 点击前用 xterm 的真实可见字符网格确认单 pane 能容纳整条 URL 与后续提示行；
+ * 保留这一前置空间，避免输出 marker 已出现但提示符把链接滚出 viewport 后产生假失败。
+ * 只投影尺寸和计数，不读取路径或终端正文。
+ * @author kongweiguang
+ */
+async function assertTerminalUrlViewportCapacity(terminal, url) {
+  const evidence = await terminal.evaluate((surface, expectedUrlLength) => {
+    const screen = surface.querySelector(".xterm-screen");
+    if (screen === null) {
+      return {
+        screenVisible: false,
+        screenWidth: 0,
+        screenHeight: 0,
+        cellWidth: 0,
+        visibleColumns: 0,
+        visibleRows: 0,
+        requiredColumns: expectedUrlLength,
+        requiredRows: 8,
+      };
+    }
+    const screenRect = screen.getBoundingClientRect();
+    const visibleRows = [...screen.querySelectorAll(".xterm-rows > div")].filter((row) => {
+      const rect = row.getBoundingClientRect();
+      return rect.height > 0 && rect.bottom > screenRect.top && rect.top < screenRect.bottom;
+    }).length;
+    const rowRoot = screen.querySelector(".xterm-rows");
+    let cellWidth = 0;
+    if (rowRoot !== null) {
+      const walker = globalThis.document.createTreeWalker(rowRoot, globalThis.NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const match = /[A-Za-z0-9]{2}/u.exec(node.textContent ?? "");
+        if (match === null) continue;
+        const first = globalThis.document.createRange();
+        first.setStart(node, match.index);
+        first.setEnd(node, match.index + 1);
+        const second = globalThis.document.createRange();
+        second.setStart(node, match.index + 1);
+        second.setEnd(node, match.index + 2);
+        const firstRect = first.getBoundingClientRect();
+        const secondRect = second.getBoundingClientRect();
+        const step = secondRect.left - firstRect.left;
+        if (
+          firstRect.width > 0 &&
+          secondRect.width > 0 &&
+          Math.abs(firstRect.top - secondRect.top) < 0.5 &&
+          step > 0 &&
+          Math.abs(step - firstRect.width) <= Math.max(1, firstRect.width * 0.2)
+        ) {
+          cellWidth = step;
+          break;
+        }
+      }
+    }
+    const visibleColumns = cellWidth > 0 ? Math.floor(screenRect.width / cellWidth) : 0;
+    return {
+      screenVisible: screen.isConnected && screenRect.width > 0 && screenRect.height > 0,
+      screenWidth: Math.round(screenRect.width),
+      screenHeight: Math.round(screenRect.height),
+      cellWidth: Math.round(cellWidth * 100) / 100,
+      visibleColumns,
+      visibleRows,
+      requiredColumns: expectedUrlLength,
+      requiredRows: 8,
+    };
+  }, url.length);
+  if (
+    !evidence.screenVisible ||
+    evidence.visibleColumns < evidence.requiredColumns ||
+    evidence.visibleRows < evidence.requiredRows
+  ) {
+    throw new Error(`Terminal 单 pane URL viewport 空间不足：${JSON.stringify(evidence)}`);
+  }
+  return evidence;
+}
+
+/**
  * 首个 Tab 通过真实 More 菜单覆盖窄 pane 的 Escape、双方向分屏、关闭与恢复；窄化期间临时调整
  * owned 原生窗口与 Workbench；finally 用独立 5 秒 cleanup deadline 恢复窗口和原尺寸，
  * 避免操作 deadline 耗尽时跳过恢复，同时不扩大主流程预算。
- * 随后构造两个真实 terminal tab、每个含四个 pane，所有资源计数限定当前 owner。
+ * 第二 Tab 在分屏前完成 URL 事务，确保 xterm 可见网格能容纳链接和提示行；随后构造两个真实 terminal tab、
+ * 每个含四个 pane，所有资源计数限定当前 owner。
  * @author kongweiguang
  */
 async function exerciseTerminalWorkspace(
@@ -25218,6 +25296,150 @@ async function exerciseTerminalWorkspace(
     deadline,
     signal,
   );
+  const terminalUrl = `${previewFixture.url}terminal-link`;
+  const urlTerminal = second.panel
+    .locator(`.ja-terminal-pane[data-pane-id="${secondActivePane}"]`)
+    .getByRole("application", { name: /^终端窗格 /u });
+  await assertTerminalUrlViewportCapacity(urlTerminal, terminalUrl);
+  const urlPaneSessionsBefore = await terminalSessionIdentities(second.panel);
+  if (urlPaneSessionsBefore.length !== 1 || urlPaneSessionsBefore[0]?.paneId !== secondActivePane) {
+    throw new Error("第二个 Terminal Tab 的单 pane URL 验收缺少唯一 session identity");
+  }
+  await writeTerminalCommand(
+    page,
+    second.panel,
+    secondActivePane,
+    `echo ${terminalUrl}`,
+    terminalUrl,
+    ownedWindow,
+    deadline,
+    signal,
+  );
+  const candidatePoints = await terminalUrlPoints(urlTerminal, terminalUrl);
+  if (candidatePoints.length === 0) {
+    throw new Error(
+      `Terminal URL 未形成可点击文本范围：${JSON.stringify({
+        viewport: await assertTerminalUrlViewportCapacity(urlTerminal, terminalUrl),
+      })}`,
+    );
+  }
+  const linkRenderer = await page.evaluate(() => ({
+    width: globalThis.innerWidth,
+    height: globalThis.innerHeight,
+  }));
+  await urlTerminal.evaluate((surface) => {
+    const trace = [];
+    for (const type of [
+      "pointermove",
+      "mousemove",
+      "pointerdown",
+      "mousedown",
+      "pointerup",
+      "mouseup",
+      "click",
+    ]) {
+      surface.addEventListener(
+        type,
+        (event) => {
+          if (trace.length >= 64 || !(event instanceof globalThis.MouseEvent)) return;
+          trace.push({
+            type,
+            trusted: event.isTrusted,
+            control: event.ctrlKey,
+            button: event.button,
+            defaultPrevented: event.defaultPrevented,
+          });
+        },
+        { capture: true },
+      );
+    }
+    globalThis.__JA_E2E_TERMINAL_LINK_TRACE__ = trace;
+  });
+  await suppressLoopbackExternalOpen(page, true);
+  try {
+    const openerBefore = await tauriInvokeCount(page, "plugin:opener|open_url");
+    const point = candidatePoints[0];
+    if (point === undefined) throw new Error("终端 URL 缺少可用字符坐标");
+    await invokeOwnedNativeInput(
+      ownedWindow,
+      {
+        kind: "move",
+        x: point.x,
+        y: point.y,
+        rendererWidth: linkRenderer.width,
+        rendererHeight: linkRenderer.height,
+      },
+      signal,
+    );
+    await waitForCondition(
+      "终端 URL 链接 hover 语义",
+      () =>
+        urlTerminal
+          .locator(".xterm-screen")
+          .evaluate((screen) => screen.classList.contains("xterm-cursor-pointer")),
+      deadline,
+      signal,
+    );
+    await invokeOwnedNativeInput(
+      ownedWindow,
+      {
+        kind: "click",
+        x: point.x,
+        y: point.y,
+        rendererWidth: linkRenderer.width,
+        rendererHeight: linkRenderer.height,
+      },
+      signal,
+    );
+    await waitForDelay(200, signal);
+    if ((await tauriInvokeCount(page, "plugin:opener|open_url")) !== openerBefore)
+      throw new Error("普通终端 URL 点击意外触发外部打开");
+    await invokeOwnedNativeInput(
+      ownedWindow,
+      {
+        kind: "click_chord",
+        modifiers: [0x11],
+        x: point.x,
+        y: point.y,
+        rendererWidth: linkRenderer.width,
+        rendererHeight: linkRenderer.height,
+      },
+      signal,
+    );
+    try {
+      await waitForCondition(
+        "Ctrl+点击 URL 语义",
+        async () => (await tauriInvokeCount(page, "plugin:opener|open_url", true)) > 0,
+        deadline,
+        signal,
+      );
+    } catch (error) {
+      const linkTrace = await page.evaluate(() =>
+        Array.isArray(globalThis.__JA_E2E_TERMINAL_LINK_TRACE__)
+          ? globalThis.__JA_E2E_TERMINAL_LINK_TRACE__
+          : [],
+      );
+      throw new Error(`Ctrl+点击 URL 未触发 opener：${JSON.stringify({ linkTrace })}`, {
+        cause: error,
+      });
+    }
+  } finally {
+    await suppressLoopbackExternalOpen(page, false);
+  }
+  const urlWorkbenchState = await readThreadWorkbenchState(page);
+  const selectedTerminalAfterUrl = await activeTerminalTab(terminalWorkspace, deadline);
+  if (
+    urlWorkbenchState.active !== "terminal" ||
+    selectedTerminalAfterUrl.panelId !== second.panelId
+  ) {
+    throw new Error("Terminal URL 点击后未返回原 Terminal Tab");
+  }
+  await assertTerminalPaneSessionContinuity(
+    second.panel,
+    urlPaneSessionsBefore,
+    1,
+    "单 pane URL 点击后返回 Terminal",
+  );
   for (const orientation of ["vertical", "horizontal", "vertical"]) {
     secondActivePane = await splitTerminalPane(
       page,
@@ -25312,115 +25534,6 @@ async function exerciseTerminalWorkspace(
     deadline,
   );
   await search.waitFor({ state: "detached", timeout: timeout() });
-
-  const terminalUrl = `${previewFixture.url}terminal-link`;
-  await writeTerminalCommand(
-    page,
-    second.panel,
-    secondActivePane,
-    `echo ${terminalUrl}`,
-    terminalUrl,
-    ownedWindow,
-    deadline,
-    signal,
-  );
-  const candidatePoints = await terminalUrlPoints(activeTerminal, terminalUrl);
-  if (candidatePoints.length === 0) throw new Error("终端 URL 未形成可点击文本范围");
-  const linkRenderer = await page.evaluate(() => ({
-    width: globalThis.innerWidth,
-    height: globalThis.innerHeight,
-  }));
-  await activeTerminal.evaluate((surface) => {
-    const trace = [];
-    for (const type of [
-      "pointermove",
-      "mousemove",
-      "pointerdown",
-      "mousedown",
-      "pointerup",
-      "mouseup",
-      "click",
-    ]) {
-      surface.addEventListener(
-        type,
-        (event) => {
-          if (trace.length >= 64 || !(event instanceof globalThis.MouseEvent)) return;
-          trace.push({
-            type,
-            trusted: event.isTrusted,
-            control: event.ctrlKey,
-            button: event.button,
-            defaultPrevented: event.defaultPrevented,
-          });
-        },
-        { capture: true },
-      );
-    }
-    globalThis.__JA_E2E_TERMINAL_LINK_TRACE__ = trace;
-  });
-  await suppressLoopbackExternalOpen(page, true);
-  try {
-    const openerBefore = await tauriInvokeCount(page, "plugin:opener|open_url");
-    const point = candidatePoints[0];
-    if (point === undefined) throw new Error("终端 URL 缺少可用字符坐标");
-    await invokeOwnedNativeInput(
-      ownedWindow,
-      {
-        kind: "move",
-        x: point.x,
-        y: point.y,
-        rendererWidth: linkRenderer.width,
-        rendererHeight: linkRenderer.height,
-      },
-      signal,
-    );
-    await waitForDelay(150, signal);
-    await invokeOwnedNativeInput(
-      ownedWindow,
-      {
-        kind: "click",
-        x: point.x,
-        y: point.y,
-        rendererWidth: linkRenderer.width,
-        rendererHeight: linkRenderer.height,
-      },
-      signal,
-    );
-    await waitForDelay(200, signal);
-    if ((await tauriInvokeCount(page, "plugin:opener|open_url")) !== openerBefore)
-      throw new Error("普通终端 URL 点击意外触发外部打开");
-    await invokeOwnedNativeInput(
-      ownedWindow,
-      {
-        kind: "click_chord",
-        modifiers: [0x11],
-        x: point.x,
-        y: point.y,
-        rendererWidth: linkRenderer.width,
-        rendererHeight: linkRenderer.height,
-      },
-      signal,
-    );
-    try {
-      await waitForCondition(
-        "Ctrl+点击 URL 语义",
-        async () => (await tauriInvokeCount(page, "plugin:opener|open_url", true)) > 0,
-        deadline,
-        signal,
-      );
-    } catch (error) {
-      const linkTrace = await page.evaluate(() =>
-        Array.isArray(globalThis.__JA_E2E_TERMINAL_LINK_TRACE__)
-          ? globalThis.__JA_E2E_TERMINAL_LINK_TRACE__
-          : [],
-      );
-      throw new Error(`Ctrl+点击 URL 未触发 opener：${JSON.stringify({ linkTrace })}`, {
-        cause: error,
-      });
-    }
-  } finally {
-    await suppressLoopbackExternalOpen(page, false);
-  }
 
   const beforeHidePaneIds = await terminalWorkspace
     .locator(".ja-terminal-pane[data-pane-id]")

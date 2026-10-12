@@ -1141,6 +1141,57 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
   assert.match(workflow, /new AggregateError\([\s\S]*?\{ cause: workflowFailure \}/u);
 });
 
+/** URL 点击必须在第二 Tab 的完整可见网格中完成；后续多 pane、搜索及隐藏恢复门禁继续原序执行。 @author kongweiguang */
+test("keeps Terminal URL acceptance in the second tab before pane splitting", async () => {
+  const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
+  const workflowStart = source.indexOf("async function exerciseTerminalWorkspace(");
+  const workflowEnd = source.indexOf("/**\n * 目录属于可解析的本地目标", workflowStart);
+  const viewportStart = source.indexOf("async function assertTerminalUrlViewportCapacity(");
+  const viewportEnd = source.indexOf("/**\n * 首个 Tab 通过真实 More 菜单", viewportStart);
+  assert.ok(workflowStart >= 0 && workflowEnd > workflowStart);
+  assert.ok(viewportStart >= 0 && viewportEnd > viewportStart);
+
+  const workflow = source.slice(workflowStart, workflowEnd);
+  const viewport = source.slice(viewportStart, viewportEnd);
+  const cwdMarker = workflow.indexOf('"ja_terminal_relative_cwd_ok"');
+  const capacityGate = workflow.indexOf(
+    "assertTerminalUrlViewportCapacity(urlTerminal, terminalUrl)",
+  );
+  const urlEcho = workflow.indexOf("`echo ${terminalUrl}`");
+  const splitLoop = workflow.indexOf(
+    'for (const orientation of ["vertical", "horizontal", "vertical"])',
+  );
+  const eightPtyGate = workflow.indexOf(
+    "const nativeSessionsAtLimit = await terminalSessionIdentities",
+  );
+  const searchMarker = workflow.indexOf('const searchMarker = "ja_terminal_search_input"');
+  const backgroundMarker = workflow.indexOf(
+    'const backgroundStartedMarker = "ja_terminal_background_started"',
+  );
+  const browserSwitch = workflow.indexOf('chooseWorkbenchTool(page, "浏览器", deadline)');
+  const terminalRestore = workflow.indexOf(
+    'chooseWorkbenchTool(page, "终端", deadline)',
+    browserSwitch,
+  );
+  assert.ok(cwdMarker >= 0 && cwdMarker < capacityGate);
+  assert.ok(capacityGate < urlEcho && urlEcho < splitLoop);
+  assert.equal((workflow.match(/`echo \$\{terminalUrl\}`/gu) ?? []).length, 1);
+  assert.ok(workflow.indexOf('"Ctrl+点击 URL 语义"') < workflow.indexOf("const urlWorkbenchState"));
+  assert.ok(workflow.indexOf("const urlWorkbenchState") < splitLoop);
+  assert.match(workflow, /urlWorkbenchState\.active !== "terminal"/u);
+  assert.match(
+    workflow,
+    /assertTerminalPaneSessionContinuity\([\s\S]*?urlPaneSessionsBefore[\s\S]*?1,[\s\S]*?"单 pane URL 点击后返回 Terminal"/u,
+  );
+  assert.ok(splitLoop < eightPtyGate && eightPtyGate < searchMarker);
+  assert.ok(searchMarker < backgroundMarker && backgroundMarker < browserSwitch);
+  assert.ok(browserSwitch < terminalRestore);
+  assert.match(viewport, /getBoundingClientRect\(\)/u);
+  assert.match(viewport, /visibleColumns < evidence\.requiredColumns/u);
+  assert.match(viewport, /visibleRows < evidence\.requiredRows/u);
+  assert.match(viewport, /requiredRows: 8/u);
+});
+
 /** 关闭新 pane 依目标自己的响应式控件；无控件或双控件可见都必须作为 UI 回归失败。 */
 test("routes Terminal pane close through one visible responsive control", async () => {
   assert.equal(
