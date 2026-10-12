@@ -26,18 +26,36 @@ async function fixture(t) {
       const target = path.join(directory, ...relative.split("/"));
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, content);
-      artifacts[relative] = { sizeBytes: content.length, sha256: createHash("sha256").update(content).digest("hex") };
+      artifacts[relative] = {
+        sizeBytes: content.length,
+        sha256: createHash("sha256").update(content).digest("hex"),
+      };
     }
     await mkdir(path.join(directory, "bin"));
     await writeFile(path.join(directory, "bin", "ja.cjs"), "same-launcher");
     await writeFile(path.join(directory, "bin", "verify.cjs"), "same-verifier");
-    await writeFile(path.join(directory, "package.json"), JSON.stringify({
-      name: "@kongweiguang/ja", version: "0.2.0", bin: { ja: "bin/ja.cjs" },
-      os: ["win32"], cpu: ["x64"], engines: { node: ">=24 <25" }, license: "GPL-3.0-or-later",
-    }));
-    await writeFile(path.join(directory, "runtime", "manifest.json"), JSON.stringify({
-      schemaVersion: 1, version: "0.2.0", target: "win32-x64", sourceCommit: "a".repeat(40), artifacts,
-    }));
+    await writeFile(
+      path.join(directory, "package.json"),
+      JSON.stringify({
+        name: "@kongweiguang/ja",
+        version: "0.2.0",
+        bin: { ja: "bin/ja.cjs" },
+        os: ["win32"],
+        cpu: ["x64"],
+        engines: { node: ">=24 <25" },
+        license: "GPL-3.0-or-later",
+      }),
+    );
+    await writeFile(
+      path.join(directory, "runtime", "manifest.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        version: "0.2.0",
+        target: "win32-x64",
+        sourceCommit: "a".repeat(40),
+        artifacts,
+      }),
+    );
   }
   return directories;
 }
@@ -55,15 +73,50 @@ test("same source with a rebuilt CLI remains reusable", async (t) => {
   await verifyPublished(...roots);
 });
 
+// npm bin-links 只移除真实入口 shebang 行的 CR；其余正文仍须字节相同。
+test("npm installed bin hashbang normalization remains reusable", async (t) => {
+  const roots = await fixture(t);
+  await writeFile(
+    path.join(roots[0], "bin", "ja.cjs"),
+    "#!/usr/bin/env node\nconst value = 1;\r\n",
+  );
+  await writeFile(
+    path.join(roots[1], "bin", "ja.cjs"),
+    "#!/usr/bin/env node\r\nconst value = 1;\r\n",
+  );
+  await verifyPublished(...roots);
+});
+
+test("bin body line ending changes still block release", async (t) => {
+  const roots = await fixture(t);
+  await writeFile(path.join(roots[0], "bin", "ja.cjs"), "#!/usr/bin/env node\nconst value = 1;\n");
+  await writeFile(
+    path.join(roots[1], "bin", "ja.cjs"),
+    "#!/usr/bin/env node\r\nconst value = 1;\r\n",
+  );
+  await assert.rejects(verifyPublished(...roots), /published launcher differs/u);
+});
+
+test("a non-bin verifier hashbang cannot be normalized", async (t) => {
+  const roots = await fixture(t);
+  await writeFile(path.join(roots[0], "bin", "verify.cjs"), "#!/usr/bin/env node\nverify();\r\n");
+  await writeFile(path.join(roots[1], "bin", "verify.cjs"), "#!/usr/bin/env node\r\nverify();\r\n");
+  await assert.rejects(verifyPublished(...roots), /published launcher differs/u);
+});
+
 test("an occupied npm version from another commit blocks release", async (t) => {
   const roots = await fixture(t);
-  await changeManifest(roots[0], (manifest) => { manifest.sourceCommit = "b".repeat(40); });
+  await changeManifest(roots[0], (manifest) => {
+    manifest.sourceCommit = "b".repeat(40);
+  });
   await assert.rejects(verifyPublished(...roots), /another source commit/u);
 });
 
 test("a package without the pinned tools cannot satisfy a rerun", async (t) => {
   const roots = await fixture(t);
-  await changeManifest(roots[0], (manifest) => { delete manifest.artifacts["runtime/bin/sidecars/tools/fd.exe"]; });
+  await changeManifest(roots[0], (manifest) => {
+    delete manifest.artifacts["runtime/bin/sidecars/tools/fd.exe"];
+  });
   await assert.rejects(verifyPublished(...roots), /native dependencies differ/u);
 });
 
@@ -79,7 +132,10 @@ test("a self-consistent but different server blocks release", async (t) => {
   const content = Buffer.from("other-server");
   await writeFile(path.join(roots[0], ...relative.split("/")), content);
   await changeManifest(roots[0], (manifest) => {
-    manifest.artifacts[relative] = { sizeBytes: content.length, sha256: createHash("sha256").update(content).digest("hex") };
+    manifest.artifacts[relative] = {
+      sizeBytes: content.length,
+      sha256: createHash("sha256").update(content).digest("hex"),
+    };
   });
   await assert.rejects(verifyPublished(...roots), /runtime dependency differs/u);
 });
