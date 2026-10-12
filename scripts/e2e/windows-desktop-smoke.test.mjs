@@ -1141,8 +1141,8 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
   assert.match(workflow, /new AggregateError\([\s\S]*?\{ cause: workflowFailure \}/u);
 });
 
-/** URL 点击必须在第二 Tab 的完整可见网格中完成；后续多 pane、搜索及隐藏恢复门禁继续原序执行。 @author kongweiguang */
-test("keeps Terminal URL acceptance in the second tab before pane splitting", async () => {
+/** URL 与隐藏输出必须在第二 Tab 的完整单 pane 网格中验收；八 pane、搜索和 PTY 身份门禁仍随后执行。 @author kongweiguang */
+test("keeps Terminal URL and hidden output acceptance before pane splitting", async () => {
   const source = await readFile(new URL("./windows-desktop-smoke.mjs", import.meta.url), "utf8");
   const workflowStart = source.indexOf("async function exerciseTerminalWorkspace(");
   const workflowEnd = source.indexOf("/**\n * 目录属于可解析的本地目标", workflowStart);
@@ -1173,19 +1173,27 @@ test("keeps Terminal URL acceptance in the second tab before pane splitting", as
     'chooseWorkbenchTool(page, "终端", deadline)',
     browserSwitch,
   );
+  const urlReturn = workflow.indexOf("const urlWorkbenchState =");
   assert.ok(cwdMarker >= 0 && cwdMarker < capacityGate);
   assert.ok(capacityGate < urlEcho && urlEcho < splitLoop);
   assert.equal((workflow.match(/`echo \$\{terminalUrl\}`/gu) ?? []).length, 1);
-  assert.ok(workflow.indexOf('"Ctrl+点击 URL 语义"') < workflow.indexOf("const urlWorkbenchState"));
-  assert.ok(workflow.indexOf("const urlWorkbenchState") < splitLoop);
+  assert.ok(workflow.indexOf('"Ctrl+点击 URL 语义"') < urlReturn);
+  assert.ok(urlReturn < backgroundMarker && backgroundMarker < browserSwitch);
+  assert.ok(browserSwitch < terminalRestore && terminalRestore < splitLoop);
+  assert.match(
+    workflow,
+    /hiddenOutputPane[\s\S]*?\.locator\("\.xterm-rows"\)[\s\S]*?rows\.textContent\?\.includes\(expected\)/u,
+  );
+  assert.match(
+    workflow,
+    /assertTerminalPaneSessionContinuity\([\s\S]*?hiddenOutputSessionsBefore[\s\S]*?1,[\s\S]*?"单 pane 隐藏输出后返回 Terminal"/u,
+  );
   assert.match(workflow, /urlWorkbenchState\.active !== "terminal"/u);
   assert.match(
     workflow,
     /assertTerminalPaneSessionContinuity\([\s\S]*?urlPaneSessionsBefore[\s\S]*?1,[\s\S]*?"单 pane URL 点击后返回 Terminal"/u,
   );
   assert.ok(splitLoop < eightPtyGate && eightPtyGate < searchMarker);
-  assert.ok(searchMarker < backgroundMarker && backgroundMarker < browserSwitch);
-  assert.ok(browserSwitch < terminalRestore);
   assert.match(viewport, /getBoundingClientRect\(\)/u);
   assert.match(viewport, /visibleColumns < evidence\.requiredColumns/u);
   assert.match(viewport, /visibleRows < evidence\.requiredRows/u);

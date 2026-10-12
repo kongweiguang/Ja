@@ -24891,7 +24891,8 @@ async function assertTerminalUrlViewportCapacity(terminal, url) {
  * 首个 Tab 通过真实 More 菜单覆盖窄 pane 的 Escape、双方向分屏、关闭与恢复；窄化期间临时调整
  * owned 原生窗口与 Workbench；finally 用独立 5 秒 cleanup deadline 恢复窗口和原尺寸，
  * 避免操作 deadline 耗尽时跳过恢复，同时不扩大主流程预算。
- * 第二 Tab 在分屏前完成 URL 事务，确保 xterm 可见网格能容纳链接和提示行；随后构造两个真实 terminal tab、
+ * 第二 Tab 在分屏前完成 URL 与隐藏输出事务，保证 URL、完成标记和命令后的 Shell prompt
+ * 都落在同一个足够高的可见 xterm 网格；返回后核对该 pane/session identity，再构造两个真实 terminal tab、
  * 每个含四个 pane，所有资源计数限定当前 owner。
  * @author kongweiguang
  */
@@ -25440,6 +25441,112 @@ async function exerciseTerminalWorkspace(
     1,
     "单 pane URL 点击后返回 Terminal",
   );
+
+  const beforeHidePaneIds = await second.panel
+    .locator(".ja-terminal-pane[data-pane-id]")
+    .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
+  const hiddenOutputSessionsBefore = await terminalSessionIdentities(second.panel);
+  if (
+    beforeHidePaneIds.length !== 1 ||
+    hiddenOutputSessionsBefore.length !== 1 ||
+    hiddenOutputSessionsBefore[0]?.paneId !== secondActivePane
+  ) {
+    throw new Error("单 pane 隐藏输出验收缺少唯一 pane/session identity");
+  }
+  const backgroundStartedMarker = "ja_terminal_background_started";
+  const backgroundCompletedMarker = "ja_terminal_background_ok";
+  await writeTerminalCommand(
+    page,
+    second.panel,
+    secondActivePane,
+    "powershell -nop -c \"'ja_terminal_'+'background_started';sleep -Milliseconds 900;'ja_terminal_'+'background_ok'\"",
+    backgroundStartedMarker,
+    ownedWindow,
+    deadline,
+    signal,
+  );
+  const hiddenPollsBefore = await tauriInvokePhaseCount(page, "ja_terminal_poll", "resolved");
+  const hiddenAt = Date.now();
+  const hiddenRemainingMs = deadline - hiddenAt;
+  await chooseWorkbenchTool(page, "浏览器", deadline);
+  // 输出可能比执行中的 marker 更晚到达；保持整格 pane 可见，避免 Shell prompt 挤出待验输出。
+  try {
+    await waitForCondition(
+      "隐藏终端继续后台 poll",
+      async () =>
+        Date.now() - hiddenAt >= 1_100 &&
+        (await tauriInvokePhaseCount(page, "ja_terminal_poll", "resolved")) > hiddenPollsBefore,
+      Math.min(deadline, hiddenAt + 15_000),
+      signal,
+    );
+  } catch (error) {
+    const pollPhases = Object.fromEntries(
+      await Promise.all(
+        ["start", "resolved", "rejected"].map(async (phase) => [
+          phase,
+          await tauriInvokePhaseCount(page, "ja_terminal_poll", phase),
+        ]),
+      ),
+    );
+    const terminalState = await workbench.evaluate((inspector) => {
+      const workbenchRoot = inspector.querySelector(".ja-workbench");
+      const surface = inspector.querySelector(".ja-terminal-workspace");
+      const terminalPanel = inspector.querySelector('[data-tab-panel="terminal"]');
+      return {
+        workspacePresent: surface !== null,
+        hidden: terminalPanel?.hasAttribute("hidden") ?? null,
+        activeWorkbenchTab: workbenchRoot?.getAttribute("data-active-tab") ?? null,
+        openWorkbenchTabs: workbenchRoot?.getAttribute("data-open-tabs") ?? null,
+        renderedTabs: [...inspector.querySelectorAll(".ja-workbench-tab-shell[data-tab]")].map(
+          (tab) => tab.getAttribute("data-tab"),
+        ),
+        panes:
+          surface === null
+            ? []
+            : [...surface.querySelectorAll(".ja-terminal-pane[data-pane-id]")].map((pane) => ({
+                paneId: pane.getAttribute("data-pane-id"),
+                lifecycle:
+                  pane.querySelector(".ja-terminal-pane-state")?.textContent?.trim() ?? null,
+              })),
+      };
+    });
+    const sessions =
+      (await terminalWorkspace.count()) === 1
+        ? await terminalSessionIdentities(terminalWorkspace)
+        : [];
+    throw new Error(
+      `隐藏终端继续后台 poll 失败：${JSON.stringify({ hiddenPollsBefore, pollPhases, hiddenRemainingMs, elapsedMs: Date.now() - hiddenAt, sessionCount: sessions.length, terminalState })}`,
+      { cause: error },
+    );
+  }
+  await chooseWorkbenchTool(page, "终端", deadline);
+  const hiddenOutputPane = second.panel.locator(
+    `.ja-terminal-pane[data-pane-id="${secondActivePane}"]`,
+  );
+  await waitForCondition(
+    "当前 Thread 单 pane 隐藏终端输出恢复显示",
+    () =>
+      hiddenOutputPane
+        .locator(".xterm-rows")
+        .evaluate(
+          (rows, expected) => rows.textContent?.includes(expected) === true,
+          backgroundCompletedMarker,
+        ),
+    deadline,
+    signal,
+  );
+  const afterShowPaneIds = await second.panel
+    .locator(".ja-terminal-pane[data-pane-id]")
+    .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
+  if (JSON.stringify(beforeHidePaneIds) !== JSON.stringify(afterShowPaneIds))
+    throw new Error("外层 Tab 隐藏后单 pane identity 变化");
+  await assertTerminalPaneSessionContinuity(
+    second.panel,
+    hiddenOutputSessionsBefore,
+    1,
+    "单 pane 隐藏输出后返回 Terminal",
+  );
+
   for (const orientation of ["vertical", "horizontal", "vertical"]) {
     secondActivePane = await splitTerminalPane(
       page,
@@ -25535,96 +25642,6 @@ async function exerciseTerminalWorkspace(
   );
   await search.waitFor({ state: "detached", timeout: timeout() });
 
-  const beforeHidePaneIds = await terminalWorkspace
-    .locator(".ja-terminal-pane[data-pane-id]")
-    .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
-  const backgroundStartedMarker = "ja_terminal_background_started";
-  const backgroundCompletedMarker = "ja_terminal_background_ok";
-  await writeTerminalCommand(
-    page,
-    second.panel,
-    secondActivePane,
-    "powershell -nop -c \"'ja_terminal_'+'background_started';sleep -Milliseconds 900;'ja_terminal_'+'background_ok'\"",
-    backgroundStartedMarker,
-    ownedWindow,
-    deadline,
-    signal,
-  );
-  const hiddenPollsBefore = await tauriInvokePhaseCount(page, "ja_terminal_poll", "resolved");
-  const hiddenAt = Date.now();
-  const hiddenRemainingMs = deadline - hiddenAt;
-  await chooseWorkbenchTool(page, "浏览器", deadline);
-  // outer panel 为 `hidden` 时，xterm 可能延迟 DOM 绘制；产品合同要求继续原生轮询并缓冲输出，
-  // 用户返回后准确渲染，而不是修改不可见 canvas。
-  try {
-    await waitForCondition(
-      "隐藏终端继续后台 poll",
-      async () =>
-        Date.now() - hiddenAt >= 1_100 &&
-        (await tauriInvokePhaseCount(page, "ja_terminal_poll", "resolved")) > hiddenPollsBefore,
-      Math.min(deadline, hiddenAt + 15_000),
-      signal,
-    );
-  } catch (error) {
-    const pollPhases = Object.fromEntries(
-      await Promise.all(
-        ["start", "resolved", "rejected"].map(async (phase) => [
-          phase,
-          await tauriInvokePhaseCount(page, "ja_terminal_poll", phase),
-        ]),
-      ),
-    );
-    const terminalState = await workbench.evaluate((inspector) => {
-      const workbenchRoot = inspector.querySelector(".ja-workbench");
-      const surface = inspector.querySelector(".ja-terminal-workspace");
-      const terminalPanel = inspector.querySelector('[data-tab-panel="terminal"]');
-      return {
-        workspacePresent: surface !== null,
-        hidden: terminalPanel?.hasAttribute("hidden") ?? null,
-        activeWorkbenchTab: workbenchRoot?.getAttribute("data-active-tab") ?? null,
-        openWorkbenchTabs: workbenchRoot?.getAttribute("data-open-tabs") ?? null,
-        renderedTabs: [...inspector.querySelectorAll(".ja-workbench-tab-shell[data-tab]")].map(
-          (tab) => tab.getAttribute("data-tab"),
-        ),
-        panes:
-          surface === null
-            ? []
-            : [...surface.querySelectorAll(".ja-terminal-pane[data-pane-id]")].map((pane) => ({
-                paneId: pane.getAttribute("data-pane-id"),
-                lifecycle:
-                  pane.querySelector(".ja-terminal-pane-state")?.textContent?.trim() ?? null,
-              })),
-      };
-    });
-    const sessions =
-      (await terminalWorkspace.count()) === 1
-        ? await terminalSessionIdentities(terminalWorkspace)
-        : [];
-    throw new Error(
-      `隐藏终端继续后台 poll 失败：${JSON.stringify({ hiddenPollsBefore, pollPhases, hiddenRemainingMs, elapsedMs: Date.now() - hiddenAt, sessionCount: sessions.length, terminalState })}`,
-      { cause: error },
-    );
-  }
-  await chooseWorkbenchTool(page, "终端", deadline);
-  await waitForCondition(
-    "当前 Thread 隐藏终端输出恢复显示",
-    () =>
-      terminalWorkspace.evaluate(
-        (surface, expected) =>
-          [...surface.querySelectorAll(".xterm-rows")].some(
-            (rows) => rows.textContent?.includes(expected) === true,
-          ),
-        backgroundCompletedMarker,
-      ),
-    deadline,
-    signal,
-  );
-  const afterShowPaneIds = await terminalWorkspace
-    .locator(".ja-terminal-pane[data-pane-id]")
-    .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
-  if (JSON.stringify(beforeHidePaneIds) !== JSON.stringify(afterShowPaneIds))
-    throw new Error("外层 Tab 隐藏后终端 pane identity 变化");
-
   const secondPaneSessionsBeforeClose = await terminalSessionIdentities(second.panel);
   if (secondPaneSessionsBeforeClose.length !== 4)
     throw new Error("八 pane 阶段第二个 Tab 缺少四个关闭前 session identity");
@@ -25702,6 +25719,11 @@ async function exerciseTerminalWorkspace(
         restoredPaneCount: 4,
       },
       preservedAcrossOuterTab: true,
+      hiddenOutput: {
+        pollContinuedWhileHidden: true,
+        completedMarkerRenderedOnReturn: true,
+        paneSessionPreserved: true,
+      },
       closedPaneAndTab: true,
       unicodeInput: {
         status: "blocked",
