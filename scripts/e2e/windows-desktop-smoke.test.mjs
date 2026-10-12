@@ -69,6 +69,7 @@ import {
   waitForStableTerminalPaneWidth,
   deriveTerminalPaneRatioFromPointerEvidence,
   terminalPaneCloseRoute,
+  terminalPaneResponsiveRoute,
   terminalWorkspaceFailureSummary,
   workbenchCloseFocusEvidenceInPage,
   waitForWorkbenchCloseFocus,
@@ -1054,7 +1055,10 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
   const ratioStart = source.indexOf("async function setTerminalPaneSplitRatio(");
   const ratioEnd = source.indexOf("/**\n * 通过 live handle 请求扩大第一支", ratioStart);
   const narrowStart = source.indexOf("async function narrowTerminalPaneWithSplitHandle(");
-  const narrowEnd = source.indexOf("/**\n * 用当前 pane 的可访问名称定位 More", narrowStart);
+  const narrowEnd = source.indexOf(
+    "/**\n * 依据当前 CSS 实际显示的响应式入口定位 More",
+    narrowStart,
+  );
   const filesWaitStart = source.indexOf("async function waitForStableFilesTreeGeometry(");
   const filesWaitEnd = source.indexOf("async function exerciseFilesTreeScroll(", filesWaitStart);
   const terminalWaitStart = source.indexOf("export async function waitForStableTerminalPaneWidth(");
@@ -1062,17 +1066,24 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
     "async function setTerminalPaneSplitRatio(",
     terminalWaitStart,
   );
+  const responsiveMenuStart = source.indexOf("async function openNarrowTerminalPaneMenu(");
+  const responsiveMenuEnd = source.indexOf(
+    "/**\n * 根据目标 pane 当前实际可见的响应式按钮选择关闭路径",
+    responsiveMenuStart,
+  );
   assert.ok(workflowStart >= 0 && workflowEnd > workflowStart);
   assert.ok(ratioStart >= 0 && ratioEnd > ratioStart);
   assert.ok(narrowStart >= 0 && narrowEnd > narrowStart);
   assert.ok(filesWaitStart >= 0 && filesWaitEnd > filesWaitStart);
   assert.ok(terminalWaitStart >= 0 && terminalWaitEnd > terminalWaitStart);
+  assert.ok(responsiveMenuStart >= 0 && responsiveMenuEnd > responsiveMenuStart);
 
   const workflow = source.slice(workflowStart, workflowEnd);
   const ratio = source.slice(ratioStart, ratioEnd);
   const narrow = source.slice(narrowStart, narrowEnd);
   const filesWait = source.slice(filesWaitStart, filesWaitEnd);
   const terminalWait = source.slice(terminalWaitStart, terminalWaitEnd);
+  const responsiveMenu = source.slice(responsiveMenuStart, responsiveMenuEnd);
   assert.match(workflow, /\{ width: 1280, height: 900 \}/u);
   assert.match(workflow, /minimumWorkbenchSize/);
   assert.match(
@@ -1104,8 +1115,17 @@ test("locks the narrow Terminal menu smoke to real resize and restoration", asyn
   );
   assert.match(narrow, /geometry: resized\.geometry/u);
   assert.match(workflow, /openNarrowTerminalPaneMenu\([\s\S]*?narrowPaneId/u);
+  assert.match(workflow, /assertPaneSplitUnavailableAtLimit\([\s\S]*?"vertical"/u);
+  assert.match(workflow, /assertPaneSplitUnavailableAtLimit\([\s\S]*?"horizontal"/u);
+  assert.match(workflow, /closeTerminalPaneWithResponsiveControl\([\s\S]*?secondPaneToClose/u);
   assert.match(workflow, /closeTerminalPaneWithResponsiveControl\([\s\S]*?closingPane/u);
+  assert.match(
+    workflow,
+    /assertTerminalPaneSessionContinuity\([\s\S]*?secondPaneSessionsBeforeClose\.filter/u,
+  );
   assert.match(workflow, /responsive_pane_close_control_selected/u);
+  assert.match(responsiveMenu, /visibleDirectActionCount !== 0/u);
+  assert.doesNotMatch(responsiveMenu, /width\s*>=\s*64/u);
   assert.match(filesWait, /waitForCondition\(/u);
   assert.match(filesWait, /references\.evaluate\(readFilesTreeGeometryFromReferences\)/u);
   assert.match(filesWait, /identityChanged[\s\S]*?stableSamples = 0/u);
@@ -1163,6 +1183,20 @@ test("routes Terminal pane close through one visible responsive control", async 
         moreVisible: true,
         toolbarCloseVisible: true,
       }),
+    /恰有一个可见/u,
+  );
+});
+
+/** pane 上限入口必须依据唯一可见 route，隐藏 toolbar 不能绕过既有 More menu 语义。 */
+test("routes pane-limit checks through the only visible toolbar or More entry", () => {
+  assert.equal(terminalPaneResponsiveRoute({ moreVisible: true, directVisible: false }), "more");
+  assert.equal(terminalPaneResponsiveRoute({ moreVisible: false, directVisible: true }), "toolbar");
+  assert.throws(
+    () => terminalPaneResponsiveRoute({ moreVisible: false, directVisible: false }),
+    /恰有一个可见/u,
+  );
+  assert.throws(
+    () => terminalPaneResponsiveRoute({ moreVisible: true, directVisible: true }),
     /恰有一个可见/u,
   );
 });

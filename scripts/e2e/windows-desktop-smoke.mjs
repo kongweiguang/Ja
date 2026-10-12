@@ -23917,15 +23917,27 @@ async function narrowTerminalPaneWithSplitHandle(page, panel, paneId, deadline, 
 }
 
 /**
- * 用当前 pane 的可访问名称定位 More；生产文案使用全角冒号，因此选择器须保持逐字一致，
- * 并限定在稳定 pane identity 内，避免同 Tab 的相邻窗格影响唯一性判断。
+ * 依据当前 CSS 实际显示的响应式入口定位 More；border-box 与 container query content-box 不等，
+ * 因此用唯一可见 More 和已隐藏 toolbar action 验证布局，不用固定宽度猜测布局状态。
+ * @author kongweiguang
  */
 async function openNarrowTerminalPaneMenu(page, pane, deadline, signal) {
   const trigger = pane.getByRole("button", { name: /^终端窗格操作：/u });
   const triggerCount = await trigger.count();
   if (triggerCount !== 1) throw new Error(`窄终端窗格 More 控件不唯一：${triggerCount}`);
   const width = await pane.evaluate((target) => target.getBoundingClientRect().width);
-  if (width >= 64) throw new Error(`终端 More 点击前窗格并不窄：${width}`);
+  const directActions = pane.locator(
+    ".ja-terminal-pane-actions > button:not(.ja-terminal-pane-menu-trigger)",
+  );
+  const directActionCount = await directActions.count();
+  const visibleDirectActionCount = await directActions.evaluateAll(
+    (buttons) => buttons.filter((button) => button.getClientRects().length > 0).length,
+  );
+  if (directActionCount < 3 || visibleDirectActionCount !== 0) {
+    throw new Error(
+      `More 响应式状态不符合预期：${JSON.stringify({ width, directActionCount, visibleDirectActionCount })}`,
+    );
+  }
   await trigger.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
   if ((await trigger.getAttribute("aria-haspopup")) !== "menu")
     throw new Error("终端窗格 More 未声明 menu 弹出语义");
@@ -23941,12 +23953,120 @@ async function openNarrowTerminalPaneMenu(page, pane, deadline, signal) {
 /**
  * 根据目标 pane 当前实际可见的响应式按钮选择关闭路径；只要求唯一控件可见，
  * 不从 border-box 宽度复算 CSS container query 的 content-box 断点。
+ * @author kongweiguang
  */
 export function terminalPaneCloseRoute({ paneWidth, moreVisible, toolbarCloseVisible }) {
   if (!Number.isFinite(paneWidth) || paneWidth < 0)
     throw new Error("终端 pane 关闭路由缺少有效几何");
-  if (moreVisible === toolbarCloseVisible) throw new Error("终端 pane 关闭入口必须恰有一个可见");
+  return terminalPaneResponsiveRoute({
+    moreVisible,
+    directVisible: toolbarCloseVisible,
+  });
+}
+
+/**
+ * pane 的操作只从唯一可见的 toolbar 或 More 路由验证，保持 disabled 语义来自产品 DOM。
+ * @author kongweiguang
+ */
+export function terminalPaneResponsiveRoute({ moreVisible, directVisible }) {
+  if (typeof moreVisible !== "boolean" || typeof directVisible !== "boolean")
+    throw new Error("终端 pane 响应式入口缺少可见状态");
+  if (moreVisible === directVisible) throw new Error("终端 pane 响应式入口必须恰有一个可见");
   return moreVisible ? "more" : "toolbar";
+}
+
+/**
+ * 达到 pane 上限后，从目标 pane 当前可见入口读取产品 disabled 语义，闭集记录实际响应式路由。
+ * @author kongweiguang
+ */
+async function assertPaneSplitUnavailableAtLimit(page, pane, orientation, deadline, signal) {
+  const actionName = orientation === "vertical" ? "纵向分屏" : "横向分屏";
+  if (orientation !== "vertical" && orientation !== "horizontal")
+    throw new Error("终端 pane 容量检查收到未知分屏方向");
+  const directAction = pane.locator(
+    `.ja-terminal-pane-actions > button[aria-label^="${actionName}不可用："]`,
+  );
+  const more = pane.locator("button.ja-terminal-pane-menu-trigger");
+  const directDomCount = await directAction.count();
+  const moreDomCount = await more.count();
+  const directVisible = directDomCount === 1 && (await directAction.isVisible());
+  const moreVisible = moreDomCount === 1 && (await more.isVisible());
+  const routeFacts = {
+    orientation,
+    directDomCount,
+    moreDomCount,
+    directVisible,
+    moreVisible,
+  };
+  const fail = (reason) => new Error(`${reason}：${JSON.stringify(routeFacts)}`);
+  const record = (extra = {}) => {
+    terminalWorkspaceLastObservation = {
+      stage: "pane_limit_route_selected",
+      ...routeFacts,
+      ...extra,
+    };
+  };
+  if (directDomCount !== 1 || moreDomCount !== 1) throw fail("终端 pane 容量入口 DOM 不唯一");
+
+  let route;
+  try {
+    route = terminalPaneResponsiveRoute({ moreVisible, directVisible });
+  } catch (error) {
+    throw fail(error instanceof Error ? error.message : "终端 pane 响应式入口无效");
+  }
+  record({ route });
+
+  if (route === "toolbar") {
+    const accessibleAction = pane.getByRole("button", {
+      name: new RegExp(`^${actionName}不可用：`, "u"),
+    });
+    const roleCount = await accessibleAction.count();
+    const roleVisible = roleCount === 1 && (await accessibleAction.isVisible());
+    const disabled = roleVisible && (await accessibleAction.isDisabled());
+    record({
+      route,
+      roleCount,
+      roleVisible,
+      disabled,
+      disabledSemantics: "toolbar_unavailable_name_and_disabled",
+    });
+    if (roleCount !== 1 || !roleVisible) throw fail("pane 上限工具栏缺少唯一可见的禁用分屏按钮");
+    if (!disabled) throw fail("pane 上限工具栏分屏按钮仍可用");
+    return { ...routeFacts, route, disabledSemantics: "toolbar_unavailable_name_and_disabled" };
+  }
+
+  const { trigger, menu } = await openNarrowTerminalPaneMenu(page, pane, deadline, signal);
+  const menuAction = menu.getByRole("menuitem", { name: actionName, exact: true });
+  const menuActionCount = await menuAction.count();
+  const menuActionVisible = menuActionCount === 1 && (await menuAction.isVisible());
+  const ariaDisabled = menuActionVisible ? await menuAction.getAttribute("aria-disabled") : null;
+  const disabled = menuActionVisible && (await menuAction.isDisabled());
+  record({
+    route,
+    menuActionCount,
+    menuActionVisible,
+    ariaDisabled: ariaDisabled === "true",
+    disabled,
+    disabledSemantics: "disabled_menuitem",
+  });
+  if (menuActionCount !== 1 || !menuActionVisible)
+    throw fail("pane 上限 More 菜单缺少唯一分屏 menuitem");
+  if (ariaDisabled !== "true" || !disabled)
+    throw fail("pane 上限 More 菜单分屏 menuitem 缺少 disabled 语义");
+  await page.keyboard.press("Escape");
+  await menu.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
+  if ((await trigger.getAttribute("aria-expanded")) !== "false")
+    throw fail("pane 上限 More 菜单 Escape 后未收起");
+  record({
+    route,
+    menuActionCount,
+    menuActionVisible,
+    ariaDisabled: true,
+    disabled: true,
+    disabledSemantics: "disabled_menuitem",
+    menuClosed: true,
+  });
+  return { ...routeFacts, route, disabledSemantics: "disabled_menuitem" };
 }
 
 /**
@@ -24695,6 +24815,7 @@ async function terminalUrlPoints(terminal, url) {
  * owned 原生窗口与 Workbench；finally 用独立 5 秒 cleanup deadline 恢复窗口和原尺寸，
  * 避免操作 deadline 耗尽时跳过恢复，同时不扩大主流程预算。
  * 随后构造两个真实 terminal tab、每个含四个 pane，所有资源计数限定当前 owner。
+ * @author kongweiguang
  */
 async function exerciseTerminalWorkspace(
   page,
@@ -25040,12 +25161,13 @@ async function exerciseTerminalWorkspace(
     .locator(".ja-terminal-pane[data-pane-id]")
     .evaluateAll((panes) => panes.map((pane) => pane.getAttribute("data-pane-id")).sort());
   if (firstPaneIds.length !== 4) throw new Error("首个终端 Tab 未达到四 pane 上限");
-  const perTabLimitControl = first.panel
-    .locator(`.ja-terminal-pane[data-pane-id="${activePaneId}"]`)
-    .getByRole("button", { name: /纵向分屏不可用/u });
-  await perTabLimitControl.waitFor({ state: "visible", timeout: timeout() });
-  if (await perTabLimitControl.isEnabled())
-    throw new Error("单个终端 Tab 达到四 pane 后仍允许分屏");
+  await assertPaneSplitUnavailableAtLimit(
+    page,
+    first.panel.locator(`.ja-terminal-pane[data-pane-id="${activePaneId}"]`),
+    "vertical",
+    deadline,
+    signal,
+  );
   await waitForDelay(200, signal);
   if ((await first.panel.locator(".ja-terminal-pane[data-pane-id]").count()) !== 4)
     throw new Error("单个终端 Tab 超过四 pane 上限");
@@ -25123,12 +25245,16 @@ async function exerciseTerminalWorkspace(
     undefined,
     { timeout: timeout() },
   );
-  const workspaceLimitControl = second.panel
-    .locator(`.ja-terminal-pane[data-pane-id="${secondActivePane}"]`)
-    .getByRole("button", { name: /横向分屏不可用/u });
-  await workspaceLimitControl.waitFor({ state: "visible", timeout: timeout() });
-  if (await workspaceLimitControl.isEnabled())
-    throw new Error("终端工作区达到八 pane 后仍允许分屏");
+  const workspaceLimitControl = second.panel.locator(
+    `.ja-terminal-pane[data-pane-id="${secondActivePane}"]`,
+  );
+  await assertPaneSplitUnavailableAtLimit(
+    page,
+    workspaceLimitControl,
+    "horizontal",
+    deadline,
+    signal,
+  );
   await waitForDelay(200, signal);
   if ((await terminalWorkspace.locator(".ja-terminal-pane[data-pane-id]").count()) !== 8)
     throw new Error("终端工作区超过八个 live pane 上限");
@@ -25386,13 +25512,23 @@ async function exerciseTerminalWorkspace(
   if (JSON.stringify(beforeHidePaneIds) !== JSON.stringify(afterShowPaneIds))
     throw new Error("外层 Tab 隐藏后终端 pane identity 变化");
 
-  await clickVerifiedControl(
-    page,
-    second.panel
-      .locator(`.ja-terminal-pane[data-pane-id="${secondActivePane}"]`)
-      .getByRole("button", { name: "关闭终端窗格", exact: true }),
-    deadline,
+  const secondPaneSessionsBeforeClose = await terminalSessionIdentities(second.panel);
+  if (secondPaneSessionsBeforeClose.length !== 4)
+    throw new Error("八 pane 阶段第二个 Tab 缺少四个关闭前 session identity");
+  const secondPaneToClose = second.panel.locator(
+    `.ja-terminal-pane[data-pane-id="${secondActivePane}"]`,
   );
+  const secondPaneCloseControl = await closeTerminalPaneWithResponsiveControl(
+    page,
+    secondPaneToClose,
+    deadline,
+    signal,
+  );
+  terminalWorkspaceLastObservation = {
+    stage: "workspace_limit_pane_close_route_selected",
+    ...secondPaneCloseControl.evidence,
+    route: secondPaneCloseControl.route,
+  };
   await page.waitForFunction(
     (panelId) =>
       globalThis.document
@@ -25400,6 +25536,12 @@ async function exerciseTerminalWorkspace(
         ?.querySelectorAll(".ja-terminal-pane[data-pane-id]").length === 3,
     second.panelId,
     { timeout: timeout() },
+  );
+  await assertTerminalPaneSessionContinuity(
+    second.panel,
+    secondPaneSessionsBeforeClose.filter(({ paneId }) => paneId !== secondActivePane),
+    3,
+    "八 pane 阶段响应式关闭 pane",
   );
   const secondTitle = (await second.tab.locator(".ja-terminal-tab-title").innerText()).trim();
   await clickVerifiedControl(
