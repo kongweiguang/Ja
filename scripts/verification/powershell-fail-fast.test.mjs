@@ -96,7 +96,6 @@ function assertIndependentVerificationRunsInParallel() {
   assert.ok(nativeJob > verificationJob && npmJob > nativeJob);
   for (const [start, end] of [
     [frontendJob, verificationJob],
-    [verificationJob, nativeJob],
     [nativeJob, npmJob],
   ]) {
     const job = source.slice(start, end);
@@ -111,6 +110,12 @@ function assertIndependentVerificationRunsInParallel() {
   ]) {
     assert.ok(source.includes(`      - name: ${name}`), `${name} is missing`);
   }
+  const verification = source.slice(verificationJob, nativeJob);
+  assert.match(verification, /needs: change-scope/u);
+  assert.match(
+    verification,
+    /always\(\)[\s\S]*needs\.change-scope\.outputs\.run_full_verification != 'false'/u,
+  );
   const release = readWorkflowText(RELEASE_WORKFLOW_PATH);
   assert.match(release, /\.head_sha == \$sha[\s\S]*\.conclusion == "success"/u);
 }

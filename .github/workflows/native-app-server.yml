@@ -87,6 +87,54 @@ concurrency:
   cancel-in-progress: ${{ !inputs.release }}
 
 jobs:
+  change-scope:
+    name: Determine verification scope
+    if: ${{ !inputs.skip_verification }}
+    runs-on: windows-2025
+    timeout-minutes: 5
+    outputs:
+      run_full_verification: ${{ steps.classify.outputs.run_full_verification }}
+    steps:
+      - name: Checkout scope candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 2
+      - name: Classify verification changes
+        id: classify
+        shell: pwsh
+        env:
+          JA_SCOPE_EVENT: ${{ github.event_name }}
+          JA_SCOPE_BASE: ${{ github.event.before }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 比较失败必须回到完整门禁；Git 退出码在每次调用后显式检查，不将未知范围当作仅脚本变化。
+          $PSNativeCommandUseErrorActionPreference = $false
+          $runFull = $true
+          try {
+            $base = $env:JA_SCOPE_BASE
+            if ($env:JA_SCOPE_EVENT -eq 'push' -and $base -cmatch '^[0-9a-f]{40}$' -and $base -ne ('0' * 40)) {
+              git cat-file -e "$base^{commit}" 2>$null
+              if ($LASTEXITCODE -ne 0) { git fetch --no-tags origin $base --depth=1 2>$null }
+              if ($LASTEXITCODE -eq 0) {
+                # 关闭 rename 折叠，生产文件移到 scripts 时仍把旧路径作为删除变化检查。
+                $changed = @(git diff --no-renames --name-only $base HEAD --)
+                if ($LASTEXITCODE -eq 0 -and $changed.Count -gt 0) {
+                  $unknown = @($changed | Where-Object { $_ -cnotmatch '^(scripts/|\.github/workflows/)' })
+                  $runFull = $unknown.Count -gt 0
+                }
+              }
+            }
+          } catch {
+            $runFull = $true
+          }
+          "run_full_verification=$($runFull.ToString().ToLowerInvariant())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          if ($runFull) {
+            'Full JVM/Rust verification required: production changes or scope could not be established.' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          } else {
+            'Only scripts/workflow/release-document changes: full JVM/Rust verification is not repeated in this run. Native build/startup/file-search, frontend and script gates still run for this exact source.' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          }
+
   fast-checks:
     name: Fast checks
     if: ${{ !inputs.skip_verification }}
@@ -261,7 +309,8 @@ jobs:
 
   fast-verification:
     name: Contracts and workspace verification
-    if: ${{ !inputs.skip_verification }}
+    needs: change-scope
+    if: ${{ always() && !cancelled() && !inputs.skip_verification && (needs.change-scope.result != 'success' || needs.change-scope.outputs.run_full_verification != 'false') }}
     runs-on: windows-2025
     timeout-minutes: 120
     steps:

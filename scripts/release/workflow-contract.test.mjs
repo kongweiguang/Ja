@@ -124,7 +124,11 @@ function assertNativeVerificationGraph() {
   assert.match(frontend, /turn-changes-card-browser\.mjs/u);
   assert.match(frontend, /vite build --config apps\/desktop\/vite\.config\.ts/u);
   assert.doesNotMatch(frontend, /^\s+pnpm build\s*$/mu);
-  assert.doesNotMatch(verification, /needs:/u);
+  assert.match(verification, /needs: change-scope/u);
+  assert.match(
+    verification,
+    /always\(\)[\s\S]*needs\.change-scope\.outputs\.run_full_verification != 'false'/u,
+  );
   assert.doesNotMatch(verification, /needs\.fast-checks/u);
   assert.match(verification, /tests\/contract\/run\.ps1/u);
   assert.match(verification, /playwright install chromium/u);
@@ -167,6 +171,34 @@ function assertNativeVerificationGraph() {
 test(
   "native and source verification run in parallel with final release bundle gates",
   assertNativeVerificationGraph,
+);
+
+/** 仅已确认的脚本和流程变化可不重复 JVM/Rust；基准、路径或分类输出未知时必须运行全量。 */
+function assertVerificationScopeFailsClosed() {
+  const source = readWorkflow(NATIVE_WORKFLOW_PATH);
+  const scope = jobBody(source, "change-scope");
+  const classification = stepBody(scope, "Classify verification changes");
+  assert.match(scope, /fetch-depth: 2/u);
+  assert.match(classification, /JA_SCOPE_BASE: \$\{\{ github\.event\.before \}\}/u);
+  assert.match(classification, /\$runFull = \$true/u);
+  assert.match(classification, /JA_SCOPE_EVENT -eq 'push'/u);
+  assert.match(classification, /git cat-file -e/u);
+  assert.match(classification, /git fetch --no-tags origin \$base --depth=1/u);
+  assert.match(classification, /git diff --no-renames --name-only \$base HEAD --/u);
+  assert.match(classification, /\$changed\.Count -gt 0/u);
+  assert.ok(classification.includes("'^(scripts/|\\.github/workflows/)'"));
+  assert.match(classification, /catch \{[\s\S]*\$runFull = \$true/u);
+  const verification = jobBody(source, "fast-verification");
+  assert.match(verification, /always\(\) && !cancelled\(\)/u);
+  assert.match(
+    verification,
+    /needs\.change-scope\.result != 'success' \|\| needs\.change-scope\.outputs\.run_full_verification != 'false'/u,
+  );
+}
+
+test(
+  "verification scope defaults to full for unknown changes or unavailable baselines",
+  assertVerificationScopeFailsClosed,
 );
 
 /** 固定成功主 CI 的精简 artifact 与恢复边界，并约束 SBOM 生产名称，避免原生编译成功后才发现缺文件。 */
