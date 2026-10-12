@@ -85,12 +85,15 @@ function assertWorkflowLineEndingNormalization() {
   const lf = readFileSync(RELEASE_WORKFLOW_PATH, "utf8").replace(/\r\n/gu, "\n");
   const crlf = lf.replace(/\n/gu, "\r\n");
   assert.equal(normalizeWorkflow(lf), normalizeWorkflow(crlf));
-  assert.match(jobBody(normalizeWorkflow(crlf), "verify-release-candidate"), /Require current main/u);
+  assert.match(
+    jobBody(normalizeWorkflow(crlf), "verify-release-candidate"),
+    /Require current main/u,
+  );
 }
 
 test("workflow contract parser normalizes LF and CRLF", assertWorkflowLineEndingNormalization);
 
-/** 固定快速门禁和桌面 reader 回归接线，防止测试遗漏或拆分后 native 提前启动。 */
+/** 独立验证并行产出证据，发布仍由同 SHA 完整成功与最终签名包安装门禁闭环。 */
 function assertNativeVerificationGraph() {
   const source = readWorkflow(NATIVE_WORKFLOW_PATH);
   const fastChecks = jobBody(source, "fast-checks");
@@ -98,12 +101,22 @@ function assertNativeVerificationGraph() {
   const verification = jobBody(source, "fast-verification");
   const native = jobBody(source, "native-app-server");
   assert.match(fastChecks, /Run Python script tests[\s\S]*test_restore_verified_native/u);
-  assert.match(fastChecks, /Run Node script tests[\s\S]*create-updater-manifest\.test\.mjs[\s\S]*workflow-contract\.test\.mjs/u);
+  assert.match(fastChecks, /Run Node script tests[\s\S]*create-updater-manifest\.test\.mjs/u);
+  const workflowTests = stepBody(fastChecks, "Run release workflow contract tests serially");
+  assert.match(workflowTests, /node --test scripts\/release\/workflow-contract\.test\.mjs/u);
   const nodeScripts = stepBody(fastChecks, "Run Node script tests");
-  assert.match(nodeScripts, /node --test[\s\S]*scripts\/e2e\/windows-desktop-smoke\.test\.mjs[\s\S]*process-session-webview2\.test\.mjs/u);
-  assert.match(fastChecks, /pnpm typecheck[\s\S]*pnpm lint[\s\S]*pnpm check:architecture[\s\S]*pnpm check:unused/u);
+  assert.doesNotMatch(nodeScripts, /workflow-contract\.test\.mjs/u);
+  assert.match(
+    nodeScripts,
+    /node --test[\s\S]*scripts\/e2e\/windows-desktop-smoke\.test\.mjs[\s\S]*process-session-webview2\.test\.mjs/u,
+  );
+  assert.match(
+    fastChecks,
+    /pnpm typecheck[\s\S]*pnpm lint[\s\S]*pnpm check:architecture[\s\S]*pnpm check:unused/u,
+  );
   assert.match(fastChecks, /cargo fmt --all -- --check/u);
-  assert.match(frontend, /needs: fast-checks/u);
+  assert.doesNotMatch(frontend, /needs:/u);
+  assert.doesNotMatch(frontend, /needs\.fast-checks/u);
   assert.match(frontend, /playwright install chromium/u);
   assert.match(frontend, /pnpm typecheck:example:spring/u);
   assert.match(frontend, /pnpm test:example:spring/u);
@@ -111,7 +124,8 @@ function assertNativeVerificationGraph() {
   assert.match(frontend, /turn-changes-card-browser\.mjs/u);
   assert.match(frontend, /vite build --config apps\/desktop\/vite\.config\.ts/u);
   assert.doesNotMatch(frontend, /^\s+pnpm build\s*$/mu);
-  assert.match(verification, /needs: fast-checks/u);
+  assert.doesNotMatch(verification, /needs:/u);
+  assert.doesNotMatch(verification, /needs\.fast-checks/u);
   assert.match(verification, /tests\/contract\/run\.ps1/u);
   assert.match(verification, /playwright install chromium/u);
   assert.match(verification, /Run JVM verification and build the Rust test fixture/u);
@@ -121,10 +135,27 @@ function assertNativeVerificationGraph() {
   assert.match(verification, /process-session-webview2\.mjs/u);
   assert.match(verification, /cli-review-loopback\.mjs/u);
   assert.match(verification, /Run the Rust workspace gates/u);
-  assert.match(native, /needs: \[fast-checks, frontend-verification, fast-verification\]/u);
-  assert.match(native, /needs\.frontend-verification\.result == 'success'/u);
-  assert.match(native, /needs\.fast-verification\.result == 'success'/u);
-  assert.match(native, /windows-desktop-smoke\.mjs/u);
+  assert.doesNotMatch(native, /needs:/u);
+  assert.doesNotMatch(native, /windows-desktop-smoke\.mjs/u);
+  assert.doesNotMatch(native, /Run unsigned Tauri (?:NSIS|DMG) bundle/u);
+  const manual = readWorkflow(resolve(".github/workflows/native-smoke-diagnostics.yml"));
+  assert.match(manual, /workflow_dispatch:/u);
+  assert.match(manual, /windows-desktop-smoke\.mjs/u);
+  for (const platform of ["Windows", "macOS"]) {
+    const signed = stepBody(
+      native,
+      platform === "Windows"
+        ? "Build Tauri NSIS bundle with updater signature (Windows)"
+        : "Build Tauri app and DMG with updater signature (macOS)",
+    );
+    assert.match(signed, /env\.JA_RELEASE == 'true'/u);
+    assert.match(signed, /--updater-signed/u);
+  }
+  const installer = stepBody(
+    native,
+    "Run unsigned-system Windows installer install/launch/uninstall smoke",
+  );
+  assert.match(installer, /env\.JA_RELEASE == 'true'/u);
   assert.match(native, /run-windows-installer-smoke\.ps1/u);
   assert.match(native, /!cancelled\(\)/u);
   const npmSmoke = jobBody(source, "npm-package-verification");
@@ -133,7 +164,10 @@ function assertNativeVerificationGraph() {
   assert.match(npmSmoke, /verify-runtime\.mjs/u);
 }
 
-test("native matrix waits for both verification jobs", assertNativeVerificationGraph);
+test(
+  "native and source verification run in parallel with final release bundle gates",
+  assertNativeVerificationGraph,
+);
 
 /** 固定成功主 CI 的精简 artifact 与恢复边界，并约束 SBOM 生产名称，避免原生编译成功后才发现缺文件。 */
 function assertNativeReuseContract() {
@@ -146,7 +180,10 @@ function assertNativeReuseContract() {
     assert.match(report, /ja-app-server\.json/u);
   }
   assert.match(source, /verified_run_id:[\s\S]*required: true[\s\S]*type: string/u);
-  assert.match(source, /name: ja-native-reuse-\$\{\{ matrix\.platform \}\}-\$\{\{ matrix\.arch \}\}/u);
+  assert.match(
+    source,
+    /name: ja-native-reuse-\$\{\{ matrix\.platform \}\}-\$\{\{ matrix\.arch \}\}/u,
+  );
   assert.match(source, /ja-agent\/ja-app-server\/target\/ja-app-server\.exe/u);
   const windowsReuse = stepBody(source, "Prepare native reuse artifact (Windows)");
   const macReuse = stepBody(source, "Prepare native reuse artifact (macOS)");
@@ -159,13 +196,25 @@ function assertNativeReuseContract() {
   }
   for (const platform of ["Windows", "macOS"]) {
     const restore = stepBody(source, `Restore verified native executable (${platform})`);
-    assert.match(restore, /\$inputRoot = Join-Path \$env:RUNNER_TEMP 'ja-verified-native\/native'/u);
+    assert.match(
+      restore,
+      /\$inputRoot = Join-Path \$env:RUNNER_TEMP 'ja-verified-native\/native'/u,
+    );
   }
   assert.match(source, /run-id: \$\{\{ inputs\.verified_run_id \}\}/u);
   assert.match(source, /github-token: \$\{\{ github\.token \}\}/u);
-  assert.match(source, /restore-verified-native\.py[\s\S]*--source-commit[\s\S]*--verified-run-id/u);
-  assert.match(source, /Build App Server Native Image \(Windows\)[\s\S]*if: matrix\.platform == 'windows' && env\.JA_RELEASE != 'true'/u);
-  assert.match(source, /Build App Server Native Image \(macOS\)[\s\S]*if: matrix\.platform == 'macos' && env\.JA_RELEASE != 'true'/u);
+  assert.match(
+    source,
+    /restore-verified-native\.py[\s\S]*--source-commit[\s\S]*--verified-run-id/u,
+  );
+  assert.match(
+    source,
+    /Build App Server Native Image \(Windows\)[\s\S]*if: matrix\.platform == 'windows' && env\.JA_RELEASE != 'true'/u,
+  );
+  assert.match(
+    source,
+    /Build App Server Native Image \(macOS\)[\s\S]*if: matrix\.platform == 'macos' && env\.JA_RELEASE != 'true'/u,
+  );
   assert.match(source, /Upload native build evidence[\s\S]*name: ja-native-app-server-/u);
 }
 
@@ -185,7 +234,10 @@ function assertReleasePreflightContract() {
   assert.match(source, /releases\?per_page=100/u);
   assert.match(source, /git ls-remote --refs origin/u);
   assert.match(source, /echo "verified_run_id=\$verified_run_id"/u);
-  assert.match(source, /verified_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u);
+  assert.match(
+    source,
+    /verified_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u,
+  );
   assert.match(source, /cancel-in-progress: false/u);
   assert.match(source, /signed-native-matrix:[\s\S]*actions: read/u);
   const nativeWorkflow = readWorkflow(NATIVE_WORKFLOW_PATH);
@@ -200,18 +252,30 @@ function assertCoordinatedPublication() {
   const npm = jobBody(source, "publish-npm-cli");
   assert.match(npm, /needs: \[verify-release-candidate, signed-native-matrix\]/u);
   assert.match(npm, /uses: \.\/\.github\/workflows\/npm-cli-publish\.yml/u);
-  assert.match(npm, /source_commit: \$\{\{ needs\.verify-release-candidate\.outputs\.source_commit \}\}/u);
-  assert.match(npm, /native_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u);
+  assert.match(
+    npm,
+    /source_commit: \$\{\{ needs\.verify-release-candidate\.outputs\.source_commit \}\}/u,
+  );
+  assert.match(
+    npm,
+    /native_run_id: \$\{\{ needs\.verify-release-candidate\.outputs\.verified_run_id \}\}/u,
+  );
   assert.match(npm, /id-token: write/u);
   assert.match(npm, /NPM_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/u);
   const publication = jobBody(source, "publish-github-release");
-  assert.match(publication, /needs: \[verify-release-candidate, signed-native-matrix, publish-npm-cli\]/u);
+  assert.match(
+    publication,
+    /needs: \[verify-release-candidate, signed-native-matrix, publish-npm-cli\]/u,
+  );
   assert.doesNotMatch(publication, /if:.*always\(\)|continue-on-error/u);
   assert.match(publication, /sourceCommit == \$sha/u);
   assert.match(publication, /sha256sum --check --strict SHA256SUMS/u);
   assert.match(publication, /gh release edit[\s\S]*--draft=false --latest/u);
   assert.match(publication, /\.draft == false and \.target_commitish == \$sha/u);
-  const preflight = stepBody(source, "Require current main, verified CI artifacts, and release metadata");
+  const preflight = stepBody(
+    source,
+    "Require current main, verified CI artifacts, and release metadata",
+  );
   assert.match(preflight, /First npm publication requires the NPM_TOKEN repository secret/u);
 }
 
@@ -232,8 +296,14 @@ function assertNpmPublicationContract() {
     stepBody(source, "Stage, inspect, and install the npm tarball"),
     stepBody(nativeSource, "Pack, install offline, and exercise the installed npm runtime"),
   ]) {
-    assert.match(candidateStep, /--app-server \(Join-Path \$reuse 'native\/ja-agent\/ja-app-server\/target\/ja-app-server\.exe'\)/u);
-    assert.match(candidateStep, /--native-report \(Join-Path \$reuse 'native\/native-evidence\/build-report\.json'\)/u);
+    assert.match(
+      candidateStep,
+      /--app-server \(Join-Path \$reuse 'native\/ja-agent\/ja-app-server\/target\/ja-app-server\.exe'\)/u,
+    );
+    assert.match(
+      candidateStep,
+      /--native-report \(Join-Path \$reuse 'native\/native-evidence\/build-report\.json'\)/u,
+    );
     assert.match(candidateStep, /--search-tools \(Join-Path \$reuse 'tools'\)/u);
   }
   assert.match(source, /name: ja-npm-windows-x64/u);
@@ -242,12 +312,21 @@ function assertNpmPublicationContract() {
   const publication = stepBody(source, "Publish and read back the verified public npm package");
   assert.match(publication, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/u);
   assert.match(publication, /\$failure\.error\.code -cne 'E404'/u);
-  assert.match(publication, /npm publish --access public --registry=https:\/\/registry\.npmjs\.org/u);
+  assert.match(
+    publication,
+    /npm publish --access public --registry=https:\/\/registry\.npmjs\.org/u,
+  );
   assert.match(publication, /npm install --ignore-scripts[\s\S]*\$spec --registry=/u);
   assert.match(publication, /verify-published\.mjs \$package \$stage/u);
   assert.match(publication, /verify-runtime\.mjs[\s\S]*ja-npm-published-smoke/u);
-  const native = stepBody(readWorkflow(NATIVE_WORKFLOW_PATH), "Prepare native reuse artifact (Windows)");
-  assert.match(native, /Copy-Item -Path \(Join-Path \$env:RUNNER_TEMP 'ja-native-stage\/sidecars\/tools\/\*'\)/u);
+  const native = stepBody(
+    readWorkflow(NATIVE_WORKFLOW_PATH),
+    "Prepare native reuse artifact (Windows)",
+  );
+  assert.match(
+    native,
+    /Copy-Item -Path \(Join-Path \$env:RUNNER_TEMP 'ja-native-stage\/sidecars\/tools\/\*'\)/u,
+  );
   assert.doesNotMatch(native, /Copy-Item -Path 'apps\/desktop\/src-tauri\/sidecars\/tools\/\*'/u);
 }
 

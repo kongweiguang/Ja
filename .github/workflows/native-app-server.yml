@@ -190,9 +190,17 @@ jobs:
             scripts/e2e/windows-desktop-smoke.test.mjs `
             scripts/e2e/process-session-webview2.test.mjs `
             scripts/verification/powershell-fail-fast.test.mjs `
-            scripts/release/create-updater-manifest.test.mjs `
-            scripts/release/workflow-contract.test.mjs
+            scripts/release/create-updater-manifest.test.mjs
           if ($LASTEXITCODE -ne 0) { throw "Node script tests failed with exit code $LASTEXITCODE" }
+
+      # Bash 语法检查单独执行，避免并发 Node fixture 的原生进程启动争用导致原有 10 秒预算失效。
+      - name: Run release workflow contract tests serially
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node --test scripts/release/workflow-contract.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "release workflow contract tests failed with exit code $LASTEXITCODE" }
 
       - name: Run PowerShell script tests
         shell: pwsh
@@ -207,8 +215,7 @@ jobs:
 
   frontend-verification:
     name: Frontend verification
-    needs: fast-checks
-    if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
+    if: ${{ !inputs.skip_verification }}
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
@@ -254,8 +261,7 @@ jobs:
 
   fast-verification:
     name: Contracts and workspace verification
-    needs: fast-checks
-    if: ${{ !inputs.skip_verification && needs.fast-checks.result == 'success' }}
+    if: ${{ !inputs.skip_verification }}
     runs-on: windows-2025
     timeout-minutes: 120
     steps:
@@ -450,19 +456,8 @@ jobs:
 
   native-app-server:
     name: App Server (${{ matrix.platform }} / ${{ matrix.arch }})
-    needs: [fast-checks, frontend-verification, fast-verification]
-    if: >-
-      ${{
-        !cancelled() &&
-        (
-          inputs.skip_verification ||
-          (
-            needs.fast-checks.result == 'success' &&
-            needs.frontend-verification.result == 'success' &&
-            needs.fast-verification.result == 'success'
-          )
-        )
-      }}
+    # 各验证任务并行产出真实证据；release preflight 仍要求同 SHA 的整体 push run 成功。
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -875,40 +870,7 @@ jobs:
           & (Join-Path $stage 'sidecars/tools/fd.exe') --version
           & (Join-Path $stage 'sidecars/tools/rg.exe') --version
 
-      - name: Run isolated Windows desktop WebView2 smoke
-        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
-        shell: pwsh
-        env:
-          JA_E2E_REAL_PROVIDER: "0"
-          JA_E2E_REAL_PROVIDER_API_KEY: ""
-          JA_E2E_KEEP_TEMP: "0"
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $env:JA_E2E_APP_SERVER_JAR = (Resolve-Path 'ja-agent/ja-app-server/target/ja-app-server.jar').Path
-          $env:JA_E2E_SCREENSHOT_DIR = Join-Path $env:RUNNER_TEMP 'ja-windows-desktop-smoke'
-          node scripts/e2e/windows-desktop-smoke.mjs
-          if ($LASTEXITCODE -ne 0) { throw "Windows desktop WebView2 smoke failed with exit code $LASTEXITCODE" }
-
-      # runner 已将目录与凭据脱敏；保留失败 summary，避免下一次只能看到 cleanup 的末级异常。
-      - name: Scan Windows desktop smoke summaries
-        id: desktop_summary_scan
-        if: ${{ always() && matrix.platform == 'windows' && env.JA_RELEASE != 'true' }}
-        shell: pwsh
-        run: |
-          "JA_DESKTOP_SUMMARY=$env:TEMP/ja-e2e-results" | Add-Content $env:GITHUB_ENV
-          python -B scripts/release/check-evidence-secrets.py "$env:TEMP/ja-e2e-results"
-          if ($LASTEXITCODE -ne 0) { throw 'desktop summary credential scan failed' }
-
-      - name: Preserve Windows desktop smoke summaries
-        if: ${{ always() && steps.desktop_summary_scan.conclusion == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: ja-windows-desktop-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.JA_DESKTOP_SUMMARY }}/*.json
-          if-no-files-found: ignore
-          retention-days: 7
-
+      # 综合桌面 WebView2 验收及其诊断产物保留在 native-smoke-diagnostics 手动流程。
       - name: Run file-search acceptance against Native App Server (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -972,46 +934,6 @@ jobs:
           test -f "$JA_NATIVE_EVIDENCE/file-search-acceptance.json"
           cat "$JA_NATIVE_EVIDENCE/file-search-acceptance.json" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run unsigned Tauri NSIS bundle smoke (Windows)
-        if: matrix.platform == 'windows' && env.JA_RELEASE != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $stage = Join-Path $env:RUNNER_TEMP 'ja-native-stage'
-          $source = Join-Path $stage 'sidecars/ja-app-server-${{ matrix.targetTriple }}.exe'
-          $sourceManifest = Join-Path $stage 'sidecar-manifest.json'
-          $toolsSource = Join-Path $stage 'sidecars/tools'
-          $toolsManifest = Join-Path $toolsSource 'tools-manifest.json'
-          $sidecars = Join-Path $PWD 'apps/desktop/src-tauri/sidecars'
-          $target = Join-Path $sidecars 'ja-app-server-${{ matrix.targetTriple }}.exe'
-          $toolsTarget = Join-Path $sidecars 'tools'
-          $evidence = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence'
-          $targetCreated = $false
-          $toolsCreated = $false
-          New-Item -ItemType Directory -Force -Path $sidecars,$evidence | Out-Null
-          try {
-            if (-not (Test-Path -LiteralPath $source)) { throw 'staged Windows sidecar is missing' }
-            if (-not (Test-Path -LiteralPath $sourceManifest)) { throw 'staged sidecar manifest is missing' }
-            if (-not (Test-Path -LiteralPath $toolsSource -PathType Container)) { throw 'staged search-tool directory is missing' }
-            if (-not (Test-Path -LiteralPath $toolsManifest -PathType Leaf)) { throw 'staged search-tool manifest is missing' }
-            if (Test-Path -LiteralPath $target) { throw 'apps/desktop/src-tauri/sidecars already contains the target sidecar' }
-            if (Test-Path -LiteralPath $toolsTarget) { throw 'apps/desktop/src-tauri/sidecars/tools already exists' }
-            $targetCreated = $true
-            Copy-Item -LiteralPath $source -Destination $target
-            $toolsCreated = $true
-            Copy-Item -LiteralPath $toolsSource -Destination $toolsTarget -Recurse
-            '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --no-sign --bundles nsis"}' | Set-Content -LiteralPath (Join-Path $evidence 'bundle-contract.json') -Encoding utf8NoBOM
-            pnpm tauri build --ci --no-sign --bundles nsis
-            if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS bundle failed with exit code $LASTEXITCODE" }
-            python -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/nsis' --extension '${{ matrix.bundleExtension }}' --output-dir $evidence --platform windows --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit $env:JA_SOURCE_COMMIT --sidecar-manifest $sourceManifest --no-sign
-            if ($LASTEXITCODE -ne 0) { throw "bundle evidence collection failed with exit code $LASTEXITCODE" }
-          } finally {
-            if ($targetCreated -and (Test-Path -LiteralPath $target)) { Remove-Item -LiteralPath $target -Force }
-            if ($toolsCreated -and (Test-Path -LiteralPath $toolsTarget)) { Remove-Item -LiteralPath $toolsTarget -Recurse -Force }
-          }
-          if (Test-Path -LiteralPath $target) { throw 'generated Windows sidecar cleanup failed' }
-          if (Test-Path -LiteralPath $toolsTarget) { throw 'generated Windows search-tool cleanup failed' }
-
       - name: Build Tauri NSIS bundle with updater signature (Windows)
         if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
         shell: pwsh
@@ -1057,11 +979,11 @@ jobs:
           if (Test-Path -LiteralPath $toolsTarget) { throw 'generated Windows search-tool cleanup failed' }
 
       - name: Run unsigned-system Windows installer install/launch/uninstall smoke
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && env.JA_RELEASE == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # 发布包和非发布包共用安装生命周期检查；按分发策略不要求操作系统签名，
+          # 只对最终 updater 签名发布包运行安装生命周期检查；系统签名按分发策略不要求，
           # 更新器签名仍单独验证。
           $installers = @(Get-ChildItem -LiteralPath 'target/release/bundle/nsis' -Filter '*.exe' -File | Sort-Object Name)
           if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
@@ -1073,46 +995,6 @@ jobs:
             -RequireUnsigned
           if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw 'installer smoke evidence is missing' }
-
-      - name: Run unsigned Tauri DMG bundle smoke (macOS)
-        if: matrix.platform == 'macos' && env.JA_RELEASE != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          stage="$RUNNER_TEMP/ja-native-stage"
-          source="$stage/sidecars/ja-app-server-${{ matrix.targetTriple }}"
-          source_manifest="$stage/sidecar-manifest.json"
-          tools_source="$stage/sidecars/tools"
-          tools_manifest="$tools_source/tools-manifest.json"
-          sidecars="apps/desktop/src-tauri/sidecars"
-          target="$sidecars/ja-app-server-${{ matrix.targetTriple }}"
-          tools_target="$sidecars/tools"
-          evidence="$RUNNER_TEMP/ja-tauri-bundle-evidence"
-          target_created=false
-          tools_created=false
-          mkdir -p "$sidecars" "$evidence"
-          cleanup() {
-            if [[ "$target_created" == true ]]; then rm -f -- "$target"; fi
-            if [[ "$tools_created" == true ]]; then rm -rf -- "$tools_target"; fi
-          }
-          trap cleanup EXIT
-          test -f "$source"
-          test -f "$source_manifest"
-          test -d "$tools_source"
-          test -f "$tools_manifest"
-          test ! -e "$target"
-          test ! -e "$tools_target"
-          target_created=true
-          cp -- "$source" "$target"
-          tools_created=true
-          cp -R -- "$tools_source" "$tools_target"
-          printf '%s\n' '{"noSign":true,"signingStatus":"unsigned","notarizationStatus":"not-run","command":"pnpm tauri build --ci --no-sign --bundles dmg"}' > "$evidence/bundle-contract.json"
-          pnpm tauri build --ci --no-sign --bundles dmg
-          python3 -B scripts/native/collect-bundle-evidence.py --bundle-dir 'target/release/bundle/dmg' --extension '${{ matrix.bundleExtension }}' --output-dir "$evidence" --platform macos --arch '${{ matrix.arch }}' --bundle '${{ matrix.tauriBundle }}' --source-commit "$JA_SOURCE_COMMIT" --sidecar-manifest "$source_manifest" --no-sign
-          cleanup
-          trap - EXIT
-          test ! -e "$target"
-          test ! -e "$tools_target"
 
       - name: Build Tauri app and DMG with updater signature (macOS)
         if: matrix.platform == 'macos' && env.JA_RELEASE == 'true'
@@ -1246,7 +1128,7 @@ jobs:
           fi
 
       - name: Publish Tauri bundle summary (Windows)
-        if: always() && matrix.platform == 'windows'
+        if: always() && matrix.platform == 'windows' && env.JA_RELEASE == 'true'
         shell: pwsh
         run: |
           $manifest = Join-Path $env:RUNNER_TEMP 'ja-tauri-bundle-evidence/tauri-bundle-manifest.json'
@@ -1257,7 +1139,7 @@ jobs:
           }
 
       - name: Publish Tauri bundle summary (macOS)
-        if: always() && matrix.platform == 'macos'
+        if: always() && matrix.platform == 'macos' && env.JA_RELEASE == 'true'
         shell: bash
         run: |
           set -euo pipefail
