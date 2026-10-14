@@ -12,11 +12,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::composer::Composer;
 use super::markdown_stream::{MarkdownStream, MarkdownStreamPiece};
 use super::model::{
-    InteractionAnswer, InteractionQuestion, InteractionQuestionKind, PendingPrompt,
-    StreamPresentation, TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice,
-    UiCommand, UiEvent, UiReferenceKind, UiSnapshot, UiSubmitMode,
+    InteractionAnswer, InteractionQuestion, InteractionQuestionKind,
+    MESSAGE_PREVIEW_TRUNCATED_NOTICE, PendingPrompt, StreamPresentation, TimelineEntry,
+    TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice, UiCommand, UiEvent,
+    UiReferenceKind, UiSnapshot, UiSubmitMode,
 };
 use super::model_settings::{ModelSettingsEffect, ModelSettingsOutcome, ModelSettingsState};
+use super::paste_burst::{CharDecision, ControlDecision, FlushResult};
 use super::transcript::Transcript;
 
 const MAX_DETAIL_BYTES: usize = 96 * 1024;
@@ -107,6 +109,7 @@ pub(super) enum Panel {
         body: String,
         scroll: DetailScroll,
         return_to_pending: bool,
+        copy_ready: bool,
     },
 }
 
@@ -120,7 +123,7 @@ pub(super) enum DetailScroll {
 /// 保留完整发送缓冲与发送前最后的问题身份，权威问题先到时可去掉临时副本，且不误合并历史相同文本。
 enum PendingSubmission {
     Message {
-        composer: Composer,
+        composer: Box<Composer>,
         previous_user_id: Option<String>,
     },
     Attachment(String),
@@ -164,6 +167,7 @@ pub struct UiState {
     cancellation: CancellationState,
     exit_confirmation: Option<Instant>,
     scheduled_file_search: Option<(String, u64, Instant)>,
+    scheduled_input_history_search: Option<(String, Option<String>, Instant)>,
     query_sequence: u64,
     active_query_id: Option<u64>,
     reference_popup_dismissed: bool,
@@ -226,6 +230,7 @@ impl UiState {
             cancellation: CancellationState::Idle,
             exit_confirmation: None,
             scheduled_file_search: None,
+            scheduled_input_history_search: None,
             query_sequence: 0,
             active_query_id: None,
             reference_popup_dismissed: false,
@@ -342,6 +347,7 @@ impl UiState {
     }
 
     /// 鼠标坐标只由当前 RenderPlan 对应的正文视口解释，覆盖层不把动作透传到背后对话。
+    /// @author kongweiguang
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<UiAction> {
         if self.closed
             || matches!(
@@ -351,16 +357,229 @@ impl UiState {
         {
             return Vec::new();
         }
+        let cancel_selection = if matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            self.transcript.get_mut().pending_selection_copy_id()
+        } else {
+            None
+        };
         let changed = self.transcript.get_mut().handle_mouse(mouse);
+        let copy_identity_changed = cancel_selection.is_some_and(|selection_id| {
+            self.transcript.borrow().pending_selection_copy_id() != Some(selection_id)
+        });
+        let mut actions = if changed && copy_identity_changed {
+            cancel_selection
+                .map(|selection_id| UiAction::CancelTranscriptSelection { selection_id })
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if changed && !self.older_page_failed && self.transcript.get_mut().needs_older() {
-            return self.request_older_history();
+            actions.extend(self.request_older_history());
         }
-        Vec::new()
+        actions
+    }
+
+    /// Apply expired text in the reducer so the terminal loop never renders a held character as lost input.
+    /// @author kongweiguang
+    pub(super) fn flush_paste_burst(&mut self, now: Instant) -> bool {
+        let result = self.composer.flush_paste_burst(now);
+        self.apply_paste_flush(result, now)
+    }
+
+    /// Let the bridge wake at the classifier boundary instead of adding another fixed poll interval.
+    /// @author kongweiguang
+    pub(super) fn next_paste_burst_deadline(&self) -> Option<Instant> {
+        self.composer.paste_burst_deadline()
+    }
+
+    /// End an editor handoff only after visible pending text has been committed to the Composer.
+    /// @author kongweiguang
+    pub(super) fn reset_input_source_handoff(&mut self) {
+        let result = self.composer.flush_paste_burst_before_modified_input();
+        self.apply_paste_flush(result, Instant::now());
+        self.composer.reset_paste_burst();
+    }
+
+    /// Expose whether the active details panel represents a user-facing message.
+    /// @author kongweiguang
+    pub(super) fn is_message_detail_entry_open(&self) -> bool {
+        matches!(
+            self.panel,
+            Some(Panel::Details { ref entry_id, .. }) if self.is_message_detail_entry(entry_id)
+        )
+    }
+
+    /// The footer advertises copy only after the controller confirms a complete bounded message read.
+    /// @author kongweiguang
+    pub(super) fn message_detail_copy_ready(&self) -> bool {
+        matches!(
+            self.panel,
+            Some(Panel::Details {
+                ref entry_id,
+                copy_ready: true,
+                ..
+            }) if self.is_message_detail_entry(entry_id)
+        )
+    }
+
+    /// Advertise F2 only when the current single-message selection or reading anchor resolves to a message.
+    /// @author kongweiguang
+    pub(super) fn has_message_detail_target(&self) -> bool {
+        let transcript = self.transcript.borrow();
+        let entry_id = if transcript.has_selection() {
+            transcript.selected_entry_id()
+        } else {
+            transcript.anchor_entry_id()
+        };
+        entry_id
+            .and_then(|entry_id| transcript.entry(&entry_id))
+            .is_some_and(|entry| is_message_entry_kind(&entry.kind))
+    }
+
+    /// Resolve detail actions against the transcript source so tool artifacts never inherit message-only copy semantics.
+    /// @author kongweiguang
+    fn is_message_detail_entry(&self, entry_id: &str) -> bool {
+        self.transcript
+            .borrow()
+            .entry(entry_id)
+            .is_some_and(|entry| is_message_entry_kind(&entry.kind))
+    }
+
+    /// Prompt text uses the same bounded editor while keeping command and workspace-query shortcuts out of answers.
+    /// @author kongweiguang
+    fn is_prompt_text_editor(&self) -> bool {
+        matches!(self.panel, Some(Panel::Pending))
+            && matches!(
+                self.snapshot.pending_prompt.as_ref(),
+                Some(PendingPrompt::Clarification { questions, .. })
+                    if questions.get(self.question_index).is_some_and(|question| {
+                        question.kind == InteractionQuestionKind::Text || self.using_free_text
+                    })
+            )
+    }
+
+    /// Only visible composer and free-text prompt input may own delayed keystrokes.
+    /// @author kongweiguang
+    fn is_text_editing_context(&self) -> bool {
+        matches!(self.panel, None | Some(Panel::Commands { .. })) || self.is_prompt_text_editor()
+    }
+
+    /// Apply held input in order; pasted bursts enter the bounded editor atomically so overflow cannot leave a prefix.
+    /// @author kongweiguang
+    fn apply_paste_flush(&mut self, result: FlushResult, now: Instant) -> bool {
+        match result {
+            FlushResult::None => false,
+            FlushResult::Typed(ch) => {
+                if self.is_prompt_text_editor() {
+                    self.insert_edit_text(&ch.to_string());
+                } else {
+                    self.accept_composer_character(ch, now);
+                }
+                true
+            }
+            FlushResult::Paste(text) => {
+                if !self.composer.insert_text(&text) {
+                    self.snapshot.notice = Some("粘贴超过 32 KiB，草稿未改变；请缩短后重试".into());
+                } else if !self.is_prompt_text_editor() {
+                    self.after_composer_text(now);
+                }
+                true
+            }
+            FlushResult::Rejected => {
+                self.snapshot.notice = Some("粘贴超过 32 KiB，草稿未改变；请缩短后重试".into());
+                true
+            }
+        }
+    }
+
+    /// Recompute suggestions only after the full accepted text is present, so burst-held markers are not missed.
+    /// @author kongweiguang
+    fn after_composer_text(&mut self, now: Instant) {
+        self.schedule_file_search(now);
+        if matches!(self.panel, Some(Panel::Commands { .. })) {
+            self.panel = if self.composer.text().starts_with('/')
+                && !self.composer.text().chars().any(char::is_whitespace)
+            {
+                Some(Panel::Commands { selected: 0 })
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Shortcut characters take effect only after the paste classifier releases them as ordinary typing.
+    /// @author kongweiguang
+    fn accept_composer_character(&mut self, ch: char, now: Instant) {
+        if self.is_prompt_text_editor() {
+            self.insert_edit_text(&ch.to_string());
+            return;
+        }
+        if ch == '?' && self.composer.is_empty() && self.panel.is_none() {
+            self.panel = Some(Panel::Help {
+                scroll: DetailScroll::FromTop(0),
+            });
+            return;
+        }
+        let opening_command = ch == '/' && self.composer.is_empty();
+        self.insert_edit_text(&ch.to_string());
+        if opening_command {
+            self.panel = Some(Panel::Commands { selected: 0 });
+            self.snapshot.notice = None;
+        }
+        self.after_composer_text(now);
+    }
+
+    /// Consume a newline only after applying any prior expired text, preserving Enter's send boundary.
+    /// @author kongweiguang
+    fn consume_paste_newline(&mut self, now: Instant) -> ControlDecision {
+        let input = self.composer.consume_paste_newline(now);
+        self.apply_paste_flush(input.flushed, now);
+        input.decision
+    }
+
+    /// A tab inside a classified burst belongs to text; otherwise the existing picker/navigation action remains.
+    /// @author kongweiguang
+    fn consume_paste_tab(&mut self, now: Instant) -> ControlDecision {
+        let input = self.composer.consume_paste_tab(now);
+        self.apply_paste_flush(input.flushed, now);
+        input.decision
     }
 
     /// 选区复制始终先于取消；装饰性空选区也消费复制键，避免误中断正在运行的任务。
+    /// @author kongweiguang
     fn transcript_key(&mut self, key: KeyEvent) -> Option<Vec<UiAction>> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::F(2) {
+            let transcript = self.transcript.get_mut();
+            let entry_id = if transcript.has_selection() {
+                transcript.selected_entry_id()
+            } else {
+                transcript.anchor_entry_id()
+            }?;
+            let entry = transcript.entry(&entry_id)?.clone();
+            if !is_message_entry_kind(&entry.kind) {
+                return Some(Vec::new());
+            }
+            let truncated = entry.detail.as_deref() == Some(MESSAGE_PREVIEW_TRUNCATED_NOTICE);
+            let message = if truncated {
+                "正文未完整加载；正在读取全文。"
+            } else {
+                "正在读取全文；当前正文作为安全预览。"
+            };
+            self.panel = Some(Panel::Details {
+                entry_id: entry.id.clone(),
+                title: entry.kind.message_detail_title().to_owned(),
+                body: format!("{message}\n\n{}", entry.text),
+                scroll: DetailScroll::FromTop(0),
+                return_to_pending: false,
+                copy_ready: false,
+            });
+            return Some(vec![UiAction::OpenDetails { entry_id: entry.id }]);
+        }
         let copy_key = control && matches!(key.code, KeyCode::Char('c' | 'C') | KeyCode::Insert);
         if copy_key && self.transcript.get_mut().has_selection() {
             if let Some((selection_id, text)) = self.transcript.get_mut().selection_copy() {
@@ -374,7 +593,17 @@ impl UiState {
         }
         match key.code {
             KeyCode::Esc if self.transcript.get_mut().has_selection() => {
+                let cancel = self
+                    .transcript
+                    .get_mut()
+                    .pending_selection_copy_id()
+                    .map(|selection_id| UiAction::CancelTranscriptSelection { selection_id });
                 self.transcript.get_mut().clear_selection();
+                let mut actions = cancel.into_iter().collect::<Vec<_>>();
+                if !self.older_page_failed && self.transcript.get_mut().needs_older() {
+                    actions.extend(self.request_older_history());
+                }
+                return Some(actions);
             }
             KeyCode::Esc if self.transcript.get_mut().is_browsing() => {
                 self.transcript.get_mut().follow_latest();
@@ -419,6 +648,7 @@ impl UiState {
 
     /// @author kongweiguang
     /// 快照先对账再归档；异步用量与详情增量不得触碰草稿、流账本、操作锁或已关闭面板。
+    /// 编辑器的新正文只有被 Composer 接纳后才结清旧反馈，拒绝或在途提交仍保留原状态。
     pub fn apply(&mut self, event: UiEvent) {
         match event {
             UiEvent::ReplaceSnapshot(snapshot) => {
@@ -464,6 +694,18 @@ impl UiState {
                     self.tool_detail_return_id = None;
                     self.active_query_id = None;
                     self.scheduled_file_search = None;
+                    self.scheduled_input_history_search = None;
+                    if matches!(
+                        self.panel,
+                        Some(Panel::Choices {
+                            kind: ChoiceKind::InputHistory,
+                            ..
+                        })
+                    ) {
+                        self.panel = None;
+                        self.input_history_query.clear();
+                        self.input_history_texts.clear();
+                    }
                     self.finalize_all_streams();
                     self.stream_receipts.clear();
                     self.transcript.get_mut().clear();
@@ -1020,7 +1262,7 @@ impl UiState {
                 }) = self.pending_submission.take()
                     && submitted.text() == draft
                 {
-                    self.composer.restore_submission(submitted);
+                    self.composer.restore_submission(*submitted);
                 } else if self.composer.is_empty() {
                     self.composer.set_text(&draft);
                 }
@@ -1030,9 +1272,13 @@ impl UiState {
             }
             UiEvent::ClearForkDraft => self.active_fork_source = None,
             UiEvent::ReplaceDraft(draft) => {
-                if self.pending_submission.is_none() && !self.composer.set_text(&draft) {
-                    self.snapshot.notice =
-                        Some("编辑后的草稿超过 32 KiB 容量，已保留原草稿。".into());
+                if self.pending_submission.is_none() {
+                    if self.composer.set_text(&draft) {
+                        self.snapshot.notice = None;
+                    } else {
+                        self.snapshot.notice =
+                            Some("编辑后的草稿超过 32 KiB 容量，已保留原草稿。".into());
+                    }
                 }
             }
             UiEvent::ReleaseDraft => self.pending_submission = None,
@@ -1056,6 +1302,7 @@ impl UiState {
                     body: sanitize_text(&body, MAX_DETAIL_BYTES),
                     scroll,
                     return_to_pending: false,
+                    copy_ready: false,
                 });
             }
             UiEvent::UpdateDetailsIfOpen {
@@ -1067,12 +1314,28 @@ impl UiState {
                     entry_id: active_entry_id,
                     title: active_title,
                     body: active_body,
+                    copy_ready,
                     ..
                 }) = self.panel.as_mut()
                     && active_entry_id == &entry_id
+                    // Once the full body is acknowledged, only a new retry may replace it.
+                    && !*copy_ready
                 {
                     *active_title = sanitize_text(&title, 256);
                     *active_body = sanitize_text(&body, MAX_DETAIL_BYTES);
+                }
+            }
+            UiEvent::SetDetailsCopyReady { entry_id, ready } => {
+                let is_message = self.is_message_detail_entry(&entry_id);
+                if let Some(Panel::Details {
+                    entry_id: active_entry_id,
+                    copy_ready,
+                    ..
+                }) = self.panel.as_mut()
+                    && active_entry_id == &entry_id
+                    && is_message
+                {
+                    *copy_ready = ready;
                 }
             }
             UiEvent::SetNotice(notice) => {
@@ -1088,10 +1351,15 @@ impl UiState {
         }
     }
 
-    /// 设置覆盖层仍允许 Ctrl+D 显式退出并先清密钥；F5 只读核实且不会解除未知提交锁或重放副作用。
+    /// 详情复制同时接受终端普遍可达的普通 C 与 Ctrl+Insert；只复制确认完整的消息，Ctrl+C 仍保留原关闭/取消语义。
+    /// @author kongweiguang
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<UiAction> {
         if key.kind != KeyEventKind::Press || self.closed {
             return Vec::new();
+        }
+        if self.is_text_editing_context() && key_ends_paste_candidate(key) {
+            let result = self.composer.flush_paste_burst_before_modified_input();
+            self.apply_paste_flush(result, Instant::now());
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if matches!(self.panel, Some(Panel::ModelSettings))
@@ -1118,6 +1386,22 @@ impl UiState {
             }
         }
         if key.code == KeyCode::F(5) {
+            let retry_message = matches!(
+                self.panel.as_ref(),
+                Some(Panel::Details { entry_id, .. }) if self.is_message_detail_entry(entry_id)
+            );
+            if retry_message
+                && let Some(Panel::Details {
+                    entry_id,
+                    copy_ready,
+                    ..
+                }) = self.panel.as_mut()
+            {
+                *copy_ready = false;
+                return vec![UiAction::OpenDetails {
+                    entry_id: entry_id.clone(),
+                }];
+            }
             return vec![match &self.panel {
                 Some(Panel::Details { entry_id, .. }) if entry_id == "status" => {
                     UiAction::Command(UiCommand::ShowStatus)
@@ -1133,11 +1417,42 @@ impl UiState {
                 _ => UiAction::RefreshSnapshot,
             }];
         }
+        // 普通 C 只在消息详情里映射复制，避免终端截获 Ctrl+Insert 后没有可执行入口。
+        let ordinary_detail_copy = matches!(key.code, KeyCode::Char('c' | 'C'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.is_message_detail_entry_open();
+        if (ordinary_detail_copy || (control && key.code == KeyCode::Insert))
+            && let Some(Panel::Details {
+                entry_id,
+                body,
+                copy_ready,
+                ..
+            }) = self.panel.as_ref()
+        {
+            if *copy_ready && self.is_message_detail_entry(entry_id) {
+                return vec![UiAction::CopyDetails {
+                    entry_id: entry_id.clone(),
+                    text: body.clone(),
+                }];
+            }
+            self.snapshot.notice = Some("消息全文尚未确认读取，暂不能复制".into());
+            return Vec::new();
+        }
         if control && key.code == KeyCode::Char('d') && self.composer.is_empty() {
             self.closed = true;
             return vec![UiAction::Quit];
         }
         if control && key.code == KeyCode::Char('c') {
+            if let Some(Panel::Details {
+                entry_id,
+                return_to_pending,
+                ..
+            }) = self.panel.clone()
+            {
+                return self.close_detail_panel(entry_id, return_to_pending);
+            }
             if self.snapshot.local_operation.is_some()
                 && self.cancellation != CancellationState::Pending
             {
@@ -1152,10 +1467,14 @@ impl UiState {
                 self.restore_choice_detail(kind, &choice_id);
                 return Vec::new();
             }
-            if matches!(
-                self.panel,
-                Some(Panel::Choices { .. } | Panel::Help { .. } | Panel::Details { .. })
-            ) {
+            if matches!(self.panel, Some(Panel::Choices { .. } | Panel::Help { .. })) {
+                let cancel_history = matches!(
+                    self.panel,
+                    Some(Panel::Choices {
+                        kind: ChoiceKind::InputHistory,
+                        ..
+                    })
+                );
                 if matches!(
                     self.panel.as_ref(),
                     Some(Panel::Choices {
@@ -1175,6 +1494,9 @@ impl UiState {
                     self.restore_fork_draft();
                 }
                 self.panel = None;
+                if cancel_history {
+                    return vec![self.cancel_input_history_search()];
+                }
                 return Vec::new();
             }
             let actions = self.composer_key(key);
@@ -1195,22 +1517,7 @@ impl UiState {
             }) => return self.choice_detail_key(key, kind, choice_id, scroll),
             Some(Panel::Pending) => return self.pending_panel_key(key),
             Some(Panel::ModelSettings) => return self.model_settings_key(key),
-            Some(Panel::Details {
-                entry_id,
-                title,
-                body,
-                scroll,
-                return_to_pending,
-            }) => {
-                return self.detail_panel_key(
-                    key,
-                    entry_id,
-                    title,
-                    body,
-                    scroll,
-                    return_to_pending,
-                );
-            }
+            Some(panel @ Panel::Details { .. }) => return self.detail_panel_key(key, panel),
             Some(Panel::Help { scroll }) => {
                 if key.code == KeyCode::Esc
                     || (key.code == KeyCode::Char('?')
@@ -1274,21 +1581,11 @@ impl UiState {
                 _ => {}
             }
         }
-        if key.code == KeyCode::Char('?')
-            && self.composer.is_empty()
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            self.panel = Some(Panel::Help {
-                scroll: DetailScroll::FromTop(0),
-            });
-            return Vec::new();
-        }
         self.composer_key(key)
     }
 
     /// 只在可见编辑态接纳粘贴，详情或选择器不能暗中改写被遮住的草稿。
+    /// @author kongweiguang
     pub fn handle_paste(&mut self, text: &str) {
         if matches!(self.panel, Some(Panel::ModelSettings)) {
             if let Some(settings) = self.model_settings.as_mut() {
@@ -1316,20 +1613,16 @@ impl UiState {
         if !editing {
             return;
         }
+        let now = Instant::now();
+        let pending = self.composer.flush_paste_burst_before_modified_input();
+        self.apply_paste_flush(pending, now);
         self.composer.reset_paste_burst();
         if !self.composer.insert_text(text) {
             self.snapshot.notice = Some("粘贴超过 32 KiB，草稿未改变；请缩短后重试".into());
             return;
         }
-        self.schedule_file_search(Instant::now());
-        if matches!(self.panel, Some(Panel::Commands { .. })) {
-            self.panel = if self.composer.text().starts_with('/')
-                && !self.composer.text().chars().any(char::is_whitespace)
-            {
-                Some(Panel::Commands { selected: 0 })
-            } else {
-                None
-            };
+        if !self.is_prompt_text_editor() {
+            self.after_composer_text(now);
         }
     }
 
@@ -1355,6 +1648,46 @@ impl UiState {
                 query_id,
             })
         }
+    }
+
+    /// Emit only the latest debounced history query while its picker still owns focus.
+    /// @author kongweiguang
+    pub(super) fn take_due_input_history_search(&mut self, now: Instant) -> Option<UiAction> {
+        if !matches!(
+            self.panel,
+            Some(Panel::Choices {
+                kind: ChoiceKind::InputHistory,
+                ..
+            })
+        ) {
+            self.scheduled_input_history_search = None;
+            return None;
+        }
+        let (query, cursor, started) = self.scheduled_input_history_search.as_ref()?;
+        if now.saturating_duration_since(*started) < FILE_SEARCH_DEBOUNCE {
+            return None;
+        }
+        let action = UiAction::SearchInputHistory {
+            query: query.clone(),
+            cursor: cursor.clone(),
+        };
+        self.scheduled_input_history_search = None;
+        Some(action)
+    }
+
+    /// Keep one newest query locally and cancel any older controller read before debounce expires.
+    /// @author kongweiguang
+    fn schedule_input_history_search(&mut self, query: String, now: Instant) -> Vec<UiAction> {
+        self.input_history_query = query.clone();
+        self.scheduled_input_history_search = Some((query, None, now));
+        vec![UiAction::CancelInputHistorySearch]
+    }
+
+    /// Closing the picker clears both its delayed request and controller-side result ownership.
+    /// @author kongweiguang
+    fn cancel_input_history_search(&mut self) -> UiAction {
+        self.scheduled_input_history_search = None;
+        UiAction::CancelInputHistorySearch
     }
 
     /// 命令输入与可见前缀候选同源；Plan 创建先留在编辑区补齐目标，避免空参数触发普通 Turn。
@@ -1423,40 +1756,22 @@ impl UiState {
         Vec::new()
     }
 
-    /// 详情关闭保留草稿和焦点；Diff 额外释放后台读取，迟到结果不能重新打开面板。
-    fn detail_panel_key(
-        &mut self,
-        key: KeyEvent,
-        entry_id: String,
-        title: String,
-        body: String,
-        scroll: DetailScroll,
-        return_to_pending: bool,
-    ) -> Vec<UiAction> {
-        if key.code == KeyCode::Esc {
-            self.panel = if return_to_pending && self.snapshot.pending_prompt.is_some() {
-                Some(Panel::Pending)
-            } else {
-                None
-            };
-            if !return_to_pending && self.tool_detail_return_id.as_deref() == Some(&entry_id) {
-                self.rebuild_tool_choices();
-                if let Some(selected) = self
-                    .tool_choices
-                    .iter()
-                    .position(|choice| choice.id == entry_id)
-                {
-                    self.panel = Some(Panel::Choices {
-                        kind: ChoiceKind::ToolSteps,
-                        selected,
-                    });
-                }
-                self.tool_detail_return_id = None;
-            }
-            if entry_id.starts_with("diff:") {
-                return vec![UiAction::CloseDetails { entry_id }];
-            }
+    /// Details closure preserves draft and anchor state while invalidating the owned asynchronous read.
+    /// @author kongweiguang
+    fn detail_panel_key(&mut self, key: KeyEvent, panel: Panel) -> Vec<UiAction> {
+        let Panel::Details {
+            entry_id,
+            title,
+            body,
+            scroll,
+            return_to_pending,
+            copy_ready,
+        } = panel
+        else {
             return Vec::new();
+        };
+        if key.code == KeyCode::Esc {
+            return self.close_detail_panel(entry_id, return_to_pending);
         }
         let next = match key.code {
             KeyCode::Up => scroll.up(1),
@@ -1473,8 +1788,34 @@ impl UiState {
             body,
             scroll: next,
             return_to_pending,
+            copy_ready,
         });
         Vec::new()
+    }
+
+    /// Close through one path so Esc and Ctrl+C invalidate the same read while restoring the correct parent panel.
+    /// @author kongweiguang
+    fn close_detail_panel(&mut self, entry_id: String, return_to_pending: bool) -> Vec<UiAction> {
+        self.panel = if return_to_pending && self.snapshot.pending_prompt.is_some() {
+            Some(Panel::Pending)
+        } else {
+            None
+        };
+        if !return_to_pending && self.tool_detail_return_id.as_deref() == Some(&entry_id) {
+            self.rebuild_tool_choices();
+            if let Some(selected) = self
+                .tool_choices
+                .iter()
+                .position(|choice| choice.id == entry_id)
+            {
+                self.panel = Some(Panel::Choices {
+                    kind: ChoiceKind::ToolSteps,
+                    selected,
+                });
+            }
+            self.tool_detail_return_id = None;
+        }
+        close_details_action(entry_id)
     }
 
     /// 候选说明独立滚动，返回时使用当前权威列表修正位置而不丢失草稿。
@@ -1540,15 +1881,17 @@ impl UiState {
         if kind == ChoiceKind::InputHistory {
             match key.code {
                 KeyCode::Backspace => {
-                    self.input_history_query.pop();
+                    if self.input_history_query.pop().is_none() {
+                        return Vec::new();
+                    }
                     self.input_history_texts.clear();
                     self.snapshot.input_history_choices.clear();
                     self.snapshot.input_history_next_cursor = None;
                     self.panel = Some(Panel::Choices { kind, selected: 0 });
-                    return vec![UiAction::SearchInputHistory {
-                        query: self.input_history_query.clone(),
-                        cursor: None,
-                    }];
+                    return self.schedule_input_history_search(
+                        self.input_history_query.clone(),
+                        Instant::now(),
+                    );
                 }
                 KeyCode::Char(ch)
                     if !key
@@ -1561,16 +1904,18 @@ impl UiState {
                     self.snapshot.input_history_choices.clear();
                     self.snapshot.input_history_next_cursor = None;
                     self.panel = Some(Panel::Choices { kind, selected: 0 });
-                    return vec![UiAction::SearchInputHistory {
-                        query: self.input_history_query.clone(),
-                        cursor: None,
-                    }];
+                    return self.schedule_input_history_search(
+                        self.input_history_query.clone(),
+                        Instant::now(),
+                    );
                 }
                 KeyCode::PageDown if self.snapshot.input_history_next_cursor.is_some() => {
-                    return vec![UiAction::SearchInputHistory {
+                    let mut actions = vec![self.cancel_input_history_search()];
+                    actions.push(UiAction::SearchInputHistory {
                         query: self.input_history_query.clone(),
                         cursor: self.snapshot.input_history_next_cursor.clone(),
-                    }];
+                    });
+                    return actions;
                 }
                 _ => {}
             }
@@ -1642,6 +1987,9 @@ impl UiState {
                     })
                 } else {
                     None
+                };
+                if kind == ChoiceKind::InputHistory {
+                    return vec![self.cancel_input_history_search()];
                 }
             }
             KeyCode::Up => self.set_choice_selection(
@@ -1734,6 +2082,7 @@ impl UiState {
                 body: body.to_owned(),
                 scroll: DetailScroll::FromTop(0),
                 return_to_pending: true,
+                copy_ready: false,
             });
             return Vec::new();
         }
@@ -1922,7 +2271,8 @@ impl UiState {
         Vec::new()
     }
 
-    /// 文本题共享同一字素编辑器，Tab 可返回选项题并保留协议答案类型。
+    /// Text answers share paste ordering while keeping Composer-only shortcuts out of responses.
+    /// @author kongweiguang
     fn question_text_key(
         &mut self,
         key: KeyEvent,
@@ -1930,12 +2280,15 @@ impl UiState {
         context: ClarificationContext,
     ) -> Vec<UiAction> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if !matches!(key.code, KeyCode::Char(ch) if !control && ch.is_ascii())
-            && key.code != KeyCode::Enter
-        {
-            self.composer.reset_paste_burst();
-        }
         match key.code {
+            KeyCode::Tab => match self.consume_paste_tab(Instant::now()) {
+                ControlDecision::Buffered => return Vec::new(),
+                ControlDecision::Insert => {
+                    self.insert_edit_text("\t");
+                    return Vec::new();
+                }
+                ControlDecision::NotPaste => return Vec::new(),
+            },
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1946,9 +2299,13 @@ impl UiState {
                 self.insert_edit_text("\n");
             }
             KeyCode::Enter => {
-                if self.composer.consume_paste_newline(Instant::now()) {
-                    self.insert_edit_text("\n");
-                    return Vec::new();
+                match self.consume_paste_newline(Instant::now()) {
+                    ControlDecision::Buffered => return Vec::new(),
+                    ControlDecision::Insert => {
+                        self.insert_edit_text("\n");
+                        return Vec::new();
+                    }
+                    ControlDecision::NotPaste => {}
                 }
                 let text = self.composer.text().trim().to_owned();
                 if text.is_empty() && !question.allow_skip {
@@ -1983,8 +2340,11 @@ impl UiState {
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if ch.is_ascii() {
-                    self.composer.observe_plain_char(ch, Instant::now());
+                let now = Instant::now();
+                let input = self.composer.observe_plain_char(ch, now);
+                self.apply_paste_flush(input.flushed, now);
+                if input.decision != CharDecision::Insert {
+                    return Vec::new();
                 }
                 self.insert_edit_text(&ch.to_string());
             }
@@ -2058,15 +2418,11 @@ impl UiState {
     }
 
     /// 发送立即腾出输入区；外部编辑只复制无结构引用的草稿，避免编辑器文本使引用身份失配。
+    /// @author kongweiguang
     fn composer_key(&mut self, key: KeyEvent) -> Vec<UiAction> {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let mut actions = Vec::new();
-        if !matches!(key.code, KeyCode::Char(ch) if !control && ch.is_ascii())
-            && key.code != KeyCode::Enter
-        {
-            self.composer.reset_paste_burst();
-        }
         match key.code {
             KeyCode::Esc
                 if self.snapshot.local_operation.is_some()
@@ -2115,10 +2471,7 @@ impl UiState {
             }
             KeyCode::Char('r') if control => {
                 self.open_picker(ChoiceKind::InputHistory);
-                actions.push(UiAction::SearchInputHistory {
-                    query: String::new(),
-                    cursor: None,
-                });
+                actions.extend(self.schedule_input_history_search(String::new(), Instant::now()));
             }
             KeyCode::Char('g') if control => {
                 if self.composer.references().is_empty() {
@@ -2158,10 +2511,14 @@ impl UiState {
                 self.schedule_file_search(Instant::now());
             }
             KeyCode::Enter => {
-                if self.composer.consume_paste_newline(Instant::now()) {
-                    self.insert_edit_text("\n");
-                    self.schedule_file_search(Instant::now());
-                    return actions;
+                match self.consume_paste_newline(Instant::now()) {
+                    ControlDecision::Buffered => return actions,
+                    ControlDecision::Insert => {
+                        self.insert_edit_text("\n");
+                        self.schedule_file_search(Instant::now());
+                        return actions;
+                    }
+                    ControlDecision::NotPaste => {}
                 }
                 let mode = if self.snapshot.turn_state == TurnState::Working
                     && self.snapshot.local_operation.is_none()
@@ -2181,6 +2538,15 @@ impl UiState {
                 self.reference_popup_dismissed = true;
             }
             KeyCode::Tab => {
+                match self.consume_paste_tab(Instant::now()) {
+                    ControlDecision::Buffered => return actions,
+                    ControlDecision::Insert => {
+                        self.insert_edit_text("\t");
+                        self.schedule_file_search(Instant::now());
+                        return actions;
+                    }
+                    ControlDecision::NotPaste => {}
+                }
                 let draft = self.composer.text().trim();
                 if draft.starts_with('/') && !draft.chars().any(char::is_whitespace) {
                     self.panel = Some(Panel::Commands { selected: 0 });
@@ -2262,21 +2628,11 @@ impl UiState {
                 self.schedule_file_search(Instant::now());
             }
             KeyCode::Char(ch) if !control => {
-                let opening_command = ch == '/' && self.composer.is_empty();
-                if ch.is_ascii() {
-                    self.composer.observe_plain_char(ch, Instant::now());
-                }
-                self.insert_edit_text(&ch.to_string());
-                if opening_command {
-                    self.panel = Some(Panel::Commands { selected: 0 });
-                    self.snapshot.notice = None;
-                }
-                if ch == '@'
-                    || ch == '$'
-                    || self.active_file_query().is_some()
-                    || self.active_skill_query().is_some()
-                {
-                    self.schedule_file_search(Instant::now());
+                let now = Instant::now();
+                let input = self.composer.observe_plain_char(ch, now);
+                self.apply_paste_flush(input.flushed, now);
+                if input.decision == CharDecision::Insert {
+                    self.accept_composer_character(ch, now);
                 }
             }
             _ => {}
@@ -2447,7 +2803,7 @@ impl UiState {
                         self.panel = Some(Panel::Choices { kind, selected });
                     }
                 }
-                return Vec::new();
+                return vec![self.cancel_input_history_search()];
             }
             ChoiceKind::Files => UiAction::SelectFileReference { id: choice.id },
             ChoiceKind::Skills => UiAction::SelectSkillReference { id: choice.id },
@@ -2470,6 +2826,7 @@ impl UiState {
                     body: format!("以下为安全预览；读取成功后更新工具详情。\n\n{preview}"),
                     scroll: DetailScroll::FromTop(0),
                     return_to_pending: false,
+                    copy_ready: false,
                 });
                 UiAction::OpenDetails {
                     entry_id: choice.id,
@@ -2775,7 +3132,7 @@ impl UiState {
             .find(|entry| entry.kind == TimelineKind::User)
             .map(|entry| entry.id.clone());
         self.pending_submission = Some(PendingSubmission::Message {
-            composer,
+            composer: Box::new(composer),
             previous_user_id,
         });
     }
@@ -3670,6 +4027,42 @@ fn sanitize_prompt(prompt: PendingPrompt) -> PendingPrompt {
                 .collect(),
         },
     }
+}
+
+/// A complete transcript source entry is required before the controller may copy an ordinary message body.
+/// @author kongweiguang
+fn is_message_entry_kind(kind: &TimelineKind) -> bool {
+    matches!(
+        kind,
+        TimelineKind::User
+            | TimelineKind::Assistant
+            | TimelineKind::FinalAnswer
+            | TimelineKind::Commentary
+            | TimelineKind::ReasoningSummary
+    )
+}
+
+/// Static details have no cancellable read; ordinary, diff, and tool details do.
+/// @author kongweiguang
+fn close_details_action(entry_id: String) -> Vec<UiAction> {
+    if matches!(entry_id.as_str(), "status" | "pending-prompt") {
+        Vec::new()
+    } else {
+        vec![UiAction::CloseDetails { entry_id }]
+    }
+}
+
+/// Modified/navigation keys end the current burst; bare Enter and Tab must reach the classifier first.
+/// @author kongweiguang
+fn key_ends_paste_candidate(key: KeyEvent) -> bool {
+    if key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Char(ch) if ch.is_ascii() => return false,
+            KeyCode::Enter | KeyCode::Tab => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// 解析白名单斜杠命令；Plan 创建保留完整目标文本，缺少目标也作为命令交给 controller 报错。

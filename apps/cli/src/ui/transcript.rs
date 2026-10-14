@@ -7,13 +7,14 @@ use std::sync::Arc;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::model::{StreamPresentation, TimelineEntry, TimelineKind};
+use super::theme;
 
 /// 主任务与稳定正文共用同一源坐标；UI 装饰行可保留可见文字而不伪造源偏移。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -410,6 +411,12 @@ impl Transcript {
         self.pending_copy = None;
     }
 
+    /// Keep the copy identity available until the reducer can cancel preparation before clearing selection state.
+    /// @author kongweiguang
+    pub(super) fn pending_selection_copy_id(&self) -> Option<u64> {
+        self.pending_copy.as_ref().map(|pending| pending.0)
+    }
+
     /// Ctrl+C 只在有范围选区时由 State 拦截，光标或单点点击仍保留原始取消语义。
     pub(super) fn has_selection(&self) -> bool {
         self.resolved_selection()
@@ -462,7 +469,8 @@ impl Transcript {
         }
     }
 
-    /// 拖选松手先完成选择，不能把相邻提示行误当返回入口；普通点击才执行返回最新。
+    /// 拖选松手先完成选择，不能把相邻提示行误当返回入口；范围变更同时使旧复制快照失效。
+    /// @author kongweiguang
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> bool {
         let position = Position::new(event.column, event.row);
         if self.is_browsing()
@@ -499,6 +507,13 @@ impl Transcript {
                 let cursor = self.cursor_at_clamped(event.column, event.row);
                 let endpoint = self.selection_endpoint(cursor);
                 if let Some((start, _)) = &self.selection {
+                    if self
+                        .selection
+                        .as_ref()
+                        .is_some_and(|(_, previous)| previous != &endpoint)
+                    {
+                        self.pending_copy = None;
+                    }
                     self.selection = Some((start.clone(), endpoint));
                     self.selection_cursors = self
                         .selection_cursors
@@ -510,6 +525,13 @@ impl Transcript {
                 let cursor = self.cursor_at_clamped(event.column, event.row);
                 let endpoint = self.selection_endpoint(cursor);
                 if let Some((start, _)) = &self.selection {
+                    if self
+                        .selection
+                        .as_ref()
+                        .is_some_and(|(_, previous)| previous != &endpoint)
+                    {
+                        self.pending_copy = None;
+                    }
                     self.selection = Some((start.clone(), endpoint));
                     self.selection_cursors = self
                         .selection_cursors
@@ -527,10 +549,79 @@ impl Transcript {
         self.reached_older_edge
     }
 
-    /// 正文与控件共享外层给出的坐标，控件行始终清空并保留，即使当前处于跟随状态。
+    /// Resolve the reading anchor to its stable entry; at latest-follow use the first visible stable entry as the anchor.
+    /// @author kongweiguang
+    pub(super) fn anchor_entry_id(&self) -> Option<String> {
+        if let Some(anchor) = self.anchor.as_ref()
+            && self
+                .stable_positions
+                .contains_key(anchor.source_key.as_ref())
+        {
+            return Some(anchor.source_key.to_string());
+        }
+        let start = self.top.min(self.rows.len());
+        let visible_height = usize::from(self.area.height.max(1));
+        self.rows[start..start.saturating_add(visible_height).min(self.rows.len())]
+            .iter()
+            .flat_map(|row| row.glyphs.iter())
+            .find_map(|glyph| {
+                let source = glyph.source.as_ref()?;
+                self.stable_positions
+                    .contains_key(source.key.as_ref())
+                    .then(|| source.key.to_string())
+            })
+    }
+
+    /// Return an entry only while its stable row remains in this transcript, including older pages.
+    /// @author kongweiguang
+    pub(super) fn entry(&self, entry_id: &str) -> Option<&TimelineEntry> {
+        let index = self.stable_positions.get(entry_id)?;
+        self.stable.get(*index).map(|entry| &entry.entry)
+    }
+
+    /// A detail shortcut may use a selection only when every selected source glyph belongs to one message.
+    /// @author kongweiguang
+    pub(super) fn selected_entry_id(&self) -> Option<String> {
+        let (start, end) = self.resolved_selection()?;
+        let (start, end) = ordered_cursors(start, end);
+        let mut source_key: Option<&str> = None;
+        for row_index in start.row..=end.row.min(self.rows.len().saturating_sub(1)) {
+            let row = self.rows.get(row_index)?;
+            let first = if row_index == start.row {
+                start.glyph
+            } else {
+                0
+            };
+            let last = if row_index == end.row {
+                end.glyph.min(row.glyphs.len().saturating_sub(1))
+            } else {
+                row.glyphs.len().saturating_sub(1)
+            };
+            for glyph in row.glyphs.get(first..=last)? {
+                let Some(source) = glyph.source.as_ref() else {
+                    continue;
+                };
+                match source_key {
+                    Some(key) if key != source.key.as_ref() => return None,
+                    Some(_) => {}
+                    None => source_key = Some(source.key.as_ref()),
+                }
+            }
+        }
+        let source_key = source_key?;
+        self.stable_positions
+            .contains_key(source_key)
+            .then(|| source_key.to_owned())
+    }
+
+    /// 正文与控件先清除旧字形再铺固定背景，Block 的样式覆盖不能替代 Clear。
     pub(super) fn render(&self, frame: &mut Frame<'_>) {
         if !self.area.is_empty() {
             frame.render_widget(Clear, self.area);
+            frame.render_widget(
+                Block::default().style(Style::default().fg(theme::TEXT).bg(theme::BACKGROUND)),
+                self.area,
+            );
             let height = usize::from(self.area.height);
             let end = self.top.saturating_add(height).min(self.rows.len());
             let selection = self.resolved_selection();
@@ -548,6 +639,10 @@ impl Transcript {
         }
         if !self.control.is_empty() {
             frame.render_widget(Clear, self.control);
+            frame.render_widget(
+                Block::default().style(Style::default().fg(theme::TEXT).bg(theme::BACKGROUND)),
+                self.control,
+            );
             if self.is_browsing() {
                 let label = if self.has_new_activity {
                     match self.control.width {
@@ -567,7 +662,7 @@ impl Transcript {
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         label,
-                        Style::default().fg(Color::Blue),
+                        Style::default().fg(theme::BLUE),
                     )))
                     .alignment(Alignment::Center),
                     self.control,
@@ -1537,7 +1632,7 @@ fn markdown_block_prefix_width(line: &str) -> usize {
     0
 }
 
-/// 输出仅物化可见行；选区覆盖到完整 grapheme cell 而保留原有 Markdown 样式。
+/// 固定正文底色先继承整行样式，再叠加字素与选区；Span 不得覆盖问题整行的灰底。
 fn visible_line(
     row: &VisualRow,
     row_index: usize,
@@ -1555,15 +1650,31 @@ fn visible_line(
                 && (cursor.row, cursor.glyph) <= (end.row, end.glyph)
         });
         let style = if selected {
-            glyph
-                .style
-                .patch(Style::default().fg(Color::White).bg(Color::Blue))
+            Style::default()
+                .fg(theme::TEXT)
+                .bg(theme::BACKGROUND)
+                .patch(row.style)
+                .patch(glyph.style)
+                .patch(
+                    Style::default()
+                        .fg(theme::SELECTION_FOREGROUND)
+                        .bg(theme::SELECTION_BACKGROUND),
+                )
         } else {
-            glyph.style
+            Style::default()
+                .fg(theme::TEXT)
+                .bg(theme::BACKGROUND)
+                .patch(row.style)
+                .patch(glyph.style)
         };
         spans.push(Span::styled(glyph.text.clone(), style));
     }
-    Line::from(spans).style(row.style)
+    Line::from(spans).style(
+        Style::default()
+            .fg(theme::TEXT)
+            .bg(theme::BACKGROUND)
+            .patch(row.style),
+    )
 }
 
 /// 规范化拖选起止顺序，允许鼠标向任意方向完成同一可读范围。

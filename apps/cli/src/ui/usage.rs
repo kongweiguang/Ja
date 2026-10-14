@@ -7,14 +7,15 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use super::model::UiUsageSnapshot;
+use super::theme;
 
-const MUTED: Color = Color::Rgb(136, 136, 150);
+const MUTED: Color = theme::MUTED;
 const TOKEN_WIDTH: usize = 5;
 const PERCENT_WIDTH: usize = 7;
 const CONTEXT_WIDTH: usize = 6 + TOKEN_WIDTH * 2 + 2 + PERCENT_WIDTH;
 const BRIEF_CONTEXT_WIDTH: usize = 6 + PERCENT_WIDTH;
 
-/// 以格式器最大数值宽度选择固定字段布局，流式回复只更新读数，不因状态或数字变长反复折叠标签。
+/// 以格式器最大数值宽度选择固定字段布局，并用主题次级色保持低优先级字段仍可读。
 pub(super) fn usage_line(usage: Option<&UiUsageSnapshot>, width: usize) -> Line<'static> {
     let padding = usize::from(width >= 4) * 2;
     let budget = width.saturating_sub(padding * 2);
@@ -59,7 +60,7 @@ pub(super) fn usage_line(usage: Option<&UiUsageSnapshot>, width: usize) -> Line<
     Line::from(spans)
 }
 
-/// 冻结窗口与当前请求保持原口径；未知用占位读数，估算/实测来源在 /status 解释而不改底栏标签。
+/// 冻结窗口与当前请求保持原口径；风险色使用固定高对比语义色，未知用占位而非零读数。
 fn context_label(usage: Option<&UiUsageSnapshot>) -> (String, String, String, Color) {
     let Some(context) = usage
         .and_then(|usage| usage.context.as_ref())
@@ -95,11 +96,11 @@ fn context_label(usage: Option<&UiUsageSnapshot>) -> (String, String, String, Co
         format!("{percentage:.1}%")
     };
     let color = if percentage >= 95.0 {
-        Color::Red
+        theme::RED
     } else if percentage >= 80.0 {
-        Color::Yellow
+        theme::YELLOW
     } else {
-        Color::Reset
+        theme::TEXT
     };
     (
         format!(

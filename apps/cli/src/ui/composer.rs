@@ -2,15 +2,14 @@
 // @author kongweiguang
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::model::{UiReference, UiReferenceKind};
+use super::paste_burst::{CharInput, ControlInput, FlushResult, PasteBurst};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const MAX_DRAFT_BYTES: usize = 32 * 1024;
-const PASTE_BURST_GAP: Duration = Duration::from_millis(12);
-const PASTE_BURST_GRACE: Duration = Duration::from_millis(180);
 const MAX_UNDO_STEPS: usize = 64;
 
 /// 光标以字素边界计数，避免中文组合字符和 Emoji 被拆成无效片段。
@@ -31,13 +30,6 @@ struct EditSnapshot {
     value: String,
     cursor: usize,
     references: Vec<UiReference>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct PasteBurst {
-    last_ascii_char: Option<Instant>,
-    run_length: u8,
-    active_until: Option<Instant>,
 }
 
 impl Composer {
@@ -388,17 +380,47 @@ impl Composer {
         positions
     }
 
-    /// ASCII 连发达到保守阈值时短暂抑制紧随其后的回车发送，兼容无 bracketed-paste 终端。
-    pub(crate) fn observe_plain_char(&mut self, ch: char, now: Instant) {
-        self.paste_burst.observe(ch, now);
+    /// 先结算已到期输入，再返回当前字符应立即插入、短暂保留或并入粘贴缓冲的决定。
+    ///
+    /// 复合结果让 controller 在输入延迟或 tick 与按键重合时仍能按原顺序提交文本；
+    /// bridge 仍须定期调用 `flush_paste_burst`，使空闲时的单字符也能及时显示。
+    /// @author kongweiguang
+    pub(crate) fn observe_plain_char(&mut self, ch: char, now: Instant) -> CharInput {
+        self.paste_burst.on_plain_char(ch, now)
     }
 
-    /// 处于 paste burst 窗口内的回车作为换行插入，并延长连续多行粘贴保护。
-    pub(crate) fn consume_paste_newline(&mut self, now: Instant) -> bool {
-        self.paste_burst.consume_newline(now)
+    /// 识别粘贴中的换行，并区分由 burst 延迟插入或立即插入的情况。
+    /// @author kongweiguang
+    pub(crate) fn consume_paste_newline(&mut self, now: Instant) -> ControlInput {
+        self.paste_burst.append_control_char('\n', now)
     }
 
-    /// 显式 bracketed paste 已完整框定边界，因此清理普通按键启发状态。
+    /// 识别无 bracketed-paste 终端把 Tab 作为文本发送的情况，避免误触命令或提交动作。
+    /// @author kongweiguang
+    pub(crate) fn consume_paste_tab(&mut self, now: Instant) -> ControlInput {
+        self.paste_burst.append_control_char('\t', now)
+    }
+
+    /// 由终端循环定期调用，释放超时的普通字符或把已完成 burst 交给一次原子插入。
+    /// @author kongweiguang
+    pub(crate) fn flush_paste_burst(&mut self, now: Instant) -> FlushResult {
+        self.paste_burst.flush_if_due(now)
+    }
+
+    /// 在光标导航或快捷键前取回所有尚未插入的文本，避免输入丢失或越过编辑动作。
+    /// @author kongweiguang
+    pub(crate) fn flush_paste_burst_before_modified_input(&mut self) -> FlushResult {
+        self.paste_burst.flush_before_modified_input()
+    }
+
+    /// 提供最早到期时间，让终端 poll 在字符释放或 paste 完成时唤醒。
+    /// @author kongweiguang
+    pub(crate) fn paste_burst_deadline(&self) -> Option<Instant> {
+        self.paste_burst.next_deadline()
+    }
+
+    /// bracketed paste 本身已经提供完整边界；调用者先 flush 后可清理普通按键状态。
+    /// @author kongweiguang
     pub(crate) fn reset_paste_burst(&mut self) {
         self.paste_burst.clear();
     }
@@ -486,44 +508,6 @@ pub(crate) fn input_visual_lines(value: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
-}
-
-impl PasteBurst {
-    /// 只观察高频 ASCII，避免中文 IME 输入被延迟或误判成粘贴。
-    fn observe(&mut self, ch: char, now: Instant) {
-        if !ch.is_ascii_graphic() && !ch.is_ascii_whitespace() {
-            self.clear();
-            return;
-        }
-        self.run_length = match self.last_ascii_char {
-            Some(previous) if now.saturating_duration_since(previous) <= PASTE_BURST_GAP => {
-                self.run_length.saturating_add(1)
-            }
-            _ => 1,
-        };
-        self.last_ascii_char = Some(now);
-        if self.run_length >= 5 {
-            self.active_until = now.checked_add(PASTE_BURST_GRACE);
-        }
-    }
-
-    /// 有效期内的换行续长窗口；过期后回到普通 Enter 发送语义。
-    fn consume_newline(&mut self, now: Instant) -> bool {
-        if self.active_until.is_some_and(|until| now <= until) {
-            self.active_until = now.checked_add(PASTE_BURST_GRACE);
-            true
-        } else {
-            self.clear();
-            false
-        }
-    }
-
-    /// 清理时间戳和计数，显式粘贴与非 ASCII 输入不继承旧启发状态。
-    fn clear(&mut self) {
-        self.last_ascii_char = None;
-        self.run_length = 0;
-        self.active_until = None;
-    }
 }
 
 /// 把字素偏移映射为 UTF-8 字节边界，集中处理插入和删除下标。

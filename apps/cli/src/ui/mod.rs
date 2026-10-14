@@ -10,17 +10,22 @@ mod markdown_stream;
 mod model;
 mod model_settings;
 mod native_backend;
+mod paste_burst;
 mod render;
 mod state;
+mod theme;
 mod transcript;
 mod usage;
+mod windows_key_sequence;
+mod wrapping;
 
 pub use bridge::{EventDelivery, TuiBridge, TuiError, UiEventSender};
 pub use composer::Composer;
 pub use model::{
-    InteractionAnswer, InteractionQuestion, InteractionQuestionKind, PendingPrompt,
-    StreamPresentation, TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice,
-    UiCommand, UiEvent, UiReference, UiReferenceKind, UiSnapshot, UiSubmitMode, UiUsageSnapshot,
+    InteractionAnswer, InteractionQuestion, InteractionQuestionKind,
+    MESSAGE_PREVIEW_TRUNCATED_NOTICE, PendingPrompt, StreamPresentation, TimelineEntry,
+    TimelineKind, TimelineStatus, TurnState, UiAction, UiChoice, UiCommand, UiEvent, UiReference,
+    UiReferenceKind, UiSnapshot, UiSubmitMode, UiUsageSnapshot,
 };
 pub use model_settings::{
     ModelSettingsCredential, ModelSettingsOutcome, ModelSettingsRequest, ModelSettingsResult,

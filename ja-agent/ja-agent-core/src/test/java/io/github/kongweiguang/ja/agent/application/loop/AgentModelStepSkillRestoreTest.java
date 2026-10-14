@@ -68,6 +68,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -77,7 +78,7 @@ final class AgentModelStepSkillRestoreTest {
     private static final AgentIdentity IDENTITY = new AgentIdentity(
             "tenant_skill", "thread_skill", "turn_skill", "user_skill");
 
-    /** 初次恢复由 Engine 边界夹具模拟；ModelStep 不得再次恢复，并须派发携带同一摘要与 Skill 的冻结请求。 */
+    /** 初次恢复由 Engine 边界夹具模拟；计量与派发必须共用摘要、Skill 和含真实调用身份的同一请求对象。 */
     @Test
     void preservesRestoredSkillsAndCheckpointSummaryForFirstModelDispatch() {
         Fixture fixture = fixture();
@@ -94,8 +95,48 @@ final class AgentModelStepSkillRestoreTest {
         assertTrue(estimated.prompt().systemPrompt().contains("skill-marker"));
         assertTrue(estimated.prompt().systemPrompt().contains(fixture.checkpointSummary().toPromptText()));
         assertTrue(fixture.dispatchedRequest().get().prompt().systemPrompt().contains("skill-marker"));
-        assertEquals(estimated, fixture.dispatchedRequest().get());
+        assertSame(estimated, fixture.dispatchedRequest().get());
+        ModelPort.RequestDiagnostics diagnostics = estimated.diagnostics();
+        assertNotNull(diagnostics);
+        assertEquals(IDENTITY.threadId(), diagnostics.threadId());
+        assertEquals(IDENTITY.turnId(), diagnostics.turnId());
+        assertEquals("modelreq_provider:1_test", diagnostics.modelRequestId());
+        assertEquals(1, diagnostics.modelRequestOrdinal());
         assertEquals(TurnState.FAILED, fixture.terminalState().get());
+    }
+
+    /** 压缩规划推进 Provider ordinal 后，同内容候选必须重新冻结诊断身份再供最终派发。 */
+    @Test
+    void refreezesSamePromptWhenProviderOrdinalAdvancesDuringPlanning() {
+        Fixture fixture = fixture(Optional.empty(), false, false, false, CancellationToken.none(),
+                new AtomicReference<>(), false, Duration.ZERO, true);
+
+        fixture.modelStep().advance();
+
+        ModelPort.ModelRequest dispatched = fixture.dispatchedRequest().get();
+        ModelPort.RequestDiagnostics diagnostics = dispatched.diagnostics();
+        assertNotNull(diagnostics);
+        assertEquals(2, diagnostics.modelRequestOrdinal());
+        assertEquals("modelreq_provider:2_test", diagnostics.modelRequestId());
+        assertEquals(TurnState.FAILED, fixture.terminalState().get());
+    }
+
+    /** 可恢复 Provider 失败提交 UNKNOWN ordinal 后，下一次真实派发必须使用新的稳定请求身份。 */
+    @Test
+    void retryUsesAdvancedProviderOrdinalForEstimateAndDispatch() {
+        Fixture fixture = fixture(Optional.empty(), false, false, false, CancellationToken.none(),
+                new AtomicReference<>(), true, Duration.ZERO);
+
+        fixture.modelStep().advance();
+        ModelPort.RequestDiagnostics first = fixture.dispatchedRequest().get().diagnostics();
+        fixture.modelStep().advance();
+
+        ModelPort.ModelRequest dispatched = fixture.dispatchedRequest().get();
+        ModelPort.RequestDiagnostics retry = dispatched.diagnostics();
+        assertEquals(1, first.modelRequestOrdinal());
+        assertEquals(2, retry.modelRequestOrdinal());
+        assertEquals("modelreq_provider:2_test", retry.modelRequestId());
+        assertSame(fixture.estimatedRequest().get(), dispatched);
     }
 
     /** Retry 先提交 UNKNOWN 调用所占的 ordinal；暂停取消只能打断退避，不能再次派发同一副作用请求。 */
@@ -230,6 +271,17 @@ final class AgentModelStepSkillRestoreTest {
                                   CancellationToken cancellation,
                                   AtomicReference<TurnExecutionState> committedCursor,
                                   boolean retryableProviderFailure, Duration retryAfterHint) {
+        return fixture(outputSchema, supportsOutputSchema, invalidFinalAnswer, malformedSchema, cancellation,
+                committedCursor, retryableProviderFailure, retryAfterHint, false);
+    }
+
+    /** 可选推进首个计量后的 Provider 游标，以复现摘要请求消费 ordinal 后的候选冻结边界。 */
+    private static Fixture fixture(Optional<JsonObject> outputSchema, boolean supportsOutputSchema,
+                                  boolean invalidFinalAnswer, boolean malformedSchema,
+                                  CancellationToken cancellation,
+                                  AtomicReference<TurnExecutionState> committedCursor,
+                                  boolean retryableProviderFailure, Duration retryAfterHint,
+                                  boolean advanceOrdinalAfterFirstEstimate) {
         Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
         AgentStore store = (AgentStore) Proxy.newProxyInstance(AgentStore.class.getClassLoader(),
                 new Class<?>[]{AgentStore.class}, (proxy, method, arguments) -> {
@@ -251,6 +303,7 @@ final class AgentModelStepSkillRestoreTest {
         AtomicReference<ModelPort.ModelRequest> estimatedRequest = new AtomicReference<>();
         AtomicReference<ModelPort.ModelRequest> dispatchedRequest = new AtomicReference<>();
         AtomicInteger dispatchCalls = new AtomicInteger();
+        AtomicInteger estimateCalls = new AtomicInteger();
         AtomicInteger restoreCalls = new AtomicInteger();
         AtomicReference<TurnState> terminalState = new AtomicReference<>();
         AtomicReference<String> terminalCode = new AtomicReference<>();
@@ -258,6 +311,9 @@ final class AgentModelStepSkillRestoreTest {
         List<String> preparedSummaries = new ArrayList<>();
         List<TurnExecutionState.ActiveSkill> activeSkills = List.of(new TurnExecutionState.ActiveSkill(
                 "skill.restore-test:restore-test", Optional.of("sha256:" + "a".repeat(64))));
+        AtomicReference<TurnExecutionState> cursor = new AtomicReference<>(new TurnExecutionState.Ready(
+                new TurnExecutionState.Common(0, 0, 1, "prompt_initial", activeSkills),
+                TurnExecutionState.Next.ASSISTANT, null));
         AgentPromptSession prompt = (AgentPromptSession) Proxy.newProxyInstance(
                 AgentPromptSession.class.getClassLoader(), new Class<?>[]{AgentPromptSession.class},
                 (proxy, method, arguments) -> switch (method.getName()) {
@@ -287,6 +343,9 @@ final class AgentModelStepSkillRestoreTest {
             @Override
             public InputTokenEstimate estimateInputTokens(ModelRequest request, CancellationToken cancellationToken) {
                 estimatedRequest.set(request);
+                if (advanceOrdinalAfterFirstEstimate && estimateCalls.getAndIncrement() == 0) {
+                    cursor.updateAndGet(state -> ((TurnExecutionState.Ready) state).advanceProviderOrdinal());
+                }
                 return new InputTokenEstimate(12, 16, "c".repeat(64));
             }
 
@@ -359,9 +418,6 @@ final class AgentModelStepSkillRestoreTest {
                 conversationRecord(execution, userRecord, 3));
         AgentLoopPersistence.Restored restored = new AgentLoopPersistence.Restored(
                 conversation, executionSnapshot, List.of(executionSnapshot), historyRecords);
-        TurnExecutionState.Ready cursor = new TurnExecutionState.Ready(
-                new TurnExecutionState.Common(0, 0, 1, "prompt_initial", activeSkills),
-                TurnExecutionState.Next.ASSISTANT, null);
         AgentExecutionDriver.Services services = new AgentExecutionDriver.Services(store,
                 new AgentLoopPersistence(store, clock), records, new TurnExecutionStateCodec(objectMapper),
                 new JacksonExecutionEventCodec(objectMapper), mapper,
@@ -406,10 +462,12 @@ final class AgentModelStepSkillRestoreTest {
                 (proxy, method, arguments) -> switch (method.getName()) {
                     case "identity" -> IDENTITY;
                     case "services" -> services;
-                    case "cursor" -> cursor;
+                    case "cursor" -> cursor.get();
                     case "restored" -> restored;
                     case "commit" -> {
-                        committedCursor.set((TurnExecutionState) arguments[1]);
+                        TurnExecutionState committed = (TurnExecutionState) arguments[1];
+                        committedCursor.set(committed);
+                        cursor.set(committed);
                         yield new AgentStore.CommitReceipt(commitRevision.incrementAndGet(),
                                 commitMutation.incrementAndGet(), 0, 0, JsonObject.empty(), true);
                     }

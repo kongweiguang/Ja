@@ -406,7 +406,7 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 /** 在同一 STA 线程复制所有原生剪贴板格式并保留内存对象，保证实际 Ctrl+C 测试后可以恢复用户数据。 @author kongweiguang */
-async function startClipboardGuard() {
+export async function startClipboardGuard() {
   const source = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)

@@ -8,7 +8,9 @@ use super::{
     CliError, ThreadContext,
     args::ReviewSource,
     attachment::{self, ImportedAttachment},
-    canonical_workspace, create_thread,
+    canonical_workspace,
+    clipboard::{ClipboardWorker, CopyState},
+    create_thread,
     external_editor::{create_editor_draft, editor_command, run_editor},
     model_settings::{self, ModelSettingsRunner},
     open_workspace,
@@ -44,9 +46,8 @@ use plan_recovery::{PlanRunAction, can_resume_plan_creation, confirms_plan_trans
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -64,8 +65,10 @@ const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const ITEM_CONTENT_PAGE_CHARACTERS: u64 = 32_768;
 const ITEM_DETAIL_MAX_BYTES: usize = 96 * 1024;
 const ITEM_DETAIL_DEADLINE: Duration = Duration::from_secs(15);
+const INPUT_HISTORY_READ_DEADLINE: Duration = Duration::from_secs(5);
+const OLDER_HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OLDER_HISTORY_DEADLINE: Duration = Duration::from_secs(15);
 const DIFF_READ_DEADLINE: Duration = Duration::from_secs(5);
-const MAX_CLIPBOARD_DIAGNOSTIC_BYTES: usize = 512;
 const EXPORT_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_EXPORT_PAGES: usize = 500;
 const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
@@ -90,6 +93,122 @@ struct OlderHistoryPage {
     turns: Vec<Value>,
     entries: Vec<TimelineEntry>,
     next_cursor: Option<String>,
+}
+
+/// Running reads have one cancellation flag and one owner thread; the controller replaces only the pending job.
+struct ReadWorker {
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
+    kind: ReadWorkerKind,
+}
+
+/// Records enough stable identity to present a useful failure if a worker panics before sending.
+enum ReadWorkerKind {
+    InputHistory,
+    OlderHistory {
+        thread_id: String,
+    },
+    Detail {
+        thread_id: String,
+        entry_id: String,
+        title: String,
+    },
+    LastReply {
+        thread_id: String,
+    },
+}
+
+/// Search jobs carry query and Thread identities so a late result cannot refill a reopened picker.
+#[derive(Clone)]
+struct InputHistoryReadJob {
+    generation: u64,
+    thread_id: Option<String>,
+    query: String,
+    cursor: Option<String>,
+}
+
+/// Keep picker rows and their full-input provenance together without repeating a nested page tuple.
+type InputHistoryUiPage = (Vec<(UiChoice, String, bool)>, Option<String>);
+
+/// A history job freezes projection inputs and cursor before its independent connection starts.
+struct OlderHistoryReadJob {
+    generation: u64,
+    thread_id: String,
+    cursor: String,
+    older_items: Vec<Value>,
+    latest_history: Value,
+    thread: ThreadContext,
+    interaction: Value,
+    config: Value,
+}
+
+/// Public messages and tool artifacts share a bounded worker but keep distinct validation contracts.
+#[derive(Clone)]
+enum DetailReadKind {
+    PublicMessage {
+        item: Value,
+    },
+    ToolArtifact {
+        turn_id: String,
+        call_id: String,
+        artifact_id: String,
+        truncated: bool,
+    },
+}
+
+/// Detail reads are tied to the visible panel request; retries supersede older results by generation.
+#[derive(Clone)]
+struct DetailReadJob {
+    generation: u64,
+    thread_id: String,
+    entry_id: String,
+    title: String,
+    preview: String,
+    kind: DetailReadKind,
+}
+
+/// `/copy` freezes the selected final-answer item so a later snapshot cannot change its source.
+#[derive(Clone)]
+struct LastReplyReadJob {
+    generation: u64,
+    thread_id: String,
+    item: Value,
+}
+
+/// Workers return data to the serial controller, which alone mutates transcript history and UI state.
+enum ReadResult {
+    InputHistory {
+        job: InputHistoryReadJob,
+        result: Result<Value, CliError>,
+    },
+    OlderHistory {
+        generation: u64,
+        thread_id: String,
+        cursor: String,
+        result: Result<OlderHistoryPage, CliError>,
+    },
+    Detail {
+        job: DetailReadJob,
+        result: Result<(String, bool), CliError>,
+    },
+    LastReply {
+        job: LastReplyReadJob,
+        result: Result<String, CliError>,
+    },
+}
+
+/// Clipboard ACKs update only their initiating action; selection IDs stay separate from detail copies.
+pub(super) enum ClipboardPurpose {
+    TranscriptSelection { selection_id: u64 },
+    LastReply,
+    MessageDetail { entry_id: String },
+}
+
+/// Keeps the user-visible reason for each native clipboard request until its real ACK arrives.
+struct PendingClipboardRequest {
+    thread_id: String,
+    purpose: ClipboardPurpose,
 }
 
 /// Thread 只有在元数据、首屏历史和展示投影都已通过校验后才可成为当前会话。
@@ -148,6 +267,25 @@ struct Interactive {
     review_notices: HashMap<String, String>,
     diff_detail: Option<DiffDetail>,
     diff_worker: Option<JoinHandle<()>>,
+    read_sender: mpsc::Sender<ReadResult>,
+    read_receiver: mpsc::Receiver<ReadResult>,
+    input_history_worker: Option<ReadWorker>,
+    input_history_pending: Option<InputHistoryReadJob>,
+    input_history_generation: u64,
+    older_history_worker: Option<ReadWorker>,
+    older_history_pending: Option<OlderHistoryReadJob>,
+    older_history_generation: u64,
+    detail_worker: Option<ReadWorker>,
+    detail_pending: Option<DetailReadJob>,
+    detail_generation: u64,
+    active_detail: Option<(String, String)>,
+    detail_copy_ready: Option<(String, String)>,
+    last_reply_worker: Option<ReadWorker>,
+    last_reply_pending: Option<LastReplyReadJob>,
+    last_reply_generation: u64,
+    clipboard: ClipboardWorker,
+    clipboard_requests: HashMap<u64, PendingClipboardRequest>,
+    detail_copy_text: Option<(String, String, String)>,
 }
 
 /// 面板拥有冻结轮次和取消标记；重试不会切换到读取期间新完成的 Turn。
@@ -536,6 +674,7 @@ pub fn run(
         _ => None,
     };
     let bridge = TuiBridge::spawn(snapshot).map_err(CliError::transport)?;
+    let (read_sender, read_receiver) = mpsc::channel();
     let mut session = Interactive {
         connection,
         pump,
@@ -581,6 +720,25 @@ pub fn run(
         review_notices: HashMap::new(),
         diff_detail: None,
         diff_worker: None,
+        read_sender,
+        read_receiver,
+        input_history_worker: None,
+        input_history_pending: None,
+        input_history_generation: 0,
+        older_history_worker: None,
+        older_history_pending: None,
+        older_history_generation: 0,
+        detail_worker: None,
+        detail_pending: None,
+        detail_generation: 0,
+        active_detail: None,
+        detail_copy_ready: None,
+        last_reply_worker: None,
+        last_reply_pending: None,
+        last_reply_generation: 0,
+        clipboard: ClipboardWorker::new(),
+        clipboard_requests: HashMap::new(),
+        detail_copy_text: None,
     };
     session.older_cursor = session
         .history
@@ -617,6 +775,7 @@ pub fn run(
         session.reconcile_pending_fork();
     }
     let result = session.event_loop();
+    session.cancel_pending_reads();
     session.diff_detail = None;
     session.cancel_review_collection_on_exit();
     for attachment in &session.attachments {
@@ -641,6 +800,7 @@ impl Interactive {
             self.poll_diff_read();
             while let Some(action) = self.bridge.try_recv_action().map_err(CliError::transport)? {
                 if matches!(action, UiAction::Quit) {
+                    self.cancel_pending_reads();
                     self.cancel_review_collection_on_exit();
                     return Ok(());
                 }
@@ -659,7 +819,13 @@ impl Interactive {
                     }
                     continue;
                 }
+                let terminal_handoff = matches!(action, UiAction::EditDraft { .. });
                 let result = self.handle_action(action);
+                if terminal_handoff {
+                    // 编辑器模式交接错误意味着 UI 已退出，先交付终态错误，不再向已关闭队列发送提示。
+                    result?;
+                    continue;
+                }
                 if self.connection.take_replaced() {
                     let result = self.restore_replaced_connection();
                     self.handle_connection_result(result)?;
@@ -670,6 +836,8 @@ impl Interactive {
                     // 由 EOF/重连分支重新取得权威状态，绝不重发刚才的动作。
                 }
             }
+            self.poll_async_reads();
+            self.poll_clipboard();
             if self.connection_lost {
                 if Instant::now() >= self.next_refresh {
                     let result = self.reconnect();
@@ -1104,7 +1272,7 @@ impl Interactive {
     }
 
     /// @author kongweiguang
-    /// 单次动作只读一页并按 Thread 身份回传增量，避免翻历史时刷新配置或用量而重置视口。
+    /// 历史页读取交给有总预算的独立连接；只冻结投影输入，不占用控制器连接和动作循环。
     fn load_older(&mut self, requested_thread_id: &str) -> Result<(), CliError> {
         if !self
             .thread
@@ -1122,43 +1290,24 @@ impl Interactive {
             return Ok(());
         };
 
-        match self.read_older_page(requested_thread_id, &cursor) {
-            Ok(page) => {
-                if !self
-                    .thread
-                    .as_ref()
-                    .is_some_and(|thread| thread.thread_id == requested_thread_id)
-                {
-                    return Ok(());
-                }
-                let mut combined = page.items;
-                combined.append(&mut self.older_items);
-                self.older_items = combined;
-                let mut combined_turns = page.turns;
-                combined_turns.append(&mut self.older_turns);
-                self.older_turns = combined_turns;
-                self.older_cursor = page.next_cursor;
-                self.send(UiEvent::OlderHistoryLoaded {
-                    thread_id: requested_thread_id.to_owned(),
-                    entries: page.entries,
-                    has_older: self.older_cursor.is_some(),
-                });
-            }
-            Err(error) => {
-                if self
-                    .thread
-                    .as_ref()
-                    .is_some_and(|thread| thread.thread_id == requested_thread_id)
-                {
-                    self.send(UiEvent::OlderHistoryFailed {
-                        thread_id: requested_thread_id.to_owned(),
-                        notice: format!(
-                            "读取更早历史失败；当前内容已保留，按 F5 重试。({})",
-                            error.message()
-                        ),
-                    });
-                }
-            }
+        let thread = self
+            .thread
+            .as_ref()
+            .filter(|thread| thread.thread_id == requested_thread_id)
+            .ok_or_else(|| CliError::usage("历史页请求已过期"))?;
+        let job = OlderHistoryReadJob {
+            generation: next_generation(&mut self.older_history_generation),
+            thread_id: requested_thread_id.to_owned(),
+            cursor,
+            older_items: self.older_items.clone(),
+            latest_history: self.history.clone(),
+            thread: clone_thread_context(thread),
+            interaction: self.interaction.clone(),
+            config: self.config.clone(),
+        };
+        self.older_history_pending = Some(job);
+        if let Some(worker) = &self.older_history_worker {
+            worker.cancelled.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -1247,99 +1396,37 @@ impl Interactive {
     }
 
     /// @author kongweiguang
-    /// 只将尚未展示的当前页转成增量，完整正文通过公共内容读取接口补齐后再投影。
-    fn read_older_page(
-        &mut self,
-        thread_id: &str,
-        cursor: &str,
-    ) -> Result<OlderHistoryPage, CliError> {
-        let mut page = self.connection.request(
-            "thread/read",
-            json!({"threadId":thread_id,"tail":true,"cursor":cursor,"limit":200}),
-        )?;
-        if required_str(&page, "threadId")? != thread_id {
-            return Err(CliError::protocol("历史页属于另一个 Thread"));
-        }
-        validate_history_origins(&page)?;
-        let next_cursor = match page.get("nextCursor") {
-            Some(Value::Null) => None,
-            Some(Value::String(value)) => Some(value.clone()),
-            _ => return Err(CliError::protocol("历史页缺少有效 nextCursor")),
-        };
-        if next_cursor.as_deref() == Some(cursor) {
-            return Err(CliError::protocol("历史分页游标未前进"));
-        }
-        let page_items = page
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CliError::protocol("历史页缺少 items"))?;
-        let latest_items = self
-            .history
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CliError::protocol("thread/read 缺少 items"))?;
-        let mut items = unseen_history_page_items(&self.older_items, latest_items, page_items)?;
-        for item in &mut items {
-            hydrate_public_history_item(item, |item_id, total_characters| {
-                read_public_item_content(
-                    &mut self.connection,
-                    thread_id,
-                    item_id,
-                    total_characters,
-                    None,
-                )
-            })?;
-        }
-        let current = self
-            .thread
-            .as_ref()
-            .filter(|thread| thread.thread_id == thread_id)
-            .ok_or_else(|| CliError::protocol("历史页读取期间 Thread 已切换"))?;
-        let item_turn_ids = items
-            .iter()
-            .filter_map(|item| item.get("turnId").and_then(Value::as_str))
-            .collect::<HashSet<_>>();
-        let turns = page
-            .get("turns")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CliError::protocol("历史页缺少 turns"))?
-            .iter()
-            .filter(|turn| {
-                turn.get("turnId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|turn_id| item_turn_ids.contains(turn_id))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        page["items"] = Value::Array(items.clone());
-        page["turns"] = Value::Array(turns.clone());
-        page["liveStream"] = Value::Null;
-        let snapshot = projection::project(
-            current,
-            &page,
-            &self.interaction,
-            &self.config,
-            Some(&current.title),
-        )?;
-        Ok(OlderHistoryPage {
-            items,
-            turns,
-            entries: snapshot.timeline,
-            next_cursor,
-        })
-    }
-
-    /// @author kongweiguang
-    /// 失败时不清除选区；成功事件由 UI 据 selection identity 决定何时关闭高亮。
-    fn copy_transcript_selection(&self, selection_id: u64, text: &str) -> Result<(), CliError> {
-        let event = match copy_to_clipboard(text) {
-            Ok(()) => UiEvent::TranscriptSelectionCopied { selection_id },
-            Err(error) => UiEvent::TranscriptSelectionCopyFailed {
+    /// Native write is acknowledged asynchronously; selection identity keeps failure and late ACK safe.
+    fn copy_transcript_selection(&mut self, selection_id: u64, text: &str) -> Result<(), CliError> {
+        let Some(thread_id) = self.thread.as_ref().map(|thread| thread.thread_id.clone()) else {
+            self.send(UiEvent::TranscriptSelectionCopyFailed {
                 selection_id,
-                notice: format!("复制失败，已保留选区：{}", error.message()),
-            },
+                notice: "请先选择会话；选区已保留".into(),
+            });
+            return Ok(());
         };
-        self.send(event);
+        self.cancel_clipboard_purpose(|purpose| {
+            matches!(purpose, ClipboardPurpose::TranscriptSelection { selection_id: active }
+                if *active != selection_id)
+        });
+        if self.clipboard_requests.values().any(|request| {
+            request.thread_id == thread_id
+                && matches!(&request.purpose, ClipboardPurpose::TranscriptSelection { selection_id: active }
+                    if *active == selection_id)
+        }) {
+            return Ok(());
+        }
+        if let Err(error) = self.submit_clipboard(
+            thread_id,
+            Some(selection_id),
+            text,
+            ClipboardPurpose::TranscriptSelection { selection_id },
+        ) {
+            self.send(UiEvent::TranscriptSelectionCopyFailed {
+                selection_id,
+                notice: format!("复制失败，已保留选区：{error}"),
+            });
+        }
         Ok(())
     }
 
@@ -1480,8 +1567,12 @@ impl Interactive {
                     | UiAction::OpenDetails { .. }
                     | UiAction::CloseDetails { .. }
                     | UiAction::LoadOlder { .. }
+                    | UiAction::CancelOlderHistory
                     | UiAction::LoadMoreForkReplies { .. }
                     | UiAction::CopyTranscriptSelection { .. }
+                    | UiAction::CancelTranscriptSelection { .. }
+                    | UiAction::CopyDetails { .. }
+                    | UiAction::CancelInputHistorySearch
                     | UiAction::Quit
             )
         {
@@ -1572,12 +1663,20 @@ impl Interactive {
             UiAction::SelectPermission { id } => self.select_permission(&id)?,
             UiAction::SelectThread { id } => self.switch_thread(&id)?,
             UiAction::LoadOlder { thread_id } => self.load_older(&thread_id)?,
+            UiAction::CancelOlderHistory => self.cancel_older_history(),
             UiAction::LoadMoreForkReplies { thread_id } => {
                 self.load_more_fork_replies(&thread_id)?
             }
             UiAction::CopyTranscriptSelection { selection_id, text } => {
                 self.copy_transcript_selection(selection_id, &text)?
             }
+            UiAction::CancelTranscriptSelection { selection_id } => {
+                self.cancel_clipboard_purpose(|purpose| {
+                    matches!(purpose, ClipboardPurpose::TranscriptSelection { selection_id: active }
+                        if *active == selection_id)
+                });
+            }
+            UiAction::CopyDetails { entry_id, text } => self.copy_details(&entry_id, &text)?,
             UiAction::RefreshSnapshot => self.refresh_snapshot(),
             UiAction::SearchFiles {
                 query,
@@ -1601,8 +1700,9 @@ impl Interactive {
                 self.search_threads(&query, cursor.as_deref())?
             }
             UiAction::SearchInputHistory { query, cursor } => {
-                self.search_input_history(&query, cursor.as_deref())?
+                self.search_input_history(&query, cursor)
             }
+            UiAction::CancelInputHistorySearch => self.cancel_input_history_search(),
             UiAction::SelectFileReference { id } => self.select_file(&id)?,
             UiAction::SelectSkillReference { id } => self.select_skill(&id)?,
             UiAction::AttachPaths { paths } => {
@@ -1659,13 +1759,7 @@ impl Interactive {
             }
             UiAction::OpenDetails { entry_id } => self.open_details(&entry_id)?,
             UiAction::CloseDetails { entry_id } => {
-                if self
-                    .diff_detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.entry_id == entry_id)
-                {
-                    self.diff_detail = None;
-                }
+                self.close_details(&entry_id);
             }
             UiAction::Quit => {}
         }
@@ -2328,6 +2422,9 @@ impl Interactive {
             mut snapshot,
             fork_reply_choices,
         } = prepared;
+        if previous_thread_id.as_deref() != Some(thread_id.as_str()) {
+            self.cancel_pending_reads();
+        }
         self.diff_detail = None;
         if let Some(event) = clear_event_before_thread_switch(
             self.thread
@@ -2475,60 +2572,745 @@ impl Interactive {
         Ok(())
     }
 
-    /// 只用 Java 的权威用户输入索引；预览与完整草稿分开，超限条目不会被误提交。
-    fn search_input_history(&mut self, query: &str, cursor: Option<&str>) -> Result<(), CliError> {
-        let mut params = json!({"query":query,"limit":10});
-        if let Some(cursor) = cursor {
-            params["cursor"] = json!(cursor);
-        }
-        let result = self.connection.request("history/input/search", params)?;
-        let items = result
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CliError::protocol("输入历史缺少 items"))?
-            .iter()
-            .map(|item| {
-                let text = required_str(item, "text")?;
-                let preview = text
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect::<String>();
-                let truncated = item
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let detail = item
-                    .get("createdAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                Ok((
-                    UiChoice {
-                        id: required_str(item, "itemId")?.into(),
-                        label: preview,
-                        detail: Some(if truncated {
-                            format!("{detail} · 过长，仅预览")
-                        } else {
-                            detail.to_owned()
-                        }),
-                    },
-                    text.to_owned(),
-                    truncated,
-                ))
-            })
-            .collect::<Result<Vec<_>, CliError>>()?;
-        self.send(UiEvent::SetInputHistoryPage {
+    /// 只排入 Java 权威输入索引查询；UI 已防抖，单独读取线程避免慢 RPC 卡住按键和取消。
+    fn search_input_history(&mut self, query: &str, cursor: Option<String>) {
+        let job = InputHistoryReadJob {
+            generation: next_generation(&mut self.input_history_generation),
+            thread_id: self.thread.as_ref().map(|thread| thread.thread_id.clone()),
             query: query.to_owned(),
-            items,
-            next_cursor: result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            append: cursor.is_some(),
+            cursor,
+        };
+        self.input_history_pending = Some(job);
+        if let Some(worker) = &self.input_history_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// @author kongweiguang
+    /// Drain results after queued user actions so an Escape or Thread switch always invalidates stale work first.
+    fn poll_async_reads(&mut self) {
+        while let Ok(result) = self.read_receiver.try_recv() {
+            self.apply_read_result(result);
+        }
+        self.reap_input_history_worker();
+        self.reap_older_history_worker();
+        self.reap_detail_worker();
+        self.reap_last_reply_worker();
+        if self.input_history_worker.is_none()
+            && let Some(job) = self.input_history_pending.take()
+        {
+            self.start_input_history_worker(job);
+        }
+        if self.older_history_worker.is_none()
+            && let Some(job) = self.older_history_pending.take()
+        {
+            self.start_older_history_worker(job);
+        }
+        if self.detail_worker.is_none()
+            && let Some(job) = self.detail_pending.take()
+        {
+            self.start_detail_worker(job);
+        }
+        if self.last_reply_worker.is_none()
+            && let Some(job) = self.last_reply_pending.take()
+        {
+            self.start_last_reply_worker(job);
+        }
+    }
+
+    /// @author kongweiguang
+    /// Picker closure drops queued work and invalidates in-flight results without waiting for a bounded RPC.
+    fn cancel_input_history_search(&mut self) {
+        next_generation(&mut self.input_history_generation);
+        self.input_history_pending = None;
+        if let Some(worker) = &self.input_history_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// @author kongweiguang
+    /// Leaving Transcript browsing cancels the page generation; an already-running read cannot prepend later.
+    fn cancel_older_history(&mut self) {
+        next_generation(&mut self.older_history_generation);
+        self.older_history_pending = None;
+        if let Some(worker) = &self.older_history_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// @author kongweiguang
+    /// Closing or replacing a detail invalidates its read and copy permission while its RPC unwinds on deadline.
+    fn close_details(&mut self, entry_id: &str) {
+        if self
+            .active_detail
+            .as_ref()
+            .is_some_and(|(_, active_entry_id)| active_entry_id == entry_id)
+        {
+            self.active_detail = None;
+            self.detail_copy_ready = None;
+            self.detail_copy_text = None;
+            next_generation(&mut self.detail_generation);
+            self.detail_pending = None;
+            if let Some(worker) = &self.detail_worker {
+                worker.cancelled.store(true, Ordering::Release);
+            }
+            self.cancel_clipboard_purpose(|purpose| {
+                matches!(purpose, ClipboardPurpose::MessageDetail { entry_id: active }
+                    if active == entry_id)
+            });
+        }
+        if self
+            .diff_detail
+            .as_ref()
+            .is_some_and(|detail| detail.entry_id == entry_id)
+        {
+            self.diff_detail = None;
+        }
+    }
+
+    /// @author kongweiguang
+    /// One active panel identity owns full-message copy eligibility; a retry always gets a fresh generation.
+    fn begin_detail_request(&mut self, thread_id: &str, entry_id: &str) -> u64 {
+        let generation = next_generation(&mut self.detail_generation);
+        self.active_detail = Some((thread_id.to_owned(), entry_id.to_owned()));
+        self.detail_copy_ready = None;
+        self.detail_copy_text = None;
+        self.detail_pending = None;
+        if let Some(worker) = &self.detail_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        self.cancel_clipboard_purpose(|purpose| {
+            matches!(purpose, ClipboardPurpose::MessageDetail { .. })
         });
+        generation
+    }
+
+    /// @author kongweiguang
+    /// A new detail target replaces only the queued request; the single in-flight request is cancelled cooperatively.
+    fn replace_running_detail_read(&mut self) {
+        if let Some(worker) = &self.detail_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// @author kongweiguang
+    /// Thread changes and shutdown invalidate all thread-bound read generations but never block on a slow owner.
+    fn cancel_pending_reads(&mut self) {
+        self.cancel_input_history_search();
+        self.cancel_older_history();
+        self.active_detail = None;
+        self.detail_copy_ready = None;
+        self.detail_copy_text = None;
+        next_generation(&mut self.detail_generation);
+        self.detail_pending = None;
+        if let Some(worker) = &self.detail_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        next_generation(&mut self.last_reply_generation);
+        self.last_reply_pending = None;
+        if let Some(worker) = &self.last_reply_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        self.cancel_clipboard_purpose(|_| true);
+    }
+
+    /// @author kongweiguang
+    /// Cancel only requests whose clipboard worker has not crossed its native-write gate; in-flight results remain unknown.
+    fn cancel_clipboard_purpose(
+        &mut self,
+        mut should_cancel: impl FnMut(&ClipboardPurpose) -> bool,
+    ) {
+        let request_ids = self
+            .clipboard_requests
+            .iter()
+            .filter_map(|(request_id, request)| {
+                should_cancel(&request.purpose).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            if self.clipboard.cancel(request_id) {
+                self.clipboard_requests.remove(&request_id);
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Search reads use a separate read-only connection and absolute deadline, preserving controller event responsiveness.
+    fn start_input_history_worker(&mut self, job: InputHistoryReadJob) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let connect = self
+            .connection
+            .read_connection_factory(INPUT_HISTORY_READ_DEADLINE);
+        let sender = self.read_sender.clone();
+        let worker_job = job.clone();
+        let spawn = std::thread::Builder::new()
+            .name("ja-input-history-read".into())
+            .spawn(move || {
+                let deadline = Instant::now() + INPUT_HISTORY_READ_DEADLINE;
+                let result = (|| {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return Err(CliError::transport("输入历史查询已取消"));
+                    }
+                    let mut connection = connect()?;
+                    let result = (|| {
+                        let mut params = json!({"query":worker_job.query,"limit":10});
+                        if let Some(cursor) = &worker_job.cursor {
+                            params["cursor"] = json!(cursor);
+                        }
+                        if worker_cancelled.load(Ordering::Acquire) {
+                            return Err(CliError::transport("输入历史查询已取消"));
+                        }
+                        connection.request_with_timeout(
+                            "history/input/search",
+                            params,
+                            remaining_scan(deadline)?,
+                        )
+                    })();
+                    let _ = connection.disconnect();
+                    result
+                })();
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.send(ReadResult::InputHistory {
+                        job: worker_job,
+                        result,
+                    });
+                }
+            });
+        match spawn {
+            Ok(worker) => {
+                self.input_history_worker = Some(ReadWorker {
+                    generation: job.generation,
+                    cancelled,
+                    worker,
+                    kind: ReadWorkerKind::InputHistory,
+                });
+            }
+            Err(error) => self.notice(format!("无法开始输入历史查询：{error}")),
+        }
+    }
+
+    /// @author kongweiguang
+    /// History reads freeze the current projection inputs and hydrate only within one 15-second, 4-MiB budget.
+    fn start_older_history_worker(&mut self, job: OlderHistoryReadJob) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let connect = self
+            .connection
+            .read_connection_factory(OLDER_HISTORY_DEADLINE);
+        let sender = self.read_sender.clone();
+        let generation = job.generation;
+        let thread_id = job.thread_id.clone();
+        let cursor = job.cursor.clone();
+        let worker_thread_id = thread_id.clone();
+        let worker_cursor = cursor.clone();
+        let worker = std::thread::Builder::new()
+            .name("ja-older-history-read".into())
+            .spawn(move || {
+                let deadline = Instant::now() + OLDER_HISTORY_DEADLINE;
+                let result = if worker_cancelled.load(Ordering::Acquire) {
+                    Err(CliError::transport("历史页读取已取消"))
+                } else {
+                    connect().and_then(|mut connection| {
+                        let result = read_older_history_page(
+                            &mut connection,
+                            &job,
+                            deadline,
+                            &worker_cancelled,
+                        );
+                        let _ = connection.disconnect();
+                        result
+                    })
+                };
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.send(ReadResult::OlderHistory {
+                        generation,
+                        thread_id: worker_thread_id,
+                        cursor: worker_cursor,
+                        result,
+                    });
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.older_history_worker = Some(ReadWorker {
+                    generation,
+                    cancelled,
+                    worker,
+                    kind: ReadWorkerKind::OlderHistory { thread_id },
+                });
+            }
+            Err(error) => self.send(UiEvent::OlderHistoryFailed {
+                thread_id,
+                notice: format!("无法开始读取更早历史；当前内容已保留。({error})"),
+            }),
+        }
+    }
+
+    /// @author kongweiguang
+    /// Public-message and artifact details share one bounded slot, so repeated F2/F5 cannot accumulate readers.
+    fn start_detail_worker(&mut self, job: DetailReadJob) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let connect = self
+            .connection
+            .read_connection_factory(ITEM_DETAIL_DEADLINE);
+        let sender = self.read_sender.clone();
+        let result_job = job.clone();
+        let worker_job = job.clone();
+        let generation = job.generation;
+        let thread_id = job.thread_id.clone();
+        let entry_id = job.entry_id.clone();
+        let worker = std::thread::Builder::new()
+            .name("ja-message-detail-read".into())
+            .spawn(move || {
+                let deadline = Instant::now() + ITEM_DETAIL_DEADLINE;
+                let result = if worker_cancelled.load(Ordering::Acquire) {
+                    Err(CliError::transport("详情读取已取消"))
+                } else {
+                    connect().and_then(|mut connection| {
+                        let result = read_detail_request(
+                            &mut connection,
+                            &worker_job,
+                            deadline,
+                            &worker_cancelled,
+                        );
+                        let _ = connection.disconnect();
+                        result
+                    })
+                };
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.send(ReadResult::Detail {
+                        job: result_job,
+                        result,
+                    });
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.detail_worker = Some(ReadWorker {
+                    generation,
+                    cancelled,
+                    worker,
+                    kind: ReadWorkerKind::Detail {
+                        thread_id,
+                        entry_id,
+                        title: job.title.clone(),
+                    },
+                });
+            }
+            Err(error) => self.detail_worker_start_failed(&job, &error.to_string()),
+        }
+    }
+
+    /// @author kongweiguang
+    /// Truncated `/copy` answers are completed off-thread before entering the acknowledged clipboard queue.
+    fn start_last_reply_worker(&mut self, job: LastReplyReadJob) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let connect = self
+            .connection
+            .read_connection_factory(ITEM_DETAIL_DEADLINE);
+        let sender = self.read_sender.clone();
+        let generation = job.generation;
+        let thread_id = job.thread_id.clone();
+        let result_job = LastReplyReadJob {
+            generation,
+            thread_id: thread_id.clone(),
+            item: job.item.clone(),
+        };
+        let worker_job = job.clone();
+        let worker_thread_id = thread_id.clone();
+        let worker = std::thread::Builder::new()
+            .name("ja-last-reply-read".into())
+            .spawn(move || {
+                let deadline = Instant::now() + ITEM_DETAIL_DEADLINE;
+                let result = connect().and_then(|mut connection| {
+                    let result = (|| {
+                        if worker_cancelled.load(Ordering::Acquire) {
+                            return Err(CliError::transport("完整回复读取已取消"));
+                        }
+                        let mut consumed_bytes = 0;
+                        read_bounded_item_content_pages(
+                            &worker_thread_id,
+                            required_str(&worker_job.item, "itemId")?,
+                            required_u64(&worker_job.item, "totalCharacters")?,
+                            Utf8ReadBudget {
+                                maximum_bytes: MAX_EXPORT_BYTES,
+                                consumed_bytes: &mut consumed_bytes,
+                            },
+                            deadline,
+                            &worker_cancelled,
+                            |params, timeout| {
+                                connection.request_with_timeout(
+                                    "thread/item-content/read",
+                                    params,
+                                    timeout.min(remaining_scan(deadline)?),
+                                )
+                            },
+                        )?
+                        .ok_or_else(|| {
+                            CliError::usage("完整回复超过 64 MiB 复制上限；请使用 /export 导出会话")
+                        })
+                    })();
+                    let _ = connection.disconnect();
+                    result
+                });
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.send(ReadResult::LastReply {
+                        job: result_job,
+                        result,
+                    });
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.last_reply_worker = Some(ReadWorker {
+                    generation,
+                    cancelled,
+                    worker,
+                    kind: ReadWorkerKind::LastReply { thread_id },
+                });
+            }
+            Err(error) => self.notice(format!("无法开始完整回复读取；未复制预览。({error})")),
+        }
+    }
+
+    /// @author kongweiguang
+    /// Apply only current identities; worker threads never mutate controller history or visible UI state.
+    fn apply_read_result(&mut self, result: ReadResult) {
+        match result {
+            ReadResult::InputHistory { job, result } => {
+                if job.generation != self.input_history_generation
+                    || self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                        != job.thread_id.as_deref()
+                {
+                    return;
+                }
+                match result.and_then(|page| input_history_ui_page(&job, &page)) {
+                    Ok((items, next_cursor)) => self.send(UiEvent::SetInputHistoryPage {
+                        query: job.query,
+                        items,
+                        next_cursor,
+                        append: job.cursor.is_some(),
+                    }),
+                    Err(error) => self.notice(format!(
+                        "输入历史读取失败；候选保持不变，请重试。({})",
+                        error.message()
+                    )),
+                }
+            }
+            ReadResult::OlderHistory {
+                generation,
+                thread_id,
+                cursor,
+                result,
+            } => {
+                if generation != self.older_history_generation
+                    || self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                        != Some(thread_id.as_str())
+                    || self.older_cursor.as_deref() != Some(cursor.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(page) => {
+                        let mut items = page.items;
+                        items.extend(std::mem::take(&mut self.older_items));
+                        self.older_items = items;
+                        self.older_turns =
+                            match merged_history_turns(&page.turns, &self.older_turns) {
+                                Ok(turns) => turns,
+                                Err(error) => {
+                                    self.send(UiEvent::OlderHistoryFailed {
+                                    thread_id,
+                                    notice: format!(
+                                        "历史页 Turn 元数据无效；已保留当前正文，按 F5 重试。({})",
+                                        error.message()
+                                    ),
+                                });
+                                    return;
+                                }
+                            };
+                        self.older_cursor = page.next_cursor;
+                        self.send(UiEvent::OlderHistoryLoaded {
+                            thread_id,
+                            entries: page.entries,
+                            has_older: self.older_cursor.is_some(),
+                        });
+                    }
+                    Err(error) => self.send(UiEvent::OlderHistoryFailed {
+                        thread_id,
+                        notice: format!(
+                            "读取更早历史失败；当前内容已保留，按 F5 重试。({})",
+                            error.message()
+                        ),
+                    }),
+                }
+            }
+            ReadResult::Detail { job, result } => {
+                if !self.detail_job_is_current(&job) {
+                    return;
+                }
+                match result {
+                    Ok((body, copy_ready)) => {
+                        self.send(UiEvent::UpdateDetailsIfOpen {
+                            entry_id: job.entry_id.clone(),
+                            title: job.title.clone(),
+                            body: body.clone(),
+                        });
+                        if copy_ready {
+                            self.detail_copy_ready =
+                                Some((job.thread_id.clone(), job.entry_id.clone()));
+                            self.detail_copy_text =
+                                Some((job.thread_id.clone(), job.entry_id.clone(), body));
+                        }
+                        self.send(UiEvent::SetDetailsCopyReady {
+                            entry_id: job.entry_id,
+                            ready: copy_ready,
+                        });
+                    }
+                    Err(error) => {
+                        self.detail_copy_ready = None;
+                        self.detail_copy_text = None;
+                        let body = detail_read_failure_body(&job, error.message());
+                        self.send(UiEvent::UpdateDetailsIfOpen {
+                            entry_id: job.entry_id.clone(),
+                            title: job.title,
+                            body,
+                        });
+                        self.send(UiEvent::SetDetailsCopyReady {
+                            entry_id: job.entry_id,
+                            ready: false,
+                        });
+                    }
+                }
+            }
+            ReadResult::LastReply { job, result } => {
+                if job.generation != self.last_reply_generation
+                    || self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                        != Some(job.thread_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(text) => {
+                        if let Err(error) = self.submit_clipboard(
+                            job.thread_id,
+                            None,
+                            &text,
+                            ClipboardPurpose::LastReply,
+                        ) {
+                            self.notice(format!("无法复制完整回复；未复制预览。({error})"));
+                        }
+                    }
+                    Err(error) => self.notice(format!(
+                        "完整回复读取失败；未复制预览。({})",
+                        error.message()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Exact thread, entry, generation and copy-ready state form the controller-side gate for detail copying.
+    fn copy_details(&mut self, entry_id: &str, text: &str) -> Result<(), CliError> {
+        let Some(thread_id) = self.thread.as_ref().map(|thread| thread.thread_id.clone()) else {
+            self.notice("请先选择会话。".into());
+            return Ok(());
+        };
+        let identity = (thread_id.clone(), entry_id.to_owned());
+        if self.active_detail.as_ref() != Some(&identity)
+            || self.detail_copy_ready.as_ref() != Some(&identity)
+            || self
+                .detail_copy_text
+                .as_ref()
+                .is_none_or(|(thread, entry, expected)| {
+                    thread != &thread_id || entry != entry_id || expected != text
+                })
+            || text.is_empty()
+            || text.len() > ITEM_DETAIL_MAX_BYTES
+        {
+            self.notice("详情尚未完整读取，不能复制预览。".into());
+            return Ok(());
+        }
+        self.submit_clipboard(
+            thread_id,
+            None,
+            text,
+            ClipboardPurpose::MessageDetail {
+                entry_id: entry_id.to_owned(),
+            },
+        )
+        .map_err(CliError::transport)
+    }
+
+    /// @author kongweiguang
+    /// A selected full detail remains the only copy source; this path never falls back to a preview body.
+    fn detail_job_is_current(&self, job: &DetailReadJob) -> bool {
+        job.generation == self.detail_generation
+            && self.active_detail.as_ref() == Some(&(job.thread_id.clone(), job.entry_id.clone()))
+            && self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                == Some(job.thread_id.as_str())
+    }
+
+    /// @author kongweiguang
+    /// Associate every OS acknowledgement with its initiating action before the native worker can report a result.
+    fn submit_clipboard(
+        &mut self,
+        thread_id: String,
+        selection_id: Option<u64>,
+        text: &str,
+        purpose: ClipboardPurpose,
+    ) -> Result<(), String> {
+        let request_id = self
+            .clipboard
+            .submit(thread_id.clone(), selection_id, text.to_owned())?;
+        self.clipboard_requests
+            .insert(request_id, PendingClipboardRequest { thread_id, purpose });
         Ok(())
+    }
+
+    /// @author kongweiguang
+    /// Native delivery notices remain bound to the Thread even after an admitted copy's detail closes.
+    fn poll_clipboard(&mut self) {
+        while let Some(event) = self.clipboard.try_recv() {
+            let Some(request) = self.clipboard_requests.get(&event.request_id) else {
+                continue;
+            };
+            if request.thread_id != event.thread_id
+                || self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                    != Some(event.thread_id.as_str())
+            {
+                self.clipboard_requests.remove(&event.request_id);
+                continue;
+            }
+            if event.state == CopyState::Delivering {
+                self.notice("正在写入系统剪贴板…".into());
+                continue;
+            }
+            if let Some(request) = self.clipboard_requests.remove(&event.request_id)
+                && let Some(feedback) =
+                    clipboard_feedback(request.purpose, event.selection_id, event.state)
+            {
+                self.send(feedback);
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Reap only finished threads and report panics against the current generation; no user action joins live I/O.
+    fn reap_input_history_worker(&mut self) {
+        if self
+            .input_history_worker
+            .as_ref()
+            .is_some_and(|worker| worker.worker.is_finished())
+        {
+            let worker = self
+                .input_history_worker
+                .take()
+                .expect("finished worker exists");
+            if worker.worker.join().is_err() && worker.generation == self.input_history_generation {
+                self.notice("输入历史查询异常结束；可重新输入或关闭后重开选择器。".into());
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// A failed page worker preserves cursor and transcript, exposing its existing F5 retry path.
+    fn reap_older_history_worker(&mut self) {
+        if self
+            .older_history_worker
+            .as_ref()
+            .is_some_and(|worker| worker.worker.is_finished())
+        {
+            let worker = self
+                .older_history_worker
+                .take()
+                .expect("finished worker exists");
+            if worker.worker.join().is_err()
+                && worker.generation == self.older_history_generation
+                && let ReadWorkerKind::OlderHistory { thread_id } = worker.kind
+            {
+                self.send(UiEvent::OlderHistoryFailed {
+                    thread_id,
+                    notice: "历史页读取异常结束；当前内容已保留，按 F5 重试。".into(),
+                });
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Detail worker panics leave the safe preview visible and keep complete-message copying disabled.
+    fn reap_detail_worker(&mut self) {
+        if self
+            .detail_worker
+            .as_ref()
+            .is_some_and(|worker| worker.worker.is_finished())
+        {
+            let worker = self.detail_worker.take().expect("finished worker exists");
+            if worker.worker.join().is_err()
+                && worker.generation == self.detail_generation
+                && let ReadWorkerKind::Detail {
+                    thread_id,
+                    entry_id,
+                    title,
+                } = worker.kind
+                && self.active_detail.as_ref() == Some(&(thread_id, entry_id.clone()))
+            {
+                self.detail_copy_ready = None;
+                self.detail_copy_text = None;
+                self.send(UiEvent::UpdateDetailsIfOpen {
+                    entry_id: entry_id.clone(),
+                    title,
+                    body: "详情读取异常结束；安全预览仍保留，按 F5 重试。".into(),
+                });
+                self.send(UiEvent::SetDetailsCopyReady {
+                    entry_id,
+                    ready: false,
+                });
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Full-reply read panics never degrade into copying the server's truncated preview.
+    fn reap_last_reply_worker(&mut self) {
+        if self
+            .last_reply_worker
+            .as_ref()
+            .is_some_and(|worker| worker.worker.is_finished())
+        {
+            let worker = self
+                .last_reply_worker
+                .take()
+                .expect("finished worker exists");
+            if worker.worker.join().is_err()
+                && worker.generation == self.last_reply_generation
+                && let ReadWorkerKind::LastReply { thread_id } = worker.kind
+                && self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+                    == Some(thread_id.as_str())
+            {
+                self.notice("完整回复读取异常结束；未复制预览。可重试 /copy。".into());
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// Spawn failures are surfaced in the open panel and never enable copying a partial body.
+    fn detail_worker_start_failed(&mut self, job: &DetailReadJob, error: &str) {
+        if self.detail_job_is_current(job) {
+            self.send(UiEvent::UpdateDetailsIfOpen {
+                entry_id: job.entry_id.clone(),
+                title: job.title.clone(),
+                body: format!("{}\n\n无法开始详情读取：{error}；按 F5 重试。", job.preview),
+            });
+            self.send(UiEvent::SetDetailsCopyReady {
+                entry_id: job.entry_id.clone(),
+                ready: false,
+            });
+        }
     }
 
     /// 未核实上次写入前不接受新候选；支持推理等级的模型先建立候选，避免偷偷套用默认等级。
@@ -3170,7 +3952,7 @@ impl Interactive {
     }
 
     /// @author kongweiguang
-    /// 工具列表激活时已同步打开安全预览；异步读取只更新仍打开的同一详情，避免 Esc 后迟到结果重开面板。
+    /// 预览与后台读取共用语义标题和有界队列；generation 阻止关闭或重试后的迟到覆盖。
     fn open_details(&mut self, entry_id: &str) -> Result<(), CliError> {
         let (thread_id, title, item, mut body) = {
             let thread = self
@@ -3202,22 +3984,22 @@ impl Interactive {
                 .ok_or_else(|| CliError::usage("详情已过期"))?;
             let title = match &entry.kind {
                 TimelineKind::Tool { action, target, .. } => format!("{action}  {target}"),
-                _ => entry
-                    .text
-                    .lines()
-                    .next()
-                    .filter(|line| !line.is_empty())
-                    .unwrap_or("消息")
-                    .to_owned(),
+                _ => entry.kind.message_detail_title().to_owned(),
             };
-            (
-                thread.thread_id.clone(),
-                title,
-                item,
-                entry.detail.clone().unwrap_or_else(|| entry.text.clone()),
-            )
+            let preview_body = if item.get("truncated").and_then(Value::as_bool) == Some(true) {
+                entry.text.clone()
+            } else {
+                entry.detail.clone().unwrap_or_else(|| entry.text.clone())
+            };
+            (thread.thread_id.clone(), title, item, preview_body)
         };
         let kind = required_str(&item, "kind")?;
+        if body.len() > ITEM_DETAIL_MAX_BYTES {
+            body = detail_preview_with_limit(&body);
+        } else if let Some(safe_body) = safe_detail_copy_text(&body) {
+            body = safe_body;
+        }
+        let generation = self.begin_detail_request(&thread_id, entry_id);
         if kind == "tool_call" {
             let presentation = item
                 .get("presentation")
@@ -3229,67 +4011,105 @@ impl Interactive {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
             body = tool_detail_body(&body, truncated, artifact_id.is_some(), None);
+            self.send(UiEvent::SetDetailsCopyReady {
+                entry_id: entry_id.to_owned(),
+                ready: false,
+            });
             self.send(UiEvent::UpdateDetailsIfOpen {
                 entry_id: entry_id.into(),
                 title: title.clone(),
-                body,
+                body: body.clone(),
             });
 
             if let Some(artifact_id) = artifact_id {
-                let read_result = (|| {
-                    let turn_id = required_str(&item, "turnId")?;
-                    let call_id = required_str(&item, "callId")?;
-                    read_tool_artifact(
-                        &mut self.connection,
-                        &thread_id,
-                        turn_id,
-                        call_id,
-                        &artifact_id,
-                    )
-                })();
-                match read_result {
-                    Ok(artifact) => self.send(UiEvent::UpdateDetailsIfOpen {
-                        entry_id: entry_id.into(),
-                        title,
-                        body: tool_detail_body("", truncated, true, Some(&artifact)),
-                    }),
-                    Err(error) => self.notice(format!(
-                        "完整工具产物读取失败，仍显示安全预览；按 F5 重读。({})",
-                        error.message()
-                    )),
-                }
+                let job = DetailReadJob {
+                    generation,
+                    thread_id,
+                    entry_id: entry_id.to_owned(),
+                    title,
+                    preview: body.clone(),
+                    kind: DetailReadKind::ToolArtifact {
+                        turn_id: required_str(&item, "turnId")?.to_owned(),
+                        call_id: required_str(&item, "callId")?.to_owned(),
+                        artifact_id,
+                        truncated,
+                    },
+                };
+                self.detail_pending = Some(job);
+                self.replace_running_detail_read();
             }
             return Ok(());
         }
-        if item.get("truncated").and_then(Value::as_bool) == Some(true)
-            && matches!(
-                kind,
-                "user_input"
-                    | "assistant_progress"
-                    | "final_answer"
-                    | "reasoning_summary"
-                    | "thread_message"
-            )
-        {
-            let total_characters = required_u64(&item, "totalCharacters")?;
-            let full_text = read_public_item_content(
-                &mut self.connection,
-                &thread_id,
-                entry_id,
-                total_characters,
-                Some(ITEM_DETAIL_MAX_BYTES),
-            )?;
-            body = if kind == "user_input" {
-                projection::user_input_display(&item, Some(&full_text))?
-            } else {
-                full_text
-            };
-        }
-        self.send(UiEvent::ShowDetails {
-            entry_id: entry_id.into(),
-            title,
-            body,
+        let public_message = matches!(
+            kind,
+            "user_input"
+                | "assistant_progress"
+                | "final_answer"
+                | "reasoning_summary"
+                | "thread_message"
+        );
+        let truncated = item.get("truncated").and_then(Value::as_bool) == Some(true);
+        self.send(UiEvent::SetDetailsCopyReady {
+            entry_id: entry_id.to_owned(),
+            ready: false,
         });
+        self.send(UiEvent::ShowDetails {
+            entry_id: entry_id.to_owned(),
+            title: title.clone(),
+            body: if truncated {
+                format!("{body}\n\n正在读取完整正文…")
+            } else {
+                body.clone()
+            },
+        });
+        if truncated && public_message {
+            let total_characters = required_u64(&item, "totalCharacters")?;
+            if total_characters > ITEM_DETAIL_MAX_BYTES as u64 {
+                self.send(UiEvent::UpdateDetailsIfOpen {
+                    entry_id: entry_id.to_owned(),
+                    title,
+                    body: bounded_detail_body(
+                        &body,
+                        "正文超过 96 KiB 的详情容量；请使用 /export 导出完整会话。",
+                    ),
+                });
+                return Ok(());
+            }
+            self.detail_pending = Some(DetailReadJob {
+                generation,
+                thread_id,
+                entry_id: entry_id.to_owned(),
+                title,
+                preview: body.clone(),
+                kind: DetailReadKind::PublicMessage { item },
+            });
+            self.replace_running_detail_read();
+        } else if public_message {
+            if let Some(copy_text) =
+                full_public_item_display(&item)?.filter(|copy_text| !copy_text.is_empty())
+            {
+                self.detail_copy_ready = Some((thread_id.clone(), entry_id.to_owned()));
+                self.detail_copy_text = Some((thread_id, entry_id.to_owned(), copy_text.clone()));
+                self.send(UiEvent::UpdateDetailsIfOpen {
+                    entry_id: entry_id.to_owned(),
+                    title: title.clone(),
+                    body: copy_text,
+                });
+                self.send(UiEvent::SetDetailsCopyReady {
+                    entry_id: entry_id.to_owned(),
+                    ready: true,
+                });
+            } else if body.contains("安全预览已缩短") {
+                self.send(UiEvent::UpdateDetailsIfOpen {
+                    entry_id: entry_id.to_owned(),
+                    title,
+                    body: bounded_detail_body(
+                        &body,
+                        "正文超过 96 KiB 的详情容量；请使用 /export 导出完整会话。",
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -4835,7 +5655,8 @@ impl Interactive {
         })
     }
 
-    /// 仅复制最新的完整公开答复；截断预览会先补齐正文。
+    /// @author kongweiguang
+    /// Copying a truncated final answer first completes it on a bounded worker; previews are never copied as full replies.
     fn copy_last_reply(&mut self) -> Result<(), CliError> {
         let thread_id = self
             .thread
@@ -4853,23 +5674,33 @@ impl Interactive {
                     })
                 })
                 .ok_or_else(|| CliError::usage("当前会话没有最终回复可复制"))?;
-        let text = if item.get("truncated").and_then(Value::as_bool) == Some(true) {
-            read_public_item_content(
-                &mut self.connection,
-                &thread_id,
-                required_str(item, "itemId")?,
-                required_u64(item, "totalCharacters")?,
-                None,
-            )?
+        let item = item.clone();
+        let generation = next_generation(&mut self.last_reply_generation);
+        self.last_reply_pending = None;
+        if let Some(worker) = &self.last_reply_worker {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        self.cancel_clipboard_purpose(|purpose| matches!(purpose, ClipboardPurpose::LastReply));
+        if item.get("truncated").and_then(Value::as_bool) == Some(true) {
+            self.last_reply_pending = Some(LastReplyReadJob {
+                generation,
+                thread_id,
+                item,
+            });
         } else {
-            required_str(item, "text")?.to_owned()
-        };
-        copy_to_clipboard(&text)?;
-        self.notice("最后一条完整回复已复制。".into());
+            let text = required_str(&item, "text")?.to_owned();
+            if text.len() > MAX_EXPORT_BYTES {
+                self.notice("完整回复超过 64 MiB 复制上限；请使用 /export 导出会话。".into());
+                return Ok(());
+            }
+            self.submit_clipboard(thread_id, None, &text, ClipboardPurpose::LastReply)
+                .map_err(CliError::transport)?;
+        }
         Ok(())
     }
 
-    /// TUI 确认挂起后才把终端交给外部编辑器；失败时恢复原草稿。
+    /// @author kongweiguang
+    /// TUI 确认挂起后才交接；模式交接失败退出时先保全原草稿，再让外层向恢复后的终端报错。
     fn edit_draft(&mut self, draft: &str) -> Result<(), CliError> {
         let editor = match editor_command() {
             Ok(Some(editor)) => editor,
@@ -4891,14 +5722,23 @@ impl Interactive {
         };
         let path = temporary.path.clone();
         if let Err(error) = self.bridge.suspend_for_external_program() {
-            self.notice(format!("终端未能交给编辑器，原草稿已保留：{error}"));
-            return Ok(());
+            return Err(preserve_editor_handoff_failure(
+                temporary,
+                None,
+                &format!("终端未能交给编辑器，Ja 已退出：{error}"),
+            ));
         }
         let edit_result = run_editor(&editor, &path);
         let resume_result = self.bridge.resume_after_external_program();
         match resume_result {
             Ok(()) => {}
-            Err(error) => return Err(CliError::transport(error)),
+            Err(error) => {
+                return Err(preserve_editor_handoff_failure(
+                    temporary,
+                    Some(draft),
+                    &format!("编辑器返回后终端恢复失败，Ja 已退出：{error}"),
+                ));
+            }
         }
         match edit_result {
             Ok(Some(text)) => self.send(UiEvent::ReplaceDraft(text)),
@@ -5880,146 +6720,6 @@ fn format_mcp_catalog(items: &[Value], truncated: bool) -> Result<String, CliErr
 }
 
 /// @author kongweiguang
-/// 正文只经 UTF-8 stdin 传入子进程；优先 pwsh，Set-Clipboard 缺失才回退 5.1，并静音 stdout、限长收集 stderr。
-fn copy_to_clipboard(text: &str) -> Result<(), CliError> {
-    #[cfg(target_os = "windows")]
-    let candidates: &[(&str, &[&str])] = &[
-        (
-            "pwsh.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$ErrorActionPreference='Stop'; if (-not (Get-Command Set-Clipboard -ErrorAction SilentlyContinue)) { throw 'JA_CLIPBOARD_COMMAND_MISSING' }; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); $text=[Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
-            ],
-        ),
-        (
-            "powershell.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$ErrorActionPreference='Stop'; if (-not (Get-Command Set-Clipboard -ErrorAction SilentlyContinue)) { throw 'JA_CLIPBOARD_COMMAND_MISSING' }; [Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); $text=[Console]::In.ReadToEnd(); Set-Clipboard -Value $text",
-            ],
-        ),
-    ];
-    #[cfg(target_os = "macos")]
-    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let candidates: &[(&str, &[&str])] =
-        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
-
-    let mut last_error = None;
-    for (index, (program, arguments)) in candidates.iter().enumerate() {
-        let mut child = match Command::new(program)
-            .args(*arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{program} 不存在：{error}"));
-                continue;
-            }
-            Err(error) => return Err(CliError::transport(error)),
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(CliError::transport("剪贴板进程未提供错误输出管道"));
-        };
-        let stderr_reader = match std::thread::Builder::new()
-            .name("ja-clipboard-diagnostic".into())
-            .spawn(move || read_bounded_clipboard_diagnostic(stderr))
-        {
-            Ok(reader) => reader,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CliError::transport(error));
-            }
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stderr_reader.join();
-            return Err(CliError::transport("剪贴板进程未提供输入管道"));
-        };
-        let write_result = write_clipboard_input(&mut stdin, text);
-        drop(stdin);
-        if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stderr_reader.join();
-            return Err(CliError::transport(error));
-        }
-        let status = match child.wait() {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stderr_reader.join();
-                return Err(CliError::transport(error));
-            }
-        };
-        let diagnostic = stderr_reader
-            .join()
-            .map_err(|_| CliError::transport("剪贴板错误输出读取线程异常"))?
-            .map_err(CliError::transport)?;
-        if status.success() {
-            return Ok(());
-        }
-        let command_missing = diagnostic.contains("JA_CLIPBOARD_COMMAND_MISSING");
-        last_error = Some(if diagnostic.is_empty() {
-            format!("{program} exited with {status}")
-        } else {
-            format!("{program} exited with {status}: {diagnostic}")
-        });
-        if command_missing && index + 1 < candidates.len() {
-            continue;
-        }
-        break;
-    }
-    Err(CliError::usage(format!(
-        "无法写入系统剪贴板{}",
-        last_error.map_or_else(String::new, |error| format!("：{error}"))
-    )))
-}
-
-/// @author kongweiguang
-/// 持续排空子进程错误管道但仅保留固定字节数，避免诊断输出阻塞或占满全屏终端。
-pub(super) fn read_bounded_clipboard_diagnostic(mut reader: impl Read) -> std::io::Result<String> {
-    let mut retained = Vec::with_capacity(MAX_CLIPBOARD_DIAGNOSTIC_BYTES);
-    let mut chunk = [0_u8; 256];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut chunk)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = MAX_CLIPBOARD_DIAGNOSTIC_BYTES.saturating_sub(retained.len());
-        let retained_count = count.min(remaining);
-        retained.extend_from_slice(&chunk[..retained_count]);
-        truncated |= retained_count < count;
-    }
-    let mut diagnostic = String::from_utf8_lossy(&retained).trim().to_owned();
-    if truncated {
-        diagnostic.push_str("…[诊断已截断]");
-    }
-    Ok(diagnostic)
-}
-
-/// @author kongweiguang
-/// 剪贴板正文经 UTF-8 字节写入子进程 stdin，测试可验证 Unicode 不受 Windows argv/code page 影响。
-pub(super) fn write_clipboard_input(writer: &mut impl Write, text: &str) -> std::io::Result<()> {
-    writer.write_all(text.as_bytes())
-}
-
-/// @author kongweiguang
 /// 去重身份只使用持久 itemId；新页按服务端旧到新顺序保留，避免并发新消息造成重复展示。
 pub(super) fn unseen_history_page_items(
     older_items: &[Value],
@@ -6359,13 +7059,37 @@ pub(super) fn read_tool_artifact_pages(
     turn_id: &str,
     call_id: &str,
     artifact_id: &str,
+    read_page: impl FnMut(Value, Duration) -> Result<Value, CliError>,
+) -> Result<String, CliError> {
+    read_tool_artifact_pages_until(
+        thread_id,
+        turn_id,
+        call_id,
+        artifact_id,
+        Instant::now() + ITEM_DETAIL_DEADLINE,
+        &AtomicBool::new(false),
+        read_page,
+    )
+}
+
+/// @author kongweiguang
+/// Artifact pagination shares one absolute deadline and checks cancellation around every RPC page.
+fn read_tool_artifact_pages_until(
+    thread_id: &str,
+    turn_id: &str,
+    call_id: &str,
+    artifact_id: &str,
+    deadline: Instant,
+    cancelled: &AtomicBool,
     mut read_page: impl FnMut(Value, Duration) -> Result<Value, CliError>,
 ) -> Result<String, CliError> {
-    let deadline = Instant::now() + ITEM_DETAIL_DEADLINE;
     let mut offset = 0_u64;
     let mut total = None;
     let mut content = String::new();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CliError::transport("工具产物读取已取消"));
+        }
         let page = read_page(
             json!({
                 "threadId":thread_id,
@@ -6377,6 +7101,9 @@ pub(super) fn read_tool_artifact_pages(
             }),
             remaining_scan(deadline)?,
         )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CliError::transport("工具产物读取已取消"));
+        }
         if required_str(&page, "artifactId")? != artifact_id
             || required_u64(&page, "offsetCharacters")? != offset
         {
@@ -6513,6 +7240,636 @@ fn terminal_safe(value: &str) -> String {
         .chars()
         .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
         .collect()
+}
+
+/// @author kongweiguang
+/// A new nonzero generation makes cancellation and same-query picker reopen distinct identities.
+fn next_generation(generation: &mut u64) -> u64 {
+    *generation = generation.wrapping_add(1).max(1);
+    *generation
+}
+
+/// @author kongweiguang
+/// Read workers need an immutable Thread projection snapshot without widening ThreadContext's public API.
+fn clone_thread_context(thread: &ThreadContext) -> ThreadContext {
+    ThreadContext {
+        thread_id: thread.thread_id.clone(),
+        title: thread.title.clone(),
+        workspace_id: thread.workspace_id.clone(),
+        workspace_root: thread.workspace_root.clone(),
+        model_id: thread.model_id.clone(),
+        provider_id: thread.provider_id.clone(),
+        reasoning_level: thread.reasoning_level.clone(),
+        access_mode: thread.access_mode.clone(),
+        revision: thread.revision,
+    }
+}
+
+/// @author kongweiguang
+/// Controller copy validation mirrors the detail panel's text sanitization so its payload must equal visible full text.
+fn safe_detail_copy_text(value: &str) -> Option<String> {
+    let mut safe = String::with_capacity(value.len().min(ITEM_DETAIL_MAX_BYTES));
+    for character in value.chars() {
+        let character = match character {
+            '\n' => '\n',
+            '\t' => ' ',
+            _ if character.is_control() => continue,
+            _ => character,
+        };
+        if safe.len().saturating_add(character.len_utf8()) > ITEM_DETAIL_MAX_BYTES {
+            return None;
+        }
+        safe.push(character);
+    }
+    Some(safe)
+}
+
+/// @author kongweiguang
+/// Large untruncated payloads are bounded before crossing the UI bridge while retaining a truthful retry/export hint.
+fn detail_preview_with_limit(value: &str) -> String {
+    bounded_detail_body(value, "…安全预览已缩短")
+}
+
+/// @author kongweiguang
+/// Status text receives reserved bytes before a large preview is clipped, so retry/export guidance cannot disappear.
+fn bounded_detail_body(preview: &str, status: &str) -> String {
+    let suffix = format!("\n\n{status}");
+    let budget = ITEM_DETAIL_MAX_BYTES.saturating_sub(suffix.len());
+    let mut body = String::with_capacity(ITEM_DETAIL_MAX_BYTES);
+    for character in preview.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            continue;
+        }
+        let character = if character == '\t' { ' ' } else { character };
+        if body.len().saturating_add(character.len_utf8()) > budget {
+            break;
+        }
+        body.push(character);
+    }
+    body.push_str(&suffix);
+    body
+}
+
+/// @author kongweiguang
+/// Only non-truncated public message bodies qualify for eager copy; tool output and private payloads stay excluded.
+pub(super) fn full_public_item_display(item: &Value) -> Result<Option<String>, CliError> {
+    if item.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
+    let kind = required_str(item, "kind")?;
+    let body = match kind {
+        "user_input" => projection::user_input_display(item, None)?,
+        "assistant_progress" | "final_answer" | "reasoning_summary" | "thread_message" => {
+            public_history_item_text(item)
+                .ok_or_else(|| CliError::protocol("公开消息缺少完整正文"))?
+                .to_owned()
+        }
+        _ => return Ok(None),
+    };
+    Ok(safe_detail_copy_text(&body))
+}
+
+/// @author kongweiguang
+/// Search rows reuse the established preview shape while running off-thread and preserve full selection text separately.
+fn input_history_ui_page(
+    _job: &InputHistoryReadJob,
+    page: &Value,
+) -> Result<InputHistoryUiPage, CliError> {
+    let items = page
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("输入历史缺少 items"))?
+        .iter()
+        .map(|item| {
+            let text = required_str(item, "text")?;
+            let preview = text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect::<String>();
+            let truncated = item
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let detail = item
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok((
+                UiChoice {
+                    id: required_str(item, "itemId")?.into(),
+                    label: preview,
+                    detail: Some(if truncated {
+                        format!("{detail} · 过长，仅预览")
+                    } else {
+                        detail.to_owned()
+                    }),
+                },
+                text.to_owned(),
+                truncated,
+            ))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    let next_cursor = page
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok((items, next_cursor))
+}
+
+/// @author kongweiguang
+/// Group the per-item cap with its page-wide accounting target so all pages and partial results share one budget.
+pub(super) struct Utf8ReadBudget<'a> {
+    pub(super) maximum_bytes: usize,
+    pub(super) consumed_bytes: &'a mut usize,
+}
+
+/// @author kongweiguang
+/// Reserve four UTF-8 bytes per requested code point and account each delivered page before continuing.
+pub(super) fn read_bounded_item_content_pages(
+    thread_id: &str,
+    item_id: &str,
+    expected_total: u64,
+    budget: Utf8ReadBudget<'_>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    mut read_page: impl FnMut(Value, Duration) -> Result<Value, CliError>,
+) -> Result<Option<String>, CliError> {
+    let maximum_bytes = budget.maximum_bytes;
+    if expected_total == 0 {
+        return Ok(Some(String::new()));
+    }
+    if expected_total > maximum_bytes as u64 {
+        return Ok(None);
+    }
+    let mut offset = 0_u64;
+    let mut content = String::new();
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CliError::transport("历史正文读取已取消"));
+        }
+        let remaining_bytes = maximum_bytes.saturating_sub(content.len());
+        if remaining_bytes == 0 {
+            return Ok(None);
+        }
+        // JA-RPC limits characters, not bytes; four bytes per requested code point prevents a page from overspending.
+        let page_limit = ITEM_CONTENT_PAGE_CHARACTERS
+            .min((remaining_bytes / 4) as u64)
+            .min(expected_total.saturating_sub(offset));
+        if page_limit == 0 {
+            return Ok(None);
+        }
+        let page = read_page(
+            json!({
+                "threadId":thread_id,
+                "itemId":item_id,
+                "offsetCharacters":offset,
+                "limitCharacters":page_limit
+            }),
+            remaining_scan(deadline)?,
+        )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CliError::transport("历史正文读取已取消"));
+        }
+        if required_str(&page, "itemId")? != item_id
+            || required_u64(&page, "offsetCharacters")? != offset
+            || required_u64(&page, "totalCharacters")? != expected_total
+        {
+            return Err(CliError::protocol("历史正文分页身份不一致"));
+        }
+        let page_text = page
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::protocol("历史正文分页缺少 content"))?;
+        *budget.consumed_bytes = (*budget.consumed_bytes).saturating_add(page_text.len());
+        let page_characters =
+            u64::try_from(page_text.chars().count()).map_err(CliError::transport)?;
+        let end_offset = offset
+            .checked_add(page_characters)
+            .ok_or_else(|| CliError::protocol("历史正文偏移无效"))?;
+        let truncated = page
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| CliError::protocol("历史正文分页缺少 truncated"))?;
+        let next_offset = match page.get("nextOffsetCharacters") {
+            Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| CliError::protocol("历史正文下一页偏移无效"))?,
+            ),
+            None => return Err(CliError::protocol("历史正文分页缺少下一页偏移")),
+        };
+        if page_characters > page_limit
+            || (truncated
+                && (page_characters == 0
+                    || next_offset != Some(end_offset)
+                    || end_offset >= expected_total))
+            || (!truncated && (next_offset.is_some() || end_offset != expected_total))
+        {
+            return Err(CliError::protocol("历史正文分页状态不一致"));
+        }
+        if content.len().saturating_add(page_text.len()) > maximum_bytes {
+            return Ok(None);
+        }
+        content.push_str(page_text);
+        if !truncated {
+            return Ok(Some(content));
+        }
+        offset = end_offset;
+    }
+}
+
+/// @author kongweiguang
+/// Bind a public body read to one read connection, one absolute deadline, and cooperative cancellation checks per page.
+fn read_public_item_content_cancellable(
+    connection: &mut Connection,
+    thread_id: &str,
+    item_id: &str,
+    expected_total: u64,
+    maximum_bytes: Option<usize>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<String, CliError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CliError::transport("正文读取已取消"));
+    }
+    read_item_content_pages_until(
+        thread_id,
+        item_id,
+        expected_total,
+        maximum_bytes,
+        deadline,
+        |params, page_timeout| {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(CliError::transport("正文读取已取消"));
+            }
+            let value = connection.request_with_timeout(
+                "thread/item-content/read",
+                params,
+                page_timeout.min(remaining_scan(deadline)?),
+            )?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(CliError::transport("正文读取已取消"));
+            }
+            Ok(value)
+        },
+    )
+}
+
+/// @author kongweiguang
+/// Count bodies already retained from `thread/read` plus every later RPC page so partial previews consume the same page budget.
+pub(super) fn hydrate_older_history_items(
+    items: &mut [Value],
+    maximum_bytes: usize,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    mut read_content: impl FnMut(&str, u64, usize, &mut usize) -> Result<Option<String>, CliError>,
+) -> Result<usize, CliError> {
+    let mut used_bytes = items.iter().fold(0usize, |total, item| {
+        total.saturating_add(public_history_item_retained_bytes(item))
+    });
+
+    for item in items {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(CliError::transport("历史页读取已取消"));
+        }
+        if item.get("truncated").and_then(Value::as_bool) != Some(true)
+            || !item
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(is_public_text_kind)
+        {
+            continue;
+        }
+        let remaining_bytes = maximum_bytes.saturating_sub(used_bytes);
+        if remaining_bytes == 0 || Instant::now() >= deadline {
+            break;
+        }
+
+        let item_id = required_str(item, "itemId")?.to_owned();
+        let total_characters = required_u64(item, "totalCharacters")?;
+        let mut item_read_bytes = 0usize;
+        let complete = read_content(
+            &item_id,
+            total_characters,
+            remaining_bytes,
+            &mut item_read_bytes,
+        );
+        used_bytes = used_bytes.saturating_add(item_read_bytes);
+        let text = match complete {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(_error) if Instant::now() >= deadline => break,
+            Err(error) => return Err(error),
+        };
+        hydrate_public_history_item(item, |_, _| Ok(text.clone()))?;
+    }
+
+    Ok(used_bytes)
+}
+
+/// @author kongweiguang
+/// Count every retained user-input text block while excluding structured references and non-public payloads.
+fn public_history_item_retained_bytes(item: &Value) -> usize {
+    match item.get("kind").and_then(Value::as_str) {
+        Some("user_input") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .fold(0usize, |total, text| total.saturating_add(text.len())),
+        Some(kind) if is_public_text_kind(kind) => public_history_item_text(item)
+            .map(str::len)
+            .unwrap_or_default(),
+        _ => 0,
+    }
+}
+
+/// @author kongweiguang
+/// 已通过会话门禁的写入回执独立于详情开关；未知结果仅解除等待，不能清选区或自动重放。
+pub(super) fn clipboard_feedback(
+    purpose: ClipboardPurpose,
+    selection_id: Option<u64>,
+    state: CopyState,
+) -> Option<UiEvent> {
+    let notice = match state {
+        CopyState::Copied => match purpose {
+            ClipboardPurpose::TranscriptSelection {
+                selection_id: active,
+            } if selection_id == Some(active) => {
+                return Some(UiEvent::TranscriptSelectionCopied {
+                    selection_id: active,
+                });
+            }
+            ClipboardPurpose::LastReply => "最后一条完整回复已复制。".to_owned(),
+            ClipboardPurpose::MessageDetail { .. } => "完整消息详情已复制。".to_owned(),
+            _ => return None,
+        },
+        CopyState::Failed(error) => match purpose {
+            ClipboardPurpose::TranscriptSelection { .. } => {
+                format!("复制失败，已保留选区：{error}")
+            }
+            ClipboardPurpose::LastReply => format!("完整回复复制失败：{error}"),
+            ClipboardPurpose::MessageDetail { .. } => format!("完整消息详情复制失败：{error}"),
+        },
+        CopyState::TimedOut => match purpose {
+            ClipboardPurpose::TranscriptSelection { .. } => "剪贴板准备超时，已保留选区".into(),
+            ClipboardPurpose::LastReply => "完整回复复制准备超时。".into(),
+            ClipboardPurpose::MessageDetail { .. } => "完整消息详情复制准备超时。".into(),
+        },
+        CopyState::OutcomeUnknown => "剪贴板写入结果未知；请先核查系统剪贴板，再手动复制。".into(),
+        CopyState::Cancelled => "复制准备已取消，尚未写入；可手动重试。".into(),
+        CopyState::Superseded => "复制请求已由新请求替换，尚未写入。".into(),
+        CopyState::Delivering => return None,
+    };
+    Some(match purpose {
+        ClipboardPurpose::TranscriptSelection {
+            selection_id: active,
+        } if selection_id == Some(active) => UiEvent::TranscriptSelectionCopyFailed {
+            selection_id: active,
+            notice,
+        },
+        ClipboardPurpose::TranscriptSelection { .. } => return None,
+        ClipboardPurpose::LastReply | ClipboardPurpose::MessageDetail { .. } => {
+            UiEvent::SetNotice(Some(notice))
+        }
+    })
+}
+
+/// @author kongweiguang
+/// UI 不再可用时交付独占恢复文件；编辑后保留原文的另一份副本，不覆盖编辑器已写入的结果。
+pub(super) fn preserve_editor_handoff_failure(
+    temporary: super::external_editor::TemporaryEditorFile,
+    original_draft: Option<&str>,
+    failure: &str,
+) -> CliError {
+    let recovery = match original_draft {
+        None => format!(
+            "原草稿已保存在 {}；可用编辑器打开后取回。",
+            temporary.preserve().display()
+        ),
+        Some(draft) => {
+            let original = create_editor_draft(draft).map(|file| file.preserve());
+            let edited = temporary.preserve();
+            match original {
+                Ok(path) => format!(
+                    "原草稿已保存在 {}；编辑文件路径为 {}，可用编辑器核查。",
+                    path.display(),
+                    edited.display()
+                ),
+                Err(save_error) => format!(
+                    "原草稿保存失败：{save_error}；编辑文件路径为 {}，请核查文件是否仍存在。",
+                    edited.display()
+                ),
+            }
+        }
+    };
+    CliError::configuration(format!("{failure}。{recovery}"))
+}
+
+/// @author kongweiguang
+/// 连接也可能阻塞；在首个 RPC 前和返回后重查取消，避免旧连接占用新分页的唯一 worker。
+pub(super) fn request_older_history_page(
+    thread_id: &str,
+    cursor: &str,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    request: impl FnOnce(Value, Duration) -> Result<Value, CliError>,
+) -> Result<Value, CliError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CliError::transport("历史页读取已取消"));
+    }
+    let page = request(
+        json!({"threadId":thread_id,"tail":true,"cursor":cursor,"limit":200}),
+        remaining_scan(deadline)?,
+    )?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CliError::transport("历史页读取已取消"));
+    }
+    Ok(page)
+}
+
+/// @author kongweiguang
+/// Hydrate only unique older-page messages; completed bodies and skipped previews publish together under one shared budget.
+fn read_older_history_page(
+    connection: &mut Connection,
+    job: &OlderHistoryReadJob,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<OlderHistoryPage, CliError> {
+    let mut page = request_older_history_page(
+        &job.thread_id,
+        &job.cursor,
+        deadline,
+        cancelled,
+        |params, timeout| connection.request_with_timeout("thread/read", params, timeout),
+    )?;
+    if required_str(&page, "threadId")? != job.thread_id {
+        return Err(CliError::protocol("历史页属于另一个 Thread"));
+    }
+    validate_history_origins(&page)?;
+    let next_cursor = match page.get("nextCursor") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => return Err(CliError::protocol("历史页缺少有效 nextCursor")),
+    };
+    if next_cursor.as_deref() == Some(job.cursor.as_str()) {
+        return Err(CliError::protocol("历史分页游标未前进"));
+    }
+    let page_items = page
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("历史页缺少 items"))?;
+    let latest_items = job
+        .latest_history
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("thread/read 缺少 items"))?;
+    let mut items = unseen_history_page_items(&job.older_items, latest_items, page_items)?;
+    hydrate_older_history_items(
+        &mut items,
+        OLDER_HISTORY_MAX_BYTES,
+        deadline,
+        cancelled,
+        |item_id, total_characters, remaining_bytes, consumed_bytes| {
+            read_bounded_item_content_pages(
+                &job.thread_id,
+                item_id,
+                total_characters,
+                Utf8ReadBudget {
+                    maximum_bytes: remaining_bytes,
+                    consumed_bytes,
+                },
+                deadline,
+                cancelled,
+                |params, timeout| {
+                    connection.request_with_timeout(
+                        "thread/item-content/read",
+                        params,
+                        timeout.min(remaining_scan(deadline)?),
+                    )
+                },
+            )
+        },
+    )?;
+    let item_turn_ids = items
+        .iter()
+        .filter_map(|item| item.get("turnId").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let turns = page
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("历史页缺少 turns"))?
+        .iter()
+        .filter(|turn| {
+            turn.get("turnId")
+                .and_then(Value::as_str)
+                .is_some_and(|turn_id| item_turn_ids.contains(turn_id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    page["items"] = Value::Array(items.clone());
+    page["turns"] = Value::Array(turns.clone());
+    page["liveStream"] = Value::Null;
+    let snapshot = projection::project(
+        &job.thread,
+        &page,
+        &job.interaction,
+        &job.config,
+        Some(&job.thread.title),
+    )?;
+    Ok(OlderHistoryPage {
+        items,
+        turns,
+        entries: snapshot.timeline,
+        next_cursor,
+    })
+}
+
+/// @author kongweiguang
+/// Full detail reads replace the preview only after all pages validate; artifacts retain their existing 4-MiB limit.
+fn read_detail_request(
+    connection: &mut Connection,
+    job: &DetailReadJob,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(String, bool), CliError> {
+    match &job.kind {
+        DetailReadKind::PublicMessage { item } => {
+            let content = read_public_item_content_cancellable(
+                connection,
+                &job.thread_id,
+                required_str(item, "itemId")?,
+                required_u64(item, "totalCharacters")?,
+                Some(ITEM_DETAIL_MAX_BYTES),
+                deadline,
+                cancelled,
+            )?;
+            let body = if required_str(item, "kind")? == "user_input" {
+                projection::user_input_display(item, Some(&content))?
+            } else {
+                content
+            };
+            let body = safe_detail_copy_text(&body).ok_or_else(|| {
+                CliError::usage("正文超过 96 KiB 的详情容量；请使用 /export 导出完整会话")
+            })?;
+            if body.is_empty() {
+                return Err(CliError::usage("完整正文为空；详情保留安全预览"));
+            }
+            Ok((body, true))
+        }
+        DetailReadKind::ToolArtifact {
+            turn_id,
+            call_id,
+            artifact_id,
+            truncated,
+        } => {
+            let artifact = read_tool_artifact_pages_until(
+                &job.thread_id,
+                turn_id,
+                call_id,
+                artifact_id,
+                deadline,
+                cancelled,
+                |params, timeout| {
+                    connection.request_with_timeout(
+                        "tool/artifact/read",
+                        params,
+                        timeout.min(remaining_scan(deadline)?),
+                    )
+                },
+            )?;
+            Ok((
+                tool_detail_body(&job.preview, *truncated, true, Some(&artifact)),
+                false,
+            ))
+        }
+    }
+}
+
+/// @author kongweiguang
+/// Failed details retain the last safe preview and expose the actual next action without granting full-copy readiness.
+fn detail_read_failure_body(job: &DetailReadJob, error: &str) -> String {
+    let export = error.contains("96 KiB")
+        || error.contains("4 MiB")
+        || error.contains("超过")
+        || error.contains("超出");
+    if export {
+        bounded_detail_body(
+            &job.preview,
+            &format!("{error}；请使用 /export 获取完整内容。"),
+        )
+    } else {
+        bounded_detail_body(
+            &job.preview,
+            &format!("详情读取失败：{error}；按 F5 重试。"),
+        )
+    }
 }
 
 /// 明确拒绝保留可修正诊断，未知回执只呈现核实动作；操作键是内部身份，不挤占用户提示。

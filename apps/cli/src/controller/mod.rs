@@ -6,6 +6,7 @@
 mod answer_export;
 mod args;
 mod attachment;
+mod clipboard;
 mod exec;
 mod external_editor;
 mod headless;

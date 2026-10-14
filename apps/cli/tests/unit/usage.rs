@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
+#[allow(dead_code)]
+#[path = "../../src/ui/theme.rs"]
+mod theme;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ja_cli::ui::{UiAction, UiCommand, UiEvent, UiSnapshot, UiState, UiUsageSnapshot, render};
 use ja_runtime::app_server_process::{
@@ -8,7 +12,6 @@ use ja_runtime::app_server_process::{
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::style::Color;
 
 /// 使用完整账本样本，区分含缓存输入与未缓存输入，避免把缓存再次叠加到总量。
 fn usage() -> UiUsageSnapshot {
@@ -410,9 +413,9 @@ fn stale_usage_retry_hint_yields_to_chat_feedback_and_preserves_a_draft() {
 #[test]
 fn context_warning_thresholds_match_desktop() {
     for (tokens, expected_color) in [
-        (799_000, Color::Reset),
-        (800_000, Color::Yellow),
-        (950_000, Color::Red),
+        (799_000, theme::TEXT),
+        (800_000, theme::YELLOW),
+        (950_000, theme::RED),
     ] {
         let mut value = usage();
         let context = value.context.as_mut().unwrap();

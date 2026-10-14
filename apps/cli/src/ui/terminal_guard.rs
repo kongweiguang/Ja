@@ -2,13 +2,94 @@
 // @author kongweiguang
 
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+
+const INPUT_HANDOFF_QUIET_PERIOD: Duration = Duration::from_millis(50);
+const INPUT_HANDOFF_MAX_DURATION: Duration = Duration::from_secs(1);
+const INPUT_HANDOFF_MAX_EVENTS: usize = 256;
+
+/// 外部程序恢复时要求一段安静输入间隔，并限制总时长及事件数避免无限排空。
+pub(super) struct HandoffInputBoundary {
+    started: Instant,
+    last_event: Instant,
+    event_count: usize,
+}
+
+impl HandoffInputBoundary {
+    /// 单独记录时间边界，便于用确定时钟验证恢复失败而不操纵真实控制台。
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            last_event: now,
+            event_count: 0,
+        }
+    }
+
+    /// 每次读取一个残留输入事件都重启安静窗口，超过配额则显式失败以免丢弃无界数据。
+    pub(super) fn observe_event(
+        &mut self,
+        event: &Event,
+        now: Instant,
+    ) -> io::Result<Option<(u16, u16)>> {
+        self.event_count += 1;
+        self.last_event = now;
+        if self.event_count > INPUT_HANDOFF_MAX_EVENTS {
+            return Err(io::Error::other(
+                "外部编辑器返回时终端输入持续到达，无法建立安全交接",
+            ));
+        }
+        self.check_deadline(now)?;
+        Ok(match event {
+            Event::Resize(width, height) => Some((*width, *height)),
+            _ => None,
+        })
+    }
+
+    /// 只有 Crossterm 与 Win32 队列都安静且满50毫秒后才允许重新接收用户输入。
+    pub(super) fn is_quiet(&self, now: Instant, native_queue_empty: bool) -> io::Result<bool> {
+        self.check_deadline(now)?;
+        Ok(native_queue_empty
+            && now.saturating_duration_since(self.last_event) >= INPUT_HANDOFF_QUIET_PERIOD)
+    }
+
+    /// 轮询上限同时受安静窗口、事件 deadline 和主循环刷新间隔约束。
+    pub(super) fn poll_timeout(
+        &self,
+        now: Instant,
+        poll_interval: Duration,
+    ) -> io::Result<Duration> {
+        self.check_deadline(now)?;
+        let quiet_remaining = INPUT_HANDOFF_QUIET_PERIOD
+            .saturating_sub(now.saturating_duration_since(self.last_event));
+        let deadline_remaining =
+            INPUT_HANDOFF_MAX_DURATION.saturating_sub(now.saturating_duration_since(self.started));
+        let timeout = poll_interval.min(quiet_remaining).min(deadline_remaining);
+        Ok(if timeout.is_zero() {
+            Duration::from_millis(1).min(deadline_remaining)
+        } else {
+            timeout
+        })
+    }
+
+    /// 全程最多等待一秒，即使终端持续抖动也必须恢复可见错误。
+    fn check_deadline(&self, now: Instant) -> io::Result<()> {
+        if now.saturating_duration_since(self.started) >= INPUT_HANDOFF_MAX_DURATION {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "外部编辑器返回后1秒内无法清空终端输入",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// 一项模式操作对应一次可失败的终端变更，测试可精确注入中途 I/O 错误。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

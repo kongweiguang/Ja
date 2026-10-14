@@ -8,13 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use serde_json::{Map, Value, json};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
+
+use super::theme;
 
 const API_SPECS: [&str; 3] = [
     "openai_responses",
@@ -2446,7 +2448,7 @@ fn trust_key(
     }
 }
 
-/// 根据窗口宽高绘制限域滚动面板；关键操作保留在最末行，Secret 只绘制固定掩码。
+/// 限域面板先覆盖清屏残影再固定铺深色表面；关键操作保留末行，Secret 只绘制固定掩码。
 pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2455,7 +2457,8 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(view.title.as_str())
-        .border_style(Style::default().fg(Color::LightBlue));
+        .style(Style::default().fg(theme::TEXT).bg(theme::SURFACE))
+        .border_style(Style::default().fg(theme::BLUE));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     if inner.width == 0 || inner.height == 0 {
@@ -2488,7 +2491,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView
     if header_height > 0 {
         frame.render_widget(
             Paragraph::new(truncate(&view.subtitle, chunks[0].width as usize))
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme::MUTED)),
             chunks[0],
         );
     }
@@ -2496,9 +2499,9 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView
         && let Some(message) = view.error.as_deref().or(view.status.as_deref())
     {
         let style = if view.error.is_some() {
-            Style::default().fg(Color::LightRed)
+            Style::default().fg(theme::RED)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::MUTED)
         };
         frame.render_widget(
             Paragraph::new(truncate(message, chunks[1].width as usize)).style(style),
@@ -2519,7 +2522,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView
             .map(|line| Line::from(truncate(line, chunks[3].width as usize)))
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().fg(Color::LightBlue)),
+            Paragraph::new(Text::from(lines)).style(Style::default().fg(theme::BLUE)),
             chunks[3],
         );
     }
@@ -2537,7 +2540,7 @@ fn render_rows(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
             } else {
                 "暂无可显示配置"
             })
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme::MUTED)),
             area,
         );
         return;
@@ -2563,12 +2566,12 @@ fn render_rows(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
             let available = usize::from(area.width).saturating_sub(2);
             let label_width =
                 UnicodeWidthStr::width(label.as_str()).min(available.saturating_mul(2) / 3);
-            let mut spans = vec![Span::styled(marker, Style::default().fg(Color::LightBlue))];
+            let mut spans = vec![Span::styled(marker, Style::default().fg(theme::BLUE))];
             spans.push(Span::styled(
                 truncate(label, label_width),
                 if *selected {
                     Style::default()
-                        .fg(Color::LightBlue)
+                        .fg(theme::BLUE)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -2578,7 +2581,7 @@ fn render_rows(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     truncate(detail, available.saturating_sub(label_width + 2)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::MUTED),
                 ));
             }
             let _ = index;
@@ -2603,7 +2606,7 @@ fn render_wrapped_confirmation_rows(frame: &mut Frame<'_>, area: Rect, view: &Mo
         group_starts.push(lines.len());
         let label_style = if *selected {
             Style::default()
-                .fg(Color::LightBlue)
+                .fg(theme::BLUE)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -2616,7 +2619,7 @@ fn render_wrapped_confirmation_rows(frame: &mut Frame<'_>, area: Rect, view: &Mo
                 "  "
             };
             lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::LightBlue)),
+                Span::styled(marker, Style::default().fg(theme::BLUE)),
                 Span::styled(line.clone(), label_style),
             ]));
         }
@@ -2624,7 +2627,7 @@ fn render_wrapped_confirmation_rows(frame: &mut Frame<'_>, area: Rect, view: &Mo
             for line in wrap_display_text(detail, width) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(line, Style::default().fg(Color::DarkGray)),
+                    Span::styled(line, Style::default().fg(theme::MUTED)),
                 ]));
             }
         }
@@ -2709,7 +2712,7 @@ fn render_form(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
     }
     if view.fields.is_empty() {
         frame.render_widget(
-            Paragraph::new("没有可编辑字段").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("没有可编辑字段").style(Style::default().fg(theme::MUTED)),
             area,
         );
         return;
@@ -2756,8 +2759,8 @@ fn render_form(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
                 cursor_position = Some(Position::new(x, y));
             }
             let mut spans = vec![
-                Span::styled(marker, Style::default().fg(Color::LightBlue)),
-                Span::styled(label, Style::default().fg(Color::DarkGray)),
+                Span::styled(marker, Style::default().fg(theme::BLUE)),
+                Span::styled(label, Style::default().fg(theme::MUTED)),
                 Span::raw(format!(
                     "{}  ",
                     " ".repeat(label_column.saturating_sub(label_width))
@@ -2767,10 +2770,10 @@ fn render_form(frame: &mut Frame<'_>, area: Rect, view: &ModelSettingsView) {
                 shown_value,
                 if field.selected {
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(theme::CYAN)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Reset)
+                    Style::default().fg(theme::TEXT)
                 },
             ));
             Line::from(spans)

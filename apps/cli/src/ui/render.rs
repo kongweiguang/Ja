@@ -12,20 +12,21 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use super::composer::input_visual_lines;
 use super::markdown::{code_label_line, render_code_lines, render_markdown};
 use super::model::{
-    InteractionQuestionKind, PendingPrompt, StreamPresentation, TimelineEntry, TimelineKind,
-    TimelineStatus, TurnState, UiChoice,
+    InteractionQuestionKind, MESSAGE_PREVIEW_TRUNCATED_NOTICE, PendingPrompt, StreamPresentation,
+    TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiChoice,
 };
 use super::state::{
     ChoiceKind, DetailScroll, Panel, UiState, command_description, command_label, matching_commands,
 };
+use super::theme;
 use super::transcript::TranscriptBlock;
 use super::usage::usage_line;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const MUTED: Color = Color::Rgb(136, 136, 150);
-const COMPOSER_BACKGROUND: Color = Color::Rgb(38, 40, 43);
-const COMPOSER_FOREGROUND: Color = Color::Rgb(238, 239, 241);
+const MUTED: Color = theme::MUTED;
+const COMPOSER_BACKGROUND: Color = theme::COMPOSER_BACKGROUND;
+const COMPOSER_FOREGROUND: Color = theme::COMPOSER_FOREGROUND;
 const MAX_SELECTOR_ITEMS: usize = 8;
 pub(super) const WORKING_INDICATOR_INTERVAL: Duration = Duration::from_millis(240);
 const WORKING_INLINE_HINT_MIN_WIDTH: usize = 32;
@@ -37,9 +38,21 @@ struct SelectionRow {
     tag: Option<String>,
 }
 
-/// 正文与底部交互区共享唯一几何计划；正文追加和滚动不会改变 Composer 的行坐标。
+/// 全屏详情独立呈现操作状态；全文未就绪与没有复制能力不能共享提示。
+/// @author kongweiguang
+struct DetailsFeedback<'a> {
+    refreshable: bool,
+    message_copy_ready: Option<bool>,
+    notice: Option<&'a str>,
+}
+
+/// 固定背景先覆盖全屏，再绘制共享几何计划，避免正文和 Composer 依赖宿主 ANSI 默认色。
 pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme::TEXT).bg(theme::BACKGROUND)),
+        area,
+    );
     let Some(plan) = render_plan(area, state) else {
         return;
     };
@@ -377,18 +390,18 @@ fn welcome_lines(state: &UiState, width: usize) -> Vec<Line<'static>> {
             Span::styled(
                 brand,
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(theme::BLUE)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(version, Style::default().fg(MUTED)),
         ]),
         Line::from(vec![
             Span::styled(directory_label, Style::default().fg(MUTED)),
-            Span::styled(directory, Style::default().fg(Color::Green)),
+            Span::styled(directory, Style::default().fg(theme::GREEN)),
         ]),
         Line::from(vec![
             Span::styled(permission_label, Style::default().fg(MUTED)),
-            Span::styled(permission, Style::default().fg(Color::Reset)),
+            Span::styled(permission, Style::default().fg(theme::TEXT)),
         ]),
     ]
 }
@@ -485,12 +498,12 @@ fn working_indicator_line(show_cancel_hint: bool, elapsed: Option<u64>) -> Line<
         / WORKING_INDICATOR_INTERVAL.as_millis();
     let active_dot = phase % 3;
     let mut spans = vec![
-        Span::styled("• ", Style::default().fg(Color::Reset)),
+        Span::styled("• ", Style::default().fg(theme::TEXT)),
         Span::styled("正在工作 ", Style::default().fg(MUTED)),
     ];
     for index in 0..3 {
         let color = if index as u128 == active_dot {
-            Color::Rgb(205, 205, 214)
+            theme::BLUE
         } else {
             MUTED
         };
@@ -557,6 +570,9 @@ fn append_entry_lines(
     match &entry.kind {
         TimelineKind::User => {
             append_input_lines(lines, &entry.text, width);
+            if entry.detail.as_deref() == Some(MESSAGE_PREVIEW_TRUNCATED_NOTICE) {
+                append_message_truncated_notice(lines, width);
+            }
         }
         TimelineKind::WorkSummary { elapsed_seconds } => {
             lines.push(Line::default());
@@ -579,17 +595,21 @@ fn append_entry_lines(
             );
             if entry.status == Some(TimelineStatus::Failed)
                 && let Some(detail) = entry.detail.as_deref()
+                && detail != MESSAGE_PREVIEW_TRUNCATED_NOTICE
             {
                 append_plain(
                     lines,
                     &bounded_lines(detail, 3),
                     "   ",
                     if entry.status == Some(TimelineStatus::Failed) {
-                        Color::Red
+                        theme::RED
                     } else {
-                        Color::Reset
+                        theme::TEXT
                     },
                 );
+            }
+            if entry.detail.as_deref() == Some(MESSAGE_PREVIEW_TRUNCATED_NOTICE) {
+                append_message_truncated_notice(lines, width);
             }
         }
         TimelineKind::AssistantFragment {
@@ -609,9 +629,9 @@ fn append_entry_lines(
         } => {
             append_reply_gap(lines);
             let action_color = if entry.status == Some(TimelineStatus::Failed) {
-                Color::Red
+                theme::RED
             } else {
-                Color::Yellow
+                theme::YELLOW
             };
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -627,13 +647,23 @@ fn append_entry_lines(
                         target,
                         width.saturating_sub(UnicodeWidthStr::width(action.as_str()) + 5),
                     ),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme::CYAN),
                 ),
                 Span::styled(" ▸", Style::default().fg(MUTED)),
             ]));
             append_tool_preview(lines, entry, width, *preview_truncated);
         }
     }
+}
+
+/// Mark an incomplete message preview as decoration, leaving its source text and copy mapping untouched.
+/// @author kongweiguang
+fn append_message_truncated_notice(lines: &mut Vec<Line<'static>>, width: usize) {
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        truncate_cells(&format!("  {MESSAGE_PREVIEW_TRUNCATED_NOTICE}"), width),
+        Style::default().fg(MUTED),
+    )));
 }
 
 /// 成功与失败共用三行安全预览；同时保留源端截断事实，不能把短预览误当完整结果。
@@ -747,7 +777,7 @@ fn append_plain(lines: &mut Vec<Line<'static>>, value: &str, prefix: &str, color
             spans.push(Span::styled(
                 prefix.to_owned(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::YELLOW)
                     .add_modifier(Modifier::BOLD),
             ));
         } else if index > 0 && !prefix.is_empty() {
@@ -841,6 +871,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, plan: &Re
 
 /// 身份、用量与操作反馈各有固定位置；空闲帮助也留在操作行，避免挤占会话身份。
 /// 矮窗先让用量退出；刷新入口让位于审批和恢复反馈，不能用计量错误覆盖聊天操作。
+/// 消息详情按可用列数缩短复制提示，避免支持键被底栏截断。
 /// @author kongweiguang
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.width == 0 || area.height == 0 {
@@ -923,7 +954,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             frame.render_widget(
                 Paragraph::new(truncate_cells(notice, area.width as usize)).style(
                     Style::default()
-                        .fg(Color::Reset)
+                        .fg(theme::TEXT)
                         .add_modifier(Modifier::BOLD),
                 ),
                 area,
@@ -1001,6 +1032,25 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         }
         Some(Panel::Help { .. }) if area.width < 40 => Some("↑↓/Pg 翻页 · Esc/? 返回"),
         Some(Panel::Help { .. }) => Some("↑↓/PgUp/PgDn/Home/End 浏览 · Esc/? 返回"),
+        Some(Panel::Details { .. }) if state.is_message_detail_entry_open() => {
+            Some(if !state.message_detail_copy_ready() && area.width < 20 {
+                "读取全文中 · Esc"
+            } else if !state.message_detail_copy_ready() {
+                "读取全文中 · F5 重试 · Esc 返回"
+            } else if area.width < 12 {
+                "Esc"
+            } else if area.width < 20 {
+                "C 复制"
+            } else if area.width < 32 {
+                "C 复制 · Esc"
+            } else if area.width < 48 {
+                "C 复制 · F5 · Esc"
+            } else if area.width < 64 {
+                "C 复制全文 · Ctrl+Ins · F5 · Esc"
+            } else {
+                "C 复制全文 / Ctrl+Insert · F5 重试 · Esc 返回"
+            })
+        }
         Some(Panel::Details { .. } | Panel::ChoiceDetail { .. }) => Some("  Esc 返回"),
         Some(Panel::ModelSettings) => None,
         None => None,
@@ -1034,7 +1084,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         frame.render_widget(
             Paragraph::new(truncate_cells(hint, area.width as usize)).style(
                 Style::default()
-                    .fg(Color::Reset)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ),
             area,
@@ -1071,6 +1121,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             "?"
         } else if area.width < 14 {
             "? 帮助"
+        } else if state.has_message_detail_target() && area.width < 34 {
+            "  ? 帮助 · F2 全文"
+        } else if state.has_message_detail_target() {
+            "  ? 查看快捷键 · F2 查看全文"
+        } else if area.width < 34 {
+            "  ? 帮助"
         } else {
             "  ? 查看快捷键"
         }),
@@ -1094,6 +1150,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 /// 显示操作错误时仍留下能退回或重试当前面板的按键，窄屏把 Esc 放在首位。
+/// @author kongweiguang
 fn notice_panel_hint(state: &UiState, width: u16) -> Option<&'static str> {
     if width < 29 {
         return Some("Esc 返回");
@@ -1102,6 +1159,9 @@ fn notice_panel_hint(state: &UiState, width: u16) -> Option<&'static str> {
         Some(Panel::Commands { .. }) => Some("Tab 补全 · Esc 返回"),
         Some(Panel::Choices { .. }) | Some(Panel::Pending) => Some("Enter 重试 · Esc 返回"),
         Some(Panel::Help { .. }) => Some("Esc/? 返回"),
+        Some(Panel::Details { .. }) if state.is_message_detail_entry_open() => {
+            Some("F5 重试 · Esc 返回")
+        }
         Some(Panel::Details { .. } | Panel::ChoiceDetail { .. }) => Some("Esc 返回"),
         Some(Panel::ModelSettings) => Some("Esc 返回"),
         None => None,
@@ -1140,7 +1200,7 @@ fn status_identity(snapshot: &super::model::UiSnapshot, width: usize) -> Line<'s
         spans.push(Span::styled(
             model,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::YELLOW)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1161,11 +1221,11 @@ fn status_identity(snapshot: &super::model::UiSnapshot, width: usize) -> Line<'s
     if directory_budget > 0 && remaining >= 4 {
         spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
         let directory = truncate_cells(&directory, directory_budget);
-        spans.push(Span::styled(directory, Style::default().fg(Color::Green)));
+        spans.push(Span::styled(directory, Style::default().fg(theme::GREEN)));
     }
     if title_width > 0 {
         spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
-        spans.push(Span::styled(title, Style::default().fg(Color::LightBlue)));
+        spans.push(Span::styled(title, Style::default().fg(theme::BLUE)));
     }
     if padding > 0 {
         spans.push(Span::raw(" ".repeat(padding)));
@@ -1198,7 +1258,7 @@ fn render_status_message(frame: &mut Frame<'_>, area: Rect, message: &str, hint:
         frame.render_widget(
             Paragraph::new(right).style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::YELLOW)
                     .add_modifier(Modifier::BOLD),
             ),
             Rect::new(
@@ -1375,14 +1435,14 @@ fn render_selector(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         let active = selected == Some(index);
         let marker = if active { "› " } else { "  " };
         let active_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::CYAN)
             .add_modifier(Modifier::BOLD);
         let mut spans = vec![Span::styled(
             marker,
             if active {
                 active_style
             } else {
-                Style::default().fg(Color::Reset)
+                Style::default().fg(theme::TEXT)
             },
         )];
         let room = content.width.saturating_sub(2) as usize;
@@ -1399,7 +1459,7 @@ fn render_selector(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             if active {
                 active_style
             } else {
-                Style::default().fg(Color::Reset)
+                Style::default().fg(theme::TEXT)
             },
         ));
         if show_description {
@@ -1507,7 +1567,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let mut lines = vec![Line::from(Span::styled(
         truncate_cells(&title, content.width as usize),
         Style::default()
-            .fg(Color::Reset)
+            .fg(theme::TEXT)
             .add_modifier(Modifier::BOLD),
     ))];
     if content.height >= 3 && !description.is_empty() {
@@ -1534,7 +1594,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     for (index, row) in rows.iter().enumerate().skip(start).take(visible_count) {
         let active = selected == Some(index);
         let active_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::CYAN)
             .add_modifier(Modifier::BOLD);
         let marker = if active { "› " } else { "  " };
         let number = if selected.is_some() {
@@ -1557,7 +1617,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 if active {
                     active_style
                 } else {
-                    Style::default().fg(Color::Reset)
+                    Style::default().fg(theme::TEXT)
                 },
             ),
             Span::styled(
@@ -1565,7 +1625,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 if active {
                     active_style
                 } else {
-                    Style::default().fg(Color::Reset)
+                    Style::default().fg(theme::TEXT)
                 },
             ),
             Span::styled(
@@ -1573,7 +1633,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 if active {
                     active_style
                 } else {
-                    Style::default().fg(Color::Reset)
+                    Style::default().fg(theme::TEXT)
                 },
             ),
         ];
@@ -1596,7 +1656,7 @@ fn render_choice_view(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
 }
 
-/// 详情继续使用全区查看层；帮助由 RenderPlan 在输入区上方预留空间。
+/// 全区详情自行显示复制就绪状态，避免依赖被遮住的 Composer 底栏；帮助仍使用预留区域。
 fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some(panel) = state.panel() else {
         return;
@@ -1613,8 +1673,10 @@ fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             body,
             scroll,
             return_to_pending,
+            copy_ready,
         } => {
-            let refreshable = entry_id == "status"
+            let refreshable = state.is_message_detail_entry_open()
+                || entry_id == "status"
                 || entry_id.starts_with("diff:")
                 || state.snapshot().timeline.iter().any(|entry| {
                     entry.id == *entry_id && matches!(entry.kind, TimelineKind::Tool { .. })
@@ -1626,10 +1688,11 @@ fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 body,
                 *scroll,
                 *return_to_pending,
-                (
+                DetailsFeedback {
                     refreshable,
-                    state.snapshot().notice.as_deref().filter(|_| refreshable),
-                ),
+                    message_copy_ready: state.is_message_detail_entry_open().then_some(*copy_ready),
+                    notice: state.snapshot().notice.as_deref().filter(|_| refreshable),
+                },
             );
         }
         Panel::ChoiceDetail {
@@ -1646,7 +1709,19 @@ fn render_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             let body = choice
                 .and_then(|choice| choice.detail.as_deref())
                 .unwrap_or("没有更多说明");
-            render_details_panel(frame, area, title, body, *scroll, false, (false, None));
+            render_details_panel(
+                frame,
+                area,
+                title,
+                body,
+                *scroll,
+                false,
+                DetailsFeedback {
+                    refreshable: false,
+                    message_copy_ready: None,
+                    notice: None,
+                },
+            );
         }
         Panel::Pending => unreachable!(),
         Panel::ModelSettings => {
@@ -1794,7 +1869,7 @@ fn help_group_lines(title: &str, entries: &[(&str, &str)], width: usize) -> Vec<
     for &(key, description) in entries {
         if stacked {
             lines.extend(wrap_transcript_lines(
-                vec![Line::from(Span::styled(key.to_owned(), Color::LightBlue))],
+                vec![Line::from(Span::styled(key.to_owned(), theme::BLUE))],
                 width,
             ));
         }
@@ -1805,7 +1880,7 @@ fn help_group_lines(title: &str, entries: &[(&str, &str)], width: usize) -> Vec<
         for (row, mut content) in wrapped.into_iter().enumerate() {
             let mut spans = Vec::new();
             if !stacked && row == 0 {
-                spans.push(Span::styled(key.to_owned(), Color::LightBlue));
+                spans.push(Span::styled(key.to_owned(), theme::BLUE));
                 spans.push(Span::raw(" ".repeat(indent.saturating_sub(key.width()))));
             } else {
                 spans.push(Span::raw(" ".repeat(indent)));
@@ -1828,6 +1903,10 @@ fn render_help_panel(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         return;
     }
     frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme::TEXT).bg(theme::BACKGROUND)),
+        area,
+    );
     let inset = u16::from(area.width >= 8) * 2;
     let inner = Rect::new(
         area.x + inset,
@@ -1917,7 +1996,7 @@ fn render_pending_inline(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let mut lines = vec![Line::from(Span::styled(
         truncate_cells(&title, content.width as usize),
         Style::default()
-            .fg(Color::Reset)
+            .fg(theme::TEXT)
             .add_modifier(Modifier::BOLD),
     ))];
     let wrapped_question = wrap_transcript_lines(
@@ -1970,15 +2049,15 @@ fn render_pending_inline(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 let label = format!("{}. {label}", index + 1);
                 let marker = if active { "› " } else { "  " };
                 lines.push(Line::from(vec![
-                    Span::styled(marker, Style::default().fg(Color::Reset)),
+                    Span::styled(marker, Style::default().fg(theme::TEXT)),
                     Span::styled(
                         truncate_cells(&label, content.width.saturating_sub(2) as usize),
                         if active {
                             Style::default()
-                                .fg(Color::Reset)
+                                .fg(theme::TEXT)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::Reset)
+                            Style::default().fg(theme::TEXT)
                         },
                     ),
                 ]));
@@ -2019,7 +2098,9 @@ fn empty_choice_label(kind: ChoiceKind) -> &'static str {
     }
 }
 
-/// 只读详情将重读能力与诊断一同呈现，失败保留正文及固定返回操作，避免错误被整屏遮住。
+/// 详情先清除底层字形再铺固定背景；C 是终端可靠的全文复制入口，Ctrl+Insert 作为宽屏补充，未确认全文时不显示复制入口。
+/// 通用状态反馈沿用底栏正文色，避免把复制成功或实际处理中统一染成错误色。
+/// @author kongweiguang
 fn render_details_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2027,10 +2108,18 @@ fn render_details_panel(
     body: &str,
     scroll: DetailScroll,
     return_to_pending: bool,
-    feedback: (bool, Option<&str>),
+    feedback: DetailsFeedback<'_>,
 ) {
-    let (refreshable, notice) = feedback;
+    let DetailsFeedback {
+        refreshable,
+        message_copy_ready,
+        notice,
+    } = feedback;
     frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme::TEXT).bg(theme::BACKGROUND)),
+        area,
+    );
     let inset = u16::from(area.width >= 4) * 2;
     let inner = Rect::new(
         area.x + inset,
@@ -2044,7 +2133,7 @@ fn render_details_panel(
     frame.render_widget(
         Paragraph::new(truncate_cells(title, inner.width as usize)).style(
             Style::default()
-                .fg(Color::Reset)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
         Rect::new(inner.x, inner.y, inner.width, 1),
@@ -2052,7 +2141,7 @@ fn render_details_panel(
     if inner.height >= 3 {
         frame.render_widget(
             Paragraph::new("─".repeat(inner.width as usize))
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme::RULE)),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
     }
@@ -2088,15 +2177,44 @@ fn render_details_panel(
         "Esc 返回"
     };
     let refresh_hint = if refreshable { " · F5 重读" } else { "" };
-    let footer = if inner.width < 50 {
+    let footer = if let Some(copy_ready) = message_copy_ready {
+        if !copy_ready {
+            if inner.width < 14 {
+                "Esc".to_owned()
+            } else if inner.width < 24 {
+                "F5 · Esc".to_owned()
+            } else if inner.width < 38 {
+                "F5 重试 · Esc 返回".to_owned()
+            } else {
+                "读取全文中 · F5 重试 · Esc 返回".to_owned()
+            }
+        } else if inner.width < 8 {
+            "Esc 返回".to_owned()
+        } else if inner.width < 12 {
+            "C 复制".to_owned()
+        } else if inner.width < 20 {
+            "C 复制 · Esc".to_owned()
+        } else if inner.width < 32 {
+            "C 复制 · F5 · Esc".to_owned()
+        } else if inner.width < 50 {
+            "C 复制全文 · F5 重试 · Esc 返回".to_owned()
+        } else if inner.width < 70 {
+            "C 复制全文 / Ctrl+Ins · F5 重试 · Esc 返回".to_owned()
+        } else {
+            format!("C 复制全文 / Ctrl+Insert · F5 重读 · Esc 返回 · ↑↓/Pg 翻页  {end}/{total}")
+        }
+    } else if inner.width < 50 {
         format!("↑↓ 滚动{refresh_hint} · {return_label}  {end}/{total}")
     } else {
         format!("↑↓ 滚动 · PgUp/PgDn 翻页 · Home/End{refresh_hint} · {return_label}  {end}/{total}")
     };
     if show_notice && let Some(notice) = notice {
         frame.render_widget(
-            Paragraph::new(truncate_cells(notice, inner.width as usize))
-                .style(Style::default().fg(Color::Red)),
+            Paragraph::new(truncate_cells(notice, inner.width as usize)).style(
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
         );
     }

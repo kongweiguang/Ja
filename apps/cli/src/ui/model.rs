@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Render-only marker carried in `TimelineEntry::detail`; source text and selection copying stay intact.
+pub const MESSAGE_PREVIEW_TRUNCATED_NOTICE: &str = "正文未完整加载，F2 查看全文";
+
 /// 对话行使用稳定 ID，流式增量才能只更新对应内容。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineEntry {
@@ -40,6 +43,22 @@ pub enum TimelineKind {
         /// 沿用服务端截断事实，让短预览也能说明完整结果仍需显式读取。
         preview_truncated: bool,
     },
+}
+
+impl TimelineKind {
+    /// 初始预览和后台详情共用语义标题，正文首行不能在回包后取代标题并重复显示。
+    /// @author kongweiguang
+    pub fn message_detail_title(&self) -> &'static str {
+        match self {
+            Self::User => "你的消息 · 完整正文",
+            Self::Assistant | Self::FinalAnswer => "Ja 回复 · 完整正文",
+            Self::Commentary => "回复过程 · 完整正文",
+            Self::ReasoningSummary => "思考摘要 · 完整正文",
+            Self::WorkSummary { .. } | Self::AssistantFragment { .. } | Self::Tool { .. } => {
+                "消息正文"
+            }
+        }
+    }
 }
 
 /// 稳定区块与代码行共用正文渲染；代码标签独立于正文以保持流式和历史外观一致。
@@ -273,12 +292,14 @@ pub enum UiAction {
     LoadOlder {
         thread_id: String,
     },
+    /// 离开正文浏览取消未完成读取，不让迟到历史改变新的阅读面。
+    CancelOlderHistory,
     /// @author kongweiguang
     /// 分叉候选分页独立于正文历史游标，避免 picker 翻页误推进 transcript 阅读位置。
     LoadMoreForkReplies {
         thread_id: String,
     },
-    /// 选区正文只经进程内事件和剪贴板 stdin 传递，不放入命令参数。
+    /// 选区正文只经进程内事件和原生剪贴板传递，不放入命令参数。
     CopyTranscriptSelection {
         selection_id: u64,
         text: String,
@@ -342,6 +363,11 @@ pub enum UiAction {
         query: String,
         cursor: Option<String>,
     },
+    /// 关闭选择器后失效正在读取的查询，保留实际草稿。
+    CancelInputHistorySearch,
+    CancelTranscriptSelection {
+        selection_id: u64,
+    },
     /// Fork 锚点使用服务端 item identity，UI 不推导 Turn 边界或上下文。
     ForkReply {
         item_id: String,
@@ -374,6 +400,11 @@ pub enum UiAction {
     },
     CloseDetails {
         entry_id: String,
+    },
+    /// 仅完整消息详情允许复制，预览不能借此冒充全文。
+    CopyDetails {
+        entry_id: String,
+        text: String,
     },
     Quit,
 }
@@ -509,6 +540,11 @@ pub enum UiEvent {
         entry_id: String,
         title: String,
         body: String,
+    },
+    /// 完整读取确认后才开放复制，关闭面板后的迟到状态不得重新启用。
+    SetDetailsCopyReady {
+        entry_id: String,
+        ready: bool,
     },
     SetNotice(Option<String>),
     Shutdown,

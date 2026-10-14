@@ -90,7 +90,7 @@ final class AgentModelStep {
     }
 
     /**
-     * 冻结计量候选再发送同一信封；checkpoint 身份延迟到压缩提交后冻结，避免记错摘要来源。
+     * 冻结计量候选并绑定 Provider ordinal；压缩请求推进游标后按新身份重建候选，checkpoint 来源仍延迟到提交后确定。
      */
     void advance() {
         prepare(false);
@@ -126,8 +126,9 @@ final class AgentModelStep {
         Map<PromptKey, FrozenRequest> candidates = new HashMap<>();
         ContextTokenMeter meter = (messages, summary, continuation, compacted) -> {
             io.github.kongweiguang.ja.agent.application.context.ContextOrchestrator.PreparedPrompt prompt = new ContextOrchestrator.PreparedPrompt(messages, summary, 0, continuation, compacted);
-            FrozenRequest frozen = candidates.computeIfAbsent(new PromptKey(messages, summary, compacted),
-                ignored -> freeze(prompt));
+            int modelRequestOrdinal = host.cursor().common().nextProviderOrdinal();
+            PromptKey key = new PromptKey(messages, summary, compacted, modelRequestOrdinal);
+            FrozenRequest frozen = candidates.computeIfAbsent(key, ignored -> freeze(prompt, modelRequestOrdinal));
             return new ContextTokenMeter.Measurement(frozen.estimate().conservativeUpperBound(),
                     frozen.estimate().estimatedTokens(), frozen.estimate().fingerprint());
         };
@@ -138,7 +139,9 @@ final class AgentModelStep {
         AgentLoopPersistence.ConversationHistory history = new AgentLoopPersistence.ConversationHistory(snapshot.conversation(), snapshot.executions(), snapshot.records());
         return context.prepare(history, host.historySelection(), host.cursor().common(), request,
             receipt -> { /* 检查点事务的持久事件已由 Session 发布，不重复投递。 */ }, prompt -> {
-                FrozenRequest frozen = candidates.get(new PromptKey(prompt.messages(), prompt.summary(), prompt.localCompaction()));
+                int modelRequestOrdinal = host.cursor().common().nextProviderOrdinal();
+                FrozenRequest frozen = candidates.get(new PromptKey(prompt.messages(), prompt.summary(),
+                    prompt.localCompaction(), modelRequestOrdinal));
                 if (frozen == null) {
                     throw new IllegalStateException("unmeasured Provider envelope");
                 }
@@ -193,11 +196,14 @@ final class AgentModelStep {
     }
 
     /**
-     * 计量候选复用完整信封及待提交补丁；Runtime 仅借用，关闭责任仍属于外层 Engine。
+     * 计量候选复用完整信封及待提交补丁，并在冻结时绑定当前 Provider ordinal；Runtime 仅借用，关闭责任仍属于外层 Engine。
      */
     @SuppressWarnings("PMD.CloseResource")
-    private FrozenRequest freeze(ContextOrchestrator.PreparedPrompt prompt) {
+    private FrozenRequest freeze(ContextOrchestrator.PreparedPrompt prompt, int modelRequestOrdinal) {
         AgentRequestRuntime runtime = host.runtime();
+        String modelRequestId = host.id("modelreq", "provider:" + modelRequestOrdinal);
+        ModelPort.RequestDiagnostics diagnostics = new ModelPort.RequestDiagnostics(
+            host.identity().threadId(), host.identity().turnId(), modelRequestId, modelRequestOrdinal);
         List<AgentTool> tools = runtime.extensions().tools();
         AgentPromptSession.PreparedPrompt prepared = runtime.promptSession().prepare(
             prompt.summary().hasNoFacts() ? "" : prompt.summary().toPromptText(), tools.stream().map(AgentTool::spec).toList());
@@ -234,19 +240,24 @@ final class AgentModelStep {
         ModelPort.ModelRequest request = new ModelPort.ModelRequest(base.configuration(),
             new ModelPort.PromptPayload(finalSystem, revision), messages,
             tools.stream().filter(tool -> visible.contains(tool.spec().name())).map(AgentTool::spec).toList(),
-            null, base.round(), ModelPort.RequestDeadlinePolicy.TURN_MANAGED, base.diagnostics(),
+            null, base.round(), ModelPort.RequestDeadlinePolicy.TURN_MANAGED, diagnostics,
             base.outputSchema());
         ModelPort.InputTokenEstimate estimate = runtime.model().estimateInputTokens(request, host.cancellation());
         return new FrozenRequest(request, prepared.budget(), prepared.snapshot().revision(), estimate, List.copyOf(writes));
     }
 
     /**
-     * ProviderPending、能力事实和本地估算先原子提交；提交后消费 Prompt 一次性提示，再确认执行权并联网。
+     * ProviderPending 与本地估算先原子提交，随后消费 Prompt 提示并确认执行权；派发复用冻结诊断 ID，避免 ordinal 错配。
      */
     private void send(FrozenRequest frozen, AgentRequestContext.SummarySource summarySource) {
         Objects.requireNonNull(summarySource, "summarySource");
         Ready current = (TurnExecutionState.Ready) host.cursor();
-        String modelRequestId = host.id("modelreq", "provider:" + current.common().nextProviderOrdinal());
+        ModelPort.RequestDiagnostics diagnostics = Objects.requireNonNull(
+            frozen.request().diagnostics(), "frozen model request diagnostics");
+        if (diagnostics.modelRequestOrdinal() != current.common().nextProviderOrdinal()) {
+            throw new IllegalStateException("frozen model request ordinal does not match the execution cursor");
+        }
+        String modelRequestId = diagnostics.modelRequestId();
         String messageId = host.id("item", modelRequestId);
         Common common = new TurnExecutionState.Common(current.common().modelRound(), current.common().usedToolCalls(),
             current.common().nextProviderOrdinal(), frozen.toolGuardRevision(),
@@ -579,15 +590,17 @@ final class AgentModelStep {
     }
 
     /**
-     * 计量值不参与候选身份，避免实际发送时由于 estimatedTokens 不同而重新调用中间件。
+     * Token 计量值不参与候选身份，但 Provider ordinal 必须参与，避免压缩期间推进调用游标后复用旧请求身份。
      *
      * @param messages  消息列表
      * @param summary   摘要
      * @param compacted 是否已压缩上下文
+     * @param modelRequestOrdinal 当前冻结请求占用的 Provider 顺序位置
      */
     private record PromptKey(List<ContextMessage> messages,
                              SummaryDocument summary,
-                             boolean compacted) {
+                             boolean compacted,
+                             int modelRequestOrdinal) {
     }
 
     /**

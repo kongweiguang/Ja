@@ -28,10 +28,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.ConnectException;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -43,6 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import javax.net.ssl.SSLException;
 
 /**
  * 多种原生 Provider wire adapter 的共享执行边界。
@@ -105,6 +110,37 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
         }
         return new ProviderProtocolException(failure.code(), failure.getMessage(), true,
                 failure, failure.retryAfter().orElse(null), "MODEL_STREAM_INVALID");
+    }
+
+    /**
+     * 投影 Throwable cause 链为固定类别，避免请求日志接触可能含 URL、响应正文或凭据的异常文本。
+     */
+    static String safeFailureCategory(Throwable failure) {
+        Objects.requireNonNull(failure, "failure");
+        Throwable cause = failure.getCause();
+        if (cause == null) {
+            return "provider";
+        }
+        boolean ioCause = false;
+        for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
+            if (cause instanceof ConnectException) {
+                return "connect";
+            }
+            if (cause instanceof UnknownHostException) {
+                return "dns";
+            }
+            if (cause instanceof SSLException) {
+                return "tls";
+            }
+            if (cause instanceof EOFException) {
+                return "eof";
+            }
+            if (cause instanceof SocketTimeoutException || cause instanceof SocketException) {
+                return "socket";
+            }
+            ioCause |= cause instanceof IOException;
+        }
+        return ioCause ? "io" : "other";
     }
 
     /**
@@ -499,13 +535,15 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             ProviderProtocolException classified = terminalFailure(failure);
             ModelPort.RequestDiagnostics diagnostics = request.diagnostics();
             LOGGER.warn("Provider request stopped threadId={} turnId={} modelRequestId={} modelRequestOrdinal={} "
-                        + "providerId={} modelId={} api={} provider_failure_code={} terminal_error_code={}",
+                        + "providerId={} modelId={} api={} provider_failure_code={} terminal_error_code={} "
+                        + "underlying_cause_category={}",
                     diagnostics == null ? null : diagnostics.threadId(),
                     diagnostics == null ? null : diagnostics.turnId(),
                     diagnostics == null ? null : diagnostics.modelRequestId(),
                     diagnostics == null ? null : diagnostics.modelRequestOrdinal(),
                     request.configuration().providerId(), request.configuration().modelId(),
-                    request.configuration().api(), failure.code(), classified.terminalErrorCode());
+                    request.configuration().api(), failure.code(), classified.terminalErrorCode(),
+                    safeFailureCategory(classified));
             throw classified;
         }
     }

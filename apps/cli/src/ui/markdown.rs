@@ -4,10 +4,13 @@
 use std::ops::Range;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use super::theme;
+use super::wrapping::word_wrap_line;
 
 /// 解析后的节点保留原始字节范围，供表格降级和流式稳定边界复用。
 struct Node<'a> {
@@ -30,7 +33,7 @@ struct Segment {
     style: Style,
 }
 
-/// 将 Markdown 渲染为有列宽约束的 Ratatui 文本，外层留白由调用方统一负责。
+/// Markdown 正文显式使用固定主题前景，外层留白仍由调用方负责，避免 ANSI 默认色反转深色画布可读性。
 pub(crate) fn render_markdown(source: &str, width: usize) -> Text<'static> {
     let nodes = parse_nodes(source);
     Text::from(render_blocks(source, &nodes, width.max(1)))
@@ -135,17 +138,17 @@ fn unstable_block_continuation(source: &str, previous: &Node<'_>, last: &Node<'_
 /// 提供共享的代码正文样式，归档代码块和流式代码片段保持相同视觉语义。
 pub(crate) fn code_body_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(218, 222, 232))
-        .bg(Color::Rgb(34, 38, 48))
+        .fg(theme::CODE_FOREGROUND)
+        .bg(theme::CODE_BACKGROUND)
 }
 
-/// 提供共享的语言标签行，首个 info token 是唯一展示的语言标识。
+/// 提供共享的语言标签行，首个 info token 唯一展示，标签色取固定次级前景以保留足够对比。
 pub(crate) fn code_label_line(code_info: &str) -> Line<'static> {
     let language = code_info.split_whitespace().next().unwrap_or("code");
     Line::from(Span::styled(
         format!("╭─ {language}"),
         Style::default()
-            .fg(Color::Rgb(137, 148, 168))
+            .fg(theme::CODE_LABEL)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -223,11 +226,27 @@ fn parse_nodes(source: &str) -> Vec<Node<'_>> {
     roots
 }
 
-/// 普通块只有一层空行间隔，列表和引用内部沿用同一规则。
+/// pulldown 的紧凑列表省略 Paragraph；连续行内节点必须先合为段落，样式边界不能变成块间空行。
 fn render_blocks(source: &str, nodes: &[Node<'_>], width: usize) -> Vec<Line<'static>> {
     let mut output = Vec::new();
-    for node in nodes {
-        let block = render_node(source, node, width.max(1));
+    let mut cursor = 0;
+    while cursor < nodes.len() {
+        let block = if is_inline_node(&nodes[cursor]) {
+            let start = cursor;
+            while cursor < nodes.len() && is_inline_node(&nodes[cursor]) {
+                cursor += 1;
+            }
+            let segments = inline_segments(&nodes[start..cursor], Style::default().fg(theme::TEXT));
+            if segments.is_empty() {
+                Vec::new()
+            } else {
+                wrap_segments(&segments, width.max(1))
+            }
+        } else {
+            let block = render_node(source, &nodes[cursor], width.max(1));
+            cursor += 1;
+            block
+        };
         if block.is_empty() {
             continue;
         }
@@ -239,25 +258,48 @@ fn render_blocks(source: &str, nodes: &[Node<'_>], width: usize) -> Vec<Line<'st
     output
 }
 
-/// 按块类型分派布局，保持解析、样式与列宽处理各自单一职责。
+/// 只把文本及其局部样式合并，嵌套列表、引用、代码和真正的段落继续保持各自块边界。
+fn is_inline_node(node: &Node<'_>) -> bool {
+    match &node.kind {
+        NodeKind::Leaf(event) => matches!(
+            event,
+            Event::Text(_)
+                | Event::Code(_)
+                | Event::InlineMath(_)
+                | Event::DisplayMath(_)
+                | Event::InlineHtml(_)
+                | Event::FootnoteReference(_)
+                | Event::SoftBreak
+                | Event::HardBreak
+                | Event::TaskListMarker(_)
+        ),
+        NodeKind::Container { tag, .. } => matches!(
+            tag,
+            Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. }
+        ),
+    }
+}
+
+/// 按块类型分派布局，并为无特殊语义的正文指定固定前景，样式不会继承宿主 ANSI 默认色。
 fn render_node(source: &str, node: &Node<'_>, width: usize) -> Vec<Line<'static>> {
     match &node.kind {
         NodeKind::Leaf(Event::Rule) => vec![
-            wrap_plain_line(
-                "────────────────",
-                width,
-                Style::default().fg(Color::DarkGray),
-            )
-            .into_iter()
-            .next()
-            .unwrap_or_default(),
+            wrap_plain_line("────────────────", width, Style::default().fg(theme::MUTED))
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
         ],
         NodeKind::Leaf(Event::Html(html) | Event::InlineHtml(html)) => {
-            wrap_plain_text(html, width, Style::default())
+            wrap_plain_text(html, width, Style::default().fg(theme::TEXT))
         }
-        NodeKind::Leaf(Event::Text(text)) => wrap_plain_text(text, width, Style::default()),
+        NodeKind::Leaf(Event::Text(text)) => {
+            wrap_plain_text(text, width, Style::default().fg(theme::TEXT))
+        }
         NodeKind::Container { tag, children } => match tag {
-            Tag::Paragraph => wrap_segments(&inline_segments(children, Style::default()), width),
+            Tag::Paragraph => wrap_segments(
+                &inline_segments(children, Style::default().fg(theme::TEXT)),
+                width,
+            ),
             Tag::Heading { level, .. } => {
                 wrap_segments(&inline_segments(children, heading_style(*level)), width)
             }
@@ -268,16 +310,20 @@ fn render_node(source: &str, node: &Node<'_>, width: usize) -> Vec<Line<'static>
             Tag::TableHead | Tag::TableRow | Tag::TableCell | Tag::Item => {
                 render_blocks(source, children, width)
             }
-            Tag::HtmlBlock => wrap_plain_text(&nodes_plain_text(children), width, Style::default()),
+            Tag::HtmlBlock => wrap_plain_text(
+                &nodes_plain_text(children),
+                width,
+                Style::default().fg(theme::TEXT),
+            ),
             _ => render_blocks(source, children, width),
         },
         NodeKind::Leaf(event) => match event {
             Event::Code(code) => wrap_plain_text(code, width, inline_code_style()),
             Event::InlineMath(math) | Event::DisplayMath(math) => {
-                wrap_plain_text(math, width, Style::default())
+                wrap_plain_text(math, width, Style::default().fg(theme::TEXT))
             }
             Event::FootnoteReference(reference) => {
-                wrap_plain_text(reference, width, Style::default().fg(Color::Cyan))
+                wrap_plain_text(reference, width, Style::default().fg(theme::CYAN))
             }
             Event::SoftBreak | Event::HardBreak | Event::TaskListMarker(_) => Vec::new(),
             _ => Vec::new(),
@@ -400,7 +446,7 @@ fn render_table(
     let available = width.saturating_sub(separator_width);
     if available < columns {
         let raw = source.get(node.range.clone()).unwrap_or_default();
-        return wrap_plain_text(raw, width, Style::default().fg(Color::Gray));
+        return wrap_plain_text(raw, width, Style::default().fg(theme::TEXT));
     }
 
     let mut widths = vec![1usize; columns];
@@ -539,7 +585,7 @@ fn collect_inline_segments(nodes: &[Node<'_>], style: Style, output: &mut Vec<Se
                 Event::HardBreak => push_segment(output, "\n", style),
                 Event::Html(html) | Event::InlineHtml(html) => push_segment(output, html, style),
                 Event::FootnoteReference(reference) => {
-                    push_segment(output, reference, style.fg(Color::Cyan))
+                    push_segment(output, reference, style.fg(theme::CYAN))
                 }
                 Event::TaskListMarker(_) | Event::Rule | Event::Start(_) | Event::End(_) => {}
             },
@@ -559,7 +605,7 @@ fn collect_inline_segments(nodes: &[Node<'_>], style: Style, output: &mut Vec<Se
                     let start = output.len();
                     collect_inline_segments(
                         children,
-                        style.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+                        style.fg(theme::CYAN).add_modifier(Modifier::UNDERLINED),
                         output,
                     );
                     let label = output[start..]
@@ -570,7 +616,7 @@ fn collect_inline_segments(nodes: &[Node<'_>], style: Style, output: &mut Vec<Se
                         push_segment(
                             output,
                             &format!(" ({dest_url})"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme::MUTED),
                         );
                     }
                 }
@@ -591,31 +637,15 @@ fn push_segment(output: &mut Vec<Segment>, text: &str, style: Style) {
     }
 }
 
-/// 按 Unicode 字素和显示列宽折行，保留段落内的样式边界与显式换行。
+/// 样式段先合并再按词边界折行，避免粗体或行内代码边界把同一个单词拆开。
 fn wrap_segments(segments: &[Segment], width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::default()];
-    let mut column = 0usize;
-    for segment in segments {
-        for grapheme in segment.text.graphemes(true) {
-            if grapheme == "\n" {
-                lines.push(Line::default());
-                column = 0;
-                continue;
-            }
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if column > 0 && column.saturating_add(grapheme_width) > width {
-                lines.push(Line::default());
-                column = 0;
-            }
-            append_text(
-                lines.last_mut().expect("renderer starts with a line"),
-                grapheme,
-                segment.style,
-            );
-            column = column.saturating_add(grapheme_width);
-        }
-    }
-    lines
+    let line = Line::from(
+        segments
+            .iter()
+            .map(|segment| Span::styled(segment.text.clone(), segment.style))
+            .collect::<Vec<_>>(),
+    );
+    word_wrap_line(&line, width)
 }
 
 /// 纯文本按逻辑换行逐行折叠，空行和宽字素不转成字节级截断。
@@ -747,13 +777,13 @@ fn fence_line(line: &str) -> Option<(char, usize, &str)> {
 fn heading_style(level: HeadingLevel) -> Style {
     match level {
         HeadingLevel::H1 => Style::default()
-            .fg(Color::Rgb(255, 197, 112))
+            .fg(theme::AMBER)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         HeadingLevel::H2 => Style::default()
-            .fg(Color::Rgb(236, 188, 117))
+            .fg(theme::AMBER_SECONDARY)
             .add_modifier(Modifier::BOLD),
         _ => Style::default()
-            .fg(Color::Rgb(201, 162, 111))
+            .fg(theme::AMBER_TERTIARY)
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -761,13 +791,13 @@ fn heading_style(level: HeadingLevel) -> Style {
 /// inline code 与 fenced code 使用同一组暖紫字色，背景只作用于有内容的 cell。
 fn inline_code_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(211, 195, 239))
-        .bg(Color::Rgb(43, 40, 53))
+        .fg(theme::INLINE_CODE_FOREGROUND)
+        .bg(theme::INLINE_CODE_BACKGROUND)
 }
 
 /// 引用符号降低对比度，让引用层级清晰但不抢占正文注意力。
 fn quote_bar_style() -> Style {
-    Style::default().fg(Color::Rgb(103, 112, 128))
+    Style::default().fg(theme::MUTED)
 }
 
 /// 表头使用粗体，数据单元格保持默认字重以控制终端视觉密度。
@@ -779,7 +809,7 @@ fn table_cell_style(header: bool) -> Style {
     }
 }
 
-/// 表格线统一使用低对比灰色，窄列内容仍比装饰线优先获得空间。
+/// 表格线使用可读的次级灰色；窄列仍优先给内容留空间，不用低对比装饰影响阅读。
 fn table_separator_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(theme::RULE)
 }

@@ -20,7 +20,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.agent.application.gateway.ModelPort;
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.time.Duration;
@@ -52,6 +54,19 @@ final class ModelAdapterRetryCancellationTest {
                     ModelAdapterTestSupport.openAiResponse("resp_ok", "in_progress"),
                     ModelAdapterTestSupport.openAiResponse(
                             "resp_ok", "completed", new ModelUsage(1, 1, 2)));
+
+    /** 诊断只保留固定底层异常类别，即使外层和 cause message 含敏感文本也不会被投影到日志字段。 */
+    @Test
+    void failureCategoryDoesNotExposeUnderlyingExceptionText() {
+        String sensitive = "https://internal.example/?token=do-not-log";
+        ProviderProtocolException failure = new ProviderProtocolException("NETWORK_ERROR", sensitive, true,
+                new IOException(sensitive, new ConnectException(sensitive)));
+
+        String category = AbstractStreamingModelAdapter.safeFailureCategory(failure);
+
+        assertEquals("connect", category);
+        assertFalse(category.contains(sensitive));
+    }
 
     /** Provider Adapter 每次只发送一个 HTTP 请求，瞬时错误交给持久会话重试。 */
     @Test

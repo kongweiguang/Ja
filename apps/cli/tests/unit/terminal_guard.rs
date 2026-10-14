@@ -10,8 +10,10 @@ use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use terminal_guard::{
-    TerminalGuard, TerminalOperation as Op, TerminalOperations, TerminalUpdateGuard,
+    HandoffInputBoundary, TerminalGuard, TerminalOperation as Op, TerminalOperations,
+    TerminalUpdateGuard,
 };
 
 #[derive(Default)]
@@ -368,4 +370,89 @@ fn finish_write_and_flush_failures_still_attempt_remaining_restore() {
     let written = bytes.lock().unwrap().bytes.clone();
     assert!(written.starts_with(start));
     assert!(written.ends_with(b"\x1b[?2026l\x1b[?25h\x1b[?2026l"));
+}
+
+/// 只有完成安静窗口且系统队列为空才开放 UI，resize等残留事件会重启等待时间。
+#[test]
+fn external_editor_input_boundary_requires_quiet_window_and_empty_queue() {
+    let start = std::time::Instant::now();
+    let mut boundary = HandoffInputBoundary::new(start);
+    assert!(
+        !boundary
+            .is_quiet(start + std::time::Duration::from_millis(49), true)
+            .unwrap()
+    );
+    assert!(
+        boundary
+            .is_quiet(start + std::time::Duration::from_millis(50), true)
+            .unwrap()
+    );
+    assert!(
+        !boundary
+            .is_quiet(start + std::time::Duration::from_millis(50), false)
+            .unwrap()
+    );
+
+    boundary
+        .observe_event(
+            &Event::Resize(100, 40),
+            start + std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+    assert!(
+        !boundary
+            .is_quiet(start + std::time::Duration::from_millis(99), true)
+            .unwrap()
+    );
+    assert!(
+        boundary
+            .is_quiet(start + std::time::Duration::from_millis(100), true)
+            .unwrap()
+    );
+}
+
+/// 输入持续到达或超出事件配额会得到真实失败，不会无限丢弃并吞掉用户新输入。
+#[test]
+fn external_editor_input_boundary_fails_after_deadline_or_event_limit() {
+    let start = std::time::Instant::now();
+    let deadline = HandoffInputBoundary::new(start);
+    assert_eq!(
+        deadline
+            .is_quiet(start + std::time::Duration::from_secs(1), true)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+
+    let mut flood = HandoffInputBoundary::new(start);
+    for index in 0..256 {
+        flood
+            .observe_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                start + std::time::Duration::from_millis(index),
+            )
+            .unwrap();
+    }
+    assert!(
+        flood
+            .observe_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                start + std::time::Duration::from_millis(256),
+            )
+            .is_err()
+    );
+}
+
+/// 安静等待过程中的终端 resize 会透传最新尺寸，桥接器据此调整恢复后的布局。
+#[test]
+fn external_editor_input_boundary_preserves_resize_dimensions() {
+    let start = std::time::Instant::now();
+    let mut boundary = HandoffInputBoundary::new(start);
+
+    assert_eq!(
+        boundary
+            .observe_event(&Event::Resize(132, 48), start)
+            .unwrap(),
+        Some((132, 48))
+    );
 }

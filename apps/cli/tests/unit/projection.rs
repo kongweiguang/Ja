@@ -85,6 +85,35 @@ mod controller {
             assert_eq!(entry.detail.as_deref(), Some("SAFE_RESULT"));
         }
 
+        /// Message truncation decorates only the preview field, leaving copied/source text untouched.
+        /// @author kongweiguang
+        #[test]
+        fn message_preview_truncation_marker_does_not_change_message_text() {
+            let snapshot = project(json!({
+                "revision": 1,
+                "turns": [],
+                "items": [
+                    {"itemId":"user-truncated", "kind":"user_input", "content":[{"type":"text", "text":"USER_PREVIEW"}], "truncated":true},
+                    {"itemId":"answer-truncated", "kind":"final_answer", "text":"ANSWER_PREVIEW", "truncated":true},
+                    {"itemId":"answer-complete", "kind":"final_answer", "text":"FULL_ANSWER", "truncated":false}
+                ],
+                "liveStream":null
+            }));
+
+            assert_eq!(snapshot.timeline[0].text, "USER_PREVIEW");
+            assert_eq!(
+                snapshot.timeline[0].detail.as_deref(),
+                Some(ja_cli::ui::MESSAGE_PREVIEW_TRUNCATED_NOTICE)
+            );
+            assert_eq!(snapshot.timeline[1].text, "ANSWER_PREVIEW");
+            assert_eq!(
+                snapshot.timeline[1].detail.as_deref(),
+                Some(ja_cli::ui::MESSAGE_PREVIEW_TRUNCATED_NOTICE)
+            );
+            assert_eq!(snapshot.timeline[2].text, "FULL_ANSWER");
+            assert_eq!(snapshot.timeline[2].detail, None);
+        }
+
         /// 自动归档跨越详情容量和多页 Unicode 偏移；不能把 UTF-8 字节当作字符数。
         #[test]
         fn automatic_transcript_reads_all_unicode_pages_beyond_detail_capacity() {

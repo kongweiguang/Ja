@@ -53,6 +53,27 @@ fn ctrl_g_requests_external_edit_without_clearing_draft() {
     assert_eq!(state.composer().cursor(), cursor);
 }
 
+/// 真实编辑器重试接纳新正文后应结清旧失败反馈；超限回执仍保留原草稿及可见诊断。
+/// @author kongweiguang
+#[test]
+fn editor_retry_clears_failure_only_after_draft_is_accepted() {
+    let mut state = UiState::new(UiSnapshot::default());
+    let original = "原草稿🙂";
+    state.handle_paste(original);
+    state.apply(UiEvent::SetNotice(Some(
+        "编辑器已取消或退出异常，原草稿已保留。".into(),
+    )));
+
+    state.apply(UiEvent::ReplaceDraft("文".repeat(32 * 1024)));
+    assert_eq!(state.composer().text(), original);
+    assert!(state.snapshot().notice.as_deref().unwrap().contains("超过"));
+
+    let edited = "原草稿🙂\n重试写回中文";
+    state.apply(UiEvent::ReplaceDraft(edited.into()));
+    assert_eq!(state.composer().text(), edited);
+    assert_eq!(state.snapshot().notice, None);
+}
+
 /// 短行往返保留目标列，宽字符和软折行只在字素边界移动。
 #[test]
 fn composer_vertical_navigation_preserves_display_column() {
@@ -126,6 +147,7 @@ fn pasted_newlines_do_not_send_until_enter_and_ack() {
             .handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
             .is_empty()
     );
+    flush_input_boundary(&mut state);
     let actions = state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         actions,
@@ -545,17 +567,22 @@ fn oversized_paste_keeps_existing_draft_and_shows_notice() {
 }
 
 /// 裸 ASCII 键事件形成的快速粘贴 burst 中，紧随其后的回车不会误触发送。
+/// @author kongweiguang
 #[test]
 fn plain_key_paste_burst_suppresses_enter_send() {
     let mut state = UiState::new(UiSnapshot::default());
     for ch in "rapidpaste".chars() {
         state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
     }
+    let actions = state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert!(
-        state
-            .handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-            .is_empty()
+        !actions
+            .iter()
+            .any(|action| matches!(action, UiAction::Submit { .. }))
     );
+    assert!(state.composer().text().is_empty());
+    // Left ends the burst synchronously, exercising the same flush boundary as idle polling without a timing sleep.
+    state.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
     assert_eq!(state.composer().text(), "rapidpaste\n");
 }
 
@@ -776,6 +803,20 @@ fn event_queue_snapshot_keeps_history_and_copy_completions() {
             selection_id: 7,
             notice: "剪贴板不可用".into(),
         },
+        UiEvent::ShowDetails {
+            entry_id: "entry-message".into(),
+            title: "消息全文".into(),
+            body: "正在读取全文".into(),
+        },
+        UiEvent::UpdateDetailsIfOpen {
+            entry_id: "entry-message".into(),
+            title: "消息全文".into(),
+            body: "完整正文".into(),
+        },
+        UiEvent::SetDetailsCopyReady {
+            entry_id: "entry-message".into(),
+            ready: true,
+        },
     ];
 
     for completion in completions {
@@ -806,6 +847,46 @@ fn event_queue_snapshot_keeps_history_and_copy_completions() {
             "snapshot replacement must retain the async completion"
         );
     }
+}
+
+/// Queue overflow must retain every message-detail phase in order so preview data cannot be mistaken for a complete copy.
+/// @author kongweiguang
+#[test]
+fn event_queue_pressure_preserves_detail_read_sequence() {
+    let events = UiEventSender::default();
+    for index in 0..32 {
+        events
+            .send(UiEvent::UpsertEntry(TimelineEntry {
+                id: format!("entry-{index}"),
+                kind: TimelineKind::Assistant,
+                text: "incremental".into(),
+                detail: None,
+                status: None,
+            }))
+            .unwrap();
+    }
+    for event in [
+        UiEvent::ShowDetails {
+            entry_id: "message-1".into(),
+            title: "消息全文".into(),
+            body: "正在读取安全预览".into(),
+        },
+        UiEvent::UpdateDetailsIfOpen {
+            entry_id: "message-1".into(),
+            title: "消息全文".into(),
+            body: "完整正文".into(),
+        },
+        UiEvent::SetDetailsCopyReady {
+            entry_id: "message-1".into(),
+            ready: true,
+        },
+    ] {
+        assert_eq!(events.send(event).unwrap(), EventDelivery::SnapshotRequired);
+    }
+    events
+        .send(UiEvent::ReplaceSnapshot(Box::default()))
+        .expect("the resync snapshot must retain all three critical detail phases");
+    assert_eq!(events.buffered_len(), 4);
 }
 
 /// 同类状态事件在压力下覆盖旧值，让终端只追到最新确定状态。
@@ -841,6 +922,30 @@ fn renderer_handles_small_and_wide_terminals() {
         assert!(output.contains('›'), "{output}");
         assert!(!output.contains("让 Ja 完成任何任务"), "{output}");
     }
+}
+
+/// Expose the F2 action only when the visible transcript resolves a single ordinary message.
+/// @author kongweiguang
+#[test]
+fn footer_advertises_message_details_only_when_a_target_exists() {
+    let empty = screen_text(&UiState::new(UiSnapshot::default()), 80, 16);
+    assert!(!empty.replace(' ', "").contains("F2查看全文"), "{empty}");
+
+    let message = screen_text(
+        &UiState::new(UiSnapshot {
+            timeline: vec![TimelineEntry {
+                id: "footer-message".into(),
+                kind: TimelineKind::Assistant,
+                text: "visible".into(),
+                detail: None,
+                status: Some(TimelineStatus::Complete),
+            }],
+            ..UiSnapshot::default()
+        }),
+        80,
+        16,
+    );
+    assert!(message.replace(' ', "").contains("F2查看全文"), "{message}");
 }
 
 /// 全屏底栏按屏幕底部排列；正文状态变化时 Composer 和身份 footer 坐标保持固定。
@@ -885,12 +990,12 @@ fn inline_layout_anchors_interaction_at_terminal_bottom() {
     assert!(
         footer
             .iter()
-            .any(|cell| cell.symbol() == "g" && cell.fg == Color::Yellow)
+            .any(|cell| cell.symbol() == "g" && cell.fg == Color::Rgb(249, 226, 175))
     );
     assert!(
         footer
             .iter()
-            .any(|cell| cell.symbol() == "C" && cell.fg == Color::Green)
+            .any(|cell| cell.symbol() == "C" && cell.fg == Color::Rgb(166, 217, 146))
     );
     let action_footer = terminal
         .backend()
@@ -900,7 +1005,7 @@ fn inline_layout_anchors_interaction_at_terminal_bottom() {
         .nth(23)
         .unwrap();
     assert_eq!(action_footer[2].symbol(), "?");
-    assert_eq!(action_footer[2].fg, Color::Rgb(136, 136, 150));
+    assert_eq!(action_footer[2].fg, Color::Rgb(180, 186, 198));
     let mut drafting = UiState::new(base.clone());
     drafting.handle_paste("正在编辑");
     assert!(!screen_rows(&drafting, 80, 24)[23].contains('?'));
@@ -954,10 +1059,8 @@ fn inline_layout_anchors_interaction_at_terminal_bottom() {
     assert!(conversation[21].contains("gpt-6-sol"));
 
     let mut picker = UiState::new(base);
-    picker.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        picker.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut picker);
+    type_chars(&mut picker, "model");
     picker.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let picker = screen_rows(&picker, 80, 24);
     assert!(
@@ -1049,7 +1152,7 @@ fn windows_directory_display_keeps_drive_and_unc_targets_readable() {
 fn tiny_windows_keep_panel_return_action_visible() {
     for (width, height) in [(40, 10), (40, 8)] {
         let mut help = UiState::new(UiSnapshot::default());
-        help.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        open_help_shortcut(&mut help, KeyModifiers::NONE);
         assert!(
             screen_text(&help, width, height).contains("Esc"),
             "help {width}x{height}: {:?}",
@@ -1167,7 +1270,10 @@ fn file_reference_candidate_uses_transcript_without_moving_composer() {
         .iter()
         .position(|cell| cell.symbol() == "›")
         .unwrap();
-    assert_eq!(buffer[(marker_column as u16, row as u16)].fg, Color::Cyan);
+    assert_eq!(
+        buffer[(marker_column as u16, row as u16)].fg,
+        Color::Rgb(137, 220, 235)
+    );
     let composer = rows
         .iter()
         .position(|line| line.contains('›') && line.contains("@Cargo"))
@@ -1404,7 +1510,7 @@ fn compact_selector_never_clips_welcome_card() {
         model_choices: vec![choice("model_a", "gpt-6-sol")],
         ..UiSnapshot::default()
     });
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut state);
     let medium = screen_rows(&state, 80, 16);
     assert!(medium[0].contains("Ja"), "{medium:?}");
     assert!(
@@ -1432,9 +1538,7 @@ fn compact_selector_never_clips_welcome_card() {
         "{narrow:?}"
     );
 
-    for ch in "model".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    type_chars(&mut state, "model");
     state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let medium = screen_rows(&state, 80, 16);
     assert!(
@@ -1476,10 +1580,8 @@ fn model_description_viewer_restores_selected_choice() {
         ],
         ..UiSnapshot::default()
     });
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut state);
+    type_chars(&mut state, "model");
     state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     state.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     assert!(screen_text(&state, 40, 15).contains("F2"));
@@ -1505,10 +1607,8 @@ fn model_detail_survives_reorder_and_rejects_removed_choice() {
         model_choices: vec![choice("model_a", "模型 A"), choice("model_b", "模型 B")],
         ..UiSnapshot::default()
     });
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut state);
+    type_chars(&mut state, "model");
     state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     state.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     state.handle_key(key(KeyCode::F(2), KeyModifiers::NONE));
@@ -1534,10 +1634,8 @@ fn model_detail_survives_reorder_and_rejects_removed_choice() {
         model_choices: vec![choice("model_a", "模型 A"), choice("model_b", "模型 B")],
         ..UiSnapshot::default()
     });
-    removed.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        removed.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut removed);
+    type_chars(&mut removed, "model");
     removed.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     removed.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     removed.handle_key(key(KeyCode::F(2), KeyModifiers::NONE));
@@ -1564,10 +1662,8 @@ fn model_picker_refresh_preserves_identity_or_requires_reopen() {
         ..UiSnapshot::default()
     };
     let mut reordered = UiState::new(initial.clone());
-    reordered.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        reordered.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut reordered);
+    type_chars(&mut reordered, "model");
     reordered.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     reordered.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     reordered.apply(UiEvent::SetModelChoices(vec![
@@ -1582,10 +1678,8 @@ fn model_picker_refresh_preserves_identity_or_requires_reopen() {
     );
 
     let mut removed = UiState::new(initial.clone());
-    removed.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        removed.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut removed);
+    type_chars(&mut removed, "model");
     removed.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     removed.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     removed.apply(UiEvent::SetModelChoices(vec![choice("model_a", "模型 A")]));
@@ -1601,10 +1695,8 @@ fn model_picker_refresh_preserves_identity_or_requires_reopen() {
     );
 
     let mut snapshot_refresh = UiState::new(initial);
-    snapshot_refresh.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        snapshot_refresh.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut snapshot_refresh);
+    type_chars(&mut snapshot_refresh, "model");
     snapshot_refresh.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     snapshot_refresh.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
     snapshot_refresh.apply(UiEvent::ReplaceSnapshot(Box::new(UiSnapshot {
@@ -1652,10 +1744,8 @@ fn codex_welcome_and_model_picker_have_distinct_layouts() {
     );
     assert!(compact_welcome.contains("权限"), "{welcome}");
     assert!(welcome.contains("›"), "{welcome}");
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut state);
+    type_chars(&mut state, "model");
     state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let picker = screen_text(&state, 80, 24);
     assert!(picker.contains("1.") && picker.contains("2."), "{picker}");
@@ -1680,10 +1770,8 @@ fn model_picker_description_column_stays_aligned_for_wide_labels() {
         model_choices: models,
         ..UiSnapshot::default()
     });
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut state);
+    type_chars(&mut state, "model");
     state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let description_columns = |state: &UiState| {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1795,16 +1883,14 @@ fn restored_history_does_not_repeat_welcome_line() {
 #[test]
 fn slash_menu_filters_completes_and_quits() {
     let mut state = UiState::new(UiSnapshot::default());
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut state);
     let all = screen_text(&state, 52, 16);
     assert_eq!(all.matches("/new").count(), 1, "{all}");
     assert!(all.contains("1/19"), "{all}");
     let narrow = screen_text(&state, 30, 10);
     assert!(narrow.contains("Tab") && narrow.contains("Esc"), "{narrow}");
 
-    for ch in "mod".chars() {
-        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    type_chars(&mut state, "mod");
     let filtered = screen_text(&state, 52, 16);
     assert!(filtered.contains("/model"), "{filtered}");
     assert!(!filtered.contains("/new"), "{filtered}");
@@ -1816,7 +1902,7 @@ fn slash_menu_filters_completes_and_quits() {
     );
 
     let mut quit = UiState::new(UiSnapshot::default());
-    quit.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut quit);
     quit.handle_paste("quit");
     assert!(screen_text(&quit, 52, 16).contains("/quit"));
     assert_eq!(
@@ -1826,7 +1912,7 @@ fn slash_menu_filters_completes_and_quits() {
     assert!(quit.is_closed());
 
     let mut unknown = UiState::new(UiSnapshot::default());
-    unknown.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut unknown);
     unknown.handle_paste("no-such-command");
     assert!(
         unknown
@@ -1836,7 +1922,7 @@ fn slash_menu_filters_completes_and_quits() {
     assert_eq!(unknown.composer().text(), "/no-such-command");
 
     let mut pasted_command = UiState::new(UiSnapshot::default());
-    pasted_command.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut pasted_command);
     pasted_command.handle_paste("attach \"C:\\tmp\\my file.txt\"");
     assert!(matches!(
         pasted_command
@@ -1905,7 +1991,7 @@ fn local_operation_is_scoped_to_its_thread_across_refresh() {
 #[test]
 fn chooser_error_is_visible_above_menu_hint() {
     let mut state = UiState::new(UiSnapshot::default());
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut state);
     state.apply(UiEvent::SetNotice(Some("模型列表读取失败".to_owned())));
     let screen = screen_text(&state, 52, 12);
     let compact = screen
@@ -1951,6 +2037,7 @@ fn attach_command_keeps_path_until_import_ack() {
 }
 
 /// 长工具正文可以到达尾部、返回顶部；浏览器内粘贴与 Ctrl+C 不暗中清空原草稿。
+/// @author kongweiguang
 #[test]
 fn details_viewer_scrolls_and_preserves_composer() {
     let mut state = UiState::new(UiSnapshot::default());
@@ -1960,6 +2047,11 @@ fn details_viewer_scrolls_and_preserves_composer() {
         title: "运行测试".to_owned(),
         body: (1..=30).map(|index| format!("LINE-{index:02}\n")).collect(),
     });
+    assert!(
+        state
+            .handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+            .is_empty()
+    );
     let first = screen_text(&state, 60, 12);
     assert!(first.contains("LINE-01"), "{first}");
     assert!(!first.contains("LINE-30"), "{first}");
@@ -1972,6 +2064,144 @@ fn details_viewer_scrolls_and_preserves_composer() {
     assert!(screen_text(&state, 60, 12).contains("LINE-01"));
     state.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert_eq!(state.composer().text(), "保留草稿");
+}
+
+/// F2 reads from the visible transcript entry; C/Ctrl+Insert copy only acknowledged full text, while Ctrl+C remains close.
+/// @author kongweiguang
+#[test]
+fn ordinary_message_details_gate_copy_and_ignore_late_preview() {
+    let mut state = UiState::new(UiSnapshot {
+        thread_id: Some("thr_detail_copy".into()),
+        timeline: vec![TimelineEntry {
+            id: "message-1".into(),
+            kind: TimelineKind::User,
+            text: "SAFE_PREVIEW".into(),
+            detail: Some("正文未完整加载，F2 查看全文".into()),
+            status: None,
+        }],
+        ..UiSnapshot::default()
+    });
+    state.handle_paste("保留草稿🙂");
+    let _ = screen_text(&state, 80, 16);
+
+    assert_eq!(
+        state.handle_key(key(KeyCode::F(2), KeyModifiers::NONE)),
+        vec![UiAction::OpenDetails {
+            entry_id: "message-1".into()
+        }]
+    );
+    let reading = screen_text(&state, 80, 16);
+    let reading_compact = reading.replace(' ', "");
+    assert!(reading_compact.contains("读取全文中"), "{reading}");
+    assert!(!reading_compact.contains("C复制"), "{reading}");
+    assert!(
+        state
+            .handle_key(key(KeyCode::Insert, KeyModifiers::CONTROL))
+            .is_empty()
+    );
+    assert!(
+        state
+            .handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE))
+            .is_empty(),
+        "a transcript preview must never enter the full-message copy flow"
+    );
+    state.apply(UiEvent::UpdateDetailsIfOpen {
+        entry_id: "message-1".into(),
+        title: "完整消息".into(),
+        body: "FULL_MESSAGE_BODY".into(),
+    });
+    state.apply(UiEvent::SetDetailsCopyReady {
+        entry_id: "message-1".into(),
+        ready: true,
+    });
+    state.apply(UiEvent::UpdateDetailsIfOpen {
+        entry_id: "message-1".into(),
+        title: "旧预览".into(),
+        body: "LATE_PREVIEW".into(),
+    });
+    let wide = screen_text(&state, 80, 16);
+    let wide_compact = wide.replace(' ', "");
+    assert!(wide_compact.contains("C复制全文"), "{wide}");
+    assert!(wide_compact.contains("Ctrl+Insert"), "{wide}");
+    let narrow = screen_text(&state, 24, 10);
+    let narrow_compact = narrow.replace(' ', "");
+    assert!(narrow_compact.contains("C复制"), "{narrow}");
+    assert!(narrow_compact.contains("Esc"), "{narrow}");
+    assert!(!narrow_compact.contains("Ctrl+Insert"), "{narrow}");
+    assert_eq!(
+        state.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE)),
+        vec![UiAction::CopyDetails {
+            entry_id: "message-1".into(),
+            text: "FULL_MESSAGE_BODY".into(),
+        }]
+    );
+    assert_eq!(
+        state.handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT)),
+        vec![UiAction::CopyDetails {
+            entry_id: "message-1".into(),
+            text: "FULL_MESSAGE_BODY".into(),
+        }]
+    );
+    assert_eq!(
+        state.handle_key(key(KeyCode::Insert, KeyModifiers::CONTROL)),
+        vec![UiAction::CopyDetails {
+            entry_id: "message-1".into(),
+            text: "FULL_MESSAGE_BODY".into(),
+        }]
+    );
+    assert_eq!(
+        state.handle_key(key(KeyCode::F(5), KeyModifiers::NONE)),
+        vec![UiAction::OpenDetails {
+            entry_id: "message-1".into()
+        }]
+    );
+    state.apply(UiEvent::SetNotice(Some(
+        "消息全文读取失败，请按 F5 重试".into(),
+    )));
+    let failed = screen_text(&state, 80, 16);
+    let failed_compact = failed.replace(' ', "");
+    assert!(failed_compact.contains("读取失败"), "{failed}");
+    assert!(!failed_compact.contains("C复制"), "{failed}");
+    assert!(
+        state
+            .handle_key(key(KeyCode::Insert, KeyModifiers::CONTROL))
+            .is_empty()
+    );
+    assert!(
+        state
+            .handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .is_empty(),
+        "a failed full read must not make the prior preview copyable"
+    );
+    assert_eq!(
+        state.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        vec![UiAction::CloseDetails {
+            entry_id: "message-1".into()
+        }]
+    );
+    state.apply(UiEvent::SetDetailsCopyReady {
+        entry_id: "message-1".into(),
+        ready: true,
+    });
+    assert_eq!(state.composer().text(), "保留草稿🙂");
+    assert!(!screen_text(&state, 80, 16).contains("FULL_MESSAGE_BODY"));
+}
+
+/// Flush each typed key because the paste-burst classifier intentionally withholds single-character input briefly.
+/// @author kongweiguang
+#[test]
+fn composer_c_remains_text_outside_complete_message_details() {
+    let mut state = UiState::new(UiSnapshot::default());
+    state.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+    flush_input_boundary(&mut state);
+    assert_eq!(state.composer().text(), "c");
+    assert!(
+        state
+            .handle_key(key(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .is_empty()
+    );
+    flush_input_boundary(&mut state);
+    assert_eq!(state.composer().text(), "cC");
 }
 
 /// Diff 重试绑定面板身份；取消或切换后迟到更新不能覆盖新面板，草稿完整保留。
@@ -2152,7 +2382,7 @@ fn clarification_shows_free_text_shortcut() {
 #[test]
 fn codex_selection_shortcuts_are_direct_and_bounded() {
     let mut help = UiState::new(UiSnapshot::default());
-    help.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    open_help_shortcut(&mut help, KeyModifiers::SHIFT);
     assert!(screen_text(&help, 60, 12).contains("Esc"));
     help.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
 
@@ -2160,10 +2390,8 @@ fn codex_selection_shortcuts_are_direct_and_bounded() {
         model_choices: vec![choice("model_a", "model-a"), choice("model_b", "model-b")],
         ..UiSnapshot::default()
     });
-    picker.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        picker.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut picker);
+    type_chars(&mut picker, "model");
     picker.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         picker.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE)),
@@ -2352,17 +2580,11 @@ fn input_history_search_restores_only_explicitly_selected_text() {
     state.handle_paste("当前草稿");
     assert_eq!(
         state.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
-        vec![UiAction::SearchInputHistory {
-            query: String::new(),
-            cursor: None
-        }]
+        vec![UiAction::CancelInputHistorySearch]
     );
     assert_eq!(
         state.handle_key(key(KeyCode::Char('测'), KeyModifiers::NONE)),
-        vec![UiAction::SearchInputHistory {
-            query: "测".into(),
-            cursor: None
-        }]
+        vec![UiAction::CancelInputHistorySearch]
     );
     state.apply(UiEvent::SetInputHistoryPage {
         query: String::new(),
@@ -2570,6 +2792,7 @@ fn dismissed_reference_popup_stays_closed_until_draft_changes() {
     });
     assert!(!screen_text(&state, 80, 16).contains("agents-example.md"));
     state.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+    flush_input_boundary(&mut state);
     let UiAction::SearchFiles {
         query_id: fresh_id, ..
     } = state
@@ -2633,6 +2856,7 @@ fn clarification_failure_keeps_answer_and_restores_task_draft() {
     state.apply(UiEvent::SetPendingPrompt(None));
     assert_eq!(state.composer().text(), "原任务草稿");
     state.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+    flush_input_boundary(&mut state);
     assert_eq!(state.composer().text(), "原任务草X稿");
 }
 
@@ -2788,6 +3012,7 @@ fn fork_child_keeps_source_composer_for_later_thread_return() {
     state.apply(UiEvent::ReplaceSnapshot(Box::new(source)));
     assert_eq!(state.composer().text(), "/fork");
     state.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+    flush_input_boundary(&mut state);
     assert_eq!(state.composer().text(), "/foXrk");
 }
 
@@ -2805,6 +3030,7 @@ fn same_thread_refresh_preserves_picker_cursor_and_pending_choice() {
         ..UiSnapshot::default()
     })));
     editor.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+    flush_input_boundary(&mut editor);
     assert_eq!(editor.composer().text(), "abXc");
 
     let mut picker = UiState::new(UiSnapshot {
@@ -2812,10 +3038,8 @@ fn same_thread_refresh_preserves_picker_cursor_and_pending_choice() {
         model_choices: vec![choice("provider_a/model_a", "model-a")],
         ..UiSnapshot::default()
     });
-    picker.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for ch in "model".chars() {
-        picker.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut picker);
+    type_chars(&mut picker, "model");
     assert_eq!(
         picker.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
         vec![UiAction::Command(UiCommand::SelectModel)]
@@ -3047,7 +3271,7 @@ fn suspended_turn_shortcuts_obey_ui_gates_and_render_recovery_hints() {
         paused_visible.contains("F6恢复任务·F7取消任务"),
         "{paused_rendered}"
     );
-    paused.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
+    open_help_shortcut(&mut paused, KeyModifiers::NONE);
     assert!(
         paused
             .handle_key(key(KeyCode::F(6), KeyModifiers::NONE))
@@ -3104,6 +3328,35 @@ fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }
 
+/// Flush one ASCII boundary so reducer tests model a completed ordinary keystroke, not a paste burst.
+/// @author kongweiguang
+fn open_command_menu(state: &mut UiState) {
+    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    flush_input_boundary(state);
+}
+
+/// Release the question-mark shortcut at an explicit input boundary for deterministic UI assertions.
+/// @author kongweiguang
+fn open_help_shortcut(state: &mut UiState, modifiers: KeyModifiers) {
+    state.handle_key(key(KeyCode::Char('?'), modifiers));
+    flush_input_boundary(state);
+}
+
+/// Complete one ordinary typing burst without invoking a user-visible command such as F5 refresh.
+/// @author kongweiguang
+fn flush_input_boundary(state: &mut UiState) {
+    state.handle_key(key(KeyCode::Null, KeyModifiers::NONE));
+}
+
+/// Model separately delivered keystrokes so command-palette tests do not accidentally simulate paste.
+/// @author kongweiguang
+fn type_chars(state: &mut UiState, text: &str) {
+    for ch in text.chars() {
+        state.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        flush_input_boundary(state);
+    }
+}
+
 /// 用量与操作提示位于身份行之后；菜单或错误反馈不能替换模型、目录与会话标题。
 #[test]
 fn footer_keeps_identity_while_feedback_changes() {
@@ -3136,7 +3389,7 @@ fn footer_keeps_identity_while_feedback_changes() {
             .contains("保存失败")
     );
     state.apply(UiEvent::SetNotice(None));
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+    open_command_menu(&mut state);
     let rows = screen_rows(&state, 120, 32);
     let input = rows
         .iter()
@@ -3195,7 +3448,7 @@ fn footer_places_title_after_directory_and_preserves_model_on_narrow_widths() {
     );
     assert_eq!(title_column, path_column + "C:\\dev\\rust\\ja".width() + 3);
     assert!(title_end_column < 77, "短身份行应自然排列: {compact:?}");
-    assert_eq!(cells[title_column].fg, Color::LightBlue);
+    assert_eq!(cells[title_column].fg, Color::Rgb(137, 180, 250));
 
     let long_state = UiSnapshot {
         model_identifier: Some("gpt-6-luna".into()),
@@ -3257,7 +3510,7 @@ fn inline_help_scrolls_and_preserves_composer_and_footer() {
         12,
     );
     let idle = screen_rows(&state, 40, 12);
-    state.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    open_help_shortcut(&mut state, KeyModifiers::SHIFT);
     let top = screen_rows(&state, 40, 12);
     let heading = top
         .iter()
@@ -3278,10 +3531,10 @@ fn inline_help_scrolls_and_preserves_composer_and_footer() {
     assert_eq!(screen_rows(&state, 40, 12), top);
     state.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE));
     assert_ne!(screen_rows(&state, 40, 12), top);
-    state.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    open_help_shortcut(&mut state, KeyModifiers::SHIFT);
     assert_eq!(screen_rows(&state, 40, 12), idle);
     state.handle_paste("任务？");
-    state.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    open_help_shortcut(&mut state, KeyModifiers::SHIFT);
     assert_eq!(state.composer().text(), "任务？?");
     state.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     state.handle_paste("/help");
@@ -3790,10 +4043,8 @@ fn hundred_thousand_event_flood_keeps_queue_bounded_and_cancel_responsive() {
 #[test]
 fn plan_create_menu_preserves_objective_for_the_controller() {
     let mut state = UiState::new(UiSnapshot::default());
-    state.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-    for character in "plan".chars() {
-        state.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE));
-    }
+    open_command_menu(&mut state);
+    type_chars(&mut state, "plan");
     let rendered = screen_text(&state, 80, 24);
     assert!(
         rendered.replace(' ', "").contains("创建并规划目标"),
@@ -3821,7 +4072,7 @@ fn plan_create_menu_preserves_objective_for_the_controller() {
 #[test]
 fn inline_help_explains_plan_creation_and_execution_commands() {
     let mut state = UiState::new(UiSnapshot::default());
-    state.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+    open_help_shortcut(&mut state, KeyModifiers::SHIFT);
     let help = screen_text(&state, 80, 24);
     assert!(help.contains("/plan create"), "{help}");
     assert!(help.contains("/plan execute"), "{help}");

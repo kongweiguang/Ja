@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
+#[allow(dead_code)]
+#[path = "../../src/ui/theme.rs"]
+mod theme;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ja_cli::ui::{
     TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiAction, UiEvent, UiSnapshot, UiState,
@@ -9,7 +13,7 @@ use ja_cli::ui::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Modifier;
 use unicode_width::UnicodeWidthStr;
 
 /// 用真实渲染器核对宽窗列布局、说明列对齐和语义颜色，避免只测试排版辅助函数。
@@ -36,7 +40,7 @@ fn wide_help_aligns_two_columns_and_keeps_identity() {
         locate(&screen, "恢复会话").unwrap().0
     );
     let file = locate(&screen, "@").unwrap();
-    assert_eq!(screen[file].fg, Color::LightBlue);
+    assert_eq!(screen[file].fg, theme::BLUE);
     assert!(screen[input].modifier.contains(Modifier::BOLD));
     let title = locate(&screen, "Ja 快捷键").unwrap();
     assert_eq!(input.1, title.1 + 2);
@@ -269,9 +273,15 @@ fn help_state(width: u16, height: u16) -> UiState {
     state
 }
 
-/// 返回动作供测试确认本地帮助没有向控制器提交副作用。
+/// 返回真实动作；布局用例模拟分开的打字，给 ASCII 暂存到期后一次无动作 tick 边界。
+/// 快速粘贴与其 Enter 归属由独立状态回归验证，不把同步测试调用误作同一粘贴批次。
 fn press(state: &mut UiState, code: KeyCode) -> Vec<ja_cli::ui::UiAction> {
-    state.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    let mut actions = state.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    if matches!(code, KeyCode::Char(ch) if ch.is_ascii()) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        actions.extend(state.handle_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)));
+    }
+    actions
 }
 
 /// 每次从当前渲染器取完整 buffer，同时核对缩放后没有越界或旧行残留。

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
+#[allow(dead_code)]
+#[path = "../../src/ui/theme.rs"]
+mod theme;
+
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -92,13 +96,20 @@ fn render_transcript(entries: &[TimelineEntry], width: u16, height: u16) -> Vec<
     render_state_transcript(&state, width, height)
 }
 
-/// Give the owned body enough rows to compare its full contents while retaining the requested display width.
+/// Give the body spare rows without exceeding Ratatui's u16 cell-area limit at wide display widths.
 fn render_state_transcript(state: &UiState, width: u16, height: u16) -> Vec<StyledRow> {
-    styled_transcript_rows(&transcript_view::render_buffer(
-        state,
-        width,
-        height.max(512),
-    ))
+    let safe_height = height.max(512).min(u16::MAX / width.max(1));
+    let buffer = transcript_view::render_buffer(state, width, safe_height);
+    let body = styled_transcript_rows(&buffer);
+    assert!(
+        !body.is_empty(),
+        "transcript unexpectedly empty at {width}: {:?}",
+        transcript_view::rows(&buffer)
+            .into_iter()
+            .take(18)
+            .collect::<Vec<_>>()
+    );
+    body
 }
 
 /// Slice at the real Composer row so full-buffer rendering can compare Markdown rows without dock noise.
@@ -302,6 +313,37 @@ fn rich_reply_rendering_matches_snapshot_for_all_delta_boundaries() {
         }
     }
     assert!(differences.is_empty(), "{}", differences.join("\n"));
+}
+
+/// 真实 transcript 同时覆盖紧凑列表的样式边界、流式分片、终态对账和缩放，防止整段与逐字都渲染错却彼此相等。
+#[test]
+fn tight_list_inline_content_stays_contiguous_across_stream_and_resize() {
+    let source = "## 业务范围\n\n- **挂号**：接诊（`is_received` / `receive_time`）；[文档](docs/README.md)。\n- HIS 集成：`record_stage`（DRAFT/FINAL）。\n\n结束🙂。\n";
+    for mode in [0, 1, 2] {
+        let state = streamed_reply_state(source, reply_chunks(source, mode));
+        for width in [40, 80, 120, 240] {
+            let expected = render_transcript(&snapshot_reply_entries(source), width, 24);
+            let actual = render_state_transcript(&state, width, 24);
+            assert_eq!(
+                row_difference(&actual, &expected),
+                None,
+                "mode={mode}, width={width}"
+            );
+            if width >= 120 {
+                let output = rows_text(&actual);
+                assert!(
+                    output.contains(
+                        "• 挂号：接诊（is_received / receive_time）；文档 (docs/README.md)。"
+                    ),
+                    "{output}"
+                );
+                assert!(
+                    output.contains("• HIS 集成：record_stage（DRAFT/FINAL）。"),
+                    "{output}"
+                );
+            }
+        }
+    }
 }
 
 /// 小型边界样本覆盖空围栏、CommonMark 三空格去缩进及 EOF 后续增量的闭合判定。
@@ -542,7 +584,7 @@ fn tool_timeline_shows_success_output_and_failure_diagnostics() {
         .flatten()
         .find(|cell| cell.symbol == "运")
         .expect("failed tool action should be visible");
-    assert_eq!(failed_action.foreground, Color::Red);
+    assert_eq!(failed_action.foreground, theme::RED);
 }
 
 /// Stable tool entries share one preview budget so success and failure cannot drift in the owned transcript.
@@ -743,11 +785,12 @@ fn tool_browser_preserves_identity_selection_and_composer_across_recovery() {
         loading_detail.contains("DETAIL_tool-newest"),
         "{loading_detail}"
     );
-    assert!(
-        state
-            .handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
-            .is_empty(),
-        "closing before the controller reply must not cancel the turn or operation"
+    assert_eq!(
+        state.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+        vec![UiAction::CloseDetails {
+            entry_id: "tool-newest".into()
+        }],
+        "closing cancels only the owned read, preserving the turn and operation"
     );
     state.apply(UiEvent::UpdateDetailsIfOpen {
         entry_id: "tool-newest".into(),
@@ -781,6 +824,8 @@ fn tool_browser_preserves_identity_selection_and_composer_across_recovery() {
         "读取工具详情失败，按 F5 重试".into(),
     )));
     let failed_detail = screen_text(&state, 80, 24);
+    assert!(!failed_detail.contains("MIDDLE_TOOL"), "{failed_detail}");
+    assert!(!failed_detail.contains(draft), "{failed_detail}");
     assert!(
         failed_detail.contains("读取工具详情失败"),
         "{failed_detail}"
@@ -851,6 +896,126 @@ fn tool_browser_preserves_identity_selection_and_composer_across_recovery() {
     );
     assert_eq!(state.composer().text(), draft);
     assert_eq!(state.composer().cursor(), cursor);
+}
+
+/// 详情明确显示全文复制与返回；预览不能冒充全文，成功反馈不能使用错误色。
+/// @author kongweiguang
+#[test]
+fn message_detail_owns_opaque_surface_and_copy_hint() {
+    let mut state = UiState::new_for_terminal(
+        UiSnapshot {
+            thread_id: Some("thread_detail_surface".into()),
+            timeline: vec![TimelineEntry {
+                id: "message-detail-surface".into(),
+                kind: TimelineKind::Assistant,
+                text: "PUBLIC_BODY".into(),
+                detail: None,
+                status: Some(TimelineStatus::Complete),
+            }],
+            ..UiSnapshot::default()
+        },
+        80,
+        24,
+    );
+    state.handle_paste("UNRELATED_COMPOSER_DRAFT");
+    let _ = screen_text(&state, 80, 24);
+    assert_eq!(
+        state.handle_key(key(KeyCode::F(2), KeyModifiers::NONE)),
+        vec![UiAction::OpenDetails {
+            entry_id: "message-detail-surface".into(),
+        }]
+    );
+
+    for (width, height) in [(40, 10), (40, 16)] {
+        let rows = render_screen(&state, width, height);
+        let text = rows_text(&rows);
+        let footer = row_text(rows.last().expect("detail screen has a footer row"));
+        assert!(text.contains("正在读取全文"), "{width}x{height}: {text}");
+        assert!(!text.contains("复制"), "{width}x{height}: {text}");
+        assert!(
+            footer.contains("F5") && footer.contains("Esc 返回"),
+            "{footer}"
+        );
+    }
+
+    state.apply(UiEvent::UpdateDetailsIfOpen {
+        entry_id: "message-detail-surface".into(),
+        title: "消息详情".into(),
+        body: "读取失败；按 F5 重试。".into(),
+    });
+    state.apply(UiEvent::SetDetailsCopyReady {
+        entry_id: "message-detail-surface".into(),
+        ready: false,
+    });
+    for (width, height) in [(40, 10), (40, 16)] {
+        let rows = render_screen(&state, width, height);
+        let text = rows_text(&rows);
+        let footer = row_text(rows.last().expect("detail screen has a footer row"));
+        assert!(text.contains("读取失败"), "{width}x{height}: {text}");
+        assert!(!text.contains("复制"), "{width}x{height}: {text}");
+        assert!(
+            footer.contains("F5") && footer.contains("Esc 返回"),
+            "{footer}"
+        );
+    }
+
+    state.apply(UiEvent::UpdateDetailsIfOpen {
+        entry_id: "message-detail-surface".into(),
+        title: "消息全文".into(),
+        body: "COMPLETE_DETAIL_BODY".into(),
+    });
+    state.apply(UiEvent::SetDetailsCopyReady {
+        entry_id: "message-detail-surface".into(),
+        ready: true,
+    });
+    for (width, height) in [(40, 10), (40, 16), (80, 24), (120, 24)] {
+        let rows = render_screen(&state, width, height);
+        let text = rows_text(&rows);
+        assert!(
+            text.contains("COMPLETE_DETAIL_BODY"),
+            "{width}x{height}: {text}"
+        );
+        assert!(
+            !text.contains("UNRELATED_COMPOSER_DRAFT"),
+            "{width}x{height}: {text}"
+        );
+        assert!(!text.contains("PUBLIC_BODY"), "{width}x{height}: {text}");
+        let footer = row_text(rows.last().expect("detail screen has a footer row"));
+        let footer_compact = footer.replace(' ', "");
+        if width == 40 {
+            assert!(
+                footer_compact.contains("C复制全文"),
+                "{width}x{height}: {footer}"
+            );
+            assert!(
+                !footer_compact.contains("Ctrl+Insert"),
+                "{width}x{height}: {footer}"
+            );
+            assert!(
+                footer_compact.contains("Esc返回"),
+                "{width}x{height}: {footer}"
+            );
+            assert!(!footer.contains('…'), "{width}x{height}: {footer}");
+            assert!(UnicodeWidthStr::width(footer.trim()) <= usize::from(width));
+        } else {
+            assert!(
+                footer_compact.contains("C复制全文") && footer_compact.contains("Ctrl+Insert"),
+                "{width}x{height}: {footer}"
+            );
+            assert!(
+                footer_compact.contains("Esc返回"),
+                "{width}x{height}: {footer}"
+            );
+        }
+    }
+    state.apply(UiEvent::SetNotice(Some("完整消息详情已复制。".into())));
+    let copied_rows = render_screen(&state, 40, 10);
+    let feedback_row = &copied_rows[copied_rows.len() - 2];
+    assert!(row_text(feedback_row).contains("已复制"));
+    assert_eq!(feedback_row[2].foreground, Color::Rgb(238, 239, 241));
+    assert!(feedback_row[2].modifier.contains(Modifier::BOLD));
+    state.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(state.composer().text(), "UNRELATED_COMPOSER_DRAFT");
 }
 
 /// 无已加载工具时快捷键给出可见反馈，不发出读取动作或创建空列表。

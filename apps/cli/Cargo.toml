@@ -12,6 +12,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+arboard = { version = "=3.6.1", default-features = false }
 base64 = "=0.22.1"
 ctrlc = "=3.5.0"
 crossterm = { version = "=0.28.1", features = ["bracketed-paste"] }
@@ -21,12 +22,14 @@ pulldown-cmark = "=0.13.0"
 ratatui = { version = "=0.29.0", default-features = false, features = ["crossterm"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+textwrap = { version = "=0.16.2", default-features = false, features = ["unicode-linebreak", "unicode-width"] }
 unicode-segmentation = "=1.12.0"
 uuid = { version = "=1.24.1", features = ["v4"] }
 unicode-width = "=0.2.0"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "=0.61.3", default-features = false, features = ["std", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+which = "=8.0.0"
+windows = { version = "=0.61.3", default-features = false, features = ["std", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [[bin]]
 name = "ja"
@@ -97,6 +100,22 @@ name = "terminal_guard"
 path = "tests/unit/terminal_guard.rs"
 
 [[test]]
+name = "clipboard"
+path = "tests/unit/clipboard.rs"
+
+[[test]]
+name = "theme"
+path = "tests/unit/theme.rs"
+
+[[test]]
+name = "paste_burst"
+path = "tests/unit/paste_burst.rs"
+
+[[test]]
+name = "windows_key_sequence"
+path = "tests/unit/windows_key_sequence.rs"
+
+[[test]]
 name = "int_cli_paths"
 path = "tests/integration/cli_paths.rs"
 
@@ -111,6 +130,10 @@ path = "tests/integration/headless_io.rs"
 [[test]]
 name = "int_editor_process"
 path = "tests/integration/editor_process.rs"
+
+[[test]]
+name = "int_editor_handoff_io"
+path = "tests/integration/editor_handoff_io.rs"
 
 [[test]]
 name = "int_help_layout_evidence"

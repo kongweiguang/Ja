@@ -16,11 +16,12 @@ use ratatui::Terminal;
 #[path = "terminal_guard.rs"]
 mod terminal_guard;
 
-use self::terminal_guard::{TerminalGuard, TerminalUpdateGuard};
+use self::terminal_guard::{HandoffInputBoundary, TerminalGuard, TerminalUpdateGuard};
 use super::model::{UiAction, UiEvent, UiSnapshot};
 use super::native_backend::NativeBackend;
 use super::render::{WORKING_INDICATOR_INTERVAL, render};
 use super::state::UiState;
+use super::windows_key_sequence::WindowsKeySequence;
 
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const EVENT_DRAIN_LIMIT: usize = 64;
@@ -208,7 +209,7 @@ fn same_projection_key(left: &UiEvent, right: &UiEvent) -> bool {
     }
 }
 
-/// 异步动作的完成结果必须投递以释放 UI 等待状态；迟到结果仍由 reducer 核验身份。
+/// 异步详情正文与复制就绪结果必须跨快照替换和队列溢出保留；迟到结果仍由 reducer 核验身份。
 fn is_critical_event(event: &UiEvent) -> bool {
     matches!(
         event,
@@ -225,6 +226,7 @@ fn is_critical_event(event: &UiEvent) -> bool {
             | UiEvent::ReleasePromptSubmission
             | UiEvent::ShowDetails { .. }
             | UiEvent::UpdateDetailsIfOpen { .. }
+            | UiEvent::SetDetailsCopyReady { .. }
             | UiEvent::OpenModelSettings { .. }
             | UiEvent::ModelSettingsResult(_)
             | UiEvent::ModelSettingsTrustRequired { .. }
@@ -412,7 +414,7 @@ impl std::error::Error for TuiError {
     }
 }
 
-/// 独占全屏终端绘制应用内 transcript；交接回滚再次失败时关闭 UI，让 Drop 重试残余模式。
+/// 独占全屏终端绘制应用内 transcript；poll 不越过粘贴/CSI-u 截止，交接失败由 Drop 重试模式恢复。
 /// @author kongweiguang
 fn terminal_loop(
     snapshot: UiSnapshot,
@@ -452,10 +454,13 @@ fn terminal_loop(
     let mut last_frame: Option<Instant> = None;
     let mut last_working_indicator_frame: Option<Instant> = None;
     let mut suspended = false;
+    let mut windows_key_sequence = WindowsKeySequence::new();
     loop {
         while let Ok(control) = terminal_control_rx.try_recv() {
             let (result, next_suspended, reply) = match control {
                 TerminalControl::Suspend(reply) => {
+                    windows_key_sequence.reset();
+                    state.reset_input_source_handoff();
                     let result = terminal
                         .clear()
                         .and_then(|()| guard.suspend_for_external_program());
@@ -468,9 +473,12 @@ fn terminal_loop(
                 TerminalControl::Resume(reply) => {
                     let result = guard
                         .resume_after_external_program()
+                        .and_then(|()| drain_handoff_input(&mut state))
                         .and_then(|()| terminal.clear())
                         .and_then(|()| terminal.autoresize())
                         .map_err(|error| error.to_string());
+                    windows_key_sequence.reset();
+                    state.reset_input_source_handoff();
                     if result.is_err() {
                         // 挂起尝试尽力清理恢复到一半的模式；即使成功，也不能让已挂起的 UI 永久忽略输入。
                         let _ = guard.suspend_for_external_program();
@@ -503,7 +511,22 @@ fn terminal_loop(
         {
             state.apply(UiEvent::Shutdown);
         }
-        if let Some(action) = state.take_due_file_search(Instant::now())
+        let now = Instant::now();
+        #[cfg(windows)]
+        for event in windows_key_sequence.flush_if_due(now) {
+            dirty |= apply_terminal_event(event, &mut state, &action_tx);
+        }
+        if state.flush_paste_burst(now) {
+            dirty = true;
+        }
+        if let Some(action) = state.take_due_input_history_search(now) {
+            if action_tx.send(action).is_err() {
+                state.apply(UiEvent::Shutdown);
+            } else {
+                dirty = true;
+            }
+        }
+        if let Some(action) = state.take_due_file_search(now)
             && action_tx.send(action).is_err()
         {
             state.apply(UiEvent::Shutdown);
@@ -512,35 +535,25 @@ fn terminal_loop(
         if state.is_closed() {
             break;
         }
-        if !suspended && event::poll(POLL_INTERVAL).map_err(TuiError::Io)? {
-            match event::read().map_err(TuiError::Io)? {
-                Event::Key(key) => {
-                    for action in state.handle_key(key) {
-                        let quitting = action == UiAction::Quit;
-                        if action_tx.send(action).is_err() || quitting {
-                            state.apply(UiEvent::Shutdown);
-                        }
-                    }
-                    dirty = true;
+        if !suspended {
+            let poll_now = Instant::now();
+            let mut poll_timeout = POLL_INTERVAL;
+            #[cfg(windows)]
+            if let Some(remaining) = windows_key_sequence.remaining_timeout(poll_now) {
+                poll_timeout = poll_timeout.min(remaining);
+            }
+            if let Some(deadline) = state.next_paste_burst_deadline() {
+                poll_timeout = poll_timeout.min(deadline.saturating_duration_since(poll_now));
+            }
+            if event::poll(poll_timeout).map_err(TuiError::Io)? {
+                let event = event::read().map_err(TuiError::Io)?;
+                #[cfg(windows)]
+                let ready_events = windows_key_sequence.push(event, Instant::now());
+                #[cfg(not(windows))]
+                let ready_events = [event].into_iter().collect::<Vec<_>>();
+                for event in ready_events {
+                    dirty |= apply_terminal_event(event, &mut state, &action_tx);
                 }
-                Event::Paste(text) => {
-                    state.handle_paste(&text);
-                    dirty = true;
-                }
-                Event::Mouse(mouse) => {
-                    for action in state.handle_mouse(mouse) {
-                        let quitting = action == UiAction::Quit;
-                        if action_tx.send(action).is_err() || quitting {
-                            state.apply(UiEvent::Shutdown);
-                        }
-                    }
-                    dirty = true;
-                }
-                Event::Resize(width, height) => {
-                    state.set_terminal_size(width, height.max(1));
-                    dirty = true;
-                }
-                _ => {}
             }
         }
         // 按键或鼠标动作可以同步关闭 UI；退出前跳过工作提示更新与最后一帧绘制。
@@ -585,4 +598,82 @@ fn terminal_loop(
     drop(terminal);
     drop(guard);
     Ok(())
+}
+
+/// 将标准输入事件交给同一状态机；共用入口保证解码回放和实时输入行为一致。
+fn apply_terminal_event(
+    event: Event,
+    state: &mut UiState,
+    action_tx: &mpsc::Sender<UiAction>,
+) -> bool {
+    match event {
+        Event::Key(key) => {
+            for action in state.handle_key(key) {
+                let quitting = action == UiAction::Quit;
+                if action_tx.send(action).is_err() || quitting {
+                    state.apply(UiEvent::Shutdown);
+                }
+            }
+            true
+        }
+        Event::Paste(text) => {
+            state.handle_paste(&text);
+            true
+        }
+        Event::Mouse(mouse) => {
+            for action in state.handle_mouse(mouse) {
+                let quitting = action == UiAction::Quit;
+                if action_tx.send(action).is_err() || quitting {
+                    state.apply(UiEvent::Shutdown);
+                }
+            }
+            true
+        }
+        Event::Resize(width, height) => {
+            state.set_terminal_size(width, height.max(1));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 编辑器退出后只消费恢复前已排队的事件，保留窗口尺寸并等待50毫秒输入静默。
+/// @author kongweiguang
+fn drain_handoff_input(state: &mut UiState) -> io::Result<()> {
+    let mut boundary = HandoffInputBoundary::new(Instant::now());
+    loop {
+        let now = Instant::now();
+        if boundary.is_quiet(now, windows_console_input_queue_empty()?)?
+            && !event::poll(Duration::ZERO)?
+            && windows_console_input_queue_empty()?
+        {
+            return Ok(());
+        }
+        let timeout = boundary.poll_timeout(Instant::now(), POLL_INTERVAL)?;
+        if event::poll(timeout)? {
+            let event = event::read()?;
+            if let Some((width, height)) = boundary.observe_event(&event, Instant::now())? {
+                state.set_terminal_size(width, height.max(1));
+            }
+        }
+    }
+}
+
+/// 交接静默确认同时查询 Win32 控制台队列；ConPTY/Crossterm事件层外的记录不能漏给UI。
+#[cfg(windows)]
+fn windows_console_input_queue_empty() -> io::Result<bool> {
+    use windows::Win32::System::Console::{
+        GetNumberOfConsoleInputEvents, GetStdHandle, STD_INPUT_HANDLE,
+    };
+
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) }.map_err(io::Error::other)?;
+    let mut count = 0;
+    unsafe { GetNumberOfConsoleInputEvents(input, &mut count) }.map_err(io::Error::other)?;
+    Ok(count == 0)
+}
+
+/// 非Windows终端以 Crossterm 自身事件队列作为输入来源，不调用系统专属控制台 API。
+#[cfg(not(windows))]
+fn windows_console_input_queue_empty() -> io::Result<bool> {
+    Ok(true)
 }

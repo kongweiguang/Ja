@@ -21,6 +21,7 @@ mod controller {
             PreferenceResolution, matches_preferences, resolve, update_then_readback_once,
         };
         use serde_json::{Value, json};
+        use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
 
         /// @author kongweiguang
@@ -2022,30 +2023,354 @@ mod controller {
         }
 
         /// @author kongweiguang
-        /// 复制桥接只写完整 UTF-8 正文到 stdin，避免 Windows argv 与系统代码页破坏组合字符。
+        /// 历史 hydration 预算按真实 UTF-8 字节累计，恰好命中上限的多页中文正文应完整返回。
         #[test]
-        fn clipboard_pipe_preserves_chinese_emoji_and_combining_characters() {
-            let text = "中文 🙂 e\u{301} 完整正文";
-            let mut bytes = Vec::new();
+        fn bounded_history_reader_counts_utf8_bytes_across_pages() {
+            let mut pages = [
+                json!({
+                    "itemId":"item_utf8",
+                    "offsetCharacters":0,
+                    "totalCharacters":2,
+                    "content":"中",
+                    "truncated":true,
+                    "nextOffsetCharacters":1
+                }),
+                json!({
+                    "itemId":"item_utf8",
+                    "offsetCharacters":1,
+                    "totalCharacters":2,
+                    "content":"🙂",
+                    "truncated":false,
+                    "nextOffsetCharacters":null
+                }),
+            ]
+            .into_iter();
+            let cancelled = AtomicBool::new(false);
+            let mut consumed_bytes = 0;
+            let body = interactive::read_bounded_item_content_pages(
+                "thr_utf8",
+                "item_utf8",
+                2,
+                interactive::Utf8ReadBudget {
+                    maximum_bytes: "中🙂".len(),
+                    consumed_bytes: &mut consumed_bytes,
+                },
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |params, _| {
+                    assert_eq!(params["threadId"], "thr_utf8");
+                    assert_eq!(params["itemId"], "item_utf8");
+                    Ok(pages.next().expect("one response per requested page"))
+                },
+            )
+            .unwrap();
 
-            interactive::write_clipboard_input(&mut bytes, text).unwrap();
-
-            assert_eq!(String::from_utf8(bytes).unwrap(), text);
+            assert_eq!(body.as_deref(), Some("中🙂"));
+            assert_eq!(consumed_bytes, "中🙂".len());
         }
 
         /// @author kongweiguang
-        /// 外部剪贴板诊断必须继续排空进程管道但限制保留长度，避免错误输出撑满全屏布局。
+        /// 连接期间收到取消时不能发首个 thread/read；新请求仍可读，旧请求返回后取消也拒绝落视图。
         #[test]
-        fn clipboard_diagnostic_is_bounded_and_drained() {
-            let diagnostic =
-                interactive::read_bounded_clipboard_diagnostic(std::io::Cursor::new(vec![
-                    b'x';
-                    4096
-                ]))
-                .unwrap();
+        fn older_history_page_rechecks_cancel_after_connect_and_after_rpc() {
+            use std::sync::atomic::Ordering;
 
-            assert!(diagnostic.len() < 600);
-            assert!(diagnostic.ends_with("[诊断已截断]"));
+            let cancelled = AtomicBool::new(false);
+            let connect = || cancelled.store(true, Ordering::Release);
+            connect();
+            let result = interactive::request_older_history_page(
+                "thr_old",
+                "cursor_old",
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |_, _| panic!("cancel received during connect must prevent thread/read"),
+            );
+            assert!(result.is_err());
+
+            cancelled.store(false, Ordering::Release);
+            let page = json!({"threadId":"thr_current", "items":[]});
+            let current = interactive::request_older_history_page(
+                "thr_current",
+                "cursor_current",
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |params, timeout| {
+                    assert_eq!(params["threadId"], "thr_current");
+                    assert_eq!(params["cursor"], "cursor_current");
+                    assert!(timeout <= Duration::from_secs(1));
+                    Ok(page.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(current, page);
+
+            let late = interactive::request_older_history_page(
+                "thr_current",
+                "cursor_current",
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |_, _| {
+                    cancelled.store(true, Ordering::Release);
+                    Ok(page)
+                },
+            );
+            assert!(late.is_err());
+        }
+
+        /// @author kongweiguang
+        /// 超预算的正文保留原 truncated 标记；取消在首个 RPC 前生效，不能把预览误认作全文。
+        #[test]
+        fn bounded_history_reader_preserves_preview_on_overflow_and_cancel() {
+            let item = json!({
+                "itemId":"item_preview",
+                "kind":"final_answer",
+                "totalCharacters":2,
+                "text":"预览",
+                "truncated":true
+            });
+            let cancelled = AtomicBool::new(false);
+            let mut consumed_bytes = 0;
+            let mut reads = 0;
+            let result = interactive::read_bounded_item_content_pages(
+                "thr_preview",
+                "item_preview",
+                2,
+                interactive::Utf8ReadBudget {
+                    maximum_bytes: "中文".len() - 1,
+                    consumed_bytes: &mut consumed_bytes,
+                },
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |_, _| {
+                    reads += 1;
+                    Ok(json!({
+                        "itemId":"item_preview",
+                        "offsetCharacters":0,
+                        "totalCharacters":2,
+                        "content":"中",
+                        "truncated":true,
+                        "nextOffsetCharacters":1
+                    }))
+                },
+            )
+            .unwrap();
+            assert_eq!(result, None);
+            assert_eq!(reads, 1);
+            assert_eq!(consumed_bytes, "中".len());
+            assert_eq!(item["truncated"], true);
+            assert_eq!(item["text"], "预览");
+
+            let cancelled = AtomicBool::new(true);
+            let mut consumed_bytes = 0;
+            let result = interactive::read_bounded_item_content_pages(
+                "thr_preview",
+                "item_preview",
+                2,
+                interactive::Utf8ReadBudget {
+                    maximum_bytes: 8,
+                    consumed_bytes: &mut consumed_bytes,
+                },
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |_, _| panic!("cancelled work must not issue another page read"),
+            );
+            assert!(result.is_err());
+        }
+
+        /// @author kongweiguang
+        /// 页预算先计入 thread/read 的完整正文与预览，再计入每个已返回正文页，部分读取也会耗尽后续预算。
+        #[test]
+        fn older_history_budget_counts_retained_bodies_and_partial_reads_across_items() {
+            let mut items = vec![
+                json!({
+                    "itemId":"item_full",
+                    "kind":"user_input",
+                    "truncated":false,
+                    "content":[
+                        {"type":"text","text":"full"},
+                        {"type":"workspace_reference","relativePath":"src/lib.rs"},
+                        {"type":"text","text":"body"}
+                    ]
+                }),
+                json!({
+                    "itemId":"item_partial",
+                    "kind":"final_answer",
+                    "totalCharacters":2,
+                    "truncated":true,
+                    "text":"p"
+                }),
+                json!({
+                    "itemId":"item_next",
+                    "kind":"final_answer",
+                    "totalCharacters":1,
+                    "truncated":true,
+                    "text":"q"
+                }),
+            ];
+            let cancelled = AtomicBool::new(false);
+            let mut page_reads = std::collections::HashMap::<String, usize>::new();
+
+            let used_bytes = interactive::hydrate_older_history_items(
+                &mut items,
+                14,
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+                |item_id, total_characters, maximum_bytes, consumed_bytes| {
+                    interactive::read_bounded_item_content_pages(
+                        "thr_budget",
+                        item_id,
+                        total_characters,
+                        interactive::Utf8ReadBudget {
+                            maximum_bytes,
+                            consumed_bytes,
+                        },
+                        Instant::now() + Duration::from_secs(1),
+                        &cancelled,
+                        |params, _| {
+                            assert_eq!(params["itemId"], item_id);
+                            *page_reads.entry(item_id.to_owned()).or_default() += 1;
+                            let offset = params["offsetCharacters"].as_u64().unwrap();
+                            let limit = params["limitCharacters"].as_u64().unwrap();
+                            let content = "x".repeat(limit as usize);
+                            let next = offset + limit;
+                            let truncated = next < total_characters;
+                            Ok(json!({
+                                "itemId":item_id,
+                                "offsetCharacters":offset,
+                                "totalCharacters":total_characters,
+                                "content":content,
+                                "truncated":truncated,
+                                "nextOffsetCharacters":if truncated { json!(next) } else { Value::Null }
+                            }))
+                        },
+                    )
+                },
+            )
+            .unwrap();
+
+            assert_eq!(used_bytes, "fullbodypq".len() + 1);
+            assert_eq!(page_reads.get("item_partial"), Some(&1));
+            assert!(!page_reads.contains_key("item_next"));
+            assert_eq!(items[1]["truncated"], true);
+            assert_eq!(items[1]["text"], "p");
+            assert_eq!(items[2]["truncated"], true);
+            assert_eq!(items[2]["text"], "q");
+        }
+
+        /// @author kongweiguang
+        /// 模拟详情关闭后的取消：写入门禁已经跨过时，成功、失败和未知结果仍须交付会话反馈。
+        #[test]
+        fn admitted_detail_copy_keeps_late_terminal_feedback_after_cancel() {
+            use super::clipboard::{ClipboardBackend, ClipboardWorker, CopyState};
+            use std::sync::{Arc, Condvar, Mutex};
+
+            struct DelayedClipboard {
+                release: Arc<(Mutex<bool>, Condvar)>,
+                outcome: CopyState,
+            }
+
+            impl ClipboardBackend for DelayedClipboard {
+                /// @author kongweiguang
+                /// 后端无需真实桌面资源，测试只制造已开始写入和终态回执之间的关闭窗口。
+                fn prepare(&mut self) -> Result<(), String> {
+                    Ok(())
+                }
+
+                /// @author kongweiguang
+                /// 门闩固定写入时序，避免调度速度让测试误走可取消的准备阶段。
+                fn set_text(&mut self, _: &str) -> Result<(), String> {
+                    let (lock, wake) = &*self.release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    drop(released);
+                    match &self.outcome {
+                        CopyState::Copied => Ok(()),
+                        CopyState::Failed(error) => Err(error.clone()),
+                        CopyState::OutcomeUnknown => panic!("injected native write panic"),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+
+            for (outcome, expected_notice) in [
+                (CopyState::Copied, "完整消息详情已复制"),
+                (CopyState::Failed("held".into()), "完整消息详情复制失败"),
+                (CopyState::OutcomeUnknown, "请先核查系统剪贴板"),
+            ] {
+                let release = Arc::new((Mutex::new(false), Condvar::new()));
+                let backend_release = Arc::clone(&release);
+                let mut worker = ClipboardWorker::with_backend_factory(move || {
+                    Box::new(DelayedClipboard {
+                        release: Arc::clone(&backend_release),
+                        outcome: outcome.clone(),
+                    })
+                });
+                let request = worker
+                    .submit("thr_detail".into(), None, "完整中文".into())
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Some(event) = worker.try_recv() {
+                        assert_eq!(event.state, CopyState::Delivering);
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "delivery never began");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // close_details 的取消请求无法撤回已跨入 OS 的操作；后续反馈不依赖面板仍然打开。
+                assert!(!worker.cancel(request));
+                *release.0.lock().unwrap() = true;
+                release.1.notify_one();
+                loop {
+                    if let Some(event) = worker.try_recv() {
+                        assert_eq!(event.request_id, request);
+                        assert_eq!(event.thread_id, "thr_detail");
+                        let feedback = interactive::clipboard_feedback(
+                            interactive::ClipboardPurpose::MessageDetail {
+                                entry_id: "item_closed".into(),
+                            },
+                            event.selection_id,
+                            event.state,
+                        );
+                        assert!(matches!(feedback, Some(UiEvent::SetNotice(Some(notice)))
+                            if notice.contains(expected_notice)));
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "terminal feedback never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        /// @author kongweiguang
+        /// 只有成功读出的完整公开正文可以成为详情复制来源，截断预览必须拒绝。
+        #[test]
+        fn detail_copy_gate_requires_complete_public_item() {
+            let full = json!({
+                "itemId":"item_full",
+                "kind":"final_answer",
+                "truncated":false,
+                "text":"完整中文正文"
+            });
+            let preview = json!({
+                "itemId":"item_full",
+                "kind":"final_answer",
+                "truncated":true,
+                "text":"完整"
+            });
+
+            assert_eq!(
+                interactive::full_public_item_display(&full)
+                    .unwrap()
+                    .as_deref(),
+                Some("完整中文正文")
+            );
+            assert_eq!(
+                interactive::full_public_item_display(&preview).unwrap(),
+                None
+            );
         }
     }
 }

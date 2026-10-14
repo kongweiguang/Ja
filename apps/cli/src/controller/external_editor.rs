@@ -2,6 +2,9 @@
 // @author kongweiguang
 
 //! 外部编辑器只接收独立草稿文件与继承的终端流，不承担会话或草稿状态所有权。
+//! Windows executable resolution follows Codex `codex-rs/tui/src/external_editor.rs` at
+//! `822e58cc3d666166c7446c5b1ea2e52f5d09594c` (Copyright 2025 OpenAI, Apache-2.0).
+//! Ja retains its own argv parser and draft handoff; source and modification notices are in `apps/cli/NOTICE.md`.
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -85,12 +88,14 @@ fn split_editor_command(value: &str) -> Result<Vec<String>, String> {
 }
 
 /// 临时草稿只在成功创建后持有删除责任，不覆盖任何用户指定路径。
-struct EditorTemporaryPath(PathBuf);
+struct EditorTemporaryPath(Option<PathBuf>);
 
 impl Drop for EditorTemporaryPath {
     /// 清理失败不覆盖编辑器结果或遮蔽控制器正在报告的主错误。
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -98,6 +103,15 @@ impl Drop for EditorTemporaryPath {
 pub(super) struct TemporaryEditorFile {
     pub(super) path: PathBuf,
     _cleanup: EditorTemporaryPath,
+}
+
+impl TemporaryEditorFile {
+    /// @author kongweiguang
+    /// 终端失去可用 UI 时将已创建文件交付给用户恢复，显式解除清理责任而不覆盖其他路径。
+    pub(super) fn preserve(mut self) -> PathBuf {
+        self._cleanup.0 = None;
+        self.path.clone()
+    }
 }
 
 /// 使用独占创建与关闭文件句柄，避免并发覆盖及 Windows 编辑器共享锁冲突。
@@ -110,7 +124,7 @@ pub(super) fn create_editor_draft(draft: &str) -> io::Result<TemporaryEditorFile
         ));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let cleanup = EditorTemporaryPath(path.clone());
+                let cleanup = EditorTemporaryPath(Some(path.clone()));
                 file.write_all(draft.as_bytes())?;
                 file.flush()?;
                 drop(file);
@@ -126,12 +140,27 @@ pub(super) fn create_editor_draft(draft: &str) -> io::Result<TemporaryEditorFile
     Err(io::Error::other("无法创建唯一的临时编辑文件"))
 }
 
-/// 继承终端流运行已配置程序，仅在程序成功退出后接收编辑文本。
+/// Windows Command::new 不会搜索 `.cmd`/`.bat` shim；which 复用 PATH 与 PATHEXT 规则。
+#[cfg(windows)]
+fn resolve_editor_program(program: &str) -> Result<PathBuf, String> {
+    which::which(program)
+        .map_err(|error| format!("无法按 PATH/PATHEXT 定位编辑器 `{program}`：{error}"))
+}
+
+/// 其他平台沿用系统进程搜索规则，不附加 Windows 专属路径解释。
+#[cfg(not(windows))]
+fn resolve_editor_program(program: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(program))
+}
+
+/// 用解析后的程序路径和 argv 直接继承终端流，避免 Shell 展开编辑器配置。
+/// VS Code 仅在缺少显式 --wait 时补上等待选项，失败退出或结果读取失败不接管草稿。
 pub(super) fn run_editor(command: &[String], path: &Path) -> Result<Option<String>, String> {
     let (program, arguments) = command
         .split_first()
         .ok_or_else(|| "编辑器命令为空".to_owned())?;
-    let mut process = Command::new(program);
+    let resolved_program = resolve_editor_program(program)?;
+    let mut process = Command::new(resolved_program);
     process.args(arguments);
     let executable = Path::new(program)
         .file_stem()

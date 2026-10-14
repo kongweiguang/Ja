@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
+#[allow(dead_code)]
+#[path = "../../src/ui/theme.rs"]
+mod theme;
+
 #[path = "../../src/ui/markdown.rs"]
 mod markdown;
+#[path = "../../src/ui/wrapping.rs"]
+mod wrapping;
 
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Text};
@@ -99,6 +105,90 @@ fn lists_keep_ordering_task_state_and_hanging_indent() {
     assert!(line_text(&nested.lines[0]).starts_with("• 普通父项"));
     assert!(visible_text(&nested).contains("[x] 子项已完成"));
     assert!(visible_text(&nested).contains("[ ] 子项未完成"));
+}
+
+/// 紧凑列表不产生 Paragraph 标签，行内样式和软换行仍必须属于同一条正文。
+#[test]
+fn tight_list_keeps_inline_nodes_in_one_paragraph() {
+    let source = "- **挂号**：手工接诊（`is_received` / `receive_time`）；[文档](docs/README.md)。\n  软换行仍属于本项。\n- HIS 集成：`record_stage`（DRAFT/FINAL）。";
+    let text = markdown::render_markdown(source, 120);
+    assert_eq!(
+        visible_text(&text),
+        "• 挂号：手工接诊（is_received / receive_time）；文档 (docs/README.md)。 软换行仍属于本项。\n• HIS 集成：record_stage（DRAFT/FINAL）。"
+    );
+    assert!(text.lines[0].spans.iter().any(|span| {
+        span.content.contains("挂号") && span.style.add_modifier.contains(Modifier::BOLD)
+    }));
+    assert!(
+        text.lines[0]
+            .spans
+            .iter()
+            .any(|span| { span.content.contains("is_received") && span.style.bg.is_some() })
+    );
+}
+
+/// 行内节点合并仅作用于同一正文，嵌套列表、引用及真正的多段条目保留块边界。
+#[test]
+fn list_inline_runs_keep_nested_and_loose_block_boundaries() {
+    let source = "- **父项**：`parent`\n  - 子项：`child`\n\n  第二段：**重点**\n\n  > 引用：`quote`\n\n- 最后：`end`";
+    let text = markdown::render_markdown(source, 60);
+    assert_eq!(
+        visible_text(&text),
+        "• 父项：parent\n\n  • 子项：child\n\n  第二段：重点\n\n  │ 引用：quote\n• 最后：end"
+    );
+}
+
+/// 断词在所有样式合并后执行，词本身能放进整行时不因剩余空间不足被硬切碎。
+#[test]
+fn prose_wraps_at_word_boundaries_across_inline_styles() {
+    let text = markdown::render_markdown("prefix **micro**service ready", 12);
+    assert_eq!(visible_text(&text), "prefix\nmicroservice\nready");
+    assert!(
+        text.lines[1].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        !text.lines[1].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+
+    let text = markdown::render_markdown("- abc `defgh` ij", 10);
+    assert_eq!(visible_text(&text), "• abc\n  defgh ij");
+}
+
+/// 原生断词机会不能拆开组合字符、旗帜和 ZWJ Emoji；超窄窗允许完整字素超出一列。
+#[test]
+fn word_wrapping_keeps_compound_graphemes_and_explicit_breaks() {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let source = "界👩‍💻e\u{301}🇨🇳👍🏽👨‍👩‍👧‍👦结尾";
+    for width in [1, 2, 3, 8, 80] {
+        let text = markdown::render_markdown(source, width);
+        let lines = text.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(lines.concat(), source, "width={width}");
+        for line in lines {
+            assert!(!line.is_empty(), "width={width}");
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= width || line.graphemes(true).count() == 1,
+                "width={width}, line={line}"
+            );
+            for grapheme in line.graphemes(true) {
+                assert!(
+                    source.graphemes(true).any(|original| original == grapheme),
+                    "split grapheme {grapheme:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        visible_text(&markdown::render_markdown("first  \nsecond", 30)),
+        "first\nsecond"
+    );
 }
 
 /// fenced code 保留语言标签、空源码行和四列制表位展开后的缩进。

@@ -5,8 +5,8 @@
 
 use super::{CliError, ThreadContext, required_str, required_u64};
 use ja_cli::ui::{
-    InteractionQuestion, InteractionQuestionKind, PendingPrompt, TimelineEntry, TimelineKind,
-    TimelineStatus, TurnState, UiChoice, UiSnapshot,
+    InteractionQuestion, InteractionQuestionKind, MESSAGE_PREVIEW_TRUNCATED_NOTICE, PendingPrompt,
+    TimelineEntry, TimelineKind, TimelineStatus, TurnState, UiChoice, UiSnapshot,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -450,7 +450,11 @@ fn project_item(
                 id,
                 kind: TimelineKind::User,
                 text: safe_display(&text),
-                detail: None,
+                detail: item
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .filter(|truncated| *truncated)
+                    .map(|_| MESSAGE_PREVIEW_TRUNCATED_NOTICE.to_owned()),
                 status: None,
             }
         }
@@ -462,7 +466,11 @@ fn project_item(
                 TimelineKind::Assistant
             },
             text: safe_display(text_field(item, "text")?),
-            detail: None,
+            detail: item
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .filter(|truncated| *truncated)
+                .map(|_| MESSAGE_PREVIEW_TRUNCATED_NOTICE.to_owned()),
             status: Some(if kind == "final_answer" && turn_status == Some("failed") {
                 TimelineStatus::Failed
             } else {
@@ -473,7 +481,11 @@ fn project_item(
             id,
             kind: TimelineKind::ReasoningSummary,
             text: safe_display(text_field(item, "text")?),
-            detail: None,
+            detail: item
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .filter(|truncated| *truncated)
+                .map(|_| MESSAGE_PREVIEW_TRUNCATED_NOTICE.to_owned()),
             status: None,
         },
         "tool_call" => {
@@ -548,7 +560,11 @@ fn project_item(
             id,
             kind: TimelineKind::Commentary,
             text: safe_display(text_field(item, "content")?),
-            detail: None,
+            detail: item
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .filter(|truncated| *truncated)
+                .map(|_| MESSAGE_PREVIEW_TRUNCATED_NOTICE.to_owned()),
             status: None,
         },
         "approval" => return Ok(None),

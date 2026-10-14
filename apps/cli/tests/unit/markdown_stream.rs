@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @author kongweiguang
 
+#[allow(dead_code)]
+#[path = "../../src/ui/theme.rs"]
+mod theme;
+
 mod model {
     /// 测试模块只映射生产模块依赖的展示枚举，保持 #[path] 加载不装配整套 UI。
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +22,8 @@ mod model {
 mod markdown;
 #[path = "../../src/ui/markdown_stream.rs"]
 mod markdown_stream;
+#[path = "../../src/ui/wrapping.rs"]
+mod wrapping;
 
 use markdown_stream::MarkdownStream;
 use model::StreamPresentation;
