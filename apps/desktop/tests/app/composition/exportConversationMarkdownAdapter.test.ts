@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, expect, it, vi } from "vitest";
+import type { ThreadReadResult } from "@/api/protocol/protocol";
 import {
   JA_HISTORY_COMMANDS,
   TauriHistoryAdapter,
   type HistoryNativeBridge,
 } from "@/api/tauri/history";
-import { exportConversationMarkdown, type TimelineSnapshot } from "@/features/conversation";
+import { exportConversationMarkdown } from "@/features/conversation";
 
 /** 生产 adapter 的正文 reader 依赖 `this.bridge`；组合层回归需覆盖真实 adapter 到导出的调用链。 */
 describe("conversation export adapter composition", () => {
-  /** 整段导出保留 adapter receiver；快照显式携带 null 活动压缩字段满足严格 IPC 契约。 */
+  /** 整段导出保留 adapter receiver；IPC fixture 使用 Wire 契约，避免领域投影遗漏必需字段。 */
   it("exports user and final text through a real history adapter instance", async () => {
     const createdAt = "2026-10-06T00:00:00Z";
-    const snapshot: TimelineSnapshot = {
+    const snapshot: ThreadReadResult = {
       threadId: "thr_export",
       revision: 7,
       turns: [],
