@@ -138,7 +138,8 @@ final class StandardAgentRequestRuntimeResolverTest {
                 IDENTITY, Optional.empty(), Map.of()), extensions, Optional.empty())) {
             assertSame(summaries, runtime.summaryModels());
             TurnBinding binding = new SummaryModel.TurnBinding(IDENTITY.threadId(), configuration,
-                    Instant.now().plusSeconds(10), io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken.none());
+                    Optional.of(Instant.now().plusSeconds(10)),
+                    io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken.none());
             assertEquals("registered-summary-invoked", assertThrows(IllegalStateException.class,
                     () -> runtime.summaryModels().bind(binding)).getMessage());
             assertEquals(1, bindings.get());
@@ -156,7 +157,8 @@ final class StandardAgentRequestRuntimeResolverTest {
         try (AgentRequestRuntime runtime = resolver.resolve(new AgentRuntimeRequest(AgentRuntimeRequest.Kind.USER_INPUT,
                 IDENTITY, Optional.empty(), Map.of()), extensions, Optional.empty())) {
             TurnBinding binding = new SummaryModel.TurnBinding(IDENTITY.threadId(), configuration,
-                    Instant.now().plusSeconds(10), io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken.none());
+                    Optional.of(Instant.now().plusSeconds(10)),
+                    io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken.none());
             assertEquals("registered_model_summary_not_supported:registered", assertThrows(IllegalStateException.class,
                     () -> runtime.summaryModels().bind(binding)).getMessage());
         }

@@ -88,13 +88,7 @@ import {
   LocalTerminalLayoutStorage,
   useTerminalLayoutPersistence,
 } from "@/features/workbench/terminal";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-  LoadingState,
-} from "@/shared/ui/primitives";
+import { LoadingState } from "@/shared/ui/primitives";
 import type { WorkspaceProjection } from "@/features/workspace";
 import { createNotifyingFilesOperations } from "../application/createNotifyingFilesOperations";
 import { usePreviewWorkspaceLifecycle } from "../application/usePreviewWorkspaceLifecycle";
@@ -282,16 +276,6 @@ function focusWorkspaceReferenceInFiles(
     focusTarget.closest<HTMLElement>('[hidden], [aria-hidden="true"], [inert]') === null
   )
     focusTarget.focus();
-}
-
-/** 只对无目录分隔符的文件名启用候选查询，显式相对/绝对路径交给 Rust 精确解析。 */
-function isBasenameFileTarget(path: string): boolean {
-  return !path.includes("/") && !path.includes("\\") && !path.startsWith("file://");
-}
-
-/** 工作区搜索结果可能使用平台分隔符；basename 比较不改变候选的权威相对路径。 */
-function workspacePathBasename(path: string): string {
-  return path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
 }
 
 export interface WorkbenchHostProps {
@@ -511,15 +495,6 @@ export function WorkbenchHost({
   });
   const processingOpenTargetRequestRef = useRef<number | undefined>(undefined);
   const settledOpenTargetRequestRef = useRef<number | undefined>(undefined);
-  const [ambiguousOpenTarget, setAmbiguousOpenTarget] = useState<
-    | {
-        requestId: number;
-        candidates: readonly string[];
-        query: string;
-        truncated: boolean;
-      }
-    | undefined
-  >();
   const parsedSelectedTask = parseTaskWorkbenchTabKey(selectedTab);
   const activeTaskThreadId = parsedSelectedTask?.taskThreadId;
   /** 仅将所选 Thread 与请求起点 Runtime 身份一致的侧聊历史写入共享 Store，避免迟到读取污染其它会话。@author kongweiguang */
@@ -1765,12 +1740,9 @@ export function WorkbenchHost({
     [],
   );
 
-  /** 先由 Rust 确定路径类型，再显示所需工作面；迟到 resolve/open 不能覆盖新 Thread intent。 */
+  /** 精确目标直接交给 Rust 核验，不搜索同名候选；迟到 resolve/open 不能覆盖新 Thread intent。 */
   const executeOpenTargetRequest = useCallback(
-    async (
-      request: ConversationOpenTargetRequest,
-      selectedRelativePath?: string,
-    ): Promise<void> => {
+    async (request: ConversationOpenTargetRequest): Promise<void> => {
       const intentSequence = ++openTargetIntentSequenceRef.current;
       const isCurrentIntent = (): boolean =>
         openTargetIntentSequenceRef.current === intentSequence &&
@@ -1791,39 +1763,7 @@ export function WorkbenchHost({
           return;
         }
 
-        let targetPath = selectedRelativePath ?? request.target.path;
-        if (selectedRelativePath === undefined && isBasenameFileTarget(targetPath)) {
-          const search = await queryRuntime("workspace/path/search", {
-            threadId: request.threadId,
-            workspaceId: request.workspaceId,
-            query: targetPath,
-            limit: 50,
-          });
-          if (!isCurrentIntent()) {
-            if (processingOpenTargetRequestRef.current === request.requestId)
-              processingOpenTargetRequestRef.current = undefined;
-            return;
-          }
-          const expectedName = workspacePathBasename(targetPath).toLocaleLowerCase();
-          const candidates = search.items
-            .filter(
-              (item) =>
-                item.kind === "file" &&
-                workspacePathBasename(item.relativePath).toLocaleLowerCase() === expectedName,
-            )
-            .map((item) => item.relativePath);
-          if (candidates.length > 1) {
-            setAmbiguousOpenTarget({
-              requestId: request.requestId,
-              candidates,
-              query: targetPath,
-              truncated: search.truncated,
-            });
-            processingOpenTargetRequestRef.current = undefined;
-            return;
-          }
-          if (candidates.length === 1) targetPath = candidates[0] ?? targetPath;
-        }
+        const targetPath = request.target.path;
 
         if (request.target.kind === "explorer") {
           await adapters.preview.revealFile(targetPath, request.workspaceId);
@@ -2025,7 +1965,6 @@ export function WorkbenchHost({
       isOpenTargetRequestCurrent,
       onOpenTargetSettled,
       previewController.actions,
-      queryRuntime,
     ],
   );
 
@@ -2175,54 +2114,20 @@ export function WorkbenchHost({
     [activateWorkbenchCapability, previewController.actions],
   );
 
-  /** 用户选择 basename 候选后复用同一个请求与 resolver，选择器不自行访问文件系统。 */
-  const chooseOpenTargetCandidate = useCallback(
-    (candidate: string): void => {
-      const request = openTargetRequestRef.current;
-      if (
-        request === undefined ||
-        ambiguousOpenTarget?.requestId !== request.requestId ||
-        !isOpenTargetRequestCurrent(request) ||
-        !ambiguousOpenTarget.candidates.includes(candidate)
-      )
-        return;
-      setAmbiguousOpenTarget(undefined);
-      processingOpenTargetRequestRef.current = request.requestId;
-      void executeOpenTargetRequest(request, candidate);
-    },
-    [ambiguousOpenTarget, executeOpenTargetRequest, isOpenTargetRequestCurrent],
-  );
-
-  /** 取消歧义选择即完成本次失败回执，不丢失原回复，也不再发起任何路径读取。 */
-  const cancelOpenTargetChoice = useCallback((): void => {
-    const request = openTargetRequestRef.current;
-    if (request === undefined || ambiguousOpenTarget?.requestId !== request.requestId) return;
-    setAmbiguousOpenTarget(undefined);
-    processingOpenTargetRequestRef.current = undefined;
-    settledOpenTargetRequestRef.current = request.requestId;
-    onOpenTargetSettled?.(request.requestId, "failed");
-  }, [ambiguousOpenTarget?.requestId, onOpenTargetSettled]);
-
-  /** 新目标开始时清除上一目标的错误提示，避免旧失败遮挡并误导本次重名选择。 */
+  /** 新目标清除上一目标的错误提示；路径解析和回执始终绑定同一点击意图。 */
   useEffect(() => {
     const request = openTargetRequest;
     if (
       request === undefined ||
       !isOpenTargetRequestCurrent(request) ||
       settledOpenTargetRequestRef.current === request.requestId ||
-      processingOpenTargetRequestRef.current === request.requestId ||
-      ambiguousOpenTarget?.requestId === request.requestId
+      processingOpenTargetRequestRef.current === request.requestId
     )
       return;
     toast.dismiss(OPEN_TARGET_TOAST_ID);
     processingOpenTargetRequestRef.current = request.requestId;
     void executeOpenTargetRequest(request);
-  }, [
-    ambiguousOpenTarget?.requestId,
-    executeOpenTargetRequest,
-    isOpenTargetRequestCurrent,
-    openTargetRequest,
-  ]);
+  }, [executeOpenTargetRequest, isOpenTargetRequestCurrent, openTargetRequest]);
 
   /**
    * 能力 Tab 关闭执行各自 teardown；只有临时侧聊需要服务端 close ACK，Subagent 仅关闭观察界面。
@@ -2277,10 +2182,6 @@ export function WorkbenchHost({
   ) : (
     <span className="ja-visually-hidden" aria-hidden="true" />
   );
-  const fileChoiceTitle =
-    openTargetRequest?.target.kind === "explorer"
-      ? "选择要在文件夹中定位的文件"
-      : "选择要打开的文件";
 
   return (
     <>
@@ -2422,50 +2323,6 @@ export function WorkbenchHost({
           onClose={onClose}
         />
       </aside>
-      <Dialog
-        open={
-          ambiguousOpenTarget !== undefined &&
-          openTargetRequest?.requestId === ambiguousOpenTarget.requestId
-        }
-        onOpenChange={(nextOpen) => {
-          if (!nextOpen) cancelOpenTargetChoice();
-        }}
-      >
-        <DialogContent
-          className="ja-open-target-dialog"
-          aria-label={fileChoiceTitle}
-          aria-describedby="ja-open-target-description"
-          onEscapeKeyDown={(event) => {
-            event.preventDefault();
-            cancelOpenTargetChoice();
-          }}
-          onInteractOutside={(event) => event.preventDefault()}
-        >
-          <DialogTitle>{fileChoiceTitle}</DialogTitle>
-          <DialogDescription id="ja-open-target-description">
-            找到多个“{ambiguousOpenTarget?.query ?? "文件"}”，请选择工作区中的目标。
-            {openTargetRequest?.target.kind === "explorer" ? "随后会打开所在文件夹并选中它。" : ""}
-            {ambiguousOpenTarget?.truncated === true ? "候选较多，仅显示前 50 项。" : ""}
-          </DialogDescription>
-          <div className="ja-open-target-candidates">
-            {ambiguousOpenTarget?.candidates.map((candidate) => (
-              <button
-                type="button"
-                key={candidate}
-                data-file-candidate={candidate}
-                onClick={() => chooseOpenTargetCandidate(candidate)}
-              >
-                <code>{candidate}</code>
-              </button>
-            ))}
-          </div>
-          <div className="ja-open-target-actions">
-            <button type="button" onClick={cancelOpenTargetChoice}>
-              取消
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
     </>
   );
 }

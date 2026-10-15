@@ -11,7 +11,7 @@ import { exportConversationMarkdown, type TimelineSnapshot } from "@/features/co
 
 /** 生产 adapter 的正文 reader 依赖 `this.bridge`；组合层回归需覆盖真实 adapter 到导出的调用链。 */
 describe("conversation export adapter composition", () => {
-  /** 整段导出必须保留 adapter receiver，并从 IPC 读回用户输入与最终答复。 */
+  /** 整段导出保留 adapter receiver；快照显式携带 null 活动压缩字段满足严格 IPC 契约。 */
   it("exports user and final text through a real history adapter instance", async () => {
     const createdAt = "2026-10-06T00:00:00Z";
     const snapshot: TimelineSnapshot = {
@@ -45,6 +45,7 @@ describe("conversation export adapter composition", () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {

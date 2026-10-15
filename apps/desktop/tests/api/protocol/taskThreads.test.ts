@@ -330,7 +330,10 @@ describe("JA-RPC v2 Task Threads", () => {
     ).toThrow();
   });
 
-  /** thread/read 按 owner 接纳侧聊的直接 Subagent，但禁止独立侧聊自身回流到主 Timeline。 */
+  /**
+   * @author kongweiguang
+   * thread/read 按 owner 接纳侧聊的直接 Subagent，但禁止独立侧聊自身回流到主 Timeline。
+   */
   it("validates task activity owner separately from global lineage root", () => {
     const childTask = {
       ...task,
@@ -358,6 +361,7 @@ describe("JA-RPC v2 Task Threads", () => {
       inputQueue: null,
       contextUsage: null,
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
@@ -511,7 +515,10 @@ describe("JA-RPC v2 Task Threads", () => {
     ).toThrow();
   });
 
-  /** Snapshot 固化 ThreadOrigin；事件仍由各自 wire fixture 表达，防止快照来源元数据被误省略。 @author kongweiguang */
+  /**
+   * @author kongweiguang
+   * Snapshot 固化 ThreadOrigin；事件仍由各自 wire fixture 表达，防止快照来源元数据被误省略。
+   */
   it("validates thread messages in snapshots and mailbox events", () => {
     const threadMessage = {
       itemId: "item_message_one",
@@ -546,6 +553,7 @@ describe("JA-RPC v2 Task Threads", () => {
       inputQueue: null,
       contextUsage: null,
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);

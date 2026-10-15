@@ -47,6 +47,7 @@ public final class ActiveStreamRegistry {
     private static final int MAX_EVENT_IDS = 256;
     private final long runtimeGeneration;
     private final java.util.Map<String, State> states = new java.util.HashMap<>();
+    private final Map<String, ContextCompactionState> contextCompactions = new java.util.HashMap<>();
 
     /**
      * 绑定唯一运行代际；重启或连接替换后旧基线不能被新 RPC 会话读取。
@@ -185,8 +186,24 @@ public final class ActiveStreamRegistry {
     /**
      * 按 Thread 释放全部临时流；删除的是 Thread 而不是某一个 Turn，不能复用按 Turn 清理的入口。
      * 删除与终态清理都保持幂等，使删除响应和迟到事件并发时不会重新暴露已删除会话的草稿。
+     *
+     * @author kongweiguang
      */
     public synchronized void abandonThread(String threadId) {
+        if (threadId == null) {
+            return;
+        }
+        requireIdentifier(threadId, "thr_");
+        states.entrySet().removeIf(entry -> entry.getValue().threadId.equals(threadId));
+        contextCompactions.remove(threadId);
+    }
+
+    /**
+     * Thread/read 确认没有活动 Turn 时仅清除 Turn 草稿；手动压缩可在没有活动 Turn 时仍处于处理中。
+     *
+     * @author kongweiguang
+     */
+    public synchronized void abandonStreams(String threadId) {
         if (threadId == null) {
             return;
         }
@@ -196,8 +213,10 @@ public final class ActiveStreamRegistry {
 
     /**
      * 在唯一 Turn 出站边界吸收事件；流式 delta 不改变数据库 revision，持久事件只推进 revision。
-     * ModelStepCommitted 和 RetryStarted 清草稿但保留 Turn 全局 streamSeq；模型请求身份仅参与
-     * 内部片段合并，不进入公开恢复数据。
+     * ModelStepCommitted 和 RetryStarted 清草稿但保留 Turn 全局 streamSeq；RetryStarted 同步推进
+     * 当前压缩摘要尝试号，且 compaction 状态仍以 Thread 的持久 revision 为读取 fence。
+     *
+     * @author kongweiguang
      */
     public synchronized void observe(TurnEvent event, Instant occurredAt) {
         Objects.requireNonNull(event, "event");
@@ -215,6 +234,16 @@ public final class ActiveStreamRegistry {
         TurnEvent.Context context = event.context();
         if (context == null) {
             return;
+        }
+        if (event instanceof TurnEvent.RetryStarted retry) {
+            observeCompactionRetry(context, retry.attempt());
+        }
+        if (event instanceof TurnEvent.Terminal
+            || event instanceof TurnEvent.StateChanged changed && changed.to().terminal()) {
+            abandonCompactionForTurn(context.threadId(), context.turnId());
+        } else {
+            /* Turn 持久提交也推进同 Thread 的压缩状态，避免 read 因 revision 前进而隐藏进行中压缩。 */
+            advanceCompactionRevision(context.threadId(), context.threadRevision());
         }
         /* Thread revision 是共享水位；queued/running 的任何 durable 提交都必须推进同 Thread 其它 stream。 */
         State owned = states.get(context.turnId());
@@ -266,6 +295,8 @@ public final class ActiveStreamRegistry {
     /**
      * 吸收同一 SQLite 提交但没有公开 TurnEvent 的内部边界，例如 Provider dispatch 的 UNKNOWN usage。
      * 这条进程内观察不写 wire；modelRound 与 mutation 一起更新，避免 read 在首段流期间误判为断流。
+     *
+     * @author kongweiguang
      */
     public synchronized void observeTurnCommit(String threadId, String turnId, long threadRevision,
                                                long turnMutationVersion, int modelRound,
@@ -279,6 +310,7 @@ public final class ActiveStreamRegistry {
         State state = states.get(turnId);
         states.values().stream().filter(candidate -> candidate.threadId.equals(threadId))
                 .forEach(candidate -> candidate.observeRevision(threadRevision));
+        advanceCompactionRevision(threadId, threadRevision);
         if (state == null || !state.threadId.equals(threadId) || state.generation != runtimeGeneration) {
             return;
         }
@@ -314,18 +346,38 @@ public final class ActiveStreamRegistry {
 
     /**
      * 登记与提交观察共用同一 Workspace/Thread max 推进规则，防止并发旧回执回拨活动流基线。
+     *
+     * @author kongweiguang
      */
     private void advanceThreadRevision(String workspaceId, String threadId, long threadRevision) {
         states.values().stream().filter(state -> state.workspaceId.equals(workspaceId)
                         && state.threadId.equals(threadId))
                 .forEach(state -> state.observeRevision(threadRevision));
+        ContextCompactionState compaction = contextCompactions.get(threadId);
+        if (compaction != null && compaction.workspaceId.equals(workspaceId)) {
+            compaction.observeRevision(threadRevision);
+        }
+    }
+
+    /** Turn 事件只携带全局唯一 Thread identity；同步推进该 Thread 压缩状态，避免快照因 revision 前进而丢失。
+     *
+     * @author kongweiguang
+     */
+    private void advanceCompactionRevision(String threadId, long threadRevision) {
+        ContextCompactionState compaction = contextCompactions.get(threadId);
+        if (compaction != null && compaction.generation == runtimeGeneration) {
+            compaction.observeRevision(threadRevision);
+        }
     }
 
     /**
-     * 将 Context Compaction 的 revision 绑定到整个 Thread；即使事件带 turnId，也不能让 queued 流停在旧水位。
+     * 在唯一事件出站边界维护压缩进度；开始、重试、成功/失败共用此状态 owner，不能从旧 revision 恢复。
+     *
+     * @author kongweiguang
      */
-    public synchronized void observeCompaction(ContextCompactionEvent.Context context) {
-        Objects.requireNonNull(context, "context");
+    public synchronized void observeCompaction(ContextCompactionEvent event) {
+        Objects.requireNonNull(event, "event");
+        ContextCompactionEvent.Context context = event.context();
         /* Thread revision 由同一 SQLite owner 共享；即使压缩带 turnId，也必须推进同 Thread queued/running。 */
         observeThreadRevision(context.workspaceId(), context.threadId(), context.threadRevision());
         if (context.turnId() != null && context.turnMutationVersion() != null) {
@@ -335,6 +387,87 @@ public final class ActiveStreamRegistry {
                 && state.generation == runtimeGeneration) {
                 state.observeDurableBoundary(context.eventId(), context.turnMutationVersion());
             }
+        }
+        ContextCompactionState current = contextCompactions.get(context.threadId());
+        if (event instanceof ContextCompactionEvent.Started) {
+            if (current == null || !current.compactionId.equals(context.compactionId())
+                    && context.threadRevision() >= current.revision) {
+                contextCompactions.put(context.threadId(), new ContextCompactionState(runtimeGeneration,
+                        context.workspaceId(), context.threadId(), context.compactionId(), context.turnId(),
+                        context.threadRevision(), 1));
+            } else if (current.compactionId.equals(context.compactionId())
+                    && Objects.equals(current.turnId, context.turnId())) {
+                current.observeRevision(context.threadRevision());
+            }
+            return;
+        }
+        if (current != null && current.compactionId.equals(context.compactionId())
+                && context.threadRevision() >= current.revision) {
+            contextCompactions.remove(context.threadId());
+        }
+    }
+
+    /**
+     * Thread/read 的 SQLite 快照可能包含没有 Turn 事件的 ProviderPending 提交；只要快照不早于压缩状态，
+     * 且同一快照证明自动压缩的 owner Turn 仍非终态，就可恢复进度。旧快照与无法确认 owner 的快照都隐藏。
+     *
+     * @author kongweiguang
+     */
+    public synchronized Optional<ContextCompactionSnapshot> contextCompaction(String threadId,
+                                                                                long snapshotRevision,
+                                                                                Set<String> nonterminalTurnIds) {
+        requireIdentifier(threadId, "thr_");
+        requireRevision(snapshotRevision);
+        Objects.requireNonNull(nonterminalTurnIds, "nonterminalTurnIds");
+        ContextCompactionState state = contextCompactions.get(threadId);
+        if (state == null || state.generation != runtimeGeneration || snapshotRevision < state.revision
+                || state.turnId != null && !nonterminalTurnIds.contains(state.turnId)) {
+            return Optional.empty();
+        }
+        return Optional.of(new ContextCompactionSnapshot(state.compactionId, state.turnId, state.retryAttempt));
+    }
+
+    /**
+     * SQLite 快照能补足终态通知丢失；只清理已被本快照覆盖的精确 owner，旧快照不能结束新压缩。
+     *
+     * @author kongweiguang
+     */
+    public synchronized void observeSnapshotTerminalTurns(String threadId, long snapshotRevision,
+                                                           Set<String> terminalTurnIds) {
+        requireIdentifier(threadId, "thr_");
+        requireRevision(snapshotRevision);
+        Objects.requireNonNull(terminalTurnIds, "terminalTurnIds");
+        ContextCompactionState state = contextCompactions.get(threadId);
+        if (state != null && state.generation == runtimeGeneration && state.turnId != null
+                && snapshotRevision >= state.revision && terminalTurnIds.contains(state.turnId)) {
+            contextCompactions.remove(threadId);
+        }
+    }
+
+    /**
+     * RetryStarted 只更新同一 Thread/Turn 当前压缩；单调 attempt 防止重复或迟到事件回拨状态。
+     *
+     * @author kongweiguang
+     */
+    private void observeCompactionRetry(TurnEvent.Context context, int attempt) {
+        ContextCompactionState state = contextCompactions.get(context.threadId());
+        if (state != null && state.generation == runtimeGeneration
+                && Objects.equals(state.turnId, context.turnId())
+                && state.revision <= context.threadRevision() && attempt > state.retryAttempt) {
+            state.observeRevision(context.threadRevision());
+            state.retryAttempt = attempt;
+        }
+    }
+
+    /**
+     * Turn 终态绑定不可复用的 turnId；结束该 Turn 时同步移除其压缩状态，避免后续快照显示旧 Spinner。
+     *
+     * @author kongweiguang
+     */
+    private void abandonCompactionForTurn(String threadId, String turnId) {
+        ContextCompactionState state = contextCompactions.get(threadId);
+        if (state != null && Objects.equals(state.turnId, turnId)) {
+            contextCompactions.remove(threadId);
         }
     }
 
@@ -401,9 +534,12 @@ public final class ActiveStreamRegistry {
 
     /**
      * 连接关闭时显式释放 registry，不能依赖 JVM 退出回收仍可能被异步 read 引用的列表。
+     *
+     * @author kongweiguang
      */
     public synchronized void clear() {
         states.clear();
+        contextCompactions.clear();
     }
 
     /**
@@ -497,6 +633,31 @@ public final class ActiveStreamRegistry {
                 throw new IllegalArgumentException("streamSeq must be non-negative");
             }
             segments = List.copyOf(Objects.requireNonNull(segments, "segments"));
+        }
+    }
+
+    /**
+     * Wire snapshot deliberately exposes only the current compaction identity and request attempt.
+     *
+     * @param compactionId active compression operation identity
+     * @param turnId owning Turn, or null for manual idle-thread compaction
+     * @param retryAttempt current summary request attempt, with the initial request numbered one
+     * @author kongweiguang
+     */
+    public record ContextCompactionSnapshot(String compactionId, String turnId, int retryAttempt) {
+        /**
+         * Wire identity and initial attempt are checked here so no caller can construct an invalid snapshot.
+         *
+         * @author kongweiguang
+         */
+        public ContextCompactionSnapshot {
+            requireIdentifier(compactionId, "cmp_");
+            if (turnId != null) {
+                requireIdentifier(turnId, "turn_");
+            }
+            if (retryAttempt < 1) {
+                throw new IllegalArgumentException("invalid context compaction attempt");
+            }
         }
     }
 
@@ -739,6 +900,42 @@ public final class ActiveStreamRegistry {
          */
         private Snapshot snapshot() {
             return new Snapshot(turnId, streamSeq, segments.stream().map(SegmentBuffer::snapshot).toList());
+        }
+    }
+
+    /** Mutable state is private to the synchronized registry and shares the Thread revision/generation fence. */
+    private static final class ContextCompactionState {
+        private final long generation;
+        private final String workspaceId;
+        private final String threadId;
+        private final String compactionId;
+        private final String turnId;
+        private long revision;
+        private int retryAttempt;
+
+        /** 初始化唯一状态 owner；revision 和 attempt 都在 registry 锁内更新，不新增恢复 IO。
+         *
+         * @author kongweiguang
+         */
+        private ContextCompactionState(long generation, String workspaceId, String threadId, String compactionId,
+                                       String turnId, long revision, int retryAttempt) {
+            this.generation = generation;
+            this.workspaceId = workspaceId;
+            this.threadId = threadId;
+            this.compactionId = compactionId;
+            this.turnId = turnId;
+            this.revision = revision;
+            this.retryAttempt = retryAttempt;
+        }
+
+        /** revision 只单调前进，使 thread/read 可按同一 SQLite revision 隐藏未对账的状态。
+         *
+         * @author kongweiguang
+         */
+        private void observeRevision(long candidate) {
+            if (candidate > revision) {
+                revision = candidate;
+            }
         }
     }
 }

@@ -2742,7 +2742,9 @@ fn attachment_result_requires_exactly_one_owner_when_bound() {
     assert!(validate_attachment_result(&conflicting_owners).is_err());
 }
 
-/// 校验平坦历史必须携带真实 Turn 归属与来源身份，并锁定附件不泄露 workspace/hash/path。
+/// 校验 thread/read 的严格字段闭集、真实 Turn 归属与可恢复压缩快照。
+///
+/// @author kongweiguang
 fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
     ensure_object_keys(
         result,
@@ -2755,6 +2757,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
             "inputQueue",
             "contextUsage",
             "liveStream",
+            "contextCompaction",
             "nextCursor",
         ],
     )?;
@@ -2816,6 +2819,7 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
         }
     }
     validate_thread_task_activities(result)?;
+    validate_context_compaction_snapshot(result.get("contextCompaction"), turns)?;
     let queue_valid = result.get("inputQueue").is_some_and(|queue| {
         queue.is_null()
             || turns.iter().any(|turn| {
@@ -2983,6 +2987,68 @@ fn validate_thread_read_result(result: &Value) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// thread/read 必须显式携带 nullable 压缩状态；非空 owner 只能关联当前快照中的活动 Turn。
+///
+/// @author kongweiguang
+fn validate_context_compaction_snapshot(
+    value: Option<&Value>,
+    turns: &[Value],
+) -> Result<(), &'static str> {
+    let value = value.ok_or("thread context compaction is missing")?;
+    if value.is_null() {
+        return Ok(());
+    }
+    ensure_object_keys(value, &["compactionId", "turnId", "retryAttempt"])?;
+    if !valid_compaction_id(value.get("compactionId"))
+        || !integer_in_bounds(value.get("retryAttempt"), 1, 9_007_199_254_740_991)
+    {
+        return Err("thread context compaction is invalid");
+    }
+    let turn_id = value
+        .get("turnId")
+        .ok_or("thread context compaction turn id is missing")?;
+    if turn_id.is_null() {
+        return Ok(());
+    }
+    let turn_id = turn_id
+        .as_str()
+        .ok_or("thread context compaction turn id is invalid")?;
+    let turn_id_value = Value::String(turn_id.to_owned());
+    if !valid_prefixed_id(Some(&turn_id_value), "turn_")
+        || !turns.iter().any(|turn| {
+            turn.get("turnId").and_then(Value::as_str) == Some(turn_id)
+                && matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("queued" | "running" | "waiting_input" | "waiting_approval" | "suspended")
+                )
+        })
+    {
+        return Err("thread context compaction owner is not active");
+    }
+    Ok(())
+}
+
+/// Match the exact JA-RPC compactionId pattern, including its 96-character suffix allowance.
+///
+/// @author kongweiguang
+fn valid_compaction_id(value: Option<&Value>) -> bool {
+    let Some(id) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(suffix) = id.strip_prefix("cmp_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 96
+        && suffix
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// 活动流是提交边界之后的公开恢复基线；序号、活动 Turn 与 UTF-8 预算必须在 Rust consumer
@@ -8254,7 +8320,9 @@ fn thread_read_tail_is_an_explicit_opt_in() {
     assert!(validate_request("thread/read", &null_tail).is_err());
 }
 
-/// Frozen history keeps explicit inherited provenance while only native turns may own live controls.
+/// Frozen history keeps explicit inherited provenance while only active turns may own compaction snapshots.
+///
+/// @author kongweiguang
 #[test]
 fn thread_read_requires_native_or_inherited_origins() {
     let result = serde_json::json!({
@@ -8285,9 +8353,51 @@ fn thread_read_requires_native_or_inherited_origins() {
         "inputQueue":null,
         "contextUsage":null,
         "liveStream":null,
+        "contextCompaction":null,
         "nextCursor":null
     });
     assert!(validate_thread_read_result(&result).is_ok());
+
+    let mut missing_compaction = result.clone();
+    missing_compaction
+        .as_object_mut()
+        .expect("result object")
+        .remove("contextCompaction");
+    assert!(validate_thread_read_result(&missing_compaction).is_err());
+
+    let mut invalid_compaction = result.clone();
+    invalid_compaction["contextCompaction"] = serde_json::json!({
+        "compactionId":"cmp_invalid",
+        "turnId":"turn_inherited",
+        "retryAttempt":0
+    });
+    assert!(validate_thread_read_result(&invalid_compaction).is_err());
+
+    let mut invalid_compaction_fields = result.clone();
+    invalid_compaction_fields["contextCompaction"] = serde_json::json!({
+        "compactionId":"cmp_invalid",
+        "turnId":null,
+        "retryAttempt":1,
+        "extra":true
+    });
+    assert!(validate_thread_read_result(&invalid_compaction_fields).is_err());
+
+    let mut terminal_owner = result.clone();
+    terminal_owner["contextCompaction"] = serde_json::json!({
+        "compactionId":"cmp_terminal",
+        "turnId":"turn_inherited",
+        "retryAttempt":1
+    });
+    assert!(validate_thread_read_result(&terminal_owner).is_err());
+
+    let mut valid_active_owner = result.clone();
+    valid_active_owner["turns"][0]["status"] = serde_json::json!("running");
+    valid_active_owner["contextCompaction"] = serde_json::json!({
+        "compactionId":"cmp_active",
+        "turnId":"turn_inherited",
+        "retryAttempt":2
+    });
+    assert!(validate_thread_read_result(&valid_active_owner).is_ok());
 
     let mut missing_turn_origin = result.clone();
     missing_turn_origin["turns"][0]

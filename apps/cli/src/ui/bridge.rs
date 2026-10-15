@@ -188,7 +188,8 @@ fn same_projection_key(left: &UiEvent, right: &UiEvent) -> bool {
         | (UiEvent::SetPermissionChoices(_), UiEvent::SetPermissionChoices(_))
         | (UiEvent::SetThreadChoices(_), UiEvent::SetThreadChoices(_))
         | (UiEvent::SetAttachments(_), UiEvent::SetAttachments(_))
-        | (UiEvent::SetNotice(_), UiEvent::SetNotice(_)) => true,
+        | (UiEvent::SetNotice(_), UiEvent::SetNotice(_))
+        | (UiEvent::SetWorkActivity(_), UiEvent::SetWorkActivity(_)) => true,
         (
             UiEvent::FinishAssistantStream { turn_id: left },
             UiEvent::FinishAssistantStream { turn_id: right },

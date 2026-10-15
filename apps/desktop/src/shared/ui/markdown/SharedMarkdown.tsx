@@ -117,7 +117,7 @@ function transformMarkdownUrl(value: string, key: string): string {
   return "";
 }
 
-/** 安全过滤前先规范显式的 Windows 盘符 Markdown 目标，否则 `C:` 会被误认为 URI scheme。 */
+/** 盘符先转为 file URI 避免被过滤；行列后缀独立保留，防止编码为文件名后失去定位语义。 */
 function remarkWindowsDriveLinks(): (tree: MarkdownAstNode) => void {
   return (tree: MarkdownAstNode): void => {
     const pending = [tree];
@@ -132,16 +132,21 @@ function remarkWindowsDriveLinks(): (tree: MarkdownAstNode) => void {
           const pathWithSeparators =
             fragmentIndex < 0 ? destination : destination.slice(0, fragmentIndex);
           const fragment = fragmentIndex < 0 ? "" : destination.slice(fragmentIndex);
+          const location = fragmentIndex < 0 ? pathWithSeparators.match(/:\d+(?::\d+)?$/u) : null;
+          const path =
+            location === null
+              ? pathWithSeparators
+              : pathWithSeparators.slice(0, -location[0].length);
           let decodedPath: string;
           try {
-            decodedPath = decodeURIComponent(pathWithSeparators);
+            decodedPath = decodeURIComponent(path);
           } catch {
-            decodedPath = pathWithSeparators;
+            decodedPath = path;
           }
           const normalizedPath = decodedPath.replace(/\\/gu, "/");
           const drive = normalizedPath.slice(0, 2);
           const components = normalizedPath.slice(3).split("/");
-          node.url = `file:///${drive}/${components.map((part) => encodeURIComponent(part)).join("/")}${fragment}`;
+          node.url = `file:///${drive}/${components.map((part) => encodeURIComponent(part)).join("/")}${location?.[0] ?? ""}${fragment}`;
         }
       }
       if (node.children !== undefined) pending.push(...node.children);
@@ -256,7 +261,7 @@ interface MarkdownFileReferenceProps {
   onCopyText?: SharedMarkdownProps["onCopyText"];
 }
 
-/** 将回复中的本地路径收口到同一受控菜单，使普通打开、预览、Explorer 和复制使用同一目标。 */
+/** 短标签通过悬停提示暴露完整目标；打开、预览、Explorer 和复制始终使用同一受控路径。 */
 function MarkdownFileReference({
   target,
   className,
@@ -318,7 +323,7 @@ function MarkdownFileReference({
         aria-label={`在 Ja 中打开路径 ${target.path}`}
         aria-description="按 Ctrl+Enter 在文件资源管理器中打开所在位置；右键可选择其他打开方式"
         aria-keyshortcuts="Control+Enter"
-        title="点击在 Ja 中打开；Ctrl+点击或 Ctrl+Enter 打开资源管理器；右键显示更多操作"
+        title={`${target.path}\n点击在 Ja 中打开；Ctrl+点击或 Ctrl+Enter 打开资源管理器；右键显示更多操作`}
         onClick={(event) => open(event.ctrlKey ? "explorer" : undefined)}
         onKeyDown={handleKeyDown}
         onContextMenu={handleContextMenu}

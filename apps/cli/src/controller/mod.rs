@@ -23,6 +23,7 @@ mod server_stop;
 mod setup;
 mod suspended_recovery;
 mod usage;
+mod work_activity;
 
 use args::Command;
 use queue_recovery::retry_command as queue_retry_command;

@@ -29,6 +29,7 @@ use super::{
         self, UsageReadIdentity, UsageState, clear_event_before_thread_switch,
         context_usage_from_history, status_lines,
     },
+    work_activity::{ContextCompactionStatus, WorkActivity},
 };
 #[path = "fork_recovery.rs"]
 pub(super) mod fork_recovery;
@@ -211,6 +212,48 @@ struct PendingClipboardRequest {
     purpose: ClipboardPurpose,
 }
 
+/// thread/read 必须给出 nullable 压缩字段；缺字段是协议错误，不能把未知状态伪装为空闲。
+fn parse_context_compaction(history: &Value) -> Result<Option<ContextCompactionStatus>, CliError> {
+    let compaction = history
+        .get("contextCompaction")
+        .ok_or_else(|| CliError::protocol("thread/read 缺少 contextCompaction"))?;
+    if compaction.is_null() {
+        return Ok(None);
+    }
+    let turn_id = match compaction.get("turnId") {
+        Some(Value::Null) => None,
+        Some(Value::String(turn_id)) => Some(turn_id.clone()),
+        _ => {
+            return Err(CliError::protocol(
+                "thread/read.contextCompaction.turnId 无效",
+            ));
+        }
+    };
+    let retry_attempt = required_u64(compaction, "retryAttempt")?;
+    if retry_attempt == 0 {
+        return Err(CliError::protocol(
+            "thread/read.contextCompaction.retryAttempt 无效",
+        ));
+    }
+    Ok(Some(ContextCompactionStatus {
+        compaction_id: required_str(compaction, "compactionId")?.to_owned(),
+        turn_id,
+        retry_attempt,
+    }))
+}
+
+/// 初始 Thread 缺省时没有发出 thread/read；只对此情况允许无快照，真实响应仍校验必需字段。
+pub(super) fn initial_context_compaction(
+    thread_read_performed: bool,
+    history: &Value,
+) -> Result<Option<ContextCompactionStatus>, CliError> {
+    if thread_read_performed {
+        parse_context_compaction(history)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Thread 只有在元数据、首屏历史和展示投影都已通过校验后才可成为当前会话。
 pub(super) struct PreparedThreadActivation {
     thread: ThreadContext,
@@ -252,6 +295,7 @@ struct Interactive {
     live_assistant_entry_id: Option<String>,
     live_reasoning_entry_id: Option<String>,
     work_activity_pending: bool,
+    work_activity: WorkActivity,
     seen_resync_notifications: ResyncNotificationDeduper,
     next_refresh: Instant,
     refresh_pending: bool,
@@ -637,6 +681,7 @@ pub fn run(
         )?,
         None => (Value::Null, Value::Null, Value::Null),
     };
+    let initial_compaction = initial_context_compaction(thread.is_some(), &history)?;
     let mut usage = UsageState::default();
     let usage_now = Instant::now();
     usage.bind_connection_generation(1, usage_now);
@@ -705,6 +750,11 @@ pub fn run(
         live_assistant_entry_id: None,
         live_reasoning_entry_id: None,
         work_activity_pending: false,
+        work_activity: {
+            let mut activity = WorkActivity::default();
+            activity.restore(initial_compaction);
+            activity
+        },
         seen_resync_notifications: ResyncNotificationDeduper::default(),
         next_refresh: Instant::now() + REFRESH_INTERVAL,
         refresh_pending: false,
@@ -747,6 +797,7 @@ pub fn run(
         .map(str::to_owned);
     session.fork_reply_cursor = fork_reply_page_cursor(&session.history);
     session.reset_stream_cursor();
+    session.publish_work_activity();
     if let Some(prompt) = initial_prompt {
         session.send(UiEvent::BeginSubmission(prompt.clone()));
         if let Err(error) =
@@ -1019,11 +1070,31 @@ impl Interactive {
             self.usage.schedule_summary_refresh(Instant::now());
             self.publish_usage();
         }
+        if method == "context/compaction-started" {
+            let turn_id = match params.get("turnId") {
+                Some(Value::Null) => None,
+                Some(Value::String(turn_id)) => Some(turn_id.clone()),
+                _ => return Err(CliError::protocol("压缩开始事件缺少有效 turnId")),
+            };
+            self.work_activity
+                .started(required_str(params, "compactionId")?.to_owned(), turn_id);
+            self.publish_work_activity();
+            return self.refresh();
+        }
+        if matches!(method, "context/compacted" | "context/compaction-failed") {
+            self.work_activity
+                .finish(required_str(params, "compactionId")?);
+            self.publish_work_activity();
+            return self.refresh();
+        }
         if method == "thread/metadata-changed" {
             return self.refresh();
         }
         if method == "turn/retry-started" {
             let turn_id = required_str(params, "turnId")?.to_owned();
+            self.work_activity
+                .retry_started(&turn_id, required_u64(params, "attempt")?);
+            self.publish_work_activity();
             self.live_assistant_entry_id = None;
             self.live_reasoning_entry_id = None;
             if !self.work_activity_pending {
@@ -1156,6 +1227,7 @@ impl Interactive {
         )?;
         let context_usage = context_usage_from_history(&history)
             .map_err(|_| CliError::protocol("thread/read.contextUsage 无效"))?;
+        let context_compaction = parse_context_compaction(&history)?;
         let revision = required_u64(&history, "revision")?;
         if deadline.is_some()
             && self
@@ -1169,6 +1241,7 @@ impl Interactive {
             thread.revision = revision;
         }
         self.history = history;
+        self.work_activity.restore(context_compaction);
         if self.older_cursor.is_none() && self.older_items.is_empty() {
             self.older_cursor = self
                 .history
@@ -1225,6 +1298,7 @@ impl Interactive {
             .collect();
         self.fork_reply_base_choices = fork_reply_choices(&merged_history)?;
         self.send(UiEvent::ReplaceSnapshot(Box::new(snapshot)));
+        self.publish_work_activity();
         self.send(UiEvent::SetForkReplyPage {
             choices: combined_fork_reply_choices(
                 &self.fork_reply_older_choices,
@@ -1488,6 +1562,11 @@ impl Interactive {
     /// 提示只说明已知事实，不把 Tool 原始输出或配置 secret 放入状态行。
     fn notice(&self, message: String) {
         self.send(UiEvent::SetNotice(Some(message)));
+    }
+
+    /// 把同一 Thread 的压缩阶段送入活动状态行，普通 notice 继续保留其原有优先级。
+    fn publish_work_activity(&self) {
+        self.send(UiEvent::SetWorkActivity(self.work_activity.status_text()));
     }
 
     /// 用独立、堆分配的 Usage 事件更新 Thread，避免膨胀事件队列或替换 Composer/Timeline。
@@ -2422,6 +2501,8 @@ impl Interactive {
             mut snapshot,
             fork_reply_choices,
         } = prepared;
+        self.work_activity
+            .restore(parse_context_compaction(&history)?);
         if previous_thread_id.as_deref() != Some(thread_id.as_str()) {
             self.cancel_pending_reads();
         }
@@ -2473,6 +2554,7 @@ impl Interactive {
         snapshot.has_older_history = self.older_cursor.is_some();
         self.stabilize_interaction_key(&mut snapshot);
         self.send(UiEvent::ReplaceSnapshot(Box::new(snapshot)));
+        self.publish_work_activity();
         self.send(UiEvent::SetForkReplyPage {
             choices: self.fork_reply_base_choices.clone(),
             next_cursor: self.fork_reply_cursor.clone(),

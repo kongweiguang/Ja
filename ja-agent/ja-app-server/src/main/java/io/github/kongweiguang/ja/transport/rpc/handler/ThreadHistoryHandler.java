@@ -449,6 +449,8 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
 
     /**
      * 逐步缩小权威 keyset 页面直至放入 RPC 单帧；只改变页大小，不丢失条目或伪造游标。
+     *
+     * @author kongweiguang
      */
     private ObjectNode read(ObjectNode params) {
         RpcParams.requireOnly(params, "threadId", "cursor", "limit", "tail");
@@ -463,6 +465,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
             ObjectNode result = readPage(threadId, cursor, pageLimit, tail);
             trimLiveStreamForFrameBudget(result);
             ThreadReadContract.requireValidLiveStream(result);
+            ThreadReadContract.requireValidContextCompaction(result);
             if (serializedBytes(result) <= THREAD_READ_FRAME_BUDGET) {
                 return result;
             }
@@ -475,10 +478,22 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
 
     /**
      * 缩页重读时重新取得完整事务版本；不能直接截掉已投影数组尾部并沿用旧游标。
+     *
+     * @author kongweiguang
      */
     private ObjectNode readPage(String threadId, String cursor, int limit, boolean tail) {
         ConsistentRead consistent = readConsistent(threadId, cursor, limit, tail);
         ThreadSnapshot snapshot = consistent.snapshot();
+        var nativeTurns = snapshot.turns().stream()
+                .filter(turn -> turn.origin() == ThreadSnapshot.Origin.NATIVE)
+                .toList();
+        Set<String> terminalTurnIds = nativeTurns.stream()
+                .filter(turn -> TurnState.valueOf(turn.status().toUpperCase(Locale.ROOT)).terminal())
+                .map(ThreadSnapshot.Turn::turnId).collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Set<String> nonterminalTurnIds = nativeTurns.stream()
+                .filter(turn -> !TurnState.valueOf(turn.status().toUpperCase(Locale.ROOT)).terminal())
+                .map(ThreadSnapshot.Turn::turnId).collect(java.util.stream.Collectors.toUnmodifiableSet());
+        session.activeStreams().observeSnapshotTerminalTurns(threadId, snapshot.thread().revision(), terminalTurnIds);
         ObjectNode result = session.mapper().createObjectNode()
                 .put("threadId", snapshot.thread().threadId())
                 .put("revision", snapshot.thread().revision());
@@ -500,6 +515,23 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
         }
         else {
             result.set("contextUsage", RpcResults.contextUsage(session.mapper(), snapshot.contextUsage()));
+        }
+        Optional<ActiveStreamRegistry.ContextCompactionSnapshot> compaction =
+                session.activeStreams().contextCompaction(threadId, snapshot.thread().revision(), nonterminalTurnIds);
+        if (compaction.isEmpty()) {
+            result.putNull("contextCompaction");
+        }
+        else {
+            ActiveStreamRegistry.ContextCompactionSnapshot state = compaction.orElseThrow();
+            ObjectNode projected = result.putObject("contextCompaction")
+                    .put("compactionId", state.compactionId())
+                    .put("retryAttempt", state.retryAttempt());
+            if (state.turnId() == null) {
+                projected.putNull("turnId");
+            }
+            else {
+                projected.put("turnId", state.turnId());
+            }
         }
         if (snapshot.inputQueue() == null) {
             result.putNull("inputQueue");
@@ -598,7 +630,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
                     .map(ThreadSnapshot.Turn::turnId).collect(java.util.stream.Collectors.toUnmodifiableSet());
             if (activeTurnIds.isEmpty()) {
                 /* 持久快照已确认没有活动 Turn；即使终态通知丢失，也必须释放 registry 临时草稿。 */
-                streams.abandonThread(threadId);
+                streams.abandonStreams(threadId);
                 return new ConsistentRead(snapshot, Optional.empty());
             }
             Map<String, Long> persistedMutationVersions = snapshot.turns().stream()

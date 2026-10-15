@@ -325,7 +325,10 @@ async function selectSessionThread(
   return screen.getByRole("button", { name: title }) as HTMLButtonElement;
 }
 
-/** 组合测试只模拟 App Server 权威查询；读取响应的 identity 必须沿用请求，才能真实切换 Thread。 */
+/**
+ * @author kongweiguang
+ * 组合测试只模拟 App Server 权威查询；读取响应的 identity 必须沿用请求，才能真实切换 Thread。
+ */
 function history(): HistoryAdapter {
   return {
     itemContentRead: vi.fn(async ({ itemId, offsetCharacters }) => ({
@@ -358,6 +361,7 @@ function history(): HistoryAdapter {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     })),
     threadCompact: vi.fn(async (input) => ({
@@ -747,7 +751,10 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(screen.queryByRole("button", { name: "重新连接" })).not.toBeInTheDocument();
   });
 
-  /** 空白 session catalog 保持无 owner；“新会话”必须先创建再激活目录，之后才开放 Composer。 */
+  /**
+   * @author kongweiguang
+   * 空白 session catalog 保持无 owner；“新会话”必须先创建再激活目录，之后才开放 Composer。
+   */
   it("creates and activates a session before enabling the first Composer", async () => {
     const user = userEvent.setup();
     const events: string[] = [];
@@ -782,6 +789,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
         contextUsage: null,
         taskActivities: [],
         liveStream: null,
+        contextCompaction: null,
         nextCursor: null,
       };
     });
@@ -856,6 +864,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   });
 
   /**
+   * @author kongweiguang
    * 项目提示属于可见 Workspace owner；本用例串联多 Thread 切换、隐藏与恢复、项目编辑及失败重试，
    * 20 秒覆盖累计 jsdom 开销，不代表产品单步 deadline；Sonner 的退出动画保留 DOM 200ms，Portal 断言只计活动通知。
    * @author kongweiguang
@@ -925,6 +934,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     }));
     // 显式复核经过真实项目资源事务；空资源的 native 回收 ACK 由 fixture 提供，不跳过清理边界。
@@ -1315,6 +1325,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
   });
 
   /**
+   * @author kongweiguang
    * 完整 App composition 通过真实 Runtime event 产生 stream gap，再让 controller 发起挂起的
    * thread/read；后台恢复期间既有历史行、新会话入口和 Composer 都必须保持稳定，且完成快照
    * 后不得由 recovered-Turn timer 再次读取。该测试不直接改 Navigation props，避免 browser fixture
@@ -1343,6 +1354,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     });
     const completedSnapshot = () => ({
@@ -1463,7 +1475,10 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(threadReadMock.mock.calls.length).toBe(readCountAfterTerminal);
   });
 
-  /** 后台恢复仍会自动重试，完整 App 应用中用状态提示而不是错误警报打断用户。 */
+  /**
+   * @author kongweiguang
+   * 后台恢复仍会自动重试，完整 App 应用中用状态提示而不是错误警报打断用户。
+   */
   it("shows an automatic background recovery status without blocking the current composer", async () => {
     const user = userEvent.setup();
     const runtimeHarness = runtimeWithEvents();
@@ -1487,6 +1502,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     historyAdapter.threadList = vi.fn(async () => ({
@@ -1668,7 +1684,10 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
     expect(searchInput).toHaveFocus();
   });
 
-  /** Runtime 未 ready 时目录动作不能成为可点击 no-op；完成同一启动后自动恢复，不需要重启页面。 */
+  /**
+   * @author kongweiguang
+   * Runtime 未 ready 时目录动作不能成为可点击 no-op；完成同一启动后自动恢复，不需要重启页面。
+   */
   it("waits for startup admission before enabling project actions", async () => {
     const runtimePort = runtime();
     const start = runtimePort.start;
@@ -1818,6 +1837,7 @@ describe("Ja desktop shell v1", { timeout: 10_000 }, () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     }));
     const settingsAdapter = settings(configuredDocument);

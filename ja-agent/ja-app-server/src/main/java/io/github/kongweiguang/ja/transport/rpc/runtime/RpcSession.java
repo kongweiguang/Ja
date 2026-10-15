@@ -950,10 +950,47 @@ public final class RpcSession implements AutoCloseable {
                 return false;
             }
 
+            /**
+             * 自动压缩只可借用 admission 已登记的连接身份；Thread 校验阻止以相同 Turn ID 跨线程解析。
+             *
+             * @author kongweiguang
+             */
+            @Override
+            public java.util.Optional<String> workspaceId(AgentIdentity identity) {
+                Objects.requireNonNull(identity, "identity");
+                if (closing.get()) {
+                    return java.util.Optional.empty();
+                }
+                TurnNotificationContext context = turnNotificationContexts.get(identity.turnId());
+                if (context == null || !context.threadId().equals(identity.threadId())) {
+                    return java.util.Optional.empty();
+                }
+                return java.util.Optional.of(context.workspaceId());
+            }
+
             /** 连接或关联已关闭时不把后台执行失败升级为 Plan run 失败。 */
             @Override
             public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
                 if (closing.get() || !turnNotificationContexts.containsKey(eventTurnId(event))) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return RpcSession.this.publish(event);
+            }
+
+            /**
+             * 压缩事件只允许通过仍存活且身份匹配的 Plan Turn 路由发布，复用 Thread 事件的权威快照水位。
+             *
+             * @author kongweiguang
+             */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(ContextCompactionEvent event) {
+                Objects.requireNonNull(event, "event");
+                ContextCompactionEvent.Context identity = event.context();
+                TurnNotificationContext registered = identity.turnId() == null
+                        ? null : turnNotificationContexts.get(identity.turnId());
+                if (closing.get() || registered == null
+                    || !registered.workspaceId().equals(identity.workspaceId())
+                    || !registered.threadId().equals(identity.threadId())) {
                     return CompletableFuture.completedFuture(null);
                 }
                 return RpcSession.this.publish(event);
@@ -1172,6 +1209,10 @@ public final class RpcSession implements AutoCloseable {
     /**
      * 发布 Thread 级压缩生命周期；事件自带 Workspace/Thread 身份，不依赖活动 Turn registry，
      * 因而手动空闲压缩与自动 Turn 压缩使用完全相同的 wire 路径。
+     * registry 同时保存只读恢复状态；thread/read 只在快照 revision 不早于该阶段且同一活动 Turn
+     * 或手动 Thread 压缩仍有效时暴露它。
+     *
+     * @author kongweiguang
      */
     public CompletableFuture<Void> publish(ContextCompactionEvent event) {
         try {
@@ -1180,7 +1221,7 @@ public final class RpcSession implements AutoCloseable {
             ObjectNode params = wire.params();
             params.put("generation", runtimeGeneration);
             /* 压缩也是 Thread revision 提交边界，活动流必须随同一版本前进。 */
-            activeStreams.observeCompaction(event.context());
+            activeStreams.observeCompaction(event);
             return watchProjection(writer.notification(wire.method(), params));
         } catch (Throwable failure) {
             failProjection(failure);
@@ -1279,6 +1320,19 @@ public final class RpcSession implements AutoCloseable {
             @Override
             public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
                 return RpcSession.this.publish(event);
+            }
+
+            /** 压缩 durable fact 只携带 Thread/Turn；workspace 由本连接已注册的 admission 身份补齐。
+             * @author kongweiguang
+             */
+            @Override
+            public java.util.Optional<String> workspaceId(AgentIdentity identity) {
+                Objects.requireNonNull(identity, "identity");
+                TurnNotificationContext context = turnNotificationContexts.get(identity.turnId());
+                if (context == null || !context.threadId().equals(identity.threadId())) {
+                    return java.util.Optional.empty();
+                }
+                return java.util.Optional.of(context.workspaceId());
             }
 
             /** 投影错误只触发权威读取提示，不伪造 durable Turn 终态。 */

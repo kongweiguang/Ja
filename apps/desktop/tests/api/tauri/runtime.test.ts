@@ -578,7 +578,7 @@ describe("RuntimeHost v1 typed adapter", () => {
     expect(localStorage.getItem("ja.pending-operations.v1")).toBe("[]");
   });
 
-  /** 自动查询持久回执仍属于原请求结算；短暂丢 ACK 后成功收敛不能先闪未知警告。 */
+  /** 自动查询持久回执仍属于原请求结算；快照明确无活动压缩才能按 revision 核实提交。 */
   it("自动回查确认已提交的请求保持静默并清除日志", async () => {
     let resolveReceipt!: (value: unknown) => void;
     const receipt = new Promise<unknown>((resolve) => {
@@ -597,6 +597,7 @@ describe("RuntimeHost v1 typed adapter", () => {
           inputQueue: null,
           contextUsage: null,
           liveStream: null,
+          contextCompaction: null,
           nextCursor: null,
         };
       throw new Error("unexpected invoke");
@@ -660,6 +661,7 @@ describe("RuntimeHost v1 typed adapter", () => {
     ).toHaveLength(1);
   });
 
+  /** required nullable contextCompaction 明确无活动压缩，保持这条回执对账快照完整。 @author kongweiguang */
   it("已提交回执经权威 Thread revision 对账后清除重载残留", async () => {
     const operationId = "op_0123456789abcdef0123456789abcdef";
     localStorage.setItem(
@@ -696,6 +698,7 @@ describe("RuntimeHost v1 typed adapter", () => {
           inputQueue: null,
           contextUsage: null,
           liveStream: null,
+          contextCompaction: null,
           nextCursor: null,
         };
       return readyStatus;
@@ -1262,7 +1265,7 @@ describe("RuntimeHost v1 typed adapter", () => {
     }
   });
 
-  /** 真实 History adapter 必须接收两种完整快照 Usage，确保首启事件与重启查询共享同一当前词汇。 */
+  /** History adapter 的已知/未知 Usage 快照均显式无活动压缩，覆盖完整 thread/read 契约。 */
   it("reads complete known and unknown Usage through the production history adapter", async () => {
     const snapshot = {
       threadId: "thr_fixture",
@@ -1285,6 +1288,7 @@ describe("RuntimeHost v1 typed adapter", () => {
       inputQueue: null,
       contextUsage: { ...knownUsage, turnId: "turn_fixture", contextEstimate: null },
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     const invoke = vi

@@ -421,6 +421,70 @@ fn cancellation_lock_releases_on_authoritative_terminal_snapshot() {
     );
 }
 
+/// 压缩重试在窄列优先显示阶段和序号；普通 notice 不遮住底栏取消键，Thread 切换清理旧状态。
+#[test]
+fn work_activity_shows_compaction_and_retry_without_stale_thread_state() {
+    let mut state = UiState::new(UiSnapshot {
+        thread_id: Some("thr_compaction_a".into()),
+        turn_state: TurnState::Working,
+        turn_started_at: Some(SystemTime::now() - Duration::from_secs(30)),
+        notice: Some("保留的操作反馈".into()),
+        ..UiSnapshot::default()
+    });
+    state.apply(UiEvent::SetWorkActivity(Some("正在压缩上下文".into())));
+    let compacting = screen_text(&state, 96, 24).replace(' ', "");
+    assert!(
+        compacting.contains("正在工作·正在压缩上下文"),
+        "{compacting}"
+    );
+    assert!(compacting.contains("保留的操作反馈"), "{compacting}");
+
+    state.apply(UiEvent::SetWorkActivity(Some(
+        "摘要重试 · 第 2 次请求".into(),
+    )));
+    let retrying = screen_text(&state, 96, 24).replace(' ', "");
+    assert!(retrying.contains("摘要重试·第2次请求"), "{retrying}");
+    assert!(retrying.contains("正在工作"), "{retrying}");
+
+    for width in [32, 40, 80] {
+        let rows = screen_rows(&state, width, 18);
+        let work_rows = rows
+            .iter()
+            .filter(|row| row.replace(' ', "").contains("正在工作"))
+            .collect::<Vec<_>>();
+        assert_eq!(work_rows.len(), 1, "width={width}: {rows:?}");
+        let status = work_rows[0].replace(' ', "");
+        assert!(status.contains("摘要重试"), "width={width}: {status}");
+        assert!(
+            UnicodeWidthStr::width(status.as_str()) <= width as usize,
+            "width={width}: {status}"
+        );
+        let screen = rows.join("").replace(' ', "");
+        assert!(screen.contains("Esc中断"), "底栏应保留取消提示: {rows:?}");
+        if width == 40 || width == 80 {
+            assert!(status.contains("摘要重试·第2次请求"), "{status}");
+        }
+        if width == 32 || width == 40 {
+            assert!(
+                !status.contains("Esc中断"),
+                "窄屏省略重复行内提示: {status}"
+            );
+        } else {
+            assert!(status.contains("Esc中断"), "宽屏保留行内提示: {status}");
+            assert!(status.contains("30秒"), "宽屏保留工作用时: {status}");
+        }
+    }
+
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(UiSnapshot {
+        thread_id: Some("thr_compaction_b".into()),
+        turn_state: TurnState::Working,
+        ..UiSnapshot::default()
+    })));
+    let switched = screen_text(&state, 96, 24).replace(' ', "");
+    assert!(!switched.contains("压缩上下文"), "{switched}");
+    assert!(switched.contains("正在工作"), "{switched}");
+}
+
 /// 取消失败保留可操作提示及真实工作状态；自动快照不盖掉错误，用户可先核查再显式重试。
 #[test]
 fn failed_cancellation_preserves_work_and_allows_explicit_retry() {

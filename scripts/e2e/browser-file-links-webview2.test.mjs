@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import {
   buildAssistantFileReply,
   canonicalFileDocumentPath,
@@ -50,7 +51,7 @@ function validReport() {
       missingPathCtrlClickReachedNativeExplorerCommand: true,
       missingPathCtrlClickKeptPanelHidden: true,
       missingPathCtrlEnterReachedNativeExplorerCommand: true,
-      duplicateExplorerChoiceDisplayed: true,
+      duplicateTargetsOpenedWithoutChoice: true,
       directoryOrdinaryClickSelectedInFiles: true,
       directoryClickNoBrowserTabCreated: true,
       explorerDirectoryOpened: false,
@@ -158,7 +159,7 @@ function validReport() {
     },
     textViewer: {
       workspaceFileOpened: true,
-      duplicateBasenameDisambiguated: true,
+      duplicateAbsoluteTargetOpened: true,
       sourceEditorFocused: true,
       workspaceFileReadOnly: false,
       externalFileReadOnly: true,
@@ -208,7 +209,7 @@ async function withTemporaryWorkspace(operation) {
   }
 }
 
-/** 验证回复里可见的项目目录在磁盘真实存在，且 Unicode/相对媒体 fixture 不逸出隔离根。 */
+/** 语料必须覆盖真实目录及两种绝对目标；盘符的定位后缀独立于含空格的文件名。 */
 test("workspace fixture covers Unicode paths, relative assets, and workspace-external read-only text", async () => {
   await withTemporaryWorkspace(async (root) => {
     const workspace = join(root, "workspace");
@@ -251,6 +252,14 @@ test("workspace fixture covers Unicode paths, relative assets, and workspace-ext
     assert.match(reply, /视频 demo\.mp4/u);
     assert.match(reply, /外部 只读说明\.txt/u);
     assert.match(reply, /重复 名称\.txt/u);
+    assert.ok(
+      reply.includes(`[重复 名称.txt](<${fixture.duplicateAPath.replaceAll("\\", "/")}:2:3>)`),
+    );
+    assert.ok(reply.includes(`[重复 名称.txt](${pathToFileURL(fixture.duplicateBPath).href})`));
+    assert.match(
+      await readFile(fixture.duplicateRootPath, "utf8"),
+      /JA_BROWSER_FILE_DUPLICATE_ROOT/u,
+    );
     assert.match(duplicateA, /JA_BROWSER_FILE_DUPLICATE_A/u);
     assert.match(duplicateB, /JA_BROWSER_FILE_DUPLICATE_B/u);
   });
@@ -319,6 +328,16 @@ test("WebView2 result validator rejects partial skeletons and missing native cle
   const report = validReport();
   assert.equal(validateBrowserFileLinksReport(report), report);
   report.threadScope.closedNativeResourcesAcknowledged = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+});
+
+/** 同名文件必须由真实绝对目标区分，不接受恢复旧选择器的报告。 */
+test("file targets require exact duplicate paths without a chooser", () => {
+  const report = validReport();
+  report.assistantTurn.duplicateTargetsOpenedWithoutChoice = false;
+  assert.throws(() => validateBrowserFileLinksReport(report));
+  report.assistantTurn.duplicateTargetsOpenedWithoutChoice = true;
+  report.textViewer.duplicateAbsoluteTargetOpened = false;
   assert.throws(() => validateBrowserFileLinksReport(report));
 });
 

@@ -134,7 +134,7 @@ final class HttpSummaryModelAdmissionTest {
         ModelPort.ModelConfiguration configuration = ModelAdapterTestSupport.configuration(
                 server.baseUri(), ModelPort.Api.OPENAI_RESPONSES, Duration.ofSeconds(5));
         return new HttpSummaryModel(new SummaryModel.TurnBinding("thread_summary", configuration,
-                NOW.plusSeconds(30), cancellation), transport, clock);
+                Optional.of(NOW.plusSeconds(30)), cancellation), transport, clock);
     }
 
     /** 提示只包含最小有效证据，故障验证聚焦准入而非内容格式。 */

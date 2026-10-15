@@ -8,6 +8,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSummary;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnSummary;
+import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
+import io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.model.UserInputHistory;
@@ -31,6 +33,7 @@ import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import io.github.kongweiguang.ja.plan.application.api.PlanExecutionEventSink;
 import io.github.kongweiguang.ja.plan.application.api.PlanUseCase;
 import io.github.kongweiguang.ja.collaboration.application.api.TaskUseCase;
+import io.github.kongweiguang.ja.plan.infrastructure.acl.PlanTaskAcl;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcCommand;
 import io.github.kongweiguang.ja.transport.rpc.protocol.JaErrorCatalog;
@@ -315,6 +318,44 @@ final class ThreadHistoryLiveStreamTest {
 
             assertEquals(JaErrorCatalog.TURN_NOT_RESUMABLE.name(), wrongThread.errorCode());
             assertEquals(JaErrorCatalog.TURN_NOT_RESUMABLE.name(), wrongWorkspace.errorCode());
+        }
+    }
+
+    /**
+     * Plan 的真实 RPC adapter 必须保留登记的 Workspace 解析器，让压缩通知和 thread/read 恢复共享同一身份。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void routesPlanCompactionThroughRegisteredWorkspaceAndReadSnapshot() throws Exception {
+        try (Harness harness = new Harness(List.of(turn("turn_plan_compaction", "running")))) {
+            PlanExecutionEventSink downstream = harness.session.planExecutionEvents();
+            assertTrue(downstream.registerTurn("turn_plan_compaction", "ws_live", "thr_live", 4));
+            TaskUseCase tasks = (TaskUseCase) Proxy.newProxyInstance(TaskUseCase.class.getClassLoader(),
+                    new Class<?>[]{TaskUseCase.class}, (ignored, method, arguments) -> {
+                        if ("projectContinuationEvents".equals(method.getName())) {
+                            return arguments[1];
+                        }
+                        throw unsupported();
+                    });
+            ConversationTurnEventSink sink = new PlanTaskAcl(tasks)
+                    .projectContinuationEvents("thr_live", downstream, true);
+            AgentIdentity identity = new AgentIdentity("ja.local", "thr_live", "turn_plan_compaction", "user_local");
+
+            assertEquals(Optional.of("ws_live"), sink.workspaceId(identity));
+            ContextCompactionEvent.Context context = new ContextCompactionEvent.Context(
+                    "evt_plan_compaction_started", "ws_live", "thr_live", "turn_plan_compaction", 4, NOW,
+                    "cmp_plan_compaction", ContextCompactionEvent.Trigger.AUTOMATIC, 3, 1_200L, null,
+                    ContextCompactionEvent.STRATEGY_VERSION, 1L);
+            sink.publish(new ContextCompactionEvent.Started(context)).toCompletableFuture().join();
+
+            ObjectNode snapshot = harness.read();
+            assertEquals("cmp_plan_compaction", snapshot.path("contextCompaction").path("compactionId").asText());
+            assertEquals("turn_plan_compaction", snapshot.path("contextCompaction").path("turnId").asText());
+            ObjectNode notification = (ObjectNode) MAPPER.readTree(harness.output.toString(StandardCharsets.UTF_8)
+                    .lines().filter(line -> line.contains("context/compaction-started")).findFirst().orElseThrow());
+            assertEquals("ws_live", notification.path("params").path("workspaceId").asText());
+            assertEquals("thr_live", notification.path("params").path("threadId").asText());
         }
     }
 

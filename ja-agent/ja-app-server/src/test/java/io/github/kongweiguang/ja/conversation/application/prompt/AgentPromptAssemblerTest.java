@@ -21,7 +21,7 @@ final class AgentPromptAssemblerTest {
     @Test
     void freezesMinimalPersonaGolden() {
         assertFalse(AgentPromptAssembler.SYSTEM_PROMPT.endsWith("\n"));
-        assertEquals("cdaaec9fe2c6c7efb73d1a0fcbd14587e89e24e9c92a5385722f678e8e4f0802",
+        assertEquals("36340a8df8cecf02e5f564e0a56755947dceb1e943f4ffa70ea00b9bd7e707d1",
                 sha256(AgentPromptAssembler.SYSTEM_PROMPT));
         assertTrue(AgentPromptAssembler.SYSTEM_PROMPT.contains(
                 "Before finishing an execution request, compare the result with the user's actual request"));
@@ -40,15 +40,20 @@ final class AgentPromptAssemblerTest {
         assertFalse(prompt.contains("within the available budget"));
     }
 
-    /** 主聊和侧聊共用此 Persona；固定简短链接约束，避免各入口分叉或要求每次列出文件。 */
+    /** 主聊和侧聊共用绝对链接目标与简短标签；禁止按文件名猜路径，不要求每次列出文件。 */
     @Test
     void guidesKnownFileLinksWithoutAddingRoutineInventories() {
         String prompt = AgentPromptAssembler.SYSTEM_PROMPT;
 
-        assertTrue(prompt.contains("link each verified path in ordinary prose and never invent paths"));
-        assertTrue(prompt.contains("Prefer workspace-relative links; include only verified line numbers"));
-        assertTrue(prompt.contains("[src/file.ts:12](src/file.ts#L12) or #L12C3"));
-        assertTrue(prompt.contains("For absolute paths, use valid file:// links"));
+        assertTrue(prompt.contains("link each verified target in ordinary prose and never invent paths"));
+        assertTrue(prompt.contains("Use absolute paths in link destinations, including workspace files"));
+        assertTrue(prompt.contains("labels may stay short"));
+        assertTrue(prompt.contains("Resolve known relative paths against the current working directory"));
+        assertTrue(prompt.contains("never by basename search or guessing"));
+        assertTrue(prompt.contains("Include only verified 1-based line/column locations"));
+        assertTrue(prompt.contains("[src/file.ts:12](file:///C:/repo/src/file.ts#L12) or #L12C3"));
+        assertTrue(prompt.contains("Use valid file:// links"));
+        assertFalse(prompt.contains("Prefer workspace-relative links"));
         assertTrue(prompt.contains("URL-encode spaces and non-ASCII characters in targets"));
         assertTrue(prompt.contains("do not add a file list just to show links"));
     }

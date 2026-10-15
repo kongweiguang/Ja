@@ -7,11 +7,24 @@ import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Ja Turn 边界同时发布通用执行事件和 Ja 专属 Thread 元数据，不把宿主事件塞回可复用 core。
  */
 public interface ConversationTurnEventSink extends TurnEventSink, ThreadMetadataEventSink {
+    /**
+     * Resolve the already registered workspace for an admitted Turn so durable compaction facts can reuse the
+     * existing Thread event contract without inventing workspace ownership in the Agent Store event.
+     *
+     * @author kongweiguang
+     */
+    default Optional<String> workspaceId(AgentIdentity identity) {
+        java.util.Objects.requireNonNull(identity, "identity");
+        return Optional.empty();
+    }
+
     /**
      * 在真实 Engine admission 已提交、执行尚未调度时同步推进通知基线；非 RPC sink 无需维护该观察状态。
      */
@@ -39,11 +52,37 @@ public interface ConversationTurnEventSink extends TurnEventSink, ThreadMetadata
     }
 
     /**
-     * 明确把仅有 Turn 路由的内部接缝提升为 Ja 组合类型；元数据仍按旧 core no-op 语义处理。
+     * 明确把仅有 Turn 路由的内部接缝提升为 Ja 组合类型；可识别的 Ja sink 继续提供其工作区解析器，
+     * 普通 core sink 则保持空解析器语义。
+     *
+     * @author kongweiguang
      */
     static ConversationTurnEventSink turnEventsOnly(TurnEventSink turnEvents) {
         java.util.Objects.requireNonNull(turnEvents, "turnEvents");
+        return turnEventsOnly(turnEvents, identity -> turnEvents instanceof ConversationTurnEventSink conversation
+                ? conversation.workspaceId(identity) : Optional.empty());
+    }
+
+    /**
+     * 为包装器保留独立于 Turn 发布函数的已登记 Workspace 解析能力；适配器不能凭方法引用反推原 owner。
+     *
+     * @author kongweiguang
+     */
+    static ConversationTurnEventSink turnEventsOnly(TurnEventSink turnEvents,
+                                                     Function<AgentIdentity, Optional<String>> workspaceResolver) {
+        java.util.Objects.requireNonNull(turnEvents, "turnEvents");
+        java.util.Objects.requireNonNull(workspaceResolver, "workspaceResolver");
         return new ConversationTurnEventSink() {
+            /**
+             * 保留原 owner 的 workspace 查询，避免压缩生命周期因包装成函数而失去连接级身份。
+             *
+             * @author kongweiguang
+             */
+            @Override
+            public Optional<String> workspaceId(AgentIdentity identity) {
+                return workspaceResolver.apply(java.util.Objects.requireNonNull(identity, "identity"));
+            }
+
             /** 保留 core Turn 事件的真实发布阶段，调用方仍可等待 sink 的异步失败。 */
             @Override
             public CompletionStage<Void> publish(TurnEvent event) {

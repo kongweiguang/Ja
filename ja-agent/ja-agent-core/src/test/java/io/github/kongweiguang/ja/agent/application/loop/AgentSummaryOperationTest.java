@@ -110,7 +110,7 @@ final class AgentSummaryOperationTest {
                 host.lastWrites.getFirst().recordId());
     }
 
-    /** 可恢复故障记录 UNKNOWN 用量事实，回到已保存摘要阶段并占用原请求 ordinal。 */
+    /** 可恢复故障将 UNKNOWN 用量与重试状态同事务提交，客户端不能只看到仍在工作的旧 Tool。 */
     @Test
     void retryCommitsUnknownUsageAndReleasesPendingCursor() {
         TestHost host = new TestHost(ready(TurnExecutionState.Next.ASSISTANT, null));
@@ -119,7 +119,7 @@ final class AgentSummaryOperationTest {
         operation.begin(PROMPT, Optional.of(profile()));
         String modelRequestId = assertInstanceOf(TurnExecutionState.ProviderPending.class, host.cursor()).modelRequestId();
 
-        operation.retry();
+        operation.retry(3, 8_000, "MODEL_IDLE_TIMEOUT");
 
         TurnExecutionState.Ready ready = assertInstanceOf(TurnExecutionState.Ready.class, host.cursor());
         assertEquals(TurnExecutionState.Next.SUMMARY, ready.next());
@@ -128,6 +128,12 @@ final class AgentSummaryOperationTest {
         assertEquals(modelRequestId, usage.modelRequestId());
         assertEquals(ExecutionFacts.UsageCertainty.UNKNOWN, usage.certainty());
         assertNull(usage.usage());
+        ExecutionEvent.RetryScheduled retry = assertInstanceOf(
+                ExecutionEvent.RetryScheduled.class, host.lastEvents.getFirst());
+        assertEquals(modelRequestId, retry.modelRequestId());
+        assertEquals(3, retry.attempt());
+        assertEquals(8_000, retry.delayMillis());
+        assertEquals("MODEL_IDLE_TIMEOUT", retry.reasonCode());
     }
 
     /** FAILED 子阶段原样恢复并阻止生成另一候选，完成 checkpoint 只接受候选态。 */
@@ -282,6 +288,7 @@ final class AgentSummaryOperationTest {
         private TurnExecutionState cursor;
         private AgentLoopPersistence.Restored restored;
         private List<AgentStore.RecordWrite> lastWrites = List.of();
+        private List<ExecutionEvent> lastEvents = List.of();
         private int commitCount;
         private int dispatchAuthorityChecks;
 
@@ -304,6 +311,7 @@ final class AgentSummaryOperationTest {
             assertEquals(TurnState.RUNNING, target);
             cursor = next;
             lastWrites = List.copyOf(records);
+            lastEvents = List.copyOf(events);
             commitCount++;
             long revision = restored.conversation().revision() + 1;
             long mutation = restored.execution().mutationVersion() + 1;

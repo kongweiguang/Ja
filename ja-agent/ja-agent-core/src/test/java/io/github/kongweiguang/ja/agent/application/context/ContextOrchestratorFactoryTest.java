@@ -63,7 +63,7 @@ final class ContextOrchestratorFactoryTest {
         ManualToken token = new ManualToken();
         ModelPort.ModelConfiguration configuration = configuration();
         SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                "thread-1", configuration, NOW.plusSeconds(30), token);
+                "thread-1", configuration, Optional.of(NOW.plusSeconds(30)), token);
         AtomicReference<SummaryModel.TurnBinding> observedBinding = new AtomicReference<>();
         AtomicReference<SummaryModel.SummaryPrompt> observedPrompt = new AtomicReference<>();
         CheckpointUsage usage = new CheckpointUsage(80, 20, 100, 5, 0);
@@ -86,7 +86,7 @@ final class ContextOrchestratorFactoryTest {
         org.junit.jupiter.api.Assertions.assertNotSame(binding, observedBinding.get());
         assertSame(configuration, observedBinding.get().configuration());
         assertSame(token, observedBinding.get().cancellationToken());
-        assertEquals(NOW.plusSeconds(30), observedBinding.get().deadline());
+        assertEquals(Optional.of(NOW.plusSeconds(30)), observedBinding.get().deadline());
         assertEquals(ModelSummaryGenerator.PROMPT_VERSION, observedPrompt.get().promptVersion());
         CheckpointStore.ContextCheckpoint checkpoint = execution.checkpoint().orElseThrow();
         assertEquals("ok", execution.result());
@@ -111,7 +111,7 @@ final class ContextOrchestratorFactoryTest {
             return summaryModel(prompt -> new SummaryModel.Result(summary(), CheckpointUsage.none()));
         });
         SummaryModel.TurnBinding expired = new SummaryModel.TurnBinding(
-                "thread-1", configuration(), NOW, new ManualToken());
+                "thread-1", configuration(), Optional.of(NOW), new ManualToken());
 
         ContextException failure = assertThrows(ContextException.class, () -> factory.create(
                 "thread-1", runtime(expired), testOperation()).execute(
@@ -133,7 +133,7 @@ final class ContextOrchestratorFactoryTest {
         ManualToken token = new ManualToken();
         AtomicBoolean invoked = new AtomicBoolean();
         SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                "thread-1", configuration(), NOW.plusSeconds(30), token);
+                "thread-1", configuration(), Optional.of(NOW.plusSeconds(30)), token);
         ContextOrchestrator orchestrator = new ContextOrchestratorFactory(store, CLOCK, ignored -> summaryModel(prompt -> {
             invoked.set(true);
             return new SummaryModel.Result(summary(), CheckpointUsage.none());
@@ -156,7 +156,7 @@ final class ContextOrchestratorFactoryTest {
         MemoryStore store = new MemoryStore("thread-1", 4);
         ManualToken token = new ManualToken();
         SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                "thread-1", configuration(), NOW.plusSeconds(30), token);
+                "thread-1", configuration(), Optional.of(NOW.plusSeconds(30)), token);
         ContextOrchestrator orchestrator = new ContextOrchestratorFactory(store, CLOCK, ignored -> summaryModel(prompt -> {
             token.cancel();
             return new SummaryModel.Result(summary(), CheckpointUsage.none());
@@ -176,7 +176,7 @@ final class ContextOrchestratorFactoryTest {
     void boundOrchestratorCannotBeReusedForAnotherThread() {
         MemoryStore store = new MemoryStore("thread-1", 4);
         SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                "thread-1", configuration(), NOW.plusSeconds(30), new ManualToken());
+                "thread-1", configuration(), Optional.of(NOW.plusSeconds(30)), new ManualToken());
         ContextOrchestrator orchestrator = new ContextOrchestratorFactory(store, CLOCK, ignored ->
                 summaryModel(prompt -> new SummaryModel.Result(summary(), CheckpointUsage.none())))
                 .create("thread-1", runtime(binding), testOperation());
@@ -273,7 +273,9 @@ final class ContextOrchestratorFactoryTest {
             @Override public void settle(CheckpointUsage usage, Progress accepted) { progress = accepted; }
 
             /** 这些 fixture 不制造网络故障，意外进入重试应使测试失败。 */
-            @Override public void retry() { throw new AssertionError("unexpected Provider retry"); }
+            @Override public void retry(int failedAttempt, long delayMillis, String reasonCode) {
+                throw new AssertionError("unexpected Provider retry");
+            }
 
             /** 固定检查点 CAS 的源版本，测试检查点仓储负责校验 revision。 */
             @Override public long checkpointSourceRevision(long originalRevision) { return originalRevision; }

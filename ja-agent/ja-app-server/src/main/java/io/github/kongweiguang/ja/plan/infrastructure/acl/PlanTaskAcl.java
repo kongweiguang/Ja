@@ -19,14 +19,19 @@ public final class PlanTaskAcl implements PlanTaskPort {
         this.tasks = Objects.requireNonNull(tasks, "tasks");
     }
 
-    /** 只转发事件投影，不让 Plan 访问 Task 的状态仓储或 admission。 */
+    /**
+     * 只转发事件投影，不让 Plan 访问 Task 的状态仓储或 admission；同时把已登记身份解析器独立传过包装层，
+     * 使自动压缩事件仍能按原 RpcSession 路由且不创建新的 Workspace owner。
+     *
+     * @author kongweiguang
+     */
     @Override
     public ConversationTurnEventSink projectContinuationEvents(String threadId,
                                                                 PlanExecutionEventSink downstream,
                                                                 boolean registered) {
         Objects.requireNonNull(downstream, "downstream");
         ConversationTurnEventSink sink = registered
-                ? ConversationTurnEventSink.turnEventsOnly(downstream::publish)
+                ? ConversationTurnEventSink.turnEventsOnly(downstream, downstream::workspaceId)
                 : ConversationTurnEventSink.noop();
         return tasks.projectContinuationEvents(threadId, sink);
     }

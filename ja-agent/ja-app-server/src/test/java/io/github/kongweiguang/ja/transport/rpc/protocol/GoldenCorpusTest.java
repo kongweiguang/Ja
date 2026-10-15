@@ -268,6 +268,31 @@ final class GoldenCorpusTest {
         assertFalse(ThreadReadContract.isValidLiveStream(result));
     }
 
+    /** 压缩快照需要完整 nullable 三字段并绑定当前活动 Turn，不能接受旧 Spinner 或重试号倒退。
+     * @author kongweiguang
+     */
+    @Test
+    void validatesContextCompactionSnapshotShapeAndOwner() {
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode result = mapper.createObjectNode();
+        result.putArray("turns").addObject().put("turnId", "turn_owner").put("status", "running");
+        ObjectNode compaction = result.putObject("contextCompaction");
+        compaction.put("compactionId", "cmp_auto").put("turnId", "turn_owner").put("retryAttempt", 2);
+
+        assertTrue(ThreadReadContract.isValidContextCompaction(result));
+        compaction.put("retryAttempt", 0);
+        assertFalse(ThreadReadContract.isValidContextCompaction(result));
+        compaction.put("retryAttempt", 2).put("turnId", "turn_finished");
+        assertFalse(ThreadReadContract.isValidContextCompaction(result));
+        compaction.remove("turnId");
+        assertFalse(ThreadReadContract.isValidContextCompaction(result));
+
+        result.putNull("contextCompaction");
+        assertTrue(ThreadReadContract.isValidContextCompaction(result));
+        result.remove("contextCompaction");
+        assertFalse(ThreadReadContract.isValidContextCompaction(result));
+    }
+
     /**
      * 仅在测试中加载仓库的 draft-2020-12 合同，使生产解码保持专注于有界
      * JSON-RPC 分帧，不在运行时重复维护每个方法的 Schema。
@@ -322,6 +347,8 @@ final class GoldenCorpusTest {
 
     /**
      * 响应先通过信封校验，再消费请求上下文并检查 Schema 与跨帧不变量；只做单帧校验会漏掉代际错配。
+     *
+     * @author kongweiguang
      */
     private static void assertNegativeCorrelatedResponse(JaRpcCodec codec, ContractSchemas schemas,
                                                          Map<String, CorrelatedRequest> pending, byte[] bytes,
@@ -342,6 +369,7 @@ final class GoldenCorpusTest {
                 && !resultSchema.validate(document.get("result").toString(), InputFormat.JSON).isEmpty();
         boolean semanticRejected = !resultRejected && (rejectsChangeSetArtifactSemantics(method, document.path("result"))
                 || rejectsLiveStreamSemantics(method, document.path("result"))
+                || rejectsContextCompactionSemantics(method, document.path("result"))
                 || ("thread/read".equals(method) && rejectsToolMediaSemantics(document.path("result")))
                 || rejectsReviewSemantics(method,
                         request == null ? null : request.params(), document.path("result"))
@@ -362,6 +390,16 @@ final class GoldenCorpusTest {
             return false;
         }
         return !ThreadReadContract.isValidLiveStream(result);
+    }
+
+    /** Golden 的读恢复语义复用生产 validator，防止 schema 合法但过期的压缩 Spinner 被继续投影。
+     * @author kongweiguang
+     */
+    private static boolean rejectsContextCompactionSemantics(String method, JsonNode result) {
+        if (!"thread/read".equals(method)) {
+            return false;
+        }
+        return !ThreadReadContract.isValidContextCompaction(result);
     }
 
     /**

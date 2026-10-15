@@ -1191,36 +1191,102 @@ describe("WorkbenchHost capability activation", () => {
     expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
   });
 
-  it("basename 冲突只在选择候选后调用 resolver", async () => {
-    const resolveFile = vi.fn(async () => ({
-      canonicalPath: "C:\\repo\\b\\notes.txt",
-      displayName: "notes.txt",
-      workspaceId: "ws_demo",
-      workspaceRelativePath: "b/notes.txt",
-      withinWorkspace: true,
-      kind: "text" as const,
-      mimeType: "text/plain",
-      fileUrl: "file:///C:/repo/b/notes.txt",
-      content: null,
-      truncated: false,
-      line: null,
-      column: null,
-      readOnly: false,
-    }));
-    const request = {
-      requestId: 303,
-      workspaceId: "ws_demo",
-      threadId: "thr_one",
-      target: { kind: "file" as const, path: "notes.txt" },
-    };
-    mocks.queryRuntime.mockResolvedValue({
-      items: [
-        { relativePath: "a/notes.txt", kind: "file" },
-        { relativePath: "b/notes.txt", kind: "file" },
-      ],
-      truncated: false,
-    });
+  /** 根目录文件名也是精确相对路径；其它目录同名文件不得触发搜索或改写目标。 */
+  it.each(["notes.txt", "b/notes.txt", "C:/repo/b/notes.txt"])(
+    "opens exact file target %s without searching duplicate basenames",
+    async (path) => {
+      const resolveFile = vi.fn(async () => ({
+        canonicalPath: "C:\\repo\\b\\notes.txt",
+        displayName: "notes.txt",
+        workspaceId: "ws_demo",
+        workspaceRelativePath: "b/notes.txt",
+        withinWorkspace: true,
+        kind: "text" as const,
+        mimeType: "text/plain",
+        fileUrl: "file:///C:/repo/b/notes.txt",
+        content: null,
+        truncated: false,
+        line: null,
+        column: null,
+        readOnly: false,
+      }));
+      const request = {
+        requestId: 303,
+        workspaceId: "ws_demo",
+        threadId: "thr_one",
+        target: { kind: "file" as const, path },
+      };
+      mocks.queryRuntime.mockResolvedValue({
+        items: [
+          { relativePath: "a/notes.txt", kind: "file" },
+          { relativePath: "b/notes.txt", kind: "file" },
+        ],
+        truncated: false,
+      });
 
+      render(
+        <WorkbenchHost
+          {...makeProps({
+            active: true,
+            rootThreadId: "thr_one",
+            adapters: { preview: { resolveFile } } as unknown as ComponentProps<
+              typeof WorkbenchHost
+            >["adapters"],
+            openTargetRequest: request,
+          })}
+        />,
+      );
+
+      await waitFor(() =>
+        expect(resolveFile).toHaveBeenCalledWith(path, "ws_demo", undefined, undefined, "editor"),
+      );
+      expect(mocks.queryRuntime).not.toHaveBeenCalledWith(
+        "workspace/path/search",
+        expect.anything(),
+      );
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    },
+  );
+
+  /** Explorer 同样保留回复的绝对目标，不在隐藏右栏时查询或弹出同名选择。 */
+  it("reveals an exact Explorer target while the right panel stays hidden", async () => {
+    const revealFile = vi.fn(async () => undefined);
+    const settled = vi.fn();
+    const onTabChange = vi.fn();
+    const path = "C:/repo/b/notes.txt";
+    render(
+      <WorkbenchHost
+        {...makeProps({
+          active: false,
+          rootThreadId: "thr_one",
+          onTabChange,
+          adapters: { preview: { revealFile } } as unknown as ComponentProps<
+            typeof WorkbenchHost
+          >["adapters"],
+          openTargetRequest: {
+            requestId: 307,
+            workspaceId: "ws_demo",
+            threadId: "thr_one",
+            target: { kind: "explorer", path },
+          },
+          onOpenTargetSettled: settled,
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(revealFile).toHaveBeenCalledWith(path, "ws_demo"));
+    expect(settled).toHaveBeenCalledWith(307, "opened");
+    expect(mocks.queryRuntime).not.toHaveBeenCalledWith("workspace/path/search", expect.anything());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(onTabChange).not.toHaveBeenCalled();
+  });
+
+  /** 路径缺失只能报失败，不能搜索同名文件代替，避免打开错误内容。 */
+  it("does not replace a missing exact file with another basename match", async () => {
+    const resolveFile = vi.fn(async () => {
+      throw new PreviewAdapterError("file_not_found");
+    });
+    const settled = vi.fn();
     render(
       <WorkbenchHost
         {...makeProps({
@@ -1229,68 +1295,27 @@ describe("WorkbenchHost capability activation", () => {
           adapters: { preview: { resolveFile } } as unknown as ComponentProps<
             typeof WorkbenchHost
           >["adapters"],
-          openTargetRequest: request,
-        })}
-      />,
-    );
-
-    expect(await screen.findByRole("dialog", { name: "选择要打开的文件" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "b/notes.txt" })).toHaveAttribute(
-      "data-file-candidate",
-      "b/notes.txt",
-    );
-    expect(resolveFile).not.toHaveBeenCalled();
-    await act(async () => {
-      screen.getByRole("button", { name: "b/notes.txt" }).click();
-    });
-    await waitFor(() =>
-      expect(resolveFile).toHaveBeenCalledWith(
-        "b/notes.txt",
-        "ws_demo",
-        undefined,
-        undefined,
-        "editor",
-      ),
-    );
-  });
-
-  /** 重名选择器保持可见，选定后才触达原生 reveal command。 */
-  it("chooses a duplicate Explorer target while the right panel stays hidden", async () => {
-    const revealFile = vi.fn(async () => undefined);
-    const settled = vi.fn();
-    mocks.queryRuntime.mockResolvedValue({
-      items: [
-        { relativePath: "a/notes.txt", kind: "file" },
-        { relativePath: "b/notes.txt", kind: "file" },
-      ],
-      truncated: false,
-    });
-    render(
-      <WorkbenchHost
-        {...makeProps({
-          active: false,
-          rootThreadId: "thr_one",
-          adapters: { preview: { revealFile } } as unknown as ComponentProps<
-            typeof WorkbenchHost
-          >["adapters"],
           openTargetRequest: {
-            requestId: 307,
+            requestId: 309,
             workspaceId: "ws_demo",
             threadId: "thr_one",
-            target: { kind: "explorer", path: "notes.txt" },
+            target: { kind: "file", path: "notes.txt" },
           },
           onOpenTargetSettled: settled,
         })}
       />,
     );
-
-    expect(
-      await screen.findByRole("dialog", { name: "选择要在文件夹中定位的文件" }),
-    ).toBeInTheDocument();
-    expect(revealFile).not.toHaveBeenCalled();
-    await act(async () => screen.getByRole("button", { name: "b/notes.txt" }).click());
-    await waitFor(() => expect(revealFile).toHaveBeenCalledWith("b/notes.txt", "ws_demo"));
-    expect(settled).toHaveBeenCalledWith(307, "opened");
+    await waitFor(() => expect(settled).toHaveBeenCalledWith(309, "failed"));
+    expect(resolveFile).toHaveBeenCalledExactlyOnceWith(
+      "notes.txt",
+      "ws_demo",
+      undefined,
+      undefined,
+      "editor",
+    );
+    expect(mocks.queryRuntime).not.toHaveBeenCalledWith("workspace/path/search", expect.anything());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(mocks.previewOpenTarget).not.toHaveBeenCalled();
   });
 
   /** 原生拒绝必须结束当前 intent，供应用层把焦点还给回复中的路径。 */

@@ -47,10 +47,12 @@ public final class AgentPromptAssembler {
             report what was completed and verified plus any unresolved blocker. A progress update is not a
             final result; do not claim completion based on an unverified assertion.
             
-            When mentioning files you created or changed, link each verified path in ordinary prose and never invent paths.
-            Prefer workspace-relative links; include only verified line numbers, for example
-            [src/file.ts:12](src/file.ts#L12) or #L12C3; omit unknown line numbers.
-            For absolute paths, use valid file:// links; URL-encode spaces and non-ASCII characters in targets.
+            When mentioning local files or directories, link each verified target in ordinary prose and never invent paths.
+            Use absolute paths in link destinations, including workspace files; labels may stay short.
+            Resolve known relative paths against the current working directory, never by basename search or guessing.
+            Use valid file:// links; URL-encode spaces and non-ASCII characters in targets.
+            Include only verified 1-based line/column locations, for example
+            [src/file.ts:12](file:///C:/repo/src/file.ts#L12) or #L12C3; omit unknown locations.
             Keep the reply concise; do not add a file list just to show links.
             
             Before the first tool call, briefly explain your intent. Share meaningful findings and changes

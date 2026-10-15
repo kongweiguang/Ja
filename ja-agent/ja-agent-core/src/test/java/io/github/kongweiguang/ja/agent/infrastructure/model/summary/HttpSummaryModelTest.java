@@ -89,6 +89,47 @@ final class HttpSummaryModelTest {
         }
     }
 
+    /** 长响应持续发送 SSE 心跳时，requestTimeout 只限制单次读取空闲，不能截断总生成时长。 */
+    @Test
+    void summaryMayOutliveRequestTimeoutWhileSseRemainsActive() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback((call, exchange) -> {
+            ModelAdapterTestSupport.heartbeatThenSse(exchange, openAiSummary(
+                    DOCUMENT, new ModelUsage(12, 5, 17)), Duration.ofMillis(250));
+        }); ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(100));
+            SummaryModel model = factory.bind(binding(configuration, Optional.empty(), CancellationToken.none()));
+
+            long startedAt = System.nanoTime();
+            SummaryModel.Result result = countedSummary(model, prompt());
+
+            assertDocument(result.document());
+            assertTrue(System.nanoTime() - startedAt > Duration.ofMillis(100).toNanos());
+            assertEquals(1, server.calls());
+        }
+    }
+
+    /** 超过配置读空闲上限且无 SSE 心跳时仍须失败，关闭总时长计时器不能放宽空闲边界。 */
+    @Test
+    void summaryStillStopsAfterReadIdleTimeout() throws Exception {
+        try (ModelAdapterTestSupport.Loopback server = new ModelAdapterTestSupport.Loopback(
+                (call, exchange) -> ModelAdapterTestSupport.delayedSse(
+                        exchange, 300, TimeUnit.MILLISECONDS));
+             ModelAdapterFactory factory = new ModelAdapterFactory(CLOCK)) {
+            ModelPort.ModelConfiguration configuration = configuration(
+                    server.baseUri(), ModelPort.Api.OPENAI_RESPONSES, Duration.ofMillis(100));
+            SummaryModel model = factory.bind(binding(configuration, Optional.empty(), CancellationToken.none()));
+
+            ContextException failure = assertThrows(ContextException.class,
+                    () -> countedSummary(model, prompt()));
+
+            ProviderProtocolException provider = assertInstanceOf(ProviderProtocolException.class, failure.getCause());
+            assertEquals("REQUEST_IDLE_TIMEOUT", provider.code());
+            assertEquals("MODEL_IDLE_TIMEOUT", provider.terminalErrorCode());
+            assertEquals(1, server.calls());
+        }
+    }
+
     /** 每次摘要调用只产生一次 HTTP 请求，后续显式调用不受先前失败次数限制。 */
     @Test
     void summaryRequestsReachHttpAfterRepeatedFailures() throws Exception {
@@ -271,14 +312,15 @@ final class HttpSummaryModelTest {
             ModelPort.ModelConfiguration configuration = configuration(
                     server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                    "thread-1", configuration, NOW.plusMillis(250), CancellationToken.none());
+                    "thread-1", configuration, Optional.of(NOW.plusMillis(250)), CancellationToken.none());
 
             ContextException failure = assertThrows(ContextException.class,
                     () -> countedSummary(factory.bind(binding), prompt()));
 
             assertTrue(responseStarted.await(1, TimeUnit.SECONDS));
             assertEquals(ContextException.Code.SUMMARY_FAILURE, failure.code());
-            assertTrue(failure.getCause() instanceof ProviderProtocolException);
+            ProviderProtocolException provider = assertInstanceOf(ProviderProtocolException.class, failure.getCause());
+            assertEquals("REQUEST_TIMEOUT", provider.code());
             assertEquals(1, server.calls());
         }
     }
@@ -293,7 +335,7 @@ final class HttpSummaryModelTest {
             ModelPort.ModelConfiguration configuration = configuration(
                     server.baseUri(), ModelPort.Api.OPENAI_RESPONSES);
             SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                    "thread-1", configuration, NOW.plusMillis(250), CancellationToken.none());
+                    "thread-1", configuration, Optional.of(NOW.plusMillis(250)), CancellationToken.none());
 
             ContextException failure = assertThrows(ContextException.class,
                     () -> countedSummary(factory.bind(binding), prompt()));
@@ -389,8 +431,15 @@ final class HttpSummaryModelTest {
     /** 构造冻结 Turn 绑定，并确保生成的诊断始终隐藏 secret。 */
     private static SummaryModel.TurnBinding binding(
             ModelPort.ModelConfiguration configuration, CancellationToken cancellation) {
+        return binding(configuration, Optional.of(NOW.plusSeconds(30)), cancellation);
+    }
+
+    /** 允许测试显式构造无总时限的长流绑定，同时复用同一配置和取消边界。 */
+    private static SummaryModel.TurnBinding binding(ModelPort.ModelConfiguration configuration,
+                                                     Optional<Instant> deadline,
+                                                     CancellationToken cancellation) {
         SummaryModel.TurnBinding binding = new SummaryModel.TurnBinding(
-                "thread-1", configuration, NOW.plusSeconds(30), cancellation);
+                "thread-1", configuration, deadline, cancellation);
         assertFalse(binding.toString().contains("test-secret"));
         return binding;
     }
@@ -429,10 +478,16 @@ final class HttpSummaryModelTest {
     /** 创建输出上限更高的原生 Provider/Model 快照，使 prompt 预留成为最终上限。 */
     private static ModelPort.ModelConfiguration configuration(
             URI baseUri, ModelPort.Api api) {
+        return configuration(baseUri, api, Duration.ofSeconds(20));
+    }
+
+    /** 为网络超时回归设置短读空闲窗口，避免依赖长时间等待或真实 Provider。 */
+    private static ModelPort.ModelConfiguration configuration(
+            URI baseUri, ModelPort.Api api, Duration requestTimeout) {
         return new ModelPort.ModelConfiguration(
                 "provider_test", "model_test", "cfg_test", api, "test-model",
                 baseUri, "test-secret",
-                Duration.ofSeconds(2), Duration.ofSeconds(20),
+                Duration.ofSeconds(2), requestTimeout,
                 java.util.Set.of(ModelPort.InputModality.TEXT),
                 new ModelPort.GenerationOptions(null, null, 900, "medium"));
     }

@@ -15,6 +15,8 @@ import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
 import io.github.kongweiguang.ja.agent.application.gateway.store.AgentRecordIds;
 import io.github.kongweiguang.ja.agent.application.gateway.store.AgentStore;
 import io.github.kongweiguang.ja.agent.application.gateway.store.CheckpointStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.List;
@@ -26,6 +28,7 @@ import java.util.UUID;
  * 将自动摘要的模型意图、用量和滚动进度纳入同一可恢复执行游标。
  */
 final class AgentSummaryOperation implements ModelSummaryGenerator.SummaryOperation {
+    private static final Logger LOGGER = LoggerFactory.getLogger(AgentSummaryOperation.class);
     private final Host host;
 
     /**
@@ -146,15 +149,21 @@ final class AgentSummaryOperation implements ModelSummaryGenerator.SummaryOperat
     }
 
     /**
-     * 将可能已计费但无可信响应的调用记为 UNKNOWN，并恢复原摘要阶段后推进 ordinal。
+     * UNKNOWN 用量与重试事件同事务提交，保留摘要进度并让客户端观察到恢复；日志只包含冻结身份和稳定错误码。
      */
     @Override
-    public void retry() {
+    public void retry(int failedAttempt, long delayMillis, String reasonCode) {
         TurnExecutionState.ProviderPending pending = pending(host.cursor());
         TurnExecutionState.Ready next = pending.resume().advanceProviderOrdinal();
         Instant at = host.services().clock().instant();
         AgentStore.RecordWrite unknown = usage(pending, null, at);
-        host.commit(TurnState.RUNNING, next, List.of(unknown), List.of());
+        ExecutionEvent.RetryScheduled retry = new ExecutionEvent.RetryScheduled(
+                pending.modelRequestId(), failedAttempt, delayMillis, reasonCode);
+        host.commit(TurnState.RUNNING, next, List.of(unknown), List.of(retry));
+        LOGGER.warn("Summary retry scheduled threadId={} turnId={} modelRequestId={} modelRequestOrdinal={} "
+                    + "attempt={} delay_ms={} terminal_error_code={}",
+                host.identity().threadId(), host.identity().turnId(), pending.modelRequestId(),
+                pending.common().nextProviderOrdinal(), failedAttempt, delayMillis, reasonCode);
     }
 
     /**

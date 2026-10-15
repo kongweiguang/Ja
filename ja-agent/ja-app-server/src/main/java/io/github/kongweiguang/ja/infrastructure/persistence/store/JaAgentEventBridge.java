@@ -46,6 +46,7 @@ import io.github.kongweiguang.ja.conversation.application.presentation.ToolPrese
 import io.github.kongweiguang.ja.conversation.domain.model.AttachmentSummary;
 import io.github.kongweiguang.ja.conversation.domain.model.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
+import io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.InputQueue;
 import io.github.kongweiguang.ja.conversation.domain.model.JaMessageIds;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSnapshot;
@@ -1008,6 +1009,7 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
         List<DecodedEvent> decoded = batch.stream().map(event ->
                 new DecodedEvent(event, events.decode(event))).toList();
         updateInputQueue(attachment, window);
+        projectContextCompactions(attachment, decoded);
         DecodedEvent terminal = find(decoded, ExecutionEvent.Terminal.class);
         if (terminal != null) {
             return List.of(terminalResult(attachment.identity, terminal.persisted(),
@@ -1077,6 +1079,75 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
             return List.of(new TurnEvent.StateChanged(context(state.persisted()), value.from(), value.to()));
         }
         return List.of();
+    }
+
+    /**
+     * Project automatic compression phases from the durable batch before selecting its primary Turn frame; manual
+     * compaction uses a distinct non-Turn identity and remains owned by ManualContextCompactionService.
+     *
+     * @author kongweiguang
+     */
+    private void projectContextCompactions(Attachment attachment, List<DecodedEvent> decoded) {
+        for (DecodedEvent value : decoded) {
+            AgentStore.PersistedEvent persisted = value.persisted();
+            if (value.event() instanceof ExecutionEvent.ContextCompactionStarted started) {
+                automaticCompactionContext(attachment, persisted, started.compactionId(), started.sourceRevision(),
+                        started.inputTokensBefore(), null).ifPresent(context ->
+                        awaitPublish(attachment.sink.publish(new ContextCompactionEvent.Started(context))));
+            } else if (value.event() instanceof ExecutionEvent.ContextCompacted compacted
+                    && compacted.outcome() == ExecutionEvent.CompactionOutcome.COMPACTED) {
+                automaticCompactionContext(attachment, persisted, compacted.compactionId(),
+                        compacted.sourceRevision(), compacted.inputTokensBefore(), compacted.inputTokensAfter())
+                        .ifPresent(context -> awaitPublish(attachment.sink.publish(
+                                new ContextCompactionEvent.Compacted(context, compacted.checkpointId()))));
+            } else if (value.event() instanceof ExecutionEvent.ContextCompactionFailed failed) {
+                automaticCompactionContext(attachment, persisted, failed.compactionId(), failed.sourceRevision(),
+                        failed.inputTokensBefore(), null).ifPresent(context ->
+                        awaitPublish(attachment.sink.publish(new ContextCompactionEvent.Failed(context,
+                                automaticCompactionErrorCode(failed.reasonCode())))));
+            }
+        }
+    }
+
+    /**
+     * Resolve workspace only at the RPC sink boundary; durable Agent Store events intentionally own Thread/Turn
+     * revisions but do not guess workspace routing. A sink without RPC ownership remains a deliberate no-op.
+     *
+     * @author kongweiguang
+     */
+    private static Optional<ContextCompactionEvent.Context> automaticCompactionContext(
+            Attachment attachment, AgentStore.PersistedEvent persisted, String compactionId, long sourceRevision,
+            Long inputTokensBefore, Long inputTokensAfter) {
+        if (!persisted.execution().turnId().equals(attachment.identity.turnId())
+                || !persisted.conversation().threadId().equals(attachment.identity.threadId())) {
+            throw new IllegalStateException("compaction event identity changed during projection");
+        }
+        Optional<String> workspaceId = attachment.sink.workspaceId(attachment.identity);
+        if (workspaceId.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(new ContextCompactionEvent.Context(persisted.eventId(), workspaceId.orElseThrow(),
+                persisted.conversation().threadId(), persisted.execution().turnId(), persisted.threadRevision(),
+                persisted.occurredAt(), compactionId, ContextCompactionEvent.Trigger.AUTOMATIC, sourceRevision,
+                inputTokensBefore, inputTokensAfter, ContextCompactionEvent.STRATEGY_VERSION,
+                persisted.mutationVersion()));
+    }
+
+    /**
+     * Keep summary failure projection stable and provider-neutral; unknown stored categories fail closed as
+     * INVALID_STATE instead of exposing an exception message or inventing a new wire code.
+     *
+     * @author kongweiguang
+     */
+    private static ContextCompactionEvent.ErrorCode automaticCompactionErrorCode(String reasonCode) {
+        return switch (Objects.requireNonNullElse(reasonCode, "")) {
+            case "CAS_CONFLICT", "CONFLICT" -> ContextCompactionEvent.ErrorCode.CONFLICT;
+            case "SUMMARY_FAILURE" -> ContextCompactionEvent.ErrorCode.SUMMARY_FAILURE;
+            case "CONTEXT_LIMIT" -> ContextCompactionEvent.ErrorCode.CONTEXT_LIMIT;
+            case "CANCELLED" -> ContextCompactionEvent.ErrorCode.CANCELLED;
+            case "THREAD_BUSY" -> ContextCompactionEvent.ErrorCode.THREAD_BUSY;
+            default -> ContextCompactionEvent.ErrorCode.INVALID_STATE;
+        };
     }
 
     /**

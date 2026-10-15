@@ -4,15 +4,18 @@
 package io.github.kongweiguang.ja.plan.application.api;
 
 import io.github.kongweiguang.ja.conversation.domain.model.TurnEvent;
+import io.github.kongweiguang.ja.conversation.domain.model.TurnEventSink;
+import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
 
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /**
  * standalone Plan run 的发起连接事件出口；它不创建 Plan observation 或第二份持久状态。
  */
-public interface PlanExecutionEventSink {
+public interface PlanExecutionEventSink extends TurnEventSink {
     /**
      * 无 UI 发起者的恢复和测试路径继续执行，但明确不制造可见事件路由。
      */
@@ -74,5 +77,15 @@ public interface PlanExecutionEventSink {
      * admission 失败或 Turn 完成后幂等释放连接关联，不改变 Plan run 的持久终态。
      */
     void abandonTurn(String turnId);
+
+    /**
+     * 查询 admission 时登记的 Workspace；无连接实现没有路由，压缩生命周期因此保持静默。
+     *
+     * @author kongweiguang
+     */
+    default Optional<String> workspaceId(AgentIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        return Optional.empty();
+    }
 }
 

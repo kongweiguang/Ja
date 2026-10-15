@@ -6,6 +6,7 @@ import io.github.kongweiguang.ja.agent.bootstrap.AgentEngineBuilder;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.agent.application.api.AgentEngine;
+import io.github.kongweiguang.ja.agent.application.api.engine.AgentCompactionRequest;
 import io.github.kongweiguang.ja.agent.application.api.engine.AgentRequest;
 import io.github.kongweiguang.ja.agent.application.gateway.AgentRequestRuntime;
 import io.github.kongweiguang.ja.agent.application.gateway.ModelPort;
@@ -45,6 +46,7 @@ import io.github.kongweiguang.ja.attachment.application.api.AttachmentUseCase;
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskMailboxQueueCommandMapper;
 import io.github.kongweiguang.ja.collaboration.domain.model.TaskModels;
 import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
+import io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.model.JaMessageIds;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSnapshot;
@@ -996,6 +998,161 @@ final class JaAgentEventBridgeTest {
         }
     }
 
+    /**
+     * Durable automatic compaction phases use the existing Thread sink and carry the Store revision fence.
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void projectsAutomaticCompactionLifecycleFromDurableEvents() throws Exception {
+        AgentIdentity identity = identity();
+        AgentStore.ConversationKey conversation = new AgentStore.ConversationKey(
+                identity.tenantId(), identity.threadId(), identity.userId());
+        JacksonExecutionEventCodec codec = new JacksonExecutionEventCodec(new ObjectMapper());
+        Instant time = Instant.parse("2026-10-15T00:00:00Z");
+        List<AgentStore.PersistedEvent> persisted = List.of(
+                contextCompactionEvent(codec, conversation, identity, 1, 11, 2,
+                        new ExecutionEvent.ContextCompactionStarted("cmp_auto_success", 10, 1_200), time),
+                contextCompactionEvent(codec, conversation, identity, 2, 12, 3,
+                        new ExecutionEvent.ContextCompacted("cmp_auto_success",
+                                ExecutionEvent.CompactionOutcome.COMPACTED, "checkpoint_auto_success",
+                                "record_auto_success", 10, 12, 1_200, 320), time.plusSeconds(1)),
+                contextCompactionEvent(codec, conversation, identity, 3, 13, 4,
+                        new ExecutionEvent.ContextCompactionStarted("cmp_auto_failure", 12, 900),
+                        time.plusSeconds(2)),
+                contextCompactionEvent(codec, conversation, identity, 4, 14, 5,
+                        new ExecutionEvent.ContextCompactionFailed("cmp_auto_failure", 12, 900,
+                                "SUMMARY_FAILURE"), time.plusSeconds(3)));
+        AgentStore store = eventStore(conversation, persisted, time, new AtomicInteger());
+        AgentEngine engine = new AgentEngineBuilder().store(store)
+                .runtimeResolver((request, extensions, recovered) -> {
+                    throw new IllegalStateException("runtime is not used by durable projection tests");
+                }).build();
+        JaAgentEventBridge bridge = eventBridge(store, codec);
+        bridge.bindEngine(engine);
+        List<ContextCompactionEvent> delivered = new CopyOnWriteArrayList<>();
+        ConversationTurnEventSink sink = new ConversationTurnEventSink() {
+            /** The fixture records ordinary turn frames without inventing any model output.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(TurnEvent event) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            /** Preserve the established ContextCompactionEvent channel for durable phases.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(ContextCompactionEvent event) {
+                delivered.add(event);
+                return CompletableFuture.completedFuture(null);
+            }
+
+            /** Resolve the workspace from the same identity owner as a live RpcSession.
+             * @author kongweiguang
+             */
+            @Override
+            public Optional<String> workspaceId(AgentIdentity eventIdentity) {
+                assertEquals(identity, eventIdentity);
+                return Optional.of("ws_compaction_bridge");
+            }
+
+            /** The fixture does not publish Thread metadata.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(
+                    io.github.kongweiguang.ja.conversation.domain.model.ThreadMetadataEvent event) {
+                return CompletableFuture.completedFuture(null);
+            }
+        };
+
+        try (engine; bridge; AutoCloseable attachment = bridge.attach(identity, sink)) {
+            awaitCompactionEventCount(delivered, 4);
+            assertTrue(delivered.get(0) instanceof ContextCompactionEvent.Started);
+            assertTrue(delivered.get(1) instanceof ContextCompactionEvent.Compacted);
+            assertTrue(delivered.get(2) instanceof ContextCompactionEvent.Started);
+            assertTrue(delivered.get(3) instanceof ContextCompactionEvent.Failed);
+            assertEquals("ws_compaction_bridge", delivered.get(0).context().workspaceId());
+            assertEquals("thr_target", delivered.get(0).context().threadId());
+            assertEquals("turn_child", delivered.get(0).context().turnId());
+            assertEquals(ContextCompactionEvent.Trigger.AUTOMATIC, delivered.get(0).context().trigger());
+            assertEquals(11L, delivered.get(0).context().threadRevision());
+            assertEquals(12L, delivered.get(1).context().threadRevision());
+            assertEquals(ContextCompactionEvent.ErrorCode.SUMMARY_FAILURE,
+                    ((ContextCompactionEvent.Failed) delivered.get(3)).errorCode());
+        }
+    }
+
+    /**
+     * Manual compaction identity remains exclusively owned by its service and never creates a Turn attachment.
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void doesNotBridgeManualCompactionIdentityAsAutomaticTurnEvent() throws Exception {
+        AgentIdentity conversationIdentity = identity();
+        AgentIdentity manualIdentity = AgentCompactionRequest.compactionIdentity(conversationIdentity,
+                "manual_bridge_test");
+        AgentStore.ConversationKey conversation = new AgentStore.ConversationKey(
+                conversationIdentity.tenantId(), conversationIdentity.threadId(), conversationIdentity.userId());
+        JacksonExecutionEventCodec codec = new JacksonExecutionEventCodec(new ObjectMapper());
+        AgentStore.PersistedEvent started = contextCompactionEvent(codec, conversation, manualIdentity, 1, 11, 2,
+                new ExecutionEvent.ContextCompactionStarted("cmp_manual_bridge", 10, 1_200), Instant.EPOCH);
+        AgentStore store = eventStore(conversation, List.of(started), Instant.EPOCH, new AtomicInteger());
+        AgentEngine engine = new AgentEngineBuilder().store(store)
+                .runtimeResolver((request, extensions, recovered) -> {
+                    throw new IllegalStateException("runtime is not used by manual identity gate test");
+                }).build();
+        JaAgentEventBridge bridge = eventBridge(store, codec);
+        bridge.bindEngine(engine);
+        AtomicInteger workspaceLookups = new AtomicInteger();
+        AtomicInteger contextEvents = new AtomicInteger();
+        ConversationTurnEventSink sink = new ConversationTurnEventSink() {
+            /** The manual identity must be rejected before any durable turn frame is read.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(TurnEvent event) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            /** ManualContextCompactionService is the only publisher for this identity.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(ContextCompactionEvent event) {
+                contextEvents.incrementAndGet();
+                return CompletableFuture.completedFuture(null);
+            }
+
+            /** A lookup would prove the automatic bridge attempted to project the manual event.
+             * @author kongweiguang
+             */
+            @Override
+            public Optional<String> workspaceId(AgentIdentity ignored) {
+                workspaceLookups.incrementAndGet();
+                return Optional.of("ws_compaction_bridge");
+            }
+
+            /** The fixture does not publish Thread metadata.
+             * @author kongweiguang
+             */
+            @Override
+            public CompletionStage<Void> publish(
+                    io.github.kongweiguang.ja.conversation.domain.model.ThreadMetadataEvent event) {
+                return CompletableFuture.completedFuture(null);
+            }
+        };
+
+        try (engine; bridge; AutoCloseable attachment = bridge.attach(manualIdentity, sink)) {
+            assertFalse(activeAttachments(bridge).containsKey(manualIdentity));
+            assertEquals(0, workspaceLookups.get());
+            assertEquals(0, contextEvents.get());
+        }
+    }
+
     /** Child Timeline 可先于 Core Conversation 创建完成 attachment；本地 ModelPort 不联网，首个 durable 状态仍须唯一投影。
      * Fixture 持有 SQLite 临时文件，必须等借用 Store 的投影线程实际退出，而不能把 detach 的停止请求当作资源释放。
      * @author kongweiguang
@@ -1559,6 +1716,32 @@ final class JaAgentEventBridgeTest {
                 write.payloadSchemaVersion(), sequence, sequence, sequence, 0, write.payload(), occurredAt);
     }
 
+    /**
+     * Encode compression phases through the production event codec and retain each durable revision watermark.
+     *
+     * @author kongweiguang
+     */
+    private static AgentStore.PersistedEvent contextCompactionEvent(JacksonExecutionEventCodec codec,
+            AgentStore.ConversationKey conversation, AgentIdentity identity, long sequence, long threadRevision,
+            long mutationVersion, ExecutionEvent event, Instant occurredAt) {
+        AgentStore.ExecutionKey execution = new AgentStore.ExecutionKey(conversation, identity.turnId());
+        AgentStore.EventWrite write = codec.encode("evt_compaction_" + sequence, event, occurredAt);
+        return new AgentStore.PersistedEvent(conversation, execution, write.eventId(), write.eventType(),
+                write.payloadSchemaVersion(), sequence, threadRevision, mutationVersion, sequence,
+                write.payload(), occurredAt);
+    }
+
+    /**
+     * Read the bridge's live attachment map to prove non-Turn manual identity is rejected before replay starts.
+     *
+     * @author kongweiguang
+     */
+    private static Map<?, ?> activeAttachments(JaAgentEventBridge bridge) throws ReflectiveOperationException {
+        Field activeField = JaAgentEventBridge.class.getDeclaredField("active");
+        activeField.setAccessible(true);
+        return (Map<?, ?>) activeField.get(bridge);
+    }
+
     /** 等待检查线程已进入 monitor 竞争，再由测试线程确定性地执行生命周期交错。 */
     private static boolean awaitBlocked(Thread thread) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
@@ -1575,6 +1758,20 @@ final class JaAgentEventBridgeTest {
             Thread.sleep(5);
         }
         assertEquals(expected, frames.size(), "durable frame was not projected");
+    }
+
+    /**
+     * Await durable compaction notifications without widening the test's asynchronous projection deadline.
+     *
+     * @author kongweiguang
+     */
+    private static void awaitCompactionEventCount(List<ContextCompactionEvent> events, int expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (events.size() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(expected, events.size(), "durable compaction phase was not projected");
     }
 
     /**

@@ -1440,6 +1440,63 @@ describe("usePreviewLifecycleController", () => {
     expect(result.current.preview.error).toBe("新页面加载失败");
   });
 
+  /** 原生读取先取样后回包；期间送达的同代际事件不能被旧 loading 快照抹掉。 */
+  it("preserves completed history and title when an earlier state read resolves late", async () => {
+    const adapters = createAdapters();
+    const pageId = "00000000-0000-4000-8000-000000000002";
+    const original: PreviewSessionSnapshot = {
+      ...(await adapters.preview.state(pageId)),
+      generation: 7,
+      load_status: "finished",
+      can_go_back: true,
+    };
+    adapters.preview.open = vi.fn(async () => ({ snapshot: original, window: original.window }));
+    adapters.preview.state = vi.fn(async () => original);
+    const { result } = renderHook(() => useJaWorkbench(project, adapters));
+    await waitFor(() => expect(adapters.preview.recoverPending).toHaveBeenCalledOnce());
+    await act(async () => result.current.preview.onOpenTarget({ kind: "url", url: original.url }));
+
+    const pendingState = createDeferred<PreviewSessionSnapshot>();
+    adapters.preview.state = vi.fn(() => pendingState.promise);
+    vi.mocked(adapters.preview.goBack).mockResolvedValue({ ...original, load_status: "loading" });
+    act(() => result.current.preview.onGoBack());
+    await waitFor(() => expect(adapters.preview.state).toHaveBeenCalledOnce());
+    const url = "http://localhost/history-origin";
+    const events: PreviewEvent["kind"][] = [
+      { type: "navigation_committed", source: "user", url },
+      { type: "history_changed", can_go_back: true, can_go_forward: true },
+      { type: "title_changed", title: "History origin" },
+      { type: "load_finished", url },
+    ];
+    act(() => {
+      for (const [index, kind] of events.entries())
+        adapters.previewEvents({
+          session_id: pageId,
+          generation: 8,
+          sequence: index + 1,
+          kind,
+        });
+    });
+    expect(result.current.preview.canGoForward).toBe(true);
+    expect(result.current.preview.pages[0]?.title).toBe("History origin");
+    await act(async () => {
+      pendingState.resolve({
+        ...original,
+        generation: 8,
+        load_status: "loading",
+        url,
+        title: "",
+        can_go_forward: false,
+        window: { ...original.window, url },
+      });
+      await flushMicrotasks();
+    });
+    expect(result.current.preview.loading).toBe(false);
+    expect(result.current.preview.canGoForward).toBe(true);
+    expect(result.current.preview.pages[0]?.title).toBe("History origin");
+    expect(result.current.preview.url).toBe(url);
+  });
+
   /** 历史 capability 来自 native snapshot/event，并将后退请求发送到原生引擎。 */
   it("uses native history state and navigates a local path within the active tab", async () => {
     const adapters = createAdapters();

@@ -17,4 +17,6 @@
 {"jsonrpc":"2.0","id":"c:compact-cancel-idle","method":"thread/compact/cancel","params":{"threadId":"thr_demo"}}
 {"jsonrpc":"2.0","id":"c:compact-cancel-idle","result":{"accepted":false}}
 {"jsonrpc":"2.0","method":"context/compaction-failed","params":{"serverInstanceId":"srv_demo","eventId":"evt_compaction_cancelled","sequence":6,"occurredAt":"2026-08-29T05:03:00Z","generation":1,"workspaceId":"ws_demo","threadId":"thr_demo","turnId":null,"threadRevision":11,"compactionId":"cmp_manual_cancelled","trigger":"manual","sourceRevision":11,"inputTokensBefore":180000,"inputTokensAfter":null,"strategyVersion":"ja-context-v1","errorCode":"CANCELLED"}}
+{"jsonrpc":"2.0","id":"c:compaction-snapshot","method":"thread/read","params":{"threadId":"thr_demo"}}
+{"jsonrpc":"2.0","id":"c:compaction-snapshot","result":{"threadId":"thr_demo","revision":10,"turns":[{"turnId":"turn_demo","status":"running","requestedAt":"2026-08-29T05:01:00Z","updatedAt":"2026-08-29T05:01:00Z","completedAt":null,"errorCode":null,"changeSet":null,"sourceMessageId":null,"origin":"native"}],"items":[],"taskActivities":[],"inputQueue":null,"contextUsage":null,"liveStream":null,"contextCompaction":{"compactionId":"cmp_auto_001","turnId":"turn_demo","retryAttempt":2},"nextCursor":null}}
 

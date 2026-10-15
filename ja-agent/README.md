@@ -33,7 +33,7 @@ SQLite 与本地 Skill 场景改为选择 `extensions/ja-agent-store-local,exten
 ```xml
 <properties>
     <maven.compiler.release>25</maven.compiler.release>
-    <ja.version>0.2.0</ja.version>
+    <ja.version>0.2.1</ja.version>
 </properties>
 <dependencies>
     <dependency>

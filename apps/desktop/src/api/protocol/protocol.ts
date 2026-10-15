@@ -964,6 +964,38 @@ const LiveStreamSchema = z
   .strict()
   .superRefine(validateLiveStreamSegments);
 
+const ContextCompactionStatusSchema = z
+  .object({
+    compactionId: CompactionIdSchema,
+    turnId: TurnIdSchema.nullable(),
+    retryAttempt: z.number().int().min(1).max(MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/**
+ * Turn 压缩必须绑定本页仍活动的 Turn；手动压缩保留 null owner。
+ *
+ * @author kongweiguang
+ */
+function validateContextCompactionSnapshot(
+  compaction: z.infer<typeof ContextCompactionStatusSchema> | null,
+  turns: z.infer<typeof ThreadSnapshotTurnSchema>[],
+  context: z.RefinementCtx,
+): void {
+  if (compaction === null || compaction.turnId === null) return;
+  const owner = turns.find((turn) => turn.turnId === compaction.turnId);
+  if (
+    owner === undefined ||
+    !["queued", "running", "waiting_input", "waiting_approval", "suspended"].includes(owner.status)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["contextCompaction", "turnId"],
+      message: "context compaction must belong to an active native Turn",
+    });
+  }
+}
+
 /** 队列条目是 App Server 签发的持久事实；inputRevision 只保护单条编辑竞态。 */
 export const QueuedInputSchema = z
   .object({
@@ -2802,6 +2834,8 @@ const ThreadTaskActivitySchema = z
 /**
  * Thread 快照只恢复当前根任务的有界低频 Task Activity；跨记录顺序和 identity 必须在客户端
  * 再次关联校验，因为 JSON Schema 无法表达这些不变量，Child Thread 的非空投影也会自然失败关闭。
+ *
+ * @author kongweiguang
  */
 export const ThreadReadResultSchema = z
   .object({
@@ -2813,6 +2847,7 @@ export const ThreadReadResultSchema = z
     inputQueue: InputQueueSchema.nullable(),
     contextUsage: ThreadRequestUsageSchema.nullable(),
     liveStream: LiveStreamSchema.nullable(),
+    contextCompaction: ContextCompactionStatusSchema.nullable(),
     nextCursor: CursorSchema.nullable(),
   })
   .strict()
@@ -2855,6 +2890,7 @@ export const ThreadReadResultSchema = z
         });
       }
     }
+    validateContextCompactionSnapshot(value.contextCompaction, value.turns, context);
   });
 
 /**

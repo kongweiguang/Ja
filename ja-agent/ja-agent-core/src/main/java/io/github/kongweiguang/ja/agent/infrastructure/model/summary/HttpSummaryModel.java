@@ -36,6 +36,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -343,8 +344,10 @@ public final class HttpSummaryModel implements SummaryModel {
         }
         Invocation invocation = current.invocation();
         try {
-            return executeBounded(minimum(invocation.configuration().requestTimeout(), remaining()),
-                    controller -> executeOnce(current, controller));
+            remaining();
+            SummaryModel.Result result = executeBounded(controller -> executeOnce(current, controller));
+            remaining();
+            return result;
         } finally {
             current.envelope().close();
         }
@@ -366,9 +369,9 @@ public final class HttpSummaryModel implements SummaryModel {
     }
 
     /**
-     * 先登记取消和 Deadline 再派发；关闭失败保留原失败，并且始终释放共享传输注册。
+     * 先登记取消和可选 Turn Deadline 再派发；单次请求超时只由 OkHttp 的建连与读写空闲预算约束。
      */
-    private <T> T executeBounded(Duration requestTimeout, Function<RequestController, T> operation) {
+    private <T> T executeBounded(Function<RequestController, T> operation) {
         RequestController controller = new RequestController(binding.cancellationToken());
         CompletableFuture<T> task = null;
         ScheduledFuture<?> timeout = null;
@@ -379,8 +382,11 @@ public final class HttpSummaryModel implements SummaryModel {
             transport.register(controller);
             registered = true;
             cancellation = binding.cancellationToken().onCancellation(controller::cancel);
-            timeout = transport.deadlineExecutor().schedule(controller::timeout,
-                    requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
+            Optional<Duration> deadlineRemaining = remaining();
+            if (deadlineRemaining.isPresent()) {
+                timeout = transport.deadlineExecutor().schedule(controller::timeout,
+                        deadlineRemaining.orElseThrow().toNanos(), TimeUnit.NANOSECONDS);
+            }
             controller.throwIfStopped();
             task = CompletableFuture.supplyAsync(() -> {
                 controller.bindThread(Thread.currentThread());
@@ -421,12 +427,18 @@ public final class HttpSummaryModel implements SummaryModel {
      */
     private SummaryModel.Result executeOnce(
             PreparedInvocation invocation, RequestController controller) {
-        controller.throwIfStopped();
-        SummaryCollector collector = new SummaryCollector(invocation.invocation().prompt().maxOutputTokens());
-        StreamContext context = new StreamContext(collector, controller, invocation.invocation().stateRequest());
-        ModelPort.ModelOutcome outcome = executeProviderAttempt(invocation, context, controller);
-        controller.throwIfStopped();
-        return collector.finish(outcome);
+        try {
+            controller.throwIfStopped();
+            SummaryCollector collector = new SummaryCollector(invocation.invocation().prompt().maxOutputTokens());
+            StreamContext context = new StreamContext(collector, controller, invocation.invocation().stateRequest());
+            ModelPort.ModelOutcome outcome = executeProviderAttempt(invocation, context, controller);
+            controller.throwIfStopped();
+            return collector.finish(outcome);
+        } catch (ProviderProtocolException failure) {
+            AbstractStreamingModelAdapter.logSummaryProviderFailure(
+                    binding.threadId(), invocation.invocation().configuration(), failure);
+            throw failure;
+        }
     }
 
     /**
@@ -483,13 +495,13 @@ public final class HttpSummaryModel implements SummaryModel {
             throw failure("summary prompt did not match its Turn binding");
         }
         binding.cancellationToken().throwIfCancellationRequested();
-        remaining();
+        Optional<Duration> deadlineRemaining = remaining();
         if (prompt.maxOutputTokens() > 1_000_000) {
             throw failure("summary output reservation exceeds provider bounds");
         }
         String payload = encodePrompt(prompt);
         binding.cancellationToken().throwIfCancellationRequested();
-        ModelPort.ModelConfiguration configuration = boundedConfiguration(prompt, remaining());
+        ModelPort.ModelConfiguration configuration = boundedConfiguration(prompt, deadlineRemaining);
         ModelPort.ModelRequest stateRequest = new ModelPort.ModelRequest(
                 configuration, new ModelPort.PromptPayload(INSTRUCTIONS, "summary-v1"),
                 List.of(new ModelMessage(ModelRole.USER,
@@ -499,24 +511,28 @@ public final class HttpSummaryModel implements SummaryModel {
     }
 
     /**
-     * 重新计算 Turn 绝对预算，避免本地编码耗时延长 Provider IO 的许可窗口。
+     * 仅在宿主显式提供绝对 Turn Deadline 时计算剩余预算；requestTimeout 始终保留为网络空闲上限。
      */
-    private Duration remaining() {
-        Duration value = Duration.between(clock.instant(), binding.deadline());
-        if (value.compareTo(Duration.ofMillis(1)) < 0) {
-            throw failure("summary model deadline expired");
-        }
-        return value;
+    private Optional<Duration> remaining() {
+        return binding.deadline().map(deadline -> {
+            Duration value = Duration.between(clock.instant(), deadline);
+            if (value.compareTo(Duration.ofMillis(1)) < 0) {
+                throw failure("summary model deadline expired");
+            }
+            return value;
+        });
     }
 
     /**
-     * 在保留冻结 Provider/Model 与配置代际的前提下，只派生更严格的 Deadline 与输出上限。
+     * 保留冻结 Provider/Model 与配置代际；显式 Turn Deadline 可收紧网络超时，但不会扩大配置值。
      */
     private ModelPort.ModelConfiguration boundedConfiguration(
-            SummaryPrompt prompt, Duration remaining) {
+            SummaryPrompt prompt, Optional<Duration> deadlineRemaining) {
         ModelPort.ModelConfiguration source = binding.configuration();
-        Duration requestTimeout = minimum(source.requestTimeout(), remaining);
-        Duration connectTimeout = minimum(source.connectTimeout(), requestTimeout);
+        Duration requestTimeout = deadlineRemaining
+                .map(value -> minimum(source.requestTimeout(), value)).orElse(source.requestTimeout());
+        Duration connectTimeout = deadlineRemaining
+                .map(value -> minimum(source.connectTimeout(), value)).orElse(source.connectTimeout());
         ModelPort.GenerationOptions generation = source.generation();
         int output = generation.maxOutputTokens() == null
                 ? prompt.maxOutputTokens()

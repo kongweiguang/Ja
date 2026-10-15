@@ -547,5 +547,7 @@ pub enum UiEvent {
         ready: bool,
     },
     SetNotice(Option<String>),
+    /// 更新正在工作的阶段说明，不占用普通错误、操作反馈或底栏 notice。
+    SetWorkActivity(Option<String>),
     Shutdown,
 }

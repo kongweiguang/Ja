@@ -449,10 +449,12 @@ fn transcript_active_blocks(state: &UiState, width: usize) -> Vec<TranscriptBloc
             .and_then(|started| SystemTime::now().duration_since(started).ok())
             .map(|elapsed| elapsed.as_secs());
         lines.push(working_indicator_line(
+            state.work_activity(),
             state.panel().is_none()
                 && state.composer().is_empty()
                 && width >= WORKING_INLINE_HINT_MIN_WIDTH,
             elapsed.filter(|_| width >= 48),
+            width,
         ));
     } else if state.snapshot().turn_state == TurnState::Paused {
         lines.push(Line::default());
@@ -489,8 +491,13 @@ fn paused_indicator_line() -> Line<'static> {
     ))
 }
 
-/// 保留三点动效；用时取后台起点，窄窗优先留下取消按键，未来或无效时间不显示。
-fn working_indicator_line(show_cancel_hint: bool, elapsed: Option<u64>) -> Line<'static> {
+/// 保留“正在工作”、动效和用时；空间不足时先让出重复的行内 Esc，底栏仍显示取消键。
+fn working_indicator_line(
+    activity: Option<&str>,
+    show_cancel_hint: bool,
+    elapsed: Option<u64>,
+    width: usize,
+) -> Line<'static> {
     let phase = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -499,8 +506,40 @@ fn working_indicator_line(show_cancel_hint: bool, elapsed: Option<u64>) -> Line<
     let active_dot = phase % 3;
     let mut spans = vec![
         Span::styled("• ", Style::default().fg(theme::TEXT)),
-        Span::styled("正在工作 ", Style::default().fg(MUTED)),
+        Span::styled("正在工作", Style::default().fg(MUTED)),
     ];
+    let elapsed_text = elapsed.map(|seconds| format!(" · {}", work_duration(seconds)));
+    let base_fixed_width = 2
+        + UnicodeWidthStr::width("正在工作")
+        + 4
+        + elapsed_text
+            .as_deref()
+            .map(|text| UnicodeWidthStr::width(text))
+            .unwrap_or_default();
+    let mut cancel_text = show_cancel_hint.then_some(" · Esc 中断");
+    if let Some(activity) = activity {
+        let activity_width = UnicodeWidthStr::width(activity);
+        let with_cancel_width = base_fixed_width
+            + 3
+            + activity_width
+            + cancel_text.map(UnicodeWidthStr::width).unwrap_or_default();
+        if cancel_text.is_some() && with_cancel_width > width {
+            cancel_text = None;
+        }
+    }
+    let fixed_width =
+        base_fixed_width + cancel_text.map(UnicodeWidthStr::width).unwrap_or_default();
+    if let Some(activity) = activity {
+        let status_width = width.saturating_sub(fixed_width + 3);
+        if status_width > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                truncate_cells(activity, status_width),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+    spans.push(Span::raw(" "));
     for index in 0..3 {
         let color = if index as u128 == active_dot {
             theme::BLUE
@@ -509,14 +548,11 @@ fn working_indicator_line(show_cancel_hint: bool, elapsed: Option<u64>) -> Line<
         };
         spans.push(Span::styled(".", Style::default().fg(color)));
     }
-    if let Some(seconds) = elapsed {
-        spans.push(Span::styled(
-            format!(" · {}", work_duration(seconds)),
-            Style::default().fg(MUTED),
-        ));
+    if let Some(elapsed) = elapsed_text {
+        spans.push(Span::styled(elapsed, Style::default().fg(MUTED)));
     }
-    if show_cancel_hint {
-        spans.push(Span::styled(" · Esc 中断", Style::default().fg(MUTED)));
+    if let Some(cancel) = cancel_text {
+        spans.push(Span::styled(cancel, Style::default().fg(MUTED)));
     }
     Line::from(spans)
 }
@@ -872,6 +908,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, plan: &Re
 /// 身份、用量与操作反馈各有固定位置；空闲帮助也留在操作行，避免挤占会话身份。
 /// 矮窗先让用量退出；刷新入口让位于审批和恢复反馈，不能用计量错误覆盖聊天操作。
 /// 消息详情按可用列数缩短复制提示，避免支持键被底栏截断。
+/// 压缩重试时普通 notice 占位仍保留 Esc 中断，避免行内优先级调整后丢失唯一取消提示。
 /// @author kongweiguang
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     if area.width == 0 || area.height == 0 {
@@ -948,7 +985,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         return;
     }
     if let Some(notice) = snapshot.notice.as_deref() {
-        if let Some(hint) = notice_panel_hint(state, area.width) {
+        let compaction_can_cancel = state.work_activity().is_some()
+            && snapshot.turn_state == TurnState::Working
+            && state.panel().is_none()
+            && state.composer().is_empty();
+        if compaction_can_cancel {
+            render_status_message(frame, area, notice, "Esc 中断");
+        } else if let Some(hint) = notice_panel_hint(state, area.width) {
             render_status_message(frame, area, notice, hint);
         } else {
             frame.render_widget(

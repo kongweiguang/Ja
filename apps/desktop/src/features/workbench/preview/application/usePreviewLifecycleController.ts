@@ -89,7 +89,7 @@ export interface PreviewLifecycleController {
   workspaceLifecycle: PreviewWorkspaceLifecycle | undefined;
 }
 
-/** 同一 WebView generation 的终态优先于迟到 loading 快照，同时保留最新历史与标题字段。 */
+/** 同代际 loading 早于已提交终态，整体保留终态以免迟到回读同时倒退标题、URL 与历史能力。 */
 function mergePreviewSnapshot(
   current: PreviewSessionSnapshot,
   next: PreviewSessionSnapshot,
@@ -103,7 +103,7 @@ function mergePreviewSnapshot(
     next.load_status !== "loading"
   )
     return next;
-  return { ...next, load_status: current.load_status };
+  return current;
 }
 
 /** 终态事实未越过当前导航起点时，仍属于旧页面，不能结束新 intent。 */

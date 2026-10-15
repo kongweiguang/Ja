@@ -18,7 +18,7 @@ use ja_runtime::app_server_process::{
     UsageProtocolError, parse_thread_context_usage,
     parse_thread_usage_summary as parse_shared_thread_usage_summary,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
@@ -622,7 +622,30 @@ pub struct ThreadReadResult {
     pub context_usage: Option<ThreadContextUsageDto>,
     pub input_queue: Option<InputQueueDto>,
     pub live_stream: Option<LiveStreamDto>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub context_compaction: Option<ContextCompactionStatusDto>,
     pub next_cursor: Option<String>,
+}
+
+/// 只投影当前压缩请求的稳定身份与序号，不把摘要正文或错误细节带进 thread/read。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextCompactionStatusDto {
+    pub compaction_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub turn_id: Option<String>,
+    pub retry_attempt: u64,
+}
+
+/// 对 nullable DTO 字段要求 wire 显式携带 null，避免 Option 把缺字段与 null 合并。
+///
+/// @author kongweiguang
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// 字符偏移以 Unicode code point 计数，renderer 可按 nextOffsetCharacters 原样请求下一页。
@@ -1147,6 +1170,8 @@ pub(crate) fn parse_item_content_read(
 /// 解析权威 snapshot；先检查嵌套判别联合与必需 nullable 字段，再反序列化 typed DTO。
 /// 这样无计量时显式 `contextUsage:null` 可恢复，而缺失 `changeSet/completedAt/errorCode` 不会被
 /// `Option` 静默当成同一种语义；失败日志只记录稳定阶段，不包含正文或 raw payload。
+///
+/// @author kongweiguang
 pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, RuntimeCommandError> {
     let object = value
         .as_object()
@@ -1162,6 +1187,7 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
                     "contextUsage",
                     "inputQueue",
                     "liveStream",
+                    "contextCompaction",
                     "nextCursor",
                 ],
             )
@@ -1250,6 +1276,10 @@ pub(crate) fn parse_thread_read(value: Value) -> Result<ThreadReadResult, Runtim
     if let Some(stream) = &result.live_stream {
         validate_live_stream(stream, &result.turns)
             .map_err(|_| history_response_rejected("thread_read_live_stream_semantics"))?;
+    }
+    if let Some(compaction) = &result.context_compaction {
+        validate_context_compaction(compaction, &result.turns)
+            .map_err(|_| history_response_rejected("thread_read_context_compaction_semantics"))?;
     }
     let encoded = serde_json::to_vec(&result.items)
         .map_err(|_| history_response_rejected("thread_read_encode"))?;
@@ -2071,6 +2101,34 @@ fn validate_live_stream(
     }
     if !stream.segments.is_empty() && previous_end != Some(stream.stream_seq) {
         return Err(RuntimeCommandError::unavailable());
+    }
+    Ok(())
+}
+
+/// 压缩快照必须使用合法标识和正请求序号；Turn 压缩只可恢复到本页仍活动的原生执行。
+///
+/// @author kongweiguang
+fn validate_context_compaction(
+    compaction: &ContextCompactionStatusDto,
+    turns: &[ThreadSnapshotTurnDto],
+) -> Result<(), RuntimeCommandError> {
+    validate_prefixed(&compaction.compaction_id, "cmp_", 100)
+        .map_err(|_| RuntimeCommandError::unavailable())?;
+    if compaction.retry_attempt == 0 || compaction.retry_attempt > MAX_SAFE_INTEGER {
+        return Err(RuntimeCommandError::unavailable());
+    }
+    if let Some(turn_id) = &compaction.turn_id {
+        validate_prefixed(turn_id, "turn_", 101).map_err(|_| RuntimeCommandError::unavailable())?;
+        let owner_is_manageable = turns.iter().any(|turn| {
+            turn.turn_id == *turn_id
+                && matches!(
+                    turn.status.as_str(),
+                    "queued" | "running" | "waiting_input" | "waiting_approval" | "suspended"
+                )
+        });
+        if !owner_is_manageable {
+            return Err(RuntimeCommandError::unavailable());
+        }
     }
     Ok(())
 }

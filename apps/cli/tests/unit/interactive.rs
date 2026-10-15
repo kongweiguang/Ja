@@ -7,6 +7,7 @@ mod controller {
 
     mod regression {
         use super::interactive::{fork_recovery, plan_recovery};
+        use super::work_activity::{ContextCompactionStatus, WorkActivity};
         use super::{
             CliError, ThreadContext, args, interactive, preference_recovery, queue_recovery,
             suspended_recovery, usage,
@@ -23,6 +24,77 @@ mod controller {
         use serde_json::{Value, json};
         use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
+
+        /// 压缩快照恢复当前请求序号，重试事件与终态仅作用于对应 compaction。
+        #[test]
+        fn compaction_activity_tracks_retry_and_authoritative_snapshot() {
+            assert_eq!(
+                interactive::initial_context_compaction(false, &Value::Null).unwrap(),
+                None
+            );
+            assert!(interactive::initial_context_compaction(true, &json!({})).is_err());
+            assert_eq!(
+                interactive::initial_context_compaction(true, &json!({"contextCompaction": null}))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                interactive::initial_context_compaction(
+                    true,
+                    &json!({
+                        "contextCompaction": {
+                            "compactionId": "cmp_active",
+                            "turnId": null,
+                            "retryAttempt": 1
+                        }
+                    })
+                )
+                .unwrap(),
+                Some(ContextCompactionStatus {
+                    compaction_id: "cmp_active".into(),
+                    turn_id: None,
+                    retry_attempt: 1,
+                })
+            );
+            assert!(
+                interactive::initial_context_compaction(
+                    true,
+                    &json!({
+                        "contextCompaction": {
+                            "compactionId": "cmp_invalid",
+                            "turnId": null,
+                            "retryAttempt": 0
+                        }
+                    })
+                )
+                .is_err()
+            );
+
+            let mut activity = WorkActivity::default();
+            activity.started("cmp_active".into(), Some("turn_active".into()));
+            assert_eq!(activity.status_text().as_deref(), Some("正在压缩上下文"));
+            assert!(!activity.retry_started("turn_other", 2));
+            assert!(activity.retry_started("turn_active", 2));
+            assert_eq!(
+                activity.status_text().as_deref(),
+                Some("摘要重试 · 第 2 次请求")
+            );
+            assert!(!activity.finish("cmp_old"));
+
+            activity.restore(Some(ContextCompactionStatus {
+                compaction_id: "cmp_active".into(),
+                turn_id: Some("turn_active".into()),
+                retry_attempt: 3,
+            }));
+            assert_eq!(
+                activity.status_text().as_deref(),
+                Some("摘要重试 · 第 3 次请求")
+            );
+            assert!(activity.finish("cmp_active"));
+            assert_eq!(activity.status_text(), None);
+            activity.restore(None);
+            assert_eq!(activity.status_text(), None);
+        }
 
         /// @author kongweiguang
         /// Fake port 暴露 operation/read 与提交次数，固定核对恢复顺序和原 tuple 重放身份。

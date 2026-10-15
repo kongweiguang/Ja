@@ -175,6 +175,7 @@ pub struct UiState {
     pub(super) transcript: RefCell<Transcript>,
     older_page_loading: bool,
     older_page_failed: bool,
+    work_activity: Option<String>,
     stream_progress: HashMap<String, StreamProgress>,
     stream_receipts: VecDeque<StreamReceipt>,
     welcome_visible: bool,
@@ -238,6 +239,7 @@ impl UiState {
             transcript: RefCell::new(Transcript::default()),
             older_page_loading: false,
             older_page_failed: false,
+            work_activity: None,
             stream_progress: HashMap::new(),
             stream_receipts: VecDeque::new(),
             welcome_visible: false,
@@ -344,6 +346,11 @@ impl UiState {
     /// 分页重试属于原请求的继续，底栏需要区别于其它 F5 权威状态核实操作。
     pub(super) fn older_history_failed(&self) -> bool {
         self.older_page_failed
+    }
+
+    /// 阶段文字只附加在活动 Turn 的原状态行，避免压缩进度覆盖更高优先级 notice。
+    pub(super) fn work_activity(&self) -> Option<&str> {
+        self.work_activity.as_deref()
     }
 
     /// 鼠标坐标只由当前 RenderPlan 对应的正文视口解释，覆盖层不把动作透传到背后对话。
@@ -690,6 +697,7 @@ impl UiState {
                     _ => None,
                 });
                 if thread_changed {
+                    self.work_activity = None;
                     self.tool_choices.clear();
                     self.tool_detail_return_id = None;
                     self.active_query_id = None;
@@ -1343,6 +1351,9 @@ impl UiState {
                     self.cancellation = CancellationState::Idle;
                 }
                 self.snapshot.notice = notice.map(|value| sanitize_text(&value, 1024));
+            }
+            UiEvent::SetWorkActivity(activity) => {
+                self.work_activity = activity.map(|value| sanitize_text(&value, 256));
             }
             UiEvent::Shutdown => {
                 self.finalize_all_streams();

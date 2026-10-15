@@ -535,66 +535,6 @@
   padding: 0.9rem;
 }
 
-/** basename 歧义选择共用 Dialog Portal，候选保留工作区相对路径并可键盘逐项打开。 */
-.ja-open-target-dialog {
-  display: grid;
-  gap: 0.75rem;
-  padding: 1rem;
-}
-.ja-open-target-dialog h2 {
-  margin: 0;
-  font-size: var(--ja-text-title-size);
-  font-weight: var(--ja-weight-semibold);
-  line-height: var(--ja-line-heading);
-}
-.ja-open-target-dialog p {
-  margin: 0;
-  color: var(--ja-foreground-muted);
-  font-size: var(--ja-text-control-size);
-  line-height: var(--ja-line-control);
-}
-.ja-open-target-candidates {
-  display: grid;
-  max-height: min(22rem, 48vh);
-  gap: 0.25rem;
-  overflow: auto;
-  padding: 0.15rem;
-}
-.ja-open-target-candidates button {
-  min-width: 0;
-  border: 1px solid transparent;
-  border-radius: var(--ja-radius-sm);
-  padding: 0.48rem 0.58rem;
-  color: var(--ja-foreground);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-.ja-open-target-candidates button:hover,
-.ja-open-target-candidates button:focus-visible {
-  border-color: var(--ja-border-strong);
-  background: var(--ja-surface-muted);
-  outline: 0;
-}
-.ja-open-target-candidates code {
-  overflow-wrap: anywhere;
-  font: var(--ja-text-control-size) / var(--ja-line-control) var(--ja-font-mono);
-}
-.ja-open-target-actions {
-  display: flex;
-  justify-content: flex-end;
-  border-top: 1px solid var(--ja-border);
-  padding-top: 0.65rem;
-}
-.ja-open-target-actions button {
-  min-height: 2rem;
-  border: 1px solid var(--ja-border-strong);
-  border-radius: var(--ja-radius-sm);
-  padding: 0.3rem 0.7rem;
-  color: var(--ja-foreground);
-  background: var(--ja-surface-muted);
-  cursor: pointer;
-}
 .ja-files-save-as-dialog label {
   color: var(--ja-foreground);
   font-size: var(--ja-text-control-size);

@@ -13,8 +13,8 @@ import java.util.Iterator;
 import java.util.Set;
 
 /**
- * 复用生产端的 {@code thread/read} 活动流跨字段约束；JSON Schema 只能描述单字段形态，不能
- * 证明 Turn 归属、公开序号连续或恢复文本仍在同一预算内。
+ * 复用生产端的 {@code thread/read} 活动流和压缩状态跨字段约束；JSON Schema 不能证明 Turn 归属、
+ * 公开序号连续或瞬态状态仍绑定当前 Thread snapshot。
  */
 public final class ThreadReadContract {
     private static final long MAX_SAFE_INTEGER = 9_007_199_254_740_991L;
@@ -23,6 +23,7 @@ public final class ThreadReadContract {
     private static final Set<String> STREAM_FIELDS = Set.of("turnId", "streamSeq", "segments");
     private static final Set<String> SEGMENT_FIELDS = Set.of(
             "kind", "segmentStartSeq", "streamSeq", "text", "occurredAt");
+    private static final Set<String> COMPACTION_FIELDS = Set.of("compactionId", "turnId", "retryAttempt");
 
     /**
      * 仅提供无状态合同函数，禁止实例化后误存放运行会话。
@@ -88,6 +89,48 @@ public final class ThreadReadContract {
     public static void requireValidLiveStream(JsonNode result) {
         if (!isValidLiveStream(result)) {
             throw new IllegalStateException("thread/read live stream violates recovery contract");
+        }
+    }
+
+    /**
+     * 校验 nullable 压缩快照；turnId 非空时只能指向本页中仍活动的同一 Turn。
+     *
+     * @author kongweiguang
+     */
+    public static boolean isValidContextCompaction(JsonNode result) {
+        if (result == null || !result.isObject() || !result.has("contextCompaction")) {
+            return false;
+        }
+        JsonNode compaction = result.get("contextCompaction");
+        if (compaction == null || compaction.isNull()) {
+            return true;
+        }
+        if (!compaction.isObject() || !exactFields(compaction, COMPACTION_FIELDS)) {
+            return false;
+        }
+        String compactionId = text(compaction, "compactionId");
+        JsonNode turnIdNode = compaction.get("turnId");
+        long retryAttempt = boundedLong(compaction.get("retryAttempt"), 1);
+        if (compactionId == null || compactionId.length() > 100 || !validIdentifier(compactionId, "cmp_")
+                || turnIdNode == null || retryAttempt < 1) {
+            return false;
+        }
+        if (turnIdNode.isNull()) {
+            return true;
+        }
+        String turnId = turnIdNode.isTextual() ? turnIdNode.textValue() : null;
+        return turnId != null && validIdentifier(turnId, "turn_")
+                && turnsOwnerActive(result.get("turns"), turnId);
+    }
+
+    /**
+     * Handler 发送前以同一生产规则拒绝旧或不完整的瞬态状态，避免重连读取复活已结束进度。
+     *
+     * @author kongweiguang
+     */
+    public static void requireValidContextCompaction(JsonNode result) {
+        if (!isValidContextCompaction(result)) {
+            throw new IllegalStateException("thread/read context compaction violates recovery contract");
         }
     }
 

@@ -66,6 +66,45 @@ describe("MarkdownMessage destinations", () => {
     );
   });
 
+  /** 同名短标签用完整路径提示区分；URI 与盘符目标仍保留独立行列且渲染不发起 IO。 */
+  it.each([
+    [
+      "file URI",
+      "[说明.txt](file:///C:/repo/%E6%96%87%E6%A1%A3%20A/%E8%AF%B4%E6%98%8E.txt#L12C3) " +
+        "[说明.txt](file:///C:/repo/%E6%96%87%E6%A1%A3%20B/%E8%AF%B4%E6%98%8E.txt#L4)",
+    ],
+    [
+      "absolute Windows path",
+      "[说明.txt](<C:/repo/文档 A/说明.txt:12:3>) " + "[说明.txt](<C:/repo/文档 B/说明.txt:4>)",
+    ],
+  ])(
+    "keeps same-label %s links distinct without resolving during render",
+    async (_format, content) => {
+      const onOpenFile = vi.fn();
+      render(<MarkdownMessage content={content} onOpenFile={onOpenFile} />);
+      const a = screen.getByRole("button", { name: "在 Ja 中打开路径 C:/repo/文档 A/说明.txt" });
+      const b = screen.getByRole("button", { name: "在 Ja 中打开路径 C:/repo/文档 B/说明.txt" });
+      expect(a).toHaveTextContent("说明.txt");
+      expect(b).toHaveTextContent("说明.txt");
+      expect(a).toHaveAttribute("title", expect.stringContaining("C:/repo/文档 A/说明.txt\n"));
+      expect(b).toHaveAttribute("title", expect.stringContaining("C:/repo/文档 B/说明.txt\n"));
+      expect(onOpenFile).not.toHaveBeenCalled();
+      await userEvent.click(a);
+      fireEvent.click(b, { ctrlKey: true });
+      expect(onOpenFile).toHaveBeenNthCalledWith(
+        1,
+        { path: "C:/repo/文档 A/说明.txt", line: 12, column: 3 },
+        a,
+      );
+      expect(onOpenFile).toHaveBeenNthCalledWith(
+        2,
+        { path: "C:/repo/文档 B/说明.txt", line: 4 },
+        b,
+        "explorer",
+      );
+    },
+  );
+
   it("opens web links only through an href-free button, never browser default navigation", async () => {
     const onOpenLink = vi.fn();
     render(<MarkdownMessage content="[site](https://example.test/path)" onOpenLink={onOpenLink} />);

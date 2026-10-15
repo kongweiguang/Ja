@@ -170,6 +170,13 @@ public final class ModelAdapterTestSupport {
                 .body(": delayed\r\n");
     }
 
+    /** 在超过单次读取空闲预算的响应中持续发送注释心跳，再写终态事件以覆盖活跃长流。 */
+    public static void heartbeatThenSse(Exchange exchange, String body, Duration duration) {
+        exchange.responseBuilder.code(200)
+                .setHeader("Content-Type", "text/event-stream; charset=utf-8")
+                .body(new HeartbeatThenSseBody(body, duration));
+    }
+
     /** 记录请求次数，并将每次真实 loopback 交换交给测试持有的 Responder。 */
     public static final class Loopback implements AutoCloseable {
         private final MockWebServer server;
@@ -283,6 +290,33 @@ public final class ModelAdapterTestSupport {
                     return;
                 }
             }
+        }
+    }
+
+    /** 提供有界的活跃 SSE 流，避免测试为总时长与读取空闲语义引入真实 Provider。 */
+    private record HeartbeatThenSseBody(String body, Duration duration) implements MockResponseBody {
+        /** 心跳间隔内长度未知，要求 MockWebServer 按流式方式发送内容。 */
+        @Override
+        public long getContentLength() {
+            return -1;
+        }
+
+        /** 周期性刷新注释帧，让客户端观察到活动，同时保留最终完整 Provider 事件。 */
+        @Override
+        public void writeTo(BufferedSink sink) throws IOException {
+            long end = System.nanoTime() + duration.toNanos();
+            while (System.nanoTime() < end) {
+                sink.writeUtf8(": keepalive\r\n\r\n");
+                sink.flush();
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("heartbeat fixture interrupted", interrupted);
+                }
+            }
+            sink.writeUtf8(body);
+            sink.flush();
         }
     }
 

@@ -104,7 +104,8 @@ final class AgentModelStep {
     }
 
     /**
-     * 强制压缩只改变规划意图；计量同时保留基础展示值与准入上界，借用 Runtime 由 Engine 在执行权周期结束后关闭。
+     * 强制压缩只改变规划意图；摘要沿用 Turn 取消和网络空闲约束，不能把网络超时投影成整次摘要的截止时间。
+     * 计量保留基础展示值与准入上界，借用 Runtime 由 Engine 在执行权周期结束后关闭。
      */
     @SuppressWarnings("PMD.CloseResource")
     private ContextOrchestrator.Execution<Void> prepare(boolean forceCompaction) {
@@ -120,7 +121,7 @@ final class AgentModelStep {
         AgentRequestContext context = new AgentRequestContext(host.identity(), runtime, services.mapper(), host.checkpoints(),
             host.cancellation(), services.clock(), () -> new ModelSummaryGenerator.RequestRuntime(
             new SummaryModel.TurnBinding(host.identity().threadId(), runtime.modelConfiguration(),
-                services.clock().instant().plus(runtime.modelConfiguration().requestTimeout()), host.cancellation()),
+                Optional.empty(), host.cancellation()),
             Optional.of(profile), () -> {
         }), host.summaryOperation());
         Map<PromptKey, FrozenRequest> candidates = new HashMap<>();

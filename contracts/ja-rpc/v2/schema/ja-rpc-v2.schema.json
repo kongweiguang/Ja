@@ -4806,6 +4806,35 @@
         }
       }
     },
+    "contextCompactionStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compactionId",
+        "turnId",
+        "retryAttempt"
+      ],
+      "properties": {
+        "compactionId": {
+          "$ref": "#/$defs/compactionId"
+        },
+        "turnId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/turnId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryAttempt": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
     "threadReadResult": {
       "type": "object",
       "additionalProperties": false,
@@ -4818,6 +4847,7 @@
         "inputQueue",
         "contextUsage",
         "liveStream",
+        "contextCompaction",
         "nextCursor"
       ],
       "properties": {
@@ -4874,6 +4904,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/liveStream"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contextCompaction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/contextCompactionStatus"
             },
             {
               "type": "null"

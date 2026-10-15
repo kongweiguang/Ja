@@ -575,7 +575,10 @@ describe("JA RPC v2 protocol", () => {
     ).toThrow();
   });
 
-  /** USER/Queue 摘要逐项跟随 attachment block，独立 snapshot item 与任意问题码均失败关闭。 */
+  /**
+   * @author kongweiguang
+   * USER/Queue 摘要逐项跟随 attachment block，独立 snapshot item 与任意问题码均失败关闭。
+   */
   it("keeps attachment summaries inside their owning user input", () => {
     const summary = {
       attachmentId: "att_capture",
@@ -630,6 +633,7 @@ describe("JA RPC v2 protocol", () => {
       contextUsage: null,
       taskActivities: [],
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);

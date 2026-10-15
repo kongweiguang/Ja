@@ -292,7 +292,11 @@ final class ActiveStreamRegistryTest {
         assertFalse(registry.hasActive("thr_terminal_fence"));
     }
 
-    /** queued Turn 与 running Turn 同时存在时，带公开流的运行 Turn 不能被空 queued 游标遮蔽。 */
+    /**
+     * 验证压缩事件也推进 Thread revision，避免 registry 的压缩快照与 Turn 流快照失去同一读取 fence。
+     *
+     * @author kongweiguang
+     */
     @Test
     void choosesRunningTurnOverQueuedTurn() {
         ActiveStreamRegistry registry = new ActiveStreamRegistry(9);
@@ -300,10 +304,10 @@ final class ActiveStreamRegistryTest {
         register(registry, "ws_queue", "turn_queued", "thr_queue", 10, 0, 0);
         registry.observe(state("turn_running", 10, TurnState.QUEUED, TurnState.RUNNING), T0);
         registry.observe(new TurnEvent.TextDelta("turn_running", 1, "running", MODEL_REQUEST_ID), T0);
-        registry.observeCompaction(new ContextCompactionEvent.Context(
+        registry.observeCompaction(new ContextCompactionEvent.Compacted(new ContextCompactionEvent.Context(
                 "evt_compaction", "ws_queue", "thr_queue", "turn_running", 11, T0,
                 "cmp_queue", ContextCompactionEvent.Trigger.AUTOMATIC, 10, 100L, 50L,
-                ContextCompactionEvent.STRATEGY_VERSION, 0L));
+                ContextCompactionEvent.STRATEGY_VERSION, 0L), "checkpoint_queue"));
         /* 压缩推进整个 Thread 水位；已登记的 queued 与 running 都必须能在新 revision 读取。 */
 
         Optional<ActiveStreamRegistry.Snapshot> result = registry.snapshot("thr_queue", 11,
@@ -317,6 +321,129 @@ final class ActiveStreamRegistryTest {
                 Map.of("turn_queued", 0L, "turn_running", 0L),
                 Map.of("turn_queued", 0, "turn_running", 0))
                 .orElseThrow().streamSeq());
+    }
+
+    /** 重连快照只恢复同 revision 的当前压缩；重试推进 attempt，终态与 Thread 删除同步清除。
+     * @author kongweiguang
+     */
+    @Test
+    void snapshotsContextCompactionAcrossRetryAndLifecycleBoundaries() {
+        ActiveStreamRegistry registry = new ActiveStreamRegistry(20);
+        register(registry, "turn_compaction", "thr_compaction", 9, 0, 0);
+        ContextCompactionEvent.Context started = new ContextCompactionEvent.Context(
+                "evt_compaction_started", "ws_registry", "thr_compaction", "turn_compaction", 10, T0,
+                "cmp_auto", ContextCompactionEvent.Trigger.AUTOMATIC, 9, 100L, null,
+                ContextCompactionEvent.STRATEGY_VERSION, 1L);
+        registry.observeCompaction(new ContextCompactionEvent.Started(started));
+
+        assertEquals(new ActiveStreamRegistry.ContextCompactionSnapshot("cmp_auto", "turn_compaction", 1),
+                registry.contextCompaction("thr_compaction", 10, Set.of("turn_compaction")).orElseThrow());
+        assertTrue(registry.contextCompaction("thr_compaction", 9, Set.of("turn_compaction")).isEmpty());
+
+        registry.observe(new TurnEvent.RetryStarted(new TurnEvent.Context(
+                "evt_summary_retry", "thr_compaction", "turn_compaction", 11, 1, T0.plusSeconds(1)), 2),
+                T0.plusSeconds(1));
+        assertTrue(registry.contextCompaction("thr_compaction", 10, Set.of("turn_compaction")).isEmpty());
+        assertEquals(new ActiveStreamRegistry.ContextCompactionSnapshot("cmp_auto", "turn_compaction", 2),
+                registry.contextCompaction("thr_compaction", 11, Set.of("turn_compaction")).orElseThrow());
+
+        registry.observe(new TurnEvent.Terminal(new TurnEvent.Context(
+                "evt_compaction_terminal", "thr_compaction", "turn_compaction", 12, 2, T0.plusSeconds(2)),
+                TurnState.CANCELLED, "cancelled", null, null, null, null, null), T0.plusSeconds(2));
+        assertTrue(registry.contextCompaction("thr_compaction", 12, Set.of()).isEmpty());
+
+        ContextCompactionEvent.Context manual = new ContextCompactionEvent.Context(
+                "evt_manual_compaction_started", "ws_registry", "thr_manual_compaction", null, 3, T0,
+                "cmp_manual", ContextCompactionEvent.Trigger.MANUAL, 2, 200L, null,
+                ContextCompactionEvent.STRATEGY_VERSION, null);
+        registry.observeCompaction(new ContextCompactionEvent.Started(manual));
+        registry.abandonStreams("thr_manual_compaction");
+        assertEquals(new ActiveStreamRegistry.ContextCompactionSnapshot("cmp_manual", null, 1),
+                registry.contextCompaction("thr_manual_compaction", 3, Set.of()).orElseThrow());
+
+        registry.observeCompaction(new ContextCompactionEvent.Failed(manual,
+                ContextCompactionEvent.ErrorCode.SUMMARY_FAILURE));
+        assertTrue(registry.contextCompaction("thr_manual_compaction", 3, Set.of()).isEmpty());
+
+        registry.observeCompaction(new ContextCompactionEvent.Started(new ContextCompactionEvent.Context(
+                "evt_manual_compaction_again", "ws_registry", "thr_manual_compaction", null, 4,
+                T0.plusSeconds(3), "cmp_manual_again", ContextCompactionEvent.Trigger.MANUAL, 3,
+                180L, null, ContextCompactionEvent.STRATEGY_VERSION, null)));
+        registry.clear();
+        assertTrue(registry.contextCompaction("thr_manual_compaction", 4, Set.of()).isEmpty());
+
+        registry.observeCompaction(new ContextCompactionEvent.Started(new ContextCompactionEvent.Context(
+                "evt_manual_compaction_third", "ws_registry", "thr_manual_compaction", null, 5,
+                T0.plusSeconds(4), "cmp_manual_third", ContextCompactionEvent.Trigger.MANUAL, 4,
+                160L, null, ContextCompactionEvent.STRATEGY_VERSION, null)));
+        registry.abandonThread("thr_manual_compaction");
+        assertTrue(registry.contextCompaction("thr_manual_compaction", 5, Set.of()).isEmpty());
+    }
+
+    /** 其他 durable Turn 提交推进压缩快照 revision，SQLite 终态还可补足丢失的 terminal 通知。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void followsTurnRevisionAndExpiresCompactionFromTerminalSnapshot() {
+        ActiveStreamRegistry registry = new ActiveStreamRegistry(21);
+        register(registry, "turn_compaction_revision", "thr_compaction_revision", 20, 0, 0);
+        ContextCompactionEvent.Context started = new ContextCompactionEvent.Context(
+                "evt_compaction_revision_started", "ws_registry", "thr_compaction_revision",
+                "turn_compaction_revision", 21, T0, "cmp_revision", ContextCompactionEvent.Trigger.AUTOMATIC,
+                19, 100L, null, ContextCompactionEvent.STRATEGY_VERSION, 1L);
+        registry.observeCompaction(new ContextCompactionEvent.Started(started));
+
+        registry.observe(new TurnEvent.StateChanged(new TurnEvent.Context(
+                "evt_unrelated_turn_commit", "thr_compaction_revision", "turn_unrelated", 22, 1,
+                T0.plusSeconds(1)), TurnState.QUEUED, TurnState.RUNNING), T0.plusSeconds(1));
+
+        assertEquals(new ActiveStreamRegistry.ContextCompactionSnapshot(
+                        "cmp_revision", "turn_compaction_revision", 1),
+                registry.contextCompaction("thr_compaction_revision", 22,
+                        Set.of("turn_compaction_revision")).orElseThrow());
+        registry.observeSnapshotTerminalTurns("thr_compaction_revision", 21,
+                Set.of("turn_compaction_revision"));
+        assertTrue(registry.contextCompaction("thr_compaction_revision", 22,
+                Set.of("turn_compaction_revision")).isPresent());
+
+        registry.observeTurnCommit("thr_compaction_revision", "turn_unrelated", 23, 1, 0,
+                null, T0.plusSeconds(2));
+        assertTrue(registry.contextCompaction("thr_compaction_revision", 23,
+                Set.of("turn_compaction_revision")).isPresent());
+        registry.observeSnapshotTerminalTurns("thr_compaction_revision", 22,
+                Set.of("turn_compaction_revision"));
+        assertTrue(registry.contextCompaction("thr_compaction_revision", 23,
+                Set.of("turn_compaction_revision")).isPresent());
+
+        registry.observeSnapshotTerminalTurns("thr_compaction_revision", 24,
+                Set.of("turn_compaction_revision"));
+        assertTrue(registry.contextCompaction("thr_compaction_revision", 24, Set.of()).isEmpty());
+    }
+
+    /** ProviderPending begin 可先提升 SQLite revision 而没有 Turn 事件；新快照要能恢复压缩，旧快照不能。
+     *
+     * @author kongweiguang
+     */
+    @Test
+    void exposesCompactionAfterUnobservedProviderPendingRevision() {
+        ActiveStreamRegistry registry = new ActiveStreamRegistry(22);
+        ContextCompactionEvent.Context started = new ContextCompactionEvent.Context(
+                "evt_provider_pending_started", "ws_registry", "thr_provider_pending", "turn_provider_pending",
+                30, T0, "cmp_provider_pending", ContextCompactionEvent.Trigger.AUTOMATIC, 29, 100L, null,
+                ContextCompactionEvent.STRATEGY_VERSION, 1L);
+        registry.observeCompaction(new ContextCompactionEvent.Started(started));
+
+        assertTrue(registry.contextCompaction("thr_provider_pending", 29,
+                Set.of("turn_provider_pending")).isEmpty());
+        assertTrue(registry.contextCompaction("thr_provider_pending", 31, Set.of()).isEmpty());
+        assertEquals(new ActiveStreamRegistry.ContextCompactionSnapshot(
+                        "cmp_provider_pending", "turn_provider_pending", 1),
+                registry.contextCompaction("thr_provider_pending", 31,
+                        Set.of("turn_provider_pending")).orElseThrow());
+
+        registry.observeSnapshotTerminalTurns("thr_provider_pending", 32, Set.of("turn_provider_pending"));
+        assertTrue(registry.contextCompaction("thr_provider_pending", 32, Set.of()).isEmpty());
     }
 
     /** 单个过长 delta 不切成伪造 seq；模型步骤提交后仍保留游标但可返回空 segment。 */

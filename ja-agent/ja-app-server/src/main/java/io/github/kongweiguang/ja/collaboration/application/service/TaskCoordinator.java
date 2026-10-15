@@ -1886,6 +1886,14 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         Objects.requireNonNull(downstream, "downstream");
         AtomicReference<Boolean> taskProjection = new AtomicReference<>();
         return new ConversationTurnEventSink() {
+            /** Keep the initiating RPC's registered workspace available to durable Turn lifecycle projection.
+             * @author kongweiguang
+             */
+            @Override
+            public java.util.Optional<String> workspaceId(AgentIdentity identity) {
+                return downstream.workspaceId(identity);
+            }
+
             /** 下游先接收原始事件，Task 投影随后只消费已确认的同一事件。 */
             @Override
             public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {

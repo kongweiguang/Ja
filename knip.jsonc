@@ -35,6 +35,8 @@
     "scripts/e2e/cli-fullscreen-acceptance.mjs",
     "scripts/e2e/cli-model-settings-acceptance.mjs",
     "scripts/e2e/cli-usage-acceptance.mjs",
+    "scripts/e2e/cli-existing-experience.mjs",
+    "scripts/e2e/cli-compaction-conpty.mjs",
     "scripts/e2e/desktop-model-settings-acceptance.mjs",
     // Settings/Workbench 真窗验收由维护者直接按 CLI 启动；fixture 由 MCP STDIO 参数再启动。
     "scripts/e2e/mcp-settings-webview2.mjs",

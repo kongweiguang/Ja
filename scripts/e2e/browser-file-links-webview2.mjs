@@ -350,6 +350,7 @@ export async function writeBrowserFileFixture(workspaceRoot) {
   const sourcePath = join(workspace, "src", "导航", "启动 模块.ts");
   const duplicateAPath = join(workspace, "文档 A", "重复 名称.txt");
   const duplicateBPath = join(workspace, "文档 B", "重复 名称.txt");
+  const duplicateRootPath = join(workspace, "重复 名称.txt");
   const externalPath = join(dirname(workspace), "工作区外 文件", "外部 只读说明.txt");
   const missingPath = join(workspace, "src", "缺失", "移动后 文件.ts");
   const contents = [
@@ -372,7 +373,8 @@ export async function writeBrowserFileFixture(workspaceRoot) {
     [textPath, `${FIXTURE_TEXT_MARKER}\nJa 本地文本文件应以只读内容页打开。\n`],
     [sourcePath, "export const first = true;\nexport const second = 2;\n"],
     [duplicateAPath, `${FIXTURE_DUPLICATE_A_MARKER}\n同名候选 A。\n`],
-    [duplicateBPath, `${FIXTURE_DUPLICATE_B_MARKER}\n同名候选 B。\n`],
+    [duplicateBPath, `${FIXTURE_DUPLICATE_B_MARKER}\n同名目标 B。\n`],
+    [duplicateRootPath, "JA_BROWSER_FILE_DUPLICATE_ROOT\n根目录同名目标。\n"],
     [externalPath, `${FIXTURE_TEXT_MARKER}\n该文件位于隔离 workspace 之外，应保持只读。\n`],
   ];
   await Promise.all(
@@ -407,6 +409,7 @@ export async function writeBrowserFileFixture(workspaceRoot) {
     sourcePath,
     duplicateAPath,
     duplicateBPath,
+    duplicateRootPath,
     externalPath,
     missingPath,
     directoryPath,
@@ -431,7 +434,7 @@ export async function writeBrowserFileFixture(workspaceRoot) {
   };
 }
 
-/** @author kongweiguang 返回真实文件引用语料，并加入目录目标验证普通点击的 Files 定位语义。 */
+/** @author kongweiguang 混合绝对路径与 URI 目标，验证短标签、行列和目录定位共用实际点击链路。 */
 export function buildAssistantFileReply(files) {
   return [
     "文件引用验收 fixture 已创建以下目标：",
@@ -448,7 +451,9 @@ export function buildAssistantFileReply(files) {
     `- 带行列定位的代码：\`${files.relativeSourcePath}#L2C4\``,
     `- 旧回复行列定位：\`${files.relativeSourcePath}:2:4\``,
     `- 纯行号定位：\`${files.relativeSourcePath}#L1\``,
-    `- 重名候选：\`重复 名称.txt\``,
+    `- 同名绝对链接 A：[重复 名称.txt](<${files.duplicateAPath.replaceAll("\\", "/")}:2:3>)`,
+    `- 同名绝对链接 B：[重复 名称.txt](${pathToFileURL(files.duplicateBPath).href})`,
+    `- 根目录精确引用：\`重复 名称.txt\``,
     `- 已删除的旧路径：\`${files.relativeMissingPath}\``,
     `- workspace 外部的 Windows 绝对路径：\`${files.externalPath}\``,
     `- workspace 外部的 file URL：[打开只读说明](${files.externalUrl})`,
@@ -1062,7 +1067,7 @@ function referenceLocation(value) {
     : { suffix: match.groups.suffix, line: Number(line) };
 }
 
-/** @author kongweiguang 按 canonical 路径匹配引用；菜单前缀统一描述目标路径，目标类型以真实打开结果验收。 */
+/** @author kongweiguang 历史快照可能只含预览；先通过真实全文入口展开，再按完整目标匹配，不能把截断误报为链接缺失。 */
 async function fileReference(
   page,
   message,
@@ -1072,6 +1077,11 @@ async function fileReference(
   expectedReference,
   expectedTargetKind = "file",
 ) {
+  const expand = message.getByRole("button", { name: "查看完整回复", exact: true });
+  if (await expand.isVisible()) {
+    await expand.click();
+    await expand.waitFor({ state: "detached" });
+  }
   const selector = "button.ja-markdown__file-link[data-file-reference]";
   const references = message.locator(selector);
   const values = await references.evaluateAll((nodes) =>
@@ -1326,27 +1336,30 @@ async function openDirectoryReference(page, message, files, deadline) {
   };
 }
 
-/** 用只有 basename 的旧式引用触发候选选择，并验证用户选中的 workspace 相对目标。 */
-async function openAmbiguousFileReference(page, message, files, deadline) {
-  const button = message
-    .locator("button.ja-markdown__file-link[data-file-reference]")
-    .filter({ hasText: "重复 名称.txt" });
-  await button.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  await button.click({ timeout: Math.max(1, deadline - Date.now()) });
-  const dialog = page.getByRole("dialog", { name: "选择要打开的文件", exact: true });
-  await dialog.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  const candidate = dialog.locator(`button[data-file-candidate="${files.relativeDuplicateAPath}"]`);
-  await candidate.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  await candidate.click({ timeout: Math.max(1, deadline - Date.now()) });
-  await dialog.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
-  return inspectFileDocument(
-    page,
-    files.duplicateAPath,
-    FIXTURE_DUPLICATE_A_MARKER,
-    false,
-    deadline,
-    files.workspace,
-  );
+/** 同名短标签用完整路径提示区分；盘符与 URI 精确打开且行列不能混入文件名。 */
+async function openDuplicateFileReferences(page, message, files, deadline) {
+  const cases = [
+    [files.duplicateAPath, FIXTURE_DUPLICATE_A_MARKER, { line: 2, column: 3 }],
+    [files.duplicateBPath, FIXTURE_DUPLICATE_B_MARKER],
+    [files.duplicateRootPath, "JA_BROWSER_FILE_DUPLICATE_ROOT"],
+  ];
+  const facts = [];
+  for (const [path, marker, reveal] of cases) {
+    const reference = await fileReference(page, message, path, files.workspace);
+    const titlePath = (await reference.locator.getAttribute("title"))?.split("\n")[0];
+    assert.equal(
+      canonicalFileDocumentPath(titlePath ?? "", files.workspace),
+      canonicalFileDocumentPath(path, files.workspace),
+      "same-label file hints must expose their exact target before opening",
+    );
+    await reference.locator.hover();
+    await openFileReference(page, message, files, path, "files", deadline);
+    facts.push(
+      await inspectFileDocument(page, path, marker, false, deadline, files.workspace, reveal),
+    );
+    assert.equal(await page.getByRole("dialog").count(), 0, "exact path must not open a chooser");
+  }
+  return facts;
 }
 
 /** @author kongweiguang 等待真实 App Server 与项目就绪，未自动选择时加入隔离 workspace。 */
@@ -1854,7 +1867,7 @@ async function inspectBrowserPreviewViewport(workbench) {
   });
 }
 
-/** 在 true Files editor wrapper 内读取只读标志和文字；不从文件路径本身推断权限结果。 */
+/** 在真实 Files editor 中等待异步定位后读取事实；复用已打开文件时不能把旧光标当本次结果。 */
 async function inspectFileDocument(
   page,
   expectedPath,
@@ -1899,47 +1912,62 @@ async function inspectFileDocument(
       `${String(error?.message ?? error)}; expected=${relative(workspaceRoot, expectedPath) || expectedPath}; observed=${JSON.stringify(observed)}`,
     );
   }
-  const facts = await wrapper.evaluate((node) => {
-    const active = document.activeElement;
-    const content = node.querySelector(".cm-content");
-    const activeLine = content?.querySelector(".cm-line.cm-activeLine");
-    const gutterLine = node.querySelector(".cm-gutterElement.cm-activeLineGutter");
-    const renderedLines = content === null ? [] : Array.from(content.querySelectorAll(".cm-line"));
-    const selection = document.getSelection();
-    let cursorColumn;
-    if (
-      activeLine !== null &&
-      selection?.anchorNode !== null &&
-      selection?.anchorNode !== undefined
-    ) {
-      if (activeLine.contains(selection.anchorNode)) {
-        const range = document.createRange();
-        range.selectNodeContents(activeLine);
-        range.setEnd(selection.anchorNode, selection.anchorOffset);
-        cursorColumn = range.toString().length + 1;
+  /** 路径 wrapper 可以先于 resolver ACK 就绪，每次从 CodeMirror 实际 selection 读取位置。 */
+  const readFacts = () =>
+    wrapper.evaluate((node) => {
+      const active = document.activeElement;
+      const content = node.querySelector(".cm-content");
+      const activeLine = content?.querySelector(".cm-line.cm-activeLine");
+      const gutterLine = node.querySelector(".cm-gutterElement.cm-activeLineGutter");
+      const renderedLines =
+        content === null ? [] : Array.from(content.querySelectorAll(".cm-line"));
+      const selection = document.getSelection();
+      let cursorColumn;
+      if (
+        activeLine !== null &&
+        selection?.anchorNode !== null &&
+        selection?.anchorNode !== undefined
+      ) {
+        if (activeLine.contains(selection.anchorNode)) {
+          const range = document.createRange();
+          range.selectNodeContents(activeLine);
+          range.setEnd(selection.anchorNode, selection.anchorOffset);
+          cursorColumn = range.toString().length + 1;
+        }
       }
-    }
-    const gutterNumber = Number.parseInt(gutterLine?.textContent?.trim() ?? "", 10);
-    return {
-      path: node.getAttribute("data-document-path"),
-      readOnly: node.getAttribute("data-document-read-only") === "true",
-      truncated: node.getAttribute("data-document-truncated"),
-      contentVisible: node.textContent?.trim().length > 0,
-      editorFocused: active !== null && node.contains(active),
-      editorPosition: {
-        activeLine:
-          Number.isInteger(gutterNumber) && gutterNumber > 0
-            ? gutterNumber
-            : activeLine === null
-              ? undefined
-              : renderedLines.indexOf(activeLine) + 1,
-        activeLineText: activeLine?.textContent?.trim(),
-        cursorColumn,
-      },
-    };
-  });
+      const gutterNumber = Number.parseInt(gutterLine?.textContent?.trim() ?? "", 10);
+      return {
+        path: node.getAttribute("data-document-path"),
+        readOnly: node.getAttribute("data-document-read-only") === "true",
+        truncated: node.getAttribute("data-document-truncated"),
+        contentVisible: node.textContent?.trim().length > 0,
+        editorFocused: active !== null && node.contains(active),
+        editorPosition: {
+          activeLine:
+            Number.isInteger(gutterNumber) && gutterNumber > 0
+              ? gutterNumber
+              : activeLine === null
+                ? undefined
+                : renderedLines.indexOf(activeLine) + 1,
+          activeLineText: activeLine?.textContent?.trim(),
+          cursorColumn,
+        },
+      };
+    });
+  let facts = await readFacts();
   if (expectedReveal !== undefined) {
     const expectedColumn = expectedReveal.column ?? 1;
+    await waitForCondition(
+      "file document line and column reveal",
+      async () => {
+        facts = await readFacts();
+        return (
+          facts.editorPosition.activeLine === expectedReveal.line &&
+          facts.editorPosition.cursorColumn === expectedColumn
+        );
+      },
+      wrapperDeadline,
+    );
     assert.equal(
       facts.editorPosition.activeLine,
       expectedReveal.line,
@@ -2488,30 +2516,6 @@ export async function runBrowserFileLinksWebView2({
     path: join(evidenceDirectory, "03b-explorer-keyboard-feedback.png"),
     animations: "disabled",
   });
-  // 重名 Explorer 意图必须说清楚将显示哪个文件；取消不得打开系统窗口或右栏。
-  const duplicateExplorerEntry = assistant
-    .locator('button.ja-markdown__file-link[data-file-reference="重复 名称.txt"]')
-    .first();
-  await duplicateExplorerEntry.click({
-    modifiers: ["Control"],
-    timeout: Math.max(1, deadline - Date.now()),
-  });
-  const explorerChoice = page.getByRole("dialog", {
-    name: "选择要在文件夹中定位的文件",
-    exact: true,
-  });
-  await explorerChoice.waitFor({ state: "visible", timeout: Math.max(1, deadline - Date.now()) });
-  await page.getByText("文件不存在或已被移动。", { exact: true }).waitFor({
-    state: "hidden",
-    timeout: Math.max(1, deadline - Date.now()),
-  });
-  await page.screenshot({
-    path: join(evidenceDirectory, "03c-explorer-duplicate-choice.png"),
-    animations: "disabled",
-  });
-  await explorerChoice.getByRole("button", { name: "取消" }).click();
-  await explorerChoice.waitFor({ state: "detached", timeout: Math.max(1, deadline - Date.now()) });
-  assert.equal(await page.getByRole("button", { name: "显示工作区面板" }).isVisible(), true);
   let explorerFolderVerified = false;
   if (verifyExplorerFolder) {
     await writeExplorerProgress(page, evidenceDirectory, "source-reference-lookup-start");
@@ -2814,13 +2818,13 @@ export async function runBrowserFileLinksWebView2({
     animations: "disabled",
   });
 
-  const duplicateFacts = await openAmbiguousFileReference(page, assistant, files, deadline);
+  const duplicateFacts = await openDuplicateFileReferences(page, assistant, files, deadline);
   assert.equal(
-    canonicalFileDocumentPath(duplicateFacts.path ?? "", files.workspace),
+    canonicalFileDocumentPath(duplicateFacts[0].path ?? "", files.workspace),
     canonicalFileDocumentPath(files.duplicateAPath, files.workspace),
   );
   await page.screenshot({
-    path: join(evidenceDirectory, "06-duplicate-file-choice.png"),
+    path: join(evidenceDirectory, "06-duplicate-exact-targets.png"),
     animations: "disabled",
   });
 
@@ -3349,11 +3353,10 @@ export async function runBrowserFileLinksWebView2({
     "02b-relative-html-source-in-files.png",
     "03-missing-file-feedback.png",
     "03b-explorer-keyboard-feedback.png",
-    "03c-explorer-duplicate-choice.png",
     "04-code-path-line-column.png",
     "04b-project-directory-in-files.png",
     "05-workspace-text-file.png",
-    "06-duplicate-file-choice.png",
+    "06-duplicate-exact-targets.png",
     "07-external-text-read-only.png",
     "08-image-browser-page.png",
     "08-image-browser-narrow.png",
@@ -3403,7 +3406,7 @@ export async function runBrowserFileLinksWebView2({
       missingPathCtrlClickReachedNativeExplorerCommand: true,
       missingPathCtrlClickKeptPanelHidden: explorerKeptPanelHidden,
       missingPathCtrlEnterReachedNativeExplorerCommand: true,
-      duplicateExplorerChoiceDisplayed: true,
+      duplicateTargetsOpenedWithoutChoice: duplicateFacts.length === 3,
       explorerFolderOpenedAndFileSelected: explorerFolderVerified,
       directoryOrdinaryClickSelectedInFiles: directoryFacts.selected,
       directoryClickNoBrowserTabCreated: directoryFacts.noBrowserTabCreated,
@@ -3465,8 +3468,8 @@ export async function runBrowserFileLinksWebView2({
       workspaceFileOpened: workspaceTextFacts.contentVisible,
       workspaceFilePath: workspaceTextFacts.path,
       workspaceFileReadOnly: workspaceTextFacts.readOnly,
-      duplicateBasenameDisambiguated:
-        canonicalFileDocumentPath(duplicateFacts.path ?? "", files.workspace) ===
+      duplicateAbsoluteTargetOpened:
+        canonicalFileDocumentPath(duplicateFacts[0].path ?? "", files.workspace) ===
         canonicalFileDocumentPath(files.duplicateAPath, files.workspace),
       externalFileReadOnly: externalTextFacts.readOnly,
       externalFileOutsideWorkspace: relative(files.workspace, files.externalPath).startsWith(".."),
@@ -3982,7 +3985,7 @@ export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.assistantTurn?.missingPathCtrlClickReachedNativeExplorerCommand, true);
   assert.equal(report?.assistantTurn?.missingPathCtrlClickKeptPanelHidden, true);
   assert.equal(report?.assistantTurn?.missingPathCtrlEnterReachedNativeExplorerCommand, true);
-  assert.equal(report?.assistantTurn?.duplicateExplorerChoiceDisplayed, true);
+  assert.equal(report?.assistantTurn?.duplicateTargetsOpenedWithoutChoice, true);
   assert.equal(report?.assistantTurn?.directoryOrdinaryClickSelectedInFiles, true);
   assert.equal(report?.assistantTurn?.directoryClickNoBrowserTabCreated, true);
   if (report?.fixture?.explorerFolderVerificationRequested) {
@@ -4090,7 +4093,7 @@ export function validateBrowserFileLinksReport(report) {
   assert.equal(report?.browser?.crossSchemeHistory?.forwardResolved, true);
   assert.equal(report?.browser?.crossSchemeHistory?.forwardRestoredLocalDocument, true);
   assert.equal(report?.textViewer?.workspaceFileOpened, true);
-  assert.equal(report?.textViewer?.duplicateBasenameDisambiguated, true);
+  assert.equal(report?.textViewer?.duplicateAbsoluteTargetOpened, true);
   assert.equal(report?.textViewer?.workspaceFileReadOnly, false);
   assert.equal(report?.textViewer?.sourceEditorFocused, true);
   assert.equal(report?.textViewer?.absoluteWindowsPathOpened, true);

@@ -113,6 +113,20 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
     }
 
     /**
+     * 记录摘要协议失败时只输出稳定身份、错误码和 cause 类别，不触碰请求、URL、响应正文或异常文本。
+     */
+    public static void logSummaryProviderFailure(String threadId, ModelPort.ModelConfiguration configuration,
+                                                 ProviderProtocolException failure) {
+        Objects.requireNonNull(threadId, "threadId");
+        Objects.requireNonNull(configuration, "configuration");
+        ProviderProtocolException classified = terminalFailure(Objects.requireNonNull(failure, "failure"));
+        LOGGER.warn("Provider request stopped threadId={} purpose=SUMMARY providerId={} modelId={} api={} "
+                        + "provider_failure_code={} terminal_error_code={} underlying_cause_category={}",
+                threadId, configuration.providerId(), configuration.modelId(), configuration.api(),
+                failure.code(), classified.terminalErrorCode(), safeFailureCategory(classified));
+    }
+
+    /**
      * 投影 Throwable cause 链为固定类别，避免请求日志接触可能含 URL、响应正文或凭据的异常文本。
      */
     static String safeFailureCategory(Throwable failure) {
@@ -202,7 +216,7 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
 
     /**
      * 单一 HTTP exchange owner 统一 Call/Response 注册、错误映射和资源释放，并把响应读取超时映射为
-     * 可重试的空闲超时，避免将它和服务端拒绝或结构损坏混为一类。
+     * 可重试的空闲超时。HTTP 失败只记录数字状态和受限错误码，避免诊断只剩泛化的不可用分类。
      */
     private static <T> T executeHttp(
             OkHttpClient client, Request request, RequestController controller,
@@ -225,8 +239,14 @@ public abstract class AbstractStreamingModelAdapter implements ModelAdapter {
             streamBound = true;
             if (!response.isSuccessful()) {
                 JsonNode error = readErrorBody(response);
-                throw classifyHttpFailure(response.code(),
+                RuntimeException failure = classifyHttpFailure(response.code(),
                         errorMapper.map(response.code(), response.headers(), error));
+                if (failure instanceof ProviderProtocolException provider) {
+                    LOGGER.warn("Provider HTTP response rejected http_status={} provider_failure_code={} "
+                                    + "terminal_error_code={}",
+                            response.code(), provider.code(), provider.terminalErrorCode());
+                }
+                throw failure;
             }
             T value;
             try {

@@ -46,7 +46,7 @@ function thread(threadId = "thr_fixture") {
   };
 }
 
-/** 正文预览的 code-point 长度与 nullable source identity 都是 thread/read 的权威字段。 */
+/** 正文预览、nullable source identity 与无活动压缩的 null 都是 thread/read 权威字段。 */
 function snapshot() {
   return {
     threadId: "thr_fixture",
@@ -113,6 +113,7 @@ function snapshot() {
     inputQueue: null,
     taskActivities: [],
     liveStream: null,
+    contextCompaction: null,
     nextCursor: null,
   };
 }

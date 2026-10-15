@@ -449,6 +449,8 @@ fn thread_read_requires_snapshot_cursor_shape() {
 }
 
 /// 可扩展 item object 不能夹带 credential field 到 WebView。
+///
+/// @author kongweiguang
 #[test]
 fn thread_read_rejects_private_item_fields() {
     let result = json!({
@@ -459,12 +461,15 @@ fn thread_read_rejects_private_item_fields() {
         "inputQueue": null,
         "contextUsage": null,
         "liveStream": null,
+        "contextCompaction": null,
         "nextCursor": null
     });
     assert!(parse_thread_read(result).is_err());
 }
 
 /// 跨会话消息作为独立历史事实保留来源标题快照；缺失来源或混入其它字段必须关闭失败。
+///
+/// @author kongweiguang
 #[test]
 fn thread_read_accepts_strict_thread_message_items() {
     let mut result = json!({
@@ -487,6 +492,7 @@ fn thread_read_accepts_strict_thread_message_items() {
         "contextUsage": null,
         "inputQueue": null,
         "liveStream": null,
+        "contextCompaction": null,
         "nextCursor": null
     });
     let parsed = parse_thread_read(result.clone()).expect("thread message item");
@@ -503,6 +509,8 @@ fn thread_read_accepts_strict_thread_message_items() {
 }
 
 /// 该 fixture 镜像当前 JA-RPC snapshot：必需 nullable 字段和正文计量完整，Tool 只携带安全 presentation。
+///
+/// @author kongweiguang
 fn thread_read_snapshot_fixture() -> serde_json::Value {
     json!({
         "threadId": "thr_demo",
@@ -609,12 +617,15 @@ fn thread_read_snapshot_fixture() -> serde_json::Value {
             "contextEstimate": null
         },
         "liveStream": null,
+        "contextCompaction": null,
         "nextCursor": null
     })
 }
 
 /// 冷启动恢复必须接受包含 `changeSet` 与精确 Usage 的当前快照；缺失必需 nullable 字段与
 /// 绝对文件路径仍应关闭失败，旧 Turn runtime 快照不再作为恢复事实。
+///
+/// @author kongweiguang
 #[test]
 fn thread_read_accepts_snapshot_and_preserves_required_nulls() {
     let fixture = thread_read_snapshot_fixture();
@@ -647,6 +658,13 @@ fn thread_read_accepts_snapshot_and_preserves_required_nulls() {
         .remove("contextUsage");
     assert!(parse_thread_read(missing_context_usage).is_err());
 
+    let mut missing_context_compaction = fixture.clone();
+    missing_context_compaction
+        .as_object_mut()
+        .expect("thread read object")
+        .remove("contextCompaction");
+    assert!(parse_thread_read(missing_context_compaction).is_err());
+
     let mut missing_change_set = fixture.clone();
     missing_change_set["turns"][0]
         .as_object_mut()
@@ -676,6 +694,53 @@ fn thread_read_accepts_snapshot_and_preserves_required_nulls() {
     let mut absolute_path = fixture;
     absolute_path["turns"][0]["changeSet"]["files"][0]["path"] = json!("C:/private/main.rs");
     assert!(parse_thread_read(absolute_path).is_err());
+}
+
+/// Retry attempt 和 Turn owner 是恢复状态的一部分；严格 parser 拒绝缺字段、坏 attempt 与终态 owner。
+///
+/// @author kongweiguang
+#[test]
+fn thread_read_validates_context_compaction_snapshot() {
+    let mut fixture = thread_read_snapshot_fixture();
+    fixture["turns"][0]["status"] = json!("running");
+    fixture["turns"][0]["completedAt"] = Value::Null;
+    fixture["turns"][0]["changeSet"] = Value::Null;
+    fixture["contextCompaction"] = json!({
+        "compactionId": "cmp_auto",
+        "turnId": "turn_demo",
+        "retryAttempt": 2
+    });
+    let parsed = parse_thread_read(fixture.clone()).expect("active summary retry snapshot");
+    let compaction = parsed.context_compaction.expect("context compaction status");
+    assert_eq!(compaction.compaction_id, "cmp_auto");
+    assert_eq!(compaction.turn_id.as_deref(), Some("turn_demo"));
+    assert_eq!(compaction.retry_attempt, 2);
+
+    let mut zero_attempt = fixture.clone();
+    zero_attempt["contextCompaction"]["retryAttempt"] = json!(0);
+    assert!(parse_thread_read(zero_attempt).is_err());
+
+    let mut terminal_owner = fixture.clone();
+    terminal_owner["turns"][0]["status"] = json!("completed");
+    assert!(parse_thread_read(terminal_owner).is_err());
+
+    let mut missing_turn_id = fixture.clone();
+    missing_turn_id["contextCompaction"]
+        .as_object_mut()
+        .expect("compaction object")
+        .remove("turnId");
+    assert!(parse_thread_read(missing_turn_id).is_err());
+
+    let mut manual = fixture;
+    manual["contextCompaction"]["turnId"] = Value::Null;
+    let parsed_manual = parse_thread_read(manual).expect("manual compaction has nullable turn id");
+    assert_eq!(
+        parsed_manual
+            .context_compaction
+            .expect("manual compaction")
+            .turn_id,
+        None
+    );
 }
 
 /// Snapshot 与 Timeline 使用全局 item 身份和 Thread/Turn/call 复合关联，保留 Provider 原生 callId。
@@ -795,6 +860,8 @@ fn thread_read_validates_live_stream_baseline_and_utf8_budget() {
 
 /// 新建 Thread 在首条消息前会返回完全空的 Timeline；该合法产品态不能因只测过有内容 fixture
 /// 而被 Rust 严格解析器误判为 runtime unavailable。
+///
+/// @author kongweiguang
 #[test]
 fn thread_read_accepts_a_new_empty_thread_snapshot() {
     let parsed = parse_thread_read(serde_json::json!({
@@ -806,6 +873,7 @@ fn thread_read_accepts_a_new_empty_thread_snapshot() {
         "contextUsage": null,
         "inputQueue": null,
         "liveStream": null,
+        "contextCompaction": null,
         "nextCursor": null
     }))
     .expect("new empty thread snapshot");

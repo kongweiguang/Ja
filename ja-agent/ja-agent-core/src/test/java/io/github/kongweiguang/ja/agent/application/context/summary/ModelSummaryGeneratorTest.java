@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class ModelSummaryGeneratorTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-08-25T12:00:00Z"), ZoneOffset.UTC);
     private static final SummaryModel.TurnBinding BINDING = new SummaryModel.TurnBinding(
-            "thread-1", configuration(), Instant.parse("2026-08-25T12:05:00Z"), CancellationToken.none());
+            "thread-1", configuration(), Optional.of(Instant.parse("2026-08-25T12:05:00Z")), CancellationToken.none());
 
     /** 锁定生成器委托带版本的结构化提示并回传 usage，避免摘要协议悄然漂移。 */
     @Test
@@ -88,7 +88,11 @@ final class ModelSummaryGeneratorTest {
             @Override public void settle(CheckpointUsage usage, Progress accepted) { progress = accepted; }
 
             /** 瞬时失败留下 UNKNOWN 审计，不把不完整文档放入上下文。 */
-            @Override public void retry() { unknownSettlements.incrementAndGet(); }
+            @Override public void retry(int failedAttempt, long delayMillis, String reasonCode) {
+                assertEquals(unknownSettlements.incrementAndGet(), failedAttempt);
+                assertEquals(0, delayMillis);
+                assertEquals("MODEL_UNAVAILABLE", reasonCode);
+            }
 
             /** 本测试只验证重试窗口，不提交检查点 Thread revision。 */
             @Override public long checkpointSourceRevision(long originalRevision) { return originalRevision; }
@@ -359,7 +363,7 @@ final class ModelSummaryGeneratorTest {
             ModelPort.ModelConfiguration configuration = configuration(modelId, generation);
             return new ModelSummaryGenerator.RequestRuntime(
                     new SummaryModel.TurnBinding("thread-1", configuration,
-                            Instant.parse("2026-08-25T12:05:00Z"), CancellationToken.none()),
+                            Optional.of(Instant.parse("2026-08-25T12:05:00Z")), CancellationToken.none()),
                     Optional.of(summaryProfile(modelId, generation, sequence)), releases::incrementAndGet);
         };
         List<ContextMessage> messages = List.of(
@@ -603,7 +607,9 @@ final class ModelSummaryGeneratorTest {
             }
 
             /** 多块测试不注入恢复错误，因此任何额外 Provider retry 都是测试失败。 */
-            @Override public void retry() { throw new AssertionError("unexpected Provider retry"); }
+            @Override public void retry(int failedAttempt, long delayMillis, String reasonCode) {
+                throw new AssertionError("unexpected Provider retry");
+            }
 
             /** 测试源 revision 固定，避免创建无关的 Thread 状态。 */
             @Override public long checkpointSourceRevision(long originalRevision) { return originalRevision; }
@@ -671,7 +677,7 @@ final class ModelSummaryGeneratorTest {
             }
 
             /** 瞬时 Provider 失败不属于此结算崩溃用例。 */
-            @Override public void retry() { }
+            @Override public void retry(int failedAttempt, long delayMillis, String reasonCode) { }
 
             /** 重启恢复夹具使用原始输入 revision。 */
             @Override public long checkpointSourceRevision(long originalRevision) { return originalRevision; }
@@ -702,7 +708,7 @@ final class ModelSummaryGeneratorTest {
             @Override public void settle(CheckpointUsage usage, Progress accepted) { }
 
             /** 没有故障注入时重试无需额外副作用。 */
-            @Override public void retry() { }
+            @Override public void retry(int failedAttempt, long delayMillis, String reasonCode) { }
 
             /** fixture 中不发生其他并发写入，保留传入源 revision。 */
             @Override public long checkpointSourceRevision(long originalRevision) { return originalRevision; }

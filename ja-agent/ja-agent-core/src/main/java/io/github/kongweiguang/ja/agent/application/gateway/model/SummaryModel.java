@@ -63,20 +63,20 @@ public interface SummaryModel extends AutoCloseable {
      *
      * @param threadId 所属对话的稳定标识
      * @param configuration 配置
-     * @param deadline 截止时间约束
+     * @param deadline 显式的 Turn 截止时间；空值表示由宿主取消，而非单次网络超时控制总时长
      * @param cancellationToken 取消控制令牌
      */
     record TurnBinding(String threadId,
                        ModelPort.ModelConfiguration configuration,
-                       Instant deadline,
+                       Optional<Instant> deadline,
                        CancellationToken cancellationToken) {
         /**
-         * 确保 Provider 配置、deadline 与取消令牌均由宿主显式提供。
+         * 确保 Provider 配置、显式可选 Deadline 和取消令牌均由宿主显式提供。
          */
         public TurnBinding {
             threadId = required(threadId, "threadId");
             Objects.requireNonNull(configuration, "configuration");
-            Objects.requireNonNull(deadline, "deadline");
+            deadline = Objects.requireNonNull(deadline, "deadline");
             Objects.requireNonNull(cancellationToken, "cancellationToken");
         }
 

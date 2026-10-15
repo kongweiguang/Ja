@@ -663,12 +663,16 @@ describe("JA RPC v2 configuration ownership", () => {
       inputQueue: null,
       contextUsage: null,
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
   });
 
-  /** thread/read 的 nullable Usage 是必需字段，且必须绑定完整请求画像并保持总量一致。 */
+  /**
+   * @author kongweiguang
+   * thread/read 的 nullable Usage 是必需字段，且必须绑定完整请求画像并保持总量一致。
+   */
   it("validates required context Usage in Thread snapshots", () => {
     const turn = {
       turnId: "turn_runtime_a",
@@ -703,6 +707,7 @@ describe("JA RPC v2 configuration ownership", () => {
         contextEstimate: null,
       },
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
@@ -783,7 +788,72 @@ describe("JA RPC v2 configuration ownership", () => {
     ).toThrow();
   });
 
-  /** 活动流恢复必须绑定活动 Turn，非空段连续覆盖 baseline，并按 UTF-8 字节而非字符限制正文。 */
+  /** thread/read 压缩恢复只接受完整 nullable 字段、正请求序号和仍活动的原生 Turn owner。
+   *
+   * @author kongweiguang
+   */
+  it("validates context compaction snapshot identity and retry attempt", () => {
+    const turn = {
+      turnId: "turn_compaction_snapshot",
+      origin: "native" as const,
+      sourceMessageId: null,
+      status: "running" as const,
+      requestedAt: "2026-08-31T00:00:00Z",
+      updatedAt: "2026-08-31T00:00:01Z",
+      completedAt: null,
+      errorCode: null,
+      changeSet: null,
+    };
+    const snapshot = {
+      threadId: "thr_compaction_snapshot",
+      revision: 3,
+      turns: [turn],
+      items: [],
+      taskActivities: [],
+      inputQueue: null,
+      contextUsage: null,
+      liveStream: null,
+      contextCompaction: {
+        compactionId: "cmp_compaction_snapshot",
+        turnId: turn.turnId,
+        retryAttempt: 2,
+      },
+      nextCursor: null,
+    };
+    expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        contextCompaction: { ...snapshot.contextCompaction, retryAttempt: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        contextCompaction: { ...snapshot.contextCompaction, extra: true },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        turns: [{ ...turn, status: "completed" as const }],
+      }),
+    ).toThrow();
+    expect(
+      parseMethodResult("thread/read", {
+        ...snapshot,
+        contextCompaction: { ...snapshot.contextCompaction, turnId: null },
+      }),
+    ).toMatchObject({ contextCompaction: { turnId: null, retryAttempt: 2 } });
+    const missing = { ...snapshot } as Record<string, unknown>;
+    delete missing["contextCompaction"];
+    expect(() => parseMethodResult("thread/read", missing)).toThrow();
+  });
+
+  /**
+   * @author kongweiguang
+   * 活动流恢复必须绑定活动 Turn，非空段连续覆盖 baseline，并按 UTF-8 字节而非字符限制正文。
+   */
   it("validates live stream baselines and byte budgets", () => {
     const snapshot = {
       threadId: "thr_live_stream",
@@ -825,6 +895,7 @@ describe("JA RPC v2 configuration ownership", () => {
           },
         ],
       },
+      contextCompaction: null,
       nextCursor: null,
     };
     expect(parseMethodResult("thread/read", snapshot)).toEqual(snapshot);
@@ -891,7 +962,10 @@ describe("JA RPC v2 configuration ownership", () => {
     expect(() => parseMethodResult("thread/read", missingLiveStream)).toThrow();
   });
 
-  /** 问答展示只接纳可见文案闭集，跳过状态与答案数组必须保持一致。 */
+  /**
+   * @author kongweiguang
+   * 问答展示只接纳可见文案闭集，跳过状态与答案数组必须保持一致。
+   */
   it("validates structured interaction answers in Tool presentations", () => {
     const turn = {
       turnId: "turn_interaction_answer",
@@ -937,6 +1011,7 @@ describe("JA RPC v2 configuration ownership", () => {
       taskActivities: [],
       contextUsage: null,
       liveStream: null,
+      contextCompaction: null,
       nextCursor: null,
     };
 

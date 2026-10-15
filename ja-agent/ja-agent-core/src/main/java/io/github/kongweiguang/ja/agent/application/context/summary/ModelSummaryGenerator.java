@@ -358,8 +358,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
                     if (provider == null) {
                         throw failure;
                     }
-                    operation.retry();
-                    waitForRetry(retryDelay(provider, attempt), runtime.binding().cancellationToken());
+                    Duration delay = retryDelay(provider, attempt);
+                    operation.retry(attempt, delay.toMillis(), provider.terminalErrorCode());
+                    waitForRetry(delay, runtime.binding().cancellationToken());
                 }
             }
         }
@@ -488,16 +489,18 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
     }
 
     /**
-     * 在模型 IO 前后复核 Thread、取消和 Deadline，避免迟到结果进入 Checkpoint CAS。
+     * 在模型 IO 前后复核 Thread、取消和显式 Deadline；未设置截止的任务不能被网络空闲预算截断。
      */
     private void requireActiveBinding(String threadId, SummaryModel.TurnBinding binding) {
         if (!binding.threadId().equals(threadId)) {
             throw failure("summary request did not match its Turn binding", null);
         }
         binding.cancellationToken().throwIfCancellationRequested();
-        if (!clock.instant().isBefore(binding.deadline())) {
-            throw failure("summary model deadline expired", null);
-        }
+        binding.deadline().ifPresent(deadline -> {
+            if (!clock.instant().isBefore(deadline)) {
+                throw failure("summary model deadline expired", null);
+            }
+        });
     }
 
     /**
@@ -540,9 +543,9 @@ public final class ModelSummaryGenerator implements SummaryGenerator {
         void settle(CheckpointUsage callUsage, Progress accepted);
 
         /**
-         * 瞬时失败必须由执行所有者持久化 UNKNOWN 请求 ordinal，禁止隐式重发。
+         * 瞬时失败原子持久化 UNKNOWN 用量、原请求 ordinal 与可见退避事实，禁止静默重发。
          */
-        void retry();
+        void retry(int failedAttempt, long delayMillis, String reasonCode);
 
         /**
          * 返回 Summary settlement 后的权威 Thread revision，避免检查点提交旧快照。
