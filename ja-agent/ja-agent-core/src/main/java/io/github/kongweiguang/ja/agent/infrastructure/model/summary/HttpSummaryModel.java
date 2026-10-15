@@ -327,7 +327,7 @@ public final class HttpSummaryModel implements SummaryModel {
     }
 
     /**
-     * 发送前重新核验绝对 Deadline，排队耗时不能延长冻结 Turn 的预算。
+     * 发送前重新核验绝对 Deadline，并直接消费预检冻结的 envelope，避免重新派生请求配置或延长 Turn 预算。
      */
     @Override
     public SummaryModel.Result summarize(SummaryPrompt prompt) {
@@ -342,7 +342,6 @@ public final class HttpSummaryModel implements SummaryModel {
             }
             throw failure("summary prompt was not locally estimated before send");
         }
-        Invocation invocation = current.invocation();
         try {
             remaining();
             SummaryModel.Result result = executeBounded(controller -> executeOnce(current, controller));

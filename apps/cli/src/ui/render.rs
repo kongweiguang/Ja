@@ -491,7 +491,7 @@ fn paused_indicator_line() -> Line<'static> {
     ))
 }
 
-/// 保留“正在工作”、动效和用时；空间不足时先让出重复的行内 Esc，底栏仍显示取消键。
+/// 按显示列宽保留“正在工作”、动效和用时；空间不足时先让出重复的行内 Esc，底栏仍显示取消键。
 fn working_indicator_line(
     activity: Option<&str>,
     show_cancel_hint: bool,
@@ -514,7 +514,7 @@ fn working_indicator_line(
         + 4
         + elapsed_text
             .as_deref()
-            .map(|text| UnicodeWidthStr::width(text))
+            .map(UnicodeWidthStr::width)
             .unwrap_or_default();
     let mut cancel_text = show_cancel_hint.then_some(" · Esc 中断");
     if let Some(activity) = activity {
