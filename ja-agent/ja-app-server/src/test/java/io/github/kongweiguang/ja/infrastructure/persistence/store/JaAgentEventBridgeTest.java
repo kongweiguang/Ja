@@ -999,7 +999,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /**
-     * Durable automatic compaction phases use the existing Thread sink and carry the Store revision fence.
+     * 验证自动压缩的持久阶段沿用 Thread sink，并保留 Store 提交的 revision 水位。
      *
      * @author kongweiguang
      */
@@ -1032,7 +1032,7 @@ final class JaAgentEventBridgeTest {
         bridge.bindEngine(engine);
         List<ContextCompactionEvent> delivered = new CopyOnWriteArrayList<>();
         ConversationTurnEventSink sink = new ConversationTurnEventSink() {
-            /** The fixture records ordinary turn frames without inventing any model output.
+            /** fixture 只记录普通 Turn 帧，不伪造模型输出。
              * @author kongweiguang
              */
             @Override
@@ -1040,7 +1040,7 @@ final class JaAgentEventBridgeTest {
                 return CompletableFuture.completedFuture(null);
             }
 
-            /** Preserve the established ContextCompactionEvent channel for durable phases.
+            /** 将持久压缩阶段写入既有 ContextCompactionEvent 通道。
              * @author kongweiguang
              */
             @Override
@@ -1049,7 +1049,7 @@ final class JaAgentEventBridgeTest {
                 return CompletableFuture.completedFuture(null);
             }
 
-            /** Resolve the workspace from the same identity owner as a live RpcSession.
+            /** 使用与真实 RpcSession 相同的身份 owner 解析 Workspace。
              * @author kongweiguang
              */
             @Override
@@ -1058,7 +1058,7 @@ final class JaAgentEventBridgeTest {
                 return Optional.of("ws_compaction_bridge");
             }
 
-            /** The fixture does not publish Thread metadata.
+            /** fixture 不发布 Thread metadata。
              * @author kongweiguang
              */
             @Override
@@ -1086,7 +1086,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /**
-     * Manual compaction identity remains exclusively owned by its service and never creates a Turn attachment.
+     * 验证手动压缩仍只由其服务负责，不创建自动 Turn 事件附件。
      *
      * @author kongweiguang
      */
@@ -1110,7 +1110,7 @@ final class JaAgentEventBridgeTest {
         AtomicInteger workspaceLookups = new AtomicInteger();
         AtomicInteger contextEvents = new AtomicInteger();
         ConversationTurnEventSink sink = new ConversationTurnEventSink() {
-            /** The manual identity must be rejected before any durable turn frame is read.
+            /** 手动身份必须在读取持久 Turn 帧之前被拒绝。
              * @author kongweiguang
              */
             @Override
@@ -1118,7 +1118,7 @@ final class JaAgentEventBridgeTest {
                 return CompletableFuture.completedFuture(null);
             }
 
-            /** ManualContextCompactionService is the only publisher for this identity.
+            /** 此身份只能由 ManualContextCompactionService 发布。
              * @author kongweiguang
              */
             @Override
@@ -1127,7 +1127,7 @@ final class JaAgentEventBridgeTest {
                 return CompletableFuture.completedFuture(null);
             }
 
-            /** A lookup would prove the automatic bridge attempted to project the manual event.
+            /** 若发生 Workspace 查询，即表示自动事件桥错误尝试投影了手动事件。
              * @author kongweiguang
              */
             @Override
@@ -1136,7 +1136,7 @@ final class JaAgentEventBridgeTest {
                 return Optional.of("ws_compaction_bridge");
             }
 
-            /** The fixture does not publish Thread metadata.
+            /** fixture 不发布 Thread metadata。
              * @author kongweiguang
              */
             @Override
@@ -1717,7 +1717,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /**
-     * Encode compression phases through the production event codec and retain each durable revision watermark.
+     * 使用生产事件 codec 编码压缩阶段，并保留每个持久事件的 revision 水位。
      *
      * @author kongweiguang
      */
@@ -1732,7 +1732,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /**
-     * Read the bridge's live attachment map to prove non-Turn manual identity is rejected before replay starts.
+     * 读取事件桥的活动附件映射，确认非 Turn 的手动身份在开始回放前已被拒绝。
      *
      * @author kongweiguang
      */
@@ -1761,7 +1761,7 @@ final class JaAgentEventBridgeTest {
     }
 
     /**
-     * Await durable compaction notifications without widening the test's asynchronous projection deadline.
+     * 在固定的异步投影期限内等待压缩通知，超时即让回归明确失败。
      *
      * @author kongweiguang
      */

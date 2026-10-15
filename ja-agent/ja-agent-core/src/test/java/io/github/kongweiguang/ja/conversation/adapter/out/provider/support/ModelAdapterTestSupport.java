@@ -293,8 +293,14 @@ public final class ModelAdapterTestSupport {
         }
     }
 
-    /** 提供有界的活跃 SSE 流，避免测试为总时长与读取空闲语义引入真实 Provider。 */
-    private record HeartbeatThenSseBody(String body, Duration duration) implements MockResponseBody {
+    /** 提供有界的活跃 SSE 流，以心跳验证空闲期限不会中断仍在发送的响应。
+     *
+     * @param body 最终发送的 SSE 事件正文
+     * @param duration 心跳维持响应活跃的时长
+     * @author kongweiguang
+     */
+    private record HeartbeatThenSseBody(String body,
+                                        Duration duration) implements MockResponseBody {
         /** 心跳间隔内长度未知，要求 MockWebServer 按流式方式发送内容。 */
         @Override
         public long getContentLength() {

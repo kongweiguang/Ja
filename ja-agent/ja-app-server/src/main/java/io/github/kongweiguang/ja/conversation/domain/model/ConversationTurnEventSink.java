@@ -15,8 +15,7 @@ import java.util.function.Function;
  */
 public interface ConversationTurnEventSink extends TurnEventSink, ThreadMetadataEventSink {
     /**
-     * Resolve the already registered workspace for an admitted Turn so durable compaction facts can reuse the
-     * existing Thread event contract without inventing workspace ownership in the Agent Store event.
+     * 返回已准入 Turn 对应的已登记 Workspace；无连接 owner 时返回空值，避免从 Agent Store 事件反推路由身份。
      *
      * @author kongweiguang
      */

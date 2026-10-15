@@ -1886,7 +1886,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         Objects.requireNonNull(downstream, "downstream");
         AtomicReference<Boolean> taskProjection = new AtomicReference<>();
         return new ConversationTurnEventSink() {
-            /** Keep the initiating RPC's registered workspace available to durable Turn lifecycle projection.
+            /** 透传已登记的 Workspace 身份，使持久 Turn 生命周期事件能够沿原 RPC 连接补齐路由信息。
              * @author kongweiguang
              */
             @Override

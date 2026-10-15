@@ -39,6 +39,7 @@ import io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -484,7 +485,7 @@ public final class ThreadHistoryHandler implements RpcHandler, AutoCloseable {
     private ObjectNode readPage(String threadId, String cursor, int limit, boolean tail) {
         ConsistentRead consistent = readConsistent(threadId, cursor, limit, tail);
         ThreadSnapshot snapshot = consistent.snapshot();
-        var nativeTurns = snapshot.turns().stream()
+        List<ThreadSnapshot.Turn> nativeTurns = snapshot.turns().stream()
                 .filter(turn -> turn.origin() == ThreadSnapshot.Origin.NATIVE)
                 .toList();
         Set<String> terminalTurnIds = nativeTurns.stream()

@@ -393,7 +393,7 @@ public final class ActiveStreamRegistry {
             if (current == null || !current.compactionId.equals(context.compactionId())
                     && context.threadRevision() >= current.revision) {
                 contextCompactions.put(context.threadId(), new ContextCompactionState(runtimeGeneration,
-                        context.workspaceId(), context.threadId(), context.compactionId(), context.turnId(),
+                        context.workspaceId(), context.compactionId(), context.turnId(),
                         context.threadRevision(), 1));
             } else if (current.compactionId.equals(context.compactionId())
                     && Objects.equals(current.turnId, context.turnId())) {
@@ -637,16 +637,18 @@ public final class ActiveStreamRegistry {
     }
 
     /**
-     * Wire snapshot deliberately exposes only the current compaction identity and request attempt.
+     * 活动快照只暴露当前压缩标识与请求次数，不携带摘要正文或其他压缩内容。
      *
-     * @param compactionId active compression operation identity
-     * @param turnId owning Turn, or null for manual idle-thread compaction
-     * @param retryAttempt current summary request attempt, with the initial request numbered one
+     * @param compactionId 当前压缩操作标识
+     * @param turnId 所属 Turn；手动压缩空闲 Thread 时为空
+     * @param retryAttempt 当前摘要请求次数，首次请求为 1
      * @author kongweiguang
      */
-    public record ContextCompactionSnapshot(String compactionId, String turnId, int retryAttempt) {
+    public record ContextCompactionSnapshot(String compactionId,
+                                            String turnId,
+                                            int retryAttempt) {
         /**
-         * Wire identity and initial attempt are checked here so no caller can construct an invalid snapshot.
+         * 校验压缩标识与请求次数，避免无效状态进入只读恢复快照。
          *
          * @author kongweiguang
          */
@@ -903,25 +905,27 @@ public final class ActiveStreamRegistry {
         }
     }
 
-    /** Mutable state is private to the synchronized registry and shares the Thread revision/generation fence. */
+    /**
+     * Registry 锁内维护的压缩状态，与 Thread revision 和 generation 共用同一更新边界。
+     *
+     * @author kongweiguang
+     */
     private static final class ContextCompactionState {
         private final long generation;
         private final String workspaceId;
-        private final String threadId;
         private final String compactionId;
         private final String turnId;
         private long revision;
         private int retryAttempt;
 
-        /** 初始化唯一状态 owner；revision 和 attempt 都在 registry 锁内更新，不新增恢复 IO。
+        /** Thread 身份由 contextCompactions 的 Map key 唯一持有，状态对象只保留该键以外的压缩水位。
          *
          * @author kongweiguang
          */
-        private ContextCompactionState(long generation, String workspaceId, String threadId, String compactionId,
+        private ContextCompactionState(long generation, String workspaceId, String compactionId,
                                        String turnId, long revision, int retryAttempt) {
             this.generation = generation;
             this.workspaceId = workspaceId;
-            this.threadId = threadId;
             this.compactionId = compactionId;
             this.turnId = turnId;
             this.revision = revision;

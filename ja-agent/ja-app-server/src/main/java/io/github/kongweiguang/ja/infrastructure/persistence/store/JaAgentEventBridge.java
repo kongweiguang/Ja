@@ -1082,8 +1082,7 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
     }
 
     /**
-     * Project automatic compression phases from the durable batch before selecting its primary Turn frame; manual
-     * compaction uses a distinct non-Turn identity and remains owned by ManualContextCompactionService.
+     * 在选择主 Turn 帧前投影 durable batch 中的自动压缩阶段；手动压缩使用非 Turn 身份，仍由手动压缩服务负责。
      *
      * @author kongweiguang
      */
@@ -1110,8 +1109,8 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
     }
 
     /**
-     * Resolve workspace only at the RPC sink boundary; durable Agent Store events intentionally own Thread/Turn
-     * revisions but do not guess workspace routing. A sink without RPC ownership remains a deliberate no-op.
+     * 仅从 RPC sink 查询已登记的 Workspace；Agent Store 事件只拥有 Thread/Turn 修订，不猜测工作区路由。
+     * sink 没有连接 owner 时保持 no-op，不构造缺少授权来源的压缩通知。
      *
      * @author kongweiguang
      */
@@ -1134,8 +1133,7 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
     }
 
     /**
-     * Keep summary failure projection stable and provider-neutral; unknown stored categories fail closed as
-     * INVALID_STATE instead of exposing an exception message or inventing a new wire code.
+     * 将摘要失败投影为稳定且不依赖 Provider 的公共错误码；未知类别收敛为 INVALID_STATE，不暴露异常文本。
      *
      * @author kongweiguang
      */
