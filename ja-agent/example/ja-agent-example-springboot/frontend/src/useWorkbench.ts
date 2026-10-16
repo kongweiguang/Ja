@@ -1417,7 +1417,8 @@ export function useWorkbench() {
 
   /**
    * @author kongweiguang
-   * 202 只表示恢复受理；仅本次显式恢复可跨越旧暂停快照继续核对事件，且旧异步回调不得越过代际边界。
+   * 202 只表示恢复受理；本次显式恢复即使读到终态也要排空游标后的持久事件，不能让快照跳过最终正文。
+   * 旧异步回调仍不得越过流代际，人工等待、错误与待核实状态继续保留给用户处理。
    */
   const observeTurnImpl: ObserveTurn = async (
     threadId,
@@ -1430,7 +1431,12 @@ export function useWorkbench() {
     const generation = ++streamGeneration.current;
     let turn = initialTurn;
     let resumeTransitionPending = resumeAccepted;
-    if (turn.resumeRequired || turn.error || hasPendingWait(turn) || isTerminal(turn.state)) {
+    if (
+      turn.resumeRequired ||
+      turn.error ||
+      hasPendingWait(turn) ||
+      (isTerminal(turn.state) && !resumeAccepted)
+    ) {
       commit({ type: "session-patch", threadId, value: { observing: false } });
       return;
     }
@@ -1655,7 +1661,8 @@ export function useWorkbench() {
   /**
    * @author kongweiguang
    * 仅消息正文、工具结果和 wait 在投影前异步回读；返回后核对流代际与同 Thread/Turn，并以最新快照重算该事件。
-   * 若最新游标已到达事件序号，权威事件已被消费，不能再次投影；recoveries 只在提交后补充状态。
+   * 若最新游标已到达事件序号，权威事件已被消费，不能再次投影；旧状态事实仍保留在历史中，但不回退较新的终态投影。
+   * recoveries 只在提交后补充状态。
    */
   const applyDurable = useCallback(
     async (
@@ -1687,13 +1694,18 @@ export function useWorkbench() {
         next = { ...next, items: [...next.items, { key, kind, text, ...extra }] };
       };
       switch (event.eventType) {
-        case "agent.execution.state":
+        case "agent.execution.state": {
+          const reportedState = asTurnState(String(data["to"] ?? "UNKNOWN"));
           next = {
             ...next,
-            state: asTurnState(String(data["to"] ?? "UNKNOWN")),
+            state:
+              isTerminal(current.state) && !isTerminal(reportedState)
+                ? current.state
+                : reportedState,
             resumeRequired: false,
           };
           break;
+        }
         case "agent.model.completed": {
           const messageRecordId = String(data["messageRecordId"] ?? "");
           const message = await postChat<{
@@ -1859,7 +1871,10 @@ export function useWorkbench() {
     [commit, refreshRecoveries],
   );
 
-  /** 用户明确恢复原 Turn；异步 202 后的旧 SUSPENDED 快照只在本次恢复中继续观察。 */
+  /**
+   * @author kongweiguang
+   * 用户明确恢复后继续观察当前游标；状态快照可能已终结，但仍需回读同一恢复代际的最终工具结果与正文。
+   */
   const resumeTurn = useCallback(
     async (threadId: string, turn: ChatTurn) => {
       let resumeError: unknown;
@@ -1891,15 +1906,16 @@ export function useWorkbench() {
           void observeTurn(threadId, current, false, true);
         return;
       }
-      if (!isTerminal(resumed.state)) {
-        await refreshRecoveries(threadId, turn.turnId);
-        const current =
-          getSession(stateRef.current, threadId).turns.find(
-            (item) => item.turnId === turn.turnId,
-          ) ?? resumed;
-        if (!current.resumeRequired && current.state !== "SUSPENDED")
-          void observeTurn(threadId, current, false);
+      if (isTerminal(resumed.state)) {
+        void observeTurn(threadId, resumed, false, true);
+        return;
       }
+      await refreshRecoveries(threadId, turn.turnId);
+      const current =
+        getSession(stateRef.current, threadId).turns.find((item) => item.turnId === turn.turnId) ??
+        resumed;
+      if (!current.resumeRequired && current.state !== "SUSPENDED")
+        void observeTurn(threadId, current, false, true);
     },
     [observeTurn, patchTurn, refreshRecoveries, refreshTurnStatus],
   );

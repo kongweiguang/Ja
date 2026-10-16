@@ -1355,6 +1355,189 @@ describe("Spring Boot enterprise workbench reliability", () => {
     expect(result.current.state.sessions["thr_a"]?.observing).toBeFalsy();
   });
 
+  /**
+   * @author kongweiguang
+   * 状态查询可能先看到已完成；显式恢复仍须重连读取原游标后的失败工具结果和最终正文。
+   */
+  it("resume 后状态立即为 COMPLETED 时仍回放最终持久消息", async () => {
+    const readRecords: string[] = [];
+    const reconnectRequests: Array<Record<string, unknown>> = [];
+    const toolResultRecordId = "record_approval_tool_result";
+    const finalMessageRecordId = "record_approval_final_message";
+    const events = [
+      {
+        sequence: 24,
+        eventType: "agent.execution.state",
+        payloadJson: JSON.stringify({ from: "WAITING_APPROVAL", to: "SUSPENDED" }),
+      },
+      {
+        sequence: 26,
+        eventType: "agent.execution.state",
+        payloadJson: JSON.stringify({ from: "SUSPENDED", to: "QUEUED" }),
+      },
+      {
+        sequence: 27,
+        eventType: "agent.execution.state",
+        payloadJson: JSON.stringify({ from: "QUEUED", to: "RUNNING" }),
+      },
+      {
+        sequence: 28,
+        eventType: "agent.tool.completed",
+        payloadJson: JSON.stringify({
+          state: "FAILED",
+          callId: "call_approval_probe",
+          resultRecordId: toolResultRecordId,
+        }),
+      },
+      {
+        sequence: 30,
+        eventType: "agent.model.completed",
+        payloadJson: JSON.stringify({
+          messageRecordId: finalMessageRecordId,
+          usageRecordId: "usage_approval_final",
+        }),
+      },
+      {
+        sequence: 31,
+        eventType: "agent.assistant.settled",
+        payloadJson: JSON.stringify({ messageRecordId: finalMessageRecordId }),
+      },
+      {
+        sequence: 32,
+        eventType: "agent.execution.state",
+        payloadJson: JSON.stringify({ from: "RUNNING", to: "COMPLETED" }),
+      },
+      {
+        sequence: 33,
+        eventType: "agent.execution.terminal",
+        payloadJson: JSON.stringify({ state: "COMPLETED", summary: "用户拒绝，未执行" }),
+      },
+    ];
+    const wait: WaitView = {
+      interactionId: "interaction_approval",
+      interactionRevision: 1,
+      kind: "approval",
+      status: "PENDING",
+      questions: [
+        {
+          questionId: "question_approval",
+          prompt: "允许执行 approval_probe？",
+          type: "SINGLE",
+          required: true,
+          allowFreeText: false,
+          options: [
+            {
+              optionId: "option_approve",
+              label: "允许",
+              description: "执行工具",
+              recommended: false,
+            },
+            {
+              optionId: "option_deny",
+              label: "拒绝",
+              description: "不执行工具",
+              recommended: false,
+            },
+          ],
+        },
+      ],
+    };
+    const fetchMock = springFetch(
+      async (path, init) => {
+        if (path === "answers") return jsonResponse(null, 204);
+        if (path === "resume") return jsonResponse({ accepted: true }, 202);
+        if (path === "status") return jsonResponse({ state: "COMPLETED", resumeRequired: false });
+        if (path === "reconnect") {
+          reconnectRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(
+            events
+              .map((event) => `event: agent-event\ndata: ${JSON.stringify(event)}\n\n`)
+              .join(""),
+            { status: 200, headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        if (path === "message") {
+          const request = JSON.parse(String(init?.body)) as { recordId: string };
+          readRecords.push(request.recordId);
+          if (request.recordId === toolResultRecordId)
+            return jsonResponse({ text: "审批已拒绝，工具未执行。" });
+          if (request.recordId === finalMessageRecordId)
+            return jsonResponse({
+              modelRequestId: "model_request_approval_final",
+              text: "用户拒绝，未执行",
+              calls: [],
+            });
+        }
+        if (path === "recoveries") return jsonResponse({ recoveries: [] });
+        return jsonResponse({});
+      },
+      ["thr_a"],
+    );
+    const { result } = await mountWorkbench(fetchMock);
+    const turn = {
+      ...emptyTurn("turn_approval", "验证审批拒绝", []),
+      state: "WAITING_APPROVAL" as const,
+      cursor: 23,
+      items: [
+        {
+          key: "tool:call_approval_probe",
+          kind: "tool" as const,
+          text: "",
+          callId: "call_approval_probe",
+          name: "approval_probe",
+          state: "RUNNING",
+        },
+      ],
+      wait,
+    };
+    act(() => result.current.commit({ type: "session-turn", threadId: "thr_a", turn }));
+
+    await act(async () => {
+      await result.current.answerAndResume("thr_a", turn, [
+        {
+          questionId: "question_approval",
+          optionIds: ["option_deny"],
+          freeText: null,
+          skipped: false,
+        },
+      ]);
+    });
+    await waitFor(() =>
+      expect(result.current.state.sessions["thr_a"]?.turns.at(-1)?.cursor).toBe(33),
+    );
+
+    expect(reconnectRequests).toEqual([
+      { threadId: "thr_a", turnId: "turn_approval", afterSequence: 23 },
+    ]);
+    expect(readRecords).toEqual([toolResultRecordId, finalMessageRecordId]);
+    expect(result.current.state.sessions["thr_a"]?.turns.at(-1)).toMatchObject({
+      state: "COMPLETED",
+      answer: "用户拒绝，未执行",
+      cursor: 33,
+      wait: { status: "CLOSED" },
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          kind: "tool-result",
+          recordId: toolResultRecordId,
+          callId: "call_approval_probe",
+          state: "FAILED",
+          text: "审批已拒绝，工具未执行。",
+        }),
+      ]),
+      events: expect.arrayContaining([
+        expect.objectContaining({ sequence: 24, eventType: "agent.execution.state" }),
+        expect.objectContaining({ sequence: 26, eventType: "agent.execution.state" }),
+        expect.objectContaining({ sequence: 27, eventType: "agent.execution.state" }),
+        expect.objectContaining({ sequence: 28, eventType: "agent.tool.completed" }),
+        expect.objectContaining({ sequence: 30, eventType: "agent.model.completed" }),
+        expect.objectContaining({ sequence: 33, eventType: "agent.execution.terminal" }),
+      ]),
+    });
+    expect(result.current.state.sessions["thr_a"]?.observing).toBe(false);
+    render(workbenchConversationView(result.current));
+    expect(screen.getByText("用户拒绝，未执行")).toBeVisible();
+  });
+
   /** 恢复初次重连可能没有新事件；202 与旧暂停快照都不能提前结束后续观察。 */
   it("resume 受理后跨越旧 SUSPENDED 快照并观察到 Core 终态", async () => {
     let reconnects = 0;
