@@ -1204,6 +1204,8 @@ fn tauri_mock_legacy_marker_does_not_block_shared_attach() {
 
 /// 覆盖真实 MockRuntime exit-request 路径：永久清理故障必须阻止首次关闭，并保留 Java owner 的 Crashed 状态。
 /// 只有显式重试成功回收进程后才能再次关闭，避免窗口退出掩盖隔离区中的活跃 owner。
+/// 冷 JVM 在 actor 外使用独立的 30s 夹具预算准备，Host 仍按生产时限连接同一共享后台。
+/// 预备连接先显式关闭自己的 Native owner，退出路径仍必须满足原有的 500ms 断言。
 #[test]
 fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
     let _jvm_guard = jvm_runtime_test_guard();
@@ -1224,7 +1226,27 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
         Arc::clone(&shutdown_failures),
     )
     .host();
-    host.start().expect("sidecar ready");
+    let cleanup = TestServerCleanup::new(host.clone(), config.clone(), marker.clone());
+    let mut bootstrap_config = config.sidecar.clone();
+    bootstrap_config.ready_timeout = Duration::from_secs(30);
+    let bootstrap_identity =
+        NativeClientIdentity::new_current_process().expect("bootstrap client identity");
+    let mut bootstrap =
+        SharedAppServerClient::connect_or_start(bootstrap_config.clone(), 1, &bootstrap_identity)
+            .expect("prepare test-owned cold JVM before exit acceptance");
+    let server_instance_id = bootstrap.server_instance_id().to_owned();
+    assert!(
+        bootstrap
+            .close_native_client_until(&bootstrap_config, Instant::now() + Duration::from_secs(5))
+            .expect("close bootstrap native owner")
+    );
+    drop(bootstrap);
+    let started = host.start().expect("sidecar ready");
+    assert_eq!(
+        started.server_instance_id.as_deref(),
+        Some(server_instance_id.as_str()),
+        "exit acceptance must attach to the prepared shared backend"
+    );
     assert_process_marker_visible(&marker, Instant::now() + Duration::from_secs(10));
     let observer = host.clone();
     let app = mock_builder()
@@ -1318,7 +1340,9 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
         process_marker_visible(&marker),
         "desktop exit must preserve shared backend"
     );
-    stop_test_shared_server(&config, &marker, Instant::now() + Duration::from_secs(10));
+    cleanup
+        .finish(Instant::now() + Duration::from_secs(10))
+        .expect("exit fixture cleanup");
 }
 
 /// 通过真实 JVM sidecar 验证 Tauri Host actor、Rust supervisor、连续失败终态与优雅关闭。
