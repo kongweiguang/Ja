@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.conversation.domain.model.ClientOperationReceip
 import io.github.kongweiguang.ja.conversation.domain.model.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnSummary;
 import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
+import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
 import io.github.kongweiguang.ja.conversation.application.api.InternalTurnStartRequest;
 import io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.TurnStartRequest;
@@ -31,6 +32,7 @@ import io.github.kongweiguang.ja.transport.rpc.protocol.RpcParams;
 import io.github.kongweiguang.ja.transport.rpc.protocol.RpcResults;
 import io.github.kongweiguang.ja.transport.rpc.runtime.RpcSession;
 import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
+import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceFailure;
 
 import java.util.Locale;
 import java.util.Objects;
@@ -211,6 +213,7 @@ public final class TurnApprovalHandler implements RpcHandler {
     /**
      * 从权威 Turn/Thread 投影建立通知上下文后恢复原 Turn；Plan 恢复 ACK 使用实际 Thread revision，
      * 且 binding 异常保持为可操作的稳定 recovery 错误。
+     * @author kongweiguang
      */
     private ObjectNode resume(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "expectedThreadRevision");
@@ -242,7 +245,7 @@ public final class TurnApprovalHandler implements RpcHandler {
                 throw JaRpcException.of(JaErrorCatalog.TURN_RESUME_ORDER_CONFLICT,
                         "turn resume order changed");
             }
-            Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
+            Workspace workspace = requireOpenWorkspace(snapshot.thread().workspaceId());
             int planModelRound = snapshot.turns().stream()
                     .filter(value -> value.turnId().equals(turnId))
                     .mapToInt(ThreadSnapshot.Turn::modelRound)
@@ -267,7 +270,7 @@ public final class TurnApprovalHandler implements RpcHandler {
             throw JaRpcException.of(JaErrorCatalog.TURN_RESUME_ORDER_CONFLICT,
                     "turn resume order changed");
         }
-        Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
+        Workspace workspace = requireOpenWorkspace(snapshot.thread().workspaceId());
         int modelRound = snapshot.turns().stream()
                 .filter(value -> value.turnId().equals(turnId))
                 .mapToInt(ThreadSnapshot.Turn::modelRound)
@@ -277,7 +280,8 @@ public final class TurnApprovalHandler implements RpcHandler {
         session.restoreTurnNotificationContext(turnId, workspace.workspaceId(), turn.threadId(), expected,
                 turn.turnMutationVersion(), modelRound);
         try {
-            TurnUseCase.Accepted accepted = session.turns().resume(turnId, expected, session.eventSink());
+            TurnUseCase.Accepted accepted = session.turns().resume(turnId, expected,
+                    taskAwareEventSink(turn.threadId()));
             bindNotificationCleanup(turnId, accepted.completion());
             return session.mapper().createObjectNode()
                     .put("accepted", true)
@@ -290,9 +294,17 @@ public final class TurnApprovalHandler implements RpcHandler {
         }
     }
 
+    /** 恢复入口和审批裁决共用 Task 投影装饰器；非 Task Thread 由装饰器原样透传，且不读取任务详情。
+     * @author kongweiguang
+     */
+    private ConversationTurnEventSink taskAwareEventSink(String threadId) {
+        return session.tasks().projectContinuationEvents(threadId, session.eventSink());
+    }
+
     /**
      * 将原 Tool 详情里的用户选择作为一次有版本和幂等键保护的裁决提交。新裁决若已消除最后一项未知，
      * 立即复用既有 Resume 编排；仍有下一项未知时返回已提交事实，不把正常等待伪装为 RPC 失败。
+     * @author kongweiguang
      */
     private ObjectNode respondToolRecovery(ObjectNode params) {
         RpcParams.requireExact(params, "turnId", "callId", "expectedThreadRevision",
@@ -429,7 +441,7 @@ public final class TurnApprovalHandler implements RpcHandler {
      */
     private RecoveryContext prepareRecoveryContext(String threadId, long expectedRevision) {
         ThreadSnapshot snapshot = requireThreadAtRevision(threadId, expectedRevision);
-        Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
+        Workspace workspace = requireOpenWorkspace(snapshot.thread().workspaceId());
         String turnId = "turn_" + UUID.randomUUID().toString().replace("-", "");
         session.registerTurnNotificationContext(turnId, workspace.workspaceId(), threadId, expectedRevision);
         return new RecoveryContext(turnId, workspace, snapshot.thread().preferences());
@@ -469,7 +481,7 @@ public final class TurnApprovalHandler implements RpcHandler {
                     .readThread(threadId, null, 1)
                     .orElseThrow(() -> JaRpcException.of(
                             JaErrorCatalog.THREAD_NOT_FOUND, "thread is unavailable"));
-            Workspace workspace = session.workspaces().requireOpenWorkspace(snapshot.thread().workspaceId());
+            Workspace workspace = requireOpenWorkspace(snapshot.thread().workspaceId());
             ThreadPreferences preferences = overrides.select(snapshot.thread().preferences(),
                     workspace.root(), session.configurationUseCase());
             String turnId = "turn_" + UUID.randomUUID().toString().replace("-", "");
@@ -754,7 +766,7 @@ public final class TurnApprovalHandler implements RpcHandler {
                                 "approval turn snapshot unavailable")));
         try {
             return session.approvalUseCase().resolve(turn.threadId(), turnId, approvalId, expected, decision,
-                    operationKey, fingerprint, session.eventSink()).handle((resolution, failure) -> {
+                    operationKey, fingerprint, taskAwareEventSink(turn.threadId())).handle((resolution, failure) -> {
                 if (failure != null) {
                     throw approvalFailure(failure);
                 }
@@ -843,6 +855,17 @@ public final class TurnApprovalHandler implements RpcHandler {
         }
         return result.put("queued", receipt.queued()).put("turnId", receipt.turnId())
                 .put("threadRevision", receipt.threadRevision());
+    }
+
+    /**
+     * 冷重启后 Workspace 必须显式打开；沿用既有领域错误映射，让调用方能重开后重试，且不误报内部故障。
+     */
+    private Workspace requireOpenWorkspace(String workspaceId) {
+        try {
+            return session.workspaces().requireOpenWorkspace(workspaceId);
+        } catch (WorkspaceFailure failure) {
+            throw WorkspaceHandler.mapFailure(failure);
+        }
     }
 
     /**

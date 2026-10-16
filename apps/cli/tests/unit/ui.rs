@@ -33,6 +33,95 @@ fn composer_edits_graphemes() {
     assert_eq!(composer.text(), "A");
 }
 
+/// @author kongweiguang
+/// `/btw` is a local create-then-send command: retain Unicode, inner and trailing whitespace, and
+/// the original retry line so it never reaches the parent model as an ordinary prompt.
+#[test]
+fn btw_preserves_full_body_and_empty_command_opens_idle_side_chat() {
+    let mut state = UiState::new(UiSnapshot::default());
+    let command = "/btw  第一行\n中文 🙂 ";
+    state.handle_paste(command);
+    assert_eq!(
+        state.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        vec![UiAction::CreateSideChat {
+            content: " 第一行\n中文 🙂 ".into(),
+            command_text: command.into(),
+        }]
+    );
+
+    let mut empty = UiState::new(UiSnapshot::default());
+    empty.handle_paste("/btw");
+    assert_eq!(
+        empty.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        vec![UiAction::CreateSideChat {
+            content: String::new(),
+            command_text: "/btw".into(),
+        }]
+    );
+}
+
+/// @author kongweiguang
+/// Thread-local composer snapshots retain each draft on return without leaking text to a child.
+#[test]
+fn composer_drafts_are_isolated_by_thread_identity() {
+    let mut state = UiState::new(UiSnapshot::default());
+    let mut first = UiSnapshot::default();
+    first.thread_id = Some("thr_parent".into());
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(first)));
+    state.handle_paste("父会话未发送草稿");
+
+    let mut child = UiSnapshot::default();
+    child.thread_id = Some("thr_side".into());
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(child)));
+    assert!(state.composer().is_empty());
+    state.handle_paste("侧聊单独草稿");
+
+    let mut returned = UiSnapshot::default();
+    returned.thread_id = Some("thr_parent".into());
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(returned)));
+    assert_eq!(state.composer().text(), "父会话未发送草稿");
+
+    let mut closed = UiSnapshot::default();
+    closed.thread_id = Some("thr_parent".into());
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(closed)));
+    state.apply(UiEvent::ForgetThreadDrafts(vec!["thr_side".into()]));
+    let mut revisit_child = UiSnapshot::default();
+    revisit_child.thread_id = Some("thr_side".into());
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(revisit_child)));
+    assert!(state.composer().is_empty());
+}
+
+/// @author kongweiguang
+/// An RPC completion may restore a safe picker command only into an empty Composer, preserving newer edits.
+#[test]
+fn safe_side_chat_recovery_route_does_not_overwrite_newer_draft() {
+    let mut state = UiState::new(UiSnapshot {
+        thread_id: Some("thr_parent".into()),
+        ..UiSnapshot::default()
+    });
+    state.handle_paste("用户等待期间新写的草稿");
+    state.apply(UiEvent::RestoreDraft("/resume".into()));
+    assert_eq!(state.composer().text(), "用户等待期间新写的草稿");
+}
+
+/// @author kongweiguang
+/// A suspended approval-expired child remains resumable from its selected Thread with the existing F6 action.
+#[test]
+fn suspended_thread_keeps_f6_resume_action() {
+    let mut state = UiState::new(UiSnapshot::default());
+    let mut snapshot = UiSnapshot::default();
+    snapshot.thread_id = Some("thr_suspended_child".into());
+    snapshot.turn_state = TurnState::Paused;
+    state.apply(UiEvent::ReplaceSnapshot(Box::new(snapshot)));
+
+    assert_eq!(
+        state.handle_key(key(KeyCode::F(6), KeyModifiers::NONE)),
+        vec![UiAction::ResumeSuspendedTurn {
+            thread_id: "thr_suspended_child".into(),
+        }]
+    );
+}
+
 /// Ctrl+G 应把当前普通草稿交给外部编辑器动作，同时保留本地正文与光标。
 #[test]
 fn ctrl_g_requests_external_edit_without_clearing_draft() {
@@ -1943,6 +2032,7 @@ fn restored_history_does_not_repeat_welcome_line() {
     );
 }
 
+/// @author kongweiguang
 /// 斜杠菜单只展示匹配命令，Tab 补全与 Enter 执行同一候选；退出项不提交为用户消息。
 #[test]
 fn slash_menu_filters_completes_and_quits() {
@@ -1950,7 +2040,7 @@ fn slash_menu_filters_completes_and_quits() {
     open_command_menu(&mut state);
     let all = screen_text(&state, 52, 16);
     assert_eq!(all.matches("/new").count(), 1, "{all}");
-    assert!(all.contains("1/19"), "{all}");
+    assert!(all.contains("1/21"), "{all}");
     let narrow = screen_text(&state, 30, 10);
     assert!(narrow.contains("Tab") && narrow.contains("Esc"), "{narrow}");
 

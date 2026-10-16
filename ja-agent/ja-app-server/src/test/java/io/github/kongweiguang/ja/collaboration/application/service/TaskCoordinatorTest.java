@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 package io.github.kongweiguang.ja.collaboration.application.service;
+
+import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskMailboxQueueCommandMapper;
 import io.github.kongweiguang.ja.collaboration.infrastructure.acl.TaskAdmissionGatewayAdapter;
 import io.github.kongweiguang.ja.collaboration.infrastructure.acl.ConversationBoundaryAdapter;
@@ -50,6 +52,7 @@ import io.github.kongweiguang.ja.agent.domain.json.JsonObject;
 import io.github.kongweiguang.ja.agent.domain.json.JsonArray;
 import io.github.kongweiguang.ja.agent.domain.json.JsonObjects;
 import io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken;
+import io.github.kongweiguang.ja.agent.application.concurrent.CancellationSource;
 import io.github.kongweiguang.ja.collaboration.interfaces.tools.TaskAgentToolGateway;
 import io.github.kongweiguang.ja.collaboration.domain.model.TaskModels;
 import io.github.kongweiguang.ja.collaboration.domain.model.AdmissionReceipt;
@@ -82,7 +85,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -188,6 +193,104 @@ final class TaskCoordinatorTest {
         assertNotNull(identity.get());
         assertTrue(participants.find(identity.get()).isEmpty());
         assertNull(admitted.get());
+    }
+
+    /** Admission 已提交后 UI 通知失败仍须返回 Child，登记完成回收并唤醒既有 waiter。
+     * @author kongweiguang
+     */
+    @Test
+    void admittedSubagentSurvivesTaskEventFailureAndCompletesWaiter() throws Exception {
+        AtomicReference<TaskModels.ChildAdmission> admitted = new AtomicReference<>();
+        AtomicReference<TaskModels.Summary> current = new AtomicReference<>();
+        AtomicReference<AdmissionProbe> probe = new AtomicReference<>();
+        JaAdmissionParticipants participants = new JaAdmissionParticipants();
+        CompletableFuture<TurnResult> completion = new CompletableFuture<>();
+        AtomicInteger publishAttempts = new AtomicInteger();
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "listTree" -> List.of();
+            case "findTask" -> {
+                TaskModels.Summary task = current.get();
+                yield task == null || !task.lineage().taskThreadId().equals(args[0])
+                        ? Optional.empty() : Optional.of(task);
+            }
+            case "readTask" -> {
+                TaskModels.ChildAdmission child = admitted.get();
+                TaskModels.Summary task = current.get();
+                yield child == null || task == null ? Optional.empty() : Optional.of(detail(child, task));
+            }
+            case "applyChildAdmission" -> {
+                TaskModels.ChildAdmission child = (TaskModels.ChildAdmission) args[0];
+                assertTaskAdmissionUsesCurrentStoreTransaction();
+                admitted.set(child);
+                TaskModels.Summary created = summary(child);
+                current.set(withState(created, TaskModels.State.QUEUED,
+                        created.projection().revision(), 1));
+                yield null;
+            }
+            case "rootTurnIdForAdmission" -> "turn_parent";
+            case "beginSideChatClose", "deleteClosedSideChat" ->
+                    throw new UnsupportedOperationException("side chat close is outside this fixture");
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        Object owner = Proxy.newProxyInstance(TaskCoordinatorTest.class.getClassLoader(),
+                new Class<?>[]{TurnUseCase.class, ChildTurnScheduler.class}, (proxy, method, args) -> {
+                    if (!"startChild".equals(method.getName())) {
+                        throw new UnsupportedOperationException(method.getName());
+                    }
+                    TurnStartRequest request = (TurnStartRequest) args[0];
+                    JaAdmissionReceipt receipt = runPreparedAdmission(participants, request, probe);
+                    return new TurnUseCase.Accepted(request.threadId(), request.turnId(),
+                            receipt.threadRevision(), true, completion);
+                });
+        TaskEventSink sink = new TaskEventSink() {
+            /** 模拟窗口断开：持久 Activity 已提交，但客户端事件投递拒绝。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(TaskEvent event) {
+                publishAttempts.incrementAndGet();
+                return CompletableFuture.failedFuture(new IllegalStateException("sink closed"));
+            }
+
+            /** 本测试不验 Timeline 事件，只验证 Child admission 与 Task Activity 的边界。 */
+            @Override public ConversationTurnEventSink turnEvents() {
+                return ConversationTurnEventSink.noop();
+            }
+        };
+        ListAppender<ILoggingEvent> logs = captureLogs();
+        try (TaskCoordinator coordinator = coordinator(repository, threads(), (TurnUseCase) owner,
+                (ChildTurnScheduler) owner, workspaces(), Clock.fixed(NOW, ZoneOffset.UTC),
+                enabledPolicies(), participants);
+             AutoCloseable ignored = coordinator.subscribe(sink)) {
+            TaskUseCase.StartResult started = coordinator.spawnAgent(new TaskUseCase.SpawnCommand(
+                    "thr_parent", "turn_parent", "review",
+                    new UserContent(List.of(new TextContent("review changes"))),
+                    PREFERENCES, capabilityCeiling(PREFERENCES, Set.of())));
+
+            assertNotNull(admitted.get(), "admission must remain committed when UI notification fails");
+            assertEquals(admitted.get().childThread().threadId(), started.task().lineage().taskThreadId());
+            assertEquals(1, publishAttempts.get());
+            CompletableFuture<TaskUseCase.WaitResult> waiting = coordinator.waitAgents(
+                    Set.of(started.task().lineage().taskThreadId()), Duration.ofSeconds(2),
+                    CancellationToken.none()).toCompletableFuture();
+
+            TaskModels.Summary queued = current.get();
+            current.set(withState(queued, TaskModels.State.COMPLETED,
+                    queued.projection().revision() + 1, queued.projection().latestActivitySequence() + 1));
+            completion.complete(completedTurnResult(started.task().lineage().taskThreadId(),
+                    started.turnId(), queued.projection().latestActivitySequence() + 1));
+
+            TaskUseCase.WaitResult result = waiting.get(1, TimeUnit.SECONDS);
+            assertFalse(result.timedOut());
+            assertEquals(TaskModels.State.COMPLETED, result.tasks().getFirst().projection().state());
+            assertEquals(2, publishAttempts.get(), "terminal UI failure must not block waiter completion");
+        } finally {
+            detachLogs(logs);
+        }
+        List<String> messages = logs.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+        assertTrue(messages.stream().anyMatch(message -> message.startsWith("event=task_activity_publish_failed")));
+        assertTrue(messages.contains("event=task_active_count active_count=1"));
+        assertTrue(messages.contains("event=task_active_count active_count=0"));
+        assertAdmissionCommittedThroughOneConnection(probe.get());
     }
 
     /** 直接调用 spawnAgent 也不能绕过已持久化的禁用策略，且不得触达 Child scheduler。 */
@@ -764,6 +867,115 @@ final class TaskCoordinatorTest {
         assertAdmissionCommittedThroughOneConnection(probe.get());
     }
 
+    /** Follow-up 已原子准入后 UI sink 失败不能误报失败或漏掉 waiter 的终态唤醒。
+     * @author kongweiguang
+     */
+    @Test
+    void admittedFollowUpSurvivesTaskEventFailureAndCompletesWaiter() throws Exception {
+        AtomicReference<TaskModels.FollowUpAdmissionReceipt> persisted = new AtomicReference<>();
+        AtomicReference<TaskModels.Summary> current = new AtomicReference<>(task(
+                "thr_target", "thr_parent", TaskModels.State.QUEUED, 3));
+        AtomicReference<AdmissionProbe> probe = new AtomicReference<>();
+        JaAdmissionParticipants participants = new JaAdmissionParticipants();
+        CompletableFuture<TurnResult> completion = new CompletableFuture<>();
+        AtomicInteger publishAttempts = new AtomicInteger();
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "listTree" -> List.of();
+            case "findTask" -> Optional.ofNullable(current.get());
+            case "readTask" -> Optional.of(activityDetail(current.get()));
+            case "findFollowUpByIdempotency" -> Optional.ofNullable(persisted.get());
+            case "findInitialContextSeedForFirstTurn" -> Optional.empty();
+            case "rootTurnIdForAdmission" -> "turn_parent";
+            case "applyFollowUpAdmission" -> {
+                TaskModels.FollowUpAdmission admission = (TaskModels.FollowUpAdmission) args[0];
+                assertTaskAdmissionUsesCurrentStoreTransaction();
+                TurnAdmission turn = admission.turn();
+                TaskModels.MailboxEnvelope mailbox = admission.mailbox();
+                AdmissionReceipt turnReceipt = new AdmissionReceipt(
+                        turn.threadId(), turn.turnId(), 6, 0, null);
+                TaskModels.MailboxMessage message = new TaskModels.MailboxMessage(
+                        1, mailbox.messageId(), "thr_parent", mailbox.senderThreadId(), "父会话",
+                        mailbox.targetThreadId(), mailbox.causalTurnId(), mailbox.kind(), mailbox.content(),
+                        mailbox.operationKey(), TaskModels.MailboxState.CONSUMED, turn.turnId(),
+                        mailbox.createdAt(), mailbox.createdAt(), mailbox.createdAt());
+                persisted.set(new TaskModels.FollowUpAdmissionReceipt(turnReceipt, message));
+                TaskModels.Summary queued = current.get();
+                current.set(withState(queued, TaskModels.State.RUNNING,
+                        queued.projection().revision() + 1,
+                        queued.projection().latestActivitySequence() + 1));
+                yield null;
+            }
+            case "beginSideChatClose", "deleteClosedSideChat" ->
+                    throw new UnsupportedOperationException("side chat close is outside this fixture");
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        ThreadUseCase childThreads = proxy(ThreadUseCase.class, (method, args) -> {
+            if ("readThread".equals(method.getName())) {
+                return Optional.of(threadWithTurns(5, List.of()));
+            }
+            throw new UnsupportedOperationException(method.getName());
+        });
+        Object owner = Proxy.newProxyInstance(TaskCoordinatorTest.class.getClassLoader(),
+                new Class<?>[]{TurnUseCase.class, ChildTurnScheduler.class}, (proxy, method, args) -> {
+                    if (!"startChild".equals(method.getName())) {
+                        throw new UnsupportedOperationException(method.getName());
+                    }
+                    TurnStartRequest request = (TurnStartRequest) args[0];
+                    JaAdmissionReceipt receipt = runPreparedAdmission(participants, request, probe);
+                    return new TurnUseCase.Accepted(request.threadId(), request.turnId(),
+                            receipt.threadRevision(), true, completion);
+                });
+        TaskEventSink sink = new TaskEventSink() {
+            /** 模拟窗口断开：Follow-up 与终态 Activity 已持久化，但客户端事件投递拒绝。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(TaskEvent event) {
+                publishAttempts.incrementAndGet();
+                return CompletableFuture.failedFuture(new IllegalStateException("sink closed"));
+            }
+
+            /** 本测试只验证 Follow-up admission 和 waiter 生命周期。 */
+            @Override public ConversationTurnEventSink turnEvents() {
+                return ConversationTurnEventSink.noop();
+            }
+        };
+        ListAppender<ILoggingEvent> logs = captureLogs();
+        TaskUseCase.FollowUpCommand command = new TaskUseCase.FollowUpCommand(
+                new TaskUseCase.MessageCommand("thr_parent", "thr_target",
+                        new UserContent(List.of(new TextContent("继续完成"))),
+                        "follow-sink-failure", "turn_parent"), 3);
+        try (TaskCoordinator coordinator = coordinator(repository, childThreads, (TurnUseCase) owner,
+                (ChildTurnScheduler) owner, workspaces(), Clock.fixed(NOW, ZoneOffset.UTC),
+                enabledPolicies(), participants);
+             AutoCloseable ignored = coordinator.subscribe(sink)) {
+            TaskUseCase.FollowUpResult accepted = assertDoesNotThrow(() -> coordinator.followUp(command));
+            assertNotNull(persisted.get(), "Follow-up admission must remain committed after UI notification failure");
+            assertEquals(TaskModels.State.RUNNING, accepted.task().projection().state());
+            assertEquals(1, publishAttempts.get());
+
+            CompletableFuture<TaskUseCase.WaitResult> waiting = coordinator.waitAgents(
+                    Set.of("thr_target"), Duration.ofSeconds(2), CancellationToken.none()).toCompletableFuture();
+            TaskModels.Summary queued = current.get();
+            current.set(withState(queued, TaskModels.State.COMPLETED,
+                    queued.projection().revision() + 1,
+                    queued.projection().latestActivitySequence() + 1));
+            completion.complete(completedTurnResult("thr_target", accepted.turnId(),
+                    queued.projection().latestActivitySequence() + 1));
+
+            TaskUseCase.WaitResult result = waiting.get(1, TimeUnit.SECONDS);
+            assertFalse(result.timedOut());
+            assertEquals(TaskModels.State.COMPLETED, result.tasks().getFirst().projection().state());
+            assertEquals(2, publishAttempts.get(), "terminal UI failure must not block waiter completion");
+        } finally {
+            detachLogs(logs);
+        }
+        List<String> messages = logs.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+        assertTrue(messages.stream().anyMatch(message -> message.startsWith("event=task_activity_publish_failed")));
+        assertTrue(messages.contains("event=task_active_count active_count=1"));
+        assertTrue(messages.contains("event=task_active_count active_count=0"));
+        assertAdmissionCommittedThroughOneConnection(probe.get());
+    }
+
     /** Child 到 root 的 QueueOnly 重试复用 Repository 回执，且不会制造 Task 事件。 */
     @Test
     void publishesChildToRootMessageOnlyForInsertWinner() {
@@ -866,6 +1078,77 @@ final class TaskCoordinatorTest {
             bridge.publish(new TurnEvent.TextDelta("turn_target", 3, "unobserved", "request_first"))
                     .toCompletableFuture().join();
             assertEquals(3, progress.size());
+        }
+    }
+
+    /** 冷恢复提交后的连接故障不阻断 waiter；重放同一持久 Activity 绝不追加或改写 Task。
+     * @author kongweiguang
+     */
+    @Test
+    void recoveredSuspensionPublishesCommittedActivityAndWakesWaiter() throws Exception {
+        AtomicReference<TaskModels.Summary> current = new AtomicReference<>(
+                taskWithProjection(TaskModels.State.RUNNING, 1, 1));
+        AtomicReference<String> turnState = new AtomicReference<>(TurnState.SUSPENDED.name());
+        AtomicInteger writes = new AtomicInteger();
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "findTask" -> Optional.of(current.get());
+            case "readTask" -> Optional.of(activityDetail(current.get()));
+            case "recordActivity" -> {
+                writes.incrementAndGet();
+                throw new AssertionError("recovery notification cannot write another Activity");
+            }
+            case "listTemporarySideChats" -> List.of();
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        ThreadUseCase threadPort = proxy(ThreadUseCase.class, (method, args) -> switch (method.getName()) {
+            case "findTurn" -> Optional.of(new io.github.kongweiguang.ja.conversation.domain.model.TurnSummary(
+                    "thr_target", "turn_expired", turnState.get(), 2, 2, false));
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        List<TaskEvent> notifications = new ArrayList<>();
+        AtomicBoolean failFirstNotification = new AtomicBoolean(true);
+        TaskEventSink subscriber = new TaskEventSink() {
+            /** 模拟提交后的连接断开，恢复 listener 必须能重放相同持久 sequence。 */
+            @Override public java.util.concurrent.CompletionStage<Void> publish(TaskEvent event) {
+                notifications.add(event);
+                if (failFirstNotification.getAndSet(false)) {
+                    return CompletableFuture.failedFuture(new IllegalStateException("connection unavailable"));
+                }
+                return CompletableFuture.completedFuture(null);
+            }
+
+            /** 冷恢复不拥有可续跑的 Turn sink。 */
+            @Override public ConversationTurnEventSink turnEvents() {
+                return ConversationTurnEventSink.noop();
+            }
+        };
+        Object owner = passiveTurnOwner();
+        try (TaskCoordinator coordinator = coordinator(repository, threadPort,
+                (TurnUseCase) owner, (ChildTurnScheduler) owner, unsupported(WorkspaceUseCase.class),
+                Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies());
+             AutoCloseable ignored = coordinator.subscribe(subscriber)) {
+            CompletableFuture<TaskUseCase.WaitResult> waiter = coordinator.waitAgents(Set.of("thr_target"),
+                    Duration.ofSeconds(5), CancellationToken.none()).toCompletableFuture();
+            assertFalse(waiter.isDone());
+            current.set(taskWithProjection(TaskModels.State.SUSPENDED, 2, 2));
+            assertThrows(java.util.concurrent.CompletionException.class,
+                    () -> coordinator.publishRecoveredSuspended("thr_target", "turn_expired"));
+            assertEquals(TaskModels.State.SUSPENDED,
+                    waiter.get(1, TimeUnit.SECONDS).tasks().getFirst().projection().state());
+            assertEquals(1, notifications.size());
+            coordinator.publishRecoveredSuspended("thr_target", "turn_expired");
+            assertEquals(2, notifications.size());
+            assertEquals(2, assertInstanceOf(TaskEvent.Activity.class,
+                    notifications.getLast()).activity().sequence());
+            assertEquals(0, writes.get());
+
+            turnState.set(TurnState.RUNNING.name());
+            coordinator.publishRecoveredSuspended("thr_target", "turn_expired");
+            assertEquals(2, notifications.size(), "resumed Turn rejects a late recovery notification");
+            turnState.set(TurnState.SUSPENDED.name());
+            current.set(taskWithProjection(TaskModels.State.COMPLETED, 3, 3));
+            coordinator.publishRecoveredSuspended("thr_target", "turn_expired");
+            assertEquals(2, notifications.size(), "terminal Task cannot publish an old suspension");
         }
     }
 
@@ -982,9 +1265,66 @@ final class TaskCoordinatorTest {
                     "approval StateChanged followed by ApprovalRequested must project one Task Activity");
             assertEquals(TaskModels.State.WAITING_APPROVAL, lastMutation.get().state());
             assertEquals(TaskModels.ActivityKind.WAITING_APPROVAL, lastMutation.get().kind());
-            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_approval_resolved",
+            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_approval_denied",
                     "thr_target", "turn_hidden", 5, 5, NOW), "appr_bridge",
+                    io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.DENY)).toCompletableFuture().join();
+            assertEquals(TaskModels.State.RUNNING, current.get().projection().state(),
+                    "denying one Tool approval resumes model reasoning instead of failing the Task");
+            assertEquals(TaskModels.ActivityKind.RESUMED, lastMutation.get().kind());
+            int writesAfterDenial = activityWrites.get();
+            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_duplicate_denial",
+                    "thr_target", "turn_hidden", 5, 5, NOW), "appr_bridge",
+                    io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.DENY)).toCompletableFuture().join();
+            assertEquals(writesAfterDenial, activityWrites.get(), "duplicate resolution must not add an Activity");
+
+            bridge.publish(new TurnEvent.StateChanged(new TurnEvent.Context("evt_running_approved_approval",
+                    "thr_target", "turn_hidden", 6, 6, NOW), io.github.kongweiguang.ja.agent.domain.turn.TurnState.RUNNING,
+                    io.github.kongweiguang.ja.agent.domain.turn.TurnState.WAITING_APPROVAL)).toCompletableFuture().join();
+            bridge.publish(new TurnEvent.ApprovalRequested(new TurnEvent.Context("evt_approved_approval_requested",
+                    "thr_target", "turn_hidden", 6, 6, NOW), "appr_approved", "call_approved", "shell",
+                    new ToolPresentation(ToolPresentation.Kind.SHELL, "执行命令", ToolPresentation.Status.PENDING,
+                            null, null, null, List.of(), List.of(), null, null,
+                            null, null, null, null, false, null),
+                    "需要确认", NOW.plusSeconds(60))).toCompletableFuture().join();
+            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_approval_approved",
+                    "thr_target", "turn_hidden", 7, 7, NOW), "appr_approved",
                     io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.APPROVE)).toCompletableFuture().join();
+            assertEquals(TaskModels.State.RUNNING, current.get().projection().state());
+            assertEquals(TaskModels.ActivityKind.RESUMED, lastMutation.get().kind());
+
+            bridge.publish(new TurnEvent.StateChanged(new TurnEvent.Context("evt_running_expiring_approval",
+                    "thr_target", "turn_hidden", 8, 8, NOW), io.github.kongweiguang.ja.agent.domain.turn.TurnState.RUNNING,
+                    io.github.kongweiguang.ja.agent.domain.turn.TurnState.WAITING_APPROVAL)).toCompletableFuture().join();
+            bridge.publish(new TurnEvent.ApprovalRequested(new TurnEvent.Context("evt_expiring_approval_requested",
+                    "thr_target", "turn_hidden", 8, 8, NOW), "appr_expiring", "call_expiring", "shell",
+                    new ToolPresentation(ToolPresentation.Kind.SHELL, "执行命令", ToolPresentation.Status.PENDING,
+                            null, null, null, List.of(), List.of(), null, null,
+                            null, null, null, null, false, null),
+                    "需要确认", NOW.plusSeconds(60))).toCompletableFuture().join();
+            bridge.publish(new TurnEvent.StateChanged(new TurnEvent.Context("evt_approval_expired_suspend",
+                    "thr_target", "turn_hidden", 9, 9, NOW), io.github.kongweiguang.ja.agent.domain.turn.TurnState.WAITING_APPROVAL,
+                    io.github.kongweiguang.ja.agent.domain.turn.TurnState.SUSPENDED)).toCompletableFuture().join();
+            assertEquals(TaskModels.State.SUSPENDED, current.get().projection().state());
+            assertEquals(TaskModels.ActivityKind.SUSPENDED, lastMutation.get().kind());
+            bridge.publish(new TurnEvent.ApprovalClosed(new TurnEvent.Context("evt_approval_expired_closed",
+                    "thr_target", "turn_hidden", 9, 9, NOW), "appr_expiring",
+                    io.github.kongweiguang.ja.agent.domain.interaction.InteractionStatus.EXPIRED))
+                    .toCompletableFuture().join();
+            int writesAfterExpiry = activityWrites.get();
+            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_late_after_expiry",
+                    "thr_target", "turn_hidden", 10, 10, NOW), "appr_expiring",
+                    io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.APPROVE)).toCompletableFuture().join();
+            assertEquals(TaskModels.State.SUSPENDED, current.get().projection().state(),
+                    "a stale approval result cannot revive a Task suspended by expiry");
+            assertEquals(writesAfterExpiry, activityWrites.get());
+            current.set(taskWithProjection(TaskModels.State.RUNNING,
+                    current.get().projection().revision() + 1, current.get().projection().latestActivitySequence()));
+            bridge.publish(new TurnEvent.StateChanged(new TurnEvent.Context("evt_stale_suspend_after_resume",
+                    "thr_target", "turn_hidden", 11, 11, NOW), io.github.kongweiguang.ja.agent.domain.turn.TurnState.WAITING_APPROVAL,
+                    io.github.kongweiguang.ja.agent.domain.turn.TurnState.SUSPENDED)).toCompletableFuture().join();
+            assertEquals(TaskModels.State.RUNNING, current.get().projection().state(),
+                    "an old suspension transition cannot overwrite a later running projection");
+            assertEquals(writesAfterExpiry, activityWrites.get());
 
             TaskModels.Summary terminal = taskWithProjection(TaskModels.State.COMPLETED, 5, 5);
             current.set(terminal);
@@ -1006,7 +1346,7 @@ final class TaskCoordinatorTest {
                     "turn_hidden", 5, 5, NOW), io.github.kongweiguang.ja.agent.domain.turn.TurnState.RUNNING,
                     io.github.kongweiguang.ja.agent.domain.turn.TurnState.WAITING_INPUT)).toCompletableFuture().join();
             assertEquals(TaskModels.State.COMPLETED, current.get().projection().state());
-            assertEquals(5, activityWrites.get(), "terminal Task state must reject late lifecycle projection");
+            assertEquals(writesAfterExpiry, activityWrites.get(), "terminal Task state must reject late lifecycle projection");
             TurnProjectionFailure failure = new TurnProjectionFailure("thr_target", "turn_hidden",
                     TurnProjectionFailure.Reason.PROJECTION_FAILED);
             bridge.publishProjectionFailure(failure).toCompletableFuture().join();
@@ -1015,10 +1355,43 @@ final class TaskCoordinatorTest {
             throw new AssertionError(failure);
         }
 
-        assertEquals(9, downstreamEvents.get());
+        assertEquals(19, downstreamEvents.get());
         assertEquals(TaskModels.State.COMPLETED, current.get().projection().state());
         assertEquals(TaskEvent.Activity.class, taskEvent.get().getClass());
         assertEquals("activity_terminal", ((TaskEvent.Activity) taskEvent.get()).activity().activityId());
+    }
+
+    /** 取消终态先由持久 Task projection 提交；随后迟到的审批关闭与裁决事件只能留在原状态。
+     * @author kongweiguang
+     */
+    @Test
+    void cancelledTaskIgnoresLateApprovalClosureAndResolution() {
+        AtomicReference<TaskModels.Summary> current = new AtomicReference<>(taskWithProjection(
+                TaskModels.State.CANCELLED, 4, 3));
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "findTask" -> Optional.of(current.get());
+            case "recordActivity" -> throw new AssertionError("late approval must not rewrite cancellation");
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        Object turnOwner = passiveTurnOwner();
+        try (TaskCoordinator coordinator = coordinator(repository, unsupported(ThreadUseCase.class),
+                (TurnUseCase) turnOwner, (ChildTurnScheduler) turnOwner, unsupported(WorkspaceUseCase.class),
+                Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies())) {
+            ConversationTurnEventSink bridge = coordinator.projectContinuationEvents("thr_target",
+                    ConversationTurnEventSink.noop());
+            bridge.publish(new TurnEvent.ApprovalClosed(new TurnEvent.Context("evt_closed_after_cancel",
+                    "thr_target", "turn_hidden", 8, 8, NOW), "appr_cancelled",
+                    io.github.kongweiguang.ja.agent.domain.interaction.InteractionStatus.CANCELLED))
+                    .toCompletableFuture().join();
+            bridge.publish(new TurnEvent.ApprovalResolved(new TurnEvent.Context("evt_resolved_after_cancel",
+                    "thr_target", "turn_hidden", 9, 9, NOW), "appr_cancelled",
+                    io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.DENY))
+                    .toCompletableFuture().join();
+
+            assertEquals(TaskModels.State.CANCELLED, current.get().projection().state());
+        }
     }
 
     /** Child 的私有适配器只过滤 UI 事件，投影失败必须抵达已登记的 RPC sink 触发权威重读。 */
@@ -1097,6 +1470,116 @@ final class TaskCoordinatorTest {
             assertEquals(List.of("thr_wait"), result.tasks().stream()
                     .map(value -> value.lineage().taskThreadId()).toList());
             assertEquals(false, result.timedOut());
+        }
+    }
+
+    /** 超时时仍返回目标当前持久状态，供模型决定是否继续等待或读取详情。
+     * @author kongweiguang
+     */
+    @Test
+    void waitAgentTimeoutReturnsCurrentTaskSummaries() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        AtomicReference<List<TaskModels.Summary>> current = new AtomicReference<>(List.of(
+                task("thr_wait", "thr_root", TaskModels.State.RUNNING, 3),
+                task("thr_other", "thr_root", TaskModels.State.RUNNING, 4)));
+        List<TaskModels.Summary> latest = List.of(task("thr_wait", "thr_root", TaskModels.State.RUNNING, 5),
+                task("thr_other", "thr_root", TaskModels.State.RUNNING, 7));
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "findTask" -> {
+                int read = reads.incrementAndGet();
+                Optional<TaskModels.Summary> observed = current.get().stream()
+                        .filter(value -> value.lineage().taskThreadId().equals(args[0]))
+                        .findFirst();
+                if (read == 3) {
+                    current.set(latest);
+                }
+                yield observed;
+            }
+            case "readTask" -> {
+                throw new AssertionError("timeout snapshots read only Task summaries");
+            }
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        Object turnOwner = passiveTurnOwner();
+        try (TaskCoordinator coordinator = coordinator(repository, unsupported(ThreadUseCase.class),
+                (TurnUseCase) turnOwner, (ChildTurnScheduler) turnOwner, unsupported(WorkspaceUseCase.class),
+                Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies())) {
+            CompletableFuture<TaskUseCase.WaitResult> waiting = coordinator.waitAgents(
+                    Set.of("thr_wait", "thr_other"), Duration.ofMillis(100),
+                    CancellationToken.none()).toCompletableFuture();
+            TaskUseCase.WaitResult result = waiting.get(2, TimeUnit.SECONDS);
+
+            assertTrue(result.timedOut());
+            assertEquals(Set.of("thr_wait", "thr_other"), result.tasks().stream()
+                    .map(value -> value.lineage().taskThreadId()).collect(java.util.stream.Collectors.toSet()));
+            assertEquals(5L, result.tasks().stream().filter(value -> value.lineage().taskThreadId().equals("thr_wait"))
+                    .findFirst().orElseThrow().projection().revision());
+            assertEquals(7L, result.tasks().stream().filter(value -> value.lineage().taskThreadId().equals("thr_other"))
+                    .findFirst().orElseThrow().projection().revision());
+            assertTrue(reads.get() >= 6,
+                    "both targets should be read initially, after registration, and at deadline");
+        }
+    }
+
+    /** 保留父 Turn 取消语义；取消先于超时完成且不读取超时快照。
+     * @author kongweiguang
+     */
+    @Test
+    void waitAgentCancellationCompletesExceptionallyBeforeTimeout() {
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "findTask" -> Optional.of(task("thr_wait", "thr_root", TaskModels.State.RUNNING, 1));
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        CancellationSource cancellation = new CancellationSource();
+        Object turnOwner = passiveTurnOwner();
+        try (TaskCoordinator coordinator = coordinator(repository, unsupported(ThreadUseCase.class),
+                (TurnUseCase) turnOwner, (ChildTurnScheduler) turnOwner, unsupported(WorkspaceUseCase.class),
+                Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies())) {
+            CompletableFuture<TaskUseCase.WaitResult> waiting = coordinator.waitAgents(Set.of("thr_wait"),
+                    Duration.ofSeconds(5), cancellation).toCompletableFuture();
+
+            cancellation.cancel("test_cancel");
+
+            assertThrows(CancellationException.class, waiting::join);
+            assertTrue(waiting.isCancelled());
+        }
+    }
+
+    /** Deadline snapshot 仓储读取失败必须完成 waiter exceptionally，不能只让定时线程退出。
+     * @author kongweiguang
+     */
+    @Test
+    void waitAgentTimeoutPropagatesRepositoryFailureInsteadOfHanging() {
+        AtomicInteger reads = new AtomicInteger();
+        TaskRepository repository = proxy(TaskRepository.class, (method, args) -> switch (method.getName()) {
+            case "findTask" -> {
+                if (reads.incrementAndGet() <= 2) {
+                    yield Optional.of(task("thr_wait", "thr_root", TaskModels.State.RUNNING, 1));
+                }
+                throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                        "timeout snapshot unavailable");
+            }
+            case "listTemporarySideChats" -> List.of();
+            case "close" -> null;
+            default -> throw new UnsupportedOperationException(method.getName());
+        });
+        Object turnOwner = passiveTurnOwner();
+        try (TaskCoordinator coordinator = coordinator(repository, unsupported(ThreadUseCase.class),
+                (TurnUseCase) turnOwner, (ChildTurnScheduler) turnOwner, unsupported(WorkspaceUseCase.class),
+                Clock.fixed(NOW, ZoneOffset.UTC), enabledPolicies())) {
+            CompletableFuture<TaskUseCase.WaitResult> waiting = coordinator.waitAgents(Set.of("thr_wait"),
+                    Duration.ofMillis(30), CancellationToken.none()).toCompletableFuture();
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> waiting.get(1, TimeUnit.SECONDS));
+            TaskRepositoryException repositoryFailure = assertInstanceOf(TaskRepositoryException.class,
+                    failure.getCause());
+            assertEquals(TaskRepositoryException.Code.INVALID_STATE, repositoryFailure.code());
+            assertTrue(reads.get() >= 3, "the storage failure must come from the deadline snapshot read");
         }
     }
 
@@ -2277,6 +2760,20 @@ final class TaskCoordinatorTest {
                 revision, state, 1, null, 1, 0, 0, 0, state.name(), NOW, completedAt, NOW));
     }
 
+    /** 仅替换同一 Child 的投影状态，保留准入身份以覆盖完成回调与 Activity 回读。
+     * @author kongweiguang
+     */
+    private static TaskModels.Summary withState(TaskModels.Summary task, TaskModels.State state,
+                                                 long revision, long latestActivitySequence) {
+        boolean terminal = state == TaskModels.State.COMPLETED || state == TaskModels.State.FAILED
+                || state == TaskModels.State.CANCELLED;
+        TaskModels.Projection projection = new TaskModels.Projection(task.lineage().taskThreadId(),
+                task.lineage().rootThreadId(), revision, state, latestActivitySequence, null,
+                1, 0, 0, 0, state.name(), state == TaskModels.State.QUEUED ? null : NOW,
+                terminal ? NOW : null, NOW);
+        return new TaskModels.Summary(task.lineage(), projection);
+    }
+
     /** 构造独立侧聊的最小投影，确保关闭测试不会把普通 Subagent 当成可清理目标。 */
     private static TaskModels.Summary sideTask(TaskModels.State state, long revision) {
         TaskModels.Lineage lineage = new TaskModels.Lineage("thr_side", "thr_parent", "thr_parent",
@@ -2304,6 +2801,40 @@ final class TaskCoordinatorTest {
                 io.github.kongweiguang.ja.agent.domain.turn.TurnState.CANCELLED,
                 "cancelled", null, null, null, null, null);
         return new TurnResult(terminal.state(), terminal.summary(), terminal);
+    }
+
+    /** 生成与 completion 阶段一致的合法终态值；Task 投影仍以仓储回读为唯一权威。
+     * @author kongweiguang
+     */
+    private static TurnResult completedTurnResult(String threadId, String turnId, long sequence) {
+        TurnEvent.Context context = new TurnEvent.Context(
+                "evt_completed_" + turnId, threadId, turnId, sequence, 0, NOW);
+        TurnEvent.Terminal terminal = new TurnEvent.Terminal(context,
+                io.github.kongweiguang.ja.agent.domain.turn.TurnState.COMPLETED,
+                "completed", null, null, new TurnEvent.FinalMessage("item_completed_" + turnId, "完成"),
+                null, TurnChangeSet.emptyComplete());
+        return new TurnResult(terminal.state(), terminal.summary(), terminal);
+    }
+
+    /** 构造带一条持久 Activity 的详情，使失败 UI sink 覆盖真实提交后的发布路径。
+     * @author kongweiguang
+     */
+    private static TaskModels.Detail activityDetail(TaskModels.Summary task) {
+        long sequence = task.projection().latestActivitySequence();
+        TaskModels.Activity activity = new TaskModels.Activity(sequence,
+                "activity_fixture_" + sequence, task.lineage().rootThreadId(),
+                task.lineage().taskThreadId(), task.lineage().taskThreadId(),
+                task.lineage().originTurnId(), TaskModels.ActivityKind.FOLLOW_UP_QUEUED,
+                JsonObjects.builder().putText("text", "续跑已接纳").build(), NOW);
+        TaskModels.ContextSeed seed = new TaskModels.ContextSeed("seed_target", "thr_parent", "turn_parent", 1,
+                TaskModels.InheritanceMode.BRIEF_ONLY,
+                new UserContent(List.of(new TextContent("继续完成"))), null,
+                new JsonArray(List.of()), JsonObjects.builder().putText("version", "task_access_v1").build(),
+                "a".repeat(64), NOW);
+        ThreadSummary thread = new ThreadSummary(task.lineage().taskThreadId(), "ws_test", "Task", "project",
+                PREFERENCES, ThreadSummary.Status.ACTIVE, false, null, true, task.projection().revision(), NOW, NOW);
+        return new TaskModels.Detail(task, ConversationAcl.snapshot(thread),
+                seed, List.of(activity), List.of());
     }
 
     /** 续跑桥测试使用可控 revision/sequence，模拟同一 SQLite projection 的逐次 CAS 结果。 */

@@ -302,9 +302,11 @@ public final class RpcTestBindings {
         /** 通用拒绝夹具不负责跨 Session 列表。 */
         @Override
         public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-        /** 通用拒绝夹具不执行 Thread 发现查询。 */
+        /** 通用夹具没有持久审批，启动观察使用空发现页；专项测试显式提供真实候选。 */
         @Override
-        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
+        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+            return new CursorPage<>(java.util.List.of(), null);
+        }
         /** 通用拒绝夹具不搜索已提交输入。 */
         @Override
         public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) { throw unsupported(); }
@@ -357,6 +359,8 @@ public final class RpcTestBindings {
         @Override public Optional<String> locallyActiveTurnId(String threadId) { return Optional.empty(); }
         /** 该纯拒绝夹具不持有任何特定 Turn 的本地执行句柄。 */
         @Override public boolean locallyOwnsTurn(String threadId, String turnId) { return false; }
+        /** 此传输拒绝夹具不创建持久事件观察或后台 watcher。 @author kongweiguang */
+        @Override public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) { return false; }
         /** 未声明的取消能力失败。 */
         @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 未声明的接纳关闭能力失败。 */

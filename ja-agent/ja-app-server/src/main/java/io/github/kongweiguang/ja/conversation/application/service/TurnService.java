@@ -122,6 +122,10 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final ConcurrentMap<AgentIdentity, CompletableFuture<Void>> owners = new ConcurrentHashMap<>();
     private final ConcurrentMap<AgentIdentity, CompletableFuture<TurnResult>> completions = new ConcurrentHashMap<>();
+    private final java.util.Set<AgentIdentity> terminalizingCompletions = ConcurrentHashMap.newKeySet();
+    private final ConcurrentMap<AgentIdentity, AutoCloseable> suspendedSubscriptions = new ConcurrentHashMap<>();
+    private final ConcurrentMap<AgentIdentity, CompletableFuture<Void>> suspendedSubscriptionReleases =
+            new ConcurrentHashMap<>();
     private final ConcurrentMap<AgentIdentity, Consumer<TurnResult>> terminalObservers = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Consumer<CompletionStage<TurnResult>>> resumeContinuations =
             new ConcurrentHashMap<>();
@@ -416,12 +420,296 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 订阅释放失败只写错误类别，展示客户端失败不能改写已经提交的业务事实。
+     *
+     * @author kongweiguang
      */
     private static void closeSubscription(AutoCloseable subscription) {
         try {
             subscription.close();
         } catch (Exception failure) {
             report("event subscription close", failure);
+            if (failure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new CompletionException(failure);
+        }
+    }
+
+    /**
+     * 暂停后只保留 durable event watcher；状态查询在锁外执行，stripe 只封闭终态判断后的登记竞态。
+     * 关闭或已有 drain 时拒绝迟到登记，并在锁外释放，避免 sink ACK 阻塞 admission 与 shutdown。
+     *
+     * @author kongweiguang
+     */
+    private void retainSuspendedSubscription(AgentIdentity identity, AutoCloseable subscription) {
+        boolean terminal;
+        try {
+            terminal = engine.query(identity).map(status -> state(status.state()).terminal()).orElse(false);
+        } catch (RuntimeException queryFailure) {
+            report("suspended event subscription state check", queryFailure);
+            terminal = false;
+        }
+        boolean retained = false;
+        boolean shutdown = false;
+        boolean duplicate = false;
+        synchronized (admissionStripes[stripe(identity)]) {
+            shutdown = !accepting.get();
+            CompletableFuture<TurnResult> completion = completions.get(identity);
+            boolean completionTerminal = completion != null && completion.isDone();
+            boolean terminalizing = terminalizingCompletions.contains(identity);
+            boolean eligible = !shutdown && !terminal && !completionTerminal && !terminalizing;
+            if (eligible && !suspendedSubscriptionReleases.containsKey(identity)) {
+                AutoCloseable previous = suspendedSubscriptions.putIfAbsent(identity, subscription);
+                retained = previous == null || previous == subscription;
+                duplicate = previous != null && previous != subscription;
+            } else if (eligible) {
+                duplicate = true;
+            }
+        }
+        if (!retained) {
+            if (shutdown) {
+                closeSubscriptionForShutdown(subscription);
+            } else {
+                closeSubscription(subscription);
+            }
+        }
+        if (duplicate) {
+            report("duplicate suspended event subscription", new IllegalStateException("duplicate watcher"));
+        }
+    }
+
+    /**
+     * 启动恢复只观察既有等待态事件；先占用身份级生命周期屏障，再锁外校验与 attach，避免与 resume 竞争。
+     * 未能保留的订阅走即时 detach，因为它不再有调用方等待其水位，且不能拖住关停。
+     *
+     * @author kongweiguang
+     */
+    @Override
+    public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) {
+        Objects.requireNonNull(turnId, "turnId");
+        Objects.requireNonNull(sink, "sink");
+        if (!accepting.get()) {
+            return false;
+        }
+        TurnOwnerProjection owner = projections.readTurn(turnId).orElse(null);
+        if (owner == null) {
+            return false;
+        }
+        AgentIdentity identity = JaTurnRequestMapper.identity(owner.threadId(), turnId);
+        Object stripe = admissionStripes[stripe(identity)];
+        CompletableFuture<Void> observation = new CompletableFuture<>();
+        synchronized (stripe) {
+            if (!accepting.get() || terminalizingCompletions.contains(identity)
+                    || owners.containsKey(identity) || completions.containsKey(identity)
+                    || resumeClaims.contains(identity) || suspendedSubscriptions.containsKey(identity)
+                    || suspendedSubscriptionReleases.putIfAbsent(identity, observation) != null) {
+                return false;
+            }
+        }
+
+        AutoCloseable subscription = null;
+        boolean retained = false;
+        try {
+            if (!isApprovalWait(identity)) {
+                return false;
+            }
+            subscription = Objects.requireNonNull(events.attach(identity, sink), "event subscription");
+            if (!accepting.get()) {
+                return false;
+            }
+            if (!isApprovalWait(identity)) {
+                return false;
+            }
+            synchronized (stripe) {
+                if (suspendedSubscriptionReleases.get(identity) == observation && accepting.get()
+                        && !terminalizingCompletions.contains(identity) && !owners.containsKey(identity)
+                        && !completions.containsKey(identity) && !resumeClaims.contains(identity)
+                        && !suspendedSubscriptions.containsKey(identity)) {
+                    retained = suspendedSubscriptions.putIfAbsent(identity, subscription) == null;
+                    if (retained) {
+                        subscription = null;
+                        suspendedSubscriptionReleases.remove(identity, observation);
+                        observation.complete(null);
+                    }
+                }
+            }
+            return retained;
+        } finally {
+            try {
+                if (subscription != null) {
+                    closeSubscriptionForShutdown(subscription);
+                }
+            } finally {
+                synchronized (stripe) {
+                    if (suspendedSubscriptionReleases.remove(identity, observation)) {
+                        observation.complete(null);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 观察启动状态只允许 Core 权威状态仍处于审批等待或普通挂起，不从 UI 投影推断执行阶段。
+     *
+     * @author kongweiguang
+     */
+    private boolean isApprovalWait(AgentIdentity identity) {
+        return engine.query(identity).map(status -> {
+            TurnState current = state(status.state());
+            return current == TurnState.WAITING_APPROVAL || current == TurnState.SUSPENDED;
+        }).orElse(false);
+    }
+
+    /**
+     * 显式恢复或终态完成前移除对应持久事件 watcher，确保同身份只能有一个活动桥订阅。
+     *
+     * @author kongweiguang
+     */
+    private void releaseSuspendedSubscription(AgentIdentity identity) {
+        Object stripe = admissionStripes[stripe(identity)];
+        AutoCloseable subscription;
+        CompletableFuture<Void> release;
+        boolean owner;
+        synchronized (stripe) {
+            CompletableFuture<Void> existing = suspendedSubscriptionReleases.get(identity);
+            if (existing != null) {
+                release = existing;
+                subscription = null;
+                owner = false;
+            } else {
+                subscription = suspendedSubscriptions.get(identity);
+                if (subscription == null) {
+                    return;
+                }
+                release = new CompletableFuture<>();
+                suspendedSubscriptionReleases.put(identity, release);
+                owner = true;
+            }
+        }
+        if (!owner) {
+            release.join();
+            return;
+        }
+
+        Throwable failure = null;
+        try {
+            closeSubscription(subscription);
+        } catch (RuntimeException | Error closeFailure) {
+            failure = closeFailure;
+        } finally {
+            synchronized (stripe) {
+                suspendedSubscriptions.remove(identity, subscription);
+                if (failure == null) {
+                    release.complete(null);
+                } else {
+                    release.completeExceptionally(failure);
+                }
+                suspendedSubscriptionReleases.remove(identity, release);
+            }
+        }
+        if (failure instanceof RuntimeException runtime) {
+            throw runtime;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+    }
+
+    /**
+     * 关闭服务前逐一释放等待中的投影 watcher；单个订阅关闭异常不得跳过其余身份。
+     *
+     * @author kongweiguang
+     */
+    private void releaseAllSuspendedSubscriptions(boolean shutdown) {
+        java.util.Set<AgentIdentity> identities = new java.util.HashSet<>(suspendedSubscriptions.keySet());
+        identities.addAll(suspendedSubscriptionReleases.keySet());
+        Throwable failure = null;
+        for (AgentIdentity identity : identities) {
+            try {
+                if (shutdown) {
+                    detachSuspendedSubscriptionForShutdown(identity);
+                } else {
+                    releaseSuspendedSubscription(identity);
+                }
+            } catch (RuntimeException | Error closeFailure) {
+                report("suspended event subscription release", closeFailure);
+                failure = mergeCloseFailure(failure, closeFailure);
+            }
+        }
+        throwCloseFailure(failure);
+    }
+
+    /**
+     * Shutdown 即时 detach 当前 watcher，即使普通 waterline drain 正在进行也不等待其 future。
+     * @author kongweiguang
+     */
+    private void detachSuspendedSubscriptionForShutdown(AgentIdentity identity) {
+        Object stripe = admissionStripes[stripe(identity)];
+        AutoCloseable subscription;
+        CompletableFuture<Void> release;
+        synchronized (stripe) {
+            subscription = suspendedSubscriptions.remove(identity);
+            release = suspendedSubscriptionReleases.get(identity);
+            if (subscription == null && release == null) {
+                return;
+            }
+            if (release == null) {
+                release = new CompletableFuture<>();
+                suspendedSubscriptionReleases.put(identity, release);
+            }
+        }
+        Throwable failure = null;
+        try {
+            if (subscription != null) {
+                events.closeForShutdown(subscription);
+            }
+        } catch (Exception | Error closeFailure) {
+            failure = closeFailure;
+            if (closeFailure instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (closeFailure instanceof Error error) {
+                throw error;
+            }
+            throw new CompletionException(closeFailure);
+        } finally {
+            synchronized (stripe) {
+                if (failure == null) {
+                    release.complete(null);
+                } else {
+                    release.completeExceptionally(failure);
+                }
+                suspendedSubscriptionReleases.remove(identity, release);
+            }
+        }
+    }
+
+    /**
+     * 关闭操作直接走事件端口的 shutdown detach；异常上抛，由聚合收尾记录并继续清理其他订阅。
+     * @author kongweiguang
+     */
+    private void closeSubscriptionForShutdown(AutoCloseable subscription) {
+        try {
+            events.closeForShutdown(subscription);
+        } catch (RuntimeException | Error failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new CompletionException(failure);
+        }
+    }
+
+    /**
+     * 按固定序递归持有全部 admission stripes，为 accepting fence 原子化 late retention 边界。
+     * @author kongweiguang
+     */
+    private void withAllAdmissionStripes(int index, Runnable action) {
+        if (index == admissionStripes.length) {
+            action.run();
+            return;
+        }
+        synchronized (admissionStripes[index]) {
+            withAllAdmissionStripes(index + 1, action);
         }
     }
 
@@ -710,6 +998,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /**
      * 在相同 admission 锁序下拒绝重复恢复，并保留提交后观察器相对于终态回调的原有顺序。
      * Workspace 租约只保留同步准入屏障，退出资源作用域才释放，无需在业务体中读取租约对象。
+     * 首次 Child 的 Thread 与执行在同一事务落库，租约归属必须来自精确身份的准入快照，不能提前要求 Child 投影。
      *
      * @author kongweiguang
      */
@@ -721,25 +1010,40 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                             boolean requireNoLocalOwner) {
         Objects.requireNonNull(sink, "sink");
         Objects.requireNonNull(admissionObserver, "admissionObserver");
-        ThreadProjection thread = projections.readThread(identity.threadId())
-                .orElseThrow(() -> new IllegalStateException("Turn Thread projection is missing"));
+        String workspaceId = admissions.find(identity).map(prepared -> prepared.facts().workspaceId())
+                .orElseGet(() -> projections.readThread(identity.threadId())
+                        .orElseThrow(() -> new IllegalStateException("Turn Thread projection is missing"))
+                        .workspaceId());
         try (WorkspaceAdmissionPort.Lease ignored =
-                     workspaceAdmissions.acquire(thread.workspaceId())) {
-            Lock gate = admissionGate.readLock();
-            gate.lock();
-            try {
-                if (!accepting.get()) {
-                    throw new RejectedExecutionException("SHUTTING_DOWN");
-                }
-                synchronized (admissionStripes[stripe(identity)]) {
-                    if (requireNoLocalOwner && owners.containsKey(identity)) {
-                        throw TurnUseCase.TurnResumeException.of(
-                                TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
+                     workspaceAdmissions.acquire(workspaceId)) {
+            while (true) {
+                // Draining can wait for an event sink, so it must precede both admissionGate and the identity stripe.
+                releaseSuspendedSubscription(identity);
+                Lock gate = admissionGate.readLock();
+                gate.lock();
+                boolean retryRelease = false;
+                try {
+                    if (!accepting.get()) {
+                        throw new RejectedExecutionException("SHUTTING_DOWN");
                     }
-                    return admit(identity, sink, inherited, admission, terminalObserver, admissionObserver);
+                    synchronized (admissionStripes[stripe(identity)]) {
+                        if (requireNoLocalOwner && owners.containsKey(identity)) {
+                            throw TurnUseCase.TurnResumeException.of(
+                                    TurnUseCase.ResumeFailure.TURN_RESUME_ORDER_CONFLICT);
+                        }
+                        if (suspendedSubscriptions.containsKey(identity)
+                                || suspendedSubscriptionReleases.containsKey(identity)) {
+                            retryRelease = true;
+                        } else {
+                            return admit(identity, sink, inherited, admission, terminalObserver, admissionObserver);
+                        }
+                    }
+                } finally {
+                    gate.unlock();
                 }
-            } finally {
-                gate.unlock();
+                if (!retryRelease) {
+                    throw new IllegalStateException("suspended subscription admission fence changed unexpectedly");
+                }
             }
         }
     }
@@ -884,6 +1188,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 先释放本地运行资源再通知终态；清理任一资源失败也必须释放 owner，避免卡住关机或恢复。
+     *
+     * @author kongweiguang
      */
     private void settleOutcome(AgentIdentity identity, CompletableFuture<Void> owner,
                                CompletableFuture<TurnResult> completion,
@@ -892,6 +1198,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         TurnResult terminalResult = null;
         Throwable completionFailure = null;
         boolean cancellationEstablished = false;
+        boolean suspended = failure == null && outcome instanceof AgentExecutionOutcome.Suspended;
         try {
             if (failure != null) {
                 Optional<TurnState> persisted = engine.query(identity).map(status -> state(status.state()));
@@ -932,7 +1239,11 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
                 completionFailure = mergeCleanupFailure(terminalResult != null, completionFailure, cleanupFailure);
             } finally {
                 try {
-                    closeSubscription(subscription);
+                    if (suspended) {
+                        retainSuspendedSubscription(identity, subscription);
+                    } else {
+                        closeSubscription(subscription);
+                    }
                 } catch (RuntimeException | Error cleanupFailure) {
                     if (terminalResult != null) {
                         report("event subscription close", cleanupFailure);
@@ -953,7 +1264,9 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
-     * 投影失败后移除同一执行的内存回执，使调用方重试时重新读取持久 Engine 状态。
+     * 非终态投影失败后移除同一执行的内存回执，使调用方重试时重新读取持久 Engine 状态。
+     *
+     * @author kongweiguang
      */
     private void failCompletion(AgentIdentity identity, CompletableFuture<TurnResult> completion,
                                 Throwable failure) {
@@ -964,18 +1277,39 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
-     * 完成 Ja terminal projection 并保证标题/Run 观察者只由一个 terminal 回读触发。
+     * 先在 identity stripe 建立终态 fence，再锁外释放 watcher；完成 future 后才撤 fence，封闭过期 query 的迟到登记。
+     *
+     * @author kongweiguang
      */
     private void finish(AgentIdentity identity, CompletableFuture<TurnResult> completion, TurnResult result) {
-        if (!completion.complete(result)) {
-            return;
+        Object stripe = admissionStripes[stripe(identity)];
+        synchronized (stripe) {
+            if (completion.isDone() || !terminalizingCompletions.add(identity)) {
+                return;
+            }
         }
-        Consumer<TurnResult> observer = terminalObservers.remove(identity);
-        if (observer != null) {
+        try {
             try {
-                observer.accept(result);
-            } catch (RuntimeException notificationFailure) {
-                report("terminal observer", notificationFailure);
+                releaseSuspendedSubscription(identity);
+            } catch (RuntimeException | Error releaseFailure) {
+                completion.completeExceptionally(releaseFailure);
+                terminalObservers.remove(identity);
+                return;
+            }
+            if (!completion.complete(result)) {
+                return;
+            }
+            Consumer<TurnResult> observer = terminalObservers.remove(identity);
+            if (observer != null) {
+                try {
+                    observer.accept(result);
+                } catch (RuntimeException notificationFailure) {
+                    report("terminal observer", notificationFailure);
+                }
+            }
+        } finally {
+            synchronized (stripe) {
+                terminalizingCompletions.remove(identity);
             }
         }
     }
@@ -1022,13 +1356,17 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 等旧执行 owner 释放后读取最新投影；只接受至少已反映触发恢复之提交版本的快照，避免旧状态越过 CAS。
-     * 同一身份最多有一个有效 resume 准入，实际执行权仍由 Engine lease 裁决。
+     * 同一身份最多有一个有效 resume 准入；与冷启动观察在 stripe 内互斥，实际执行权仍由 Engine lease 裁决。
+     *
+     * @author kongweiguang
      */
     private void scheduleResume(String threadId, String turnId, long expectedRevision,
                                 ConversationTurnEventSink sink, NativeExecutionSnapshot nativeContext) {
         AgentIdentity identity = JaTurnRequestMapper.identity(threadId, turnId);
-        if (!resumeClaims.add(identity)) {
-            return;
+        synchronized (admissionStripes[stripe(identity)]) {
+            if (!resumeClaims.add(identity)) {
+                return;
+            }
         }
         CompletableFuture<Void> previousOwner = owners.get(identity);
         CompletionStage<Void> released = previousOwner == null
@@ -1365,13 +1703,15 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 写锁屏障让已经进入的准入完成后再拒绝后续执行。
+     *
+     * @author kongweiguang
      */
     @Override
     public void stopAccepting() {
         Lock gate = admissionGate.writeLock();
         gate.lock();
         try {
-            accepting.set(false);
+            withAllAdmissionStripes(0, () -> accepting.set(false));
         } finally {
             gate.unlock();
         }
@@ -1379,6 +1719,8 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 关闭扫描完成后在同一准入屏障内检查 owner 并关闸，防止检查与关闭间接纳新 Turn。
+     *
+     * @author kongweiguang
      */
     @Override
     public boolean stopAcceptingIfQuiescent() {
@@ -1388,7 +1730,7 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             if (owners.values().stream().anyMatch(owner -> !owner.isDone())) {
                 return false;
             }
-            accepting.set(false);
+            withAllAdmissionStripes(0, () -> accepting.set(false));
             return true;
         } finally {
             gate.unlock();
@@ -1494,12 +1836,19 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 先收口临时会话，再封闭准入并关闭 Engine；任一步失败都不跳过其余资源收尾。
+     *
+     * @author kongweiguang
      */
     @Override
     public void close() {
         Throwable failure = runPreShutdownHook(Long.MAX_VALUE);
         try {
             stopAccepting();
+        } catch (RuntimeException | Error closeFailure) {
+            failure = mergeCloseFailure(failure, closeFailure);
+        }
+        try {
+            releaseAllSuspendedSubscriptions(true);
         } catch (RuntimeException | Error closeFailure) {
             failure = mergeCloseFailure(failure, closeFailure);
         }
@@ -1513,11 +1862,18 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
         } catch (RuntimeException | Error closeFailure) {
             failure = mergeCloseFailure(failure, closeFailure);
         }
+        try {
+            releaseAllSuspendedSubscriptions(true);
+        } catch (RuntimeException | Error closeFailure) {
+            failure = mergeCloseFailure(failure, closeFailure);
+        }
         throwCloseFailure(failure);
     }
 
     /**
      * 宿主 deadline 下先收口临时会话，再封闭准入并等待 Engine；失败仍尝试剩余步骤并保留主因。
+     *
+     * @author kongweiguang
      */
     @Override
     public void closeAt(long deadline) {
@@ -1528,12 +1884,22 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
             failure = mergeCloseFailure(failure, closeFailure);
         }
         try {
+            releaseAllSuspendedSubscriptions(true);
+        } catch (RuntimeException | Error closeFailure) {
+            failure = mergeCloseFailure(failure, closeFailure);
+        }
+        try {
             engine.closeAsync();
         } catch (RuntimeException | Error closeFailure) {
             failure = mergeCloseFailure(failure, closeFailure);
         }
         try {
             engine.awaitClosed(Duration.ofNanos(Math.max(1, deadline - System.nanoTime())));
+        } catch (RuntimeException | Error closeFailure) {
+            failure = mergeCloseFailure(failure, closeFailure);
+        }
+        try {
+            releaseAllSuspendedSubscriptions(true);
         } catch (RuntimeException | Error closeFailure) {
             failure = mergeCloseFailure(failure, closeFailure);
         }

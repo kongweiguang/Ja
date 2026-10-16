@@ -582,7 +582,8 @@ describe("Task product panels", () => {
     expect(toolResult).not.toHaveTextContent("已回答 1 个问题");
   });
 
-  it("子任务总览不展示侧聊及其委派分支", () => {
+  /** 计数必须和可见委派树共享 owner 过滤，不能把独立侧聊或其子树计入。@author kongweiguang */
+  it("子任务总览不展示侧聊及其委派分支，也只统计可见 Subagent", () => {
     const side = idleSideTask();
     const sideAgent = {
       ...runningTask,
@@ -601,8 +602,50 @@ describe("Task product panels", () => {
       />,
     );
     expect(screen.getAllByRole("treeitem")).toHaveLength(1);
+    expect(screen.getByText("共 1 个后代任务")).toBeInTheDocument();
     expect(screen.queryByText("旁支子任务")).not.toBeInTheDocument();
     expect(screen.queryByText(side.taskName)).not.toBeInTheDocument();
+  });
+
+  /** 只有独立侧聊及其旁支时，总览应呈现真正的无 Subagent 空态，而非空白树。@author kongweiguang */
+  it("子任务总览只含侧聊旁支时显示空态和零派生任务计数", () => {
+    const side = idleSideTask();
+    const sideAgent = {
+      ...runningTask,
+      taskThreadId: "thr_side_agent",
+      parentThreadId: side.taskThreadId,
+      taskName: "旁支子任务",
+      depth: 2,
+    };
+    render(
+      <SubagentOverview
+        ownerThreadId={runningTask.rootThreadId}
+        tasks={[side, sideAgent]}
+        loading={false}
+        onRefresh={vi.fn(async () => undefined)}
+        onOpenTask={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("当前主任务还没有派生任务")).toBeInTheDocument();
+    expect(screen.getByText("暂无子智能体")).toBeInTheDocument();
+    expect(screen.queryAllByRole("treeitem")).toHaveLength(0);
+  });
+
+  /** 无关侧聊摘要不能让真实的 root 任务列表错误变成“无子任务”，错误仍提供原重试入口。@author kongweiguang */
+  it("仅有侧聊摘要且 root 读取失败时仍显示真实错误", () => {
+    const side = idleSideTask();
+    render(
+      <SubagentOverview
+        ownerThreadId={runningTask.rootThreadId}
+        tasks={[side]}
+        loading={false}
+        error="任务列表读取失败"
+        onRefresh={vi.fn(async () => undefined)}
+        onOpenTask={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("子智能体暂不可用")).toBeInTheDocument();
+    expect(screen.getByText("任务列表读取失败")).toBeInTheDocument();
   });
 
   it("侧边 Composer 的模型、推理强度和访问权限都回调 shared controller", async () => {

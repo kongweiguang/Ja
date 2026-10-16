@@ -154,6 +154,12 @@
         </if>
         ) ORDER BY x.turn_sequence
     </select>
+    <!-- 分页快照可能裁掉当前路径中段 Turn；只用窄标量精确复核路径末端。 -->
+    <select id="selectLatestCurrentTurnId" resultType="string">
+        SELECT turn_id FROM ja_conversation_turn
+        WHERE thread_id=#{threadId} AND is_current_path=1
+        ORDER BY turn_sequence DESC LIMIT 1
+    </select>
     <select id="selectTurnById" resultMap="turnRow">
         SELECT x.turn_id,x.thread_id,x.state,x.mutation_version,x.requested_at_ms,x.updated_at_ms,
         x.completed_at_ms,x.terminal_summary,x.error_code,x.error_message,x.cancel_requested_at_ms,x.cancel_reason,

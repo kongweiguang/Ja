@@ -4,7 +4,23 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { assertThreadHistory, decodeTaskReceipt } from "./coding-agent-collaboration.mjs";
+import {
+  assertThreadHistory,
+  decodeTaskReceipt,
+  parseArguments,
+} from "./coding-agent-collaboration.mjs";
+
+/** 原生产物检查不能被 JVM 参数掩盖，否则同一验收成功不代表目标 Native 可用。 */
+test("native collaboration selection rejects mixed JVM arguments", () => {
+  assert.equal(
+    parseArguments(["--native-executable", "C:/audit/ja-app-server.exe"]).nativeExecutable,
+    "C:/audit/ja-app-server.exe",
+  );
+  assert.throws(() =>
+    parseArguments(["--native-executable", "C:/audit/server.exe", "--jar", "C:/audit/server.jar"]),
+  );
+  assert.throws(() => parseArguments(["--native-executable"]));
+});
 
 /** 构造与生产完整投影相同的长度和摘要尾注，避免用纯 JSON 替身掩盖 wire 格式。 */
 function projectedReceipt(receipt) {

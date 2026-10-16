@@ -642,6 +642,14 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         closedThreadIds.forEach(threadId -> nativeSideChatOwners.remove(threadId, owner));
     }
 
+    /** 持久关闭后保留仅能由原 owner 命中的 root tombstone，用于幂等重放且不阻止 idle 回收。
+     * @author kongweiguang
+     */
+    private void rememberClosedNativeSideChatRoots(NativeClientWork owner, Set<String> closedThreadIds) {
+        owner.removeClosedRoots(closedThreadIds);
+        closedThreadIds.forEach(threadId -> nativeSideChatOwners.remove(threadId, owner));
+    }
+
     /**
      * 任务树普通删除没有 stop/cancel/barrier 语义；只要子树含临时 Side Task 就必须先走专用关闭。
      * @author kongweiguang
@@ -705,6 +713,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         private final NativeClientOwner owner;
         private final Object lock = new Object();
         private final LinkedHashMap<String, NativeRootState> roots = new LinkedHashMap<>();
+        private final Set<String> closedRoots = new LinkedHashSet<>();
         private int inFlightCreates;
         private boolean closing;
         private boolean closed;
@@ -786,6 +795,15 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             }
         }
 
+        /** 只允许 owner 回放自己已持久关闭的 root，不能把关闭历史当成新资源或任意 ID 授权。
+         * @author kongweiguang
+         */
+        private boolean containsClosedRoot(String taskThreadId) {
+            synchronized (lock) {
+                return closedRoots.contains(taskThreadId);
+            }
+        }
+
         /**
          * idle hold 只由真实 root/reservation 驱动，不因空逻辑 Host 阻止后台回收。
          * @author kongweiguang
@@ -814,6 +832,20 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         private void removeRoots(Set<String> taskThreadIds) {
             synchronized (lock) {
                 taskThreadIds.forEach(roots::remove);
+            }
+        }
+
+        /** 持久关闭回执只记住本 owner 原先登记过的 root，再清除活跃 ledger 与 idle hold。
+         * @author kongweiguang
+         */
+        private void removeClosedRoots(Set<String> taskThreadIds) {
+            synchronized (lock) {
+                for (String taskThreadId : taskThreadIds) {
+                    if (roots.containsKey(taskThreadId)) {
+                        closedRoots.add(taskThreadId);
+                    }
+                    roots.remove(taskThreadId);
+                }
             }
         }
 
@@ -867,6 +899,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                 closing = true;
                 closed = true;
                 roots.clear();
+                closedRoots.clear();
             }
         }
 
@@ -950,7 +983,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * Child 创建严格遵循 reserve → 单事务 admission → submit，完成回调只读取已提交终态。
+     * Child 创建严格遵循 reserve → 单事务 admission → submit；提交后先登记完成观察，再发布可失败的 UI 通知，
+     * 避免通知故障把已准入的子任务误报成创建失败；注册已完成的 Turn 后重读投影，避免旧初始快照覆盖同步终态。
+     * @author kongweiguang
      */
     private StartResult startNew(String parentThreadId, String parentTurnId, String taskName, UserContent content,
                                  ThreadSummary parent, TaskModels.Kind kind,
@@ -1000,8 +1035,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             events.abandon();
         }
         TaskModels.Summary task = requireTask(childThreadId);
-        publishLatest(task);
         observeCompletion(task, accepted);
+        task = requireTask(childThreadId);
+        publishLatestAfterCommit(task);
         return new StartResult(task, turnId);
     }
 
@@ -1013,7 +1049,8 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * 完成阶段在终态事务与 Turn 通知之后更新活动数、唤醒 waiter，并发布最新持久 Activity。
+     * 完成阶段先回收活动数，再从已提交投影唤醒 waiter；UI sink 故障不能影响任务回收或等待结果。
+     * @author kongweiguang
      */
     private void observeCompletion(TaskModels.Summary initial, TurnUseCase.Accepted accepted) {
         if (!accepted.queued()) {
@@ -1032,7 +1069,7 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             acceptedTaskTurns.computeIfPresent(initial.lineage().taskThreadId(), (key, count) ->
                     count.decrementAndGet() == 0 ? null : count);
             logActiveTaskCount();
-            tasks.findTask(initial.lineage().taskThreadId()).ifPresent(this::publishLatest);
+            tasks.findTask(initial.lineage().taskThreadId()).ifPresent(this::publishLatestAfterCommit);
         });
     }
 
@@ -1185,7 +1222,8 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * Follow-up 先回读幂等事实，再执行 revision 门与 TurnQueue 预留；公开重试因此不会创建草稿 Turn。
+     * Follow-up 先回读幂等事实，再执行 revision 门与 TurnQueue 预留；提交后先观察完成并重读投影，避免通知故障误报及同步终态被旧快照覆盖。
+     * @author kongweiguang
      */
     @Override
     public FollowUpResult followUp(FollowUpCommand command) {
@@ -1232,8 +1270,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             events.abandon();
         }
         TaskModels.Summary task = requireTask(before.lineage().taskThreadId());
-        publishLatest(task);
         observeCompletion(task, accepted);
+        task = requireTask(before.lineage().taskThreadId());
+        publishLatestAfterCommit(task);
         return new FollowUpResult(task, receipt.admission().turnId(), receipt.mailbox().messageId());
     }
 
@@ -1286,7 +1325,8 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * RPC 携带的 owner 只能关闭自己登记的独立 root；回执提交后同步移除已收口的嵌套 root。
+     * RPC owner 只能关闭自身登记或本生命周期内已关闭的 root；已关闭身份只用于持久回执回放，不计入活跃 work。
+     * @author kongweiguang
      */
     @Override
     public TaskModels.SideChatCloseReceipt closeSideChat(String taskThreadId,
@@ -1296,11 +1336,15 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             return closeSideChat(taskThreadId);
         }
         NativeClientWork owner = requireTaskNativeClient(ownerScope.orElseThrow());
-        if (!owner.containsRoot(taskThreadId)) {
+        if (!owner.containsRoot(taskThreadId) && !owner.containsClosedRoot(taskThreadId)) {
             throw nativeClientPermissionDenied();
         }
         TaskModels.SideChatCloseReceipt receipt = runSideChatClose(taskThreadId);
-        removeNativeSideChatRoots(owner, Set.copyOf(receipt.closedThreadIds()));
+        if (!receipt.closedThreadIds().contains(taskThreadId)) {
+            throw new TaskRepositoryException(TaskRepositoryException.Code.INVALID_STATE,
+                    "native client close omitted its root");
+        }
+        rememberClosedNativeSideChatRoots(owner, Set.copyOf(receipt.closedThreadIds()));
         return receipt;
     }
 
@@ -1629,7 +1673,8 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * 先校验令牌再观察目标，避免无效取消依赖在登记 waiter 与超时任务后才失败。
+     * 先校验令牌再观察目标；超时读取仓库当前快照并把读取失败交给 waiter，避免后台定时任务异常后悬挂。
+     * @author kongweiguang
      */
     @Override
     public CompletionStage<WaitResult> waitAgents(Set<String> taskThreadIds, Duration timeout,
@@ -1654,8 +1699,16 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             waiters.put(waiterId, waiter);
             ScheduledFuture<?> timeoutTask;
             try {
-                timeoutTask = timeouts.schedule(() -> completion.complete(new WaitResult(List.of(), true)),
-                        timeout.toMillis(), TimeUnit.MILLISECONDS);
+                timeoutTask = timeouts.schedule(() -> {
+                    if (completion.isDone()) {
+                        return;
+                    }
+                    try {
+                        completion.complete(new WaitResult(currentTargets(targets), true));
+                    } catch (RuntimeException failure) {
+                        completion.completeExceptionally(failure);
+                    }
+                }, timeout.toMillis(), TimeUnit.MILLISECONDS);
             } catch (RuntimeException failure) {
                 waiters.remove(waiterId, waiter);
                 throw failure;
@@ -1755,22 +1808,74 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
     }
 
     /**
-     * 可见详情由 Task 身份匹配所有独立观察；没有观察者时不向来源会话广播侧边任务活动。
+     * 可见详情由 Task 身份匹配所有独立观察；先读持久 Activity 并唤醒 waiter，再通知 UI，避免 sink 背压阻断等待。
+     * @author kongweiguang
      */
     private void publishLatest(TaskModels.Summary task) {
+        TaskEvent event = latestActivityEvent(task);
+        notifyWaiters(task);
+        if (event != null) {
+            publish(event);
+        }
+    }
+
+    /**
+     * 只把持久读取错误留在同步调用链；提交后的 UI 通知失败仅记录异常类型，不能撤销 admission 或泄露正文。
+     * @author kongweiguang
+     */
+    private void publishLatestAfterCommit(TaskModels.Summary task) {
+        TaskEvent event = latestActivityEvent(task);
+        notifyWaiters(task);
+        if (event == null) {
+            return;
+        }
+        try {
+            publish(event);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("event=task_activity_publish_failed task_thread_id={} cause_type={}",
+                    task.lineage().taskThreadId(), failure.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * 仅读取当前可见 Task 的最新持久 Activity；仓储异常保持原样向同步调用方传播。
+     * @return 可见的最新 Activity；无 Activity 或未观察的独立侧聊返回 null
+     * @author kongweiguang
+     */
+    private TaskEvent latestActivityEvent(TaskModels.Summary task) {
         if (task.lineage().kind() == TaskModels.Kind.SIDE_TASK
             && observations.values().stream().noneMatch(observation ->
                     observation.taskThreadId().equals(task.lineage().taskThreadId()))) {
-            return;
+            return null;
         }
         long sequence = task.projection().latestActivitySequence();
-        tasks.readTask(task.lineage().taskThreadId(), sequence - 1, 0, 1).ifPresent(detail -> {
-            if (!detail.activities().isEmpty()) {
-                publish(new TaskEvent.Activity(context(task, detail.activities().getFirst().createdAt()),
-                        detail.activities().getFirst(), task));
-            }
-        });
-        notifyWaiters(task);
+        return tasks.readTask(task.lineage().taskThreadId(), sequence - 1, 0, 1)
+                .filter(detail -> !detail.activities().isEmpty())
+                .map(detail -> new TaskEvent.Activity(context(task, detail.activities().getFirst().createdAt()),
+                        detail.activities().getFirst(), task))
+                .orElse(null);
+    }
+
+    /**
+     * 启动恢复先提交耐久投影，再复用同一通知与 waiter 出口；这里只发布已暂停的真实事实，
+     * 不执行 Turn、不追加 Activity，迟到或重放回调也不能覆盖恢复后的新状态。
+     * 通知失败继续交还恢复 listener 重放相同 sequence，避免把持久提交误报成未发生。
+     * @author kongweiguang
+     */
+    public void publishRecoveredSuspended(String taskThreadId, String turnId) {
+        requireOpen();
+        Objects.requireNonNull(taskThreadId, "taskThreadId");
+        Objects.requireNonNull(turnId, "turnId");
+        boolean suspendedTurn = threads.findTurn(turnId)
+                .filter(turn -> taskThreadId.equals(turn.threadId()))
+                .filter(turn -> TurnState.SUSPENDED.name().equals(turn.status()))
+                .isPresent();
+        if (!suspendedTurn) {
+            return;
+        }
+        tasks.findTask(taskThreadId)
+                .filter(task -> task.projection().state() == TaskModels.State.SUSPENDED)
+                .ifPresent(this::publishLatest);
     }
 
     /**
@@ -1801,8 +1906,9 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         return new TurnEventBinding(sink, request.turnId(), projected);
     }
 
-    /**
-     * Child Turn 的低频生命周期进入 Task projection；流式 delta 只给当前 observation，且永不持久化。
+    /** Child Turn 的低频生命周期进入 Task projection；流式 delta 只给当前 observation，且永不持久化。
+     * 审批结果只能从 WAITING_APPROVAL 推进，过期或取消后的迟到结果不得把 SUSPENDED/终态任务复活。
+     * @author kongweiguang
      */
     private void projectTurnEvent(String taskThreadId, io.github.kongweiguang.ja.conversation.domain.model.TurnEvent event) {
         switch (event) {
@@ -1813,11 +1919,15 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
                     when state.to() == TurnState.WAITING_INPUT -> recordTurnActivity(taskThreadId,
                     TaskModels.State.WAITING_INPUT, TaskModels.ActivityKind.WAITING_INPUT,
                     state.context().turnId(), "等待补充信息");
+            case io.github.kongweiguang.ja.conversation.domain.model.TurnEvent.StateChanged state
+                    when state.to() == TurnState.SUSPENDED -> recordTurnActivityFrom(taskThreadId,
+                    taskState(state.from()), TaskModels.State.SUSPENDED, TaskModels.ActivityKind.SUSPENDED,
+                    state.context().turnId(), "等待显式恢复");
             case io.github.kongweiguang.ja.conversation.domain.model.TurnEvent.ApprovalRequested approval ->
                     recordTurnActivity(taskThreadId, TaskModels.State.WAITING_APPROVAL,
                             TaskModels.ActivityKind.WAITING_APPROVAL, approval.context().turnId(), "等待审批");
             case io.github.kongweiguang.ja.conversation.domain.model.TurnEvent.ApprovalResolved resolved ->
-                    recordTurnActivity(taskThreadId, TaskModels.State.RUNNING,
+                    recordTurnActivityFrom(taskThreadId, TaskModels.State.WAITING_APPROVAL, TaskModels.State.RUNNING,
                             TaskModels.ActivityKind.RESUMED, resolved.context().turnId(), "审批已处理，继续运行");
             case io.github.kongweiguang.ja.conversation.domain.model.TurnEvent.TextDelta delta ->
                     publishProgress(taskThreadId, delta.streamSeq(), delta.text());
@@ -1828,14 +1938,39 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
         }
     }
 
-    /**
-     * projection CAS 与 Activity 由 Repository 同事务提交，竞争时让下一权威事件或 task/read 收敛。
+    /** projection CAS 与 Activity 由 Repository 同事务提交，竞争时让下一权威事件或 task/read 收敛。
+     * @author kongweiguang
      */
     private void recordTurnActivity(String taskThreadId, TaskModels.State state, TaskModels.ActivityKind kind,
                                     String turnId, String text) {
+        recordTurnActivityFrom(taskThreadId, null, state, kind, turnId, text);
+    }
+
+    /** 把 Turn 来源态映射为对应 Task projection，供暂停事件的来源态 CAS 拒绝迟到回放。
+     * @author kongweiguang
+     */
+    private static TaskModels.State taskState(TurnState turnState) {
+        return switch (turnState) {
+            case QUEUED -> TaskModels.State.QUEUED;
+            case RUNNING -> TaskModels.State.RUNNING;
+            case WAITING_APPROVAL -> TaskModels.State.WAITING_APPROVAL;
+            case WAITING_INPUT -> TaskModels.State.WAITING_INPUT;
+            case SUSPENDED -> TaskModels.State.SUSPENDED;
+            case COMPLETED -> TaskModels.State.COMPLETED;
+            case FAILED -> TaskModels.State.FAILED;
+            case CANCELLED -> TaskModels.State.CANCELLED;
+        };
+    }
+
+    /** 用 projection CAS 同时校验预期来源状态，使迟到事件不能越过新的暂停或终态事实。
+     * @author kongweiguang
+     */
+    private void recordTurnActivityFrom(String taskThreadId, TaskModels.State expectedState, TaskModels.State state,
+                                        TaskModels.ActivityKind kind, String turnId, String text) {
         for (int attempt = 0; attempt < 8; attempt++) {
             TaskModels.Summary current = requireTask(taskThreadId);
-            if (current.projection().state() == state || terminal(current.projection().state())) {
+            if ((expectedState != null && current.projection().state() != expectedState)
+                    || current.projection().state() == state || terminal(current.projection().state())) {
                 return;
             }
             try {
@@ -1975,6 +2110,18 @@ public final class TaskCoordinator implements TaskUseCase, TurnCancellationListe
             }
         }
         return List.copyOf(ready);
+    }
+
+    /**
+     * Deadline 结果保留全部目标的当前状态，不套用正常事件唤醒的 ready 过滤。
+     * @author kongweiguang
+     */
+    private List<TaskModels.Summary> currentTargets(Set<String> targets) {
+        List<TaskModels.Summary> current = new ArrayList<>(targets.size());
+        for (String target : targets) {
+            current.add(requireTask(target));
+        }
+        return List.copyOf(current);
     }
 
     /**

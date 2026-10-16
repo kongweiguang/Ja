@@ -51,6 +51,11 @@ public interface AgentLoopExecutionService extends AutoCloseable {
                                                   TurnEventSink streamSink);
 
     /**
+     * 冷启动只重挂持久 Wait 截止时间；实现可以提交 EXPIRED 控制事实，但绝不进入 Driver。
+     */
+    void restoreApprovalExpiry(AgentIdentity identity, Consumer<AgentEvent> afterCommit);
+
+    /**
      * 先通过 Store 控制事务提交取消事实，再取消模型和工具共用的执行作用域。
      */
     CompletionStage<AgentStore.CommitReceipt> cancel(AgentIdentity identity,

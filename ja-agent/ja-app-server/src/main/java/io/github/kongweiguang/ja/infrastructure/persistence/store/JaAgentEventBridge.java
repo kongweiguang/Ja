@@ -88,6 +88,7 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -465,10 +466,25 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
     }
 
     /**
-     * 从独立投影线程等待 sink 完成，阻塞只隔离该消费者且不会回压模型/工具执行线程。
+     * 从独立投影线程可中断地等待 sink 完成；关停时 worker 能退出，不遗留 join 在未完成 future 上。
+     * @author kongweiguang
      */
     private static void awaitPublish(java.util.concurrent.CompletionStage<Void> published) {
-        Objects.requireNonNull(published, "published").toCompletableFuture().join();
+        try {
+            Objects.requireNonNull(published, "published").toCompletableFuture().get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new java.util.concurrent.CompletionException(interrupted);
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new java.util.concurrent.CompletionException(cause == null ? failed : cause);
+        }
     }
 
     /**
@@ -671,7 +687,8 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
     }
 
     /**
-     * Engine 的关闭由组合根管理；桥仅关闭临时订阅和自身虚拟线程。
+     * Engine 的关闭由组合根管理；桥仅立即关闭临时订阅和自身虚拟线程，不等待用户 sink ACK。
+     * @author kongweiguang
      */
     @Override
     public void close() {
@@ -679,12 +696,26 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
             if (!closed.compareAndSet(false, true)) {
                 return;
             }
-            active.values().forEach(Attachment::detach);
+            active.values().forEach(Attachment::detachImmediately);
             active.clear();
             synchronized (resumeLock) {
                 resumeCheckpoints.clear();
                 while (collectedSinks.poll() != null) { /* Drain collected connection keys on owner shutdown. */ }
             }
+        }
+    }
+
+    /**
+     * TurnService 关停时绕过耐心排空路径，使宿主 shutdown deadline 不受 sink ACK 阻塞。
+     * @author kongweiguang
+     */
+    @Override
+    public void closeForShutdown(AutoCloseable subscription) throws Exception {
+        AutoCloseable value = Objects.requireNonNull(subscription, "subscription");
+        if (value instanceof Attachment attachment) {
+            attachment.detachImmediately();
+        } else {
+            value.close();
         }
     }
 
@@ -2202,6 +2233,7 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
         private final AgentStreamSubscription stream;
         private final Semaphore wake = new Semaphore(0);
         private final AtomicBoolean detached = new AtomicBoolean();
+        private final AtomicBoolean resourcesDetached = new AtomicBoolean();
         private final AtomicBoolean projectionFailureNotified = new AtomicBoolean();
         private final AtomicLong signalGeneration = new AtomicLong();
         private final Object replayLock = new Object();
@@ -2419,7 +2451,8 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
         }
 
         /**
-         * 正常结束先确认已提交水位；不持投递锁等待 sink，退出和 worker 自身清理直接 detach。
+         * 普通释放先确认已提交水位，detach 使用最近 ACK 检查点；shutdown 则直接跳过该水位等待。
+         * @author kongweiguang
          */
         @Override
         public void close() {
@@ -2431,27 +2464,45 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
                     awaitReplay(watermark, true);
                 }
             } finally {
-                detach();
+                detachImmediately();
             }
         }
 
         /**
-         * 失败与关机直接释放本订阅，不等待无法确认的投影，也不取消 Engine 执行。
+         * 立即释放订阅并中断 interruptible sink wait；不等待 deliveryLock 或未完成 sink future。
+         * @author kongweiguang
          */
-        private void detach() {
-            synchronized (deliveryLock) {
-                if (!detached.compareAndSet(false, true)) {
-                    return;
-                }
+        private void detachImmediately() {
+            detached.set(true);
+            signalDetached();
+            detachResources();
+        }
+
+        /**
+         * 统一唤醒 reader 与关闭水位 waiter；不依赖 deliveryLock 或未完成的 sink future。
+         * @author kongweiguang
+         */
+        private void signalDetached() {
+            wake.release();
+            Thread thread = worker;
+            if (thread != null) {
+                thread.interrupt();
+            }
+            failReplayWaiters(new IllegalStateException("event projection was detached"));
+        }
+
+        /**
+         * 原子释放 Core stream 与 checkpoint；resumeState 是 volatile 的最近确认快照，不读取活跃 reducer。
+         * @author kongweiguang
+         */
+        private void detachResources() {
+            if (!resourcesDetached.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                stream.close();
+            } finally {
                 try {
-                    stream.close();
-                } finally {
-                    wake.release();
-                    Thread thread = worker;
-                    if (thread != null) {
-                        thread.interrupt();
-                    }
-                    failReplayWaiters(new IllegalStateException("event projection was detached"));
                     if (registered) {
                         if (terminalDelivered) {
                             forgetCheckpoint(sink, identity);
@@ -2460,6 +2511,7 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
                             persistCheckpoint();
                         }
                     }
+                } finally {
                     active.remove(identity, this);
                 }
             }

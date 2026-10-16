@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// @author kongweiguang
-/// 同一 ModelStep 的正文和公开摘要各自合并，按首段序号排列；UI 加载态不从历史投影继承，避免旧选择器状态泄漏。
+/// 同一 ModelStep 的正文和公开摘要按首段序号排列；子任务活动从 Thread 快照合并，避免 UI 自行维护第二份状态。
 pub fn project(
     context: &ThreadContext,
     history: &Value,
@@ -182,6 +182,7 @@ pub fn project(
         }
     }
     append_work_summaries(turns, &mut timeline, &mut turn_id_by_entry_id);
+    append_task_activities(&context.thread_id, history, &mut timeline)?;
     let mut pending_prompt = approval_prompt(
         items,
         latest_turn_id,
@@ -281,6 +282,111 @@ fn append_work_summaries(
         );
         turn_id_by_entry_id.insert(id, turn_id.to_owned());
     }
+}
+
+/// @author kongweiguang
+/// 用 taskThreadId 合并最多 128 条快照事实，再按活动时间和稳定 Task ID 排列最新安全活动。
+fn append_task_activities(
+    thread_id: &str,
+    history: &Value,
+    timeline: &mut Vec<TimelineEntry>,
+) -> Result<(), CliError> {
+    let activities = history
+        .get("taskActivities")
+        .and_then(Value::as_array)
+        .filter(|activities| activities.len() <= 128)
+        .ok_or_else(|| CliError::protocol("thread/read.taskActivities 无效"))?;
+    let mut latest_by_task: HashMap<&str, (u64, &Value, &Value)> = HashMap::new();
+    for pair in activities {
+        let activity = pair
+            .get("activity")
+            .ok_or_else(|| CliError::protocol("thread/read.taskActivities 缺少 activity"))?;
+        let task = pair
+            .get("task")
+            .ok_or_else(|| CliError::protocol("thread/read.taskActivities 缺少 task"))?;
+        let activity_task_id = required_str(activity, "taskThreadId")?;
+        let task_thread_id = required_str(task, "taskThreadId")?;
+        if activity_task_id != task_thread_id {
+            return Err(CliError::protocol(
+                "thread/read.taskActivities 的 Task 身份不一致",
+            ));
+        }
+        let parent_thread_id = required_str(task, "parentThreadId")?;
+        let task_kind = required_str(task, "taskKind")?;
+        if parent_thread_id != thread_id || task_kind != "subagent" {
+            continue;
+        }
+        let sequence = required_u64(activity, "activitySequence")?;
+        let latest_sequence = required_u64(task, "latestActivitySequence")?;
+        if sequence > latest_sequence {
+            return Err(CliError::protocol(
+                "thread/read.taskActivities 的活动序号超过 Task 最新序号",
+            ));
+        }
+        latest_by_task
+            .entry(task_thread_id)
+            .and_modify(|current| {
+                if sequence > current.0 {
+                    *current = (sequence, activity, task);
+                }
+            })
+            .or_insert((sequence, activity, task));
+    }
+
+    let mut latest = latest_by_task
+        .into_values()
+        .map(|(sequence, activity, task)| {
+            let created_at = required_str(activity, "createdAt")?;
+            let created_at = parse_utc_epoch_nanoseconds(created_at).ok_or_else(|| {
+                CliError::protocol("thread/read.taskActivities 的 createdAt 无效")
+            })?;
+            let task_thread_id = required_str(task, "taskThreadId")?.to_owned();
+            Ok((created_at, task_thread_id, sequence, activity, task))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    latest.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, _, _, activity, task) in latest {
+        let task_thread_id = required_str(task, "taskThreadId")?;
+        let task_name = safe_display(required_str(task, "taskName")?);
+        let state = required_str(task, "state")?;
+        let (state_label, status) = match state {
+            "queued" | "idle" | "running" => ("正在工作", Some(TimelineStatus::Running)),
+            "waiting_approval" => ("等待审批", Some(TimelineStatus::Running)),
+            "waiting_input" => ("等待输入", Some(TimelineStatus::Running)),
+            // Paused work is neither active execution nor a terminal success/cancellation.
+            "suspended" => ("已暂停 · 待恢复", None),
+            "completed" => ("已完成", Some(TimelineStatus::Complete)),
+            "failed" => ("失败", Some(TimelineStatus::Failed)),
+            "cancelled" => ("已取消", Some(TimelineStatus::Complete)),
+            _ => {
+                return Err(CliError::protocol(
+                    "thread/read.taskActivities 的 Task 状态无效",
+                ));
+            }
+        };
+        let summary = activity
+            .get("summary")
+            .and_then(|summary| summary.get("text"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::protocol("thread/read.taskActivities 缺少安全摘要"))?;
+        let detail = if summary.is_empty() {
+            format!("状态：{state_label}")
+        } else {
+            format!("状态：{state_label}\n{}", safe_display(summary))
+        };
+        timeline.push(TimelineEntry {
+            id: format!("subagent:{task_thread_id}"),
+            kind: TimelineKind::Tool {
+                action: "子任务".to_owned(),
+                target: task_name,
+                preview_truncated: false,
+            },
+            text: String::new(),
+            detail: Some(detail),
+            status,
+        });
+    }
+    Ok(())
 }
 
 /// 只从已确认的终态起止时间计算整秒时长，不用客户端当前时间补齐缺失事实。

@@ -4,6 +4,7 @@
 package io.github.kongweiguang.ja.infrastructure.persistence.repository;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.kongweiguang.ja.agent.application.api.AgentEngine;
 import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
 import io.github.kongweiguang.ja.agent.application.api.engine.AgentAnswer;
 import io.github.kongweiguang.ja.agent.application.engine.AgentRequestFingerprint;
@@ -64,6 +65,7 @@ import io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionRecord
 import io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionEventCodec;
 import io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionControlCodec;
 import io.github.kongweiguang.ja.agent.application.gateway.store.CheckpointStore;
+import io.github.kongweiguang.ja.agent.shared.Hashing;
 import io.github.kongweiguang.ja.conversation.domain.model.CollaborationMode;
 import io.github.kongweiguang.ja.conversation.domain.model.JaMessageIds;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadPreferences;
@@ -79,6 +81,8 @@ import io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEven
 import io.github.kongweiguang.ja.conversation.domain.model.TurnEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnResult;
 import io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase;
+import io.github.kongweiguang.ja.conversation.application.api.ApprovalUseCase;
+import io.github.kongweiguang.ja.conversation.application.approval.JaApprovalService;
 import io.github.kongweiguang.ja.conversation.application.gateway.AdmissionFacts;
 import io.github.kongweiguang.ja.conversation.application.gateway.ToolCallPreviewReadPort;
 import io.github.kongweiguang.ja.conversation.application.presentation.ToolPresentationProjector;
@@ -93,6 +97,7 @@ import io.github.kongweiguang.ja.attachment.application.api.AttachmentUseCase;
 import org.apache.ibatis.session.SqlSession;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -546,6 +551,114 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
                         callId, clientOperationId, requestFingerprint, answeredAt);
                 assertEquals(0, interactionRequestCount(database, approvalId));
             }
+        }
+    }
+
+    /**
+     * 到期关闭只写 Core wait 原因，decision/resolved_at 保持空且 Ja 响应入口拒绝迟到批准。
+     * @author kongweiguang
+     */
+    @Test
+    void settlesExpiredApprovalWithoutInventingDecision() throws Exception {
+        try (TestDatabase database = database("agent-approval-expired-control")) {
+            assertClosedApprovalWait(database, InteractionStatus.EXPIRED,
+                    ApprovalUseCase.Failure.EXPIRED, "expired");
+        }
+    }
+
+    /**
+     * 用户取消审批等待不能伪造成 DENY 决议，之后的审批提交应按已关闭等待拒绝。
+     * @author kongweiguang
+     */
+    @Test
+    void settlesCancelledApprovalWithoutInventingDenial() throws Exception {
+        try (TestDatabase database = database("agent-approval-cancelled-control")) {
+            assertClosedApprovalWait(database, InteractionStatus.CANCELLED,
+                    ApprovalUseCase.Failure.ALREADY_RESOLVED, "cancelled");
+        }
+    }
+
+    /**
+     * 通过真实 SQLite WAIT_SETTLEMENT 和 Ja participant 固定 closed wait 与显式决议的边界。
+     * @author kongweiguang
+     */
+    private void assertClosedApprovalWait(TestDatabase database, InteractionStatus closeStatus,
+            ApprovalUseCase.Failure expectedFailure, String suffix) throws Exception {
+        String threadId = "thr_approval_" + suffix;
+        String turnId = "turn_approval_" + suffix;
+        String callId = "call_approval_" + suffix;
+        String approvalId = "approval_" + suffix;
+        Instant expiresAt = START.plusSeconds(300);
+        AgentStoreProjectionFixture fixture = admit(database, threadId, turnId);
+        try (fixture) {
+            prepareToolCall(fixture, callId, START.plusSeconds(1), approvalId, expiresAt);
+            Instant waitAt = START.plusSeconds(5);
+            InteractionWait pending = approvalWait(approvalId, callId, expiresAt, waitAt);
+            AgentStore.RecordWrite waitRecord = fixture.controls().encodeWait(
+                    fixture.recordId(ExecutionControlCodec.WAIT_RECORD_TYPE, "wait:" + approvalId), pending, waitAt);
+            AgentStore.RecordWrite middlewareState = approvalMiddlewareState(fixture, waitAt, approvalId);
+            fixture.commitRecords(TurnState.WAITING_APPROVAL, cursor(), List.of(waitRecord, middlewareState),
+                    List.of(new ExecutionEvent.WaitRequested(approvalId, "approval", waitRecord.recordId())), waitAt);
+
+            Instant closedAt = closeStatus == InteractionStatus.EXPIRED ? expiresAt.plusSeconds(1)
+                    : waitAt.plusSeconds(2);
+            InteractionWait closed = pending.close(closeStatus, closedAt);
+            String binding = approvalId + ":interaction-revision:" + pending.interactionRevision();
+            String operationType = closeStatus == InteractionStatus.EXPIRED
+                    ? "agent.wait.expire" : "agent.wait.cancel";
+            String operationNamespace = closeStatus == InteractionStatus.EXPIRED
+                    ? "agent.wait.expiry.operation" : "agent.wait.cancellation.operation";
+            String operationKey = fixture.recordId(operationNamespace, binding);
+            AgentIdentity identity = identity(threadId, turnId);
+            AgentStore.OperationIdentity operation = new AgentStore.OperationIdentity(operationKey, operationType,
+                    Hashing.sha256Hex(identity.tenantId() + "\u0000" + identity.threadId() + "\u0000"
+                            + identity.turnId() + "\u0000" + operationType + "\u0000" + binding),
+                    JsonObjects.builder().putNumber("schemaVersion", 1).build());
+            AgentStore.RecordWrite closedWaitRecord = fixture.controls().encodeWait(
+                    fixture.recordId(ExecutionControlCodec.WAIT_RECORD_TYPE,
+                            approvalId + ":interaction-revision:" + closed.interactionRevision()), closed, closedAt);
+            AgentStore store = database.jaAgentStore();
+            AgentStore.ConversationSnapshot conversation = store.loadConversation(fixture.execution().conversation())
+                    .orElseThrow();
+            AgentStore.ExecutionSnapshot execution = store.loadExecution(fixture.execution()).orElseThrow();
+            AgentStore.CommitReceipt receipt = store.controlCommit(new AgentStore.ControlCommit(
+                    fixture.execution(), conversation.revision(), execution.state(), execution.mutationVersion(),
+                    AgentStore.ControlKind.WAIT_SETTLEMENT, List.of(closedWaitRecord),
+                    List.of(fixture.event("approval-close-state", new ExecutionEvent.StateChanged(
+                                    TurnState.WAITING_APPROVAL, TurnState.SUSPENDED), closedAt),
+                            fixture.event("approval-close-reason", new ExecutionEvent.ControlRecorded(
+                                    ExecutionEvent.ControlAction.WAIT_RESOLVED, closedWaitRecord.recordId(),
+                                    operation.operationKey(), closeStatus.name()), closedAt)),
+                    operation, Optional.of(new AgentStore.WaitControl(approvalId,
+                            pending.interactionRevision(), Optional.empty())), closedAt));
+
+            assertTrue(receipt.newlyCommitted());
+            assertEquals("SUSPENDED", store.loadExecution(fixture.execution()).orElseThrow().state());
+            assertEquals(closeStatus, latestWait(database, fixture, approvalId).status());
+            assertNoApprovalDecision(database, approvalId);
+            assertNotEquals(ToolPresentation.Status.WAITING_APPROVAL,
+                    snapshotToolStatus(database, threadId, callId));
+            assertEquals(0, interactionRequestCount(database, approvalId));
+            assertEquals("PREPARED", toolCallState(database, threadId, turnId, callId));
+
+            AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                    new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> {
+                        throw new AssertionError("closed approval must not dispatch an answer to Core");
+                    });
+            JaApprovalService approvals = new JaApprovalService(store, fixture.controls(), engine,
+                    ignored -> Optional.empty());
+            approvals.bindResumeScheduler((resumedThread, resumedTurn, revision, sink, context) -> {
+                throw new AssertionError("closed approval must not schedule a resume");
+            });
+            ApprovalUseCase.ApprovalException rejected = assertThrows(ApprovalUseCase.ApprovalException.class,
+                    () -> approvals.resolve(threadId, turnId, approvalId,
+                            database.history().readThread(threadId, null, 20).orElseThrow().thread().revision(),
+                            io.github.kongweiguang.ja.agent.domain.approval.ApprovalDecision.APPROVE,
+                            "operation_late_" + suffix, "f".repeat(64),
+                            io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink.noop()));
+            assertEquals(expectedFailure, rejected.failure());
+            assertNoApprovalDecision(database, approvalId);
+            assertEquals("PREPARED", toolCallState(database, threadId, turnId, callId));
         }
     }
 
@@ -1076,12 +1189,13 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
         }
     }
 
-    /** wait 仅生成 approvals 卡片；有效期按 ja_approval 的 epoch 毫秒精度核对 Core wait。 */
+    /** wait 与系统关闭均不记录用户决议；有效期按 ja_approval 的 epoch 毫秒精度核对 Core wait。 */
     private static void assertPendingApproval(TestDatabase database, String approvalId,
             String threadId, String turnId, String callId, Instant expiresAt) throws SQLException {
         try (SqlSession session = database.sessions().openSession();
              PreparedStatement query = session.getConnection().prepareStatement(
-                     "SELECT thread_id,turn_id,call_id,decision,expires_at_ms FROM ja_approval WHERE approval_id=?")) {
+                     "SELECT thread_id,turn_id,call_id,decision,resolved_at_ms,expires_at_ms "
+                             + "FROM ja_approval WHERE approval_id=?")) {
             query.setString(1, approvalId);
             try (ResultSet rows = query.executeQuery()) {
                 assertTrue(rows.next());
@@ -1089,9 +1203,81 @@ final class AgentProjectionPersistenceTest extends PersistenceTestSupport {
                 assertEquals(turnId, rows.getString(2));
                 assertEquals(callId, rows.getString(3));
                 assertNull(rows.getString(4));
-                assertEquals(expiresAt.toEpochMilli(), rows.getLong(5));
+                assertNull(rows.getObject(5));
+                assertEquals(expiresAt.toEpochMilli(), rows.getLong(6));
                 assertFalse(rows.wasNull());
                 assertFalse(rows.next());
+            }
+        }
+    }
+
+    /**
+     * 已关闭等待只保留 Core reason，ja_approval 不得制造 APPROVE/DENY 或伪造 resolved 时间。
+     * @author kongweiguang
+     */
+    private static void assertNoApprovalDecision(TestDatabase database, String approvalId) throws SQLException {
+        try (SqlSession session = database.sessions().openSession();
+             PreparedStatement query = session.getConnection().prepareStatement(
+                     "SELECT decision,resolved_at_ms FROM ja_approval WHERE approval_id=?")) {
+            query.setString(1, approvalId);
+            try (ResultSet rows = query.executeQuery()) {
+                assertTrue(rows.next());
+                assertNull(rows.getString(1));
+                assertNull(rows.getObject(2));
+                assertFalse(rows.next());
+            }
+        }
+    }
+
+    /**
+     * 用固定执行记录水位读取最新 typed wait，保证测试断言的是已提交关闭而非局部对象。
+     * @author kongweiguang
+     */
+    private static InteractionWait latestWait(TestDatabase database, AgentStoreProjectionFixture fixture,
+                                              String interactionId) {
+        AgentStore store = database.jaAgentStore();
+        AgentStore.ExecutionSnapshot snapshot = store.loadExecution(fixture.execution()).orElseThrow();
+        InteractionWait latest = null;
+        long after = 0;
+        while (after < snapshot.lastRecordSequence()) {
+            AgentStore.RecordPage page = store.readRecords(AgentStore.RecordQuery.withDefaultMaxBytes(
+                    fixture.execution(), after, snapshot.lastRecordSequence(), 128));
+            for (AgentStore.StoredRecord record : page.records()) {
+                if (ExecutionControlCodec.WAIT_RECORD_TYPE.equals(record.recordType())) {
+                    InteractionWait candidate = fixture.controls().decodeWait(record);
+                    if (candidate.interactionId().equals(interactionId)) {
+                        latest = candidate;
+                    }
+                }
+            }
+            if (!page.hasMore()) {
+                break;
+            }
+            if (page.nextSequence() <= after) {
+                throw new IllegalStateException("wait record page did not advance");
+            }
+            after = page.nextSequence();
+        }
+        return java.util.Objects.requireNonNull(latest, "persisted interaction wait");
+    }
+
+    /**
+     * 系统结束审批时工具仍停在 PREPARED，不能越过显式用户批准执行副作用。
+     * @author kongweiguang
+     */
+    private static String toolCallState(TestDatabase database, String threadId, String turnId, String callId)
+            throws SQLException {
+        try (SqlSession session = database.sessions().openSession();
+             PreparedStatement query = session.getConnection().prepareStatement(
+                     "SELECT state FROM ja_tool_call WHERE thread_id=? AND turn_id=? AND call_id=?")) {
+            query.setString(1, threadId);
+            query.setString(2, turnId);
+            query.setString(3, callId);
+            try (ResultSet rows = query.executeQuery()) {
+                assertTrue(rows.next());
+                String state = rows.getString(1);
+                assertFalse(rows.next());
+                return state;
             }
         }
     }

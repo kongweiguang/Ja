@@ -985,8 +985,8 @@ export function startConPtyCli(artifacts, directories, harness, threadId, prompt
     return undefined;
   }
 
-  /** 先发空草稿下的 Ctrl+D，再尝试确认式 Ctrl+C；只有均无效才关闭独有的 Job Object，并保留自然退出的真实退出码。 @author kongweiguang */
-  async function close() {
+  /** 先发空草稿下的 Ctrl+D，再尝试确认式 Ctrl+C；自然退出时可先停共享 Native，再关闭 ConPTY Job。 @author kongweiguang */
+  async function close(options = {}) {
     let forced = false;
     sendKeys("\u0004");
     let exitCode = await waitForChildExit(1_500);
@@ -1001,6 +1001,18 @@ export function startConPtyCli(artifacts, directories, harness, threadId, prompt
       child.stdin.write("KILL\n");
       exitCode = await waitForChildExit(5_000);
     }
+    let beforeHarnessCloseFailure;
+    if (!forced && exitCode !== undefined && options.beforeHarnessClose !== undefined) {
+      if (typeof options.beforeHarnessClose !== "function") {
+        beforeHarnessCloseFailure = new Error("beforeHarnessClose must be an async function");
+      } else {
+        try {
+          await options.beforeHarnessClose();
+        } catch (error) {
+          beforeHarnessCloseFailure = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+    }
     const closeStart = messages.length;
     child.stdin.write("CLOSE\n");
     await waitForMessage("CLOSE_ACCEPTED=true", closeStart, 5_000);
@@ -1010,6 +1022,7 @@ export function startConPtyCli(artifacts, directories, harness, threadId, prompt
       await Promise.race([exitPromise, delay(3_000)]);
     }
     await pullVt();
+    if (beforeHarnessCloseFailure) throw beforeHarnessCloseFailure;
     return { childExitCode: exitCode ?? null, forced, harnessExitCode: harnessResult?.code ?? null };
   }
 

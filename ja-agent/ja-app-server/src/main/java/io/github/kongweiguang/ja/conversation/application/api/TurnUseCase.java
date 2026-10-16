@@ -114,6 +114,14 @@ public interface TurnUseCase extends DeadlineCloseable {
     }
 
     /**
+     * 为启动时仍等待审批的 Turn 仅接入持久事件观察，不准入执行、不取得运行资源或恢复 Driver。
+     * 返回 false 表示 Turn 已移除或状态过期、已有本地执行/观察者、正在关停或并发操作占用该身份。
+     *
+     * @author kongweiguang
+     */
+    boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink);
+
+    /**
      * 提交已显示在原 Tool 详情上的恢复裁决。调用方只提供当前 Thread/恢复 revision 与显式选择，
      * 文件核实、执行游标和 ToolResult 配对仍由 Java Kernel 的存储事务唯一决定。
      */

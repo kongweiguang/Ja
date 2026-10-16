@@ -235,6 +235,8 @@ pub enum UiCommand {
     ShowMcp,
     ReviewThread,
     ForkThread,
+    CreateSideChat,
+    ReturnToParent,
     CopyLastReply,
     ExportThread,
     Help,
@@ -309,6 +311,13 @@ pub enum UiAction {
     CreatePlan {
         objective: String,
     },
+    /// User side chats reuse the active Thread and preserve the complete retry command on failure.
+    CreateSideChat {
+        content: String,
+        command_text: String,
+    },
+    /// Return through the current child Thread's validated parent identity.
+    ReturnToParent,
     EditDraft {
         draft: String,
     },
@@ -477,6 +486,8 @@ pub enum UiEvent {
     },
     SetPermissionChoices(Vec<UiChoice>),
     SetThreadChoices(Vec<UiChoice>),
+    /// Exact close receipts release cached drafts without inferring descendants from lineage.
+    ForgetThreadDrafts(Vec<String>),
     SetThreadPage {
         query: String,
         choices: Vec<UiChoice>,

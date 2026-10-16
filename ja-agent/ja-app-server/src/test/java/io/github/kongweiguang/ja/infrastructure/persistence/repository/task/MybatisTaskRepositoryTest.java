@@ -749,6 +749,15 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
         fixture.close();
     }
 
+    /** 真实 Store fixture 按当前快照 cursor 提交状态，使回归覆盖可持久化的 Suspended 与 Running Turn。 */
+    private static void commitState(TestDatabase database, AgentStoreProjectionFixture fixture,
+                                    TurnState target, Instant occurredAt) {
+        AgentStore.ExecutionSnapshot snapshot = database.agentStore().loadExecution(fixture.execution()).orElseThrow();
+        TurnExecutionState cursor = new TurnExecutionStateCodec(database.mapper())
+                .read(snapshot.cursorSchemaVersion(), snapshot.cursor());
+        fixture.commit(target, cursor, List.of(), List.of(), occurredAt);
+    }
+
     /** 邮箱只经只读来源转为初始队列命令，绑定仍由 Store admission participant 原子完成。 */
     private static List<AgentInputCommand.Enqueue> mailboxInputs(TestDatabase database,
             MybatisTaskRepository tasks, String threadId) {
@@ -1518,6 +1527,78 @@ final class MybatisTaskRepositoryTest extends PersistenceTestSupport {
             assertPolicy(database, ROOT, parentPolicy);
             assertPolicy(database, "thr_task_policy_side", parentPolicy);
             assertPolicy(database, "thr_task_policy_agent", parentPolicy);
+        }
+    }
+
+    /** 全局最新 Turn 已切出旧分支且分页只含旧暂停时，迟到 expiry 不能把当前运行 Task 回拨为 SUSPENDED。 */
+    @Test
+    void ignoresLateSuspensionWhenNewerCurrentTurnIsRunning() throws Exception {
+        String taskThreadId = "thr_task_late_expiry";
+        String oldTurnId = "turn_task_old_wait";
+        String currentTurnId = "turn_task_current_running";
+        String latestOffPathTurnId = "turn_task_latest_off_path";
+        try (TestDatabase database = database("task-late-expiry-current-turn");
+             ExecutionLeaseCleanup cleanup = new ExecutionLeaseCleanup()) {
+            setupRoot(database);
+            MybatisTaskRepository tasks = repository(database);
+            ChildFixture child = child(taskThreadId, oldTurnId, "item_task_old_wait", "seed_old_wait",
+                    "activity_task_old_wait", TaskModels.Kind.SUBAGENT, TaskModels.Lifecycle.ATTACHED,
+                    TaskModels.InheritanceMode.BRIEF_ONLY, null, new JsonArray(List.of()), permission());
+            AgentStoreProjectionFixture oldWait = admitChild(database, tasks, child);
+            commitState(database, oldWait, TurnState.SUSPENDED, START.plusSeconds(3));
+            closeExecution(oldWait);
+
+            AgentStoreProjectionFixture currentRunning = admitUser(database, tasks,
+                    turn(taskThreadId, currentTurnId, "item_task_current_running", "继续任务",
+                            threadRevision(database.sessions(), taskThreadId),
+                            START.plusSeconds(1)));
+            commitState(database, currentRunning, TurnState.RUNNING, START.plusSeconds(4));
+            closeExecution(currentRunning);
+
+            AgentStoreProjectionFixture latestOffPath = admitUser(database, tasks,
+                    turn(taskThreadId, latestOffPathTurnId, "item_task_latest_off_path", "另一个分支",
+                            threadRevision(database.sessions(), taskThreadId),
+                            START.plusSeconds(2)));
+            closeExecution(latestOffPath);
+            TaskModels.Summary projection = tasks.findTask(taskThreadId).orElseThrow();
+            tasks.recordActivity(new TaskModels.ActivityMutation(taskThreadId,
+                    projection.projection().revision(), TaskModels.State.RUNNING,
+                    "activity_guard_manual_resume_record_01", taskThreadId, currentTurnId,
+                    TaskModels.ActivityKind.RESUMED, summary("当前任务正在运行"), "当前任务正在运行",
+                    START.plusSeconds(5)));
+            int activityCountBeforeExpiry = tasks.readTask(taskThreadId, 0, 0, 20).orElseThrow().activities().size();
+
+            try (SqlSession session = database.sessions().openSession()) {
+                try (PreparedStatement statement = session.getConnection().prepareStatement(
+                        "UPDATE ja_conversation_turn SET is_current_path=0 WHERE thread_id=? AND turn_id=?")) {
+                    statement.setString(1, taskThreadId);
+                    statement.setString(2, latestOffPathTurnId);
+                    assertEquals(1, statement.executeUpdate());
+                }
+                session.commit();
+            }
+            try (SqlSession session = database.sessions().openSession()) {
+                PersistenceMappers mapper = PersistenceMappers.open(session);
+                List<PersistenceRecords.TurnRow> bounded = mapper.agent()
+                        .selectSnapshotTurns(taskThreadId, List.of(oldTurnId), true);
+                List<String> boundedCurrent = bounded.stream().filter(PersistenceRecords.TurnRow::currentPath)
+                        .map(PersistenceRecords.TurnRow::turnId).toList();
+                assertEquals(List.of(oldTurnId), boundedCurrent,
+                        "the regression fixture must reproduce the bounded-snapshot blind spot");
+                assertEquals(currentTurnId, mapper.agent().selectLatestCurrentTurnId(taskThreadId));
+                session.commit();
+            }
+            assertTrue(tasks.reconcileRecoveredSuspension(oldTurnId, START.plusSeconds(6)).isEmpty());
+
+            TaskModels.Summary unchanged = tasks.findTask(taskThreadId).orElseThrow();
+            assertEquals(TaskModels.State.RUNNING, unchanged.projection().state());
+            assertEquals(activityCountBeforeExpiry,
+                    tasks.readTask(taskThreadId, 0, 0, 20).orElseThrow().activities().size(),
+                    "stale expiry must not append a suspension activity");
+            assertEquals(TurnState.SUSPENDED.name(), database.agentStore().loadExecution(oldWait.execution())
+                    .orElseThrow().state());
+            assertEquals(TurnState.RUNNING.name(), database.agentStore().loadExecution(currentRunning.execution())
+                    .orElseThrow().state());
         }
     }
 

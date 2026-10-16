@@ -1408,6 +1408,129 @@ describe("Composer", () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
+  /** 异步 Slash action 等待期间不应让 Enter/表单提交丢弃草稿；完成后也不抢焦或覆盖新 selection。@author kongweiguang */
+  it("异步 Slash action pending 时明确忙碌且保留后续输入、焦点与 selection", async () => {
+    const user = userEvent.setup();
+    let resolveCommand!: () => void;
+    const execute = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCommand = resolve;
+        }),
+    );
+    const onSend = vi.fn();
+    render(
+      <>
+        <button type="button">其它控件</button>
+        <ControlledComposerHarness
+          initialText="/btw"
+          preferences={PREFERENCES}
+          models={MODELS}
+          slashCommands={[
+            {
+              id: "btw",
+              name: "btw",
+              aliases: [],
+              label: "新建侧聊",
+              description: "创建临时侧聊",
+              available: true,
+              argument: { mode: "optional", label: "内容", placeholder: "描述内容" },
+              execute,
+            },
+          ]}
+          onSend={onSend}
+        />
+      </>,
+    );
+
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    input.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(execute).toHaveBeenCalledOnce());
+
+    expect(screen.getByRole("form", { name: "发送消息" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status", { name: "指令处理中" })).toHaveTextContent(
+      "输入内容会保留，完成后可继续。",
+    );
+    expect(input).toBeEnabled();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+
+    await user.type(input, "/btw 后续内容");
+    input.setSelectionRange(5, 5);
+    fireEvent.select(input);
+    await user.keyboard("{Enter}");
+    fireEvent.submit(screen.getByRole("form", { name: "发送消息" }));
+    expect(execute).toHaveBeenCalledOnce();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue("/btw 后续内容");
+
+    screen.getByRole("button", { name: "其它控件" }).focus();
+    await act(async () => resolveCommand());
+
+    await waitFor(() =>
+      expect(screen.getByRole("form", { name: "发送消息" })).not.toHaveAttribute("aria-busy"),
+    );
+    expect(screen.queryByRole("status", { name: "指令处理中" })).not.toBeInTheDocument();
+    expect(input).toHaveValue("/btw 后续内容");
+    expect(input.selectionStart).toBe(5);
+    expect(screen.getByRole("button", { name: "其它控件" })).toHaveFocus();
+  });
+
+  /** 失败回包只能恢复未改动的命令草稿；新输入和用户后来选择的焦点归当前用户。@author kongweiguang */
+  it("异步 Slash action 失败时保留新草稿并提示如何重试且不抢焦点", async () => {
+    const user = userEvent.setup();
+    let rejectCommand!: (error: Error) => void;
+    const execute = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCommand = reject;
+        }),
+    );
+    render(
+      <>
+        <button type="button">其它控件</button>
+        <ControlledComposerHarness
+          initialText="/btw"
+          preferences={PREFERENCES}
+          models={MODELS}
+          slashCommands={[
+            {
+              id: "btw",
+              name: "btw",
+              aliases: [],
+              label: "新建侧聊",
+              description: "创建临时侧聊",
+              available: true,
+              argument: { mode: "optional", label: "内容", placeholder: "描述内容" },
+              execute,
+            },
+          ]}
+          onSend={vi.fn()}
+        />
+      </>,
+    );
+
+    const input = screen.getByRole("textbox", { name: "消息" }) as HTMLTextAreaElement;
+    input.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    await user.type(input, "保留这段新草稿");
+    input.setSelectionRange(3, 3);
+    fireEvent.select(input);
+    screen.getByRole("button", { name: "其它控件" }).focus();
+
+    await act(async () => rejectCommand(new Error("private command failure")));
+
+    await waitFor(() =>
+      expect(screen.getByRole("form", { name: "发送消息" })).not.toHaveAttribute("aria-busy"),
+    );
+    expect(input).toHaveValue("保留这段新草稿");
+    expect(input.selectionStart).toBe(3);
+    expect(screen.getByRole("alert")).toHaveTextContent("已保留你编辑的内容");
+    expect(screen.getByRole("alert")).toHaveTextContent("请重新输入该指令");
+    expect(screen.getByRole("button", { name: "其它控件" })).toHaveFocus();
+  });
+
   /** 异步命令失败要恢复同一内联编辑态，避免用户重输必填参数。 */
   it("必填参数命令失败后恢复正文和输入焦点", async () => {
     const user = userEvent.setup();

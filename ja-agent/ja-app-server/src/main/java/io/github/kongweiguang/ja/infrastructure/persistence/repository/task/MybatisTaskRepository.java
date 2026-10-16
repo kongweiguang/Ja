@@ -1272,6 +1272,15 @@ public final class MybatisTaskRepository implements TaskRepository, TaskMailboxP
     }
 
     /**
+     * 以 Task 仓储唯一事务 owner 收敛自然过期后的 SUSPENDED 投影；重复调用由稳定活动身份保持幂等。
+     */
+    public Optional<TaskRecords.TaskSummaryRow> reconcileRecoveredSuspension(String turnId, Instant occurredAt) {
+        ensureOpen();
+        return transactions.required(mapper -> TaskRecoveryPersistence.reconcileSuspended(
+                mapper, objectMapper, turnId, occurredAt));
+    }
+
+    /**
      * composition shutdown 后阻止迟到事务，datasource 生命周期仍由 JaDatabase owner 管理。
      */
     @Override

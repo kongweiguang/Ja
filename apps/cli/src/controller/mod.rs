@@ -200,11 +200,23 @@ pub struct ThreadContext {
     pub title: String,
     pub workspace_id: String,
     pub workspace_root: String,
+    pub thread_kind: DiscoveredThreadKind,
+    pub parent_thread_id: Option<String>,
+    pub root_thread_id: String,
     pub model_id: String,
     pub provider_id: String,
     pub reasoning_level: Option<String>,
     pub access_mode: String,
     pub revision: u64,
+}
+
+/// @author kongweiguang
+/// 发现类型是恢复权限与导航边界；侧聊和 Subagent 不能被主 Thread 元数据路径冒充。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveredThreadKind {
+    Main,
+    SideChat,
+    Subagent,
 }
 
 /// 命令仅在需要时连接；resume 正文由恢复流程选定 Thread 后消费一次，不能同时充当启动正文。
@@ -401,6 +413,9 @@ fn create_exec_thread(
         title: required_str(&thread, "title")?.to_owned(),
         workspace_id,
         workspace_root: cwd_text.to_owned(),
+        thread_kind: DiscoveredThreadKind::Main,
+        parent_thread_id: None,
+        root_thread_id: required_str(&thread, "threadId")?.to_owned(),
         model_id: selection.1.to_owned(),
         provider_id: selection.0.to_owned(),
         reasoning_level: reasoning_level.as_str().map(str::to_owned),
@@ -505,6 +520,9 @@ fn create_thread(
         title: required_str(&thread, "title")?.to_owned(),
         workspace_id,
         workspace_root: cwd.to_owned(),
+        thread_kind: DiscoveredThreadKind::Main,
+        parent_thread_id: None,
+        root_thread_id: required_str(&thread, "threadId")?.to_owned(),
         model_id: model.to_owned(),
         provider_id: provider.to_owned(),
         reasoning_level: effective

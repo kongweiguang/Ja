@@ -1402,6 +1402,7 @@ export function Composer({
         intermediateText: string;
         start: number;
         end: number;
+        restoreFocus: boolean;
       }
     | undefined
   >(undefined);
@@ -1410,6 +1411,7 @@ export function Composer({
   const activeRef = useRef(active);
   const suggestionRequestRef = useRef(0);
   const commandBusyRef = useRef(false);
+  const [commandPending, setCommandPending] = useState(false);
   const composerScopeIdentity = `${threadId ?? ""}\u0000${workspaceId ?? ""}\u0000${runtimeGeneration ?? ""}`;
   const composerContextRef = useRef(composerScopeIdentity);
   const consumedDropTokenRef = useRef<string | undefined>(undefined);
@@ -1755,6 +1757,7 @@ export function Composer({
     selectedModel !== undefined &&
     !disabled &&
     !preferenceBusy &&
+    !commandPending &&
     !sending &&
     !cancelling &&
     !resuming &&
@@ -1774,6 +1777,7 @@ export function Composer({
     showContinue &&
     !disabled &&
     !preferenceBusy &&
+    !commandPending &&
     !sending &&
     !cancelling &&
     !resuming &&
@@ -1785,7 +1789,7 @@ export function Composer({
 
   /** 原样提交草稿供 application 精确清空/恢复；正文规范化和并发锁均由该 owner 负责。 */
   const submit = (): void => {
-    if (!canSend) return;
+    if (commandBusyRef.current || !canSend) return;
     const input = inputRef.current;
     if (input !== null) {
       lastSelectionRef.current = {
@@ -1883,7 +1887,8 @@ export function Composer({
 
   /**
    * Slash action 在执行前先提交可见草稿变化，并把同步与异步失败统一到 Promise 恢复链；
-   * 恢复 selection 绑定目标文本与 scope，待受控值 commit 后再恢复，避免 RAF 与 value 写入竞争。
+   * pending 期间明示发送锁；仅失败且原输入仍未修改时恢复命令，避免覆盖新草稿或抢走目标 Composer 焦点。
+   * @author kongweiguang
    */
   const runSlashCommand = (
     command: ComposerSlashCommand,
@@ -1893,31 +1898,45 @@ export function Composer({
   ): void => {
     if (!command.available || commandBusyRef.current) return;
     const commandContext = composerContextRef.current;
+    const commandInput = inputRef.current;
+    const restoreFocus = commandInput !== null && document.activeElement === commandInput;
+    pendingSelectionRecoveryRef.current = undefined;
     commandBusyRef.current = true;
+    setCommandPending(true);
     updateSuggestionSession({ commandError: undefined, dismissedTrigger: undefined });
     setOwnedInlineCommand(undefined);
     onTextChange(visibleText);
     void Promise.resolve()
       .then(() => command.execute({ argument }))
-      .then(() => {
-        if (composerContextRef.current === commandContext) focusTextareaAt(visibleText.length);
-      })
       .catch(() => {
         if (composerContextRef.current !== commandContext) return;
-        pendingSelectionRecoveryRef.current = {
-          scopeIdentity: commandContext,
-          expectedText: recovery.text,
-          intermediateText: visibleText,
-          start: recovery.start,
-          end: recovery.end,
-        };
-        onTextChange(recovery.text);
-        if (recovery.inline)
-          setOwnedInlineCommand({ scopeIdentity: composerScopeIdentity, command });
-        updateSuggestionSession({ commandError: "指令未完成，请重试。" });
+        const input = inputRef.current;
+        const commandTextUnchanged = input !== null && input.value === visibleText;
+        if (commandTextUnchanged) {
+          pendingSelectionRecoveryRef.current = {
+            scopeIdentity: commandContext,
+            expectedText: recovery.text,
+            intermediateText: visibleText,
+            start: recovery.start,
+            end: recovery.end,
+            restoreFocus,
+          };
+          onTextChange(recovery.text);
+          if (recovery.inline)
+            setOwnedInlineCommand({ scopeIdentity: composerScopeIdentity, command });
+        } else {
+          // A newer draft is user-owned; the failed command may explain retry, but cannot restore over it.
+          pendingSelectionRecoveryRef.current = undefined;
+        }
+        updateSuggestionSession({
+          commandError: commandTextUnchanged
+            ? "指令未完成，请重试。"
+            : "指令未完成；已保留你编辑的内容。需要重试时，请重新输入该指令。",
+        });
       })
       .finally(() => {
         commandBusyRef.current = false;
+        setCommandPending(false);
       });
   };
 
@@ -2017,7 +2036,9 @@ export function Composer({
       const input = inputRef.current;
       if (input === null || input.value !== pending.expectedText) return;
       pendingSelectionRecoveryRef.current = undefined;
-      input.focus({ preventScroll: true });
+      const restoreFocus =
+        pending.restoreFocus && document.activeElement === input && activeRef.current;
+      if (restoreFocus) input.focus({ preventScroll: true });
       input.setSelectionRange(pending.start, pending.end);
       lastSelectionRef.current = { start: pending.start, end: pending.end };
       setCaretState({ text: pending.expectedText, position: pending.end });
@@ -2091,6 +2112,7 @@ export function Composer({
   /** 表单提交优先收口内联 command；普通消息仍交给并发保护的 submit。 */
   const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
+    if (commandBusyRef.current) return;
     if (inlineCommand !== undefined) {
       submitInlineCommand();
       return;
@@ -2104,6 +2126,10 @@ export function Composer({
    */
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     if (composingRef.current || event.nativeEvent.isComposing) return;
+    if (commandBusyRef.current && event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      return;
+    }
     if (inlineCommand !== undefined) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -2224,7 +2250,7 @@ export function Composer({
         data-editing-question={editingQuestion || undefined}
         data-has-queue={queuedInputs.length > 0 || undefined}
         data-drop-active={dropActive || undefined}
-        aria-busy={activeTurn || sending || cancelling || resuming || undefined}
+        aria-busy={activeTurn || sending || cancelling || resuming || commandPending || undefined}
       >
         {interactionPanelExpanded ? null : planStatus}
         {editingQuestion ? (
@@ -2703,6 +2729,11 @@ export function Composer({
               </button>
             ) : null}
           </div>
+        ) : null}
+        {commandPending ? (
+          <p className="ja-composer__feedback" role="status" aria-label="指令处理中">
+            正在处理指令，发送暂不可用；输入内容会保留，完成后可继续。
+          </p>
         ) : null}
       </form>
     </>

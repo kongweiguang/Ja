@@ -25,6 +25,11 @@ public interface AgentMapper {
                                                          @Param("hasTurnIds") boolean hasTurnIds);
 
     /**
+     * 只读取当前对话路径上最新 Turn 的标识，避免把历史分页裁剪结果误当作精确路径末端。
+     */
+    String selectLatestCurrentTurnId(@Param("threadId") String threadId);
+
+    /**
      * PK 读取提交回执，重复请求不能依赖进程内生命周期判断是否已执行。
      */
     PersistenceRecords.ClientOperationRow selectClientOperation(@Param("operationKey") String operationKey);

@@ -428,6 +428,19 @@ public final class StandardAgentLoopExecutionService implements AgentLoopExecuti
     }
 
     /**
+     * 冷启动只重新登记固定 Wait revision 的截止时间；到期 CAS 经既有提交回调发布，绝不申请租约或调用 Driver。
+     */
+    @Override
+    public void restoreApprovalExpiry(AgentIdentity identity, Consumer<AgentEvent> afterCommit) {
+        Objects.requireNonNull(identity, "identity");
+        Objects.requireNonNull(afterCommit, "afterCommit");
+        if (closed.get()) {
+            throw new IllegalStateException("agent loop service is closed");
+        }
+        settleExpiredApprovals(identity, afterCommit);
+    }
+
+    /**
      * 先提交取消事实，再通知当前进程令牌；跨节点执行者会在租约心跳时观察相同记录。
      */
     @Override

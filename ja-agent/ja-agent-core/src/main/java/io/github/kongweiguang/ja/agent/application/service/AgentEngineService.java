@@ -502,6 +502,16 @@ public final class AgentEngineService implements AgentEngine {
     }
 
     /**
+     * 只恢复 Store 中审批 Wait 的截止时间；使用统一提交事件总线投影到宿主，但不构造执行租约或 Driver。
+     */
+    @Override
+    public void restoreApprovalExpiry(AgentIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        ensureOpen();
+        service.restoreApprovalExpiry(identity, this::publishControlEvent);
+    }
+
+    /**
      * 只读持久执行状态，所有查询键均从租户、会话和执行身份派生。
      */
     public Optional<AgentExecutionStatus> query(AgentIdentity identity) {

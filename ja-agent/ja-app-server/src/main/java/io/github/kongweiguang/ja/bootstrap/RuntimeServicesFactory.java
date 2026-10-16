@@ -16,8 +16,9 @@ import io.github.kongweiguang.ja.conversation.application.api.InteractionUseCase
 import io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.TurnUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.ProcessSessionUseCase;
-import io.github.kongweiguang.ja.review.application.api.ReviewUseCase;
+import io.github.kongweiguang.ja.infrastructure.persistence.startup.ApprovalExpiryStartupRecovery;
 import io.github.kongweiguang.ja.plan.application.api.PlanUseCase;
+import io.github.kongweiguang.ja.review.application.api.ReviewUseCase;
 import io.github.kongweiguang.ja.collaboration.application.api.TaskUseCase;
 import io.github.kongweiguang.ja.transport.rpc.RpcServiceBindings;
 import io.github.kongweiguang.ja.workspace.application.api.WorkspacePathSearchUseCase;
@@ -46,12 +47,13 @@ public final class RuntimeServicesFactory {
     private final InteractionUseCase interactions;
     private final ProcessSessionUseCase processes;
     private final ReviewUseCase reviews;
+    private final ApprovalExpiryStartupRecovery approvalExpiryRecovery;
     private final JsonValueCodec jsonValueCodec;
     private final Consumer<ShutdownDeadline> closeAction;
     private final AtomicReference<RuntimeServices> opened = new AtomicReference<>();
 
     /**
-     * 仅保存明确端口与一次性连接绑定，不延迟创建 Repository、配置或业务服务。
+     * 仅保存明确端口和已完成的审批恢复屏障与一次性连接绑定；不延迟创建 Repository、配置或业务服务。
      */
     public RuntimeServicesFactory(WorkspaceUseCase workspaces, WorkspacePathSearchUseCase workspacePathSearch,
                                   ThreadUseCase threads, ThreadMcpUseCase threadMcp,
@@ -64,6 +66,7 @@ public final class RuntimeServicesFactory {
                                   InteractionUseCase interactions,
                                   ProcessSessionUseCase processes,
                                   ReviewUseCase reviews,
+                                  ApprovalExpiryStartupRecovery approvalExpiryRecovery,
                                   JsonValueCodec jsonValueCodec,
                                   Consumer<ShutdownDeadline> closeAction) {
         this.workspaces = Objects.requireNonNull(workspaces, "workspaces");
@@ -81,6 +84,7 @@ public final class RuntimeServicesFactory {
         this.interactions = Objects.requireNonNull(interactions, "interactions");
         this.processes = Objects.requireNonNull(processes, "processes");
         this.reviews = Objects.requireNonNull(reviews, "reviews");
+        this.approvalExpiryRecovery = Objects.requireNonNull(approvalExpiryRecovery, "approvalExpiryRecovery");
         this.jsonValueCodec = Objects.requireNonNull(jsonValueCodec, "jsonValueCodec");
         if (attachments != attachmentPreviews) {
             throw new IllegalArgumentException("attachment and preview ports must share one owner");
@@ -96,12 +100,15 @@ public final class RuntimeServicesFactory {
     }
 
     /**
-     * 校验握手模式并一次性发布服务图；MCP 状态端口与 Thread 查询端口在同一连接代际冻结，
-     * 实例所有权转移到字段并由应用关闭链回收，因此不能在本方法局部关闭。
+     * 先要求启动审批恢复扫描完成，再校验握手模式并一次性发布服务图；MCP 状态端口与 Thread 查询端口
+     * 在同一连接代际冻结，实例所有权转移到字段并由应用关闭链回收，因此不能在本方法局部关闭。
      */
     @SuppressWarnings("PMD.CloseResource")
     public synchronized RpcServiceBindings open(ObjectMapper mapper) {
         Objects.requireNonNull(mapper, "mapper");
+        if (approvalExpiryRecovery.scannedPages() < 1) {
+            throw new IllegalStateException("approval expiry startup recovery has not completed");
+        }
         if (opened.get() != null) {
             throw new IllegalStateException("runtime services were already opened");
         }

@@ -5,7 +5,7 @@
 
 use super::args::{ResumeRequest, ResumeTarget};
 use super::{
-    CliError, ThreadContext,
+    CliError, DiscoveredThreadKind, ThreadContext,
     args::ReviewSource,
     attachment::{self, ImportedAttachment},
     canonical_workspace,
@@ -265,6 +265,25 @@ pub(super) struct PreparedThreadActivation {
     fork_reply_choices: Vec<UiChoice>,
 }
 
+/// @author kongweiguang
+/// Child creation has distinct pre-commit, unknown-commit, and post-commit failures so a retry
+/// never creates a duplicate side chat after the server may already have accepted the request.
+enum SideChatStartFailure {
+    Rejected(CliError),
+    Unknown(CliError),
+    Created { thread_id: String, error: CliError },
+}
+
+/// @author kongweiguang
+/// Unknown `/btw` receipts keep the original body until the user inspects a candidate or explicitly retries.
+pub(super) struct PendingSideChatRecovery {
+    pub(super) root_thread_id: String,
+    pub(super) workspace_id: String,
+    pub(super) candidate_thread_id: Option<String>,
+    pub(super) content: String,
+    pub(super) inspected: bool,
+}
+
 struct Interactive {
     connection: Connection,
     pump: EventPump,
@@ -306,6 +325,10 @@ struct Interactive {
     pending_suspended_control: Option<PendingSuspendedControl>,
     thread_list_scope_all: bool,
     resume_prompt: Option<String>,
+    temporary_side_chat_parents: HashMap<String, String>,
+    pending_side_chat_content: HashMap<String, String>,
+    pending_side_chat_recovery: HashMap<String, PendingSideChatRecovery>,
+    pending_side_chat_close_targets: HashMap<String, String>,
     review_collection: Option<ReviewCollection>,
     active_reviews: Vec<ActiveReview>,
     review_notices: HashMap<String, String>,
@@ -765,6 +788,10 @@ pub fn run(
         pending_suspended_control: None,
         thread_list_scope_all: global_scope,
         resume_prompt,
+        temporary_side_chat_parents: HashMap::new(),
+        pending_side_chat_content: HashMap::new(),
+        pending_side_chat_recovery: HashMap::new(),
+        pending_side_chat_close_targets: HashMap::new(),
         review_collection: None,
         active_reviews: Vec::new(),
         review_notices: HashMap::new(),
@@ -840,6 +867,18 @@ pub fn run(
     let _ = session.connection.disconnect();
     let _ = session.bridge.shutdown();
     result
+}
+
+/// @author kongweiguang
+/// 子任务归属按直接 parent Thread 核验；rootThreadId 仅表示树根，避免嵌套 Subagent 串到祖先会话。
+pub(super) fn task_activity_targets_thread(
+    params: &Value,
+    thread_id: &str,
+) -> Result<bool, CliError> {
+    let task = params
+        .get("task")
+        .ok_or_else(|| CliError::protocol("task/activity 缺少 task"))?;
+    Ok(required_str(task, "parentThreadId")? == thread_id)
 }
 
 impl Interactive {
@@ -1028,7 +1067,8 @@ impl Interactive {
         Ok(())
     }
 
-    /// 两类公开增量共用权威序号；摘要实时接续，同一次模型正文保持身份以防终态重复。
+    /// Task 活动只触发直接父 Thread 的权威快照刷新；摘要与正文增量仍按各自序号合并。
+    /// @author kongweiguang
     fn handle_notification(&mut self, method: &str, params: &Value) -> Result<(), CliError> {
         if method == "configuration/changed" {
             let applies = self.thread.as_ref().is_some_and(|thread| {
@@ -1041,9 +1081,18 @@ impl Interactive {
             }
             return Ok(());
         }
+        if method == "task/closed" {
+            return self.handle_closed_notification(params);
+        }
         let Some(thread) = &self.thread else {
             return Ok(());
         };
+        if method == "task/activity" {
+            if !task_activity_targets_thread(params, &thread.thread_id)? {
+                return Ok(());
+            }
+            return self.refresh();
+        }
         if method == "turn/resync-required" {
             let notification = parse_resync_required(params)
                 .map_err(|reason| CliError::protocol(format!("无效的恢复通知：{reason}")))?;
@@ -1166,12 +1215,13 @@ impl Interactive {
     }
 
     /// 跨端改名与偏好更新从完整 Thread 元数据回读；未知写入回执在读回前禁止再次提交。
+    /// @author kongweiguang
     fn reload_metadata(&mut self) -> Result<(), CliError> {
         let connection = &mut self.connection;
         reload_thread_metadata(
             &mut self.thread,
             &mut self.preferences_sync_pending,
-            |workspace_id, thread_id| list_thread_in_workspace(connection, workspace_id, thread_id),
+            |thread| read_thread_metadata(connection, thread),
         )
     }
 
@@ -1652,11 +1702,14 @@ impl Interactive {
                     | UiAction::CancelTranscriptSelection { .. }
                     | UiAction::CopyDetails { .. }
                     | UiAction::CancelInputHistorySearch
+                    | UiAction::ReturnToParent
                     | UiAction::Quit
             )
         {
             if let UiAction::Submit { text, .. } = &action {
                 self.send(UiEvent::RestoreDraft(text.clone()));
+            } else if let UiAction::CreateSideChat { command_text, .. } = &action {
+                self.send(UiEvent::RestoreDraft(command_text.clone()));
             }
             self.notice(
                 "恢复或取消结果待核实；按 F5 只读核实，当前 Thread 与 Turn 已锁定。".into(),
@@ -1687,11 +1740,20 @@ impl Interactive {
                 references,
                 mode,
             } => {
-                if let Err(error) = self.submit(text.clone(), references, mode, None) {
-                    if self.pending_input.is_none() {
-                        self.send(UiEvent::RestoreDraft(text));
+                let recovered_side_chat = self.recovered_side_chat_parent(&text);
+                match self.submit(text.clone(), references, mode, None) {
+                    Ok(()) if self.pending_input.is_none() => {
+                        if let Some(parent_id) = recovered_side_chat {
+                            self.pending_side_chat_recovery.remove(&parent_id);
+                        }
                     }
-                    self.notice(submission_notice(&error));
+                    Ok(()) => {}
+                    Err(error) => {
+                        if self.pending_input.is_none() {
+                            self.send(UiEvent::RestoreDraft(text));
+                        }
+                        self.notice(submission_notice(&error));
+                    }
                 }
             }
             UiAction::CancelTurn => {
@@ -1713,6 +1775,11 @@ impl Interactive {
             }
             UiAction::ContinueReply => self.continue_reply()?,
             UiAction::Command(command) => self.command(command)?,
+            UiAction::CreateSideChat {
+                content,
+                command_text,
+            } => self.start_side_chat(&content, &command_text),
+            UiAction::ReturnToParent => self.return_to_parent()?,
             UiAction::CreatePlan { objective } => {
                 if let Err(error) = self.create_plan(&objective) {
                     if self.pending_input.is_none() {
@@ -1855,8 +1922,15 @@ impl Interactive {
                 .lookup_operation(&pending.operation_key, pending.method)
             {
                 Ok(receipt) if receipt.get("accepted").and_then(Value::as_bool) == Some(true) => {
+                    let recovered_side_chat = self
+                        .pending_input
+                        .as_ref()
+                        .and_then(|pending| self.recovered_side_chat_parent(&pending.text));
                     self.pending_input = None;
                     self.accept_input();
+                    if let Some(parent_id) = recovered_side_chat {
+                        self.pending_side_chat_recovery.remove(&parent_id);
+                    }
                 }
                 Ok(receipt) if receipt.get("accepted").and_then(Value::as_bool) == Some(false) => {
                     let pending = self.pending_input.take().expect("原操作仍待核实");
@@ -2084,7 +2158,8 @@ impl Interactive {
         }
     }
 
-    /// 输入按原协议提交；Plan 规划 Turn 可要求 PLAN 模式并拒绝转成已有 Turn 的 steering。
+    /// @author kongweiguang
+    /// 输入按原协议提交；普通非空正文保留原始空白，Plan 规划 Turn 仍单独校验模式。
     fn submit(
         &mut self,
         text: String,
@@ -2173,7 +2248,9 @@ impl Interactive {
             content.push(json!({"type":"attachment","attachmentId":attachment.id}));
         }
         if !plain.trim().is_empty() {
-            content.push(json!({"type":"text","text":plain.trim()}));
+            // Normal chat commands have already rejected all-whitespace drafts; retain their
+            // exact user bytes here so `/btw <body>` does not silently rewrite its message.
+            content.push(json!({"type":"text","text":plain}));
         }
         if content.is_empty() {
             return Err(CliError::usage("输入不能为空"));
@@ -2299,6 +2376,8 @@ impl Interactive {
                 self.activate_thread(thread)?;
             }
             UiCommand::ResumeThread => self.show_thread_choices()?,
+            UiCommand::CreateSideChat => self.start_side_chat("", "/btw"),
+            UiCommand::ReturnToParent => self.return_to_parent()?,
             UiCommand::SelectModel => self.show_model_choices()?,
             UiCommand::SelectPermissions => {
                 self.send(UiEvent::SetPermissionChoices(
@@ -2607,14 +2686,469 @@ impl Interactive {
         }
     }
 
-    /// 选择器 identity 只能来自服务端发现列表，最终仍读取完整 Thread 元数据核验。
+    /// @author kongweiguang
+    /// 选择器 identity 只能来自服务端发现列表，最终仍读取完整 Thread 元数据核验；待核实正文仅恢复为草稿。
     fn switch_thread(&mut self, thread_id: &str) -> Result<(), CliError> {
         let thread = load_context(&mut self.connection, thread_id)?;
+        let recovered_side_chat = self.thread.as_ref().and_then(|active| {
+            pending_side_chat_recovery_candidate(
+                &mut self.pending_side_chat_recovery,
+                &active.thread_id,
+                &thread,
+            )
+        });
         self.activate_thread(thread)?;
+        if let Some(content) = recovered_side_chat {
+            self.restore_side_chat_recovery(content);
+        } else {
+            self.send_pending_side_chat_content(thread_id);
+        }
         if let Some(prompt) = self.resume_prompt.take() {
             self.send_resume_prompt(prompt);
         }
         Ok(())
+    }
+
+    /// @author kongweiguang
+    /// Create and activate through the shared Task and Thread paths; uncertain creation restores
+    /// only the safe picker command, while a definitive rejection restores the complete `/btw`.
+    fn start_side_chat(&mut self, content: &str, retry_command: &str) {
+        let parent = self.thread.as_ref().map(|thread| {
+            (
+                thread.thread_id.clone(),
+                thread.root_thread_id.clone(),
+                thread.workspace_id.clone(),
+            )
+        });
+        if let Some((parent_id, _, _)) = parent.as_ref()
+            && let Some(recovery) = self.pending_side_chat_recovery.get(parent_id)
+        {
+            if recovery.inspected && recovery.content == content {
+                // Re-entering the same command after /resume is an explicit retry after inspection.
+                self.pending_side_chat_recovery.remove(parent_id);
+            } else {
+                self.send(UiEvent::RestoreDraft("/resume".into()));
+                self.notice(
+                    "上次侧聊创建结果仍待核实；先运行 /resume。原正文保留，未再次创建侧聊。".into(),
+                );
+                return;
+            }
+        }
+        match self.create_side_chat(content) {
+            Ok(()) => {}
+            Err(SideChatStartFailure::Rejected(error)) => {
+                self.send(UiEvent::RestoreDraft(retry_command.to_owned()));
+                self.notice(format!("侧聊创建失败：{}", error.message()));
+            }
+            Err(SideChatStartFailure::Unknown(error)) => {
+                if let Some((parent_id, root_id, workspace_id)) = parent
+                    && !content.trim().is_empty()
+                {
+                    self.pending_side_chat_recovery.insert(
+                        parent_id,
+                        PendingSideChatRecovery {
+                            root_thread_id: root_id,
+                            workspace_id,
+                            candidate_thread_id: None,
+                            content: content.to_owned(),
+                            inspected: false,
+                        },
+                    );
+                }
+                self.send(UiEvent::RestoreDraft("/resume".into()));
+                self.notice(format!(
+                    "侧聊创建结果待核实；原正文已保留，运行 /resume 查找可能已创建的侧聊，未自动重试。({})",
+                    error.message()
+                ));
+            }
+            Err(SideChatStartFailure::Created { thread_id, error }) => {
+                if let Some((parent_id, root_id, workspace_id)) = parent
+                    && !content.trim().is_empty()
+                    && !self.pending_side_chat_content.contains_key(&thread_id)
+                {
+                    self.pending_side_chat_recovery.insert(
+                        parent_id,
+                        PendingSideChatRecovery {
+                            root_thread_id: root_id,
+                            workspace_id,
+                            candidate_thread_id: Some(thread_id.clone()),
+                            content: content.to_owned(),
+                            inspected: false,
+                        },
+                    );
+                }
+                self.send(UiEvent::RestoreDraft("/resume".into()));
+                self.notice(format!(
+                    "侧聊 {thread_id} 已创建但身份或打开尚待核实；原正文已保留，运行 /resume 选择后继续。({})",
+                    error.message()
+                ));
+            }
+        }
+    }
+
+    /// @author kongweiguang
+    /// The recovery body is removed only after that exact selected child accepts the user's send.
+    fn recovered_side_chat_parent(&self, content: &str) -> Option<String> {
+        let thread = self.thread.as_ref()?;
+        if thread.thread_kind != DiscoveredThreadKind::SideChat {
+            return None;
+        }
+        let parent_id = thread.parent_thread_id.as_ref()?;
+        self.pending_side_chat_recovery
+            .get(parent_id)
+            .filter(|recovery| {
+                recovery.candidate_thread_id.as_deref() == Some(thread.thread_id.as_str())
+                    && recovery.content == content
+            })
+            .map(|_| parent_id.clone())
+    }
+
+    /// @author kongweiguang
+    /// Restore only an identity-validated candidate's body and retain the receipt-unknown copy
+    /// until the matching user submission is accepted or the parent closes.
+    fn restore_side_chat_recovery(&mut self, content: String) {
+        if let Some(thread) = self.thread.as_ref()
+            && let Some(parent_id) = thread.parent_thread_id.as_deref()
+            && let Some(recovery) = self.pending_side_chat_recovery.get_mut(parent_id)
+        {
+            recovery.candidate_thread_id = Some(thread.thread_id.clone());
+        }
+        self.send(UiEvent::RestoreDraft(content));
+        self.notice("已打开可能由上次 /btw 创建的侧聊；原正文已恢复为草稿，请确认后发送。".into());
+    }
+
+    /// @author kongweiguang
+    /// A created child is stored before activation; body delivery is deferred until the validated
+    /// child is active, so a failed read can be retried by selecting it without creating again.
+    fn create_side_chat(&mut self, content: &str) -> Result<(), SideChatStartFailure> {
+        let parent = self
+            .thread
+            .as_ref()
+            .ok_or_else(|| SideChatStartFailure::Rejected(CliError::usage("请先选择会话")))?;
+        if self.pending_input.is_some() {
+            return Err(SideChatStartFailure::Rejected(CliError::usage(
+                "发送结果待核实；按 F5 核实后再创建侧聊",
+            )));
+        }
+        let parent_id = parent.thread_id.clone();
+        let root_id = parent.root_thread_id.clone();
+        let workspace_id = parent.workspace_id.clone();
+        let mut expected_revision = parent.revision;
+        let create_params = |revision| {
+            json!({
+                "parentThreadId":parent_id,
+                "parentTurnId":null,
+                "expectedParentRevision":revision,
+                "taskName":"侧聊"
+            })
+        };
+        let mut result = match self
+            .connection
+            .request("task/create", create_params(expected_revision))
+        {
+            Ok(value) => value,
+            Err(error) if error.rpc_code == Some(-32075) => {
+                if let Err(read_error) = self.refresh() {
+                    return Err(SideChatStartFailure::Rejected(read_error));
+                }
+                let Some(refreshed) = self.thread.as_ref().filter(|thread| {
+                    thread.thread_id == parent_id
+                        && thread.workspace_id == workspace_id
+                        && thread.root_thread_id == root_id
+                }) else {
+                    return Err(SideChatStartFailure::Rejected(CliError::usage(
+                        "父会话已变化；未创建侧聊，请重新运行 /btw",
+                    )));
+                };
+                expected_revision = refreshed.revision;
+                match self
+                    .connection
+                    .request("task/create", create_params(expected_revision))
+                {
+                    Ok(value) => value,
+                    Err(retry_error) if retry_error.rpc_code.is_some() => {
+                        return Err(SideChatStartFailure::Rejected(retry_error));
+                    }
+                    Err(retry_error) => return Err(SideChatStartFailure::Unknown(retry_error)),
+                }
+            }
+            Err(error) if error.rpc_code.is_some() => {
+                return Err(SideChatStartFailure::Rejected(error));
+            }
+            Err(error) => return Err(SideChatStartFailure::Unknown(error)),
+        };
+        if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+            return Err(SideChatStartFailure::Unknown(CliError::protocol(
+                "task/create 未返回 accepted:true",
+            )));
+        }
+        let task = match result.get_mut("task") {
+            Some(task) => task,
+            None => {
+                return Err(SideChatStartFailure::Unknown(CliError::protocol(
+                    "task/create 缺少已接受任务摘要",
+                )));
+            }
+        };
+        let child_id = match required_str(task, "taskThreadId") {
+            Ok(id) if id != parent_id => id.to_owned(),
+            _ => {
+                return Err(SideChatStartFailure::Unknown(CliError::protocol(
+                    "task/create 已受理但缺少可验证的侧聊 identity",
+                )));
+            }
+        };
+        if required_str(task, "parentThreadId").ok() != Some(parent_id.as_str())
+            || required_str(task, "rootThreadId").ok() != Some(root_id.as_str())
+            || required_str(task, "taskKind").ok() != Some("side_task")
+            || required_str(task, "lifecycle").ok() != Some("independent")
+        {
+            return Err(SideChatStartFailure::Created {
+                thread_id: child_id,
+                error: CliError::protocol("task/create 回执与父会话身份不匹配"),
+            });
+        }
+        self.temporary_side_chat_parents
+            .insert(child_id.clone(), parent_id.clone());
+        if !content.trim().is_empty() {
+            self.pending_side_chat_content
+                .insert(child_id.clone(), content.to_owned());
+        }
+        let child = match load_context(&mut self.connection, &child_id) {
+            Ok(thread)
+                if thread.thread_kind == DiscoveredThreadKind::SideChat
+                    && thread.parent_thread_id.as_deref() == Some(&parent_id)
+                    && thread.root_thread_id == root_id
+                    && thread.workspace_id == workspace_id =>
+            {
+                thread
+            }
+            Ok(_) => {
+                return Err(SideChatStartFailure::Created {
+                    thread_id: child_id,
+                    error: CliError::protocol("新侧聊的类型、父会话或 Workspace 不匹配"),
+                });
+            }
+            Err(error) => {
+                return Err(SideChatStartFailure::Created {
+                    thread_id: child_id,
+                    error,
+                });
+            }
+        };
+        if let Err(error) = self.activate_thread(child) {
+            return Err(SideChatStartFailure::Created {
+                thread_id: child_id,
+                error,
+            });
+        }
+        self.send_pending_side_chat_content(&child_id);
+        Ok(())
+    }
+
+    /// @author kongweiguang
+    /// A pending `/btw` body is consumed once only after the corresponding child becomes current.
+    fn send_pending_side_chat_content(&mut self, thread_id: &str) {
+        if self.thread.as_ref().map(|thread| thread.thread_id.as_str()) != Some(thread_id) {
+            return;
+        }
+        let Some(content) = self.pending_side_chat_content.remove(thread_id) else {
+            return;
+        };
+        if content.is_empty() {
+            return;
+        }
+        self.send(UiEvent::BeginSubmission(content.clone()));
+        if let Err(error) = self.submit(content.clone(), Vec::new(), UiSubmitMode::Immediate, None)
+        {
+            if self.pending_input.is_none() {
+                self.send(UiEvent::RestoreDraft(content));
+            }
+            self.notice(submission_notice(&error));
+        }
+    }
+
+    /// @author kongweiguang
+    /// Navigate only through task/read-validated lineage; a CLI-owned side chat closes after the
+    /// parent is active, while Subagents and side chats owned by another Host remain untouched.
+    fn return_to_parent(&mut self) -> Result<(), CliError> {
+        let Some(current) = self.thread.as_ref() else {
+            return Err(CliError::usage("当前没有可返回的会话"));
+        };
+        let current_id = current.thread_id.clone();
+        if let Some(child_id) = self
+            .pending_side_chat_close_targets
+            .get(&current_id)
+            .cloned()
+        {
+            self.close_temporary_side_chat(&current_id, &child_id);
+            return Ok(());
+        }
+        let Some(parent_id) = current.parent_thread_id.clone() else {
+            return Err(CliError::usage("当前会话没有可返回的父会话"));
+        };
+        let current_workspace = current.workspace_id.clone();
+        let current_root = current.root_thread_id.clone();
+        let current_kind = current.thread_kind;
+        let parent = load_context(&mut self.connection, &parent_id)?;
+        if parent.workspace_id != current_workspace
+            || parent.root_thread_id != current_root
+            || parent.thread_id == current_id
+        {
+            return Err(CliError::usage(
+                "父会话 identity 或 Workspace 已变化；未切换当前会话",
+            ));
+        }
+        self.activate_thread(parent)?;
+        if current_kind == DiscoveredThreadKind::SideChat
+            && self.temporary_side_chat_parents.get(&current_id) == Some(&parent_id)
+        {
+            self.pending_side_chat_close_targets
+                .insert(parent_id.clone(), current_id.clone());
+            self.close_temporary_side_chat(&parent_id, &current_id);
+        }
+        Ok(())
+    }
+
+    /// @author kongweiguang
+    /// Close only the exact temporary root owned by this CLI process and trust cleanup solely
+    /// after the server's unique `closedThreadIds` receipt; failed closes remain retryable at parent.
+    fn close_temporary_side_chat(&mut self, parent_id: &str, child_id: &str) {
+        if self.thread.as_ref().map(|thread| thread.thread_id.as_str()) != Some(parent_id) {
+            self.notice("请先返回侧聊的父会话，再运行 /back 重试关闭。".into());
+            return;
+        }
+        let Some(root_id) = self
+            .thread
+            .as_ref()
+            .map(|thread| thread.root_thread_id.clone())
+        else {
+            return;
+        };
+        let result = self
+            .connection
+            .request("task/close", json!({"taskThreadId":child_id}))
+            .and_then(|receipt| validate_task_close_receipt(&receipt, child_id, &root_id));
+        match result {
+            Ok(closed_thread_ids) => self.accept_closed_threads(&closed_thread_ids),
+            Err(error) => self.notice(format!(
+                "已返回父会话，但侧聊关闭未确认；再运行 /back 重试。({})",
+                error.message()
+            )),
+        }
+    }
+
+    /// @author kongweiguang
+    /// Apply only server-enumerated closed identities to transient CLI ownership and composer state.
+    fn accept_closed_threads(&mut self, closed_thread_ids: &[String]) {
+        let closed = closed_thread_ids.iter().collect::<HashSet<_>>();
+        self.temporary_side_chat_parents
+            .retain(|child, parent| !closed.contains(child) && !closed.contains(parent));
+        retain_open_side_chat_payloads(
+            &mut self.pending_side_chat_content,
+            &mut self.pending_side_chat_recovery,
+            closed_thread_ids,
+        );
+        self.pending_side_chat_close_targets
+            .retain(|parent, child| !closed.contains(parent) && !closed.contains(child));
+        self.send(UiEvent::ForgetThreadDrafts(closed_thread_ids.to_vec()));
+    }
+
+    /// @author kongweiguang
+    /// The exact close notification can outlive local close ACKs; move an active deleted child to
+    /// its surviving root, or clear its projection if the receipt's owner was already purged.
+    fn handle_closed_notification(&mut self, params: &Value) -> Result<(), CliError> {
+        let root_id = required_str(params, "rootThreadId")?.to_owned();
+        let task_thread_id = required_str(params, "taskThreadId")?.to_owned();
+        let closed_thread_ids = params
+            .get("closedThreadIds")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CliError::protocol("task/closed 缺少 closedThreadIds"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| CliError::protocol("task/closed 包含无效 Thread identity"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if root_id == task_thread_id
+            || closed_thread_ids.is_empty()
+            || closed_thread_ids.iter().collect::<HashSet<_>>().len() != closed_thread_ids.len()
+            || !closed_thread_ids.contains(&task_thread_id)
+            || closed_thread_ids.contains(&root_id)
+        {
+            return Err(CliError::protocol("task/closed receipt identity 不一致"));
+        }
+        let current = self.thread.as_ref().map(|thread| {
+            (
+                thread.thread_id.clone(),
+                thread.root_thread_id.clone(),
+                thread.workspace_id.clone(),
+            )
+        });
+        self.accept_closed_threads(&closed_thread_ids);
+        let Some((current_id, current_root, current_workspace)) = current else {
+            return Ok(());
+        };
+        if !closed_thread_ids.contains(&current_id) {
+            return Ok(());
+        }
+        if current_root == root_id {
+            match load_context(&mut self.connection, &root_id) {
+                Ok(root)
+                    if root.thread_kind == DiscoveredThreadKind::Main
+                        && root.root_thread_id == root_id
+                        && root.workspace_id == current_workspace =>
+                {
+                    if let Err(error) = self.activate_thread(root) {
+                        self.clear_closed_active_thread(&closed_thread_ids);
+                        self.notice(format!(
+                            "当前侧聊已关闭，父会话暂不可读取；运行 /resume 重试。({})",
+                            error.message()
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        self.clear_closed_active_thread(&closed_thread_ids);
+        self.notice("当前会话已关闭；运行 /resume 选择仍可用的会话。".into());
+        Ok(())
+    }
+
+    /// @author kongweiguang
+    /// If the exact close receipt's root is no longer readable, remove the closed Thread identity
+    /// locally so a late snapshot cannot make the deleted child current again.
+    fn clear_closed_active_thread(&mut self, closed_thread_ids: &[String]) {
+        let workspace_id = self
+            .thread
+            .as_ref()
+            .map(|thread| thread.workspace_id.clone());
+        if let Some(workspace_id) = workspace_id {
+            self.thread_list_workspace_id = workspace_id;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = self.connection.unobserve(&thread.thread_id);
+        }
+        self.usage.bind_thread(None, Instant::now());
+        self.history = Value::Null;
+        self.interaction = Value::Null;
+        self.config = Value::Null;
+        self.pending_input = None;
+        self.pending_suspended_control = None;
+        self.work_activity = WorkActivity::default();
+        self.attachments.clear();
+        self.file_choices.clear();
+        self.skill_choices.clear();
+        self.thread_list_scope_all = true;
+        self.send(UiEvent::SetSuspendedControlPending(false));
+        self.send(UiEvent::ReplaceSnapshot(Box::default()));
+        self.send(UiEvent::ForgetThreadDrafts(closed_thread_ids.to_vec()));
+        self.publish_usage();
     }
 
     /// 续接 prompt 会创建新的用户 Turn；已有工作通过 turn/resume 恢复，避免重放旧工具调用。
@@ -2628,9 +3162,16 @@ impl Interactive {
         }
     }
 
-    /// 打开选择器先读最近一页，后续查询和翻页都复用同一 Java keyset 接口。
+    /// @author kongweiguang
+    /// 打开选择器先读最近一页；成功读取后才允许用户以显式 /btw 重试未确认的创建。
     fn show_thread_choices(&mut self) -> Result<(), CliError> {
-        self.search_threads("", None)
+        self.search_threads("", None)?;
+        if let Some(thread_id) = self.thread.as_ref().map(|thread| thread.thread_id.as_str())
+            && let Some(recovery) = self.pending_side_chat_recovery.get_mut(thread_id)
+        {
+            recovery.inspected = true;
+        }
+        Ok(())
     }
 
     /// 服务端按当前 Workspace 和标题过滤且返回游标，CLI 不扫描其它项目或物化完整历史。
@@ -3578,17 +4119,15 @@ impl Interactive {
         self.save_preferences(requested, &workspace_id, &thread_id)
     }
 
-    /// 通过所在 Workspace 的完整 Thread 条目取得偏好；不以配置默认值覆盖已有会话选择。
+    /// @author kongweiguang
+    /// 依当前 ThreadKind 读取权威完整快照；不让子会话落到 MAIN Workspace 历史目录。
     fn current_preferences(&mut self) -> Result<Value, CliError> {
         let thread = self
             .thread
             .as_ref()
+            .map(clone_thread_context)
             .ok_or_else(|| CliError::usage("请先选择会话"))?;
-        let metadata = list_thread_in_workspace(
-            &mut self.connection,
-            &thread.workspace_id,
-            &thread.thread_id,
-        )?;
+        let metadata = read_thread_metadata(&mut self.connection, &thread)?;
         self.apply_thread_metadata(&metadata)?;
         metadata
             .get("preferences")
@@ -3607,7 +4146,8 @@ impl Interactive {
         Ok(())
     }
 
-    /// 模型与权限共用一次写入、一次完整读回，避免 ACK 不明时重放偏好副作用。
+    /// @author kongweiguang
+    /// 模型与权限共用一次写入、一次按 ThreadKind 的完整读回，避免子会话误查 MAIN 或重放副作用。
     fn save_preferences(
         &mut self,
         requested: Value,
@@ -3615,8 +4155,15 @@ impl Interactive {
         thread_id: &str,
     ) -> Result<(), CliError> {
         self.ensure_preferences_verified()?;
-        let workspace_id = workspace_id.to_owned();
-        let thread_id = thread_id.to_owned();
+        let thread = self
+            .thread
+            .as_ref()
+            .filter(|thread| {
+                thread.workspace_id.as_str() == workspace_id
+                    && thread.thread_id.as_str() == thread_id
+            })
+            .map(clone_thread_context)
+            .ok_or_else(|| CliError::usage("偏好目标已切换；请重新选择当前会话"))?;
         self.preferences_sync_pending = true;
         let attempt = update_then_readback_once(
             &mut self.connection,
@@ -3625,7 +4172,7 @@ impl Interactive {
                     .request("thread/preferences/update", requested.clone())
                     .map(|_| ())
             },
-            |connection| list_thread_in_workspace(connection, &workspace_id, &thread_id),
+            |connection| read_thread_metadata(connection, &thread),
         );
         let readback_matches = attempt
             .readback
@@ -4034,7 +4581,7 @@ impl Interactive {
     }
 
     /// @author kongweiguang
-    /// 预览与后台读取共用语义标题和有界队列；generation 阻止关闭或重试后的迟到覆盖。
+    /// 预览与后台读取共用语义标题和有界队列；Task 活动没有子 Thread 控制器，只展示已投影安全摘要。
     fn open_details(&mut self, entry_id: &str) -> Result<(), CliError> {
         let (thread_id, title, item, mut body) = {
             let thread = self
@@ -4050,8 +4597,7 @@ impl Interactive {
                         .iter()
                         .find(|item| item.get("itemId").and_then(Value::as_str) == Some(entry_id))
                 })
-                .cloned()
-                .ok_or_else(|| CliError::usage("详情已过期"))?;
+                .cloned();
             let snapshot = projection::project(
                 thread,
                 &history,
@@ -4068,13 +4614,30 @@ impl Interactive {
                 TimelineKind::Tool { action, target, .. } => format!("{action}  {target}"),
                 _ => entry.kind.message_detail_title().to_owned(),
             };
-            let preview_body = if item.get("truncated").and_then(Value::as_bool) == Some(true) {
-                entry.text.clone()
-            } else {
-                entry.detail.clone().unwrap_or_else(|| entry.text.clone())
+            if item.is_none() && !entry_id.starts_with("subagent:") {
+                return Err(CliError::usage("详情已过期"));
+            }
+            let preview_body = match item.as_ref() {
+                Some(item) if item.get("truncated").and_then(Value::as_bool) == Some(true) => {
+                    entry.text.clone()
+                }
+                _ => entry.detail.clone().unwrap_or_else(|| entry.text.clone()),
             };
             (thread.thread_id.clone(), title, item, preview_body)
         };
+        if item.is_none() {
+            self.send(UiEvent::SetDetailsCopyReady {
+                entry_id: entry_id.to_owned(),
+                ready: false,
+            });
+            self.send(UiEvent::ShowDetails {
+                entry_id: entry_id.to_owned(),
+                title,
+                body,
+            });
+            return Ok(());
+        }
+        let item = item.expect("non-synthetic timeline entries require a history item");
         let kind = required_str(&item, "kind")?;
         if body.len() > ITEM_DETAIL_MAX_BYTES {
             body = detail_preview_with_limit(&body);
@@ -4846,20 +5409,15 @@ impl Interactive {
     }
 
     /// @author kongweiguang
-    /// 用有界线程目录读取完整偏好快照；metadata 失败时保留先前已确认的 Thread 字段。
+    /// 用调用方共享 deadline 按 ThreadKind 读取完整快照；失败保留先前已确认字段。
     fn read_status_metadata(&mut self, deadline: Instant) -> Result<Value, CliError> {
-        let (workspace_id, thread_id) = self
+        let thread = self
             .thread
             .as_ref()
-            .map(|thread| (thread.workspace_id.clone(), thread.thread_id.clone()))
+            .map(clone_thread_context)
             .ok_or_else(|| CliError::usage("请先选择会话"))?;
-        let metadata = list_thread_in_workspace_until(
-            &mut self.connection,
-            &workspace_id,
-            &thread_id,
-            deadline,
-            remaining_status,
-        )?;
+        let metadata =
+            read_thread_metadata_until(&mut self.connection, &thread, deadline, remaining_status)?;
         self.apply_thread_metadata(&metadata)?;
         Ok(metadata)
     }
@@ -6142,16 +6700,17 @@ pub(super) fn resumed_live_reasoning_entry_id(stream: &Value) -> Option<String> 
     Some(format!("live-reasoning:{turn_id}:{start}"))
 }
 
-/// 先完整读取并校验 metadata，再一次性更新本地 Thread；失败保留此前已确认的标题与偏好。
+/// @author kongweiguang
+/// 先按 ThreadKind 完整读取并校验 metadata，再一次性更新；失败保留此前确认值。
 pub(super) fn reload_thread_metadata(
     thread: &mut Option<ThreadContext>,
     preferences_sync_pending: &mut bool,
-    read: impl FnOnce(&str, &str) -> Result<Value, CliError>,
+    read: impl FnOnce(&ThreadContext) -> Result<Value, CliError>,
 ) -> Result<(), CliError> {
     let Some(current) = thread.as_ref() else {
         return Ok(());
     };
-    let metadata = read(&current.workspace_id, &current.thread_id)?;
+    let metadata = read(current)?;
     apply_thread_metadata_snapshot(thread, preferences_sync_pending, &metadata)
 }
 
@@ -6202,7 +6761,8 @@ fn apply_thread_metadata_snapshot(
     Ok(())
 }
 
-/// 复用 App Server 的 Workspace 过滤、标题搜索与游标，避免客户端全局枚举后再过滤。
+/// @author kongweiguang
+/// 复用 App Server 的 Workspace 过滤、标题搜索与游标，并保留发现类型以暴露子 Thread 审批入口。
 fn list_thread_choices(
     connection: &mut Connection,
     workspace_id: &str,
@@ -6225,13 +6785,15 @@ fn list_thread_choices(
         .ok_or_else(|| CliError::protocol("历史列表缺少 items"))?
         .iter()
         .map(|item| {
+            let kind = required_str(item, "kind")?;
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(thread_status_label);
             Ok(UiChoice {
                 id: required_str(item, "threadId")?.into(),
                 label: required_str(item, "title")?.into(),
-                detail: item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(|status| thread_status_label(status).to_owned()),
+                detail: combine_thread_choice_detail(kind, status, None)?,
             })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
@@ -6242,7 +6804,8 @@ fn list_thread_choices(
     Ok((choices, next_cursor))
 }
 
-/// 全局续接复用服务端 keyset 分页，并让每条结果绑定 Java Thread identity。
+/// @author kongweiguang
+/// 全局续接复用服务端 keyset 分页，展示 Thread 类型与审批状态但只绑定不透明 Thread identity。
 fn list_all_thread_choices(
     connection: &mut Connection,
     query: &str,
@@ -6267,15 +6830,11 @@ fn list_all_thread_choices(
                 .get("workspaceName")
                 .or_else(|| item.get("workspaceId"))
                 .and_then(Value::as_str);
+            let kind = required_str(item, "kind")?;
             Ok(UiChoice {
                 id: required_str(item, "threadId")?.into(),
                 label: required_str(item, "title")?.into(),
-                detail: match (status, workspace) {
-                    (Some(status), Some(workspace)) => Some(format!("{status} · {workspace}")),
-                    (Some(status), None) => Some(status.to_owned()),
-                    (None, Some(workspace)) => Some(workspace.to_owned()),
-                    (None, None) => None,
-                },
+                detail: combine_thread_choice_detail(kind, status, workspace)?,
             })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
@@ -6284,6 +6843,46 @@ fn list_all_thread_choices(
         .and_then(Value::as_str)
         .map(str::to_owned);
     Ok((choices, next_cursor))
+}
+
+/// @author kongweiguang
+/// Recover an uncertain `/btw` body only after the user selects a side chat matching its parent,
+/// root, Workspace, and any child identity already present in the server receipt.
+pub(super) fn pending_side_chat_recovery_candidate(
+    recoveries: &mut HashMap<String, PendingSideChatRecovery>,
+    active_parent_id: &str,
+    candidate: &ThreadContext,
+) -> Option<String> {
+    if candidate.thread_kind != DiscoveredThreadKind::SideChat
+        || candidate.parent_thread_id.as_deref() != Some(active_parent_id)
+    {
+        return None;
+    }
+    let recovery = recoveries.get_mut(active_parent_id)?;
+    if recovery.root_thread_id != candidate.root_thread_id
+        || recovery.workspace_id != candidate.workspace_id
+        || recovery
+            .candidate_thread_id
+            .as_deref()
+            .is_some_and(|thread_id| thread_id != candidate.thread_id)
+    {
+        return None;
+    }
+    recovery.candidate_thread_id = Some(candidate.thread_id.clone());
+    Some(recovery.content.clone())
+}
+
+/// @author kongweiguang
+/// Purge only payloads whose exact Thread identity appears in the close receipt; a dead active
+/// projection must not discard a pending first send owned by a surviving side chat.
+pub(super) fn retain_open_side_chat_payloads(
+    pending_content: &mut HashMap<String, String>,
+    recoveries: &mut HashMap<String, PendingSideChatRecovery>,
+    closed_thread_ids: &[String],
+) {
+    let closed = closed_thread_ids.iter().collect::<HashSet<_>>();
+    pending_content.retain(|thread_id, _| !closed.contains(thread_id));
+    recoveries.retain(|parent_id, _| !closed.contains(parent_id));
 }
 
 /// `--last` asks Java for the newest workspace Thread instead of inferring recency from local history.
@@ -6305,17 +6904,43 @@ fn last_thread_in_workspace(
         .transpose()
 }
 
-/// 会话候选只翻译冻结的状态枚举，不对未知 wire 状态猜测完成事实。
-fn thread_status_label(status: &str) -> &'static str {
+/// @author kongweiguang
+/// 会话候选翻译冻结的类型和状态枚举；审批等待必须突出显示以让用户找到子会话处理入口。
+pub(super) fn thread_status_label(status: &str) -> &'static str {
     match status {
         "idle" => "空闲",
-        "queued" | "running" | "waiting_approval" | "suspended" => "正在工作",
+        "queued" | "running" => "正在工作",
+        "waiting_approval" => "等待审批",
+        "suspended" => "已暂停",
         "waiting_input" => "等待回答",
         "completed" => "已完成",
         "failed" => "失败",
         "cancelled" => "已取消",
         _ => "状态未知",
     }
+}
+
+/// @author kongweiguang
+/// 恢复候选一行说明类型、状态和可选 Workspace；kind 是服务端闭集，未知类型不能伪装成主会话。
+pub(super) fn combine_thread_choice_detail(
+    kind: &str,
+    status: Option<&str>,
+    workspace: Option<&str>,
+) -> Result<Option<String>, CliError> {
+    let kind = match kind {
+        "main" => "会话",
+        "side_chat" => "侧聊",
+        "subagent" => "子任务",
+        _ => return Err(CliError::protocol("会话发现包含未知 Thread 类型")),
+    };
+    let mut parts = vec![kind.to_owned()];
+    if let Some(status) = status {
+        parts.push(status.to_owned());
+    }
+    if let Some(workspace) = workspace {
+        parts.push(workspace.to_owned());
+    }
+    Ok(Some(parts.join(" · ")))
 }
 
 /// 推理等级短标签统一中文，底层等级标识保持原值供 Java 校验。
@@ -6502,11 +7127,12 @@ fn request_with_deadline(
     }
 }
 
-/// 全局发现提供 workspace identity，随后读取完整条目以恢复原模型、权限和 Workspace 根。
+/// @author kongweiguang
+/// 先用全局发现确定类型和 Workspace；子 Thread 必须由 task/read 证明身份，不能因普通列表 404 伪装成 MAIN。
 fn load_context(connection: &mut Connection, thread_id: &str) -> Result<ThreadContext, CliError> {
     let deadline = Instant::now() + DISCOVERY_DEADLINE;
     let mut cursor: Option<String> = None;
-    let mut workspace_id = None;
+    let mut discovery = None;
     for _ in 0..MAX_DISCOVERY_PAGES {
         let mut params = json!({"scope":"all","limit":200});
         if let Some(cursor) = &cursor {
@@ -6522,7 +7148,10 @@ fn load_context(connection: &mut Connection, thread_id: &str) -> Result<ThreadCo
             .iter()
             .find(|item| item.get("threadId").and_then(Value::as_str) == Some(thread_id))
         {
-            workspace_id = Some(required_str(found, "workspaceId")?.to_owned());
+            discovery = Some((
+                required_str(found, "workspaceId")?.to_owned(),
+                required_str(found, "kind")?.to_owned(),
+            ));
             break;
         }
         cursor = result
@@ -6533,9 +7162,38 @@ fn load_context(connection: &mut Connection, thread_id: &str) -> Result<ThreadCo
             break;
         }
     }
-    let workspace_id =
-        workspace_id.ok_or_else(|| CliError::usage("未在有界历史目录中找到该会话"))?;
-    let metadata = list_thread_in_workspace(connection, &workspace_id, thread_id)?;
+    let (workspace_id, kind) =
+        discovery.ok_or_else(|| CliError::usage("未在有界历史目录中找到该会话"))?;
+    let (metadata, thread_kind, parent_thread_id, root_thread_id) = match kind.as_str() {
+        "main" => {
+            let metadata = list_thread_in_workspace(connection, &workspace_id, thread_id)?;
+            validate_discovered_main_metadata(&metadata, thread_id, &workspace_id)?;
+            (
+                metadata,
+                DiscoveredThreadKind::Main,
+                None,
+                thread_id.to_owned(),
+            )
+        }
+        "side_chat" | "subagent" => {
+            let result =
+                connection.request("task/read", json!({"taskThreadId":thread_id,"limit":1}))?;
+            let (metadata, parent_thread_id, root_thread_id) =
+                task_read_thread_metadata(&result, thread_id, &workspace_id, &kind)?;
+            let thread_kind = if kind == "side_chat" {
+                DiscoveredThreadKind::SideChat
+            } else {
+                DiscoveredThreadKind::Subagent
+            };
+            (
+                metadata,
+                thread_kind,
+                Some(parent_thread_id),
+                root_thread_id,
+            )
+        }
+        _ => return Err(CliError::protocol("会话发现包含未知 Thread 类型")),
+    };
     let record = list_workspace_by_id(connection, &workspace_id)?;
     let workspace = if record.get("kind").and_then(Value::as_str) == Some("project") {
         connection.request(
@@ -6561,6 +7219,9 @@ fn load_context(connection: &mut Connection, thread_id: &str) -> Result<ThreadCo
         title: required_str(&metadata, "title")?.into(),
         workspace_id,
         workspace_root: root,
+        thread_kind,
+        parent_thread_id,
+        root_thread_id,
         provider_id: required_str(prefs, "providerId")?.into(),
         model_id: required_str(prefs, "modelId")?.into(),
         reasoning_level: prefs
@@ -6570,6 +7231,109 @@ fn load_context(connection: &mut Connection, thread_id: &str) -> Result<ThreadCo
         access_mode: required_str(prefs, "accessMode")?.into(),
         revision: required_u64(&metadata, "revision")?,
     })
+}
+
+/// @author kongweiguang
+/// 子会话元数据只能由 task/read 返回；逐项核对 discovery kind、lineage、Thread identity 和 Workspace。
+pub(super) fn task_read_thread_metadata(
+    result: &Value,
+    thread_id: &str,
+    workspace_id: &str,
+    discovery_kind: &str,
+) -> Result<(Value, String, String), CliError> {
+    let task = result
+        .get("task")
+        .ok_or_else(|| CliError::protocol("task/read 缺少 task"))?;
+    let thread = result
+        .get("thread")
+        .ok_or_else(|| CliError::protocol("task/read 缺少 thread"))?;
+    let expected_task_kind = match discovery_kind {
+        "side_chat" => "side_task",
+        "subagent" => "subagent",
+        _ => return Err(CliError::protocol("task/read 不适用于 MAIN Thread")),
+    };
+    let expected_lifecycle = if discovery_kind == "side_chat" {
+        "independent"
+    } else {
+        "attached"
+    };
+    let task_thread_id = required_str(task, "taskThreadId")?;
+    let parent_thread_id = required_str(task, "parentThreadId")?;
+    let root_thread_id = required_str(task, "rootThreadId")?;
+    if task_thread_id != thread_id
+        || required_str(thread, "threadId")? != thread_id
+        || required_str(thread, "workspaceId")? != workspace_id
+        || required_str(task, "taskKind")? != expected_task_kind
+        || required_str(task, "lifecycle")? != expected_lifecycle
+        || parent_thread_id == thread_id
+        || root_thread_id == thread_id
+        || required_str(thread, "status")? != "active"
+    {
+        return Err(CliError::usage(
+            "子会话候选已变化、已关闭或身份与 Workspace 不匹配；请重新运行 /resume",
+        ));
+    }
+    if expected_task_kind == "subagent" && task.get("originTurnId").is_none_or(Value::is_null) {
+        return Err(CliError::protocol("Subagent task/read 缺少 originTurnId"));
+    }
+    Ok((
+        thread.clone(),
+        parent_thread_id.to_owned(),
+        root_thread_id.to_owned(),
+    ))
+}
+
+/// @author kongweiguang
+/// Close is complete only with the server's unique receipt containing the requested root and
+/// excluding its surviving owner; 404, duplicates, and inferred descendants never count as success.
+pub(super) fn validate_task_close_receipt(
+    receipt: &Value,
+    requested_thread_id: &str,
+    surviving_root_thread_id: &str,
+) -> Result<Vec<String>, CliError> {
+    let closed_thread_ids = receipt
+        .get("closedThreadIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::protocol("task/close 缺少 closedThreadIds 回执"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| CliError::protocol("task/close 回执包含无效 Thread identity"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if closed_thread_ids.is_empty()
+        || closed_thread_ids.iter().collect::<HashSet<_>>().len() != closed_thread_ids.len()
+        || !closed_thread_ids
+            .iter()
+            .any(|thread_id| thread_id == requested_thread_id)
+        || closed_thread_ids
+            .iter()
+            .any(|thread_id| thread_id == surviving_root_thread_id)
+    {
+        return Err(CliError::protocol("task/close 回执与请求身份不一致"));
+    }
+    Ok(closed_thread_ids)
+}
+
+/// @author kongweiguang
+/// MAIN 只接受 thread/list 返回的精确元数据；已删除或归档候选不会尝试 task/read 或新建替代会话。
+fn validate_discovered_main_metadata(
+    metadata: &Value,
+    thread_id: &str,
+    workspace_id: &str,
+) -> Result<(), CliError> {
+    if required_str(metadata, "threadId")? != thread_id
+        || required_str(metadata, "workspaceId")? != workspace_id
+        || required_str(metadata, "status")? != "active"
+    {
+        return Err(CliError::usage(
+            "会话候选已删除、归档或 Workspace 已变化；请重新运行 /resume",
+        ));
+    }
+    Ok(())
 }
 
 /// 项目 Workspace 只能按已登记 root 重开；session 才允许按 ID 打开。
@@ -6605,6 +7369,90 @@ fn list_workspace_by_id(
         }
     }
     Err(CliError::usage("未在有界 Workspace 目录中找到会话根"))
+}
+
+/// @author kongweiguang
+/// 当前 Thread 的权威 metadata 按发现身份选择来源，子会话不得从 MAIN Workspace 列表降级读取。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreadMetadataReadSource {
+    WorkspaceThreadList,
+    TaskRead(&'static str),
+}
+
+/// @author kongweiguang
+/// 固定 MAIN 与子会话的元数据协议分界，供调用路径和回归测试共同使用。
+pub(super) fn thread_metadata_read_source(kind: DiscoveredThreadKind) -> ThreadMetadataReadSource {
+    match kind {
+        DiscoveredThreadKind::Main => ThreadMetadataReadSource::WorkspaceThreadList,
+        DiscoveredThreadKind::SideChat => ThreadMetadataReadSource::TaskRead("side_chat"),
+        DiscoveredThreadKind::Subagent => ThreadMetadataReadSource::TaskRead("subagent"),
+    }
+}
+
+/// @author kongweiguang
+/// A refresh must keep the parent and root recorded at selection time; task/read may not silently retarget it.
+pub(super) fn validate_active_task_lineage(
+    thread: &ThreadContext,
+    parent_thread_id: &str,
+    root_thread_id: &str,
+) -> Result<(), CliError> {
+    if thread.thread_kind == DiscoveredThreadKind::Main
+        || thread.parent_thread_id.as_deref() != Some(parent_thread_id)
+        || thread.root_thread_id != root_thread_id
+    {
+        return Err(CliError::usage(
+            "子会话 parent/root identity 已变化；请重新运行 /resume",
+        ));
+    }
+    Ok(())
+}
+
+/// @author kongweiguang
+/// 常规刷新和偏好核实共享有界权威读取；MAIN 用历史目录，子会话用 task/read 并校验原 lineage。
+fn read_thread_metadata(
+    connection: &mut Connection,
+    thread: &ThreadContext,
+) -> Result<Value, CliError> {
+    read_thread_metadata_until(
+        connection,
+        thread,
+        Instant::now() + DISCOVERY_DEADLINE,
+        remaining_scan,
+    )
+}
+
+/// @author kongweiguang
+/// F5/status 与普通刷新共用身份路由，并沿用调用方 deadline，避免子会话路径失去读取预算。
+fn read_thread_metadata_until(
+    connection: &mut Connection,
+    thread: &ThreadContext,
+    deadline: Instant,
+    remaining: impl Fn(Instant) -> Result<Duration, CliError>,
+) -> Result<Value, CliError> {
+    match thread_metadata_read_source(thread.thread_kind) {
+        ThreadMetadataReadSource::WorkspaceThreadList => list_thread_in_workspace_until(
+            connection,
+            &thread.workspace_id,
+            &thread.thread_id,
+            deadline,
+            remaining,
+        ),
+        ThreadMetadataReadSource::TaskRead(discovery_kind) => {
+            let result = connection.request_with_timeout(
+                "task/read",
+                json!({"taskThreadId":thread.thread_id,"limit":1}),
+                remaining(deadline)?,
+            )?;
+            let (metadata, parent_thread_id, root_thread_id) = task_read_thread_metadata(
+                &result,
+                &thread.thread_id,
+                &thread.workspace_id,
+                discovery_kind,
+            )?;
+            validate_active_task_lineage(&thread, &parent_thread_id, &root_thread_id)?;
+            Ok(metadata)
+        }
+    }
 }
 
 /// Workspace 级列表分页查找精确 Thread，不把 discovery 的简化状态冒充完整偏好。
@@ -7339,6 +8187,9 @@ fn clone_thread_context(thread: &ThreadContext) -> ThreadContext {
         title: thread.title.clone(),
         workspace_id: thread.workspace_id.clone(),
         workspace_root: thread.workspace_root.clone(),
+        thread_kind: thread.thread_kind,
+        parent_thread_id: thread.parent_thread_id.clone(),
+        root_thread_id: thread.root_thread_id.clone(),
         model_id: thread.model_id.clone(),
         provider_id: thread.provider_id.clone(),
         reasoning_level: thread.reasoning_level.clone(),

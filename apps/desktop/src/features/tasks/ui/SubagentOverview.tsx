@@ -77,7 +77,10 @@ function TaskTreeItems({
   );
 }
 
-/** 树形总览只投影服务端摘要，绝不为未选中实例读取正文或建立 observe。 */
+/**
+ * 树形总览的计数、空态与列表共用当前 owner 的委派子集；无关侧聊摘要不能伪造子任务数量或压住真实读取错误。
+ * @author kongweiguang
+ */
 export function SubagentOverview({
   tasks,
   ownerThreadId,
@@ -93,22 +96,27 @@ export function SubagentOverview({
   onRefresh: () => Promise<void>;
   onOpenTask: (task: TaskSummary) => void;
 }): ReactElement {
-  if (error !== undefined && tasks.length === 0)
+  const delegatedTasks = selectDelegatedTasks(tasks, ownerThreadId);
+  if (error !== undefined && delegatedTasks.length === 0)
     return <ErrorState title="子智能体暂不可用" message={error} onRetry={() => void onRefresh()} />;
-  const sections = buildTaskOverviewSections(selectDelegatedTasks(tasks, ownerThreadId));
+  const sections = buildTaskOverviewSections(delegatedTasks);
   return (
     <section className="ja-task-overview" aria-label="子智能体总览" aria-busy={loading}>
       <header className="ja-task-overview-header">
         <div>
           <h2>子智能体</h2>
-          <p>{tasks.length === 0 ? "当前主任务还没有派生任务" : `共 ${tasks.length} 个后代任务`}</p>
+          <p>
+            {delegatedTasks.length === 0
+              ? "当前主任务还没有派生任务"
+              : `共 ${delegatedTasks.length} 个后代任务`}
+          </p>
         </div>
         <Button type="button" variant="ghost" size="sm" onClick={() => void onRefresh()}>
           <RefreshCw aria-hidden="true" />
           刷新
         </Button>
       </header>
-      {tasks.length === 0 && !loading ? (
+      {delegatedTasks.length === 0 && !loading ? (
         <EmptyState title="暂无子智能体" description="Agent 派发后会自动出现在这里。" />
       ) : (
         <div className="ja-task-sections">

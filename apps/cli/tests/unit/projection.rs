@@ -13,14 +13,168 @@ mod controller {
         use serde_json::{Value, json};
         use std::time::{Duration, Instant, UNIX_EPOCH};
 
-        /// 直接消费真实 Tool presentation，防止渲染夹具绕过输入与结果的投影规则。
+        /// @author kongweiguang
+        /// 直接消费真实 Tool presentation，并保留必需的空 taskActivities 合同字段。
         fn tool_preview_entry(presentation: Value) -> ja_cli::ui::TimelineEntry {
             project(json!({
                 "revision": 7,
                 "turns": [],
                 "items": [{"itemId":"tool_preview", "turnId":"turn_projection", "kind":"tool_call", "presentation":presentation}],
+                "taskActivities": [],
                 "liveStream":null
             })).timeline.into_iter().next().unwrap()
+        }
+
+        /// @author kongweiguang
+        /// 构造快照中的直接 Subagent 活动对，状态由任务摘要提供、文字只取安全摘要。
+        fn task_activity_pair(
+            task_thread_id: &str,
+            task_name: &str,
+            state: &str,
+            sequence: u64,
+            created_at: &str,
+            summary: &str,
+        ) -> Value {
+            json!({
+                "activity": {
+                    "activityId": format!("activity_{task_thread_id}_{sequence}"),
+                    "activitySequence": sequence,
+                    "taskThreadId": task_thread_id,
+                    "createdAt": created_at,
+                    "summary": {"text": summary}
+                },
+                "task": {
+                    "taskThreadId": task_thread_id,
+                    "parentThreadId": "thr_projection",
+                    "taskKind": "subagent",
+                    "taskName": task_name,
+                    "state": state,
+                    "latestActivitySequence": sequence
+                }
+            })
+        }
+
+        /// @author kongweiguang
+        /// 按各活动真实时间排序并以 taskThreadId 稳定破平局；同一任务只保留最新状态和摘要。
+        #[test]
+        fn subagent_activities_merge_latest_per_task_and_project_terminal_states() {
+            let mut history = json!({
+                "revision": 7,
+                "turns": [],
+                "items": [],
+                "taskActivities": [
+                    task_activity_pair("thr_child_a", "检索资料", "queued", 1, "2026-10-15T00:00:01Z", "旧活动"),
+                    task_activity_pair("thr_child_b", "等待确认", "waiting_input", 1, "2026-10-15T00:00:02Z", "需要补充输入"),
+                    task_activity_pair("thr_child_a", "检索资料", "failed", 2, "2026-10-15T00:00:04Z", "执行失败：权限不足"),
+                    task_activity_pair("thr_child_c", "已取消", "cancelled", 1, "2026-10-15T00:00:03Z", "用户取消"),
+                    task_activity_pair("thr_child_0", "同一时刻", "completed", 1, "2026-10-15T00:00:02Z", "已完成"),
+                    task_activity_pair("thr_child_d", "运行中", "running", 1, "2026-10-15T00:00:02.500Z", "正在工作"),
+                    task_activity_pair("thr_child_s", "等待审批超时", "suspended", 1, "2026-10-15T00:00:04.500Z", "等待续跑")
+                ],
+                "liveStream": null
+            });
+            let mut unrelated = task_activity_pair(
+                "thr_unrelated",
+                "其它父任务",
+                "running",
+                1,
+                "2026-10-15T00:00:05Z",
+                "不可见活动",
+            );
+            unrelated["task"]["parentThreadId"] = json!("thr_other_parent");
+            history["taskActivities"]
+                .as_array_mut()
+                .unwrap()
+                .push(unrelated);
+
+            let snapshot = project(history);
+            let child_entries = snapshot
+                .timeline
+                .iter()
+                .filter(|entry| entry.id.starts_with("subagent:"))
+                .collect::<Vec<_>>();
+            assert_eq!(child_entries.len(), 6);
+            assert_eq!(
+                child_entries
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "subagent:thr_child_0",
+                    "subagent:thr_child_b",
+                    "subagent:thr_child_d",
+                    "subagent:thr_child_c",
+                    "subagent:thr_child_a",
+                    "subagent:thr_child_s"
+                ]
+            );
+
+            let failed = child_entries
+                .iter()
+                .find(|entry| entry.id == "subagent:thr_child_a")
+                .unwrap();
+            assert_eq!(failed.status, Some(TimelineStatus::Failed));
+            assert!(failed.detail.as_deref().unwrap().contains("状态：失败"));
+            assert!(
+                failed
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("执行失败：权限不足")
+            );
+            assert!(!failed.detail.as_deref().unwrap().contains("旧活动"));
+
+            let waiting = child_entries
+                .iter()
+                .find(|entry| entry.id == "subagent:thr_child_b")
+                .unwrap();
+            assert_eq!(waiting.status, Some(TimelineStatus::Running));
+            assert!(
+                waiting
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("状态：等待输入")
+            );
+
+            let running = child_entries
+                .iter()
+                .find(|entry| entry.id == "subagent:thr_child_d")
+                .unwrap();
+            assert_eq!(running.status, Some(TimelineStatus::Running));
+            assert!(
+                running
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("状态：正在工作")
+            );
+
+            let cancelled = child_entries
+                .iter()
+                .find(|entry| entry.id == "subagent:thr_child_c")
+                .unwrap();
+            assert_eq!(cancelled.status, Some(TimelineStatus::Complete));
+            assert!(
+                cancelled
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("状态：已取消")
+            );
+
+            let suspended = child_entries
+                .iter()
+                .find(|entry| entry.id == "subagent:thr_child_s")
+                .unwrap();
+            assert_eq!(suspended.status, None);
+            assert!(
+                suspended
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("状态：已暂停 · 待恢复")
+            );
         }
 
         /// 没有结果的终态不能拿输入参数冒充结果；运行中仅以明确的输入标签展示参数。
@@ -97,6 +251,7 @@ mod controller {
                     {"itemId":"answer-truncated", "kind":"final_answer", "text":"ANSWER_PREVIEW", "truncated":true},
                     {"itemId":"answer-complete", "kind":"final_answer", "text":"FULL_ANSWER", "truncated":false}
                 ],
+                "taskActivities": [],
                 "liveStream":null
             }));
 
@@ -493,20 +648,17 @@ mod controller {
             assert_eq!(project(active).turn_started_at, None);
         }
 
+        /// @author kongweiguang
         /// 普通 metadata 重读把权威改名送入下一次投影；失败或不完整结果不污染已确认标题。
         #[test]
         fn metadata_refresh_updates_title_atomically_and_keeps_it_on_read_failure() {
             let mut thread = Some(thread_context());
             let mut preferences_pending = false;
-            interactive::reload_thread_metadata(
-                &mut thread,
-                &mut preferences_pending,
-                |workspace_id, thread_id| {
-                    assert_eq!(workspace_id, "ws_projection");
-                    assert_eq!(thread_id, "thr_projection");
-                    Ok(json!({"title":"桌面端改名","revision":8,"preferences":null}))
-                },
-            )
+            interactive::reload_thread_metadata(&mut thread, &mut preferences_pending, |thread| {
+                assert_eq!(thread.workspace_id, "ws_projection");
+                assert_eq!(thread.thread_id, "thr_projection");
+                Ok(json!({"title":"桌面端改名","revision":8,"preferences":null}))
+            })
             .unwrap();
             let thread = thread.unwrap();
             assert_eq!(thread.title, "桌面端改名");
@@ -524,22 +676,20 @@ mod controller {
             let mut thread = Some(thread);
             let mut preferences_pending = true;
             let old_revision = thread.as_ref().unwrap().revision;
-            let error = interactive::reload_thread_metadata(
-                &mut thread,
-                &mut preferences_pending,
-                |_, _| Err(CliError::transport("thread metadata unavailable")),
-            )
-            .unwrap_err();
+            let error =
+                interactive::reload_thread_metadata(&mut thread, &mut preferences_pending, |_| {
+                    Err(CliError::transport("thread metadata unavailable"))
+                })
+                .unwrap_err();
             assert!(error.read_retryable);
             assert!(preferences_pending);
             assert_eq!(thread.as_ref().unwrap().title, "桌面端改名");
             assert_eq!(thread.as_ref().unwrap().revision, old_revision);
 
-            let invalid = interactive::reload_thread_metadata(
-                &mut thread,
-                &mut preferences_pending,
-                |_, _| Ok(json!({"title":"不应提交","revision":9,"preferences":null})),
-            );
+            let invalid =
+                interactive::reload_thread_metadata(&mut thread, &mut preferences_pending, |_| {
+                    Ok(json!({"title":"不应提交","revision":9,"preferences":null}))
+                });
             assert!(invalid.is_err());
             assert_eq!(thread.as_ref().unwrap().title, "桌面端改名");
             assert_eq!(thread.as_ref().unwrap().revision, old_revision);
@@ -946,12 +1096,14 @@ mod controller {
             assert_eq!(output(&terminal).matches("JA_DIFFERENT_TURN").count(), 2);
         }
 
-        /// fixture 只提供真实投影所需合同字段，避免手写 UiSnapshot 绕开本次根因。
+        /// @author kongweiguang
+        /// fixture 提供真实投影所需字段与必需 Task 活动集合，避免手写 UiSnapshot 绕开投影合同。
         fn history(status: &str, body: &str, durable: bool) -> Value {
             json!({
                 "revision":7,
                 "turns":[{"turnId":"turn_projection","status":status}],
                 "items":if durable {vec![json!({"itemId":"final_projection","turnId":"turn_projection","kind":"final_answer","text":body})]} else {vec![]},
+                "taskActivities":[],
                 "liveStream":{"turnId":"turn_projection","segments":[{"kind":"assistant","segmentStartSeq":1,"streamSeq":1,"text":body}]}
             })
         }
@@ -981,6 +1133,9 @@ mod controller {
                 title: "投影回归".into(),
                 workspace_id: "ws_projection".into(),
                 workspace_root: "C:/projection".into(),
+                thread_kind: crate::controller::DiscoveredThreadKind::Main,
+                parent_thread_id: None,
+                root_thread_id: "thr_projection".into(),
                 model_id: "model".into(),
                 provider_id: "provider".into(),
                 reasoning_level: None,

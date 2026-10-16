@@ -392,7 +392,7 @@ public final class TaskAgentToolGateway implements TaskCapabilityCeilingPort {
     }
 
     /**
-     * 只公开稳定 Task 分类；未知实现故障不携带异常正文进入模型上下文。
+     * 只公开稳定 Task 分类；未知实现故障仅记录异常类型和代码位置，既能追查准入失败，也不泄露正文或凭据。
      */
     private static JaTool.ToolResult failure(Throwable source) {
         Throwable failure = source instanceof CompletionException && source.getCause() != null
@@ -415,6 +415,11 @@ public final class TaskAgentToolGateway implements TaskCapabilityCeilingPort {
             return new JaTool.ToolResult(ToolOutcome.FAILED, "Task Tool arguments are invalid.", Optional.empty(),
                     "TOOL_ARGUMENTS_INVALID");
         }
+        LOGGER.warn("Task operation failed type={} causeType={} origin={}", failure.getClass().getName(),
+                failure.getCause() == null ? "none" : failure.getCause().getClass().getName(),
+                java.util.Arrays.stream(failure.getStackTrace())
+                        .filter(frame -> frame.getClassName().startsWith("io.github.kongweiguang.ja."))
+                        .limit(6).toList());
         return new JaTool.ToolResult(ToolOutcome.FAILED, "Task operation failed safely.", Optional.empty(),
                 "TASK_TOOL_FAILED");
     }

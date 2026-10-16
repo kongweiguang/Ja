@@ -31,9 +31,12 @@ import io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionContro
 import io.github.kongweiguang.ja.agent.application.gateway.store.ExecutionRecordCodec;
 import io.github.kongweiguang.ja.agent.store.local.infrastructure.SQLiteAgentStore;
 import io.github.kongweiguang.ja.conversation.application.admission.JaAdmissionParticipants;
+import io.github.kongweiguang.ja.conversation.application.gateway.AdmissionFacts;
+import io.github.kongweiguang.ja.conversation.application.gateway.JaAdmissionTransactionParticipant;
 import io.github.kongweiguang.ja.conversation.domain.model.JaMessageIds;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadPreferences;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadProjection;
+import io.github.kongweiguang.ja.conversation.domain.model.TurnOwnerProjection;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnProjection;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnOrigin;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnEvent;
@@ -53,11 +56,13 @@ import io.github.kongweiguang.ja.conversation.application.gateway.TurnRuntimeRes
 import io.github.kongweiguang.ja.conversation.application.gateway.WorkspaceBindingResolver;
 import io.github.kongweiguang.ja.conversation.application.gateway.ConversationAttachmentPort;
 import io.github.kongweiguang.ja.conversation.application.gateway.ConversationWorkspaceReferencePort;
+import io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceAdmissionPort;
 import io.github.kongweiguang.ja.conversation.application.title.AutomaticThreadTitleScheduler;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -71,6 +76,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
@@ -326,6 +332,186 @@ final class TurnServiceTest {
         assertEquals(1, closedSubscriptions.get());
     }
 
+    /**
+     * 首个 Child 尚无持久 Thread 投影；租约归属只能取精确身份登记的 Child admission facts。
+     * @author kongweiguang
+     */
+    @Test
+    void preparedChildAdmissionUsesWorkspaceWithoutThreadProjection() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_child_admission", "turn_child_admission",
+                "user_local");
+        JaAdmissionParticipants admissions = new JaAdmissionParticipants();
+        AtomicReference<String> acquiredWorkspace = new AtomicReference<>();
+        AtomicInteger acquiredLeases = new AtomicInteger();
+        AtomicInteger releasedLeases = new AtomicInteger();
+        AtomicInteger projectionReads = new AtomicInteger();
+        AtomicInteger admissionAttempts = new AtomicInteger();
+        WorkspaceAdmissionPort workspaceGate = workspaceId -> {
+            acquiredWorkspace.set(workspaceId);
+            acquiredLeases.incrementAndGet();
+            return () -> releasedLeases.incrementAndGet();
+        };
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 18, 3,
+                Instant.EPOCH);
+        AtomicInteger queryCount = new AtomicInteger();
+        AgentEngine engine = statusEngine(identity, status, queryCount);
+        AtomicInteger closedSubscriptions = new AtomicInteger();
+        AgentExecutionEvents events = workspaceAdmissionEvents(closedSubscriptions);
+        ConversationProjectionRepository projections = missingThreadProjections(projectionReads);
+        TurnService service = workspaceAdmissionTestService(engine, events, admissions, projections, workspaceGate);
+        AgentAdmissionReceipt receipt = new AgentAdmissionReceipt(17, 2, 1, 1);
+        AgentExecutionHandle handle = new AgentExecutionHandle(identity, new CompletableFuture<>(),
+                CompletableFuture.completedFuture(Optional.of(receipt)));
+        Function<Consumer<AgentAdmissionReceipt>, AgentExecutionHandle> admission = beforeSchedule -> {
+            admissionAttempts.incrementAndGet();
+            beforeSchedule.accept(receipt);
+            return handle;
+        };
+        ConversationTurnEventSink sink = revisionSink(identity, new AtomicReference<>(), new AtomicReference<>(),
+                new AtomicInteger());
+
+        try (JaAdmissionParticipants.Registration ignored = admissions.register(identity,
+                preparedChildAdmission(identity, "ws_child_admission"))) {
+            TurnUseCase.Accepted accepted = invokeSubmit(service, identity, sink, admission);
+            assertEquals(identity.threadId(), accepted.threadId());
+            assertEquals(identity.turnId(), accepted.turnId());
+            assertEquals(17L, accepted.threadRevision());
+            assertTrue(accepted.queued());
+        }
+
+        assertEquals("ws_child_admission", acquiredWorkspace.get());
+        assertEquals(1, acquiredLeases.get());
+        assertEquals(1, releasedLeases.get());
+        assertEquals(0, projectionReads.get());
+        assertEquals(1, admissionAttempts.get());
+        assertEquals(1, queryCount.get());
+        assertEquals(0, closedSubscriptions.get());
+    }
+
+    /**
+     * 普通已持久化会话没有临时 Child admission 时仍须使用其投影 Workspace 作为既有回退来源。
+     * @author kongweiguang
+     */
+    @Test
+    void existingThreadProjectionRemainsWorkspaceAdmissionFallback() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_projected_turn", "turn_projected_turn",
+                "user_local");
+        AtomicReference<String> acquiredWorkspace = new AtomicReference<>();
+        AtomicInteger acquiredLeases = new AtomicInteger();
+        AtomicInteger releasedLeases = new AtomicInteger();
+        AtomicInteger projectionReads = new AtomicInteger();
+        WorkspaceAdmissionPort workspaceGate = workspaceId -> {
+            acquiredWorkspace.set(workspaceId);
+            acquiredLeases.incrementAndGet();
+            return () -> releasedLeases.incrementAndGet();
+        };
+        ThreadPreferences preferences = new ThreadPreferences("provider_test", "model_test", "medium",
+                AccessMode.APPROVAL_REQUIRED, CollaborationMode.DEFAULT, ThreadPreferences.TitleSource.MANUAL);
+        ThreadProjection thread = new ThreadProjection(identity.threadId(), "ws_projected_turn", preferences, 4,
+                List.of());
+        ConversationProjectionRepository projections = presentThreadProjections(thread, projectionReads);
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 5, 2,
+                Instant.EPOCH);
+        TurnService service = workspaceAdmissionTestService(statusEngine(identity, status, new AtomicInteger()),
+                workspaceAdmissionEvents(new AtomicInteger()), new JaAdmissionParticipants(), projections,
+                workspaceGate);
+        AgentAdmissionReceipt receipt = new AgentAdmissionReceipt(5, 2, 1, 1);
+        AgentExecutionHandle handle = new AgentExecutionHandle(identity, new CompletableFuture<>(),
+                CompletableFuture.completedFuture(Optional.of(receipt)));
+        ConversationTurnEventSink sink = revisionSink(identity, new AtomicReference<>(), new AtomicReference<>(),
+                new AtomicInteger());
+
+        TurnUseCase.Accepted accepted = invokeSubmit(service, identity, sink, beforeSchedule -> {
+            beforeSchedule.accept(receipt);
+            return handle;
+        });
+
+        assertEquals(identity.threadId(), accepted.threadId());
+        assertEquals(5L, accepted.threadRevision());
+        assertEquals("ws_projected_turn", acquiredWorkspace.get());
+        assertEquals(1, acquiredLeases.get());
+        assertEquals(1, releasedLeases.get());
+        assertEquals(1, projectionReads.get());
+    }
+
+    /**
+     * 没有 Child admission 且没有 Thread 投影时，Workspace 身份未知，准入必须在取锁前拒绝。
+     * @author kongweiguang
+     */
+    @Test
+    void missingAdmissionAndThreadProjectionRejectBeforeWorkspaceLease() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_unregistered_child", "turn_unregistered_child",
+                "user_local");
+        AtomicInteger acquiredLeases = new AtomicInteger();
+        AtomicInteger projectionReads = new AtomicInteger();
+        AtomicInteger admissionAttempts = new AtomicInteger();
+        WorkspaceAdmissionPort workspaceGate = workspaceId -> {
+            acquiredLeases.incrementAndGet();
+            return () -> { };
+        };
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 1, 1,
+                Instant.EPOCH);
+        AgentExecutionEvents events = workspaceAdmissionEvents(new AtomicInteger());
+        TurnService service = workspaceAdmissionTestService(statusEngine(identity, status, new AtomicInteger()),
+                events, new JaAdmissionParticipants(), missingThreadProjections(projectionReads), workspaceGate);
+        ConversationTurnEventSink sink = revisionSink(identity, new AtomicReference<>(), new AtomicReference<>(),
+                new AtomicInteger());
+        AgentExecutionHandle handle = new AgentExecutionHandle(identity, new CompletableFuture<>(),
+                CompletableFuture.completedFuture(Optional.empty()));
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> invokeSubmit(service, identity, sink, beforeSchedule -> {
+                    admissionAttempts.incrementAndGet();
+                    return handle;
+                }));
+
+        assertEquals("Turn Thread projection is missing", failure.getMessage());
+        assertEquals(1, projectionReads.get());
+        assertEquals(0, acquiredLeases.get());
+        assertEquals(0, admissionAttempts.get());
+    }
+
+    /**
+     * Child 已登记并取得正确 Workspace 租约后，同步 Engine 失败仍须释放租约和事件订阅。
+     * @author kongweiguang
+     */
+    @Test
+    void synchronousChildAdmissionFailureReleasesWorkspaceLease() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_failed_child_admission",
+                "turn_failed_child_admission", "user_local");
+        JaAdmissionParticipants admissions = new JaAdmissionParticipants();
+        AtomicReference<String> acquiredWorkspace = new AtomicReference<>();
+        AtomicInteger acquiredLeases = new AtomicInteger();
+        AtomicInteger releasedLeases = new AtomicInteger();
+        WorkspaceAdmissionPort workspaceGate = workspaceId -> {
+            acquiredWorkspace.set(workspaceId);
+            acquiredLeases.incrementAndGet();
+            return () -> releasedLeases.incrementAndGet();
+        };
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 1, 1,
+                Instant.EPOCH);
+        AtomicInteger closedSubscriptions = new AtomicInteger();
+        TurnService service = workspaceAdmissionTestService(statusEngine(identity, status, new AtomicInteger()),
+                workspaceAdmissionEvents(closedSubscriptions), admissions, missingThreadProjections(new AtomicInteger()),
+                workspaceGate);
+        ConversationTurnEventSink sink = revisionSink(identity, new AtomicReference<>(), new AtomicReference<>(),
+                new AtomicInteger());
+
+        try (JaAdmissionParticipants.Registration ignored = admissions.register(identity,
+                preparedChildAdmission(identity, "ws_failed_child_admission"))) {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> invokeSubmit(service, identity, sink, beforeSchedule -> {
+                        throw new IllegalStateException("injected child scheduling failure");
+                    }));
+            assertEquals("injected child scheduling failure", failure.getMessage());
+        }
+
+        assertEquals("ws_failed_child_admission", acquiredWorkspace.get());
+        assertEquals(1, acquiredLeases.get());
+        assertEquals(1, releasedLeases.get());
+        assertEquals(1, closedSubscriptions.get());
+    }
+
     /** 注入订阅关闭故障，验证已提交终态仍返回且 owner 完成信号不被清理路径卡住。 */
     @Test
     void terminalProjectionSurvivesSubscriptionCloseFailure() throws Exception {
@@ -445,6 +631,661 @@ final class TurnServiceTest {
         }
     }
 
+    /** 冷启动观察只接入仍在 Core 审批等待或挂起的 MAIN/CHILD Turn，并交由原 watcher 生命周期回收。 @author kongweiguang */
+    @Test
+    void observeApprovalWaitRetainsOnlyAuthoritativeApprovalWaits() throws Exception {
+        for (TurnState observedState : List.of(TurnState.WAITING_APPROVAL, TurnState.SUSPENDED)) {
+            AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_" + observedState.name().toLowerCase(),
+                    "turn_observe_" + observedState.name().toLowerCase(), "user_local");
+            AgentExecutionStatus status = new AgentExecutionStatus(identity, observedState.name(), 2, 3,
+                    Instant.EPOCH);
+            AtomicInteger queryCount = new AtomicInteger();
+            AtomicInteger attachCount = new AtomicInteger();
+            AtomicInteger closeCount = new AtomicInteger();
+            AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+                case "attach" -> {
+                    assertEquals(identity, arguments[0]);
+                    assertTrue(arguments[1] instanceof ConversationTurnEventSink);
+                    attachCount.incrementAndGet();
+                    yield (AutoCloseable) closeCount::incrementAndGet;
+                }
+                case "toString" -> "ApprovalObservationEvents";
+                default -> throw new AssertionError("unexpected event call: " + method.getName());
+            });
+            TurnService service = approvalObservationTestService(identity, status, queryCount, events);
+
+            assertTrue(service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+            assertEquals(2, queryCount.get(), "the persisted Engine state must fence both sides of attach");
+            assertEquals(1, attachCount.get());
+            assertTrue(suspendedSubscriptions(service).containsKey(identity));
+
+            invokeRelease(service, identity);
+            assertEquals(1, closeCount.get());
+            assertFalse(suspendedSubscriptions(service).containsKey(identity));
+            assertFalse(suspendedReleases(service).containsKey(identity));
+        }
+    }
+
+    /** 不为已前进或缺失的状态建立 durable observer；Core query 仍在 watcher fence 外执行。 @author kongweiguang */
+    @Test
+    void observeApprovalWaitRejectsStaleCoreState() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_stale", "turn_observe_stale",
+                "user_local");
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 2, 3,
+                Instant.EPOCH);
+        AtomicInteger queryCount = new AtomicInteger();
+        AtomicInteger attachCount = new AtomicInteger();
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> {
+                attachCount.incrementAndGet();
+                yield (AutoCloseable) () -> { };
+            }
+            case "toString" -> "StaleApprovalObservationEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = approvalObservationTestService(identity, status, queryCount, events);
+
+        assertFalse(service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+        assertEquals(1, queryCount.get());
+        assertEquals(0, attachCount.get());
+        assertFalse(suspendedReleases(service).containsKey(identity));
+    }
+
+    /** 冷观察不得覆盖本进程执行、恢复 claim、完成回执或已存在的 watcher/drain。 @author kongweiguang */
+    @Test
+    void observeApprovalWaitRejectsExistingLocalLifecycle() throws Exception {
+        for (String blocker : List.of("owner", "completion", "resume", "watcher", "release")) {
+            AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_" + blocker,
+                    "turn_observe_" + blocker, "user_local");
+            AgentExecutionStatus status = new AgentExecutionStatus(identity,
+                    TurnState.WAITING_APPROVAL.name(), 2, 3, Instant.EPOCH);
+            AtomicInteger queryCount = new AtomicInteger();
+            AtomicInteger attachCount = new AtomicInteger();
+            AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+                case "attach" -> {
+                    attachCount.incrementAndGet();
+                    yield (AutoCloseable) () -> { };
+                }
+                case "toString" -> "ExistingApprovalLifecycleEvents";
+                default -> throw new AssertionError("unexpected event call: " + method.getName());
+            });
+            TurnService service = approvalObservationTestService(identity, status, queryCount, events);
+            switch (blocker) {
+                case "owner" -> owners(service).put(identity, new CompletableFuture<>());
+                case "completion" -> completions(service).put(identity, new CompletableFuture<>());
+                case "resume" -> resumeClaims(service).add(identity);
+                case "watcher" -> suspendedSubscriptions(service).put(identity, () -> { });
+                case "release" -> suspendedReleases(service).put(identity, CompletableFuture.completedFuture(null));
+                default -> throw new AssertionError("unknown local lifecycle blocker");
+            }
+
+            assertFalse(service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()), blocker);
+            assertEquals(0, queryCount.get(), blocker + " must be rejected before reading Engine state");
+            assertEquals(0, attachCount.get(), blocker + " must not create another durable bridge subscription");
+        }
+    }
+
+    /** Terminal finish racing an out-of-lock Core query fences the late cold observer before retention. @author kongweiguang */
+    @Test
+    void approvalObservationQueryCannotRetainAfterTerminalFinish() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_terminal_race",
+                "turn_observe_terminal_race", "user_local");
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.WAITING_APPROVAL.name(), 2, 3,
+                Instant.EPOCH);
+        CountDownLatch queryEntered = new CountDownLatch(1);
+        CountDownLatch allowQuery = new CountDownLatch(1);
+        AtomicInteger queryCount = new AtomicInteger();
+        AtomicInteger closeCount = new AtomicInteger();
+        AtomicInteger attachCount = new AtomicInteger();
+        AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "query" -> {
+                        int ordinal = queryCount.incrementAndGet();
+                        if (ordinal == 1) {
+                            queryEntered.countDown();
+                            if (!allowQuery.await(3, TimeUnit.SECONDS)) {
+                                throw new AssertionError("test did not release observation query");
+                            }
+                        }
+                        yield Optional.of(status);
+                    }
+                    case "toString" -> "TerminalApprovalObservationEngine";
+                    default -> throw new AssertionError("unexpected Engine call: " + method.getName());
+                });
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> {
+                attachCount.incrementAndGet();
+                yield (AutoCloseable) closeCount::incrementAndGet;
+            }
+            case "closeForShutdown" -> {
+                ((AutoCloseable) arguments[0]).close();
+                yield null;
+            }
+            case "toString" -> "TerminalApprovalObservationEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = approvalObservationTestService(identity, status, engine, events);
+        CompletableFuture<Boolean> observation = CompletableFuture.supplyAsync(
+                () -> service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+        CompletableFuture<TurnResult> completion = new CompletableFuture<>();
+        CompletableFuture<Void> finishing = new CompletableFuture<>();
+
+        try {
+            assertTrue(queryEntered.await(2, TimeUnit.SECONDS));
+            Thread.ofVirtual().start(() -> {
+                try {
+                    invokeFinish(service, identity, completion, terminalResult(identity));
+                    finishing.complete(null);
+                } catch (Exception failure) {
+                    finishing.completeExceptionally(failure);
+                }
+            });
+            long fenceDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!terminalizingCompletions(service).contains(identity) && System.nanoTime() < fenceDeadline) {
+                Thread.onSpinWait();
+            }
+            assertTrue(terminalizingCompletions(service).contains(identity), "finish must publish its stripe fence");
+            assertFalse(completion.isDone(), "finish must wait for the reserved attach lifecycle to settle");
+        } finally {
+            allowQuery.countDown();
+        }
+
+        assertFalse(observation.get(2, TimeUnit.SECONDS));
+        finishing.get(2, TimeUnit.SECONDS);
+        assertEquals(1, attachCount.get());
+        assertEquals(1, closeCount.get());
+        assertTrue(completion.isDone());
+        assertFalse(suspendedSubscriptions(service).containsKey(identity));
+        assertFalse(suspendedReleases(service).containsKey(identity));
+    }
+
+    /** 同身份的并发冷观察共享一个预留屏障，不能重复 attach 或覆盖已登记的 watcher。 @author kongweiguang */
+    @Test
+    void concurrentApprovalObservationRejectsDuplicateWithoutLeakingReservation() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_duplicate", "turn_observe_duplicate",
+                "user_local");
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.WAITING_APPROVAL.name(), 2, 3,
+                Instant.EPOCH);
+        CountDownLatch firstQueryEntered = new CountDownLatch(1);
+        CountDownLatch allowFirstQuery = new CountDownLatch(1);
+        AtomicInteger queryCount = new AtomicInteger();
+        AtomicInteger attachCount = new AtomicInteger();
+        AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "query" -> {
+                        assertEquals(identity, arguments[0]);
+                        int ordinal = queryCount.incrementAndGet();
+                        if (ordinal == 1) {
+                            firstQueryEntered.countDown();
+                            if (!allowFirstQuery.await(3, TimeUnit.SECONDS)) {
+                                throw new AssertionError("test did not release first Engine query");
+                            }
+                        }
+                        yield Optional.of(status);
+                    }
+                    case "toString" -> "ConcurrentApprovalObservationEngine";
+                    default -> throw new AssertionError("unexpected Engine call: " + method.getName());
+                });
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> {
+                attachCount.incrementAndGet();
+                yield (AutoCloseable) () -> { };
+            }
+            case "toString" -> "ConcurrentApprovalObservationEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = approvalObservationTestService(identity, status, engine, events);
+        CompletableFuture<Boolean> first = CompletableFuture.supplyAsync(
+                () -> service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+
+        try {
+            assertTrue(firstQueryEntered.await(2, TimeUnit.SECONDS));
+            assertFalse(service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+            assertEquals(0, attachCount.get(), "the reservation owner is still waiting on its first state query");
+        } finally {
+            allowFirstQuery.countDown();
+        }
+
+        assertTrue(first.get(2, TimeUnit.SECONDS));
+        assertEquals(2, queryCount.get());
+        assertEquals(1, attachCount.get());
+        assertEquals(1, suspendedSubscriptions(service).size());
+        invokeRelease(service, identity);
+        assertTrue(suspendedReleases(service).isEmpty());
+    }
+
+    /** closeAt 不等待锁外 attach；迟到订阅在准入关闭后即时 detach 且不残留生命周期屏障。 @author kongweiguang */
+    @Test
+    void shutdownDuringApprovalObservationDetachesLateSubscription() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_shutdown", "turn_observe_shutdown",
+                "user_local");
+        AgentExecutionStatus status = new AgentExecutionStatus(identity, TurnState.WAITING_APPROVAL.name(), 2, 3,
+                Instant.EPOCH);
+        CountDownLatch attachEntered = new CountDownLatch(1);
+        CountDownLatch allowAttach = new CountDownLatch(1);
+        AtomicInteger detached = new AtomicInteger();
+        AtomicInteger queries = new AtomicInteger();
+        AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "query" -> {
+                        queries.incrementAndGet();
+                        yield Optional.of(status);
+                    }
+                    case "closeAsync" -> CompletableFuture.completedFuture(null);
+                    case "awaitClosed" -> null;
+                    case "toString" -> "ShutdownApprovalObservationEngine";
+                    default -> throw new AssertionError("unexpected Engine call: " + method.getName());
+                });
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> {
+                attachEntered.countDown();
+                if (!allowAttach.await(3, TimeUnit.SECONDS)) {
+                    throw new AssertionError("test did not release blocked attach");
+                }
+                yield (AutoCloseable) () -> { };
+            }
+            case "closeForShutdown" -> {
+                detached.incrementAndGet();
+                yield null;
+            }
+            case "toString" -> "ShutdownApprovalObservationEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = approvalObservationTestService(identity, status, engine, events);
+        CompletableFuture<Boolean> observation = CompletableFuture.supplyAsync(
+                () -> service.observeApprovalWait(identity.turnId(), ConversationTurnEventSink.noop()));
+
+        try {
+            assertTrue(attachEntered.await(2, TimeUnit.SECONDS));
+            long started = System.nanoTime();
+            service.closeAt(started - TimeUnit.MILLISECONDS.toNanos(1));
+            assertTrue(System.nanoTime() - started < TimeUnit.MILLISECONDS.toNanos(500),
+                    "shutdown must not wait for an in-flight attach");
+        } finally {
+            allowAttach.countDown();
+        }
+
+        assertFalse(observation.get(2, TimeUnit.SECONDS));
+        assertEquals(1, queries.get(), "the closed admission fence prevents a post-attach state query");
+        assertEquals(1, detached.get());
+        assertFalse(suspendedSubscriptions(service).containsKey(identity));
+        assertFalse(suspendedReleases(service).containsKey(identity));
+    }
+
+    /** 并发恢复共享唯一 drain；实际 close 在身份 stripe 与 admission gate 外执行。 @author kongweiguang */
+    @Test
+    void concurrentSuspendedReleaseDrainsOnceOutsideAdmissionLocks() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_watcher_drain", "turn_watcher_drain",
+                "user_local");
+        CountDownLatch closeEntered = new CountDownLatch(1);
+        CountDownLatch allowClose = new CountDownLatch(1);
+        CountDownLatch stripeAcquired = new CountDownLatch(1);
+        CountDownLatch gateProbed = new CountDownLatch(1);
+        AtomicInteger closeCount = new AtomicInteger();
+        AtomicBoolean admissionWriteLockAcquired = new AtomicBoolean();
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> (AutoCloseable) () -> { };
+            case "toString" -> "WatcherDrainEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = watcherLifecycleTestService(events);
+        Object stripe = identityStripe(service, identity);
+        java.util.concurrent.locks.ReentrantReadWriteLock gate = admissionGate(service);
+        suspendedSubscriptions(service).put(identity, () -> {
+            closeCount.incrementAndGet();
+            Thread.ofVirtual().start(() -> {
+                synchronized (stripe) {
+                    stripeAcquired.countDown();
+                }
+            });
+            Thread.ofVirtual().start(() -> {
+                if (gate.writeLock().tryLock()) {
+                    admissionWriteLockAcquired.set(true);
+                    gate.writeLock().unlock();
+                }
+                gateProbed.countDown();
+            });
+            closeEntered.countDown();
+            if (!allowClose.await(3, TimeUnit.SECONDS)) {
+                throw new AssertionError("test did not release watcher close");
+            }
+        });
+
+        CompletableFuture<Void> first = releaseAsync(service, identity);
+        CompletableFuture<Void> second = new CompletableFuture<>();
+        CountDownLatch secondStarted = new CountDownLatch(1);
+        Thread.ofVirtual().start(() -> {
+            secondStarted.countDown();
+            try {
+                invokeRelease(service, identity);
+                second.complete(null);
+            } catch (Throwable failure) {
+                second.completeExceptionally(failure);
+            }
+        });
+        try {
+            assertTrue(closeEntered.await(2, TimeUnit.SECONDS));
+            assertTrue(secondStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(stripeAcquired.await(2, TimeUnit.SECONDS), "watcher close retained its identity stripe");
+            assertTrue(gateProbed.await(2, TimeUnit.SECONDS));
+            assertTrue(admissionWriteLockAcquired.get(), "watcher close retained the admission read gate");
+            assertThrows(TimeoutException.class, () -> second.get(100, TimeUnit.MILLISECONDS));
+            assertEquals(1, closeCount.get(), "concurrent release must not close the same watcher twice");
+        } finally {
+            allowClose.countDown();
+        }
+        first.get(2, TimeUnit.SECONDS);
+        second.get(2, TimeUnit.SECONDS);
+        assertFalse(suspendedSubscriptions(service).containsKey(identity));
+        assertFalse(suspendedReleases(service).containsKey(identity));
+    }
+
+    /** closeAt 必须在普通 drain 卡住时直接 detach，并拒绝后续迟到的 suspended retain。 @author kongweiguang */
+    @Test
+    void shutdownDetachesInFlightDrainAndClosesLateRetention() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_watcher_shutdown", "turn_watcher_shutdown",
+                "user_local");
+        CountDownLatch closeEntered = new CountDownLatch(1);
+        CountDownLatch allowClose = new CountDownLatch(1);
+        AtomicInteger ordinaryCloseCount = new AtomicInteger();
+        AtomicInteger shutdownDetachCount = new AtomicInteger();
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> (AutoCloseable) () -> { };
+            case "closeForShutdown" -> {
+                shutdownDetachCount.incrementAndGet();
+                yield null;
+            }
+            case "toString" -> "WatcherShutdownEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = watcherLifecycleTestService(events);
+        suspendedSubscriptions(service).put(identity, () -> {
+            ordinaryCloseCount.incrementAndGet();
+            closeEntered.countDown();
+            if (!allowClose.await(3, TimeUnit.SECONDS)) {
+                throw new AssertionError("test did not release ordinary drain");
+            }
+        });
+        CompletableFuture<Void> draining = releaseAsync(service, identity);
+
+        try {
+            assertTrue(closeEntered.await(2, TimeUnit.SECONDS));
+            long started = System.nanoTime();
+            service.closeAt(started - TimeUnit.MILLISECONDS.toNanos(1));
+            assertTrue(System.nanoTime() - started < TimeUnit.MILLISECONDS.toNanos(500),
+                    "shutdown waited for an in-flight sink drain past its deadline");
+            assertEquals(1, ordinaryCloseCount.get());
+            assertEquals(1, shutdownDetachCount.get());
+            assertFalse(suspendedSubscriptions(service).containsKey(identity));
+
+            invokeRetain(service, identity, () -> {
+                throw new AssertionError("late retention must use the shutdown detach port");
+            });
+            assertEquals(2, shutdownDetachCount.get());
+            assertFalse(suspendedSubscriptions(service).containsKey(identity));
+        } finally {
+            allowClose.countDown();
+        }
+        draining.get(2, TimeUnit.SECONDS);
+    }
+
+    /** Engine 状态 query 已读到旧 RUNNING 后终态完成，迟到 retain 必须被 stripe 内的完成 fence 拒绝。 @author kongweiguang */
+    @Test
+    void staleSuspendedQueryCannotRetainWatcherAfterTerminalFinish() throws Exception {
+        AgentIdentity identity = new AgentIdentity("ja.local", "thr_watcher_terminal_race",
+                "turn_watcher_terminal_race", "user_local");
+        CountDownLatch queryEntered = new CountDownLatch(1);
+        CountDownLatch allowQuery = new CountDownLatch(1);
+        AtomicInteger closeCount = new AtomicInteger();
+        AgentExecutionStatus stale = new AgentExecutionStatus(identity, TurnState.RUNNING.name(), 4, 3,
+                Instant.EPOCH);
+        AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "query" -> {
+                        assertEquals(identity, arguments[0]);
+                        queryEntered.countDown();
+                        if (!allowQuery.await(3, TimeUnit.SECONDS)) {
+                            throw new AssertionError("test did not release stale Engine query");
+                        }
+                        yield Optional.of(stale);
+                    }
+                    case "toString" -> "StaleSuspendedQueryEngine";
+                    default -> throw new AssertionError("unexpected Engine call: " + method.getName());
+                });
+        AgentExecutionEvents events = lifecycleEvents((proxy, method, arguments) -> switch (method.getName()) {
+            case "attach" -> (AutoCloseable) () -> { };
+            case "toString" -> "TerminalRaceEvents";
+            default -> throw new AssertionError("unexpected event call: " + method.getName());
+        });
+        TurnService service = admissionTestService(engine, events);
+        CompletableFuture<TurnResult> completion = new CompletableFuture<>();
+        completions(service).put(identity, completion);
+        TurnResult result = terminalResult(identity);
+        CompletableFuture<Void> retain = CompletableFuture.runAsync(() -> {
+            try {
+                invokeRetain(service, identity, () -> closeCount.incrementAndGet());
+            } catch (Exception failure) {
+                throw new CompletionException(failure);
+            }
+        });
+
+        try {
+            assertTrue(queryEntered.await(2, TimeUnit.SECONDS));
+            invokeFinish(service, identity, completion, result);
+            assertSame(result, completion.get(2, TimeUnit.SECONDS),
+                    "finish must not wait for an Engine query outside the stripe");
+        } finally {
+            allowQuery.countDown();
+        }
+
+        retain.get(2, TimeUnit.SECONDS);
+        assertEquals(1, closeCount.get(), "late watcher must be closed after terminal completion");
+        assertFalse(suspendedSubscriptions(service).containsKey(identity));
+        assertTrue(completions(service).get(identity).isDone(), "completed future remains the terminal fence");
+        assertFalse(terminalizingCompletions(service).contains(identity), "terminalizing marker must be reclaimed");
+    }
+
+    /** 构造只用于 watcher 锁与关停回归的 Engine 代理，不启动 Core 驱动。 @author kongweiguang */
+    private static TurnService watcherLifecycleTestService(AgentExecutionEvents events) {
+        AgentEngine engine = (AgentEngine) Proxy.newProxyInstance(AgentEngine.class.getClassLoader(),
+                new Class<?>[]{AgentEngine.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "query" -> Optional.empty();
+                    case "closeAsync" -> CompletableFuture.completedFuture(null);
+                    case "close", "awaitClosed" -> null;
+                    case "toString" -> "WatcherLifecycleEngine";
+                    default -> throw new AssertionError("unexpected Engine call: " + method.getName());
+                });
+        return admissionTestService(engine, events);
+    }
+
+    /** 把持久 owner 投影与指定 Core 状态配成真实 observeApprovalWait 可读的最小服务夹具。 @author kongweiguang */
+    private static TurnService approvalObservationTestService(AgentIdentity identity, AgentExecutionStatus status,
+                                                               AtomicInteger queryCount,
+                                                               AgentExecutionEvents events) {
+        return approvalObservationTestService(identity, status, statusEngine(identity, status, queryCount), events);
+    }
+
+    /** 使用显式 Engine 代理保留并发和关停场景的可控 query，而投影仍从唯一 Turn ID 精确解析身份。 @author kongweiguang */
+    private static TurnService approvalObservationTestService(AgentIdentity identity, AgentExecutionStatus status,
+                                                               AgentEngine engine, AgentExecutionEvents events) {
+        ThreadPreferences preferences = new ThreadPreferences("provider_test", "model_test", "medium",
+                AccessMode.APPROVAL_REQUIRED, CollaborationMode.DEFAULT, ThreadPreferences.TitleSource.MANUAL);
+        TurnOwnerProjection owner = new TurnOwnerProjection(identity.threadId(), "ws_observe_test", preferences,
+                status.threadRevision(), new TurnProjection(identity.turnId(), TurnState.valueOf(status.state()),
+                status.mutationVersion(), true, null));
+        ConversationProjectionRepository projections = (ConversationProjectionRepository) Proxy.newProxyInstance(
+                ConversationProjectionRepository.class.getClassLoader(),
+                new Class<?>[]{ConversationProjectionRepository.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("readTurn")) {
+                        assertEquals(identity.turnId(), arguments[0]);
+                        return Optional.of(owner);
+                    }
+                    if (method.getName().equals("toString")) {
+                        return "approval-observation-projection";
+                    }
+                    throw new AssertionError("unexpected projection call: " + method.getName());
+                });
+        return new TurnService(engine, unusedPort(AgentStore.class), unusedPort(ExecutionRecordCodec.class),
+                unusedPort(ExecutionControlCodec.class), unusedPort(JaOperationReceiptRepository.class),
+                projections, new JaExecutionContexts(), new JaAdmissionParticipants(), thread -> Optional.empty(),
+                (thread, limit) -> List.of(), events, unusedPort(ConversationAttachmentPort.class),
+                unusedPort(ConversationWorkspaceReferencePort.class), unusedPort(WorkspaceBindingResolver.class),
+                unusedPort(TurnRuntimeResolver.class), AutomaticThreadTitleScheduler.disabled(),
+                java.time.Clock.systemUTC());
+    }
+
+    /** 构造一个合法终态事件供生命周期测试直接驱动 TurnService.finish。 @author kongweiguang */
+    private static TurnResult terminalResult(AgentIdentity identity) {
+        TurnEvent.Context eventContext = new TurnEvent.Context("evt_" + identity.turnId(), identity.threadId(),
+                identity.turnId(), 1, 0, Instant.EPOCH);
+        return new TurnResult(TurnState.COMPLETED, "done",
+                new TurnEvent.Terminal(eventContext, TurnState.COMPLETED, "done", null, null,
+                        new TurnEvent.FinalMessage("item_" + identity.turnId(), "done"), null,
+                        TurnChangeSet.emptyComplete()));
+    }
+
+    /** 创建可显式处理 shutdown default-method 的事件端口代理。 @author kongweiguang */
+    private static AgentExecutionEvents lifecycleEvents(InvocationHandler handler) {
+        return (AgentExecutionEvents) Proxy.newProxyInstance(AgentExecutionEvents.class.getClassLoader(),
+                new Class<?>[]{AgentExecutionEvents.class}, handler);
+    }
+
+    /** 在测试中调用真实 stripe 认领及其锁外 drain 路径。 @author kongweiguang */
+    private static CompletableFuture<Void> releaseAsync(TurnService service, AgentIdentity identity) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                invokeRelease(service, identity);
+            } catch (Exception failure) {
+                throw new CompletionException(failure);
+            }
+        });
+    }
+
+    /** 反射读取已归属于当前 TurnService 的 watcher map，避免测试构造第二套生命周期状态。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static java.util.concurrent.ConcurrentMap<AgentIdentity, AutoCloseable> suspendedSubscriptions(
+            TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("suspendedSubscriptions");
+        field.setAccessible(true);
+        return (java.util.concurrent.ConcurrentMap<AgentIdentity, AutoCloseable>) field.get(service);
+    }
+
+    /** 读取release barrier以验证完成后不遗留身份级等待状态。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<Void>> suspendedReleases(
+            TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("suspendedSubscriptionReleases");
+        field.setAccessible(true);
+        return (java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<Void>>) field.get(service);
+    }
+
+    /** 读取现有 Turn completion 回执，确认终态 future 在 retain fence 中仍可见。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<TurnResult>> completions(
+            TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("completions");
+        field.setAccessible(true);
+        return (java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<TurnResult>>) field.get(service);
+    }
+
+    /** 读取活动执行 owner map，验证冷启动 watcher 不覆盖本进程持有的运行句柄。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<Void>> owners(
+            TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("owners");
+        field.setAccessible(true);
+        return (java.util.concurrent.ConcurrentMap<AgentIdentity, CompletableFuture<Void>>) field.get(service);
+    }
+
+    /** 读取 resume claim 集合，验证恢复任务与冷启动观察不会同时争夺同一 Turn 生命周期。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static Set<AgentIdentity> resumeClaims(TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("resumeClaims");
+        field.setAccessible(true);
+        return (Set<AgentIdentity>) field.get(service);
+    }
+
+    /** 检查 finish 的临时终态 fence 在 future 完成后回收，不把 identity 永久留在过渡集合。 @author kongweiguang */
+    @SuppressWarnings("unchecked")
+    private static Set<AgentIdentity> terminalizingCompletions(TurnService service) throws Exception {
+        Field field = TurnService.class.getDeclaredField("terminalizingCompletions");
+        field.setAccessible(true);
+        return (Set<AgentIdentity>) field.get(service);
+    }
+
+    /** 读取锁对象仅用于证明阻塞的 close 回调未持有 admission stripe。 @author kongweiguang */
+    private static Object identityStripe(TurnService service, AgentIdentity identity) throws Exception {
+        Field field = TurnService.class.getDeclaredField("admissionStripes");
+        field.setAccessible(true);
+        Object[] stripes = (Object[]) field.get(service);
+        Method stripeIndex = TurnService.class.getDeclaredMethod("stripe", AgentIdentity.class);
+        stripeIndex.setAccessible(true);
+        return stripes[(int) stripeIndex.invoke(service, identity)];
+    }
+
+    /** 返回 admission gate 用来探测 read lock 是否被 watcher close 持有。 @author kongweiguang */
+    private static java.util.concurrent.locks.ReentrantReadWriteLock admissionGate(TurnService service)
+            throws Exception {
+        Field field = TurnService.class.getDeclaredField("admissionGate");
+        field.setAccessible(true);
+        return (java.util.concurrent.locks.ReentrantReadWriteLock) field.get(service);
+    }
+
+    /** 只对齐 TurnService 内部 release 入口，保留其 stripe/barrier 实现作为被测对象。 @author kongweiguang */
+    private static void invokeRelease(TurnService service, AgentIdentity identity) throws Exception {
+        Method method = TurnService.class.getDeclaredMethod("releaseSuspendedSubscription", AgentIdentity.class);
+        method.setAccessible(true);
+        try {
+            method.invoke(service, identity);
+        } catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception exception) {
+                throw exception;
+            }
+            if (failure.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new AssertionError(failure.getCause());
+        }
+    }
+
+    /** 使用生产 finish 路径建立终态标记并完成与 admitted identity 关联的 future。 @author kongweiguang */
+    private static void invokeFinish(TurnService service, AgentIdentity identity,
+                                    CompletableFuture<TurnResult> completion, TurnResult result) throws Exception {
+        Method method = TurnService.class.getDeclaredMethod("finish", AgentIdentity.class,
+                CompletableFuture.class, TurnResult.class);
+        method.setAccessible(true);
+        try {
+            method.invoke(service, identity, completion, result);
+        } catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception exception) {
+                throw exception;
+            }
+            if (failure.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new AssertionError(failure.getCause());
+        }
+    }
+
+    /** 检验 accepting fence 后的迟到结果走 shutdown detach，不重新占用 suspended map。 @author kongweiguang */
+    private static void invokeRetain(TurnService service, AgentIdentity identity, AutoCloseable subscription)
+            throws Exception {
+        Method method = TurnService.class.getDeclaredMethod("retainSuspendedSubscription", AgentIdentity.class,
+                AutoCloseable.class);
+        method.setAccessible(true);
+        try {
+            method.invoke(service, identity, subscription);
+        } catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception exception) {
+                throw exception;
+            }
+            if (failure.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new AssertionError(failure.getCause());
+        }
+    }
+
     /** 用 Engine 状态代理隔离 query 水位验证，并记录其调用次数。 */
     private static AgentEngine statusEngine(AgentIdentity identity, AgentExecutionStatus status,
                                             AtomicInteger queryCount) {
@@ -491,7 +1332,10 @@ final class TurnServiceTest {
         };
     }
 
-    /** 构造只用于 admission 水位测试的服务实例，不启动 Core 执行或外部端口。 */
+    /**
+     * 构造只用于 admission 水位测试的服务实例，不启动 Core 执行或外部端口。
+     * @author kongweiguang
+     */
     private static TurnService admissionTestService(AgentEngine engine, AgentExecutionEvents events) {
         return new TurnService(engine, unusedPort(AgentStore.class), unusedPort(ExecutionRecordCodec.class),
                 unusedPort(ExecutionControlCodec.class), unusedPort(JaOperationReceiptRepository.class),
@@ -500,6 +1344,139 @@ final class TurnServiceTest {
                 unusedPort(ConversationAttachmentPort.class), unusedPort(ConversationWorkspaceReferencePort.class),
                 unusedPort(WorkspaceBindingResolver.class), unusedPort(TurnRuntimeResolver.class),
                 AutomaticThreadTitleScheduler.disabled(), java.time.Clock.systemUTC());
+    }
+
+    /**
+     * 注入可观测的 Workspace gate 与空投影，让 Child 首次准入只依赖临时冻结 facts。
+     * @author kongweiguang
+     */
+    private static TurnService workspaceAdmissionTestService(AgentEngine engine, AgentExecutionEvents events,
+                                                              JaAdmissionParticipants admissions,
+                                                              ConversationProjectionRepository projections,
+                                                              WorkspaceAdmissionPort workspaceAdmissions) {
+        return new TurnService(engine, unusedPort(AgentStore.class), unusedPort(ExecutionRecordCodec.class),
+                unusedPort(ExecutionControlCodec.class), unusedPort(JaOperationReceiptRepository.class),
+                projections, new JaExecutionContexts(), admissions, thread -> Optional.empty(),
+                (thread, limit) -> List.of(), events, unusedPort(ConversationAttachmentPort.class),
+                unusedPort(ConversationWorkspaceReferencePort.class), unusedPort(WorkspaceBindingResolver.class),
+                unusedPort(TurnRuntimeResolver.class), AutomaticThreadTitleScheduler.disabled(),
+                java.time.Clock.systemUTC(), workspaceAdmissions);
+    }
+
+    /**
+     * 首个 Child 先创建 Thread，因此本场景必须明确返回缺失投影而不能从父 Thread 偷取 Workspace。
+     * @author kongweiguang
+     */
+    private static ConversationProjectionRepository missingThreadProjections(AtomicInteger reads) {
+        return (ConversationProjectionRepository) Proxy.newProxyInstance(
+                ConversationProjectionRepository.class.getClassLoader(),
+                new Class<?>[]{ConversationProjectionRepository.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("readThread")) {
+                        reads.incrementAndGet();
+                        return Optional.empty();
+                    }
+                    if (method.getName().equals("toString")) {
+                        return "missing-child-thread-projections";
+                    }
+                    throw new AssertionError("unexpected projection call: " + method.getName());
+                });
+    }
+
+    /**
+     * 普通执行以持久 Thread 投影提供 Workspace；只公开该路径会读取的字段来源。
+     * @author kongweiguang
+     */
+    private static ConversationProjectionRepository presentThreadProjections(ThreadProjection thread,
+                                                                              AtomicInteger reads) {
+        return (ConversationProjectionRepository) Proxy.newProxyInstance(
+                ConversationProjectionRepository.class.getClassLoader(),
+                new Class<?>[]{ConversationProjectionRepository.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("readThread")) {
+                        reads.incrementAndGet();
+                        assertEquals(thread.threadId(), arguments[0]);
+                        return Optional.of(thread);
+                    }
+                    if (method.getName().equals("toString")) {
+                        return "present-thread-projections";
+                    }
+                    throw new AssertionError("unexpected projection call: " + method.getName());
+                });
+    }
+
+    /**
+     * 准备具备首 Child 因果身份和新 Thread Workspace 的冻结 admission，不触碰持久 Store。
+     * @author kongweiguang
+     */
+    private static JaAdmissionParticipants.PreparedAdmission preparedChildAdmission(AgentIdentity identity,
+                                                                                   String workspaceId) {
+        ThreadPreferences preferences = new ThreadPreferences("provider_test", "model_test", "medium",
+                AccessMode.APPROVAL_REQUIRED, CollaborationMode.DEFAULT, ThreadPreferences.TitleSource.MANUAL);
+        AdmissionFacts facts = new AdmissionFacts(identity, workspaceId, TurnOrigin.CHILD_TASK, "task/create",
+                Instant.EPOCH, null, "turn_parent", "turn_root", null, null, null, null, 0,
+                Optional.of(new AdmissionFacts.ThreadInitialization(workspaceId, "首个 Child", preferences,
+                        Instant.EPOCH)));
+        JaAdmissionTransactionParticipant participant = new JaAdmissionTransactionParticipant() {
+            /**
+             * 该单测只验证提交前的 Workspace gate；事务阶段不得进入伪造的持久层。
+             * @author kongweiguang
+             */
+            @Override
+            public void beforeProjection(
+                    io.github.kongweiguang.ja.agent.application.gateway.store.AgentStoreTransactionContext tx) {
+                throw new AssertionError("prepared admission must not write a Store in this unit test");
+            }
+
+            /**
+             * 该单测不提交 AgentStore 事务，后投影 hook 同样必须保持不可达。
+             * @author kongweiguang
+             */
+            @Override
+            public void afterProjection(
+                    io.github.kongweiguang.ja.agent.application.gateway.store.AgentStoreTransactionContext tx) {
+                throw new AssertionError("prepared admission must not write a Store in this unit test");
+            }
+        };
+        return new JaAdmissionParticipants.PreparedAdmission(facts, participant, Optional.empty());
+    }
+
+    /**
+     * 最小事件端口允许 admission 清理链验证订阅的同步释放，不启动真实事件流。
+     * @author kongweiguang
+     */
+    private static AgentExecutionEvents workspaceAdmissionEvents(AtomicInteger closedSubscriptions) {
+        return (AgentExecutionEvents) Proxy.newProxyInstance(AgentExecutionEvents.class.getClassLoader(),
+                new Class<?>[]{AgentExecutionEvents.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "attach" -> (AutoCloseable) closedSubscriptions::incrementAndGet;
+                    case "toString" -> "WorkspaceAdmissionEvents";
+                    default -> throw new AssertionError("unexpected event call: " + method.getName());
+                });
+    }
+
+    /**
+     * 绕过 Engine 编排只触达 submit 的 gate，保留真实 admission resource scope 与 cleanup。
+     * @author kongweiguang
+     */
+    private static TurnUseCase.Accepted invokeSubmit(TurnService service, AgentIdentity identity,
+                                                     ConversationTurnEventSink sink,
+                                                     Function<Consumer<AgentAdmissionReceipt>, AgentExecutionHandle>
+                                                             admission) throws Exception {
+        Method submit = java.util.Arrays.stream(TurnService.class.getDeclaredMethods())
+                .filter(method -> method.getName().equals("submit") && method.getParameterCount() == 7
+                        && method.getParameterTypes()[6] == boolean.class)
+                .findFirst().orElseThrow();
+        submit.setAccessible(true);
+        try {
+            return (TurnUseCase.Accepted) submit.invoke(service, identity, sink, null, admission,
+                    (Consumer<TurnResult>) ignored -> { }, (Runnable) () -> { }, false);
+        } catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception exception) {
+                throw exception;
+            }
+            if (failure.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new AssertionError(failure.getCause());
+        }
     }
 
     /** 直接经过私有 admission 边界调用测试函数，避免重复反射装配与真实 Engine 调度。 */

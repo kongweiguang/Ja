@@ -65,6 +65,7 @@ import io.github.kongweiguang.ja.agent.application.api.TurnResult;
 import io.github.kongweiguang.ja.agent.application.gateway.store.ExtensionFactRecordCodec;
 import io.github.kongweiguang.ja.agent.store.local.infrastructure.SQLiteAgentStore;
 import io.github.kongweiguang.ja.agent.infrastructure.persistence.ControlPayloadCodec;
+import io.github.kongweiguang.ja.agent.infrastructure.persistence.JacksonExecutionEventCodec;
 import io.github.kongweiguang.ja.agent.infrastructure.persistence.StorePayloadCodec;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -1298,6 +1299,98 @@ final class AgentLoopIntegrationTest {
         } finally {
             first.close();
         }
+    }
+
+    /** 冷恢复只接管持久 Wait 的截止时间；自然到期与已过期重扫都不得启动 Driver 或重复关闭事件。 */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void restoresApprovalExpiryWithoutResumingExecution(boolean alreadyExpiredAtRestore) throws Exception {
+        AtomicInteger executions = new AtomicInteger();
+        ScriptedModel model = new ScriptedModel("lookup", true);
+        AgentIdentity identity = identity(alreadyExpiredAtRestore
+                ? "execution-restore-expired" : "execution-restore-future");
+        AgentEngine first = engine(model, executions, new ApprovalWait(Duration.ofSeconds(5)));
+        try {
+            AgentExecutionOutcome initial = first.submit(AgentRequest.text(identity, "等待授权", "op-restore-expiry"))
+                    .completion().toCompletableFuture().get(20, TimeUnit.SECONDS);
+            assertInstanceOf(AgentExecutionOutcome.Suspended.class, initial);
+            assertEquals("WAITING_APPROVAL", first.query(identity).orElseThrow().state());
+            int modelRequestsAtWait = model.requests.get();
+            first.close();
+
+            if (alreadyExpiredAtRestore) {
+                Thread.sleep(Duration.ofSeconds(6));
+            }
+
+            AgentEngine restored = engine(model, executions, new ApprovalWait());
+            try {
+                restored.restoreApprovalExpiry(identity);
+                restored.restoreApprovalExpiry(identity);
+                if (!alreadyExpiredAtRestore) {
+                    awaitExecutionState(restored, identity, "SUSPENDED", Duration.ofSeconds(10));
+                }
+
+                assertEquals("SUSPENDED", restored.query(identity).orElseThrow().state());
+                assertEquals(modelRequestsAtWait, model.requests.get(),
+                        "expiry restoration must not resolve a Driver or issue another Provider request");
+                assertEquals(0, executions.get(), "expiry restoration must never dispatch the protected Tool");
+                assertSingleExpiredApproval(identity);
+
+                long closeEvents = resolvedWaitEventCount(restored, identity);
+                assertEquals(1, closeEvents, "repeated restoration must not commit a second expiry event");
+                restored.restoreApprovalExpiry(identity);
+                assertEquals(closeEvents, resolvedWaitEventCount(restored, identity));
+            } finally {
+                restored.close();
+            }
+        } finally {
+            first.close();
+        }
+    }
+
+    /** 只轮询只读状态投影，确认真实调度器结算且不以显式 resume 推进执行。 */
+    private static void awaitExecutionState(AgentEngine engine, AgentIdentity identity,
+                                            String state, Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            if (engine.query(identity).map(status -> status.state().equals(state)).orElse(false)) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        assertEquals(state, engine.query(identity).orElseThrow().state(), "execution did not reach expected state");
+    }
+
+    /** 对真实 SQLite 事实确认自然 expiry 留空 decision/answer，且持久等待只关闭一次。 */
+    private void assertSingleExpiredApproval(AgentIdentity identity) {
+        try (SQLiteAgentStore store = sqlite()) {
+            List<AgentStore.StoredRecord> records = executionRecords(store, identity);
+            StorePayloadCodec payloads = new StorePayloadCodec(new ObjectMapper());
+            List<ExecutionFacts.Approval> approvals = records.stream()
+                    .filter(record -> record.recordType().equals("agent.approval"))
+                    .map(payloads::decode).map(ExecutionFacts.Approval.class::cast).toList();
+            assertEquals(1, approvals.size());
+            assertNull(approvals.getFirst().decision());
+
+            ControlPayloadCodec controls = new ControlPayloadCodec(new ObjectMapper());
+            List<InteractionWait> expired = records.stream()
+                    .filter(record -> record.recordType().equals("agent.interaction.wait"))
+                    .map(controls::decodeWait).filter(wait -> wait.status() == InteractionStatus.EXPIRED).toList();
+            assertEquals(1, expired.size());
+            assertTrue(expired.getFirst().answers().isEmpty());
+        }
+    }
+
+    /** 从真实事件 codec 统计等待关闭提交，防止重复恢复伪造第二份控制事件。 */
+    private long resolvedWaitEventCount(AgentEngine engine, AgentIdentity identity) {
+        JacksonExecutionEventCodec codec = new JacksonExecutionEventCodec(new ObjectMapper());
+        return engine.readEvents(identity, 0, 1_000).events().stream()
+                .map(codec::decode)
+                .filter(io.github.kongweiguang.ja.agent.domain.execution.ExecutionEvent.ControlRecorded.class::isInstance)
+                .map(io.github.kongweiguang.ja.agent.domain.execution.ExecutionEvent.ControlRecorded.class::cast)
+                .filter(event -> event.action()
+                        == io.github.kongweiguang.ja.agent.domain.execution.ExecutionEvent.ControlAction.WAIT_RESOLVED)
+                .count();
     }
 
     /** 直接核对真实 SQLite 事实，过期是系统关闭而非用户拒绝，恢复也不能重复生成结果。 */

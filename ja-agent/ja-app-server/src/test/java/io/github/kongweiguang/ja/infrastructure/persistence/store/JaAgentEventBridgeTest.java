@@ -1337,6 +1337,44 @@ final class JaAgentEventBridgeTest {
         }
     }
 
+    /** shutdown detach 跳过未确认 sink 水位、中断 worker，并在旧 worker 退出后允许同身份重新 attach。 @author kongweiguang */
+    @Test
+    void closeForShutdownInterruptsUnacknowledgedSinkAndReleasesActiveIdentity() throws Exception {
+        AgentIdentity identity = identity();
+        AgentStore.ConversationKey conversation = new AgentStore.ConversationKey(identity.tenantId(),
+                identity.threadId(), "user_local");
+        JacksonExecutionEventCodec codec = new JacksonExecutionEventCodec(new ObjectMapper());
+        AgentStore store = eventStore(conversation, List.of(event(codec, conversation, identity, 1,
+                TurnState.RUNNING, TurnState.SUSPENDED, Instant.EPOCH)), Instant.EPOCH, new AtomicInteger());
+        AgentEngine engine = new AgentEngineBuilder().store(store)
+                .runtimeResolver((request, extensions, recovered) -> {
+                    throw new IllegalStateException("runtime is not used by shutdown detach test");
+                }).build();
+        JaAgentEventBridge bridge = eventBridge(store, codec);
+        bridge.bindEngine(engine);
+        CountDownLatch published = new CountDownLatch(1);
+        CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
+        try (engine; bridge) {
+            AutoCloseable first = bridge.attach(identity, ConversationTurnEventSink.turnEventsOnly(event -> {
+                published.countDown();
+                return acknowledgement;
+            }));
+            assertTrue(published.await(3, TimeUnit.SECONDS), "durable event did not reach the blocked sink");
+            Field workerField = first.getClass().getDeclaredField("worker");
+            workerField.setAccessible(true);
+            Thread worker = (Thread) workerField.get(first);
+
+            bridge.closeForShutdown(first);
+            worker.join(TimeUnit.SECONDS.toMillis(2));
+
+            assertFalse(worker.isAlive(), "shutdown detach left a worker blocked on a sink future");
+            AutoCloseable replacement = bridge.attach(identity, ConversationTurnEventSink.noop());
+            bridge.closeForShutdown(replacement);
+        } finally {
+            acknowledgement.complete(null);
+        }
+    }
+
     /** 关停后 attach 必须先拒绝，不能因 Engine 未绑定而触发订阅创建或留下后台 worker。 */
     @Test
     void rejectsAttachAfterBridgeClose() {

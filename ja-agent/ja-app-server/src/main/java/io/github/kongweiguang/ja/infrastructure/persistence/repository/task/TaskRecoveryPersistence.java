@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.agent.domain.json.JsonObjects;
 import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceMappers;
+import io.github.kongweiguang.ja.infrastructure.persistence.mapper.PersistenceRecords;
 import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TaskRecords;
 import io.github.kongweiguang.ja.collaboration.domain.model.TaskModels;
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskRepositoryException;
@@ -18,7 +19,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * 启动恢复的 Task 投影扩展；调用方已在同一事务内完成对应 Turn 状态调和。
+ * 启动恢复的 Task 投影扩展；调用方先读取当前 Core Turn，本方法在同一事务内复核暂停代际。
  */
 public final class TaskRecoveryPersistence {
     private static final Logger LOGGER = LoggerFactory.getLogger(TaskRecoveryPersistence.class);
@@ -30,8 +31,8 @@ public final class TaskRecoveryPersistence {
     }
 
     /**
-     * 非 Child Turn 安静返回；Child 只从非终态投影收敛为 SUSPENDED，并使用确定性 Activity 身份，
-     * 使恢复事务回滚重试仍竞争同一追加事实。
+     * 仅当前最新 Core Turn 仍为 SUSPENDED 时才收敛 Child 投影；Activity 身份包含单调 mutationVersion，
+     * 让同一暂停重放幂等，同时允许同 Turn 显式恢复后再次过期追加新的暂停事实。
      */
     public static Optional<TaskRecords.TaskSummaryRow> reconcileSuspended(
             PersistenceMappers mapper, ObjectMapper objectMapper, String turnId, Instant occurredAt) {
@@ -39,6 +40,14 @@ public final class TaskRecoveryPersistence {
         Objects.requireNonNull(objectMapper, "objectMapper");
         Objects.requireNonNull(turnId, "turnId");
         Objects.requireNonNull(occurredAt, "occurredAt");
+        PersistenceRecords.TurnRow turn = mapper.agent().selectTurnById(turnId);
+        if (turn == null || !TurnState.SUSPENDED.name().equals(turn.state()) || !turn.currentPath()) {
+            return Optional.empty();
+        }
+        String latestCurrentTurnId = mapper.agent().selectLatestCurrentTurnId(turn.threadId());
+        if (!turnId.equals(latestCurrentTurnId)) {
+            return Optional.empty();
+        }
         TaskRecords.TerminalTaskRow task = mapper.tasks().selectTaskByTurn(turnId);
         if (task == null) {
             return Optional.empty();
@@ -46,9 +55,13 @@ public final class TaskRecoveryPersistence {
         if (terminal(task.taskState())) {
             return Optional.ofNullable(mapper.tasks().selectTaskSummary(task.taskThreadId()));
         }
-        String summary = "任务因进程中断已暂停，等待显式恢复";
+        if (TaskModels.State.SUSPENDED.name().equals(task.taskState())) {
+            return Optional.ofNullable(mapper.tasks().selectTaskSummary(task.taskThreadId()));
+        }
+        String summary = "任务已暂停，等待显式恢复";
         Long sequence = mapper.tasks().insertActivity(new TaskRecords.ActivityInsert(
-                "activity_task_recovery_" + TaskTerminalPersistence.stableSuffix(turnId),
+                "activity_task_recovery_" + TaskTerminalPersistence.stableSuffix(
+                        turnId + ":suspended:" + turn.mutationVersion()),
                 task.rootThreadId(), task.taskThreadId(), task.taskThreadId(), turnId,
                 TaskModels.ActivityKind.SUSPENDED.name(),
                 new TaskJsonCodec(objectMapper).write(JsonObjects.builder().putText("text", summary).build()),

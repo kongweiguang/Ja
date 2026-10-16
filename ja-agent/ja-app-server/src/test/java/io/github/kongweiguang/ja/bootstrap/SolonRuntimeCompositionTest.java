@@ -6,6 +6,7 @@ package io.github.kongweiguang.ja.bootstrap;
 import io.github.kongweiguang.ja.attachment.domain.model.AttachmentFailure;
 import io.github.kongweiguang.ja.attachment.application.api.AttachmentUseCase;
 import io.github.kongweiguang.ja.infrastructure.aot.AotSideEffectGuard;
+import io.github.kongweiguang.ja.infrastructure.persistence.startup.ApprovalExpiryStartupRecovery;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kongweiguang.ja.agent.application.api.AgentEngine;
@@ -128,7 +129,7 @@ final class SolonRuntimeCompositionTest {
         assertSame(expected, deferred.resolveLimits(null));
     }
 
-    /** 启动真实组合根，锁定唯一核心实例与显式能力装配，避免仅测试局部工厂而漏掉生产接线。 */
+    /** 启动真实组合根，并验证 RPC 工厂发布前确实执行审批恢复扫描，不只验证局部 Bean 工厂。 */
     @Test
     void solonPublishesOneCoreRuntimeGeneration() throws Exception {
         Path data = Files.createTempDirectory("ja-solon-");
@@ -168,6 +169,10 @@ final class SolonRuntimeCompositionTest {
 
             ObjectMapper mapper = Solon.context().getBean(ObjectMapper.class);
             RuntimeServicesFactory factory = Solon.context().getBean(RuntimeServicesFactory.class);
+            ApprovalExpiryStartupRecovery recovery =
+                    Solon.context().getBean(ApprovalExpiryStartupRecovery.class);
+            assertNotNull(recovery);
+            assertEquals(1, recovery.scannedPages(), "RPC factory creation must finish the startup discovery scan");
             RpcServiceBindings services = factory.open(mapper);
             assertSame(Solon.context().getBean(TurnService.class), services.turns());
             assertSame(Solon.context().getBean(WorkspaceService.class), services.workspaces());

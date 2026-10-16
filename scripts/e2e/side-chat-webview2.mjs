@@ -11,6 +11,7 @@
  */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -22,8 +23,12 @@ const endpoint = process.env.JA_E2E_SIDE_CHAT_CDP_ENDPOINT?.trim();
 const evidenceDirectory = process.env.JA_E2E_SIDE_CHAT_ARTIFACT_DIR?.trim();
 const isolated = process.env.JA_E2E_SIDE_CHAT_ISOLATED === "1";
 const phase = process.env.JA_E2E_SIDE_CHAT_PHASE?.trim() || "initial";
+const scenario = process.env.JA_E2E_SIDE_CHAT_SCENARIO?.trim() || "full";
+const backendMode = process.env.JA_E2E_SIDE_CHAT_BACKEND_MODE?.trim() || "jvm";
 const normalExitRequested = process.env.JA_E2E_SIDE_CHAT_NORMAL_EXIT === "1";
+const subagentOnly = process.env.JA_E2E_SIDE_CHAT_SUBAGENT_ONLY === "1";
 const retainedFile = process.env.JA_E2E_SIDE_CHAT_RETAINED_FILE?.trim();
+const approvalWriteDirectory = process.env.JA_E2E_SIDE_CHAT_APPROVAL_WRITE_DIR?.trim();
 const messageCommand =
   process.env.JA_E2E_SIDE_CHAT_MESSAGE_COMMAND?.trim() || "ja_runtime_task_message_send";
 const closeCommand = process.env.JA_E2E_SIDE_CHAT_CLOSE_COMMAND?.trim() || "ja_runtime_task_close";
@@ -42,6 +47,48 @@ const MAILBOX_MARKER = "JA_SIDE_CHAT_MAILBOX";
 const RUNNING_MAILBOX_MARKER = "JA_SIDE_CHAT_RUNNING_MAILBOX";
 const SPAWN_MARKER = "JA_SIDE_CHAT_SPAWN_AGENT";
 const SUBAGENT_MARKER = "JA_SIDE_CHAT_SUBAGENT_BRIEF";
+const APPROVAL_FIXTURES = [
+  {
+    key: "allow",
+    taskName: "审批允许回归",
+    spawnMarker: "JA_SUBAGENT_APPROVAL_ALLOW_SPAWN",
+    childMarker: "JA_SUBAGENT_APPROVAL_ALLOW_CHILD",
+    callId: "call_approval_allow_exec",
+    fileName: "approval-allow.txt",
+    fileValue: "JA_APPROVAL_ALLOW_FILE",
+    verified: "JA_APPROVAL_ALLOW_WRITE_VERIFIED",
+  },
+  {
+    key: "deny",
+    taskName: "审批拒绝回归",
+    spawnMarker: "JA_SUBAGENT_APPROVAL_DENY_SPAWN",
+    childMarker: "JA_SUBAGENT_APPROVAL_DENY_CHILD",
+    callId: "call_approval_deny_exec",
+    fileName: "approval-deny.txt",
+    fileValue: "JA_APPROVAL_DENY_FILE",
+    verified: "JA_APPROVAL_DENY_WRITE_VERIFIED",
+  },
+  {
+    key: "cancel",
+    taskName: "审批取消回归",
+    spawnMarker: "JA_SUBAGENT_APPROVAL_CANCEL_SPAWN",
+    childMarker: "JA_SUBAGENT_APPROVAL_CANCEL_CHILD",
+    callId: "call_approval_cancel_exec",
+    fileName: "approval-cancel.txt",
+    fileValue: "JA_APPROVAL_CANCEL_FILE",
+    verified: "JA_APPROVAL_CANCEL_WRITE_VERIFIED",
+  },
+  {
+    key: "resume",
+    taskName: "审批到期恢复回归",
+    spawnMarker: "JA_SUBAGENT_APPROVAL_RESUME_SPAWN",
+    childMarker: "JA_SUBAGENT_APPROVAL_RESUME_CHILD",
+    callId: "call_approval_resume_exec",
+    fileName: "approval-resume.txt",
+    fileValue: "JA_APPROVAL_RESUME_FILE",
+    verified: "JA_APPROVAL_RESUME_WRITE_VERIFIED",
+  },
+];
 const PRIMARY_MODEL = "ja-side-primary";
 const SECONDARY_MODEL = "ja-side-secondary";
 
@@ -57,6 +104,29 @@ function validateEnvironment() {
     throw new Error("JA_E2E_SIDE_CHAT_RETAINED_FILE 必须是绝对隔离文件路径");
   if (!new Set(["initial", "restart"]).has(phase))
     throw new Error(`不支持的侧聊验收阶段：${phase}`);
+  if (!new Set(["full", "approvals"]).has(scenario))
+    throw new Error(`不支持的侧聊验收场景：${scenario}`);
+  if (!new Set(["jvm", "native"]).has(backendMode))
+    throw new Error(`不支持的侧聊后端模式：${backendMode}`);
+  if (scenario === "approvals" && phase !== "initial")
+    throw new Error("审批专项只支持独立 initial 阶段");
+  if (scenario === "approvals" && (approvalWriteDirectory === undefined || !isAbsolute(approvalWriteDirectory)))
+    throw new Error("审批专项需要隔离的绝对写入目录");
+}
+
+/** PowerShell 单引号字面量转义只用于 runner 创建的短期隔离路径，不在报告回显该路径。@author kongweiguang */
+function escapePowerShellLiteral(value) {
+  return value.replaceAll("'", "''");
+}
+
+/** 审批回归只触及 runner 的临时目录，并在获准后回读标记证明副作用真的完成。@author kongweiguang */
+function buildApprovalWriteCommand(fixture) {
+  if (approvalWriteDirectory === undefined || !isAbsolute(approvalWriteDirectory))
+    throw new Error("审批 Provider 没有隔离写入目录");
+  const target = escapePowerShellLiteral(join(approvalWriteDirectory, fixture.fileName));
+  const expected = escapePowerShellLiteral(fixture.fileValue);
+  const verified = escapePowerShellLiteral(fixture.verified);
+  return `$target='${target}'; Set-Content -LiteralPath $target -Value '${expected}' -NoNewline -Encoding utf8; if ((Get-Content -LiteralPath $target -Raw) -ceq '${expected}') { Write-Output '${verified}' } else { exit 17 }`;
 }
 
 /** 将 Tauri 错误压缩为稳定 code/message，避免证据文件写入路径、凭据或正文。 */
@@ -112,6 +182,51 @@ async function waitForCondition(label, predicate, timeoutMs = 30_000) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`${label} 超时`);
+}
+
+/** 在动作触发前观察 Composer 的公开 `aria-busy` 状态边沿；Tab 提前出现时仍等真实 Slash Promise 收敛。@author kongweiguang */
+async function armComposerBusyCycle(page, composer) {
+  const token = `side-chat-command-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await composer.evaluate((element, probeToken) => {
+    const form = element.matches("form.ja-composer")
+      ? element
+      : element.querySelector("form.ja-composer");
+    if (!(form instanceof HTMLFormElement)) throw new Error("Composer 表单不可观察");
+    const probes =
+      globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__ ??
+      (globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__ = new Map());
+    const entry = { phase: form.getAttribute("aria-busy") === "true" ? "busy" : "waiting" };
+    const observer = new MutationObserver(() => {
+      if (form.getAttribute("aria-busy") === "true") {
+        entry.phase = "busy";
+      } else if (entry.phase === "busy") {
+        entry.phase = "settled";
+        observer.disconnect();
+      }
+    });
+    observer.observe(form, { attributes: true, attributeFilter: ["aria-busy"] });
+    probes.set(probeToken, { entry, observer });
+  }, token);
+  return token;
+}
+
+/** 仅以可访问 busy 状态的 true→false 转换作为命令完成，不用固定 sleep 掩盖异步时序。@author kongweiguang */
+async function waitForComposerBusyCycle(page, token, label) {
+  try {
+    await waitForCondition(`${label}结束`, async () =>
+      page.evaluate((probeToken) => {
+        const probe = globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__?.get(probeToken);
+        return probe?.entry.phase === "settled";
+      }, token),
+    );
+  } finally {
+    await page.evaluate((probeToken) => {
+      const probes = globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__;
+      const probe = probes?.get(probeToken);
+      probe?.observer.disconnect();
+      probes?.delete(probeToken);
+    }, token).catch(() => undefined);
+  }
 }
 
 /** 等待真实页面动画收敛，截图只记录稳定组件和全局样式。 */
@@ -201,8 +316,18 @@ async function startLoopbackProvider() {
       )
       .filter((text) => !text.includes('"kind":"external_thread_message"'));
     const scenario = userTexts.at(-1) ?? serialized;
-    const marker = scenario.includes(SPAWN_MARKER)
-      ? "spawn"
+    const approvalSpawnFixture = APPROVAL_FIXTURES.find((fixture) =>
+      scenario.includes(fixture.spawnMarker),
+    );
+    const approvalChildFixture = APPROVAL_FIXTURES.find((fixture) =>
+      scenario.includes(fixture.childMarker),
+    );
+    const marker = approvalSpawnFixture !== undefined
+      ? `approval_spawn_${approvalSpawnFixture.key}`
+      : approvalChildFixture !== undefined
+        ? `approval_${approvalChildFixture.key}`
+        : scenario.includes(SPAWN_MARKER)
+          ? "spawn"
       : scenario.includes(SUBAGENT_MARKER)
         ? "subagent"
         : scenario.includes(BTW_MARKER)
@@ -222,6 +347,22 @@ async function startLoopbackProvider() {
                       : serialized.includes(ROOT_MARKER)
                         ? "root"
                         : "unknown";
+    const toolResults = (body.messages ?? [])
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .filter((block) => block?.type === "tool_result")
+      .map((block) => {
+        const text = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.filter((part) => part?.type === "text").map((part) => part.text).join("\n")
+            : "";
+        return {
+          callId: block.tool_use_id,
+          isError: block.is_error === true,
+          containsVerification: APPROVAL_FIXTURES.some((fixture) => text.includes(fixture.verified)),
+          containsDenial: /denied|拒绝|未获批准/iu.test(text),
+        };
+      });
     const record = {
       sequence: ++sequence,
       marker,
@@ -229,12 +370,35 @@ async function startLoopbackProvider() {
       hasParentMarker: serialized.includes(ROOT_MARKER),
       hasMailboxMarker: serialized.includes(MAILBOX_MARKER),
       hasRunningMailboxMarker: serialized.includes(RUNNING_MAILBOX_MARKER),
+      toolResults,
     };
     requests.push(record);
     if (marker === "side_running") await runningReleased;
+    const approvalCallId = approvalSpawnFixture === undefined
+      ? undefined
+      : `call_approval_spawn_${approvalSpawnFixture.key}`;
+    const approvalCommand = approvalChildFixture === undefined
+      ? undefined
+      : buildApprovalWriteCommand(approvalChildFixture);
     const boundaryCall =
       marker === "side_running" && !serialized.includes("call_running_boundary")
         ? { id: "call_running_boundary", name: "list_threads", input: { limit: 10 } }
+        : approvalSpawnFixture !== undefined && !serialized.includes(approvalCallId)
+          ? {
+              id: approvalCallId,
+              name: "spawn_agent",
+              input: {
+                taskName: approvalSpawnFixture.taskName,
+                brief: `Run one exec_command for ${approvalSpawnFixture.childMarker}, then report its real result.`,
+                accessMode: "approval_required",
+              },
+            }
+          : approvalChildFixture !== undefined && !serialized.includes(approvalChildFixture.callId)
+            ? {
+                id: approvalChildFixture.callId,
+                name: "exec_command",
+                input: { cmd: approvalCommand, yield_time_ms: 10_000 },
+              }
         : marker === "spawn" && !serialized.includes("call_spawn_child")
           ? {
               id: "call_spawn_child",
@@ -301,7 +465,17 @@ async function startLoopbackProvider() {
       return;
     }
     const text =
-      marker === "spawn"
+      marker.startsWith("approval_spawn_")
+        ? "JA_SUBAGENT_APPROVAL_SPAWN_DONE"
+        : marker === "approval_allow"
+          ? "JA_SUBAGENT_APPROVAL_ALLOW_DONE"
+          : marker === "approval_deny"
+            ? "JA_SUBAGENT_APPROVAL_DENY_DONE"
+            : marker === "approval_resume"
+              ? "JA_SUBAGENT_APPROVAL_RESUME_DONE"
+              : marker === "approval_cancel"
+                ? "JA_SUBAGENT_APPROVAL_CANCEL_DONE"
+      : marker === "spawn"
         ? "JA_SIDE_CHAT_SPAWN_DONE"
         : marker === "subagent"
           ? "JA_SIDE_CHAT_SUBAGENT_DONE"
@@ -673,6 +847,7 @@ async function exerciseBtw(page, rootComposer, provider, existingSideIds) {
   const knownSideIds = new Set(existingSideIds);
   const before = provider.requests.length;
   const input = rootComposer.getByRole("textbox", { name: "消息", exact: true });
+  const idleCommandProbe = await armComposerBusyCycle(page, rootComposer);
   await input.fill("/btw");
   await input.press("Enter");
   let idleThreadId;
@@ -716,11 +891,13 @@ async function exerciseBtw(page, rootComposer, provider, existingSideIds) {
   };
   await idle.region.waitFor({ state: "visible", timeout: 20_000 });
   await idle.composer.waitFor({ state: "visible", timeout: 20_000 });
+  await waitForComposerBusyCycle(page, idleCommandProbe, "/btw 空命令");
 
   const rootRequestCountBeforeContent = provider.requests.filter(
     (request) => request.marker === "root",
   ).length;
   const contentBefore = provider.requests.length;
+  const contentCommandProbe = await armComposerBusyCycle(page, rootComposer);
   await input.fill(`/btw ${BTW_MARKER}`);
   await input.press("Enter");
   let contentThreadId;
@@ -750,6 +927,7 @@ async function exerciseBtw(page, rootComposer, provider, existingSideIds) {
   await contentTab.waitFor({ state: "visible", timeout: 20_000 });
   const contentRegion = page.locator(".ja-task-detail:visible").last();
   await contentRegion.waitFor({ state: "visible", timeout: 20_000 });
+  await waitForComposerBusyCycle(page, contentCommandProbe, "/btw 内容命令");
   await contentRegion
     .getByText("JA_SIDE_CHAT_BTW_DONE", { exact: true })
     .waitFor({ state: "visible", timeout: 60_000 });
@@ -833,8 +1011,9 @@ async function inspectVisualParity(page) {
 }
 
 /**
- * QueueOnly 只落到目标 Mailbox，空闲目标不启动 Provider；task/read 只核对入箱事实，正文权限必须经
- * Thread/item 身份读取，不能把 Mailbox 预览当作完整历史或跨会话读取授权。operationKey 是该持久写入的去重键，
+ * QueueOnly 只落到目标 Mailbox，空闲目标不启动 Provider；task/read 只核对入箱事实。
+ * 下一次模型请求消费后才按 Thread/item 身份读取正文，不能把 Mailbox 预览当作完整历史或跨会话读取授权。
+ * 投递回执的 msg 身份与历史 item 身份分离；operationKey 是该持久写入的去重键，
  * 与 JSON-RPC 请求 id 及 Thread 身份分离；响应未知时重试必须复用同一个键。
  */
 async function exerciseMailbox(page, provider, rootThreadId, side) {
@@ -859,27 +1038,34 @@ async function exerciseMailbox(page, provider, rootThreadId, side) {
     "Mailbox 没有持久化消息正文",
   );
   const messageId = receipt.value?.messageId;
-  assert.match(messageId ?? "", /^item_/u, "投递回执没有稳定消息 item 身份");
+  assert.match(messageId ?? "", /^msg_/u, "投递回执没有稳定 Mailbox 消息身份");
+  const itemId = `item_${createHash("sha256").update(messageId, "utf8").digest("hex")}`;
+  const pendingThread = requireInvoke(await readThread(page, side.threadId), "待消费侧聊历史");
+  assert.equal(
+    pendingThread.items?.some((item) => item.itemId === itemId),
+    false,
+    "尚未消费的 Mailbox 消息提前进入历史",
+  );
+  const before = provider.requests.length;
+  await sendComposer(side.composer, SIDE_SECOND_MARKER, "JA_SIDE_CHAT_SECOND_DONE");
+  const request = await waitForRequest(provider, "side_second", before);
+  assert.equal(request.hasMailboxMarker, true, "下一次 Provider 请求前没有消费 Mailbox");
   const thread = requireInvoke(await readThread(page, side.threadId), "收件侧聊历史");
-  const messageItem = thread.items?.find((item) => item.itemId === messageId);
+  const messageItem = thread.items?.find((item) => item.itemId === itemId);
   assert.equal(messageItem?.kind, "thread_message", "收件 Thread 未投影对应 Mailbox item");
   const content = requireInvoke(
     await invoke(page, "ja_thread_item_content_read", {
       threadId: side.threadId,
-      itemId: messageId,
+      itemId,
       offsetCharacters: 0,
       limitCharacters: 256,
     }),
     "收件 Mailbox 正文读取",
   );
-  assert.equal(content.itemId, messageId);
+  assert.equal(content.itemId, itemId);
   assert.equal(content.content, MAILBOX_MARKER, "收件 Thread 读取的正文与投递不一致");
   assert.equal(content.truncated, false, "短 Mailbox 正文不应被截断");
-  const before = provider.requests.length;
-  await sendComposer(side.composer, SIDE_SECOND_MARKER, "JA_SIDE_CHAT_SECOND_DONE");
-  const request = await waitForRequest(provider, "side_second", before);
-  assert.equal(request.hasMailboxMarker, true, "下一次 Provider 请求前没有消费 Mailbox");
-  return { receipt: receipt.value, request, messageId };
+  return { receipt: receipt.value, request, messageId, itemId };
 }
 
 /** 同一 owner 的其他 Thread 不能借已投递的 item 身份读取收件侧聊私有正文。 */
@@ -988,6 +1174,26 @@ async function listThreads(page, workspaceId) {
  * 呈现 closing/错误并允许重试。重试才穿透真实 App Server，返回的 ID 集合作为 UI ACK 证据。
  */
 async function exerciseSideChatCloseRetry(page, side, shell) {
+  if (backendMode === "native") {
+    // Installed bundles intentionally omit the test-only invoke probe; exercise the real close path and let closeSideChat verify the backend receipt.
+    const close = shell.locator('[data-tab-close="true"]');
+    await close.click();
+    await waitForCondition(
+      "生产构建真实侧聊关闭 ACK",
+      async () =>
+        (await page
+          .locator(
+            `[data-workbench-tab="side-task:${side.threadId}"], [data-tab="side-task:${side.threadId}"]`,
+          )
+          .count()) === 0,
+      30_000,
+    );
+    return {
+      injectedFailure: false,
+      productionCloseObserved: true,
+      closedThreadIds: undefined,
+    };
+  }
   await page.evaluate(({ command, threadId }) => {
     const previous = globalThis.__JA_E2E_NATIVE_INVOKE_PROBE__;
     const state = { attempts: 0, delegated: 0, released: false };
@@ -1068,9 +1274,9 @@ async function exerciseSideChatCloseRetry(page, side, shell) {
 /**
  * 关闭先验证 UI 操作确实完成服务端删除/关闭，再调用幂等 close 检查回执；
  * 若 UI 只是移除 Tab 而没有关闭后端 Thread，第一次 read 会立即失败验收，
- * 不会被后续的补偿 command 掩盖；UI closing/失败/重试也必须先完成。
+ * 不会被后续的补偿 command 掩盖；UI closing/失败/重试也必须先完成。预期集合包含实际派生子树，不能只检查侧聊根。
  */
-async function closeSideChat(page, side) {
+async function closeSideChat(page, side, expectedThreadIds = [side.threadId]) {
   // 每个标签的关闭按钮是 tab 的兄弟；必须用固定 Thread 的容器定位，不能按重名“关闭侧聊”猜目标。
   const shell = page
     .locator(".ja-workbench-tab-shell")
@@ -1098,13 +1304,15 @@ async function closeSideChat(page, side) {
   const closedThreadIds = assertSideChatCloseReceipt(
     closeResult.value,
     side.threadId,
-    [side.threadId],
+    expectedThreadIds,
   );
-  assert.deepEqual(
-    lifecycle.closedThreadIds,
-    closedThreadIds,
-    "UI 关闭 ACK 与幂等重试返回了不同的关闭范围",
-  );
+  if (lifecycle.closedThreadIds !== undefined) {
+    assert.deepEqual(
+      lifecycle.closedThreadIds,
+      closedThreadIds,
+      "UI 关闭 ACK 与幂等重试返回了不同的关闭范围",
+    );
+  }
   const read = await readThread(page, side.threadId);
   const closed = read.ok !== true || ["closed", "deleted"].includes(read.value?.status);
   assert.equal(
@@ -1153,17 +1361,34 @@ async function waitForTaskClosedEvent(page, rootThreadId, taskThreadId) {
     event = await page.evaluate(({ expectedRootThreadId, expectedTaskThreadId }) => {
       const events = globalThis.__JA_SIDE_CHAT_CLOSE_EVENTS__;
       if (!Array.isArray(events)) return undefined;
-      const payload = events.find((candidate) =>
+      const notification = events.find((candidate) =>
         candidate?.method === "task/closed" &&
         candidate.params?.rootThreadId === expectedRootThreadId &&
         candidate.params?.taskThreadId === expectedTaskThreadId,
-      )?.params;
-      if (payload === undefined) return undefined;
+      );
+      if (notification === undefined) return undefined;
+      const params = notification.params;
+      const metadataNames = new Set([
+        "serverInstanceId",
+        "eventId",
+        "sequence",
+        "occurredAt",
+        "generation",
+      ]);
+      const businessNames = new Set(["rootThreadId", "taskThreadId", "closedThreadIds"]);
+      const names = Object.keys(params).sort();
       return {
-        rootThreadId: payload.rootThreadId,
-        taskThreadId: payload.taskThreadId,
-        closedThreadIds: payload.closedThreadIds,
-        paramsFields: Object.keys(payload).sort(),
+        rootThreadId: params.rootThreadId,
+        taskThreadId: params.taskThreadId,
+        closedThreadIds: params.closedThreadIds,
+        serverInstanceId: params.serverInstanceId,
+        eventId: params.eventId,
+        sequence: params.sequence,
+        occurredAt: params.occurredAt,
+        generation: params.generation,
+        metadataFields: names.filter((name) => metadataNames.has(name)).sort(),
+        businessFields: names.filter((name) => businessNames.has(name)).sort(),
+        unexpectedFields: names.filter((name) => !metadataNames.has(name) && !businessNames.has(name)),
       };
     }, { expectedRootThreadId: rootThreadId, expectedTaskThreadId: taskThreadId });
     return event !== undefined;
@@ -1182,7 +1407,504 @@ async function unsubscribeTaskClosedEvents(page, eventId) {
   }, eventId);
 }
 
-/** 初始阶段执行真实交互，并用 RPC 通知核对侧聊关闭集合后再保存重启状态。 */
+/** 从服务端 Task Tree 读取确切委派对象；不从 Timeline 卡片标题合成 Thread identity。@author kongweiguang */
+async function readOwnedApprovalTask(page, rootThreadId, taskName) {
+  const result = requireInvoke(
+    await invoke(page, "ja_runtime_task_list", { rootThreadId }),
+    "审批回归任务树",
+  );
+  return result.items?.find(
+    (task) =>
+      task.taskKind === "subagent" &&
+      task.parentThreadId === rootThreadId &&
+      task.rootThreadId === rootThreadId &&
+      task.taskName === taskName,
+  );
+}
+
+/**
+ * Task 与父 Thread Activity 必须同时到达同一状态；Thread snapshot 返回 activity history，
+ * 所以父投影按 activitySequence 取最新一条，避免旧事件冒充当前状态。
+ * @author kongweiguang
+ */
+async function waitForOwnedApprovalState(page, rootThreadId, taskThreadId, expectedState, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let observed;
+  while (Date.now() < deadline) {
+    const taskResult = await invoke(page, "ja_runtime_task_read", { taskThreadId });
+    const ownerSnapshot = threadFacts(await readThread(page, rootThreadId));
+    const ownerActivity = ownerSnapshot?.taskActivities
+      .filter((entry) => entry.task.taskThreadId === taskThreadId)
+      .reduce(
+        (latest, entry) =>
+          latest === undefined ||
+          entry.activity.activitySequence > latest.activity.activitySequence
+            ? entry
+            : latest,
+        undefined,
+      );
+    observed = {
+      task: taskResult.ok === true ? taskResult.value?.task : undefined,
+      ownerTask: ownerActivity?.task,
+      ownerActivity: ownerActivity?.activity,
+    };
+    if (
+      observed.task?.state === expectedState &&
+      observed.ownerTask?.state === expectedState &&
+      observed.ownerActivity?.taskThreadId === taskThreadId &&
+      observed.ownerActivity?.rootThreadId === rootThreadId
+    )
+      return observed;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `Task 与委派方 Activity 未收敛到 ${expectedState}：${JSON.stringify({
+      taskState: observed?.task?.state,
+      ownerState: observed?.ownerTask?.state,
+      activityKind: observed?.ownerActivity?.kind,
+    })}`,
+  );
+}
+
+/** Task Activity 点击只重开既有 Task tab；状态与审批正文仍必须来自真实 Child Transcript。@author kongweiguang */
+async function openApprovalTaskDetail(page, task) {
+  const stateLabels = {
+    queued: "排队中",
+    running: "运行中",
+    waiting_approval: "等待确认",
+    suspended: "已挂起",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+  };
+  const taskTabKey = `subagent:${task.taskThreadId}`;
+  const card = page.getByRole("button", {
+    name: `打开${task.taskName}，${stateLabels[task.state] ?? task.state}`,
+    exact: true,
+  });
+  await card.waitFor({ state: "visible", timeout: 30_000 });
+  await card.click();
+  const tab = page.locator(`[data-workbench-tab="${taskTabKey}"]`);
+  await tab.waitFor({ state: "visible", timeout: 30_000 });
+  await waitForCondition(
+    `子任务详情 ${task.taskName}`,
+    () => page.locator(".ja-task-detail:visible").last().getAttribute("aria-label").then((label) => label === task.taskName),
+  );
+  return {
+    tab,
+    region: page.locator(".ja-task-detail:visible").last(),
+  };
+}
+
+/** 关闭只解除该 Subagent 的展示入口；随后用父 Activity 卡重开验证持久审批仍可见。@author kongweiguang */
+async function closeAndReopenApprovalTask(page, task) {
+  const shell = page.locator(`.ja-workbench-tab-shell[data-tab="subagent:${task.taskThreadId}"]`);
+  await shell.getByRole("button", { name: `关闭${task.taskName}`, exact: true }).click();
+  await shell.waitFor({ state: "detached", timeout: 20_000 });
+  const reopened = await openApprovalTaskDetail(page, task);
+  return { reopened: true, ...reopened };
+}
+
+/** 读取 Core 持久的 pending Approval identity，UI 只能以该 callId/Thread 承载决定。@author kongweiguang */
+async function pendingExecApproval(page, taskThreadId) {
+  const snapshot = requireInvoke(await readThread(page, taskThreadId), "子任务审批历史");
+  const approvals = (snapshot.items ?? []).filter(
+    (item) => item.kind === "approval" && item.toolName === "exec_command" && item.decision === null,
+  );
+  assert.equal(approvals.length, 1, "子任务历史必须只有一个真实待处理 exec_command 审批");
+  return approvals[0];
+}
+
+/** 已挂起的 Turn 可保留关闭审批历史，但 UI 不得再暴露允许或拒绝操作。@author kongweiguang */
+async function assertNoActiveApprovalActions(region, stage) {
+  const cards = region.locator(".ja-approval-card");
+  assert.equal(
+    await cards.getByRole("button", { name: "批准", exact: true }).count(),
+    0,
+    `${stage}仍显示批准操作`,
+  );
+  assert.equal(
+    await cards.getByRole("button", { name: "拒绝", exact: true }).count(),
+    0,
+    `${stage}仍显示拒绝操作`,
+  );
+}
+
+/** 等待唯一 fixture 工具结果进入下一个模型请求，并只保留可供验收的布尔摘要。@author kongweiguang */
+async function waitForApprovalToolResult(provider, marker, callId, afterSequence) {
+  let request;
+  await waitForCondition(
+    `${marker} 工具审批结果回传 Provider`,
+    () => {
+      request = provider.requests.find(
+        (candidate) =>
+          candidate.marker === marker &&
+          candidate.sequence > afterSequence &&
+          candidate.toolResults.some((result) => result.callId === callId),
+      );
+      return request !== undefined;
+    },
+    60_000,
+  );
+  return request.toolResults.find((result) => result.callId === callId);
+}
+
+/** 通过 root Thread 的模型原生 spawn_agent 创建 Child；权限上限由结构化 Provider fixture 明确收紧。@author kongweiguang */
+async function spawnApprovalChild(page, provider, rootComposer, rootThreadId, fixture) {
+  const before = provider.requests.length;
+  await sendComposer(rootComposer, fixture.spawnMarker, "JA_SUBAGENT_APPROVAL_SPAWN_DONE");
+  const spawnRequest = await waitForRequest(provider, `approval_spawn_${fixture.key}`, before);
+  let task;
+  await waitForCondition(
+    `${fixture.taskName} 创建并归属 root`,
+    async () => {
+      task = await readOwnedApprovalTask(page, rootThreadId, fixture.taskName);
+      return task !== undefined;
+    },
+    60_000,
+  );
+  assert.equal(task.parentThreadId, rootThreadId, "子任务 parentThreadId 错误");
+  assert.equal(task.rootThreadId, rootThreadId, "子任务 lineage root 错误");
+  assert.equal(task.taskKind, "subagent");
+  assert.ok(spawnRequest.sequence > before, "子任务不是由真实 Provider spawn_agent 委派");
+  return task;
+}
+
+/** 以真实审批卡和文件回读覆盖 allow；新开与重开都必须保留同一个 pending Approval identity。@author kongweiguang */
+async function approveApprovalChild(page, provider, rootThreadId, task, fixture) {
+  const childRequest = await waitForRequest(provider, `approval_${fixture.key}`);
+  await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "waiting_approval");
+  let detail = await openApprovalTaskDetail(page, { ...task, state: "waiting_approval" });
+  let approval = await pendingExecApproval(page, task.taskThreadId);
+  await detail.region.locator(".ja-approval-card").getByRole("button", { name: "批准", exact: true }).waitFor({ state: "visible" });
+  const firstApprovalId = approval.approvalId;
+  detail = await closeAndReopenApprovalTask(page, { ...task, state: "waiting_approval" });
+  approval = await pendingExecApproval(page, task.taskThreadId);
+  assert.equal(approval.approvalId, firstApprovalId, "重开子任务后审批 identity 被替换");
+  const card = detail.region.locator(".ja-approval-card");
+  await card.getByRole("button", { name: "批准", exact: true }).click();
+  await card.getByRole("heading", { name: "工具调用已批准", exact: true }).waitFor({ state: "visible" });
+  const toolResult = await waitForApprovalToolResult(provider, "approval_allow", fixture.callId, childRequest.sequence);
+  const filePath = join(approvalWriteDirectory, fixture.fileName);
+  const contents = await readFile(filePath, "utf8");
+  assert.equal(contents, fixture.fileValue, "允许后真实隔离文件没有写入预期内容");
+  assert.equal(toolResult.isError, false, "获准的 shell ToolResult 被报告为失败");
+  assert.equal(toolResult.containsVerification, true, "shell 没有回读新文件内容");
+  const terminal = await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "completed");
+  return {
+    taskThreadId: task.taskThreadId,
+    parentThreadId: task.parentThreadId,
+    approvalId: approval.approvalId,
+    callId: fixture.callId,
+    approvedAfterReopen: true,
+    fileWrittenAndReadBack: true,
+    toolResultIsError: toolResult.isError,
+    ownerState: terminal.ownerTask.state,
+    ownerActivity: terminal.ownerActivity.kind,
+  };
+}
+
+/** 拒绝必须返回失败 ToolResult 给原模型调用方，且临时文件不存在、父 Activity 收敛完成。@author kongweiguang */
+async function denyApprovalChild(page, provider, rootThreadId, task, fixture) {
+  const childRequest = await waitForRequest(provider, `approval_${fixture.key}`);
+  await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "waiting_approval");
+  const detail = await openApprovalTaskDetail(page, { ...task, state: "waiting_approval" });
+  const approval = await pendingExecApproval(page, task.taskThreadId);
+  const card = detail.region.locator(".ja-approval-card");
+  await card.getByRole("button", { name: "拒绝", exact: true }).click();
+  await card.getByRole("heading", { name: "工具调用已拒绝", exact: true }).waitFor({ state: "visible" });
+  const toolResult = await waitForApprovalToolResult(
+    provider,
+    "approval_deny",
+    fixture.callId,
+    childRequest.sequence,
+  );
+  assert.equal(toolResult.isError, true, "拒绝的 ToolResult 没有保持失败结果");
+  assert.equal(toolResult.containsVerification, false, "拒绝后模型收到了写入成功结果");
+  await assert.rejects(access(join(approvalWriteDirectory, fixture.fileName)), { code: "ENOENT" });
+  const terminal = await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "completed");
+  return {
+    taskThreadId: task.taskThreadId,
+    parentThreadId: task.parentThreadId,
+    approvalId: approval.approvalId,
+    callId: fixture.callId,
+    denied: true,
+    fileAbsent: true,
+    toolResultIsError: toolResult.isError,
+    ownerState: terminal.ownerTask.state,
+    ownerActivity: terminal.ownerActivity.kind,
+  };
+}
+
+/**
+ * pending Approval 时从 Task UI 显式取消；Core 用 typed close reason 收敛审批而不伪造用户决定。
+ * 遇到 revision conflict 先重读 Task 与审批身份，再由 UI 确认；最终要求 Task/父 Activity 取消、审批 decision 保持 null 且无副作用。
+ * @author kongweiguang
+ */
+async function cancelApprovalChild(page, provider, rootThreadId, task, fixture) {
+  await waitForRequest(provider, `approval_${fixture.key}`);
+  await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "waiting_approval");
+  let currentTask = { ...task, state: "waiting_approval" };
+  let detail = await openApprovalTaskDetail(page, currentTask);
+  const approval = await pendingExecApproval(page, task.taskThreadId);
+  const confirmCancellation = async () => {
+    const approvalCard = detail.region.locator(".ja-approval-card");
+    await approvalCard
+      .getByRole("button", { name: "批准", exact: true })
+      .waitFor({ state: "visible" });
+    await detail.region.getByRole("button", { name: "取消任务", exact: true }).click();
+    const confirmation = detail.region.getByRole("group", { name: "确认取消任务" });
+    await confirmation.waitFor({ state: "visible" });
+    const scopeText = await confirmation.locator("span").textContent();
+    assert.equal(
+      scopeText?.trim(),
+      "将同时取消 0 个未结束后代",
+      "取消前必须确认该隔离 fixture 最新详情仍没有子任务后代",
+    );
+    await confirmation.getByRole("button", { name: "确认取消", exact: true }).click();
+    let outcome;
+    await waitForCondition(
+      "审批取消或关闭完成，或显示 revision conflict",
+      async () => {
+        if (
+          (await approvalCard.getByRole("heading", { name: "审批已取消", exact: true }).count()) ||
+          (await approvalCard.getByRole("heading", { name: "审批请求已关闭", exact: true }).count())
+        ) {
+          outcome = "approval_closed";
+          return true;
+        }
+        if (
+          await detail.region
+            .getByRole("alert")
+            .getByText("任务状态已更新，请查看最新任务及取消范围后重新确认。", {
+              exact: true,
+            })
+            .count()
+        ) {
+          outcome = "revision_conflict";
+          return true;
+        }
+        return false;
+      },
+      30_000,
+    );
+    return outcome;
+  };
+
+  let outcome = await confirmCancellation();
+  let retriedAfterConflict = false;
+  if (outcome === "revision_conflict") {
+    const refreshed = requireInvoke(
+      await invoke(page, "ja_runtime_task_read", { taskThreadId: task.taskThreadId }),
+      "取消冲突后重新读取 Task",
+    );
+    currentTask = refreshed.task;
+    assert.equal(currentTask.taskThreadId, task.taskThreadId);
+    assert.equal(currentTask.parentThreadId, rootThreadId);
+    assert.equal(currentTask.rootThreadId, rootThreadId);
+    assert.equal(
+      currentTask.state,
+      "waiting_approval",
+      "冲突后 Task 已变化，不得基于旧审批继续重试取消",
+    );
+    const refreshedApproval = await pendingExecApproval(page, task.taskThreadId);
+    assert.equal(refreshedApproval.approvalId, approval.approvalId);
+    assert.equal(refreshedApproval.callId, approval.callId);
+    assert.equal(refreshedApproval.decision, null);
+    detail = await closeAndReopenApprovalTask(page, currentTask);
+    outcome = await confirmCancellation();
+    retriedAfterConflict = true;
+  }
+  assert.equal(outcome, "approval_closed", "最新 Task 重确认后审批仍未关闭");
+  const terminal = await waitForOwnedApprovalState(page, rootThreadId, task.taskThreadId, "cancelled");
+  assert.equal(
+    await detail.region.locator(".ja-approval-card").getByRole("button", { name: "批准", exact: true }).count(),
+    0,
+    "Task 取消后审批卡仍显示批准操作",
+  );
+  assert.equal(
+    await detail.region.locator(".ja-approval-card").getByRole("button", { name: "拒绝", exact: true }).count(),
+    0,
+    "Task 取消后审批卡仍显示拒绝操作",
+  );
+  const cancelledHistory = requireInvoke(
+    await readThread(page, task.taskThreadId),
+    "取消后回读审批历史",
+  );
+  const closedApproval = (cancelledHistory.items ?? []).filter(
+    (item) =>
+      item.kind === "approval" &&
+      item.approvalId === approval.approvalId &&
+      item.callId === fixture.callId,
+  );
+  assert.equal(closedApproval.length, 1, "取消后历史必须保留同一审批 identity");
+  assert.equal(
+    closedApproval[0].decision,
+    null,
+    "Task cancel 必须关闭 pending Tool，但不能写入用户未作出的审批决定",
+  );
+  await assert.rejects(access(join(approvalWriteDirectory, fixture.fileName)), { code: "ENOENT" });
+  assert.equal(
+    provider.requests.some((request) => request.marker === "approval_cancel" && request.toolResults.some((result) => result.callId === fixture.callId)),
+    false,
+    "取消后 pending shell 意外进入了 Provider ToolResult 续答",
+  );
+  return {
+    taskThreadId: task.taskThreadId,
+    parentThreadId: task.parentThreadId,
+    approvalId: approval.approvalId,
+    callId: fixture.callId,
+    cancelledWhileWaiting: true,
+    retriedAfterConflict,
+    cancelledWithoutUserDecision: true,
+    fileAbsent: true,
+    ownerState: terminal.ownerTask.state,
+    ownerActivity: terminal.ownerActivity.kind,
+  };
+}
+
+/** 审批自然到期后核对权威挂起状态与无活动决策按钮，再重开并继续运行，不要求历史过期卡仍可见。@author kongweiguang */
+async function resumeExpiredApprovalChild(page, provider, rootThreadId, task, fixture) {
+  const childRequest = await waitForRequest(provider, `approval_${fixture.key}`);
+  const waiting = await waitForOwnedApprovalState(
+    page,
+    rootThreadId,
+    task.taskThreadId,
+    "waiting_approval",
+  );
+  const detail = await openApprovalTaskDetail(page, { ...task, ...waiting.task });
+  const approval = await pendingExecApproval(page, task.taskThreadId);
+  await detail
+    .region.locator(".ja-approval-card")
+    .getByRole("button", { name: "批准", exact: true })
+    .waitFor({ state: "visible" });
+  const remaining = Date.parse(approval.expiresAt) - Date.now();
+  if (!Number.isFinite(remaining) || remaining < 0 || remaining > 6 * 60_000)
+    throw new Error("审批到期时间不在隔离回归的六分钟期限内");
+  const suspended = await waitForOwnedApprovalState(
+    page,
+    rootThreadId,
+    task.taskThreadId,
+    "suspended",
+    Math.max(30_000, remaining + 60_000),
+  );
+  let expiredHistory;
+  await waitForCondition(
+    "过期审批对应的 Thread Turn 投影挂起",
+    async () => {
+      expiredHistory = requireInvoke(
+        await readThread(page, task.taskThreadId),
+        "自然到期后回读子线程",
+      );
+      return expiredHistory.turns.some(
+        (turn) => turn.turnId === approval.turnId && turn.status === "suspended",
+      );
+    },
+    60_000,
+  );
+  const closedApproval = (expiredHistory.items ?? []).filter(
+    (item) =>
+      item.kind === "approval" &&
+      item.approvalId === approval.approvalId &&
+      item.callId === fixture.callId,
+  );
+  assert.equal(closedApproval.length, 1, "到期后应保留同一审批历史 identity");
+  assert.equal(closedApproval[0].decision, null, "系统到期不能伪造用户审批决定");
+  await assertNoActiveApprovalActions(detail.region, "审批到期挂起后");
+  const reopened = await closeAndReopenApprovalTask(page, { ...task, ...suspended.task });
+  await assertNoActiveApprovalActions(reopened.region, "重开已挂起任务后");
+  await reopened.region.getByRole("button", { name: "继续运行", exact: true }).click();
+  const toolResult = await waitForApprovalToolResult(
+    provider,
+    "approval_resume",
+    fixture.callId,
+    childRequest.sequence,
+  );
+  assert.equal(toolResult.isError, true, "过期审批恢复后不应伪造已执行 shell 成功");
+  assert.equal(toolResult.containsVerification, false);
+  await assert.rejects(access(join(approvalWriteDirectory, fixture.fileName)), { code: "ENOENT" });
+  const terminal = await waitForOwnedApprovalState(
+    page,
+    rootThreadId,
+    task.taskThreadId,
+    "completed",
+    60_000,
+  );
+  return {
+    taskThreadId: task.taskThreadId,
+    parentThreadId: task.parentThreadId,
+    approvalId: approval.approvalId,
+    callId: fixture.callId,
+    expiredToSuspended: true,
+    threadTurnSuspended: true,
+    expiredApprovalDecisionNull: true,
+    noActiveApprovalActions: true,
+    resumedAfterReopen: true,
+    fileAbsent: true,
+    toolResultIsError: toolResult.isError,
+    ownerState: terminal.ownerTask.state,
+    ownerActivity: terminal.ownerActivity.kind,
+  };
+}
+
+/** 独立审批 phase 复用本地 Provider 与真实 Thread UI，覆盖父归属、允许/拒绝/取消、到期恢复及重开 pending 审批。@author kongweiguang */
+async function runApprovals(page, provider) {
+  await page.locator(".ja-composer").first().waitFor({ state: "visible", timeout: 60_000 });
+  await configureLoopbackProvider(page, provider);
+  const newConversation = page.getByRole("button", { name: "新会话", exact: true });
+  if (await newConversation.count()) await newConversation.click();
+  const rootComposer = page.locator(".ja-conversation .ja-composer").first();
+  await chooseModel(rootComposer, PRIMARY_MODEL);
+  await sendComposer(rootComposer, ROOT_MARKER, "JA_SIDE_CHAT_PARENT_DONE");
+  const rootThreadId = await currentThreadId(page);
+  const outcomes = {};
+  for (const key of ["allow", "deny", "cancel", "resume"]) {
+    const fixture = APPROVAL_FIXTURES.find((candidate) => candidate.key === key);
+    const task = await spawnApprovalChild(page, provider, rootComposer, rootThreadId, fixture);
+    const childBefore = await waitForRequest(provider, `approval_${key}`);
+    if (key === "allow")
+      outcomes.allow = await approveApprovalChild(page, provider, rootThreadId, task, fixture);
+    else if (key === "deny")
+      outcomes.deny = await denyApprovalChild(page, provider, rootThreadId, task, fixture);
+    else if (key === "cancel")
+      outcomes.cancel = await cancelApprovalChild(page, provider, rootThreadId, task, fixture);
+    else
+      outcomes.resume = await resumeExpiredApprovalChild(page, provider, rootThreadId, task, fixture);
+    outcomes[key].childStartSequence = childBefore.sequence;
+    await capture(page, `approval-${key}-settled`);
+  }
+  const rootActivities = threadFacts(await readThread(page, rootThreadId)).taskActivities;
+  const latestActivityByTask = new Map();
+  for (const entry of rootActivities) {
+    const taskThreadId = entry.task.taskThreadId;
+    const current = latestActivityByTask.get(taskThreadId);
+    if (current === undefined || entry.activity.activitySequence > current.activity.activitySequence)
+      latestActivityByTask.set(taskThreadId, entry);
+  }
+  const ownedTasks = [...latestActivityByTask.values()].map((entry) => ({
+    taskThreadId: entry.task.taskThreadId,
+    parentThreadId: entry.task.parentThreadId,
+    rootThreadId: entry.task.rootThreadId,
+    state: entry.task.state,
+    activity: entry.activity.kind,
+  }));
+  assert.equal(ownedTasks.length, 4, "委派方 Thread 必须只保留四种审批场景的直接 Subagent 入口");
+  assert.ok(ownedTasks.every((entry) => entry.parentThreadId === rootThreadId));
+  assert.ok(ownedTasks.every((entry) => entry.rootThreadId === rootThreadId));
+  const report = {
+    status: "approvals_passed",
+    evidenceScope: "isolated Windows Tauri/WebView2, local Provider, Native/JVM selected by runner, real Task Activity and ApprovalCard UI",
+    rootThreadId,
+    outcomes,
+    ownerProjection: ownedTasks,
+    providerRequestCount: provider.requests.length,
+  };
+  await writeFile(join(evidenceDirectory, "side-chat-approvals.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  await capture(page, "approval-parent-final");
+  return report;
+}
+
+/** 初始阶段执行真实交互；子任务专项只验本轮委派、归属、完成和级联关闭，全量模式再验证侧聊其余能力。 */
 async function runInitial(page, provider) {
   await page.locator(".ja-composer").first().waitFor({ state: "visible", timeout: 60_000 });
   await configureLoopbackProvider(page, provider);
@@ -1237,11 +1959,38 @@ async function runInitial(page, provider) {
     "侧聊未收到实际委派活动",
   );
 
+  if (subagentOnly) {
+    await waitForCondition("子任务完成正文", async () => {
+      const child = requireInvoke(await readThread(page, childTask.taskThreadId), "子任务历史");
+      return JSON.stringify(child.items).includes("JA_SIDE_CHAT_SUBAGENT_DONE");
+    });
+    await capture(page, "03-subagent-completed");
+    const close = await closeSideChat(page, first, [first.threadId, childTask.taskThreadId]);
+    assert.equal(
+      (await readThread(page, childTask.taskThreadId)).ok,
+      false,
+      "关闭来源侧聊后子任务仍可读取",
+    );
+    assert.equal((await readThread(page, rootThreadId)).ok, true, "关闭子树误删主会话");
+    return {
+      status: "subagent_passed",
+      evidenceScope:
+        "Windows Tauri/WebView2, JVM backend, loopback Provider, structured spawn_agent, completion, owner isolation, close retry and subtree purge",
+      rootThreadId,
+      sideThreadId: first.threadId,
+      childTaskThreadId: childTask.taskThreadId,
+      mailbox,
+      running,
+      close,
+      providerRequestCount: provider.requests.length,
+    };
+  }
+
   const btw = await exerciseBtw(page, rootComposer, provider, [first.threadId]);
   const second = await openSideChat(page);
   const secondSnapshot = threadFacts(await readThread(page, second.threadId));
   assert.equal(secondSnapshot?.turns.length, 0, "第二个空侧聊创建时唤醒 Provider");
-  await rejectMailboxReadFromOtherThread(page, second.threadId, mailbox.messageId);
+  await rejectMailboxReadFromOtherThread(page, second.threadId, mailbox.itemId);
   const sidePlan = await createSidePlan(page, provider, second);
   await first.tab.click();
   await first.region
@@ -1305,10 +2054,23 @@ async function runInitial(page, provider) {
     close = await closeSideChat(page, second);
     closeEvent = await waitForTaskClosedEvent(page, rootThreadId, second.threadId);
     assert.deepEqual(
-      closeEvent.paramsFields,
+      closeEvent.metadataFields,
+      ["eventId", "generation", "occurredAt", "sequence", "serverInstanceId"],
+      "task/closed transport metadata 不符合生产协议闭集",
+    );
+    assert.deepEqual(
+      closeEvent.businessFields,
       ["closedThreadIds", "rootThreadId", "taskThreadId"],
       "task/closed 业务 params 不符合严格字段闭集",
     );
+    assert.deepEqual(closeEvent.unexpectedFields, [], "task/closed params 出现协议外字段");
+    const runtimeIdentity = requireInvoke(await invoke(page, "ja_runtime_state", {}), "关闭事件 Runtime 身份");
+    assert.equal(closeEvent.serverInstanceId, runtimeIdentity.serverInstanceId);
+    assert.equal(closeEvent.generation, runtimeIdentity.generation);
+    assert.match(closeEvent.eventId, /^evt_[A-Za-z0-9._-]{1,95}$/u);
+    assert.ok(Number.isSafeInteger(closeEvent.sequence) && closeEvent.sequence > 0);
+    assert.ok(Number.isSafeInteger(closeEvent.generation) && closeEvent.generation > 0);
+    assert.ok(Number.isFinite(Date.parse(closeEvent.occurredAt)));
     const eventClosedThreadIds = assertSideChatCloseReceipt(
       { closedThreadIds: closeEvent.closedThreadIds },
       second.threadId,
@@ -1442,7 +2204,11 @@ async function main() {
     });
     await page.setViewportSize({ width: 1280, height: 820 });
     await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
-    const report = phase === "initial" ? await runInitial(page, provider) : await runRestart(page);
+    const report = phase !== "initial"
+      ? await runRestart(page)
+      : scenario === "approvals"
+        ? await runApprovals(page, provider)
+        : await runInitial(page, provider);
     await writeFile(
       join(evidenceDirectory, `side-chat-${phase}.json`),
       `${JSON.stringify(report, null, 2)}\n`,

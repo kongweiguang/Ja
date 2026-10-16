@@ -143,6 +143,7 @@ pub struct UiState {
     composer: Composer,
     fork_source_composers: HashMap<String, Composer>,
     active_fork_source: Option<String>,
+    thread_composers: HashMap<String, Composer>,
     terminal_width: usize,
     terminal_height: usize,
     deferred_composer: Option<Composer>,
@@ -184,7 +185,8 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// 使用 owner 的权威快照初始化；恢复会话列表选择无需凭空创建 thread。
+    /// @author kongweiguang
+    /// 使用 owner 快照初始化，并按 Thread identity 缓存编辑器草稿，避免会话切换泄漏内容。
     pub fn new(snapshot: UiSnapshot) -> Self {
         Self::new_for_terminal(snapshot, 80, 24)
     }
@@ -207,6 +209,7 @@ impl UiState {
             composer: Composer::new(),
             fork_source_composers: HashMap::new(),
             active_fork_source: None,
+            thread_composers: HashMap::new(),
             terminal_width: usize::from(width.max(1)),
             terminal_height: usize::from(height.max(1)),
             deferred_composer: None,
@@ -663,12 +666,25 @@ impl UiState {
                 let was_pending = self.snapshot.pending_prompt.is_some();
                 let thread_changed = self.snapshot.thread_id != snapshot.thread_id;
                 let previous_thread_id = self.snapshot.thread_id.clone();
-                if thread_changed
-                    && let Some(thread_id) = previous_thread_id.as_deref()
-                    && self.active_fork_source.as_deref() != Some(thread_id)
-                    && let Some(draft) = self.fork_source_composers.get_mut(thread_id)
-                {
-                    *draft = self.composer.clone();
+                if thread_changed && let Some(thread_id) = previous_thread_id.as_deref() {
+                    if self.active_fork_source.as_deref() == Some(thread_id) {
+                        // Fork submission clears the live Composer before the child snapshot arrives;
+                        // persist its separately retained source draft into the normal per-Thread cache.
+                        if let Some(draft) = self.fork_source_composers.get(thread_id) {
+                            self.thread_composers
+                                .insert(thread_id.to_owned(), draft.clone());
+                        }
+                    } else if self.composer.is_empty() {
+                        self.thread_composers.remove(thread_id);
+                    } else {
+                        self.thread_composers
+                            .insert(thread_id.to_owned(), self.composer.clone());
+                    }
+                    if self.active_fork_source.as_deref() != Some(thread_id)
+                        && let Some(draft) = self.fork_source_composers.get_mut(thread_id)
+                    {
+                        *draft = self.composer.clone();
+                    }
                 }
                 if thread_changed && self.settings_start_pending {
                     self.close_model_settings(false);
@@ -796,11 +812,11 @@ impl UiState {
                 }
                 if thread_changed {
                     if let Some(thread_id) = self.snapshot.thread_id.as_deref()
-                        && let Some(composer) = self.fork_source_composers.get(thread_id)
+                        && let Some(composer) = self.thread_composers.get(thread_id)
                     {
                         self.composer = composer.clone();
-                    } else if self.active_fork_source.is_some() {
-                        // 分叉创建只复制来源草稿快照；新 child 的编辑器必须从空白状态开始。
+                    } else {
+                        // Thread 草稿按 identity 隔离；新会话与 fork child 均从空白编辑器开始。
                         self.composer = Composer::new();
                     }
                 }
@@ -986,6 +1002,12 @@ impl UiState {
             UiEvent::SetThreadChoices(choices) => {
                 self.snapshot.thread_choices = sanitize_choices(choices);
                 self.clamp_choice_selection(ChoiceKind::Threads);
+            }
+            UiEvent::ForgetThreadDrafts(thread_ids) => {
+                for thread_id in thread_ids {
+                    self.thread_composers.remove(&thread_id);
+                    self.fork_source_composers.remove(&thread_id);
+                }
             }
             UiEvent::SetThreadPage {
                 query,
@@ -2651,7 +2673,8 @@ impl UiState {
         actions
     }
 
-    /// 普通消息立即搬出编辑区并显示待发送问题；完整缓冲用于拒绝恢复，未知回执继续锁住重复提交。
+    /// @author kongweiguang
+    /// 普通消息立即搬出编辑区并显示待发送问题；命令先读原文以保全 `/btw` 完整正文。
     fn submit_or_continue(&mut self, mode: UiSubmitMode) -> Option<UiAction> {
         if self.pending_submission.is_some()
             || self.snapshot.pending_prompt.is_some()
@@ -2670,7 +2693,9 @@ impl UiState {
             }
             return None;
         }
-        if let Some(action) = parse_command(text.trim()) {
+        // Try the original first so `/btw` can retain its exact trailing/inner message bytes;
+        // the trimmed retry preserves the historical convenience of leading command whitespace.
+        if let Some(action) = parse_command(&text).or_else(|| parse_command(text.trim())) {
             if matches!(action, UiAction::AttachPaths { .. }) {
                 self.pending_submission = Some(PendingSubmission::Attachment(text));
                 self.scheduled_file_search = None;
@@ -4076,15 +4101,26 @@ fn key_ends_paste_candidate(key: KeyEvent) -> bool {
     true
 }
 
-/// 解析白名单斜杠命令；Plan 创建保留完整目标文本，缺少目标也作为命令交给 controller 报错。
+/// @author kongweiguang
+/// 解析白名单斜杠命令；`/btw` 仅去掉命令边界空白，完整正文与原重试命令一起交给 owner。
 fn parse_command(text: &str) -> Option<UiAction> {
     let command_text = text.strip_prefix('/')?;
     let mut parts = command_text.splitn(2, char::is_whitespace);
     let command = parts.next()?.to_ascii_lowercase();
-    let argument = parts.next().unwrap_or_default().trim();
+    let raw_argument = parts.next().unwrap_or_default();
+    let argument = raw_argument.trim();
     let command = match command.as_str() {
         "new" if argument.is_empty() => UiCommand::NewThread,
         "resume" if argument.is_empty() => UiCommand::ResumeThread,
+        "btw" => {
+            return Some(UiAction::CreateSideChat {
+                // Consume only the command's first separator; additional and trailing body
+                // whitespace belongs to the message and must survive create-then-send.
+                content: raw_argument.to_owned(),
+                command_text: text.to_owned(),
+            });
+        }
+        "back" if argument.is_empty() => return Some(UiAction::ReturnToParent),
         "model" if argument.is_empty() => UiCommand::SelectModel,
         "permissions" if argument.is_empty() => UiCommand::SelectPermissions,
         "attach" => {
@@ -4178,6 +4214,8 @@ const COMMANDS: &[UiCommand] = &[
     UiCommand::ResumeThread,
     UiCommand::SelectModel,
     UiCommand::SelectPermissions,
+    UiCommand::CreateSideChat,
+    UiCommand::ReturnToParent,
     UiCommand::Attach,
     UiCommand::ShowTools,
     UiCommand::ShowDiff,
@@ -4195,11 +4233,14 @@ const COMMANDS: &[UiCommand] = &[
     UiCommand::Quit,
 ];
 
-/// 返回精确命令标签；创建目标由用户在补全后继续输入。
+/// @author kongweiguang
+/// 返回精确命令标签；`/btw` 的正文由解析器捕获，不能由补全把它误当模型输入。
 pub(crate) fn command_label(command: UiCommand) -> &'static str {
     match command {
         UiCommand::NewThread => "/new",
         UiCommand::ResumeThread => "/resume",
+        UiCommand::CreateSideChat => "/btw",
+        UiCommand::ReturnToParent => "/back",
         UiCommand::SelectModel => "/model",
         UiCommand::SelectPermissions => "/permissions",
         UiCommand::Attach => "/attach",
@@ -4238,11 +4279,14 @@ pub(crate) fn matching_commands(draft: &str) -> Vec<UiCommand> {
         .collect()
 }
 
-/// 菜单只列真实可调用的常用入口；动作说明保持简短以适应窄终端。
+/// @author kongweiguang
+/// 菜单只列可调用的常用入口；侧聊正文提交与返回关闭均走现有会话控制器。
 pub(crate) fn command_description(command: UiCommand) -> &'static str {
     match command {
         UiCommand::NewThread => "新建会话",
         UiCommand::ResumeThread => "恢复会话",
+        UiCommand::CreateSideChat => "创建临时侧聊",
+        UiCommand::ReturnToParent => "返回父会话并关闭侧聊及其子任务",
         UiCommand::SelectModel => "切换或管理模型",
         UiCommand::SelectPermissions => "执行权限",
         UiCommand::Attach => "添加附件",

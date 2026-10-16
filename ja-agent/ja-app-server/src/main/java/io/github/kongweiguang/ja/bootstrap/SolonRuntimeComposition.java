@@ -120,6 +120,8 @@ import io.github.kongweiguang.ja.infrastructure.persistence.mapper.TurnChangeSet
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.task.MybatisTaskRepository;
 import io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisAttachmentRepository;
+import io.github.kongweiguang.ja.infrastructure.persistence.startup.ApprovalExpiryRecoveryListener;
+import io.github.kongweiguang.ja.infrastructure.persistence.startup.ApprovalExpiryStartupRecovery;
 import io.github.kongweiguang.ja.infrastructure.persistence.startup.StartupMaintenanceService;
 import io.github.kongweiguang.ja.infrastructure.persistence.store.JaAdmissionParticipantFactory;
 import io.github.kongweiguang.ja.infrastructure.persistence.store.JaAgentEventBridge;
@@ -945,7 +947,7 @@ public final class SolonRuntimeComposition {
     }
 
     /**
-     * Engine 只持久化统一 AgentStore；Plan 事件监听器单独结算 Plan 账本，不引入另一种执行来源。
+     * Engine 只持久化统一 AgentStore；审批恢复监听器仅投影本次启动重挂的到期代际，不恢复 Driver。
      */
     @Bean(value = "jaAgentEngine", typed = true)
     public AgentEngine agentEngine(
@@ -954,11 +956,14 @@ public final class SolonRuntimeComposition {
             @Inject(value = "jaInteractionUseCase", required = false) InteractionService interactions,
             @Inject(value = "jaAgentEventBridge", required = false) JaAgentEventBridge events,
             @Inject(value = "jaPlanCommittedEventListener", required = false)
-            PlanCommittedEventListener planEvents) {
+            PlanCommittedEventListener planEvents,
+            @Inject(value = "jaApprovalExpiryRecoveryListener", required = false)
+            ApprovalExpiryRecoveryListener approvalExpiry) {
         if (AotSideEffectGuard.processing()) {
             return null;
         }
-        if (store == null || runtimes == null || interactions == null || events == null || planEvents == null) {
+        if (store == null || runtimes == null || interactions == null || events == null || planEvents == null
+            || approvalExpiry == null) {
             throw new IllegalStateException("Ja Agent Engine dependencies are unavailable");
         }
         AgentEngine engine = new AgentEngineBuilder().store(store).runtimeResolver(runtimes)
@@ -966,6 +971,7 @@ public final class SolonRuntimeComposition {
                     registry.registerEventListener(interactions);
                     registry.registerEventListener(events);
                     registry.registerEventListener(planEvents);
+                    registry.registerEventListener(approvalExpiry);
                 })
                 .parallelism(8).maxOutstandingExecutions(64).maxOutstandingPerThread(8).build();
         try {
@@ -982,6 +988,25 @@ public final class SolonRuntimeComposition {
             }
             throw failure;
         }
+    }
+
+    /**
+     * Durable expiry observer starts before Engine dispatch; its Task claim remains empty until the startup scan.
+     */
+    @Bean(value = "jaApprovalExpiryRecoveryListener", typed = true)
+    public ApprovalExpiryRecoveryListener approvalExpiryRecoveryListener(
+            @Inject(value = "jaAgentStore", required = false) AgentStore store,
+            ExecutionControlCodec controls,
+            ExecutionEventCodec events,
+            @Inject(value = "jaTaskRepository", required = false) MybatisTaskRepository tasks,
+            Clock clock) {
+        if (AotSideEffectGuard.processing()) {
+            return null;
+        }
+        if (store == null || tasks == null) {
+            throw new IllegalStateException("Ja approval expiry recovery dependencies are unavailable");
+        }
+        return lifecycle.own(new ApprovalExpiryRecoveryListener(store, controls, events, tasks, clock));
     }
 
     /**
@@ -1452,6 +1477,26 @@ public final class SolonRuntimeComposition {
     }
 
     /**
+     * Startup discovery runs after temporary side-chat purge and after Engine/Task owners exist, before RPC can observe stale waits.
+     */
+    @Bean(value = "jaApprovalExpiryStartupRecovery", typed = true)
+    public ApprovalExpiryStartupRecovery approvalExpiryStartupRecovery(
+            StartupMaintenanceService maintenance,
+            @Inject(value = "jaApprovalExpiryRecoveryListener", required = false)
+            ApprovalExpiryRecoveryListener listener,
+            @Inject(value = "jaAgentEngine", required = false) AgentEngine engine,
+            @Inject(value = "jaHistory", required = false) ThreadUseCase threads,
+            @Inject(value = "jaTaskUseCase", required = false) TaskCoordinator tasks) {
+        if (AotSideEffectGuard.processing()) {
+            return null;
+        }
+        if (listener == null || engine == null || threads == null || tasks == null) {
+            throw new IllegalStateException("Ja approval expiry startup dependencies are unavailable");
+        }
+        return new ApprovalExpiryStartupRecovery(maintenance, listener, engine, threads, tasks);
+    }
+
+    /**
      * 将 Task admission 的 Conversation 事务实现收口到基础设施 ACL，避免应用服务直接拼装参与者。
      */
     @Bean(value = "jaTaskAdmissionGateway", typed = true)
@@ -1544,7 +1589,8 @@ public final class SolonRuntimeComposition {
     }
 
     /**
-     * 基于精确运行时 Bean 身份发布 RPC 工厂；AOT 只登记类型，不创建用户运行时门面。
+     * 先要求启动审批到期恢复扫描完成，再基于精确运行时 Bean 身份发布 RPC 工厂；AOT 只登记类型，
+     * 不创建用户运行时门面。
      */
     @Bean(value = "jaRuntimeServicesFactory", typed = true)
     public RuntimeServicesFactory runtimeServicesFactory(
@@ -1567,18 +1613,22 @@ public final class SolonRuntimeComposition {
             io.github.kongweiguang.ja.conversation.application.api.InteractionUseCase interactions,
             @Inject(value = "jaProcessSessionUseCase", required = false) ProcessSessionUseCase processes,
             @Inject(value = "jaReviewUseCase", required = false) ReviewUseCase reviews,
+            @Inject(value = "jaApprovalExpiryStartupRecovery", required = false)
+            ApprovalExpiryStartupRecovery approvalExpiryRecovery,
             @Inject(value = "jaJsonValueCodec", required = true) JsonValueCodec jsonValueCodec) {
         if (AotSideEffectGuard.processing()) {
             return null;
         }
         if (workspaces == null || workspacePathSearch == null || threads == null || threadMcp == null
             || turns == null || compactions == null || approvals == null || catalog == null
-            || tasks == null || plans == null || processes == null || reviews == null) {
+            || tasks == null || plans == null || processes == null || reviews == null
+            || approvalExpiryRecovery == null) {
             throw new IllegalStateException("Ja RPC runtime dependencies are unavailable");
         }
         return new RuntimeServicesFactory(
                 workspaces, workspacePathSearch, threads, threadMcp, turns, compactions, approvals, catalog,
                 attachments, attachmentPreviews, tasks, plans, interactions, processes, reviews,
+                approvalExpiryRecovery,
                 jsonValueCodec, lifecycle::close);
     }
 

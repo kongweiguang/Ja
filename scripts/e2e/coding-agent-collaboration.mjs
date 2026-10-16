@@ -402,7 +402,7 @@ async function collaborationResponse(payload, observations) {
 }
 
 /** 启动只监听回环地址的 Responses fixture；未知请求被记录为验收失败并拒绝。 */
-async function startCollaborationProvider() {
+export async function startCollaborationProvider() {
   const observations = [];
   let failure = null;
   const server = createServer(async (request, response) => {
@@ -444,16 +444,17 @@ async function startCollaborationProvider() {
   };
 }
 
-/** 解析仅包含本地 JAR、Java 与外部证据目录的验收参数。 */
+/** 原生与 JVM 验收互斥选择，确保原生产物失败时不会静默退回 JAR。 */
 export function parseArguments(argv = process.argv.slice(2)) {
   const parsed = {
     jar: process.env.JA_CODING_AGENT_JAR,
     java: process.env.JA_TEST_JAVA,
+    nativeExecutable: undefined,
     evidenceDirectory: process.env.JA_CODING_AGENT_EVIDENCE_DIR,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (!["--jar", "--java", "--evidence-directory"].includes(argument)) {
+    if (!["--jar", "--java", "--native-executable", "--evidence-directory"].includes(argument)) {
       throw new Error(`unknown coding-agent collaboration argument: ${argument}`);
     }
     const value = argv[index + 1];
@@ -462,7 +463,11 @@ export function parseArguments(argv = process.argv.slice(2)) {
     index += 1;
     if (argument === "--jar") parsed.jar = value;
     if (argument === "--java") parsed.java = value;
+    if (argument === "--native-executable") parsed.nativeExecutable = value;
     if (argument === "--evidence-directory") parsed.evidenceDirectory = value;
+  }
+  if (parsed.nativeExecutable && (parsed.jar || parsed.java)) {
+    throw new Error("native collaboration acceptance cannot also select a JAR or Java");
   }
   return parsed;
 }
@@ -516,11 +521,11 @@ function rpcResult(frame, operation) {
   return frame.result;
 }
 
-/** 初始化真实 sidecar，并等待 Ja Kernel 报告 ready 后才开放验收请求。 */
+/** 初始化指定产物并等待 Kernel 就绪；Native 直接启动，绝不拼接 JVM 参数或回退到开发 JAR。 */
 async function startReadySession({ command, jar, directories }) {
   const session = new JsonlSession({
     command,
-    prefixArgs: ["-jar", jar],
+    prefixArgs: jar === null ? [] : ["-jar", jar],
     directories,
     apiKey: placeholderSecret,
     endpoint: "http://127.0.0.1",
@@ -653,17 +658,24 @@ async function persistEvidence(directory, report) {
   return file;
 }
 
-/** 真实 JVM JAR、隔离 SQLite、回环 Provider 与两条 Thread 组成一次端到端协作验收。 */
+/** 指定 JVM/Native 产物、隔离 SQLite 与回环 Provider 组成同一协作验收，并绑定实际二进制摘要。 */
 export async function runAcceptance(options = {}) {
   const parsed = { ...parseArguments(options.argv), ...options };
-  const jar = await resolveJar(parsed.jar);
-  const java = resolveJava(parsed.java);
-  const javaMajor = await assertJava25(java);
+  const nativeExecutable = parsed.nativeExecutable ? resolve(parsed.nativeExecutable) : null;
+  const jar = nativeExecutable === null ? await resolveJar(parsed.jar) : null;
+  const java = nativeExecutable ?? resolveJava(parsed.java);
+  const javaMajor = nativeExecutable === null ? await assertJava25(java) : null;
+  const artifact = nativeExecutable ?? jar;
+  const artifactSha256 = createHash("sha256")
+    .update(await readFile(artifact))
+    .digest("hex");
   const directories = await createIsolatedDirectories();
   const startedAt = Date.now();
   const report = {
     status: "running",
-    jar: basename(jar),
+    runtime: nativeExecutable === null ? "jvm" : "native",
+    artifact: basename(artifact),
+    artifactSha256,
     javaMajor,
     providerRequestTimeoutMs: requestTimeoutMs,
     phases: [],
@@ -851,8 +863,7 @@ export async function runAcceptance(options = {}) {
     assert.equal(report.historyAfterRestart.mainRevisionDidNotRegress, true);
     assert.equal(report.historyAfterRestart.childRevisionDidNotRegress, true);
     report.status = "completed";
-    report.evidenceScope =
-      "JDK 25 JVM JAR, JA-RPC, loopback Responses, parent/child workspace writes, restart history";
+    report.evidenceScope = `${nativeExecutable === null ? "JDK 25 JVM JAR" : "Native executable"}, JA-RPC, loopback Responses, parent/child workspace writes, restart history`;
     return report;
   } catch (error) {
     report.status = "failed";
@@ -863,7 +874,12 @@ export async function runAcceptance(options = {}) {
     };
     report.stderrOrigin = (session?.stderr ?? "")
       .split(/\r?\n/u)
-      .filter((line) => line.includes("Task operation rejected code=") && line.includes(" origin="))
+      .filter(
+        (line) =>
+          (line.includes("Task operation rejected code=") ||
+            line.includes("Task operation failed type=")) &&
+          line.includes(" origin="),
+      )
       .slice(-10);
     report.rpcEvents = (session?.events ?? []).slice(-80).map((frame) => ({
       method: frame.method,

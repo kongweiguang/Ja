@@ -456,7 +456,8 @@ final class JaInteractionProjection {
     }
 
     /**
-     * 审批 wait 的核心状态和 Ja 授权卡片同事务结算；身份来自 wait 字段，属性只保留策略期限。
+     * 审批 wait 的关闭原因继续由 typed wait 事件表达；Ja approval 行只记录真实 APPROVE/DENY 决议。
+     * 到期或取消不能写成用户拒绝，也不能扩展 decision 枚举。
      */
     private void applyApprovalWait(Connection connection, AgentStoreTransactionContext transaction,
                                    InteractionWait wait, InteractionAnswerSubmission submission)
@@ -491,35 +492,11 @@ final class JaInteractionProjection {
             insertApprovalReceipt(connection, transaction, wait, submission, decision);
             return;
         }
-        if (approval.decision() == null) {
-            String closeDecision = switch (wait.status()) {
-                case CANCELLED -> "DENY";
-                case EXPIRED -> "EXPIRED";
-                case ANSWERED, PENDING, SUPERSEDED -> throw new SQLException("unsupported Ja approval close state");
-            };
-            try (PreparedStatement update = connection.prepareStatement(
-                    """
-                        UPDATE ja_approval SET decision=?,resolved_at_ms=? WHERE approval_id=? AND thread_id=? \
-                        AND turn_id=? AND call_id=? AND decision IS NULL\
-                        """)) {
-                update.setString(1, closeDecision);
-                update.setLong(2, wait.updatedAt().toEpochMilli());
-                update.setString(3, wait.interactionId());
-                update.setString(4, threadId);
-                update.setString(5, turnId);
-                update.setString(6, wait.toolCallId());
-                requireOne(update.executeUpdate(), "Ja approval cancellation CAS failed");
-            }
-        } else {
-            String expectedClosedDecision = switch (wait.status()) {
-                case CANCELLED -> "DENY";
-                case EXPIRED -> "EXPIRED";
-                case ANSWERED -> throw new SQLException("answered approval was not handled");
-                case PENDING, SUPERSEDED -> throw new SQLException("unsupported Ja approval close state");
-            };
-            if (!expectedClosedDecision.equals(approval.decision())) {
-                throw new SQLException("closed Ja approval has a different resolution");
-            }
+        if (wait.status() != InteractionStatus.CANCELLED && wait.status() != InteractionStatus.EXPIRED) {
+            throw new SQLException("unsupported Ja approval close state");
+        }
+        if (approval.decision() != null) {
+            throw new SQLException("closed Ja approval conflicts with a committed user decision");
         }
     }
 

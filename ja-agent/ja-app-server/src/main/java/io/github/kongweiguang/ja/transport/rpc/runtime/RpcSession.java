@@ -12,6 +12,7 @@ import io.github.kongweiguang.ja.agent.application.concurrent.ShutdownDeadline;
 import io.github.kongweiguang.ja.agent.application.gateway.JsonValueCodec;
 import io.github.kongweiguang.ja.agent.domain.concurrent.CancellationToken;
 import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
+import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
 import io.github.kongweiguang.ja.attachment.application.api.AttachmentPreviewUseCase;
 import io.github.kongweiguang.ja.attachment.application.api.AttachmentUseCase;
 import io.github.kongweiguang.ja.catalog.application.api.CatalogUseCase;
@@ -19,6 +20,7 @@ import io.github.kongweiguang.ja.catalog.application.api.ThreadMcpUseCase;
 import io.github.kongweiguang.ja.configuration.application.api.ConfigurationUseCase;
 import io.github.kongweiguang.ja.conversation.domain.model.ContextCompactionEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
+import io.github.kongweiguang.ja.conversation.domain.model.ThreadDiscovery;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadMetadataEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadSnapshot;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnSummary;
@@ -90,6 +92,7 @@ public final class RpcSession implements AutoCloseable {
     private final String serverInstanceId = "srv_ja_" + UUID.randomUUID().toString().replace("-", "");
     private final AtomicLong eventIds = new AtomicLong();
     private final AtomicBoolean closing = new AtomicBoolean();
+    private final AtomicBoolean coldApprovalObservationScanned = new AtomicBoolean();
     private final Object runtimePublicationLock = new Object();
     private final Set<CompletableFuture<Void>> runtimePublications = new HashSet<>();
     private final ReentrantLock runtimeOpenLock = new ReentrantLock();
@@ -433,6 +436,14 @@ public final class RpcSession implements AutoCloseable {
             opening = beginRuntimeOpen();
             factory.retryStorage();
             openRuntime();
+            if (ready && servicesAvailable()) {
+                try {
+                    observeColdApprovalWaits();
+                } catch (RuntimeException | Error failure) {
+                    failProjection(failure);
+                    throw failure;
+                }
+            }
         } finally {
             try {
                 completeRuntimeOpen(opening);
@@ -464,9 +475,261 @@ public final class RpcSession implements AutoCloseable {
         }
         try {
             notifyRuntime("ready", null).join();
+            if (servicesAvailable()) {
+                observeColdApprovalWaits();
+            }
         } finally {
             completeRuntimePublication(publication);
         }
+    }
+
+    /**
+     * 就绪帧完成后只为确有未决审批的 MAIN/SUBAGENT 恢复 Bridge 观察；Core 的持久恢复与 Task 投影仍由原 owner 负责。
+     * 分页无固定总数上限，关闭或取消会在页边界及时停止，损坏/重复游标作为连接启动失败处理。
+     *
+     * @author kongweiguang
+     */
+    private void observeColdApprovalWaits() {
+        if (!ready || closing.get() || !servicesAvailable()
+                || !coldApprovalObservationScanned.compareAndSet(false, true)) {
+            return;
+        }
+        Set<String> seenCursors = new HashSet<>();
+        String cursor = null;
+        try {
+            do {
+                checkColdApprovalScanActive();
+                CursorPage<ThreadDiscovery> page = Objects.requireNonNull(
+                        threads().discoverThreads(new ThreadDiscovery.Query("all", null, cursor, 200)),
+                        "thread discovery page");
+                for (ThreadDiscovery candidate : page.items()) {
+                    checkColdApprovalScanActive();
+                    if (candidate.kind() != ThreadDiscovery.Kind.MAIN
+                            && candidate.kind() != ThreadDiscovery.Kind.SUBAGENT) {
+                        continue;
+                    }
+                    if (candidate.latestTurnId() == null
+                            || candidate.status() != ThreadDiscovery.Status.WAITING_APPROVAL
+                            && candidate.status() != ThreadDiscovery.Status.SUSPENDED) {
+                        continue;
+                    }
+                    observeColdApprovalWait(candidate);
+                }
+                String nextCursor = page.nextCursor();
+                if (nextCursor == null) {
+                    cursor = null;
+                } else if (nextCursor.equals(cursor) || !seenCursors.add(nextCursor)) {
+                    throw new IllegalStateException("thread discovery cursor did not advance");
+                } else {
+                    cursor = nextCursor;
+                }
+            } while (cursor != null);
+        } catch (RuntimeException | Error failure) {
+            // A partially restored session must not be reported ready; lifecycle shutdown releases attached watches.
+            coldApprovalObservationScanned.set(false);
+            throw failure;
+        }
+    }
+
+    /**
+     * 检查逐页恢复能否继续，避免长历史扫描在 RPC 关闭后继续占用存储。
+     *
+     * @author kongweiguang
+     */
+    private void checkColdApprovalScanActive() {
+        if (closing.get() || cancellation.isCancellationRequested()) {
+            throw JaRpcException.of(JaErrorCatalog.SHUTTING_DOWN, "runtime is shutting down");
+        }
+    }
+
+    /**
+     * 使用同一轮读取确认 latest path 及实际未决审批，再先登记路由后 attach Bridge；若快照与 Turn 投影跨越审批到期，
+     * 只重读一次以收敛到稳定身份，避免无限追逐并发更新。Observe 返回 false 时只清除本次新建的路由。
+     *
+     * @author kongweiguang
+     */
+    private void observeColdApprovalWait(ThreadDiscovery candidate) {
+        String threadId = candidate.threadId();
+        String turnId = candidate.latestTurnId();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            checkColdApprovalScanActive();
+            ThreadSnapshot snapshot = threads().readThreadLatest(threadId, null, 200).orElse(null);
+            if (snapshot == null || !snapshot.thread().threadId().equals(threadId)) {
+                return;
+            }
+            if (!snapshot.thread().workspaceId().equals(candidate.workspaceId())) {
+                throw new IllegalStateException("discovered thread workspace identity changed");
+            }
+            if (!turnId.equals(snapshot.thread().latestTurnId())) {
+                return;
+            }
+            ThreadSnapshot.Turn snapshotTurn = snapshot.turns().stream()
+                    .filter(turn -> turn.turnId().equals(turnId)
+                            && turn.origin() == ThreadSnapshot.Origin.NATIVE)
+                    .findFirst().orElse(null);
+            if (snapshotTurn == null) {
+                continue;
+            }
+            TurnSummary turn = threads().findTurn(turnId).orElse(null);
+            if (turn == null) {
+                continue;
+            }
+            if (!turn.threadId().equals(threadId)) {
+                return;
+            }
+            long revision = snapshot.thread().revision();
+            if (turn.threadRevision() > revision
+                    || turn.turnMutationVersion() != snapshotTurn.mutationVersion()
+                    || !turn.status().equalsIgnoreCase(snapshotTurn.status())
+                    || snapshot.thread().latestTurnStatus() == null
+                    || !snapshot.thread().latestTurnStatus().name().equalsIgnoreCase(snapshotTurn.status())) {
+                continue;
+            }
+            boolean waitingApproval = "waiting_approval".equalsIgnoreCase(turn.status());
+            boolean suspended = "suspended".equalsIgnoreCase(turn.status());
+            if ((!waitingApproval && !suspended) || !hasCurrentApproval(snapshot, turnId, suspended)) {
+                return;
+            }
+            ThreadNotificationRegistration registration = registerColdApprovalContext(turnId,
+                    candidate.workspaceId(), threadId, revision, turn.turnMutationVersion(), snapshotTurn.modelRound());
+            try {
+                boolean attached = turns().observeApprovalWait(turnId,
+                        coldApprovalEventSink(turnId, threadId, revision));
+                if (!attached) {
+                    releaseColdApprovalContext(turnId, registration);
+                }
+            } catch (RuntimeException | Error failure) {
+                releaseColdApprovalContext(turnId, registration);
+                throw failure;
+            }
+            return;
+        }
+    }
+
+    /** 只把当前 Turn 最后一个本地审批事实视作未决，继承历史和已裁决卡片都不能启动冷观察。 */
+    private boolean hasCurrentApproval(ThreadSnapshot snapshot, String turnId, boolean suspended) {
+        ThreadSnapshot.ApprovalItem latest = null;
+        for (ThreadSnapshot.Item item : snapshot.items()) {
+            if (item instanceof ThreadSnapshot.ApprovalItem approval
+                    && approval.origin() == ThreadSnapshot.Origin.NATIVE
+                    && approval.turnId().equals(turnId)) {
+                latest = approval;
+            }
+        }
+        return latest != null && latest.decision() == null
+                && (!suspended || !latest.expiresAt().isAfter(clock.instant()));
+    }
+
+    /**
+     * 为异步 replay 提前发布精确路由，并记录注册是否归本扫描所有，防止 false/异常误删已有活动上下文。
+     */
+    private ThreadNotificationRegistration registerColdApprovalContext(String turnId, String workspaceId,
+                                                                        String threadId, long revision,
+                                                                        long mutationVersion, int modelRound) {
+        String validatedTurnId = requireIdentifier(turnId, "turn_");
+        TurnNotificationContext proposed = new TurnNotificationContext(workspaceId, threadId, revision);
+        TurnNotificationContext current = turnNotificationContexts.putIfAbsent(validatedTurnId, proposed);
+        boolean created = current == null;
+        TurnNotificationContext context = created ? proposed : current;
+        if (!context.workspaceId().equals(workspaceId) || !context.threadId().equals(threadId)) {
+            if (created) {
+                turnNotificationContexts.remove(validatedTurnId, proposed);
+            }
+            throw JaRpcException.of(JaErrorCatalog.INVALID_STATE, "Turn notification identity changed");
+        }
+        try {
+            if (created) {
+                activeStreams.register(validatedTurnId, workspaceId, threadId, revision, mutationVersion, modelRound);
+            } else {
+                context.observeRevision(revision);
+                activeStreams.observeThreadRevision(workspaceId, threadId, revision);
+            }
+            return new ThreadNotificationRegistration(context, created);
+        } catch (RuntimeException | Error failure) {
+            releaseColdApprovalContext(validatedTurnId, new ThreadNotificationRegistration(context, created));
+            throw failure;
+        }
+    }
+
+    /** 只回收本轮新创建且仍指向同一对象的 context；Stream 清理与路由移除保持原子归属判断。 */
+    private void releaseColdApprovalContext(String turnId, ThreadNotificationRegistration registration) {
+        if (registration.created()
+                && turnNotificationContexts.remove(turnId, registration.context())) {
+            activeStreams.abandon(turnId);
+        }
+    }
+
+    /**
+     * 包装 fresh replay：旧历史仍用于 Bridge 内部 reducer，但只有 exact identity 且不早于读取 fence 的 durable 帧
+     * 才进入本 RPC 连接；无 Context 草稿永不作为冷恢复事实。非 Turn Sink 能力保持委派给唯一连接 Sink。
+     */
+    private ConversationTurnEventSink coldApprovalEventSink(String turnId, String threadId, long minimumRevision) {
+        ConversationTurnEventSink delegate = eventSink();
+        return new ConversationTurnEventSink() {
+            /** 冷回放丢弃 fence 前历史与无上下文草稿，避免陈旧 ApprovalRequested 覆盖当前挂起状态。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(TurnEvent event) {
+                TurnEvent.Context context = event.context();
+                if (context == null || !context.threadId().equals(threadId)
+                        || !context.turnId().equals(turnId)
+                        || context.threadRevision() < minimumRevision) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return delegate.publish(event);
+            }
+
+            /** Bridge 用同一 Workspace owner 构造压缩事实，不从发现摘要猜测路径。 */
+            @Override
+            public java.util.Optional<String> workspaceId(AgentIdentity identity) {
+                return delegate.workspaceId(identity);
+            }
+
+            /** durable 回放故障仍经连接的唯一投影失败通道触发 owner 关闭。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publishProjectionFailure(
+                    TurnProjectionFailure failure) {
+                return delegate.publishProjectionFailure(failure);
+            }
+
+            /** Bridge 的内部流 fence 继续更新，但只允许当前被观察身份推进。 */
+            @Override
+            public void observeCommittedTurn(String committedThreadId, String committedTurnId,
+                                             long threadRevision, long turnMutationVersion, int modelRound,
+                                             TurnEvent event, Instant occurredAt) {
+                if (threadId.equals(committedThreadId) && turnId.equals(committedTurnId)
+                        && threadRevision >= minimumRevision) {
+                    delegate.observeCommittedTurn(committedThreadId, committedTurnId, threadRevision,
+                            turnMutationVersion, modelRound, event, occurredAt);
+                }
+            }
+
+            /** 恢复仍沿用连接 Sink 的 Thread revision 观察规则，避免额外维护 stream fence。 */
+            @Override
+            public void onThreadRevision(AgentIdentity identity, long revision) {
+                if (threadId.equals(identity.threadId()) && turnId.equals(identity.turnId())
+                        && revision >= minimumRevision) {
+                    delegate.onThreadRevision(identity, revision);
+                }
+            }
+
+            /** 自动压缩仍使用已冻结 Workspace 的现有 wire mapper 与投影失败处理。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(ContextCompactionEvent event) {
+                ContextCompactionEvent.Context context = event.context();
+                if (context.turnId() == null || !context.threadId().equals(threadId)
+                        || !context.turnId().equals(turnId)
+                        || context.threadRevision() < minimumRevision) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return delegate.publish(event);
+            }
+
+            /** 线程元数据仍交给连接级统一出口，避免复制标题与 revision 的 Wire 逻辑。 */
+            @Override
+            public java.util.concurrent.CompletionStage<Void> publish(ThreadMetadataEvent event) {
+                return delegate.publish(event);
+            }
+        };
     }
 
     /**
@@ -1779,6 +2042,10 @@ public final class RpcSession implements AutoCloseable {
         private void observeRevision(long revision) {
             threadRevision.accumulateAndGet(revision, Math::max);
         }
+    }
+
+    /** 冷审批扫描记录该上下文是否由自己创建，以便 false attach 时不误删既有 owner。 */
+    private record ThreadNotificationRegistration(TurnNotificationContext context, boolean created) {
     }
 
 }

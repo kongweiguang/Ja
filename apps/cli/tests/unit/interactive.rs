@@ -25,6 +25,331 @@ mod controller {
         use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
 
+        /// @author kongweiguang
+        /// 嵌套子任务按直接父会话刷新；共享 root 不能把孙任务活动泄漏到主会话。
+        #[test]
+        fn task_activity_notification_matches_direct_parent_thread() {
+            let params = json!({
+                "rootThreadId":"thr_root",
+                "taskThreadId":"thr_child",
+                "task":{"parentThreadId":"thr_parent"}
+            });
+            assert!(interactive::task_activity_targets_thread(&params, "thr_parent").unwrap());
+            assert!(!interactive::task_activity_targets_thread(&params, "thr_root").unwrap());
+            assert!(!interactive::task_activity_targets_thread(&params, "thr_sibling").unwrap());
+            assert!(interactive::task_activity_targets_thread(&json!({}), "thr_parent").is_err());
+        }
+
+        /// @author kongweiguang
+        /// 子任务关闭只承认严格的服务端 ID 回执，不允许空集合、缺目标、重复项或删除存活 root。
+        #[test]
+        fn task_close_receipt_requires_exact_nonempty_identity_set() {
+            assert_eq!(
+                interactive::validate_task_close_receipt(
+                    &json!({"closedThreadIds":["thr_child","thr_grandchild"]}),
+                    "thr_child",
+                    "thr_root"
+                )
+                .unwrap(),
+                ["thr_child", "thr_grandchild"]
+            );
+            for receipt in [
+                json!({"closedThreadIds": []}),
+                json!({"closedThreadIds": ["thr_other"]}),
+                json!({"closedThreadIds": ["thr_child", "thr_child"]}),
+                json!({"closedThreadIds": ["thr_child", "thr_root"]}),
+                json!({"closed": true}),
+            ] {
+                assert!(
+                    interactive::validate_task_close_receipt(&receipt, "thr_child", "thr_root")
+                        .is_err(),
+                    "accepted {receipt}"
+                );
+            }
+        }
+
+        /// @author kongweiguang
+        /// An uncertain `/btw` body can follow only the user-selected SideChat under the exact original lineage.
+        #[test]
+        fn uncertain_side_chat_body_requires_matching_selected_identity() {
+            use std::collections::HashMap;
+
+            let mut recoveries = HashMap::from([(
+                "thr_parent".to_owned(),
+                interactive::PendingSideChatRecovery {
+                    root_thread_id: "thr_root".into(),
+                    workspace_id: "ws_main".into(),
+                    candidate_thread_id: None,
+                    content: "  完整正文 🙂  ".into(),
+                    inspected: false,
+                },
+            )]);
+            let candidate = |thread_id: &str,
+                             workspace_id: &str,
+                             root_thread_id: &str,
+                             parent_thread_id: &str,
+                             thread_kind| ThreadContext {
+                thread_id: thread_id.into(),
+                title: "侧聊".into(),
+                workspace_id: workspace_id.into(),
+                workspace_root: "C:/workspace".into(),
+                thread_kind,
+                parent_thread_id: Some(parent_thread_id.into()),
+                root_thread_id: root_thread_id.into(),
+                provider_id: "provider".into(),
+                model_id: "model".into(),
+                reasoning_level: None,
+                access_mode: "default".into(),
+                revision: 1,
+            };
+
+            for mismatch in [
+                candidate(
+                    "thr_wrong_parent",
+                    "ws_main",
+                    "thr_root",
+                    "thr_elsewhere",
+                    super::DiscoveredThreadKind::SideChat,
+                ),
+                candidate(
+                    "thr_wrong_workspace",
+                    "ws_other",
+                    "thr_root",
+                    "thr_parent",
+                    super::DiscoveredThreadKind::SideChat,
+                ),
+                candidate(
+                    "thr_wrong_root",
+                    "ws_main",
+                    "thr_other_root",
+                    "thr_parent",
+                    super::DiscoveredThreadKind::SideChat,
+                ),
+                candidate(
+                    "thr_subagent",
+                    "ws_main",
+                    "thr_root",
+                    "thr_parent",
+                    super::DiscoveredThreadKind::Subagent,
+                ),
+            ] {
+                assert!(
+                    interactive::pending_side_chat_recovery_candidate(
+                        &mut recoveries,
+                        "thr_parent",
+                        &mismatch
+                    )
+                    .is_none()
+                );
+            }
+            assert_eq!(
+                interactive::pending_side_chat_recovery_candidate(
+                    &mut recoveries,
+                    "thr_parent",
+                    &candidate(
+                        "thr_child",
+                        "ws_main",
+                        "thr_root",
+                        "thr_parent",
+                        super::DiscoveredThreadKind::SideChat,
+                    )
+                )
+                .as_deref(),
+                Some("  完整正文 🙂  ")
+            );
+            assert!(
+                interactive::pending_side_chat_recovery_candidate(
+                    &mut recoveries,
+                    "thr_parent",
+                    &candidate(
+                        "thr_another_child",
+                        "ws_main",
+                        "thr_root",
+                        "thr_parent",
+                        super::DiscoveredThreadKind::SideChat,
+                    )
+                )
+                .is_none()
+            );
+        }
+
+        /// @author kongweiguang
+        /// A close receipt removes only exact Thread payloads, preserving other pending first sends.
+        #[test]
+        fn close_receipt_preserves_other_side_chat_pending_bodies() {
+            use std::collections::HashMap;
+
+            let mut pending_content = HashMap::from([
+                ("thr_closed_child".into(), "remove me".into()),
+                ("thr_live_child".into(), "保留的首发正文".into()),
+            ]);
+            let recovery = |content: &str| interactive::PendingSideChatRecovery {
+                root_thread_id: "thr_root".into(),
+                workspace_id: "ws_main".into(),
+                candidate_thread_id: None,
+                content: content.into(),
+                inspected: false,
+            };
+            let mut recoveries = HashMap::from([
+                ("thr_closed_parent".into(), recovery("remove")),
+                ("thr_live_parent".into(), recovery("keep")),
+            ]);
+
+            interactive::retain_open_side_chat_payloads(
+                &mut pending_content,
+                &mut recoveries,
+                &["thr_closed_child".into(), "thr_closed_parent".into()],
+            );
+
+            assert_eq!(pending_content.len(), 1);
+            assert_eq!(
+                pending_content.get("thr_live_child").map(String::as_str),
+                Some("保留的首发正文")
+            );
+            assert_eq!(recoveries.len(), 1);
+            assert!(recoveries.contains_key("thr_live_parent"));
+        }
+
+        /// @author kongweiguang
+        /// 恢复目录应把过期审批的 suspended 明确显示为暂停，而不是工作或终态取消。
+        #[test]
+        fn thread_choice_exposes_paused_child_for_resume() {
+            assert_eq!(interactive::thread_status_label("suspended"), "已暂停");
+            assert_eq!(
+                interactive::combine_thread_choice_detail("subagent", Some("已暂停"), None)
+                    .unwrap(),
+                Some("子任务 · 已暂停".into())
+            );
+        }
+
+        /// @author kongweiguang
+        /// A child visible in global discovery must still fail selection if its task/read identity
+        /// or lifecycle changed; candidate visibility is never permission to fall back to MAIN.
+        #[test]
+        fn visible_subagent_candidate_is_rejected_after_identity_or_lifecycle_changes() {
+            assert_eq!(
+                interactive::combine_thread_choice_detail(
+                    "subagent",
+                    Some("等待审批"),
+                    Some("项目")
+                )
+                .unwrap(),
+                Some("子任务 · 等待审批 · 项目".into())
+            );
+            let valid = json!({
+                "task": {
+                    "taskThreadId":"thr_child",
+                    "parentThreadId":"thr_parent",
+                    "rootThreadId":"thr_root",
+                    "taskKind":"subagent",
+                    "lifecycle":"attached",
+                    "originTurnId":"turn_origin"
+                },
+                "thread": {
+                    "threadId":"thr_child",
+                    "workspaceId":"ws_main",
+                    "status":"active"
+                }
+            });
+            assert!(
+                interactive::task_read_thread_metadata(&valid, "thr_child", "ws_main", "subagent")
+                    .is_ok()
+            );
+            for stale in [
+                {
+                    let mut value = valid.clone();
+                    value["thread"]["workspaceId"] = json!("ws_other");
+                    value
+                },
+                {
+                    let mut value = valid.clone();
+                    value["thread"]["status"] = json!("closing");
+                    value
+                },
+                {
+                    let mut value = valid.clone();
+                    value["task"]["taskThreadId"] = json!("thr_another");
+                    value
+                },
+                {
+                    let mut value = valid.clone();
+                    value["task"]["lifecycle"] = json!("independent");
+                    value
+                },
+            ] {
+                assert!(
+                    interactive::task_read_thread_metadata(
+                        &stale,
+                        "thr_child",
+                        "ws_main",
+                        "subagent"
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        /// @author kongweiguang
+        /// 审批后刷新、F5/status 与偏好回读必须沿用子会话 task/read 来源，不能退回 MAIN 历史目录。
+        #[test]
+        fn authoritative_metadata_source_follows_thread_kind_without_main_fallback() {
+            use interactive::{ThreadMetadataReadSource, thread_metadata_read_source};
+
+            assert_eq!(
+                thread_metadata_read_source(super::DiscoveredThreadKind::Main),
+                ThreadMetadataReadSource::WorkspaceThreadList
+            );
+            assert_eq!(
+                thread_metadata_read_source(super::DiscoveredThreadKind::SideChat),
+                ThreadMetadataReadSource::TaskRead("side_chat")
+            );
+            assert_eq!(
+                thread_metadata_read_source(super::DiscoveredThreadKind::Subagent),
+                ThreadMetadataReadSource::TaskRead("subagent")
+            );
+        }
+
+        /// @author kongweiguang
+        /// 审批后的 task/read 若改了 parent/root，刷新不能把结果应用到当前 CLI 会话。
+        #[test]
+        fn active_task_metadata_must_keep_selected_parent_and_root() {
+            let thread = ThreadContext {
+                thread_id: "thr_child".into(),
+                title: "子任务".into(),
+                workspace_id: "ws_main".into(),
+                workspace_root: "C:/workspace".into(),
+                thread_kind: super::DiscoveredThreadKind::Subagent,
+                parent_thread_id: Some("thr_parent".into()),
+                root_thread_id: "thr_root".into(),
+                provider_id: "provider".into(),
+                model_id: "model".into(),
+                reasoning_level: None,
+                access_mode: "default".into(),
+                revision: 1,
+            };
+
+            assert!(
+                interactive::validate_active_task_lineage(&thread, "thr_parent", "thr_root")
+                    .is_ok()
+            );
+            assert!(
+                interactive::validate_active_task_lineage(
+                    &thread,
+                    "thr_changed_parent",
+                    "thr_root"
+                )
+                .is_err()
+            );
+            assert!(
+                interactive::validate_active_task_lineage(
+                    &thread,
+                    "thr_parent",
+                    "thr_changed_root"
+                )
+                .is_err()
+            );
+        }
+
         /// 压缩快照恢复当前请求序号，重试事件与终态仅作用于对应 compaction。
         #[test]
         fn compaction_activity_tracks_retry_and_authoritative_snapshot() {
@@ -462,6 +787,9 @@ mod controller {
                 title: "来源".into(),
                 workspace_id: "ws_source".into(),
                 workspace_root: "C:/workspace".into(),
+                thread_kind: super::DiscoveredThreadKind::Main,
+                parent_thread_id: None,
+                root_thread_id: "thr_source".into(),
                 provider_id: "provider".into(),
                 model_id: "model".into(),
                 reasoning_level: None,
@@ -482,6 +810,9 @@ mod controller {
                 title: "来源（分叉）".into(),
                 workspace_id: "ws_source".into(),
                 workspace_root: "C:/workspace".into(),
+                thread_kind: super::DiscoveredThreadKind::Main,
+                parent_thread_id: None,
+                root_thread_id: "thr_child".into(),
                 provider_id: "provider".into(),
                 model_id: "model".into(),
                 reasoning_level: None,

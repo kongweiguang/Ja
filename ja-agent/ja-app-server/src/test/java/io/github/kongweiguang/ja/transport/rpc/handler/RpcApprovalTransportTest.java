@@ -31,6 +31,7 @@ import io.github.kongweiguang.ja.agent.domain.turn.TurnState;
 import io.github.kongweiguang.ja.conversation.domain.model.TurnEvent;
 import io.github.kongweiguang.ja.conversation.domain.model.ToolPresentation;
 import io.github.kongweiguang.ja.conversation.domain.model.ConversationTurnEventSink;
+import io.github.kongweiguang.ja.collaboration.application.api.TaskUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.application.api.TurnStartRequest;
 import io.github.kongweiguang.ja.conversation.application.api.InternalTurnStartRequest;
@@ -43,8 +44,10 @@ import io.github.kongweiguang.ja.plan.domain.PlanModels.PlanStatus;
 import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
 import io.github.kongweiguang.ja.foundation.runtime.SidecarConfiguration;
 import io.github.kongweiguang.ja.workspace.domain.model.Workspace;
+import io.github.kongweiguang.ja.workspace.domain.model.WorkspaceFailure;
 import io.github.kongweiguang.ja.workspace.application.api.WorkspaceUseCase;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
@@ -64,6 +67,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static io.github.kongweiguang.ja.transport.rpc.runtime.RpcRuntimeTestAccess.markReady;
 import static io.github.kongweiguang.ja.conversation.testsupport.ConversationTestFixtures.preferences;
@@ -79,6 +83,75 @@ final class RpcApprovalTransportTest {
                 .toAbsolutePath().normalize();
         return new SidecarConfiguration(root.resolve("home"), root.resolve("data"),
                 root.resolve("run"), root.resolve("logs"));
+    }
+
+    /** 仅替换绑定中的 Task 装饰器，保留其它显式端口，供 RPC continuation 验证实际接收的 sink。
+     * @author kongweiguang
+     */
+    private static RpcServiceBindings withTaskUseCase(RpcServiceBindings base, TaskUseCase tasks) {
+        return new RpcServiceBindings(base.workspaces(), base.workspacePathSearch(), base.threads(), base.threadMcp(),
+                base.turns(), base.compactions(), base.approvals(), base.catalog(), base.attachments(),
+                base.attachmentPreviews(), tasks, base.plans(), base.interactions(), base.processes(), base.reviews(),
+                base.lifecycle());
+    }
+
+    /** 记录 wrapper 接线与下游事件，其他 Task 能力仍 fail closed，避免 transport 测试获得隐式实现。
+     * @author kongweiguang
+     */
+    private static final class TaskEventProbe {
+        private final AtomicInteger projectionCalls = new AtomicInteger();
+        private final AtomicInteger projectedTurnEvents = new AtomicInteger();
+        private final AtomicReference<String> projectedThreadId = new AtomicReference<>();
+        private final AtomicReference<ConversationTurnEventSink> projectedSink = new AtomicReference<>();
+        private final AtomicReference<ConversationTurnEventSink> receivedEventSink = new AtomicReference<>();
+        private final TaskUseCase api = (TaskUseCase) java.lang.reflect.Proxy.newProxyInstance(
+                TaskUseCase.class.getClassLoader(), new Class<?>[]{TaskUseCase.class}, (proxy, method, arguments) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return switch (method.getName()) {
+                            case "toString" -> "TaskEventProbe";
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            case "equals" -> proxy == arguments[0];
+                            default -> throw unsupported();
+                        };
+                    }
+                    return switch (method.getName()) {
+                        case "projectContinuationEvents" -> {
+                            projectionCalls.incrementAndGet();
+                            projectedThreadId.set((String) arguments[0]);
+                            ConversationTurnEventSink downstream = (ConversationTurnEventSink) arguments[1];
+                            ConversationTurnEventSink projected = (ConversationTurnEventSink)
+                                    java.lang.reflect.Proxy.newProxyInstance(
+                                            ConversationTurnEventSink.class.getClassLoader(),
+                                            new Class<?>[]{ConversationTurnEventSink.class},
+                                            (sinkProxy, sinkMethod, sinkArguments) -> {
+                                                if (sinkMethod.getDeclaringClass() == Object.class) {
+                                                    return switch (sinkMethod.getName()) {
+                                                        case "toString" -> "ProjectedTaskEventSink";
+                                                        case "hashCode" -> System.identityHashCode(sinkProxy);
+                                                        case "equals" -> sinkProxy == sinkArguments[0];
+                                                        default -> throw unsupported();
+                                                    };
+                                                }
+                                                if ("publish".equals(sinkMethod.getName())
+                                                        && sinkArguments != null && sinkArguments.length == 1
+                                                        && sinkArguments[0] instanceof TurnEvent) {
+                                                    projectedTurnEvents.incrementAndGet();
+                                                }
+                                                try {
+                                                    return sinkMethod.invoke(downstream, sinkArguments);
+                                                } catch (InvocationTargetException failure) {
+                                                    throw failure.getCause();
+                                                }
+                                            });
+                            projectedSink.set(projected);
+                            yield projected;
+                        }
+                        case "closeTemporarySideChats", "close" -> null;
+                        case "hasLiveNativeClientWork" -> false;
+                        case "subscribe" -> (AutoCloseable) () -> { };
+                        default -> throw unsupported();
+                    };
+                });
     }
 
     /** 无效决策必须在 resolve 前以稳定错误拒绝；有效决策的 resolved 通知须先于响应完成 flush。 */
@@ -153,7 +226,9 @@ final class RpcApprovalTransportTest {
         }
     }
 
-    /** 新连接没有收到 requested 通知时仍可依据持久用例回答，不能依赖连接本地 pending。 */
+    /** 新连接没有收到 requested 通知时仍可依据持久用例回答；裁决事件必须走 Task 感知的连接 sink。
+     * @author kongweiguang
+     */
     @Test
     void reconnectAnswersWithoutConnectionLocalApproval() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
@@ -172,6 +247,10 @@ final class RpcApprovalTransportTest {
                     new RpcCommand(RpcMethod.APPROVAL_RESPOND, params)).toCompletableFuture().get(2, TimeUnit.SECONDS);
             assertTrue(result.path("accepted").booleanValue());
             assertEquals(4, result.path("threadRevision").longValue());
+            assertEquals(1, services.taskEvents.projectionCalls.get());
+            assertEquals("thr_test", services.taskEvents.projectedThreadId.get());
+            assertSame(services.taskEvents.projectedSink.get(), services.taskEvents.receivedEventSink.get());
+            assertEquals(1, services.taskEvents.projectedTurnEvents.get());
         }
     }
 
@@ -453,9 +532,8 @@ final class RpcApprovalTransportTest {
         }
     }
 
-    /**
-     * turn/resume 只接收原 Turn identity 与 Thread CAS；工作区和通知关联必须从权威投影恢复，
-     * 不能要求 React 回传运行时快照或生成新的 Operation identity。
+    /** turn/resume 只接收原 Turn identity 与 Thread CAS；通知 sink 还必须穿过 Task 投影装饰器。
+     * @author kongweiguang
      */
     @Test
     void turnResumeDelegatesOriginalIdentityAndAuthoritativeNotificationContext() throws Exception {
@@ -486,6 +564,9 @@ final class RpcApprovalTransportTest {
             assertEquals(8, response.path("threadRevision").longValue());
             assertTrue(response.path("accepted").booleanValue());
             assertTrue(response.path("queued").booleanValue());
+            assertEquals(1, services.taskEvents.projectionCalls.get());
+            assertEquals("thr_start", services.taskEvents.projectedThreadId.get());
+            assertSame(services.taskEvents.projectedSink.get(), turns.resumedEventSink.get());
         } finally {
             if (session != null) {
                 session.close();
@@ -525,6 +606,32 @@ final class RpcApprovalTransportTest {
                 session.close();
             }
             writer.close();
+        }
+    }
+
+    /** 冷重启后 Workspace 未打开时返回可恢复的领域错误，且绝不准入 Turn resume。
+     * @author kongweiguang
+     */
+    @Test
+    void turnResumeMapsClosedWorkspaceToNotFoundWithoutAdmission() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        StartServices services = new StartServices();
+        WorkspaceUseCase closedWorkspace = new StartWorkspaces(services.workspace,
+                new WorkspaceFailure(WorkspaceFailure.Code.WORKSPACE_NOT_OPEN, "fixture workspace is closed"));
+        try (StdioWriter writer = new StdioWriter(new ByteArrayOutputStream(), mapper, 4 * 1024 * 1024);
+             RpcSession session = new RpcSession(testConfiguration(), mapper, CLOCK, writer,
+                     ignored -> services.bindings(closedWorkspace), TestConfigurationPorts.unavailable())) {
+            session.initialize();
+            markReady(session, "0123456789abcdef0123456789abcdef");
+            ObjectNode params = mapper.createObjectNode().put("turnId", "turn_resume")
+                    .put("expectedThreadRevision", 7);
+
+            JaRpcException failure = assertThrows(JaRpcException.class,
+                    () -> new TurnApprovalHandler(session)
+                            .handle(new RpcCommand(RpcMethod.TURN_RESUME, params)));
+
+            assertEquals("WORKSPACE_NOT_FOUND", failure.errorCode());
+            assertNull(((CapturingTurns) services.turns).resumedTurn.get());
         }
     }
 
@@ -877,9 +984,12 @@ final class RpcApprovalTransportTest {
         private final AtomicReference<ApprovalUseCase.Failure> failure = new AtomicReference<>();
         private final AtomicInteger resolveCalls = new AtomicInteger();
         private final AtomicInteger resolvedEventAttempts = new AtomicInteger();
+        private final TaskEventProbe taskEvents = new TaskEventProbe();
         private final ThreadUseCase history = new ApprovalHistory();
         private final ApprovalUseCase approvals = new ApprovalUseCase() {
-            /** 记录 resolve 与事件尝试，使非法输入的零副作用边界可被直接断言。 */
+            /** 记录 resolve 并沿 Handler 提供的 sink 发布事件，锁定 Task wrapper 与原 Timeline 路由。
+             * @author kongweiguang
+             */
             @Override
             public java.util.concurrent.CompletionStage<ApprovalUseCase.Resolution> resolve(
                     String threadId, String turnId, String approvalId, long expectedThreadRevision,
@@ -891,16 +1001,21 @@ final class RpcApprovalTransportTest {
                     return CompletableFuture.failedFuture(new ApprovalUseCase.ApprovalException(configuredFailure));
                 }
                 resolvedEventAttempts.incrementAndGet();
-                session.get().publish(new TurnEvent.ApprovalResolved(
-                        context("evt_resolved", 4), approvalId, response));
-                return java.util.concurrent.CompletableFuture.completedFuture(new ApprovalUseCase.Resolution(4));
+                taskEvents.receivedEventSink.set(sink);
+                return sink.publish(new TurnEvent.ApprovalResolved(
+                        context("evt_resolved", 4), approvalId, response))
+                        .thenApply(ignored -> new ApprovalUseCase.Resolution(4));
             }
 
         };
 
-        /** 只组合审批与 Turn 查找端口，其余能力由测试拒绝实现保护。 */
+        /** 只组合审批、Turn 查找与轻量 Task 事件装饰器，未声明能力仍由拒绝实现保护。
+         * @author kongweiguang
+         */
         private RpcServiceBindings bindings() {
-            return RpcTestBindings.create(null, history, new CapturingTurns(), approvals, null, null);
+            RpcServiceBindings base = RpcTestBindings.create(null, history, new CapturingTurns(), approvals,
+                    null, null);
+            return withTaskUseCase(base, taskEvents.api);
         }
 
         /** 最小权威查询为 respond 提供准确的 Thread revision CAS 投影。 */
@@ -967,9 +1082,11 @@ final class RpcApprovalTransportTest {
             /** 审批响应夹具不读取 Session 列表。 */
             @Override
             public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-            /** 审批响应夹具不执行 Thread 发现。 */
+            /** 响应夹具没有待恢复的持久审批，启动观察不创建额外订阅。 */
             @Override
-            public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
+            public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+                return new CursorPage<>(List.of(), null);
+            }
             /** 审批响应夹具不搜索用户输入。 */
             @Override
             public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) { throw unsupported(); }
@@ -1000,6 +1117,7 @@ final class RpcApprovalTransportTest {
         private final ThreadUseCase threads;
         private final TurnUseCase turns;
         private final PlanUseCase plans;
+        private final TaskEventProbe taskEvents = new TaskEventProbe();
 
         /** 默认夹具保持单次固定快照和捕获型 Turn 端口。 */
         private StartServices() {
@@ -1055,14 +1173,26 @@ final class RpcApprovalTransportTest {
             this.plans = plans;
         }
 
-        /** 通过拒绝型测试工厂组合三个明确端口，不引入 Runtime Resolver 测试替身。 */
+        /** 通过拒绝型测试工厂组合显式端口，只为 continuation 注入可观察的 Task 事件装饰器。
+         * @author kongweiguang
+         */
         private RpcServiceBindings bindings() {
+            return bindings(new StartWorkspaces(workspace));
+        }
+
+        /** 仅为 workspace 错误映射回归替换工作区端口，保留其余显式拒绝型服务绑定。
+         * @author kongweiguang
+         */
+        private RpcServiceBindings bindings(WorkspaceUseCase selectedWorkspaces) {
+            RpcServiceBindings base;
             if (plans != null) {
-                return RpcTestBindings.createWithPlans(new StartWorkspaces(workspace), threads,
+                base = RpcTestBindings.createWithPlans(selectedWorkspaces, threads,
                         turns, null, null, plans, null);
+            } else {
+                base = RpcTestBindings.create(selectedWorkspaces, threads,
+                        turns, null, null, null);
             }
-            return RpcTestBindings.create(new StartWorkspaces(workspace), threads,
-                    turns, null, null, null);
+            return withTaskUseCase(base, taskEvents.api);
         }
     }
 
@@ -1133,10 +1263,19 @@ final class RpcApprovalTransportTest {
     /** 仅允许按已打开身份取得固定工作区，任何其他工作区操作均失败。 */
     private static final class StartWorkspaces implements WorkspaceUseCase {
         private final Workspace workspace;
+        private final WorkspaceFailure failureOnRequireOpen;
 
         /** 固定预先打开的工作区，使测试不会产生文件系统副作用。 */
         private StartWorkspaces(Workspace workspace) {
+            this(workspace, null);
+        }
+
+        /** 在指定用例中模拟 workspace 未打开，避免真实文件系统依赖。
+         * @author kongweiguang
+         */
+        private StartWorkspaces(Workspace workspace, WorkspaceFailure failureOnRequireOpen) {
             this.workspace = workspace;
+            this.failureOnRequireOpen = failureOnRequireOpen;
         }
 
         /** 未声明工作区打开能力。 */
@@ -1158,8 +1297,13 @@ final class RpcApprovalTransportTest {
                 acquireAdmission(String workspaceId) {
             return io.github.kongweiguang.ja.workspace.application.gateway.WorkspaceAdmissionPort.noOpLease();
         }
-        /** 仅返回与 Thread 关联且已经打开的工作区。 */
+        /** 默认只返回关联的已打开工作区，指定失败时复现冷重启后的关闭状态。
+         * @author kongweiguang
+         */
         @Override public Workspace requireOpenWorkspace(String workspaceId) {
+            if (failureOnRequireOpen != null) {
+                throw failureOnRequireOpen;
+            }
             if (!workspace.workspaceId().equals(workspaceId)) {
                 throw unsupported();
             }
@@ -1243,9 +1387,11 @@ final class RpcApprovalTransportTest {
         /** 启动预检不列出跨 Session Thread。 */
         @Override
         public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-        /** 启动预检不执行 Thread 发现。 */
+        /** 预检夹具没有待恢复的持久审批，启动观察只接收空发现页。 */
         @Override
-        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
+        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+            return new CursorPage<>(List.of(), null);
+        }
         /** 启动预检不搜索用户输入。 */
         @Override
         public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) { throw unsupported(); }
@@ -1265,6 +1411,7 @@ final class RpcApprovalTransportTest {
         private final AtomicReference<TurnStartRequest> request = new AtomicReference<>();
         private final AtomicReference<String> resumedTurn = new AtomicReference<>();
         private final AtomicReference<Long> resumedRevision = new AtomicReference<>();
+        private final AtomicReference<ConversationTurnEventSink> resumedEventSink = new AtomicReference<>();
         private final AtomicReference<ToolRecoveryRequest> recoveryRequest = new AtomicReference<>();
         private final boolean recoveryRemainsPending;
         private final TurnUseCase.InputMutationFailure inputFailure;
@@ -1343,14 +1490,19 @@ final class RpcApprovalTransportTest {
         @Override public Optional<String> locallyActiveTurnId(String threadId) { return Optional.empty(); }
         /** 捕获型 transport 夹具不持有任何特定 Turn 的执行句柄。 */
         @Override public boolean locallyOwnsTurn(String threadId, String turnId) { return false; }
+        /** 捕获型 transport 夹具不创建持久事件观察或后台 watcher。 @author kongweiguang */
+        @Override public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) { return false; }
 
-        /** 捕获原 Turn identity 与 CAS，证明 transport 没有生成新 Operation 或传递配置快照。 */
+        /** 捕获原 Turn identity、CAS 与装饰后的事件 sink，证明恢复不生成新 Operation 或配置快照。
+         * @author kongweiguang
+         */
         @Override
         public Accepted resume(String turnId, long expectedThreadRevision, ConversationTurnEventSink sink) {
             if (!resumedTurn.compareAndSet(null, turnId)) {
                 throw unsupported();
             }
             resumedRevision.set(expectedThreadRevision);
+            resumedEventSink.set(sink);
             if (recoveryRemainsPending) {
                 throw TurnResumeException.of(ResumeFailure.RECOVERY_REQUIRED);
             }
@@ -1445,9 +1597,11 @@ final class RpcApprovalTransportTest {
         /** 竞态夹具不列出跨 Session Thread。 */
         @Override
         public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-        /** 竞态夹具不执行 Thread 发现。 */
+        /** 竞态夹具没有待恢复的持久审批，避免启动观察改变待测裁决时序。 */
         @Override
-        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
+        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+            return new CursorPage<>(List.of(), null);
+        }
         /** 竞态夹具不搜索用户输入。 */
         @Override
         public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) { throw unsupported(); }
@@ -1517,9 +1671,11 @@ final class RpcApprovalTransportTest {
         /** 取消夹具不列出跨 Session Thread。 */
         @Override
         public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-        /** 取消夹具不执行 Thread 发现。 */
+        /** 取消夹具没有待恢复的持久审批，启动观察不参与取消竞态。 */
         @Override
-        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
+        public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
+            return new CursorPage<>(List.of(), null);
+        }
         /** 取消夹具不搜索用户输入。 */
         @Override
         public CursorPage<UserInputHistory> searchUserInputs(String query, String cursor, int limit) { throw unsupported(); }
@@ -1567,6 +1723,8 @@ final class RpcApprovalTransportTest {
         @Override public Optional<String> locallyActiveTurnId(String threadId) { return Optional.empty(); }
         /** 边界取消夹具不持有任何特定 Turn 的执行句柄。 */
         @Override public boolean locallyOwnsTurn(String threadId, String turnId) { return false; }
+        /** 边界取消夹具不创建持久事件观察或后台 watcher。 @author kongweiguang */
+        @Override public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) { return false; }
         /** 记录 transport 已验证的 Turn identity；completion 仍提供 TurnService 权威终态屏障。 */
         @Override public CancelResult cancel(String turnId) {
             attempts.incrementAndGet();
@@ -1657,6 +1815,8 @@ final class RpcApprovalTransportTest {
         @Override public Optional<String> locallyActiveTurnId(String threadId) { return Optional.empty(); }
         /** 重试夹具不持有任何特定 Turn 的执行句柄。 */
         @Override public boolean locallyOwnsTurn(String threadId, String turnId) { return false; }
+        /** 重试夹具不创建持久事件观察或后台 watcher。 @author kongweiguang */
+        @Override public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) { return false; }
         /** 竞态夹具不取消 Turn。 */
         @Override public CancelResult cancel(String turnId) { throw unsupported(); }
         /** 关闭测试会话时不再接纳。 */

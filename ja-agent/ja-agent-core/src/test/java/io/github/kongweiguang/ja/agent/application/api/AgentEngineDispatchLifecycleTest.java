@@ -53,6 +53,44 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 固定 facade 向 Core 移交运行时租约的同步边界，防止 close 与慢启动交错导致双重所有权。 */
 final class AgentEngineDispatchLifecycleTest {
+    /** Startup expiry restoration must reach the loop service without resolving or executing a model runtime. */
+    @Test
+    void approvalExpiryRestorationDoesNotResolveExecutionRuntime() {
+        AgentIdentity identity = new AgentIdentity("tenant_test", "thread_cold", "turn_cold", "user_test");
+        AtomicInteger restored = new AtomicInteger();
+        AgentIdentity[] restoredIdentity = new AgentIdentity[1];
+        AgentLoopExecutionService service = (AgentLoopExecutionService) Proxy.newProxyInstance(
+                AgentLoopExecutionService.class.getClassLoader(), new Class<?>[]{AgentLoopExecutionService.class},
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "restoreApprovalExpiry" -> {
+                        restoredIdentity[0] = (AgentIdentity) arguments[0];
+                        assertTrue(arguments[1] instanceof java.util.function.Consumer<?>);
+                        restored.incrementAndGet();
+                        yield null;
+                    }
+                    case "close" -> null;
+                    case "toString" -> "cold-expiry-test-service";
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        AgentStore store = (AgentStore) Proxy.newProxyInstance(AgentStore.class.getClassLoader(),
+                new Class<?>[]{AgentStore.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "toString" -> "cold-expiry-test-store";
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+        AgentEngine engine = new AgentEngineService(store, service,
+                (request, base, recovered) -> { throw new AssertionError("cold expiry must not resolve a runtime"); },
+                new ExtensionRegistry().freeze(), new AgentRequestBindingCodec(),
+                new AgentInitialQueuedInputsCodec(), new AgentEventWatchRegistry(store, 8),
+                new AgentStreamRegistry(8), new DefaultCancellationCoordinator(),
+                new ExecutionScheduler(1, 4, 4), null);
+
+        engine.restoreApprovalExpiry(identity);
+
+        assertEquals(1, restored.get());
+        assertSame(identity, restoredIdentity[0]);
+        engine.close();
+    }
+
     /** close 等待所有权移交与清理；终态已经落库而句柄未结束时，不能把取消状态冲突误判为释放失败。 */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})

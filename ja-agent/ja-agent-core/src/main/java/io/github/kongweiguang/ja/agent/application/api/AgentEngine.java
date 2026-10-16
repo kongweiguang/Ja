@@ -85,6 +85,11 @@ public interface AgentEngine extends AutoCloseable {
     AgentExecutionHandle resume(AgentIdentity identity);
 
     /**
+     * 在进程启动恢复时仅重新结算或登记持久审批的自然到期；此入口不得解析模型运行时或恢复 Driver。
+     */
+    void restoreApprovalExpiry(AgentIdentity identity);
+
+    /**
      * 查询当前执行状态，不重新派发执行。
      */
     Optional<AgentExecutionStatus> query(AgentIdentity identity);
