@@ -766,6 +766,12 @@
         <Class name="io.github.kongweiguang.ja.infrastructure.persistence.repository.MybatisHistoryService"/>
         <Method name="~(forkThread|lifecycle|closeThreadProcesses)"/>
     </Match>
+    <!-- watcher 关闭先完成身份级屏障并汇总清理结果，再保留原始 unchecked 首因供上层分类；包装会改变失败类型。 -->
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.application.service.TurnService"/><Method name="closeSubscription"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.application.service.TurnService"/><Method name="releaseSuspendedSubscription"/></Match>
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.conversation.application.service.TurnService"/><Method name="detachSuspendedSubscriptionForShutdown"/></Match>
+    <!-- 异步 sink 首因由 ExecutionException 包装；投影线程恢复原 unchecked 类型以保留既有失败分类。 -->
+    <Match><Bug pattern="THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"/><Class name="io.github.kongweiguang.ja.infrastructure.persistence.store.JaAgentEventBridge"/><Method name="awaitPublish"/></Match>
 </FindBugsFilter>
 
 

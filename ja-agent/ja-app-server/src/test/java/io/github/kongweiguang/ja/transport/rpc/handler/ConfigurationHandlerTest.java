@@ -449,10 +449,14 @@ final class ConfigurationHandlerTest {
         }
     }
 
-    /** 创建只允许组合、不允许调用的端口代理，缩小直接 handler 测试夹具。 */
+    /** 允许 Session 就绪时的无候选冷审批扫描，其它未声明端口仍失败以保持 handler 测试隔离。 */
     private static <T> T unusedPort(Class<T> type) {
         Object proxy = Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type},
                 (ignored, method, arguments) -> {
+                    if (type == ThreadUseCase.class && method.getName().equals("discoverThreads")) {
+                        return new io.github.kongweiguang.ja.agent.domain.pagination.CursorPage<>(
+                                java.util.List.of(), null);
+                    }
                     throw new UnsupportedOperationException("unused test port: " + method.getName());
                 });
         return type.cast(proxy);

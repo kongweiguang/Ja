@@ -53,7 +53,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 固定 facade 向 Core 移交运行时租约的同步边界，防止 close 与慢启动交错导致双重所有权。 */
 final class AgentEngineDispatchLifecycleTest {
-    /** Startup expiry restoration must reach the loop service without resolving or executing a model runtime. */
+    /** 启动到期恢复只应进入 loop 恢复服务，避免解析模型 runtime 引入执行或外部副作用。 */
     @Test
     void approvalExpiryRestorationDoesNotResolveExecutionRuntime() {
         AgentIdentity identity = new AgentIdentity("tenant_test", "thread_cold", "turn_cold", "user_test");

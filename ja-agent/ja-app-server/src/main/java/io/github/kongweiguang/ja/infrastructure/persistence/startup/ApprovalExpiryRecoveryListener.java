@@ -15,6 +15,7 @@ import io.github.kongweiguang.ja.agent.domain.interaction.InteractionStatus;
 import io.github.kongweiguang.ja.agent.domain.interaction.InteractionWait;
 import io.github.kongweiguang.ja.agent.domain.json.JsonText;
 import io.github.kongweiguang.ja.agent.domain.model.AgentIdentity;
+import io.github.kongweiguang.ja.agent.domain.pagination.CursorPage;
 import io.github.kongweiguang.ja.collaboration.application.service.TaskCoordinator;
 import io.github.kongweiguang.ja.conversation.application.api.ThreadUseCase;
 import io.github.kongweiguang.ja.conversation.domain.model.ThreadDiscovery;
@@ -115,7 +116,9 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
 
     /**
      * 队列缺口按固定事件水位补读；超界或无进展时保留失败供下次启动扫描收敛。
+     * Engine 由运行时组合根持有，本监听器只借用其事件读取能力；PMD 无法区分借用端口与待关闭资源。
      */
+    @SuppressWarnings("PMD.CloseResource")
     @Override
     public void onReplayRequired(ReplayRequired replay) {
         ReplayRequired request = Objects.requireNonNull(replay, "replay");
@@ -134,7 +137,7 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
                 throw new IllegalStateException("approval recovery replay cursor did not advance");
             }
             long previous = cursor;
-            for (var persisted : page.events()) {
+            for (AgentStore.PersistedEvent persisted : page.events()) {
                 if (persisted.sequence() <= previous || persisted.sequence() > request.throughSequence()) {
                     if (persisted.sequence() > request.throughSequence()) {
                         break;
@@ -190,7 +193,8 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
         int pages = 0;
         for (; pages < maxPages; pages++) {
             ensureNotInterrupted();
-            var page = threads.discoverThreads(new ThreadDiscovery.Query("all", null, cursor, pageSize));
+            CursorPage<ThreadDiscovery> page =
+                    threads.discoverThreads(new ThreadDiscovery.Query("all", null, cursor, pageSize));
             if (page.items().size() > pageSize) {
                 throw new IllegalStateException("approval recovery discovery exceeded its page bound");
             }
@@ -223,7 +227,9 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
 
     /**
      * 精确绑定最新 Turn 与 Ja approval 问题；只在 SUBAGENT 中保留 Task 恢复 claim。
+     * 恢复操作借用组合根持有的 Engine，关闭权仍属于共享生命周期 owner。
      */
+    @SuppressWarnings("PMD.CloseResource")
     private void recoverThread(ThreadDiscovery thread) {
         AgentIdentity identity = AppServerIdentity.local().execution(thread.threadId(), thread.latestTurnId());
         Optional<InteractionWait> found = request(identity);
@@ -287,11 +293,12 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
      * 固定 Core 执行水位后逐页归约最新 wait；不依赖缺席的普通交互投影，也不创建 Driver 或推进执行。
      */
     private Optional<InteractionWait> request(AgentIdentity identity) {
-        var snapshot = store.loadExecution(AppServerIdentity.local().executionKey(identity));
+        Optional<AgentStore.ExecutionSnapshot> snapshot =
+                store.loadExecution(AppServerIdentity.local().executionKey(identity));
         if (snapshot.isEmpty()) {
             return Optional.empty();
         }
-        var execution = snapshot.orElseThrow();
+        AgentStore.ExecutionSnapshot execution = snapshot.orElseThrow();
         long through = execution.lastRecordSequence();
         long cursor = 0;
         InteractionWait latest = null;
@@ -300,10 +307,10 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
                 throw new IllegalStateException("approval recovery records exceeded their page limit");
             }
             ensureNotInterrupted();
-            var page = store.readRecords(AgentStore.RecordQuery.withDefaultMaxBytes(
+            AgentStore.RecordPage page = store.readRecords(AgentStore.RecordQuery.withDefaultMaxBytes(
                     execution.key(), cursor, through, REPLAY_PAGE_SIZE));
             long previous = cursor;
-            for (var record : page.records()) {
+            for (AgentStore.StoredRecord record : page.records()) {
                 if (record.sequence() <= cursor || record.sequence() > through) {
                     throw new IllegalStateException("approval recovery record page is out of order");
                 }
@@ -338,7 +345,12 @@ public final class ApprovalExpiryRecoveryListener implements AgentEventListener,
     }
 
     /**
-     * claim 绑定本进程发现的具体交互代际；用户批准、取消或替代后会在首个对应事件移除。
+     * 绑定本进程发现的审批代际，使恢复只对同一交互版本生效并可被后续用户决定撤销。
+     *
+     * @param identity 执行身份，用于限定租户与会话归属
+     * @param interactionId 交互标识，用于识别本次审批等待
+     * @param interactionRevision 交互版本，用于拒绝过期代际的恢复投影
+     * @param childTask 是否属于子任务，用于选择对应的 Task 状态对账
      */
     private record ApprovalClaim(AgentIdentity identity,
                                  String interactionId,

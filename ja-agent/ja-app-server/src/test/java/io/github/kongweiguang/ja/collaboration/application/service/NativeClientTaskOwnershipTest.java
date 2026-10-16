@@ -4,10 +4,8 @@
 package io.github.kongweiguang.ja.collaboration.application.service;
 
 import io.github.kongweiguang.ja.agent.application.gateway.JsonValueCodec;
-import io.github.kongweiguang.ja.agent.domain.UserContent;
 import io.github.kongweiguang.ja.agent.domain.json.JsonArray;
 import io.github.kongweiguang.ja.agent.domain.json.JsonObjects;
-import io.github.kongweiguang.ja.agent.domain.model.TextContent;
 import io.github.kongweiguang.ja.collaboration.application.api.TaskUseCase;
 import io.github.kongweiguang.ja.collaboration.application.gateway.ConversationBoundary;
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskAdmissionGateway;
@@ -15,7 +13,6 @@ import io.github.kongweiguang.ja.collaboration.application.gateway.TaskMailboxPo
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskRepository;
 import io.github.kongweiguang.ja.collaboration.application.gateway.TaskRepositoryException;
 import io.github.kongweiguang.ja.collaboration.domain.model.TaskModels;
-import io.github.kongweiguang.ja.collaboration.domain.model.ThreadDefinition;
 import io.github.kongweiguang.ja.collaboration.infrastructure.acl.ConversationBoundaryAdapter;
 import io.github.kongweiguang.ja.conversation.application.api.ChildTurnScheduler;
 import io.github.kongweiguang.ja.conversation.application.api.NativeExecutionContext;
@@ -211,6 +208,7 @@ final class NativeClientTaskOwnershipTest {
      */
     @FunctionalInterface
     private interface Invocation {
+        /** 将调用身份与参数交给测试分发器，保留对代理边界的精确断言能力。 */
         Object invoke(java.lang.reflect.Method method, Object[] args);
     }
 

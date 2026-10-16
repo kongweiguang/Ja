@@ -725,7 +725,7 @@ final class TurnServiceTest {
         }
     }
 
-    /** Terminal finish racing an out-of-lock Core query fences the late cold observer before retention. @author kongweiguang */
+    /** Core 查询需在锁外执行以免阻塞终态提交；该竞争用例保证迟到的冷观察者不会被终态后保留。 */
     @Test
     void approvalObservationQueryCannotRetainAfterTerminalFinish() throws Exception {
         AgentIdentity identity = new AgentIdentity("ja.local", "thr_observe_terminal_race",

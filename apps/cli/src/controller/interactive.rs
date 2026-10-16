@@ -7449,7 +7449,7 @@ fn read_thread_metadata_until(
                 &thread.workspace_id,
                 discovery_kind,
             )?;
-            validate_active_task_lineage(&thread, &parent_thread_id, &root_thread_id)?;
+            validate_active_task_lineage(thread, &parent_thread_id, &root_thread_id)?;
             Ok(metadata)
         }
     }

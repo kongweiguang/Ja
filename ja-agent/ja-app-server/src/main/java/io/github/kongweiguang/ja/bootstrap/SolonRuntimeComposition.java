@@ -991,7 +991,7 @@ public final class SolonRuntimeComposition {
     }
 
     /**
-     * Durable expiry observer starts before Engine dispatch; its Task claim remains empty until the startup scan.
+     * 先注册持久化到期观察者，再等待启动扫描生成 Task claim，避免 Engine 事件早于恢复监听而漏接。
      */
     @Bean(value = "jaApprovalExpiryRecoveryListener", typed = true)
     public ApprovalExpiryRecoveryListener approvalExpiryRecoveryListener(
@@ -1477,7 +1477,7 @@ public final class SolonRuntimeComposition {
     }
 
     /**
-     * Startup discovery runs after temporary side-chat purge and after Engine/Task owners exist, before RPC can observe stale waits.
+     * 临时侧聊清理且 Engine、Task owner 装配完成后再扫描，确保过期 wait 在 RPC 可见前恢复到期投影。
      */
     @Bean(value = "jaApprovalExpiryStartupRecovery", typed = true)
     public ApprovalExpiryStartupRecovery approvalExpiryStartupRecovery(

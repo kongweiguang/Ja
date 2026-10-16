@@ -652,7 +652,7 @@ final class ThreadHistoryLiveStreamTest {
         private final List<String> lifecycle;
         private final ThreadUseCase proxy;
 
-        /** 固定 Thread/Turn 权威快照，令恢复测试从同一持久投影读取 revision 与 mutation 水位。 */
+        /** 固定 Thread/Turn 快照，并让 ready 阶段发现扫描确认本夹具没有待恢复审批。 */
         private RecordingThreads(List<ThreadSnapshot.Turn> turns, List<ThreadSnapshot.Item> items,
                                  List<String> lifecycle) {
             this.turns = List.copyOf(turns);
@@ -661,6 +661,9 @@ final class ThreadHistoryLiveStreamTest {
             this.proxy = (ThreadUseCase) Proxy.newProxyInstance(
                     ThreadUseCase.class.getClassLoader(), new Class<?>[]{ThreadUseCase.class},
                     (ignored, method, args) -> {
+                        if ("discoverThreads".equals(method.getName())) {
+                            return new CursorPage<>(List.of(), null);
+                        }
                         if ("readThread".equals(method.getName())) {
                             int start = args[1] == null ? 0
                                     : Integer.parseInt(((String) args[1]).substring("offset_".length()));
@@ -738,7 +741,7 @@ final class ThreadHistoryLiveStreamTest {
         /** 活动流回归不读取跨 Session Thread 列表。 */
         @Override
         public CursorPage<ThreadSummary> listSessionThreads(String cursor, int limit) { throw unsupported(); }
-        /** 活动流回归不执行 Thread 发现。 */
+        /** 活动流测试通过代理处理历史与启动扫描，直接调用该端口表示越过测试接线。 */
         @Override
         public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) { throw unsupported(); }
         /** 活动流回归不搜索用户输入。 */

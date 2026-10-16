@@ -742,6 +742,7 @@ final class WebSocketDaemonTest {
         ThreadUseCase threads = (ThreadUseCase) Proxy.newProxyInstance(getClass().getClassLoader(),
                 new Class<?>[]{ThreadUseCase.class}, (proxy, method, arguments) -> switch (method.getName()) {
                     case "readThread", "readThreadLatest" -> Optional.of(snapshot);
+                    case "discoverThreads" -> new CursorPage<ThreadDiscovery>(List.of(), null);
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
         TaskUseCase tasks = (TaskUseCase) Proxy.newProxyInstance(getClass().getClassLoader(),

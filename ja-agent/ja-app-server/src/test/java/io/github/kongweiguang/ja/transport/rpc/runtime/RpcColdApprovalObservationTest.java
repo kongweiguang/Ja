@@ -335,6 +335,12 @@ class RpcColdApprovalObservationTest {
         }
     }
 
-    private record Fixture(ThreadSnapshot snapshot, TurnSummary turn) {
+    /** 将同一持久快照与精确 Turn 投影配对，验证冷恢复只观察一致的执行代际。
+     *
+     * @param snapshot latest Thread 历史快照
+     * @param turn     与快照水位对应的持久 Turn 摘要
+     */
+    private record Fixture(ThreadSnapshot snapshot,
+                           TurnSummary turn) {
     }
 }

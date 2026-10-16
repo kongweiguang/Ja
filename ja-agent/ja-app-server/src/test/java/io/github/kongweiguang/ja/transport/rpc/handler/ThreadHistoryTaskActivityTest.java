@@ -138,10 +138,14 @@ final class ThreadHistoryTaskActivityTest {
         }
     }
 
-    /** Thread 端口只返回请求身份对应的空历史快照，Task 数据必须由独立有界端口提供。 */
+    /** Thread 端口提供空冷发现页和请求身份对应的历史快照，Task 数据仍由独立有界端口提供。 */
     private static ThreadUseCase threads() {
         return (ThreadUseCase) Proxy.newProxyInstance(ThreadUseCase.class.getClassLoader(),
                 new Class<?>[]{ThreadUseCase.class}, (proxy, method, arguments) -> {
+                    if ("discoverThreads".equals(method.getName())) {
+                        return new io.github.kongweiguang.ja.agent.domain.pagination.CursorPage<>(
+                                java.util.List.of(), null);
+                    }
                     if (!"readThread".equals(method.getName())) {
                         throw new UnsupportedOperationException(method.getName());
                     }

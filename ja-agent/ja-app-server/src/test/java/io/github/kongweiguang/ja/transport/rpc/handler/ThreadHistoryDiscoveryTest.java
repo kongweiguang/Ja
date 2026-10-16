@@ -260,12 +260,17 @@ final class ThreadHistoryDiscoveryTest {
         private String localOwnerThreadId = "thr_discovered";
         private String localActiveTurnId;
 
-        /** 返回记录器代理，保留 ThreadUseCase 的所有未声明入口为显式失败。 */
+        /** 冷扫描返回空终止页；显式 handler 查询才进入记录路径，避免混淆两种发现请求。 */
         private ThreadUseCase proxy() {
             return (ThreadUseCase) Proxy.newProxyInstance(ThreadUseCase.class.getClassLoader(),
                     new Class<?>[]{ThreadUseCase.class}, (proxy, method, arguments) -> {
                         if ("discoverThreads".equals(method.getName())) {
-                            discoveryQuery = (ThreadDiscovery.Query) arguments[0];
+                            ThreadDiscovery.Query query = (ThreadDiscovery.Query) arguments[0];
+                            if (query.query() == null && query.cursor() == null
+                                    && query.workspaceId() == null && query.limit() == 200) {
+                                return new CursorPage<>(List.of(), null);
+                            }
+                            discoveryQuery = query;
                             return new CursorPage<>(List.of(new ThreadDiscovery("thr_discovered", "review target",
                                     ThreadDiscovery.Kind.SUBAGENT, "ws_project", discoveredStatus, latestTurnId)),
                                     "cursor_next");

@@ -7,7 +7,6 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import {
   mkdir,
-  mkdtemp,
   readFile,
   realpath,
   rm,

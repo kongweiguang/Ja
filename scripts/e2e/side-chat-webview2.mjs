@@ -184,19 +184,19 @@ async function waitForCondition(label, predicate, timeoutMs = 30_000) {
   throw new Error(`${label} 超时`);
 }
 
-/** 在动作触发前观察 Composer 的公开 `aria-busy` 状态边沿；Tab 提前出现时仍等真实 Slash Promise 收敛。@author kongweiguang */
+/** 在浏览器上下文观察 Composer 的公开 busy 状态边沿；DOM 构造器来自该页面，Tab 提前出现时仍等真实 Slash Promise 收敛。@author kongweiguang */
 async function armComposerBusyCycle(page, composer) {
   const token = `side-chat-command-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   await composer.evaluate((element, probeToken) => {
     const form = element.matches("form.ja-composer")
       ? element
       : element.querySelector("form.ja-composer");
-    if (!(form instanceof HTMLFormElement)) throw new Error("Composer 表单不可观察");
+    if (!(form instanceof globalThis.HTMLFormElement)) throw new Error("Composer 表单不可观察");
     const probes =
       globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__ ??
       (globalThis.__JA_SIDE_CHAT_COMMAND_BUSY_PROBES__ = new Map());
     const entry = { phase: form.getAttribute("aria-busy") === "true" ? "busy" : "waiting" };
-    const observer = new MutationObserver(() => {
+    const observer = new globalThis.MutationObserver(() => {
       if (form.getAttribute("aria-busy") === "true") {
         entry.phase = "busy";
       } else if (entry.phase === "busy") {

@@ -48,6 +48,9 @@
     // 侧聊、侧边任务和子智能体设置各自拥有隔离 profile 与真实 WebView2 driver。
     "scripts/e2e/side-chat-runner.mjs",
     "scripts/e2e/side-chat-webview2.mjs",
+    // 真实模型验收需维护者显式指定安装产物、配置和隔离证据目录，不由应用或自动测试静态导入。
+    "scripts/e2e/real-model-cli-approval-conpty.mjs",
+    "scripts/e2e/real-model-desktop-webview2.mjs",
     "scripts/e2e/side-task-preferences-runner.mjs",
     "scripts/e2e/side-task-preferences-webview2.mjs",
     "scripts/e2e/subagent-settings-webview2.mjs",

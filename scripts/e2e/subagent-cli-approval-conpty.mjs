@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { copyFile, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFile, spawn } from "node:child_process";
@@ -703,7 +703,7 @@ function loopbackPortAcceptsConnection(host, port) {
   });
 }
 
-/** 通过 /resume 搜索精确 taskName；选中后强制断言候选是等待审批的子任务并显示当前 exec_command。 @author kongweiguang */
+/** 通过 /resume 等待精确 taskName 的审批子任务；候选证据取自实际屏幕，选中后再核对 exec_command。 @author kongweiguang */
 async function selectPendingChild(cli, taskName, runRoot, evidenceKey) {
   cli.sendKeys("/resume");
   await waitScreen(cli, (visible) => visible.includes("/resume"), `${evidenceKey} /resume command text`);
@@ -711,7 +711,7 @@ async function selectPendingChild(cli, taskName, runRoot, evidenceKey) {
   cli.sendKeys("\r");
   await waitScreen(cli, (visible) => visible.includes("恢复会话") && visible.includes("搜索标题"), `${evidenceKey} /resume selector`);
   cli.sendKeys(taskName);
-  const candidate = await waitScreen(cli, (_visible, lines) => lines.some((line) =>
+  await waitScreen(cli, (_visible, lines) => lines.some((line) =>
     /^\s*(?:›\s*)?\d+\.\s*/u.test(line) &&
     line.includes(taskName) && line.includes("子任务") && line.includes("等待审批"),
   ), `${evidenceKey} visible approval child candidate`);

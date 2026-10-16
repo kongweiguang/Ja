@@ -309,10 +309,16 @@ final class ThreadCompactionHandlerTest {
         }
     }
 
-    /** 非目标端口一旦被调用就失败，防止 Handler 越过压缩用例边界。 */
+    /** 拒绝非目标业务调用，但为 Session ready 的审批恢复扫描提供空结果。 */
     @SuppressWarnings("unchecked")
     private static <T> T unsupported(Class<T> type) {
         return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type},
-                (proxy, method, args) -> { throw new UnsupportedOperationException(method.getName()); });
+                (proxy, method, args) -> {
+                    if (type == ThreadUseCase.class && method.getName().equals("discoverThreads")) {
+                        return new io.github.kongweiguang.ja.agent.domain.pagination.CursorPage<>(
+                                java.util.List.of(), null);
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
     }
 }

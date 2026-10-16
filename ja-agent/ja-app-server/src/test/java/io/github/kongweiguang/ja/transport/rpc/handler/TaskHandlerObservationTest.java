@@ -343,10 +343,16 @@ final class TaskHandlerObservationTest {
         @Override public void close() { }
     }
 
-    /** 非目标端口一旦被调用就失败，防止 Handler 绕过 TaskUseCase。 */
+    /** 拒绝非目标业务调用，但允许 ready 阶段无候选的持久审批发现扫描。 */
     @SuppressWarnings("unchecked")
     private static <T> T unsupported(Class<T> type) {
         return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type},
-                (proxy, method, arguments) -> { throw new UnsupportedOperationException(method.getName()); });
+                (proxy, method, arguments) -> {
+                    if (type == ThreadUseCase.class && method.getName().equals("discoverThreads")) {
+                        return new io.github.kongweiguang.ja.agent.domain.pagination.CursorPage<>(
+                                java.util.List.of(), null);
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
     }
 }

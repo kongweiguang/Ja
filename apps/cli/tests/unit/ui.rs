@@ -61,32 +61,42 @@ fn btw_preserves_full_body_and_empty_command_opens_idle_side_chat() {
 }
 
 /// @author kongweiguang
-/// Thread-local composer snapshots retain each draft on return without leaking text to a child.
+/// 按 Thread 身份构造独立快照，验证返回时恢复原草稿且新子会话不会继承父草稿。
 #[test]
 fn composer_drafts_are_isolated_by_thread_identity() {
     let mut state = UiState::new(UiSnapshot::default());
-    let mut first = UiSnapshot::default();
-    first.thread_id = Some("thr_parent".into());
+    let first = UiSnapshot {
+        thread_id: Some("thr_parent".into()),
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(first)));
     state.handle_paste("父会话未发送草稿");
 
-    let mut child = UiSnapshot::default();
-    child.thread_id = Some("thr_side".into());
+    let child = UiSnapshot {
+        thread_id: Some("thr_side".into()),
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(child)));
     assert!(state.composer().is_empty());
     state.handle_paste("侧聊单独草稿");
 
-    let mut returned = UiSnapshot::default();
-    returned.thread_id = Some("thr_parent".into());
+    let returned = UiSnapshot {
+        thread_id: Some("thr_parent".into()),
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(returned)));
     assert_eq!(state.composer().text(), "父会话未发送草稿");
 
-    let mut closed = UiSnapshot::default();
-    closed.thread_id = Some("thr_parent".into());
+    let closed = UiSnapshot {
+        thread_id: Some("thr_parent".into()),
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(closed)));
     state.apply(UiEvent::ForgetThreadDrafts(vec!["thr_side".into()]));
-    let mut revisit_child = UiSnapshot::default();
-    revisit_child.thread_id = Some("thr_side".into());
+    let revisit_child = UiSnapshot {
+        thread_id: Some("thr_side".into()),
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(revisit_child)));
     assert!(state.composer().is_empty());
 }
@@ -105,13 +115,15 @@ fn safe_side_chat_recovery_route_does_not_overwrite_newer_draft() {
 }
 
 /// @author kongweiguang
-/// A suspended approval-expired child remains resumable from its selected Thread with the existing F6 action.
+/// 显式构造审批过期后的暂停子会话，确保既有 F6 动作继续绑定所选 Thread。
 #[test]
 fn suspended_thread_keeps_f6_resume_action() {
     let mut state = UiState::new(UiSnapshot::default());
-    let mut snapshot = UiSnapshot::default();
-    snapshot.thread_id = Some("thr_suspended_child".into());
-    snapshot.turn_state = TurnState::Paused;
+    let snapshot = UiSnapshot {
+        thread_id: Some("thr_suspended_child".into()),
+        turn_state: TurnState::Paused,
+        ..UiSnapshot::default()
+    };
     state.apply(UiEvent::ReplaceSnapshot(Box::new(snapshot)));
 
     assert_eq!(

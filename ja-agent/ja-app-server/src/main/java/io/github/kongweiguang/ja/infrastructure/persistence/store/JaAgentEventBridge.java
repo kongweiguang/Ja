@@ -467,8 +467,11 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
 
     /**
      * 从独立投影线程可中断地等待 sink 完成；关停时 worker 能退出，不遗留 join 在未完成 future 上。
+     * RuntimeException 与 Error 按原对象传播；checked cause 才包装并保留 cause，确保消费方按原失败分类处理。
+     * PMD 无法分析 CompletionStage 的分支重抛，因此仅在本方法抑制 PreserveStackTrace。
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.PreserveStackTrace")
     private static void awaitPublish(java.util.concurrent.CompletionStage<Void> published) {
         try {
             Objects.requireNonNull(published, "published").toCompletableFuture().get();
@@ -707,8 +710,11 @@ public final class JaAgentEventBridge implements AgentEventListener, AgentExecut
 
     /**
      * TurnService 关停时绕过耐心排空路径，使宿主 shutdown deadline 不受 sink ACK 阻塞。
+     * 输入句柄由调用方移交；Attachment 由 detachImmediately 释放，其它 AutoCloseable 在此直接关闭。
+     * PMD 无法识别 Attachment 的专用 detach 生命周期，因此只在此方法抑制 CloseResource。
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.CloseResource")
     @Override
     public void closeForShutdown(AutoCloseable subscription) throws Exception {
         AutoCloseable value = Objects.requireNonNull(subscription, "subscription");

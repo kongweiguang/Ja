@@ -194,7 +194,7 @@ final class ApprovalExpiryRecoveryListenerTest extends PersistenceTestSupport {
     /** 后续 generation 使用真实递增时间，避免测试 wait 时间戳早于显式 resume 提交。 */
     private static InteractionWait approval(String interactionId, InteractionStatus status, long revision,
                                             String callId, Instant createdAt) {
-        var question = new InteractionQuestion("question_approval", "是否允许执行工具？",
+        InteractionQuestion question = new InteractionQuestion("question_approval", "是否允许执行工具？",
                 InteractionQuestionType.SINGLE,
                 List.of(new InteractionOption("option_approve", "允许", "继续本次工具", true),
                         new InteractionOption("option_deny", "拒绝", "停止本次工具", false)), true, false);
@@ -271,7 +271,8 @@ final class ApprovalExpiryRecoveryListenerTest extends PersistenceTestSupport {
     /** 已绑定 WAL checkpoint 的 PersistenceTestSupport 不重复初始化该 factory，只就绪启动屏障。 */
     private static StartupMaintenanceService initializedMaintenanceFixture() {
         try {
-            var constructor = StartupMaintenanceService.class.getDeclaredConstructor(boolean.class);
+            java.lang.reflect.Constructor<StartupMaintenanceService> constructor =
+                    StartupMaintenanceService.class.getDeclaredConstructor(boolean.class);
             if (!constructor.trySetAccessible()) {
                 throw new IllegalStateException("startup maintenance fixture constructor is inaccessible");
             }
@@ -498,7 +499,7 @@ final class ApprovalExpiryRecoveryListenerTest extends PersistenceTestSupport {
 
     /** 用 JaAgentStore 保证 admission participant 与 Core 投影的阶段顺序，后续 wait 仍写同一 SQLite 执行。 */
     private AgentStoreProjectionFixture admissionFixture(TestDatabase database, AgentStore store) throws Exception {
-        var root = Files.createDirectories(temp.resolve("workspace_approval_recovery"));
+        Path root = Files.createDirectories(temp.resolve("workspace_approval_recovery"));
         database.history().register(new Workspace.Registration(WORKSPACE_ID, root.toAbsolutePath(),
                 "审批恢复测试工作区", Workspace.Trust.TRUSTED, Workspace.Kind.PROJECT, NOW.minusSeconds(10)));
         ThreadPreferences preferences = new ThreadPreferences("provider_test", "model_test", "medium",

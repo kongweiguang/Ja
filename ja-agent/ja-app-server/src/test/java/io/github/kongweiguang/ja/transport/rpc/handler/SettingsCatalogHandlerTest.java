@@ -228,10 +228,13 @@ final class SettingsCatalogHandlerTest {
                 lifecycleOnlyClose());
     }
 
-    /** 用拒绝式动态代理隔离非目标端口，意外跨域调用会直接暴露为测试失败。 */
+    /** 用拒绝式代理隔离非目标端口，同时为 ready 所需冷扫描提供无候选终止页。 */
     private static <T> T unsupported(Class<T> type) {
         return type.cast(Proxy.newProxyInstance(SettingsCatalogHandlerTest.class.getClassLoader(),
                 new Class<?>[]{type}, (proxy, method, arguments) -> {
+                    if (type == ThreadUseCase.class && method.getName().equals("discoverThreads")) {
+                        return new CursorPage<>(List.of(), null);
+                    }
                     throw new AssertionError("unexpected port call: " + method.getName());
                 }));
     }

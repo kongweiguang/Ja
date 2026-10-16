@@ -419,10 +419,12 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     }
 
     /**
-     * 订阅释放失败只写错误类别，展示客户端失败不能改写已经提交的业务事实。
+     * 订阅释放失败只写错误类别，展示客户端失败不能改写已经提交的业务事实；保留原 RuntimeException 分类。
+     * PMD 无法识别分支中重抛的是同一异常对象，因此只在此方法抑制 PreserveStackTrace。
      *
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.PreserveStackTrace")
     private static void closeSubscription(AutoCloseable subscription) {
         try {
             subscription.close();
@@ -438,9 +440,12 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /**
      * 暂停后只保留 durable event watcher；状态查询在锁外执行，stripe 只封闭终态判断后的登记竞态。
      * 关闭或已有 drain 时拒绝迟到登记，并在锁外释放，避免 sink ACK 阻塞 admission 与 shutdown。
+     * 成功登记后 map 接管新订阅；未保留时本方法负责关闭。previous 是 map 已有 owner 的句柄，不由此处释放。
+     * PMD 无法推断 putIfAbsent 的资源所有权转移，因此仅在本方法抑制 CloseResource。
      *
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.CloseResource")
     private void retainSuspendedSubscription(AgentIdentity identity, AutoCloseable subscription) {
         boolean terminal;
         try {
@@ -481,9 +486,11 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
     /**
      * 启动恢复只观察既有等待态事件；先占用身份级生命周期屏障，再锁外校验与 attach，避免与 resume 竞争。
      * 未能保留的订阅走即时 detach，因为它不再有调用方等待其水位，且不能拖住关停。
+     * 被保留的句柄转交给 suspendedSubscriptions；其余路径由 finally 关闭，PMD 无法识别此 null 转移。
      *
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.CloseResource")
     @Override
     public boolean observeApprovalWait(String turnId, ConversationTurnEventSink sink) {
         Objects.requireNonNull(turnId, "turnId");
@@ -563,9 +570,12 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * 显式恢复或终态完成前移除对应持久事件 watcher，确保同身份只能有一个活动桥订阅。
+     * 唯一 release owner 关闭 map 中的句柄并结算屏障；并发调用只等待该屏障，不重复关闭资源。
+     * PMD 无法推断身份级 release 协议，因此仅在本方法抑制 CloseResource。
      *
      * @author kongweiguang
      */
+    @SuppressWarnings("PMD.CloseResource")
     private void releaseSuspendedSubscription(AgentIdentity identity) {
         Object stripe = admissionStripes[stripe(identity)];
         AutoCloseable subscription;
@@ -642,8 +652,12 @@ public final class TurnService implements TurnUseCase, ChildTurnScheduler {
 
     /**
      * Shutdown 即时 detach 当前 watcher，即使普通 waterline drain 正在进行也不等待其 future。
+     * 从 map 移出的句柄交给 closeForShutdown 关闭或 detach，finally 结算屏障；PMD 无法追踪该委托 owner。
+     * unchecked 首因按原对象重抛以保留关停错误分类，checked 失败包装时仍保留原 cause。
+     * 因此仅在本方法抑制 CloseResource 与 PreserveStackTrace。
      * @author kongweiguang
      */
+    @SuppressWarnings({"PMD.CloseResource", "PMD.PreserveStackTrace"})
     private void detachSuspendedSubscriptionForShutdown(AgentIdentity identity) {
         Object stripe = admissionStripes[stripe(identity)];
         AutoCloseable subscription;

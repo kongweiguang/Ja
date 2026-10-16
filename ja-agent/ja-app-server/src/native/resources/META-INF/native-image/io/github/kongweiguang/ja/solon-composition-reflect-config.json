@@ -34,6 +34,7 @@
           "io.github.kongweiguang.ja.conversation.application.api.InteractionUseCase",
           "io.github.kongweiguang.ja.conversation.application.api.ProcessSessionUseCase",
           "io.github.kongweiguang.ja.review.application.api.ReviewUseCase",
+          "io.github.kongweiguang.ja.infrastructure.persistence.startup.ApprovalExpiryStartupRecovery",
           "io.github.kongweiguang.ja.agent.application.gateway.JsonValueCodec"
         ]
       }

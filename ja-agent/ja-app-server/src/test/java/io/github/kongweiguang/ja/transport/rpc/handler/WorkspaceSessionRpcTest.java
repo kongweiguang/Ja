@@ -996,10 +996,10 @@ final class WorkspaceSessionRpcTest extends PersistenceTestSupport {
             throw new UnsupportedOperationException();
         }
 
-        /** 工作区会话测试不执行 Thread 发现查询。 */
+        /** 工作区命令测试不含待恢复审批，冷启动发现返回空终止页。 */
         @Override
         public CursorPage<ThreadDiscovery> discoverThreads(ThreadDiscovery.Query query) {
-            throw new UnsupportedOperationException();
+            return new CursorPage<>(List.of(), null);
         }
 
         /** 工作区会话测试不搜索已提交输入。 */

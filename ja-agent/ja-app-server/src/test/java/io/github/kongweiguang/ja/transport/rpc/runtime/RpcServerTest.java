@@ -729,9 +729,10 @@ final class RpcServerTest {
         }
     }
 
-    /** SessionBinding 构造失败或缺少释放句柄时，Server 不得泄漏已启动的 Writer owner。 */
+    /** SessionBinding 失败不得泄漏本次构造的 Writer owner，线程归属按对象身份隔离并行测试。 */
     @Test
     void bindingConstructionFailureStopsWriterOwner() {
+        Set<Thread> existingWriters = liveWriterOwners();
         RuntimeException bindingFailure = new IllegalStateException("synthetic binding failure");
         assertSame(bindingFailure, assertThrows(RuntimeException.class,
                 () -> new RpcServer(new ByteArrayInputStream(new byte[0]), new ByteArrayOutputStream(),
@@ -740,20 +741,28 @@ final class RpcServerTest {
                         TestConfigurationPorts.unavailable(), session -> {
                             throw bindingFailure;
                         })));
-        assertFalse(hasLiveWriterOwner());
+        assertFalse(hasNewLiveWriterOwner(existingWriters));
 
         assertThrows(IllegalArgumentException.class,
                 () -> new RpcServer(new ByteArrayInputStream(new byte[0]), new ByteArrayOutputStream(),
                         testConfiguration(), CLOCK,
                         ignored -> new EmptyServices(new AtomicBoolean()).bindings(),
                         TestConfigurationPorts.unavailable(), session -> null));
-        assertFalse(hasLiveWriterOwner());
+        assertFalse(hasNewLiveWriterOwner(existingWriters));
     }
 
-    /** 仅检查本类独占创建的固定名称平台线程，确保失败构造已完成同步清理。 */
-    private static boolean hasLiveWriterOwner() {
+    /** 失败构造前记录已存在的 writer，避免并行测试中的其它会话影响本测试的所有权断言。 */
+    private static Set<Thread> liveWriterOwners() {
         return Thread.getAllStackTraces().keySet().stream()
-                .anyMatch(thread -> thread.isAlive() && "ja-rpc-writer".equals(thread.getName()));
+                .filter(thread -> thread.isAlive() && "ja-rpc-writer".equals(thread.getName()))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    /** 只检查失败构造新增的 writer，仍能直接发现该 RpcServer 未释放的线程。 */
+    private static boolean hasNewLiveWriterOwner(Set<Thread> existingWriters) {
+        return Thread.getAllStackTraces().keySet().stream()
+                .anyMatch(thread -> thread.isAlive() && "ja-rpc-writer".equals(thread.getName())
+                        && !existingWriters.contains(thread));
     }
 
     /** 验证 initialize、ready 与 EOF 关闭只写出公开帧，任何凭据均不会回显。 */

@@ -152,10 +152,14 @@ final class ThreadChangeSetReadHandlerTest {
                 Base64.getEncoder().encodeToString("diff".getBytes(StandardCharsets.UTF_8))));
     }
 
-    /** 动态代理只开放目标端口，阻止测试夹具无意依赖 ThreadUseCase 其它默认方法。 */
+    /** 开放目标文件读取与 ready 必需的空冷扫描，其余 ThreadUseCase 入口仍显式拒绝。 */
     private static ThreadUseCase reader(ReaderOperation operation) {
         return (ThreadUseCase) Proxy.newProxyInstance(ThreadUseCase.class.getClassLoader(),
                 new Class<?>[]{ThreadUseCase.class}, (proxy, method, arguments) -> {
+                    if ("discoverThreads".equals(method.getName())) {
+                        return new io.github.kongweiguang.ja.agent.domain.pagination.CursorPage<>(
+                                java.util.List.of(), null);
+                    }
                     if (!"readChangeSetArtifact".equals(method.getName())) {
                         throw new UnsupportedOperationException(method.getName());
                     }

@@ -2044,8 +2044,13 @@ public final class RpcSession implements AutoCloseable {
         }
     }
 
-    /** 冷审批扫描记录该上下文是否由自己创建，以便 false attach 时不误删既有 owner。 */
-    private record ThreadNotificationRegistration(TurnNotificationContext context, boolean created) {
+    /** 冷审批扫描记录创建归属，避免 attach 失败时删除已存在的 owner。
+     *
+     * @param context 该 Turn 当前使用的通知路由上下文
+     * @param created 是否由本次冷扫描创建该上下文
+     */
+    private record ThreadNotificationRegistration(TurnNotificationContext context,
+                                                  boolean created) {
     }
 
 }
