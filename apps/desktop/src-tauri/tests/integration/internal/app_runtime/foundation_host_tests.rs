@@ -1326,6 +1326,8 @@ fn tauri_exit_request_denied_then_retry_allowed_with_quarantine() {
 /// App Server identity 与原生 capability，后续 Turn 才能捕获不混入既有 dirty 状态的基线；
 /// 前一个 Turn 完成后，后一个 Turn 也不能因生命周期投影而误报失败并诱发 UI 重试。
 /// accepted revision 是不可变准入回执；只与同 Turn 的终态比较，不假设未公开事务之间的 revision 连续。
+/// 审批通知可至少投递一次，因此按稳定 approvalId 只决策一次并校验重放的 eventId；
+/// 不同 approval 仍各自响应原事件 revision，失败时才回读快照诊断，不自动重试或更新 CAS。
 /// 总预算覆盖真实 JVM 冷启动、配置与 workspace 写入以及两个连续 Turn，为 hosted CI 负载留出余量；
 /// 本地 Provider 用真实结构化调用产生审批，不依赖生产测试分支或不可达网络的最终失败。
 #[test]
@@ -1432,6 +1434,7 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
     );
     assert!(second_accepted.accepted);
     let mut second_events = Vec::new();
+    let mut decided_approval_events = std::collections::HashMap::<String, String>::new();
     loop {
         let event = receiver
             .recv_timeout(total_deadline.saturating_duration_since(Instant::now()))
@@ -1448,25 +1451,58 @@ fn real_java_turn_and_shutdown_close_without_token_leak() {
                 == Some(second_accepted.turn_id.as_str());
         if belongs_to_second_turn && method(&event) == Some("approval/requested") {
             let params = params.expect("approval params");
-            host.approval_respond(ApprovalResponseInput {
-                operation_key: format!("op_{}", uuid::Uuid::new_v4().simple()),
-                approval_id: params
-                    .get("approvalId")
-                    .and_then(Value::as_str)
-                    .expect("approval id")
-                    .to_owned(),
-                turn_id: params
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .expect("approval turn id")
-                    .to_owned(),
-                decision: "approve".to_owned(),
-                expected_thread_revision: params
-                    .get("threadRevision")
-                    .and_then(Value::as_u64)
-                    .expect("approval revision"),
-            })
-            .expect("approval response accepted");
+            let approval_id = params
+                .get("approvalId")
+                .and_then(Value::as_str)
+                .expect("approval id");
+            let approval_event_id = params
+                .get("eventId")
+                .and_then(Value::as_str)
+                .expect("approval event id");
+            let approval_revision = params
+                .get("threadRevision")
+                .and_then(Value::as_u64)
+                .expect("approval revision");
+            if let Some(previous_event_id) = decided_approval_events.get(approval_id) {
+                assert_eq!(
+                    previous_event_id.as_str(),
+                    approval_event_id,
+                    "replayed approval request must retain its durable event identity"
+                );
+            } else {
+                decided_approval_events
+                    .insert(approval_id.to_owned(), approval_event_id.to_owned());
+                let response = host.approval_respond(ApprovalResponseInput {
+                    operation_key: format!("op_{}", uuid::Uuid::new_v4().simple()),
+                    approval_id: approval_id.to_owned(),
+                    turn_id: second_accepted.turn_id.clone(),
+                    decision: "approve".to_owned(),
+                    expected_thread_revision: approval_revision,
+                });
+                if let Err(failure) = response {
+                    let snapshot = harness.read_thread(&second_thread_id).ok();
+                    let current_revision = snapshot
+                        .as_ref()
+                        .and_then(|value| value.get("revision"))
+                        .and_then(Value::as_u64);
+                    let current_turn_status = snapshot
+                        .as_ref()
+                        .and_then(|value| value.get("turns"))
+                        .and_then(Value::as_array)
+                        .and_then(|turns| {
+                            turns.iter().find(|turn| {
+                                turn.get("turnId").and_then(Value::as_str)
+                                    == Some(second_accepted.turn_id.as_str())
+                            })
+                        })
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(Value::as_str);
+                    panic!(
+                        "approval response accepted: {failure:?}; approvalId={approval_id} turnId={} eventId={approval_event_id} eventRevision={approval_revision} currentThreadRevision={current_revision:?} currentTurnStatus={current_turn_status:?}",
+                        second_accepted.turn_id,
+                    );
+                }
+            }
         }
         let terminal = belongs_to_second_turn && method(&event) == Some("turn/terminal");
         if belongs_to_second_thread {
